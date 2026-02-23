@@ -2,7 +2,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import * as MediaLibrary from "expo-media-library";
 import { Alert, Linking, Platform } from "react-native";
 
-export const APP_FOLDER = "HelloChat";
+export const APP_FOLDER = "baatCheet";
 export const SENT_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Sent/`;
 export const RECEIVED_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Received/`;
 

@@ -642,19 +642,31 @@ export default function useChatLogic({ navigation, route }) {
 
   /* ========== Presence & typing helpers ========== */
   const requestUserPresence = useCallback(() => {
-    const socket = getSocket();
+    const socket = socketRef.current || getSocket();
+  
     if (!socket || !isSocketConnected() || !chatData.peerUser?._id) {
+      console.log("⚠️ Cannot request presence");
       setUserStatus("offline");
       return;
     }
-    socket.emit('presence:manual', { userId: chatData.peerUser._id }, (response) => {
-      if (response?.data) { 
-        setUserStatus(response.data.status || "offline"); 
-        setLastSeen(response.data.lastSeen); 
+  
+    console.log("📤 Requesting presence for:", chatData.peerUser._id);
+  
+    socket.emit(
+      "presence:manual",
+      { userId: chatData.peerUser._id },
+      (response) => {
+        console.log("📥 presence:manual response:", response);
+  
+        const data = response?.data || response;
+  
+        if (data?.status) {
+          setUserStatus(data.status);
+          setLastSeen(data.lastSeen || null);
+        }
       }
-      else if (response?.status === false) setUserStatus("offline");
-    });
-  }, [chatData.peerUser?._id]);
+    );
+  }, [chatData.peerUser]);
 
   // FIXED: Send typing status with proper error handling
   const sendTypingStatus = useCallback((isTypingNow) => {
@@ -717,161 +729,224 @@ export default function useChatLogic({ navigation, route }) {
   // FIXED: Setup socket listeners with proper typing handlers
   const setupSocketListeners = useCallback((socket, currentChatId) => {
     removeSocketListeners(socket);
-
+    socket.onAny((event, data) => {
+      console.log("📡 SOCKET EVENT:", event, data);
+    });
+    /* ================= MESSAGE EVENTS ================= */
+  
     socket.on('message:sent:ack', (data) => {
-      const messageId = data.messageId || data._id || data.data?.messageId || data.data?._id;
+      const messageId =
+        data.messageId ||
+        data._id ||
+        data.data?.messageId ||
+        data.data?._id;
+  
       const tempId = data.tempId || data.data?.tempId;
+  
       if (data.persistenceConfirmed === true || data.status === true || messageId) {
         updateMessageStatus(tempId, 'sent', { messageId, ...data });
       }
     });
-
+  
     socket.on('message:new', (data) => {
       const chatInPayload = data.chatId || data.chat || data.roomId;
       if (chatInPayload && chatInPayload !== currentChatId) return;
       handleReceivedMessage(data);
     });
-
-    socket.on('message:received', (data) => { handleReceivedMessage(data); });
-    socket.on('message:delivered', (data) => { if (data.messageId) updateMessageStatus(data.messageId, 'delivered', data); });
-    socket.on('message:read', (data) => { if (data.messageId) updateMessageStatus(data.messageId, 'seen', data); });
-
+  
+    socket.on('message:received', handleReceivedMessage);
+  
+    socket.on('message:delivered', (data) => {
+      if (data.messageId) updateMessageStatus(data.messageId, 'delivered', data);
+    });
+  
+    socket.on('message:read', (data) => {
+      if (data.messageId) updateMessageStatus(data.messageId, 'seen', data);
+    });
+  
     socket.on('message:delete:everyone', (data) => {
       const { messageId, chatId } = data;
       if (chatId !== currentChatId) return;
       handleDeleteMessage(messageId, true);
     });
-
+  
     socket.on('message:delete:me', (data) => {
       const { messageId, chatId, deletedBy } = data;
       if (chatId !== currentChatId) return;
-      if (deletedBy && deletedBy === currentUserIdRef.current) handleDeleteMessage(messageId, false);
+      if (deletedBy && deletedBy === currentUserIdRef.current)
+        handleDeleteMessage(messageId, false);
     });
-
-    socket.on('messagedeleteeveryone:response', (data) => { if (data.status === false) Alert.alert("Error", data.message || "Failed to delete message for everyone"); });
-    socket.on('messagedeleteme:response', (data) => { if (data.status === false) Alert.alert("Error", data.message || "Failed to delete message"); });
-
+  
+    /* ================= PRESENCE EVENTS ================= */
+  
     socket.on('presence:update', (data) => {
-      if (data.userId === chatData.peerUser._id) {
+      console.log('📨 presence:update:', data);
+  
+      const incomingId = data.userId || data.id;
+  
+      if (String(incomingId) === String(chatData.peerUser?._id)) {
+        console.log('✅ Updating peer presence');
+  
         setUserStatus(data.status || "offline");
-        if (data.lastSeen) setLastSeen(data.lastSeen);
+  
+        if (data.lastSeen) {
+          setLastSeen(data.lastSeen);
+        }
       }
     });
-
+  
     socket.on('user:online', (data) => {
-      if (data.userId === chatData.peerUser._id) { 
-        setUserStatus("online"); 
-        setLastSeen(null); 
+      console.log('📨 user:online:', data);
+  
+      const incomingId = data.userId || data.id;
+  
+      if (String(incomingId) === String(chatData.peerUser?._id)) {
+        setUserStatus("online");
+        setLastSeen(null);
       }
     });
-
+  
     socket.on('user:offline', (data) => {
-      if (data.userId === chatData.peerUser._id) { 
-        setUserStatus("offline"); 
-        setLastSeen(data.lastSeen || new Date().toISOString()); 
+      console.log('📨 user:offline:', data);
+  
+      const incomingId = data.userId || data.id;
+  
+      if (String(incomingId) === String(chatData.peerUser?._id)) {
+        setUserStatus("offline");
+        setLastSeen(data.lastSeen || new Date().toISOString());
       }
     });
-
-    // FIXED: Typing event handlers
+  
+    /* ================= TYPING EVENTS ================= */
+  
     socket.on('typing:start', (data) => {
-      console.log('📨 [TYPING] Received typing:start:', data);
-      
       const senderId = data.userId || data.senderId || data.from;
       const chatIdInPayload = data.chatId || data.roomId;
-      
-      // Only show typing indicator if it's from the peer user and for this chat
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
-        
-        console.log('👤 [TYPING] Peer is typing');
+  
+      if (
+        String(senderId) === String(chatData.peerUser?._id) &&
+        (!chatIdInPayload || chatIdInPayload === currentChatId)
+      ) {
         setIsPeerTyping(true);
-        
-        // Clear any existing timeout
+  
         if (peerTypingTimeoutRef.current) {
           clearTimeout(peerTypingTimeoutRef.current);
         }
-        
-        // Set timeout to hide typing indicator after TYPING_TIMEOUT
+  
         peerTypingTimeoutRef.current = setTimeout(() => {
-          console.log('⏰ [TYPING] Peer typing timeout');
           setIsPeerTyping(false);
           peerTypingTimeoutRef.current = null;
         }, TYPING_TIMEOUT);
       }
     });
-
+  
     socket.on('typing:stop', (data) => {
-      console.log('📨 [TYPING] Received typing:stop:', data);
-      
       const senderId = data.userId || data.senderId || data.from;
       const chatIdInPayload = data.chatId || data.roomId;
-      
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
-        
-        console.log('👤 [TYPING] Peer stopped typing');
+  
+      if (
+        String(senderId) === String(chatData.peerUser?._id) &&
+        (!chatIdInPayload || chatIdInPayload === currentChatId)
+      ) {
         setIsPeerTyping(false);
-        
-        // Clear timeout
+  
         if (peerTypingTimeoutRef.current) {
           clearTimeout(peerTypingTimeoutRef.current);
           peerTypingTimeoutRef.current = null;
         }
       }
     });
-
-    // Handle recording as typing
+  
     socket.on('typing:recording', (data) => {
       const senderId = data.userId || data.senderId || data.from;
       const chatIdInPayload = data.chatId || data.roomId;
-      
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
+  
+      if (
+        String(senderId) === String(chatData.peerUser?._id) &&
+        (!chatIdInPayload || chatIdInPayload === currentChatId)
+      ) {
         setIsPeerTyping(true);
-        
+  
         if (peerTypingTimeoutRef.current) {
           clearTimeout(peerTypingTimeoutRef.current);
         }
-        
+  
         peerTypingTimeoutRef.current = setTimeout(() => {
           setIsPeerTyping(false);
           peerTypingTimeoutRef.current = null;
         }, TYPING_TIMEOUT);
       }
     });
-
+  
     socket.on('typing:recording:update', (data) => {
       const senderId = data.userId || data.senderId || data.from;
       const chatIdInPayload = data.chatId || data.roomId;
-      
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
+  
+      if (
+        String(senderId) === String(chatData.peerUser?._id) &&
+        (!chatIdInPayload || chatIdInPayload === currentChatId)
+      ) {
         setIsPeerTyping(true);
-        
+  
         if (peerTypingTimeoutRef.current) {
           clearTimeout(peerTypingTimeoutRef.current);
         }
-        
+  
         peerTypingTimeoutRef.current = setTimeout(() => {
           setIsPeerTyping(false);
           peerTypingTimeoutRef.current = null;
         }, TYPING_TIMEOUT);
       }
     });
-
+  
+    /* ================= CONNECTION EVENTS ================= */
+  
     socket.on('disconnect', () => {
       setUserStatus("offline");
-      setIsPeerTyping(false); // Reset typing state on disconnect
-      setTimeout(() => { if (isComponentMounted.current) checkAndReconnectSocket(); }, 2000);
+      setIsPeerTyping(false);
+  
+      setTimeout(() => {
+        if (isComponentMounted.current) {
+          checkAndReconnectSocket();
+        }
+      }, 2000);
     });
-
+  
     socket.on('connect', () => {
+      console.log("🟢 Socket connected");
+  
       reconnectAttempts.current = 0;
-      requestUserPresence();
-      socket.emit('chat:join', { chatId: currentChatId, userId: currentUserIdRef.current });
-      socket.emit('user:status', { userId: currentUserIdRef.current, status: 'online', chatId: currentChatId });
+  
+      /* 🔥 CRITICAL FIX: Join USER room */
+      socket.emit("user:join", {
+        userId: currentUserIdRef.current
+      });
+  
+      /* Join chat room */
+      socket.emit('chat:join', {
+        chatId: currentChatId,
+        userId: currentUserIdRef.current
+      });
+  
+      /* Mark self online */
+      socket.emit('user:status', {
+        userId: currentUserIdRef.current,
+        status: 'online',
+        chatId: currentChatId
+      });
+  
+      /* 🔥 Force presence refresh AFTER join */
+      setTimeout(() => {
+        requestUserPresence();
+      }, 800);
     });
-  }, [chatData.peerUser, removeSocketListeners, requestUserPresence, checkAndReconnectSocket]);
+  
+  }, [
+    chatData.peerUser,
+    removeSocketListeners,
+    requestUserPresence,
+    checkAndReconnectSocket
+  ]);
 
   const removeDuplicateMessages = useCallback((messagesArr) => {
     const seen = new Set();
@@ -1535,23 +1610,18 @@ export default function useChatLogic({ navigation, route }) {
 
   /* ========== FIXED: Render status helper ========== */
   const renderStatusText = useCallback(() => {
-    console.log('📊 [STATUS] Rendering status:', { 
-      isPeerTyping, 
-      userStatus, 
-      lastSeen 
+    console.log("📊 STATUS CHECK →", {
+      isPeerTyping,
+      userStatus,
+      lastSeen,
+      peerId: chatData.peerUser?._id
     });
-    
-    if (isPeerTyping) {
-      return 'typing...';
-    }
-    if (userStatus === 'online') {
-      return 'online';
-    }
-    if (lastSeen) {
-      return `last seen ${moment(lastSeen).fromNow()}`;
-    }
-    return 'offline';
-  }, [isPeerTyping, userStatus, lastSeen]);
+  
+    if (isPeerTyping) return "typing...";
+    if (userStatus === "online") return "online";
+    if (lastSeen) return `last seen ${moment(lastSeen).fromNow()}`;
+    return "offline";
+  }, [isPeerTyping, userStatus, lastSeen, chatData.peerUser]);
 
   const openMediaOptions = () => setShowMediaOptions(true);
   const closeMediaOptions = () => setShowMediaOptions(false);

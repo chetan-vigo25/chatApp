@@ -782,7 +782,6 @@ export default function ChatScreen({ navigation, route }) {
             keyboardShouldPersistTaps="handled" 
             contentContainerStyle={{ paddingBottom: 10, paddingTop: 10 }} 
             showsVerticalScrollIndicator={false} 
-            
             // FIXED: Use renderHeader for typing indicator
             ListFooterComponent={renderHeader}
             onEndReached={!isSearching ? loadMoreMessages : undefined} 
