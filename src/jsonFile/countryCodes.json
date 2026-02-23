@@ -1,0 +1,249 @@
+[
+    {
+      "code": "+91",
+      "name": "India",
+      "flag": "🇮🇳",
+      "region": "Asia"
+    },
+    {
+      "code": "+1",
+      "name": "United States",
+      "flag": "🇺🇸",
+      "region": "North America"
+    },
+    {
+      "code": "+44",
+      "name": "United Kingdom",
+      "flag": "🇬🇧",
+      "region": "Europe"
+    },
+    {
+      "code": "+86",
+      "name": "China",
+      "flag": "🇨🇳",
+      "region": "Asia"
+    },
+    {
+      "code": "+81",
+      "name": "Japan",
+      "flag": "🇯🇵",
+      "region": "Asia"
+    },
+    {
+      "code": "+82",
+      "name": "South Korea",
+      "flag": "🇰🇷",
+      "region": "Asia"
+    },
+    {
+      "code": "+65",
+      "name": "Singapore",
+      "flag": "🇸🇬",
+      "region": "Asia"
+    },
+    {
+      "code": "+971",
+      "name": "UAE",
+      "flag": "🇦🇪",
+      "region": "Middle East"
+    },
+    {
+      "code": "+966",
+      "name": "Saudi Arabia",
+      "flag": "🇸🇦",
+      "region": "Middle East"
+    },
+    {
+      "code": "+61",
+      "name": "Australia",
+      "flag": "🇦🇺",
+      "region": "Oceania"
+    },
+    {
+      "code": "+49",
+      "name": "Germany",
+      "flag": "🇩🇪",
+      "region": "Europe"
+    },
+    {
+      "code": "+33",
+      "name": "France",
+      "flag": "🇫🇷",
+      "region": "Europe"
+    },
+    {
+      "code": "+39",
+      "name": "Italy",
+      "flag": "🇮🇹",
+      "region": "Europe"
+    },
+    {
+      "code": "+34",
+      "name": "Spain",
+      "flag": "🇪🇸",
+      "region": "Europe"
+    },
+    {
+      "code": "+7",
+      "name": "Russia",
+      "flag": "🇷🇺",
+      "region": "Europe"
+    },
+    {
+      "code": "+55",
+      "name": "Brazil",
+      "flag": "🇧🇷",
+      "region": "South America"
+    },
+    {
+      "code": "+52",
+      "name": "Mexico",
+      "flag": "🇲🇽",
+      "region": "North America"
+    },
+    {
+      "code": "+27",
+      "name": "South Africa",
+      "flag": "🇿🇦",
+      "region": "Africa"
+    },
+    {
+      "code": "+234",
+      "name": "Nigeria",
+      "flag": "🇳🇬",
+      "region": "Africa"
+    },
+    {
+      "code": "+20",
+      "name": "Egypt",
+      "flag": "🇪🇬",
+      "region": "Africa"
+    },
+    {
+      "code": "+880",
+      "name": "Bangladesh",
+      "flag": "🇧🇩",
+      "region": "Asia"
+    },
+    {
+      "code": "+92",
+      "name": "Pakistan",
+      "flag": "🇵🇰",
+      "region": "Asia"
+    },
+    {
+      "code": "+94",
+      "name": "Sri Lanka",
+      "flag": "🇱🇰",
+      "region": "Asia"
+    },
+    {
+      "code": "+977",
+      "name": "Nepal",
+      "flag": "🇳🇵",
+      "region": "Asia"
+    },
+    {
+      "code": "+93",
+      "name": "Afghanistan",
+      "flag": "🇦🇫",
+      "region": "Asia"
+    },
+    {
+      "code": "+98",
+      "name": "Iran",
+      "flag": "🇮🇷",
+      "region": "Middle East"
+    },
+    {
+      "code": "+90",
+      "name": "Turkey",
+      "flag": "🇹🇷",
+      "region": "Europe"
+    },
+    {
+      "code": "+974",
+      "name": "Qatar",
+      "flag": "🇶🇦",
+      "region": "Middle East"
+    },
+    {
+      "code": "+965",
+      "name": "Kuwait",
+      "flag": "🇰🇼",
+      "region": "Middle East"
+    },
+    {
+      "code": "+973",
+      "name": "Bahrain",
+      "flag": "🇧🇭",
+      "region": "Middle East"
+    },
+    {
+      "code": "+968",
+      "name": "Oman",
+      "flag": "🇴🇲",
+      "region": "Middle East"
+    },
+    {
+      "code": "+60",
+      "name": "Malaysia",
+      "flag": "🇲🇾",
+      "region": "Asia"
+    },
+    {
+      "code": "+66",
+      "name": "Thailand",
+      "flag": "🇹🇭",
+      "region": "Asia"
+    },
+    {
+      "code": "+84",
+      "name": "Vietnam",
+      "flag": "🇻🇳",
+      "region": "Asia"
+    },
+    {
+      "code": "+63",
+      "name": "Philippines",
+      "flag": "🇵🇭",
+      "region": "Asia"
+    },
+    {
+      "code": "+62",
+      "name": "Indonesia",
+      "flag": "🇮🇩",
+      "region": "Asia"
+    },
+    {
+      "code": "+855",
+      "name": "Cambodia",
+      "flag": "🇰🇭",
+      "region": "Asia"
+    },
+    {
+      "code": "+856",
+      "name": "Laos",
+      "flag": "🇱🇦",
+      "region": "Asia"
+    },
+    {
+      "code": "+95",
+      "name": "Myanmar",
+      "flag": "🇲🇲",
+      "region": "Asia"
+    },
+    {
+      "code": "+975",
+      "name": "Bhutan",
+      "flag": "🇧🇹",
+      "region": "Asia"
+    },
+    {
+      "code": "+960",
+      "name": "Maldives",
+      "flag": "🇲🇻",
+      "region": "Asia"
+    }
+  ]
+  
