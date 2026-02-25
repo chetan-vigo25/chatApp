@@ -14,9 +14,15 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.vigorous.baatCheet"
+      "bundleIdentifier": "com.chat.baatCheet",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "This app needs access to your photo library to pick media.",
+        "NSCameraUsageDescription": "This app needs access to your camera to take photos or videos.",
+        "NSPhotoLibraryAddUsageDescription": "This app needs permission to save photos to your library."
+      }
     },
     "android": {
+      "googleServicesFile": "./google-services.json",
       "permissions": [
         "CAMERA",
         "RECORD_AUDIO",
@@ -29,7 +35,7 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "package": "com.vigorous.baatCheet"
+      "package": "com.chat.baatCheet"
     },
     "web": {
       "favicon": "./assets/favicon.png"

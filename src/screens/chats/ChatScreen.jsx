@@ -875,7 +875,7 @@ export default function ChatScreen({ navigation, route }) {
               <TouchableOpacity onPress={() => handlePickMedia('document')} style={{ paddingVertical: 12 }}>
                 <Text style={{ color: theme.colors.primaryTextColor }}>Document</Text>
               </TouchableOpacity> */}
-              <TouchableOpacity onPress={closeMediaOptions} style={{ paddingVertical: 12 }}>
+              <TouchableOpacity onPress={closeMediaOptions} style={{ paddingVertical: 12, marginBottom:30 }}>
                 <Text style={{ color: '#FF3B30' }}>Cancel</Text>
               </TouchableOpacity>
             </View>

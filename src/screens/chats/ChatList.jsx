@@ -89,14 +89,14 @@ export default function ChatList({ navigation }) {
           <Image resizeMode="cover" source={{ uri: item.peerUser?.profileImage }} style={{ width:'100%', height:'100%', borderRadius:100 }} />
         ) : (
           <View style={{ width:50, height:50, borderRadius:100, backgroundColor: getUserColor(item.peerUser?._id || item.peerUser?.fullName || ""), alignItems:'center', justifyContent:'center' }}>
-            <Text style={{ color:theme.colors.textWhite, fontSize:20, textTransform:'uppercase' }}>{item.peerUser?.fullName?.charAt(0)}</Text>
+            <Text style={{ color:theme.colors.textWhite, fontSize:28, textTransform:'uppercase', fontFamily:'Poppins-Medium' }}>{item.peerUser?.fullName?.charAt(0)}</Text>
           </View>
         )}
       </View>
       <TouchableOpacity onPress={() => navigation.navigate('ChatScreen', { item })} style={{width:'85%', flexDirection:"row", justifyContent:"space-between", alignItems:"center"}} >
         <View>
-          <Text style={{ color:theme.colors.primaryTextColor, fontSize:16, textTransform:'capitalize' }}>{item.peerUser?.fullName}</Text>
-          <Text style={{ color:theme.colors.placeHolderTextColor, fontSize:12 }}>{getPreviewText(item?.lastMessage?.text)}</Text>
+          <Text style={{ color:theme.colors.primaryTextColor, fontSize:16, fontFamily:'Poppins-Medium', textTransform:'capitalize' }}>{item.peerUser?.fullName}</Text>
+          <Text style={{ color:theme.colors.placeHolderTextColor, fontSize:12, fontFamily:'Poppins-Regular' }}>{getPreviewText(item?.lastMessage?.text)}</Text>
         </View>
         <View style={{ alignItems:'center', justifyContent:'space-between' }} >
           <Text style={{ color:theme.colors.placeHolderTextColor, fontSize:10 }}>{moment(item.lastMessageAt).format('hh:mm A')}</Text>
@@ -115,7 +115,7 @@ export default function ChatList({ navigation }) {
       <View style={{ flex:1, backgroundColor: theme.colors.background }}>
         {/* Header */}
         <View style={{ flexDirection:'row', padding:8, justifyContent:'space-between', alignItems:'center', borderBottomWidth:0.5, borderBottomColor:theme.colors.borderColor }} >
-          <Text style={{ fontSize:24, color:theme.colors.themeColor }}>Chats</Text>
+          <Text style={{ fontSize:24, color:theme.colors.themeColor, fontFamily:'Poppins-SemiBold' }}>Chats</Text>
           <Menu key={menuKey} visible={visible} onDismiss={() => { setVisible(false); setMenuKey(prev=>prev+1) }} contentStyle={{ backgroundColor: theme.colors.cardBackground }} anchor={
             <TouchableOpacity onPress={() => setVisible(true)} style={{ width:30, height:30, alignItems:'center', justifyContent:'center' }} >
               <FontAwesome6 name="bars-staggered" size={18} color={ theme.colors.placeHolderTextColor } />
@@ -166,6 +166,14 @@ export default function ChatList({ navigation }) {
                     <Text style={{ color:theme.colors.textWhite, fontSize:150, textTransform:'uppercase' }}>{(profileData?.fullName || selectedChatItem?.peerUser?.fullName || "").charAt(0)}</Text>
                   </View>
                 )}
+              </View>
+              <View style={{ flexDirection:'row', width:'100%', backgroundColor:'rgba(0, 0, 0, 0.5)', alignItems:'flex-start', justifyContent:'center', position:'absolute', bottom:0,}} >
+                <TouchableOpacity onPress={() => {navigation.navigate('ChatScreen', {item: selectedChatItem}); closeModal();}} activeOpacity={0.9} style={{ flex:1, alignItems:'center', justifyContent:'center', padding:5 }} >
+                  <MaterialCommunityIcons name="message-reply-text-outline" size={24} color={theme.colors.textWhite} />
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => {navigation.navigate('UserB', {item: selectedChatItem}); closeModal();}} activeOpacity={0.9} style={{ flex:1, alignItems:'center', justifyContent:'center', padding:5 }} >
+                  <AntDesign name="exclamation-circle" size={24} color={theme.colors.textWhite} />
+                </TouchableOpacity>
               </View>
             </View>
           </TouchableOpacity>

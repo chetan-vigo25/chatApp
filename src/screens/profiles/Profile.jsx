@@ -297,7 +297,7 @@ export default function Profile({ navigation }) {
                     style={{ width: '100%', height: 40, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 0.4, borderBottomColor: theme.colors.borderColor, marginBottom: 10 }}
                   >
                     <View style={{ width: 30, height: 30, justifyContent: "center", alignItems: 'center', borderRadius: 50 }}>
-                      <AntDesign name="exclamationcircleo" size={20} color={theme.colors.placeHolderTextColor} />
+                      <AntDesign name="exclamation-circle" size={20} color={theme.colors.placeHolderTextColor} />
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.primaryTextColor }}>About</Text>

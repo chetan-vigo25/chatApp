@@ -6,50 +6,38 @@ export const APP_FOLDER = "baatCheet";
 export const SENT_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Sent/`;
 export const RECEIVED_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Received/`;
 
+// Normalize URI for consistency
 export const normalizeUri = (uri) => {
   if (!uri) return uri;
   if (/^(file|content|https?):\/\//i.test(uri)) return uri;
   return uri.startsWith("/") ? `file://${uri}` : uri;
 };
 
-async function requestStoragePermission() {
-  if (Platform.OS === 'android') {
-    const { status } = await MediaLibrary.requestPermissionsAsync();
-    if (status !== 'granted') {
-      throw new Error('Storage permission is required');
-    }
-  }
-}
-
+// ---------------------------
+// FOLDER MANAGEMENT
+// ---------------------------
 export const ensureAppFoldersExist = async () => {
   try {
     const baseDir = `${FileSystem.documentDirectory}${APP_FOLDER}`;
-    const baseInfo = await FileSystem.getInfoAsync(baseDir);
-    if (!baseInfo.exists) {
+    if (!(await FileSystem.getInfoAsync(baseDir)).exists) {
       await FileSystem.makeDirectoryAsync(baseDir, { intermediates: true });
     }
-
-    const sentInfo = await FileSystem.getInfoAsync(SENT_DIR);
-    if (!sentInfo.exists) {
+    if (!(await FileSystem.getInfoAsync(SENT_DIR)).exists) {
       await FileSystem.makeDirectoryAsync(SENT_DIR, { intermediates: true });
     }
-
-    const recvInfo = await FileSystem.getInfoAsync(RECEIVED_DIR);
-    if (!recvInfo.exists) {
+    if (!(await FileSystem.getInfoAsync(RECEIVED_DIR)).exists) {
       await FileSystem.makeDirectoryAsync(RECEIVED_DIR, { intermediates: true });
     }
-
     return true;
   } catch (err) {
-    console.warn('❌ ensureAppFoldersExist error:', err);
+    console.warn("❌ ensureAppFoldersExist error:", err);
     return false;
   }
 };
 
 export const ensureDirExists = async (dir) => {
   try {
-    const info = await FileSystem.getInfoAsync(dir);
-    if (!info.exists) {
+    if (!(await FileSystem.getInfoAsync(dir)).exists) {
       await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
     }
     return true;
@@ -59,17 +47,79 @@ export const ensureDirExists = async (dir) => {
   }
 };
 
-export async function copyToAppFolder(inputUri, suggestedName = null, destDir = SENT_DIR, onProgress = null) {
+// ---------------------------
+// PERMISSIONS
+// ---------------------------
+let _hasPhotoPermission = null;
+
+export async function requestStoragePermission() {
+  if (_hasPhotoPermission !== null) return _hasPhotoPermission;
+
+  if (Platform.OS === "android") {
+    const { status } = await MediaLibrary.requestPermissionsAsync();
+    _hasPhotoPermission = status === "granted";
+    if (!_hasPhotoPermission) {
+      throw new Error("Storage permission is required");
+    }
+    return _hasPhotoPermission;
+  }
+
+  if (Platform.OS === "ios") {
+    const { status } = await MediaLibrary.requestPermissionsAsync({ writeOnly: false });
+    _hasPhotoPermission = status === "granted";
+    if (status === "limited") {
+      console.log("iOS: limited photo access, consider prompting user for full access in settings");
+      _hasPhotoPermission = true; // still allow saving, iOS handles limited access
+    }
+    if (!_hasPhotoPermission) {
+      throw new Error("Photo library permission is required");
+    }
+    return _hasPhotoPermission;
+  }
+
+  return true;
+}
+
+// ---------------------------
+// SAVE TO GALLERY
+// ---------------------------
+export async function saveFileToMediaLibrary(localUri, albumName = APP_FOLDER) {
+  try {
+    if (!localUri) return null;
+    await requestStoragePermission();
+    const normalized = normalizeUri(localUri);
+    const asset = await MediaLibrary.createAssetAsync(normalized);
+    try {
+      await MediaLibrary.createAlbumAsync(albumName, asset, false);
+    } catch (_) {} // album may already exist
+    return asset;
+  } catch (err) {
+    console.warn("saveFileToMediaLibrary failed", err);
+    return null;
+  }
+}
+
+// ---------------------------
+// COPY FILE TO APP FOLDER
+// ---------------------------
+export async function copyToAppFolder(inputUri, suggestedName = null, destDir = SENT_DIR, saveToLibrary = true, onProgress = null) {
   try {
     if (!inputUri) return null;
     await ensureDirExists(destDir);
 
+    const uriWithoutQuery = inputUri.split("?")[0];
+    const extMatch = uriWithoutQuery.match(/\.(\w+)$/);
+    const ext = extMatch ? `.${extMatch[1]}` : "";
+
+    // Avoid double extension
+    const filename = suggestedName
+      ? suggestedName.endsWith(ext) ? suggestedName : suggestedName + ext
+      : `file_${Date.now()}${ext}`;
+
+    const dest = `${destDir}${filename}`;
+
+    // Remote URL
     if (/^https?:\/\//i.test(inputUri)) {
-      const urlForExt = inputUri.split("?")[0];
-      const extMatch = urlForExt.match(/\.(\w+)$/);
-      const ext = extMatch ? `.${extMatch[1]}` : "";
-      const filename = (suggestedName || `file_${Date.now()}`) + ext;
-      const dest = `${destDir}${filename}`;
       const downloadResumable = FileSystem.createDownloadResumable(
         inputUri,
         dest,
@@ -81,27 +131,27 @@ export async function copyToAppFolder(inputUri, suggestedName = null, destDir = 
         }
       );
       const result = await downloadResumable.downloadAsync();
-      return result?.uri ? normalizeUri(result.uri) : null;
+      const finalUri = normalizeUri(result.uri);
+      if (saveToLibrary) await saveFileToMediaLibrary(finalUri);
+      return finalUri;
     }
 
+    // Local file
     if (/^file:\/\//i.test(inputUri) || inputUri.startsWith("/")) {
-      const extMatch = inputUri.split('?')[0].match(/\.(\w+)$/);
-      const ext = extMatch ? `.${extMatch[1]}` : "";
-      const filename = (suggestedName || `file_${Date.now()}`) + ext;
-      const dest = `${destDir}${filename}`;
       await FileSystem.copyAsync({ from: inputUri, to: dest });
-      return normalizeUri(dest);
+      const finalUri = normalizeUri(dest);
+      if (saveToLibrary) await saveFileToMediaLibrary(finalUri);
+      return finalUri;
     }
 
+    // Content URI
     if (/^content:\/\//i.test(inputUri)) {
       const asset = await MediaLibrary.createAssetAsync(inputUri);
       if (asset && asset.uri) {
-        const extMatch = (asset.filename || "").match(/\.(\w+)$/);
-        const ext = extMatch ? `.${extMatch[1]}` : "";
-        const filename = (suggestedName || `file_${Date.now()}`) + ext;
-        const dest = `${destDir}${filename}`;
         await FileSystem.copyAsync({ from: asset.uri, to: dest });
-        return normalizeUri(dest);
+        const finalUri = normalizeUri(dest);
+        if (saveToLibrary) await saveFileToMediaLibrary(finalUri);
+        return finalUri;
       }
     }
 
@@ -112,32 +162,21 @@ export async function copyToAppFolder(inputUri, suggestedName = null, destDir = 
   }
 }
 
-export async function saveFileToMediaLibrary(localUri, albumName = APP_FOLDER) {
-  try {
-    if (!localUri) return null;
-    const normalized = normalizeUri(localUri);
-    const { status } = await MediaLibrary.requestPermissionsAsync();
-    if (status !== "granted" && status !== "limited") return null;
-    const asset = await MediaLibrary.createAssetAsync(normalized);
-    try {
-      await MediaLibrary.createAlbumAsync(albumName, asset, false);
-    } catch (e) {}
-    return asset;
-  } catch (err) {
-    console.warn("saveFileToMediaLibrary failed", err);
-    return null;
-  }
-}
-
-export async function downloadRemoteToReceived(remoteUrl, filename, onProgress = null) {
+// ---------------------------
+// DOWNLOAD REMOTE FILE
+// ---------------------------
+export async function downloadRemoteToReceived(remoteUrl, filename, onProgress = null, saveToLibrary = true) {
   try {
     if (!remoteUrl) return null;
     await ensureDirExists(RECEIVED_DIR);
+
     const urlForExt = remoteUrl.split("?")[0];
     const extMatch = urlForExt.match(/\.(\w+)$/);
     const ext = extMatch ? `.${extMatch[1]}` : "";
-    const safeFilename = (filename || `recv_${Date.now()}`) + ext;
+    const safeFilename = filename.endsWith(ext) ? filename : filename + ext;
+
     const dest = `${RECEIVED_DIR}${safeFilename}`;
+
     const downloadResumable = FileSystem.createDownloadResumable(
       remoteUrl,
       dest,
@@ -148,30 +187,34 @@ export async function downloadRemoteToReceived(remoteUrl, filename, onProgress =
         }
       }
     );
+
     const result = await downloadResumable.downloadAsync();
-    return result?.uri ? normalizeUri(result.uri) : null;
+    const finalUri = normalizeUri(result.uri);
+    if (saveToLibrary) await saveFileToMediaLibrary(finalUri);
+    return finalUri;
   } catch (err) {
     console.warn("downloadRemoteToReceived failed", err);
     return null;
   }
 }
 
+// ---------------------------
+// UPLOAD MEDIA
+// ---------------------------
 export async function uploadMediaFile({ file, chatId, dispatch, mediaUploadAction }) {
   try {
     if (!file || !dispatch || !mediaUploadAction) {
       throw new Error("Missing params for uploadMediaFile");
     }
-    
+
     const formData = new FormData();
     formData.append("file", {
       uri: normalizeUri(file.uri),
       name: file.name || `file_${Date.now()}.jpg`,
       type: file.type || "image/jpeg",
     });
-    
-    if (chatId) {
-      formData.append("chatId", chatId);
-    }
+
+    if (chatId) formData.append("chatId", chatId);
 
     const action = await dispatch(mediaUploadAction(formData));
     return action;
@@ -181,15 +224,17 @@ export async function uploadMediaFile({ file, chatId, dispatch, mediaUploadActio
   }
 }
 
+// ---------------------------
+// DOWNLOAD & OPEN MEDIA
+// ---------------------------
 export async function downloadAndOpenMedia({ msg, dispatch, downloadAction, onProgress = null, openAfterDownload = false, saveToLibrary = true }) {
   try {
     if (!msg) throw new Error("Invalid message");
 
     if (msg.localUri) {
       const local = normalizeUri(msg.localUri);
-      if (openAfterDownload) {
-        const can = await Linking.canOpenURL(local);
-        if (can) await Linking.openURL(local);
+      if (openAfterDownload && (await Linking.canOpenURL(local))) {
+        await Linking.openURL(local);
       }
       return local;
     }
@@ -204,16 +249,11 @@ export async function downloadAndOpenMedia({ msg, dispatch, downloadAction, onPr
     if (!remoteUrl) throw new Error("No remote URL to download");
 
     const filename = `${msg.serverMessageId || msg.id || Date.now()}`;
-    const localUri = await downloadRemoteToReceived(remoteUrl, filename, onProgress);
+    const localUri = await downloadRemoteToReceived(remoteUrl, filename, onProgress, saveToLibrary);
     if (!localUri) throw new Error("Download failed");
 
-    if (saveToLibrary) {
-      try { await saveFileToMediaLibrary(localUri, APP_FOLDER); } catch (_) {}
-    }
-
-    if (openAfterDownload) {
-      const supported = await Linking.canOpenURL(localUri);
-      if (supported) await Linking.openURL(localUri);
+    if (openAfterDownload && (await Linking.canOpenURL(localUri))) {
+      await Linking.openURL(localUri);
     }
 
     return localUri;

@@ -26,7 +26,7 @@ export default function Splash({ navigation }) {
         }).start(() => {
           navigation.navigate('UserAgree');
         });
-      }, 3500);
+      }, 2000);
     
       return () => clearTimeout(timer);
     }, [navigation]);

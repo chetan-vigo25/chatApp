@@ -46,7 +46,7 @@ export const defaultTheme = lightTheme;
 export const ThemeProvider = ({ children }) => {
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [chatColor, setChatColor] = useState(null);
+  const [chatColor, setChatColor] = useState('#34B7F1');
   const [hasManualTheme, setHasManualTheme] = useState(false);
 
   // 1️⃣ Load saved theme and chat color on mount

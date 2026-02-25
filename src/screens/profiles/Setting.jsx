@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { View, Text, Image, Animated, TouchableOpacity, ScrollView, Alert, Button } from "react-native";
+import { View, Text, Image, Animated, TouchableOpacity, ScrollView, Alert, Button, Pressable } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Switch } from 'react-native-paper';
