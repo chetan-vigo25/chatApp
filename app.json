@@ -4,45 +4,64 @@
     "slug": "baatCheet",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "scheme": "baatcheet",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+
+    "icon": "./assets/icon.png",
     "splash": {
       "image": "./assets/icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+
+    "notification": {
+      "icon": "./assets/ic_notification.png",
+      "color": "#ffffff",
+      "iosDisplayInForeground": true
+    },
+
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chat.baatCheet",
       "infoPlist": {
-        "NSPhotoLibraryUsageDescription": "This app needs access to your photo library to pick media.",
-        "NSCameraUsageDescription": "This app needs access to your camera to take photos or videos.",
+        "NSCameraUsageDescription": "This app needs access to your camera to take photos and videos.",
+        "NSMicrophoneUsageDescription": "This app needs access to your microphone to record audio.",
+        "NSPhotoLibraryUsageDescription": "This app needs access to your photo library to select media.",
         "NSPhotoLibraryAddUsageDescription": "This app needs permission to save photos to your library."
       }
     },
+
     "android": {
+      "package": "com.chat.baatCheet",
       "googleServicesFile": "./google-services.json",
+      "edgeToEdgeEnabled": true,
+
       "permissions": [
         "CAMERA",
         "RECORD_AUDIO",
-        "ACCESS_FINE_LOCATION",
-        "android.permission.CAMERA",
-        "android.permission.RECORD_AUDIO"
+        "ACCESS_FINE_LOCATION"
       ],
+
+      "notification": {
+        "icon": "./assets/ic_notification.png",
+        "color": "#ffffff"
+      },
+
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
-      },
-      "edgeToEdgeEnabled": true,
-      "package": "com.chat.baatCheet"
+      }
     },
+
     "web": {
       "favicon": "./assets/favicon.png"
     },
+
     "plugins": [
       "expo-font",
       "expo-secure-store",
+      "expo-notifications",
       [
         "expo-camera",
         {

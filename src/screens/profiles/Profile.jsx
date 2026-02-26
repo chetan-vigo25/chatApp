@@ -54,7 +54,7 @@ export default function Profile({ navigation }) {
     const pickImage = async () => {
       const hasPermission = await requestPermission();
       if (!hasPermission) return;
-
+    
       try {
         const result = await ImagePicker.launchImageLibraryAsync({
           mediaTypes: ImagePicker.MediaTypeOptions.Images,
@@ -63,9 +63,13 @@ export default function Profile({ navigation }) {
           quality: 0.8,
           base64: false,
         });
-
+    
         if (!result.canceled && result.assets && result.assets.length > 0) {
-          setSelectedImage(result.assets[0].uri);
+          const uri = result.assets[0].uri;
+          setSelectedImage(uri);
+    
+          // 🔹 Immediately upload the selected image
+          await imageEdit(uri);
         }
       } catch (error) {
         console.error('Error picking image:', error);
@@ -79,16 +83,20 @@ export default function Profile({ navigation }) {
         Alert.alert('Permission needed', 'Sorry, we need camera permissions to make this work!');
         return;
       }
-
+    
       try {
         const result = await ImagePicker.launchCameraAsync({
           allowsEditing: true,
           aspect: [1, 1],
           quality: 0.8,
         });
-
+    
         if (!result.canceled && result.assets && result.assets.length > 0) {
-          setSelectedImage(result.assets[0].uri);
+          const uri = result.assets[0].uri;
+          setSelectedImage(uri);
+    
+          // 🔹 Immediately upload the captured photo
+          await imageEdit(uri);
         }
       } catch (error) {
         console.error('Error taking photo:', error);
@@ -118,47 +126,44 @@ export default function Profile({ navigation }) {
       );
     };
     
-    const imageEdit = async () => {
-      if (!selectedImage) {
+    const imageEdit = async (uri) => {
+      if (!uri) {
         showToast('No image selected');
         return;
       }
-
+    
       setLoader(true);
       try {
         let token = await AsyncStorage.getItem("accessToken");
         const myHeaders = new Headers();
         myHeaders.append("Authorization", "Bearer " + token);
-
+    
         const formData = new FormData();
-        
-        // Get file extension and mime type
-        const uriParts = selectedImage.split('.');
+        const uriParts = uri.split('.');
         const fileType = uriParts[uriParts.length - 1];
         const mimeType = fileType === 'jpg' || fileType === 'jpeg' ? 'image/jpeg' : 'image/png';
-
+    
         formData.append("file", {
-          uri: selectedImage,
+          uri,
           name: `profile.${fileType}`,
           type: mimeType,
         });
-
+    
         const requestOptions = {
           method: "POST",
           headers: myHeaders,
           body: formData,
         };
-
+    
         const response = await fetch(`${BACKEND_URL}user/profile/picture`, requestOptions);
         const result = await response.json();
-
+    
         if (result?.statusCode === 200) {
           showToast("Profile image updated");
           setLoader(false);
           dispatch(profileDetail());
-          setSelectedImage(null); // Clear selected image after successful upload
+          setSelectedImage(null); // Clear after successful upload
         } else {
-          console.error("Image upload failed with response:", result);
           const msg = result?.message || "Image upload failed";
           showToast(msg);
           setLoader(false);
@@ -334,28 +339,6 @@ export default function Profile({ navigation }) {
               </View>
             </View>
           </ScrollView>
-          
-          {selectedImage && (
-            <TouchableOpacity 
-              onPress={imageEdit} 
-              disabled={loader} 
-              style={{ 
-                opacity: loader ? 0.5 : 1, 
-                width: '80%', 
-                height: 50, 
-                alignSelf: "center", 
-                backgroundColor: theme.colors.themeColor, 
-                justifyContent: 'center', 
-                alignItems: 'center', 
-                borderRadius: 40, 
-                marginBottom: 20 
-              }}
-            >
-              <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 16, color: '#fff' }}>
-                {loader ? 'Uploading...' : 'Upload'}
-              </Text>
-            </TouchableOpacity>
-          )}
         </View>
       </Animated.View>
     );

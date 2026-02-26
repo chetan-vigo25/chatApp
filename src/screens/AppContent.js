@@ -33,20 +33,16 @@ export default function AppContent() {
 
   useEffect(() => {
     let isMounted = true;
-
     const initFCM = async () => {
       // 1️⃣ Setup Comment category for notifications
       await setupNotificationCategory();
-
       // 2️⃣ Get FCM token
       const token = await getFCMToken();
       if (token && isMounted) {
         console.log('FCM token ready for Backend:', token);
-      }
-
+      } 
       // 3️⃣ Initialize notifications (foreground + background + Comment button)
       const unsubscribe = initializeNotifications();
-
       return unsubscribe; // will be used in cleanup
     };
 

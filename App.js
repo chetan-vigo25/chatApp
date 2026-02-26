@@ -11,15 +11,11 @@ import {  getFCMToken, initializeNotifications, setupNotificationCategory } from
 
 // Register background FCM handler
 
-
-
-
 export default function App() {
   useEffect(() => {
-    setupNotificationCategory();
+    // setupNotificationCategory();
     getFCMToken();
     const unsubscribe = initializeNotifications();
-
     return () => unsubscribe();
   }, []); 
   return (
