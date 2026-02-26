@@ -146,25 +146,7 @@ export default function Setting ({ navigation }) {
                           <Ionicons name="color-palette-outline" size={20} color={theme.colors.primaryTextColor} />
                         </View>
                         <View style={{ width:"75%", flexDirection:'row', gap:10, }} >
-                          <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >Chat Color</Text>
-                        </View>
-                        <Entypo name="chevron-right" size={24} color={ theme.colors.placeHolderTextColor } />
-                      </TouchableOpacity>
-                      <View activeOpacity={0.9} style={{ width:'100%', height:40, flexDirection:'row', alignItems:'center', justifyContent:'space-between', borderBottomWidth:.4, borderBottomColor:theme.colors.borderColor, marginBottom:10 }} >
-                        <View style={{ width:30, height:30, justifyContent:"center", alignItems:'center', borderRadius:50, }} >
-                          <Ionicons name={isDarkMode ? "sunny-outline" : "moon-outline"} size={20} color={theme.colors.primaryTextColor} />
-                        </View>
-                        <View style={{ width:"68%", flexDirection:'row', gap:10, }} >
-                          <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >{isDarkMode ? "Light Mode" : "Dark Mode"}</Text>
-                        </View>
-                        <Switch value={isDarkMode} onValueChange={toggleTheme} trackColor={{ false: '#ccc', true: theme.colors.themeColor, }} thumbColor={isDarkMode ? '#fff' : '#fff'} />
-                      </View>
-                      <TouchableOpacity onPress={resetThemeToSystem} activeOpacity={0.9} style={{ width:'100%', height:40, flexDirection:'row', alignItems:'center', justifyContent:'space-between', borderBottomWidth:.4, borderBottomColor:theme.colors.borderColor, marginBottom:10 }} >
-                        <View style={{ width:30, height:30, justifyContent:"center", alignItems:'center', borderRadius:50, }} >
-                        <Ionicons name={isDarkMode ? "sunny-outline" : "moon-outline"} size={20} color={theme.colors.primaryTextColor} />
-                        </View>
-                        <View style={{ width:"75%", flexDirection:'row', gap:10, }} >
-                          <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >Use System Theme</Text>
+                          <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >Change Theme</Text>
                         </View>
                         <Entypo name="chevron-right" size={24} color={ theme.colors.placeHolderTextColor } />
                       </TouchableOpacity>

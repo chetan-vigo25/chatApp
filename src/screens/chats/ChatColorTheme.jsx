@@ -3,11 +3,12 @@ import { View, Text, FlatList, ScrollView, TouchableOpacity, Animated, Image, Te
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../../contexts/ThemeContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { RadioButton } from 'react-native-paper';
 
-import { FontAwesome6, Entypo } from '@expo/vector-icons';
+import { FontAwesome6, Entypo, Ionicons, FontAwesome } from '@expo/vector-icons';
 
 export default function ChatColorTheme({ navigation }) {
-    const { theme, updateChatColor, chatColor } = useTheme();
+    const { theme, updateChatColor, toggleTheme, isDarkMode, hasManualTheme, setTheme, resetThemeToSystem } = useTheme()
     const fadeAnim = useRef(new Animated.Value(0)).current;
     const [selectedColor, setSelectedColor] = useState(null);
 
@@ -69,8 +70,46 @@ export default function ChatColorTheme({ navigation }) {
                   </View>
               </View>
               <ScrollView showsVerticalScrollIndicator={false} style={{ flex:1, padding:20 }} >
+                <Text style={{ fontFamily:'Poppins-Medium', fontSize:16, color:theme.colors.placeHolderTextColor, marginBottom:10 }} >Display</Text>
+              <View style={{ width:'100%', marginBottom:20 }} >
+                <View style={{ width:'100%', height:40, flexDirection:'row', alignItems:'center', justifyContent:'space-between', marginBottom:10 }} >
+                  <View style={{ width:30, height:30, justifyContent:"center", alignItems:'center', borderRadius:50, }} >
+                    <FontAwesome name="gear" size={20} color={theme.colors.primaryTextColor} />
+                  </View>
+                  <View style={{flex:1, flexDirection:'row', justifyContent:'space-between', gap:0, paddingLeft:10 }} >
+                   <View>
+                      <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >Theme</Text>
+                      <Text style={{ fontFamily:'Poppins-Medium', fontSize:12, color:theme.colors.primaryTextColor }} >{isDarkMode? 'Dark': 'Light'}</Text>
+                   </View>
+                   <View style={{ }} >
+                    <RadioButton
+                      value="manual"
+                      status={hasManualTheme ? 'checked' : 'unchecked'}
+                      onPress={toggleTheme}
+                    />
+                   </View>
+                  </View>
+                </View>
+                <View style={{ width:'100%', height:40, flexDirection:'row', alignItems:'center', justifyContent:'space-between', marginBottom:10 }} >
+                  <View style={{ width:30, height:30, justifyContent:"center", alignItems:'center', borderRadius:50, }} >
+                    <Ionicons name="color-palette-outline" size={20} color={theme.colors.primaryTextColor} />
+                  </View>
+                  <View style={{flex:1, flexDirection:'row', justifyContent:'space-between', alignItems:'center', gap:0, paddingLeft:10 }} >
+                   <View>
+                      <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >Use System Theme</Text>
+                   </View>
+                   <View style={{ }}>
+                    <RadioButton
+                      value="system"
+                      status={!hasManualTheme ? 'checked' : 'unchecked'}
+                      onPress={resetThemeToSystem}
+                    />
+                   </View>
+                  </View>
+                </View>
+              </View>
+              <Text style={{ fontFamily:'Poppins-Medium', fontSize:16, color:theme.colors.placeHolderTextColor, marginBottom:10 }} >Chat Colors</Text>
                 <View style={{ flexDirection:'row', gap:10, flexWrap:'wrap', justifyContent:"flex-start", alignItems:'center', }} >
-                  {/* <View style={{ width:80, height:120, borderRadius:5, borderColor:theme.colors.borderColor, borderWidth:1, justifyContent:'center', alignItems:'center' }} ></View> */}
                   {
                      colors.map((color, index) => {
                          const isSelected = selectedColor === color;

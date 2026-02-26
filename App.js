@@ -13,11 +13,21 @@ import {  getFCMToken, initializeNotifications, setupNotificationCategory } from
 
 export default function App() {
   useEffect(() => {
-    // setupNotificationCategory();
-    getFCMToken();
-    const unsubscribe = initializeNotifications();
-    return () => unsubscribe();
-  }, []); 
+    const setup = async () => {
+      const token = await getFCMToken();
+      console.log('Device FCM token ready:', token);
+
+      const unsubscribe = initializeNotifications();
+      return unsubscribe;
+    };
+
+    let cleanup;
+    setup().then(unsub => {
+      cleanup = unsub;
+    });
+
+    return () => cleanup && cleanup();
+  }, []);
   return (
     <ThemeProvider>
       <NetworkProvider>
