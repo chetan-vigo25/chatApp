@@ -6,7 +6,7 @@ import { useDispatch, useSelector } from "react-redux";
 import { chatListData } from "../../Redux/Reducer/Chat/Chat.reducer";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { useFocusEffect } from '@react-navigation/native';
-import { FontAwesome6, AntDesign, MaterialCommunityIcons } from '@expo/vector-icons';
+import { FontAwesome6, AntDesign, MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 
 export default function ChatList({ navigation }) {
@@ -19,6 +19,11 @@ export default function ChatList({ navigation }) {
   const [menuKey, setMenuKey] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [, setTimeTick] = useState(0);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filteredChats, setFilteredChats] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
 
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedChatItem, setSelectedChatItem] = useState(null);
@@ -34,9 +39,30 @@ export default function ChatList({ navigation }) {
     }
   }, []);
 
+  // Update filtered chats when effectiveChatList or searchQuery changes
+  useEffect(() => {
+    if (effectiveChatList.length > 0) {
+      if (searchQuery.trim() === "") {
+        setFilteredChats(effectiveChatList);
+        setIsSearching(false);
+      } else {
+        const query = searchQuery.toLowerCase().trim();
+        const filtered = effectiveChatList.filter(item => {
+          const fullName = item.peerUser?.fullName?.toLowerCase() || "";
+          const lastMessage = getLastMessageText(item).toLowerCase();
+          return fullName.includes(query) || lastMessage.includes(query);
+        });
+        setFilteredChats(filtered);
+        setIsSearching(true);
+      }
+    } else {
+      setFilteredChats([]);
+    }
+  }, [searchQuery, effectiveChatList]);
+
   const listOrderSignature = useMemo(
-    () => (effectiveChatList || []).map((item) => item?.chatId || item?._id).filter(Boolean).join('|'),
-    [effectiveChatList]
+    () => (filteredChats || []).map((item) => item?.chatId || item?._id).filter(Boolean).join('|'),
+    [filteredChats]
   );
 
   useEffect(() => {
@@ -75,6 +101,7 @@ export default function ChatList({ navigation }) {
     setRefreshing(true);
     try {
       await dispatch(chatListData(""));
+      setSearchQuery(""); // Clear search on refresh
     } catch (err) {
       console.warn("Failed to refresh chats:", err);
     } finally {
@@ -82,10 +109,15 @@ export default function ChatList({ navigation }) {
     }
   };
 
+  // Clear search
+  const clearSearch = () => {
+    setSearchQuery("");
+  };
+
   const getPreviewText = (text, maxLength = 20) => {
     if (!text) return "";
     if (text.length <= maxLength) return text;
-    return text.substring(0, maxLength) + " ";
+    return text.substring(0, maxLength) + "... ";
   };
 
   const getRelativeTime = (value) => {
@@ -190,6 +222,58 @@ export default function ChatList({ navigation }) {
     setSelectedChatItem(null);
   }
 
+  // Render empty state based on whether searching or not
+  const renderEmptyComponent = () => {
+    if (isSearching) {
+      return (
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20, marginTop: 50 }}>
+          <Ionicons name="search-outline" size={60} color={theme.colors.placeHolderTextColor} />
+          <Text style={{ 
+            fontSize: 16, 
+            fontFamily: 'Poppins-Medium', 
+            color: theme.colors.placeHolderTextColor,
+            textAlign: 'center',
+            marginTop: 20
+          }}>
+            No chats found for "{searchQuery}"
+          </Text>
+          <TouchableOpacity 
+            onPress={clearSearch}
+            style={{ 
+              marginTop: 20, 
+              paddingHorizontal: 20, 
+              paddingVertical: 10, 
+              backgroundColor: theme.colors.themeColor,
+              borderRadius: 20
+            }}
+          >
+            <Text style={{ color: theme.colors.textWhite, fontFamily: 'Poppins-Medium' }}>
+              Clear Search
+            </Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 }} >
+        <View style={{ width: 80, height: 80 }} >
+          <Image source={require('../../../assets/images/chat-msg.png')} resizeMode="contain" style={{ width: '100%', height: '100%' }} />
+        </View>
+        <View style={{ marginTop: 40 }} >
+          <Text style={{ fontSize: 18, fontFamily: 'Poppins-SemiBold', color: theme.colors.primaryTextColor }} >
+            It's boring without friends!
+          </Text>
+        </View>
+        <View style={{ marginTop: 40, paddingHorizontal: 40 }} >
+          <Text style={{ fontSize: 18, fontFamily: 'Poppins-Medium', color: theme.colors.borderColor, textAlign: 'center' }} >
+            Share your profile now to send anonymous messages to your friends😊 
+          </Text>
+        </View>
+      </View>
+    );
+  };
+
   const renderChatListItem = ({ item }) => (
     <TouchableOpacity
       onPress={() => handleModal(item)}
@@ -210,9 +294,9 @@ export default function ChatList({ navigation }) {
         {item.peerUser?.profileImage ? (
           <View>
             <Image resizeMode="cover" source={{ uri: item.peerUser?.profileImage }} style={{ width:50, height:50, borderRadius:100 }} />
-            {!!item?.realtime?.presence?.status && (
+            {/* {!!item?.realtime?.presence?.status && (
               <View style={{ position:'absolute', right:1, bottom:1, width:12, height:12, borderRadius:6, backgroundColor:getPresenceDotColor(item?.realtime?.presence?.status), borderWidth:1.5, borderColor:theme.colors.background }} />
-            )}
+            )} */}
           </View>
         ) : (
           <View>
@@ -287,23 +371,56 @@ export default function ChatList({ navigation }) {
           </Menu>
         </View>
 
-        {/* Search & Chat List */}
+        {/* Search Bar */}
+        <View style={{ paddingHorizontal: 10, paddingTop: 10 }}>
+          <View style={{ 
+            flexDirection: 'row', 
+            alignItems: 'center', 
+            backgroundColor: theme.colors.menuBackground, 
+            borderRadius: 25,
+            paddingHorizontal: 15,
+            paddingVertical: Platform.OS === 'ios' ? 8 : 4,
+            borderWidth: 1,
+            borderColor: theme.colors.borderColor
+          }}>
+            <Ionicons name="search" size={20} color={theme.colors.placeHolderTextColor} />
+            <TextInput
+              placeholder="Search chats..."
+              placeholderTextColor={theme.colors.placeHolderTextColor}
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              style={{
+                flex: 1,
+                marginLeft: 10,
+                fontSize: 14,
+                color: theme.colors.primaryTextColor,
+                fontFamily: 'Poppins-Regular',
+                paddingVertical: 8
+              }}
+            />
+            {searchQuery.length > 0 && (
+              <TouchableOpacity onPress={clearSearch}>
+                <Ionicons name="close-circle" size={20} color={theme.colors.placeHolderTextColor} />
+              </TouchableOpacity>
+            )}
+          </View>
+        </View>
+
+        {/* Chat List */}
         <View style={{ flex:1, alignItems:'center', padding:10 }}>
-          {/* <TextInput placeholder="Search" placeholderTextColor={theme.colors.placeHolderTextColor} style={{ backgroundColor:theme.colors.menuBackground, borderRadius:50, width:'100%', padding:14, fontSize:12, marginBottom:10 }} /> */}
-          {isLoading ? (
-            <ActivityIndicator size="large" color={theme.colors.themeColor} />
+          {isLoading && effectiveChatList.length === 0 ? (
+            <ActivityIndicator size="large" color={theme.colors.themeColor} style={{ marginTop: 50 }} />
           ) : (
             <FlatList
-              data={effectiveChatList}
+              data={filteredChats}
               keyExtractor={(item) => String(item?.chatId || item?._id)}
               renderItem={renderChatListItem}
               showsVerticalScrollIndicator={false}
               refreshControl={
                 <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} colors={[theme.colors.themeColor]} />
               }
-              ListEmptyComponent={() => (
-                <View style={{ flex:1, justifyContent:'center', alignItems:'center', padding:20 }} />
-              )}
+              ListEmptyComponent={renderEmptyComponent}
+              contentContainerStyle={{ flexGrow: 1 }}
             />
           )}
         </View>

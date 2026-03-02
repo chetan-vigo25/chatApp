@@ -14,9 +14,9 @@ import { ImageProvider } from './src/contexts/ImageProvider';
 import { PresenceProvider } from './src/presence/store/PresenceContext';
 import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
+import { AuthProvider } from './src/contexts/AuthContext';
 import {  getFCMToken, initializeNotifications, setupNotificationCategory } from './src/firebase/fcmService';
 import 'react-native-get-random-values';
-
 import NoInternet from './src/screens/NoInternet';
 
 import 'react-native-gesture-handler';
@@ -31,7 +31,7 @@ export default function App() {
          const token = await getFCMToken();
          if (token) {
            await AsyncStorage.setItem('fcmToken', token);
-           console.log('Device FCM token saved:', token);
+          //  console.log('Device FCM token saved:', token);
          }
          cleanup = initializeNotifications();
        } catch (error) {
@@ -54,7 +54,9 @@ export default function App() {
              <DeviceLocationProvider>
                 <PresenceProvider>
                   <RealtimeChatProvider>
-                    <AppContent />
+                    <AuthProvider>
+                      <AppContent />
+                    </AuthProvider>
                   </RealtimeChatProvider>
                 </PresenceProvider>
              </DeviceLocationProvider>

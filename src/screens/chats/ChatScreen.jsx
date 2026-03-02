@@ -298,7 +298,7 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   const renderChatsItem = ({ item: msg, index }) => {
-    console.log("Rendering message:", { msg, index });
+    // console.log("Rendering message:", { msg, index });
 
     const messageKey = getMessageKey(msg);
     const isSelected = selectedMessage.some(sel => sameId(sel, messageKey));
@@ -343,7 +343,7 @@ export default function ChatScreen({ navigation, route }) {
             justifyContent: "flex-end", 
             backgroundColor: isDeletedMessage
               ? theme.colors.menuBackground
-              : (isMyMessage ? chatColor : '#bbbbbb'), 
+              : (isMyMessage ? chatColor : '#999'), 
             borderBottomRightRadius: isMyMessage ? 4 : 20, 
             borderBottomLeftRadius: isMyMessage ? 20 : 4, 
             paddingVertical: 6, 
@@ -387,7 +387,7 @@ export default function ChatScreen({ navigation, route }) {
                     return (
                       <View style={{ 
                         width: 160, 
-                        height: 120, 
+                        height: 220, 
                         borderRadius: 8, 
                         backgroundColor: '#e1e1e1', 
                         alignItems: 'center', 
@@ -405,7 +405,7 @@ export default function ChatScreen({ navigation, route }) {
                   return (
                     <Image 
                       source={{ uri: imageSource }} 
-                      style={{ width: 160, height: 120, borderRadius: 8, marginBottom: 6 }}
+                      style={{ width: 200, height: 220, borderRadius: 8, marginBottom: 6 }}
                       onError={(e) => {
                         console.log('❌ Image load error:', imageSource);
                         // If local file fails, try payload
@@ -429,7 +429,7 @@ export default function ChatScreen({ navigation, route }) {
                       <TouchableOpacity onPress={() => handleDownloadMedia(msg)}>
                         <Image 
                           source={{ uri: imageSrc }} 
-                          style={{ width: 160, height: 120, borderRadius: 8, marginBottom: 6 }} 
+                          style={{ width: 200, height: 220, borderRadius: 8, marginBottom: 6 }} 
                           onError={(e) => console.error('Image load error:', imageSrc)}
                         />
                       </TouchableOpacity>
@@ -442,8 +442,8 @@ export default function ChatScreen({ navigation, route }) {
                       <TouchableOpacity 
                         onPress={() => handleDownloadMedia(msg)} 
                         style={{ 
-                          width: 160, 
-                          height: 120, 
+                          width: 200, 
+                          height: 220, 
                           borderRadius: 8, 
                           backgroundColor: theme.colors.menuBackground,
                           alignItems: 'center', 
@@ -475,8 +475,8 @@ export default function ChatScreen({ navigation, route }) {
                     <TouchableOpacity 
                       onPress={() => handleDownloadMedia(msg)} 
                       style={{ 
-                        width: 160, 
-                        height: 120, 
+                        width: 200, 
+                        height: 220, 
                         borderRadius: 8, 
                         overflow: 'hidden', 
                         marginBottom: 6 
@@ -807,27 +807,13 @@ export default function ChatScreen({ navigation, route }) {
     if (!isPeerTyping) return null;
     return (
       <View style={{ alignItems: "flex-start", paddingVertical: 5, paddingHorizontal: 12 }}>
-        <View style={{ 
-          borderRadius: 20, 
-          flexDirection: 'row', 
-          alignItems: "center", 
-          gap: 8, 
-          backgroundColor: '#bbbbbb', 
-          borderBottomLeftRadius: 4, 
-          paddingVertical: 10, 
-          paddingHorizontal: 15 
-        }}>
+        <View style={{ borderRadius: 20, flexDirection: 'row', alignItems: "center", gap: 8, backgroundColor: '#bbbbbb', borderBottomLeftRadius: 4, paddingVertical: 10, paddingHorizontal: 15 }}>
           <View style={{ flexDirection: 'row', gap: 4 }}>
             <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#fff', opacity: 0.6 }} />
             <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#fff', opacity: 0.8 }} />
             <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#fff' }} />
           </View>
-          <Text style={{ 
-            fontSize: 14, 
-            color: theme.colors.textWhite, 
-            fontFamily: "Poppins-Medium", 
-            fontStyle: 'italic' 
-          }}>
+          <Text style={{ fontSize: 14, color: theme.colors.textWhite, fontFamily: "Poppins-Medium", fontStyle: 'italic' }}>
             typing...
           </Text>
         </View>
@@ -958,7 +944,7 @@ export default function ChatScreen({ navigation, route }) {
             showsVerticalScrollIndicator={false} 
             
             // FIXED: Use renderHeader for typing indicator
-            ListFooterComponent={renderHeader}
+            // ListFooterComponent={renderHeader}
             onEndReached={!isSearching ? loadMoreMessages : undefined} 
             onEndReachedThreshold={0.1} 
             
@@ -968,14 +954,14 @@ export default function ChatScreen({ navigation, route }) {
             viewabilityConfig={viewabilityConfig}
             
             refreshControl={
-              isAtTop ? (
+              // isAtTop ? (
                 <RefreshControl 
                   refreshing={isRefreshing} 
                   onRefresh={onRefresh} 
                   tintColor={theme.colors.themeColor} 
                   colors={[theme.colors.themeColor]} 
                 />
-              ) : undefined
+              // ) : undefined
             }
             
             removeClippedSubviews={false} 
@@ -993,24 +979,8 @@ export default function ChatScreen({ navigation, route }) {
         {isManualReloading && (
           <View
             pointerEvents="none"
-            style={{
-              position: 'absolute',
-              top: 74,
-              left: 0,
-              right: 0,
-              alignItems: 'center',
-            }}
-          >
-            <View style={{
-              flexDirection: 'row',
-              alignItems: 'center',
-              backgroundColor: theme.colors.menuBackground,
-              borderRadius: 16,
-              paddingHorizontal: 12,
-              paddingVertical: 8,
-              borderWidth: 1,
-              borderColor: theme.colors.borderColor,
-            }}>
+            style={{ position: 'absolute', top: 74, left: 0, right: 0, alignItems: 'center', }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: theme.colors.menuBackground, borderRadius: 16, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: theme.colors.borderColor, }}>
               <ActivityIndicator size="small" color={theme.colors.themeColor} />
               <Text style={{ marginLeft: 8, color: theme.colors.primaryTextColor, fontSize: 12 }}>Reloading messages...</Text>
             </View>
@@ -1020,34 +990,10 @@ export default function ChatScreen({ navigation, route }) {
         {showScrollButton && (
           <TouchableOpacity
             onPress={handleScrollToLatest}
-            style={{
-              position: 'absolute',
-              right: 16,
-              bottom: 78,
-              width: 44,
-              height: 44,
-              borderRadius: 22,
-              backgroundColor: theme.colors.menuBackground,
-              alignItems: 'center',
-              justifyContent: 'center',
-              borderWidth: 1,
-              borderColor: theme.colors.borderColor,
-            }}
-          >
+            style={{ position: 'absolute', right: 16, bottom: 78, width: 44, height: 44, borderRadius: 22, backgroundColor: theme.colors.menuBackground, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: theme.colors.borderColor, }} >
             <Ionicons name="arrow-down" size={20} color={theme.colors.primaryTextColor} />
             {newMessagesCount > 0 && (
-              <View style={{
-                position: 'absolute',
-                top: -6,
-                right: -4,
-                minWidth: 18,
-                height: 18,
-                borderRadius: 9,
-                backgroundColor: theme.colors.themeColor,
-                alignItems: 'center',
-                justifyContent: 'center',
-                paddingHorizontal: 4,
-              }}>
+              <View style={{ position: 'absolute', top: -6, right: -4, minWidth: 18, height: 18, borderRadius: 9, backgroundColor: theme.colors.themeColor, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4, }}>
                 <Text style={{ fontSize: 10, color: theme.colors.textWhite, fontFamily: 'Poppins-Medium' }}>
                   {newMessagesCount > 99 ? '99+' : newMessagesCount}
                 </Text>
@@ -1057,7 +1003,7 @@ export default function ChatScreen({ navigation, route }) {
         )}
 
         {/* Input Bar */}
-        <View style={{ flexDirection: "row", padding: 10, alignItems: "center", marginBottom: 0, borderTopWidth: 1, borderTopColor: theme.colors.borderColor }}>
+        <View style={{ flexDirection: "row", padding: 10, alignItems: "center", marginBottom: 0, borderTopWidth: 0, borderTopColor: theme.colors.borderColor }}>
           <View style={{ flex: 1, flexDirection: "row", alignItems: "center", backgroundColor: theme.colors.menuBackground, borderRadius: 40, borderWidth: 1, borderColor: theme.colors.borderColor, paddingHorizontal: 12, paddingVertical: Platform.OS === "ios" ? 8 : 4, marginRight: 10 }}>
             {pendingMedia ? (
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 }}>
@@ -1079,16 +1025,7 @@ export default function ChatScreen({ navigation, route }) {
                 textAlignVertical="top" 
                 placeholderTextColor={theme.colors.placeHolderTextColor} 
                 editable={!isSearching} 
-                style={{
-                  flex: 1,
-                  fontSize: 14,
-                  color: theme.colors.primaryTextColor,
-                  fontFamily: "Poppins-Regular",
-                  minHeight: 34,
-                  maxHeight: 90,
-                  height: inputHeight,
-                }} 
-              />
+                style={{ flex: 1, fontSize: 14, color: theme.colors.primaryTextColor, fontFamily: "Poppins-Regular", minHeight: 34, maxHeight: 90, height: inputHeight, }}  />
             )}
             <TouchableOpacity
               onPress={openMediaOptions}
@@ -1107,13 +1044,9 @@ export default function ChatScreen({ navigation, route }) {
               }
             }} 
             disabled={(!text.trim() && !pendingMedia) || isSearching} 
-            style={{ 
-              width: 48, 
-              height: 48, 
-              borderRadius: 24, 
+            style={{ width: 48, height: 48, borderRadius: 24, 
               backgroundColor: ((!text.trim() && !pendingMedia) || isSearching) ? theme.colors.menuBackground : (chatColor || theme.colors.themeColor), 
-              alignItems: "center", 
-              justifyContent: "center", 
+              alignItems: "center",  justifyContent: "center", 
               opacity: ((!text.trim() && !pendingMedia) || isSearching) ? 0.5 : 1 
             }}>
             {text.trim() || pendingMedia ? (
@@ -1130,18 +1063,7 @@ export default function ChatScreen({ navigation, route }) {
             onPress={() => setShowMenu(false)}
             style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.15)' }}
           >
-            <View style={{
-              marginTop: 84,
-              marginRight: 12,
-              marginLeft: 100,
-              backgroundColor: theme.colors.background,
-              borderRadius: 10,
-              borderWidth: 1,
-              borderColor: theme.colors.borderColor,
-              overflow: 'hidden',
-              alignSelf: 'flex-end',
-              minWidth: 210,
-            }}>
+            <View style={{ marginTop: 84, marginRight: 12, marginLeft: 100, backgroundColor: theme.colors.background, borderRadius: 10, borderWidth: 1, borderColor: theme.colors.borderColor, overflow: 'hidden', alignSelf: 'flex-end', minWidth: 210, }}>
               <TouchableOpacity onPress={handleToggleSearchBar} style={{ paddingVertical: 12, paddingHorizontal: 14 }}>
                 <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>🔍 Search</Text>
               </TouchableOpacity>

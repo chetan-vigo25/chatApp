@@ -7,20 +7,17 @@
     "scheme": "baatcheet",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
-
     "icon": "./assets/icon.png",
     "splash": {
       "image": "./assets/icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
-
     "notification": {
       "icon": "./assets/ic_notification.png",
       "color": "#ffffff",
       "iosDisplayInForeground": true
     },
-
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chat.baatCheet",
@@ -32,37 +29,40 @@
         "NSPhotoLibraryAddUsageDescription": "This app needs permission to save photos to your library."
       }
     },
-
     "android": {
       "package": "com.chat.baatCheet",
       "googleServicesFile": "./google-services.json",
       "edgeToEdgeEnabled": true,
-
       "permissions": [
         "CAMERA",
         "RECORD_AUDIO",
-        "ACCESS_FINE_LOCATION"
+        "ACCESS_FINE_LOCATION",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "CAMERA",
+        "RECORD_AUDIO",
+        "ACCESS_FINE_LOCATION",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
       ],
-
       "notification": {
         "icon": "./assets/ic_notification.png",
         "color": "#ffffff"
       },
-
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       }
     },
-
     "web": {
       "favicon": "./assets/favicon.png"
     },
-
     "plugins": [
       "expo-font",
       "expo-secure-store",
       "expo-notifications",
+      "@react-native-firebase/app",
+      "@react-native-firebase/messaging",
       [
         "expo-camera",
         {
@@ -71,6 +71,17 @@
           "recordAudioAndroid": true
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "499f98f8-2c96-4c91-bd66-f52356fa0ad3"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/499f98f8-2c96-4c91-bd66-f52356fa0ad3"
+    }
   }
 }

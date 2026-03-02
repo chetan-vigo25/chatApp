@@ -8,6 +8,7 @@ import { useDispatch, useSelector } from "react-redux";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { logout } from "../../Redux/Reducer/Auth/Auth.reducer";
 import { getSocket } from "../../Redux/Services/Socket/socket";
+import { useAuth } from "../../contexts/AuthContext";
 
 
 import { Entypo, AntDesign, Ionicons, FontAwesome6, MaterialCommunityIcons } from '@expo/vector-icons';
@@ -16,6 +17,7 @@ export default function Setting ({ navigation }) {
     const { theme, toggleTheme, isDarkMode, hasManualTheme, setTheme, resetThemeToSystem } = useTheme()
     const fadeAnim = useRef(new Animated.Value(0)).current;
     const dispatch = useDispatch();
+    const { logout: authLogout } = useAuth();
     const { profileData, isLoading, error } = useSelector(state => state.profile);
  
     useEffect(() => {
@@ -36,33 +38,29 @@ export default function Setting ({ navigation }) {
       return parts.map((p) => p.charAt(0).toUpperCase()).join("");
     }
 
-    const handleLogout = async () => {
+       const handleLogout = async () => {
       try {
-        const socket = getSocket(); // Get the socket instance
-        if (socket) {
+        const socket = getSocket();
+        if (socket && socket.connected) {
           socket.emit('logout:all', { force: true });
-          console.log("🔐 Emitting logout:all to the server");
-          await AsyncStorage.removeItem('accessToken');
-          // await resetChatColor();
-          console.log("User session cleared.");
-          socket.disconnect();
-          console.log("Socket disconnected.");
-          navigation.reset({
-            index: 0,
-            routes: [{ name: "Login" }],
-          });
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
+        
+        // Use authLogout from AuthContext
+        await authLogout();
+        
         // Dispatch logout action to update Redux state
         dispatch(logout());
+        
+        // Navigate to Login
         navigation.reset({
           index: 0,
           routes: [{ name: "Login" }],
         });
-        // Optionally, show a confirmation alert
-        console.log("Logged out", "You have been logged out from all devices.");
+        
+        console.log("✅ Logged out successfully");
       } catch (error) {
-        console.error("Error logging out:", error);
-        // Optionally handle error (e.g., show an alert)
+        console.error("❌ Error logging out:", error);
         Alert.alert("Error", "An error occurred while logging out. Please try again.");
       }
     };
@@ -114,15 +112,6 @@ export default function Setting ({ navigation }) {
                       </View>
                     </View>
                     <View style={{ width:'100%', padding:15, backgroundColor: theme.colors.cardBackground, borderRadius:6, elevation:2,}} >
-                      <TouchableOpacity activeOpacity={0.9} style={{ width:'100%', height:40, flexDirection:'row', alignItems:'center', justifyContent:'space-between', borderBottomWidth:.4, borderBottomColor:theme.colors.borderColor, marginBottom:10 }} >
-                        <View style={{ width:30, height:30, justifyContent:"center", alignItems:'center', borderRadius:50, }} >
-                          <Ionicons name="key-outline" size={20} color={theme.colors.primaryTextColor} />
-                        </View>
-                        <View style={{ width:"75%", flexDirection:'row', gap:10, }} >
-                          <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:14, color:theme.colors.primaryTextColor }} >Change Password</Text>
-                        </View>
-                        <Entypo name="chevron-right" size={24} color={ theme.colors.placeHolderTextColor } />
-                      </TouchableOpacity>
                       <TouchableOpacity onPress={()=> navigation.navigate('Privacy')} activeOpacity={0.9} style={{ width:'100%', height:40, flexDirection:'row', alignItems:'center', justifyContent:'space-between', borderBottomWidth:.4, borderBottomColor:theme.colors.borderColor, marginBottom:10 }} >
                         <View style={{ width:30, height:30, justifyContent:"center", alignItems:'center', borderRadius:50, }} >
                           <MaterialCommunityIcons name="security" size={20} color={theme.colors.primaryTextColor} />

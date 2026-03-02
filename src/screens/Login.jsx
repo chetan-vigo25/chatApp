@@ -97,7 +97,7 @@ export default function Login({ navigation }) {
           </View>
           <View style={{ flex:1, justifyContent:'center', alignItems:'flex-start', borderBottomWidth:1.5, borderColor:theme.colors.themeColor, }} >
             <TextInput
-              style={{ letterSpacing:2, fontFamily: 'Poppins-SemiBold', fontSize: 14, color: theme.colors.placeHolderTextColor, paddingVertical:0, }}
+              style={{ letterSpacing:1, fontFamily: 'Poppins-SemiBold', fontSize: 14, color: theme.colors.placeHolderTextColor, paddingVertical:0, }}
               placeholder="Phone Number"
               value={phoneNumber}
               onChangeText={setPhoneNumber}

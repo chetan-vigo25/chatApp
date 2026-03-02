@@ -1,9 +1,11 @@
-import React, { useRef } from "react";
+// src/navigations/RootNavigator.js
+import React, { useEffect, useState } from "react";
 import { NavigationContainer } from "@react-navigation/native";
 import { createStackNavigator } from "@react-navigation/stack";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { TransitionPresets } from '@react-navigation/stack';
 import { navigationRef } from "../Redux/Services/navigationService";
+import { ActivityIndicator, View } from "react-native";
 
 import Splash from "../screens/Splash";
 import UserAgree from "../screens/UserAgree";
@@ -31,18 +33,69 @@ import SessionsScreen from "../screens/presence/SessionsScreen";
 import PrivacySettingsScreen from "../screens/presence/PrivacySettingsScreen";
 
 import { useTheme } from "../contexts/ThemeContext";
+import { useAuth } from "../contexts/AuthContext";
 
 const Stack = createStackNavigator();
 
+function AppNavigator() {
+  const { theme } = useTheme();
+  const { isAuthenticated, isLoading } = useAuth();
+
+  if (isLoading) {
+    return (
+      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: theme.colors.background }}>
+        <ActivityIndicator size="large" color={theme.colors.primary} />
+      </View>
+    );
+  }
+
+  return (
+    <Stack.Navigator
+      screenOptions={{
+        headerShown: false,
+        cardStyle: { backgroundColor: theme.colors.background },
+        gestureEnabled: true,
+        gestureResponseDistance: 50,
+        ...TransitionPresets.SlideFromRightIOS,
+      }}
+      initialRouteName={isAuthenticated ? "ChatList" : "Splash"}
+    >
+      <Stack.Screen name="Splash" component={Splash} />
+      <Stack.Screen name="UserAgree" component={UserAgree} />
+      <Stack.Screen name="Login" component={Login} />
+      <Stack.Screen name="Otp" component={Otp} />
+      <Stack.Screen name="ChatList" component={ChatList} />
+      <Stack.Screen name="ChatScreen" component={ChatScreen} />
+      <Stack.Screen name="AddUser" component={AddUser} />
+      <Stack.Screen name="Profile" component={Profile} />
+      <Stack.Screen name="NoInternet" component={NoInternet} />
+      <Stack.Screen name="LinkDevice" component={LinkDevice} />
+      <Stack.Screen name="Test" component={Test} />
+      <Stack.Screen name="Privacy" component={Privacy} />
+      <Stack.Screen name="Term" component={Term} />
+      <Stack.Screen name="EditProfile" component={EditProfile} />
+      <Stack.Screen name="PersonalInfoEdit" component={PersonalInfoEdit} />
+      <Stack.Screen name="Setting" component={Setting} />
+      <Stack.Screen name="UserB" component={UserB} />
+      <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
+      <Stack.Screen name="AddNewContact" component={AddNewContact} />
+      <Stack.Screen name="StatusScreen" component={StatusScreen} />
+      <Stack.Screen name="ContactsPresenceScreen" component={ContactsPresenceScreen} />
+      <Stack.Screen name="SessionsScreen" component={SessionsScreen} />
+      <Stack.Screen name="PrivacySettingsScreen" component={PrivacySettingsScreen} />
+    </Stack.Navigator>
+  );
+}
+
 export default function RootNavigator() {
   const { theme } = useTheme();
-  
+
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }}>
-      <NavigationContainer 
+      <NavigationContainer
         ref={navigationRef}
         theme={{
-          dark: false, // We handle dark mode through our custom theme
+          dark: false,
           colors: {
             primary: theme.colors.primary,
             background: theme.colors.background,
@@ -53,64 +106,7 @@ export default function RootNavigator() {
           },
         }}
       >
-        <Stack.Navigator 
-          screenOptions={{ 
-            headerShown: false,
-            cardStyle: { backgroundColor: theme.colors.background },
-            gestureEnabled: true,
-            gestureResponseDistance: 50,
-            ...TransitionPresets.SlideFromRightIOS,
-            transitionSpec: {
-              open: {
-                animation: 'spring',
-                config: {
-                  damping: 80,
-                  stiffness: 500,
-                  mass: 3,
-                  overshootClamping: false,
-                  restDisplacementThreshold: 0.01,
-                  restSpeedThreshold: 0.01,
-                }
-              },
-              close: {
-                animation: 'spring',
-                config: {
-                  damping: 80,
-                  stiffness: 500,
-                  mass: 3,
-                  overshootClamping: false,
-                  restDisplacementThreshold: 0.01,
-                  restSpeedThreshold: 0.01,
-                }
-              }
-            }
-          }}
-          initialRouteName="Splash"
-        >
-          <Stack.Screen name="Splash" component={Splash} />
-          <Stack.Screen name="UserAgree" component={UserAgree} />
-          <Stack.Screen name="Login" component={Login} />
-          <Stack.Screen name="Otp" component={Otp} />
-          <Stack.Screen name="ChatList" component={ChatList} />
-          <Stack.Screen name="ChatScreen" component={ChatScreen} />
-          <Stack.Screen name="AddUser" component={AddUser} />
-          <Stack.Screen name="Profile" component={Profile} />
-          <Stack.Screen name="NoInternet" component={NoInternet} />
-          <Stack.Screen name="LinkDevice" component={LinkDevice} />
-          <Stack.Screen name="Test" component={Test} />
-          <Stack.Screen name="Privacy" component={Privacy} />
-          <Stack.Screen name="Term" component={Term} />
-          <Stack.Screen name="EditProfile" component={EditProfile} />
-          <Stack.Screen name="PersonalInfoEdit" component={PersonalInfoEdit} />
-          <Stack.Screen name="Setting" component={Setting} />
-          <Stack.Screen name="UserB" component={UserB} />
-          <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
-          <Stack.Screen name="AddNewContact" component={AddNewContact} />
-          <Stack.Screen name="StatusScreen" component={StatusScreen} />
-          <Stack.Screen name="ContactsPresenceScreen" component={ContactsPresenceScreen} />
-          <Stack.Screen name="SessionsScreen" component={SessionsScreen} />
-          <Stack.Screen name="PrivacySettingsScreen" component={PrivacySettingsScreen} />
-        </Stack.Navigator>
+        <AppNavigator />
       </NavigationContainer>
     </SafeAreaView>
   );

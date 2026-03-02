@@ -11,6 +11,12 @@ let sessionId = '';
 let deviceId = '';
 let isAuthenticating = false;
 let appState = AppState.currentState;
+let navigationRef = null;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let isInitialized = false;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAY = 2000;
 
 // ============================================
 // 📱 DEVICE INFO HELPERS
@@ -28,7 +34,7 @@ const getAccessToken = async () => {
   try {
     return await AsyncStorage.getItem("accessToken");
   } catch (error) {
-    console.error("�� Error getting access token:", error);
+    console.error("❌ Error getting access token:", error);
     return null;
   }
 };
@@ -51,10 +57,24 @@ const getDeviceId = async () => {
   }
 };
 
+const getUserData = async () => {
+  try {
+    const userData = await AsyncStorage.getItem("userData");
+    return userData ? JSON.parse(userData) : null;
+  } catch (error) {
+    console.error("❌ Error getting user data:", error);
+    return null;
+  }
+};
+
 const saveTokens = async (accessToken, refreshTokenHash) => {
   try {
-    await AsyncStorage.setItem("accessToken", accessToken);
-    await AsyncStorage.setItem("refreshToken", refreshTokenHash);
+    if (accessToken) {
+      await AsyncStorage.setItem("accessToken", accessToken);
+    }
+    if (refreshTokenHash) {
+      await AsyncStorage.setItem("refreshToken", refreshTokenHash);
+    }
     console.log("✅ Tokens saved successfully");
   } catch (error) {
     console.error("❌ Error saving tokens:", error);
@@ -64,32 +84,42 @@ const saveTokens = async (accessToken, refreshTokenHash) => {
 // ============================================
 // 🚪 LOGOUT HANDLER
 // ============================================
-const handleLogout = async (navigation) => {
+const handleLogout = async () => {
   try {
     console.log("🚪 Logging out user...");
+    
+    // Clear reconnect timer
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     
     // Clear all auth data
     await AsyncStorage.multiRemove([
       "accessToken",
       "refreshToken",
       "userInfo",
+      "userData",
       "sessionId"
     ]);
     
     // Disconnect socket
     if (socket) {
+      socket.removeAllListeners();
       socket.disconnect();
       socket = null;
     }
     
     sessionId = '';
     deviceId = '';
+    reconnectAttempts = 0;
+    isInitialized = false;
     
     console.log("✅ Logout completed");
     
     // Navigate to login
-    if (navigation) {
-      navigation.reset({
+    if (navigationRef) {
+      navigationRef.reset({
         index: 0,
         routes: [{ name: "Login" }],
       });
@@ -113,7 +143,6 @@ const emitDeviceEvents = () => {
     if (response) {
       console.log("✅ Device session response:", {
         status: response.status,
-        data: response.data,
         message: response.message
       });
     }
@@ -123,7 +152,13 @@ const emitDeviceEvents = () => {
 // ============================================
 // 🔄 RE-AUTHENTICATION LOGIC
 // ============================================
-const reauthenticateSocket = async (navigation) => {
+const reauthenticateSocket = async (deviceInfo = null) => {
+  // Clear any existing reconnect timer
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
   if (isAuthenticating) {
     console.log("⏳ Already re-authenticating, skipping...");
     return;
@@ -133,45 +168,247 @@ const reauthenticateSocket = async (navigation) => {
   console.log("🔄 Starting re-authentication process...");
 
   try {
+    const accessToken = await getAccessToken();
     const refreshToken = await getRefreshToken();
     const currentDeviceId = await getDeviceId();
+    const userData = await getUserData();
 
-    if (!refreshToken || !currentDeviceId) {
-      console.error("❌ No refresh token or device ID found");
-      await handleLogout(navigation);
+    console.log("🔑 Re-auth check:", {
+      hasAccessToken: !!accessToken,
+      hasRefreshToken: !!refreshToken,
+      hasDeviceId: !!currentDeviceId,
+      hasUserData: !!userData
+    });
+
+    // If no valid session, don't proceed
+    if (!userData || !currentDeviceId || (!accessToken && !refreshToken)) {
+      console.log("ℹ️ No valid session found for re-authentication");
+      isAuthenticating = false;
       return;
     }
 
     deviceId = currentDeviceId;
 
-    console.log("🔑 Re-authenticating with refresh token");
+    // If socket doesn't exist, initialize it first
+    if (!socket) {
+      console.log("🔧 Socket doesn't exist, initializing before re-authentication");
+      
+      // Get device info from params or create basic device info
+      const deviceData = deviceInfo || {
+        osName: Platform.OS,
+        appVersion: '1.0.0',
+        brand: 'unknown'
+      };
+      
+      // Initialize socket with current tokens
+      await initializeSocketWithTokens(deviceData, navigationRef, {
+        accessToken,
+        refreshToken,
+        deviceId: currentDeviceId,
+        userData
+      });
+      
+      console.log("✅ Socket initialized for re-authentication");
+      isAuthenticating = false;
+      return;
+    }
+
+    // Use refresh token if available, otherwise use access token
+    const tokenToUse = refreshToken || accessToken;
+    
+    console.log("🔑 Re-authenticating with token");
     
     // Update socket auth
     socket.auth = { 
-      token: refreshToken, 
-      deviceId: currentDeviceId 
+      token: tokenToUse, 
+      deviceId: currentDeviceId,
+      userData
     };
 
-    // Reconnect socket
-    socket.connect();
+    // Reconnect socket if disconnected
+    if (!socket.connected) {
+      console.log("🔄 Socket disconnected, connecting...");
+      socket.connect();
+    }
 
-    // Wait for connection
-    socket.once("connect", () => {
-      console.log("🚀 Socket reconnected:", socket.id);
-      console.log("📤 Emitting reauthenticate event...");
-      
+    // Wait for connection or emit directly if already connected
+    if (socket.connected) {
+      console.log("📤 Socket already connected, emitting reauthenticate...");
       socket.emit("reauthenticate", { 
-        refreshTokenHash: refreshToken, 
-        deviceId: currentDeviceId 
+        refreshTokenHash: refreshToken || accessToken, 
+        deviceId: currentDeviceId,
+        userId: userData?._id || userData?.userId
       });
-    });
+    } else {
+      // Set up one-time connect listener
+      const connectHandler = () => {
+        console.log("🚀 Socket reconnected:", socket.id);
+        console.log("📤 Emitting reauthenticate event...");
+        
+        socket.emit("reauthenticate", { 
+          refreshTokenHash: refreshToken || accessToken, 
+          deviceId: currentDeviceId,
+          userId: userData?._id || userData?.userId
+        });
+        
+        socket.off("connect", connectHandler);
+      };
+      
+      socket.once("connect", connectHandler);
+    }
 
   } catch (error) {
     console.error("❌ Error during re-authentication:", error);
-    await handleLogout(navigation);
   } finally {
     isAuthenticating = false;
   }
+};
+
+// Helper function to initialize socket with tokens
+const initializeSocketWithTokens = async (deviceInfo, navigation, tokens) => {
+  try {
+    const deviceData = getDeviceInfo(deviceInfo);
+    const tokenToUse = tokens.refreshToken || tokens.accessToken;
+
+    if (!tokenToUse) {
+      console.error("❌ No token found for socket initialization");
+      return null;
+    }
+
+    // Clean up existing socket
+    if (socket) {
+      socket.removeAllListeners();
+      socket.disconnect();
+      socket = null;
+    }
+
+    // Initialize new socket
+    socket = io(SOCKET_URL, {
+      transports: ["websocket", "polling"],
+      auth: {
+        token: tokenToUse,
+        deviceId: tokens.deviceId,
+        deviceInfo: deviceData,
+        userId: tokens.userData?._id || tokens.userData?.userId
+      },
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 10000,
+      autoConnect: true,
+      forceNew: true
+    });
+
+    setupSocketListeners(socket, tokenToUse, tokens.deviceId, deviceData, tokens.userData);
+    
+    return socket;
+  } catch (error) {
+    console.error("❌ Error initializing socket with tokens:", error);
+    return null;
+  }
+};
+
+// Setup socket listeners
+const setupSocketListeners = (socketInstance, token, deviceId, deviceData, userData) => {
+  socketInstance.on("connect", () => {
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("🚀 SOCKET CONNECTED");
+    console.log("   Socket ID:", socketInstance.id);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    socketInstance.emit("authenticate", {
+      token: token,
+      deviceId: deviceId,
+      deviceInfo: deviceData,
+      userId: userData?._id || userData?.userId
+    });
+
+    socketInstance.emit('token:validate', { token }, (response) => {
+      console.log("✅ Token validation response:", response);
+    });
+
+    reconnectAttempts = 0;
+  });
+
+  socketInstance.once("authenticated", (response) => {
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("📥 AUTHENTICATED EVENT RECEIVED");
+    console.log("   Status:", response.status);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if (response.status === true) {
+      console.log("✅ Authentication successful!");
+      sessionId = response.data?.sessionId || '';
+      console.log("   Session ID:", sessionId);
+      emitDeviceEvents();
+    } else {
+      console.log("❌ Authentication failed:", response.message);
+      if (response.message === "Token expired" || response.message === "Invalid token") {
+        console.log("🔄 Token issue detected, re-authenticating...");
+        reauthenticateSocket(deviceData);
+      }
+    }
+  });
+
+  socketInstance.once("reauthenticated", async (response) => {
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("📥 RE-AUTHENTICATED EVENT RECEIVED");
+    console.log("   Status:", response.status);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    if (response.status === true) {
+      console.log("✅ Re-authentication successful!");
+      if (response.data?.accessToken && response.data?.refreshTokenHash) {
+        await saveTokens(response.data.accessToken, response.data.refreshTokenHash);
+        sessionId = response.data?.sessionId || sessionId;
+      }
+      emitDeviceEvents();
+    } else {
+      console.log("❌ Re-authentication failed:", response.message);
+    }
+  });
+
+  socketInstance.on("disconnect", async (reason) => {
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("🔌 SOCKET DISCONNECTED");
+    console.log("   Reason:", reason);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    const userData = await getUserData();
+    const deviceId = await getDeviceId();
+
+    if (!userData || !deviceId) {
+      console.log("ℹ️ User is logged out, cleaning up");
+      handleLogout();
+      return;
+    }
+
+    if (reason === "io server disconnect") {
+      console.log("🔄 Server requested disconnect. Re-authenticating...");
+      reauthenticateSocket();
+    }
+  });
+
+  socketInstance.on("connect_error", (err) => {
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("❌ SOCKET CONNECTION ERROR");
+    console.log("   Message:", err.message);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  });
+
+  socketInstance.on("token:validation:result", (response) => {
+    console.log("📥 TOKEN VALIDATION RESULT:", response);
+    if (!response.status) {
+      console.log("🔄 Token invalid, attempting refresh...");
+      reauthenticateSocket();
+    }
+  });
+
+  socketInstance.on("logout", () => {
+    console.log("📥 LOGOUT EVENT RECEIVED");
+    handleLogout();
+  });
 };
 
 // ============================================
@@ -182,223 +419,55 @@ export const initSocket = async (deviceInfo, navigation) => {
     console.log("🔧 Initializing socket connection...");
     console.log("📍 Socket URL:", SOCKET_URL);
 
+    // Store navigation reference
+    navigationRef = navigation;
+
     // Get stored credentials
-    const token = await getAccessToken();
+    const accessToken = await getAccessToken();
+    const refreshToken = await getRefreshToken();
     const storedDeviceId = await getDeviceId();
+    const userData = await getUserData();
     const deviceData = getDeviceInfo(deviceInfo);
 
-    if (!token || !storedDeviceId) {
-      console.error("❌ Missing token or device ID");
-      await handleLogout(navigation);
+    // Check if user is logged in
+    if (!userData || !storedDeviceId) {
+      console.log("ℹ️ User not logged in, skipping socket initialization");
+      return;
+    }
+
+    // Use refresh token if available, otherwise use access token
+    const tokenToUse = refreshToken || accessToken;
+
+    if (!tokenToUse) {
+      console.error("❌ No token found for socket initialization");
       return;
     }
 
     deviceId = storedDeviceId;
+    isInitialized = true;
 
     console.log("🔐 Auth data:", {
-      hasToken: !!token,
+      hasToken: !!tokenToUse,
       deviceId: storedDeviceId,
-      deviceInfo: deviceData
+      deviceInfo: deviceData,
+      userId: userData?._id || userData?.userId
     });
 
-    // Initialize socket
-    socket = io(SOCKET_URL, {
-      transports: ["websocket", "polling"],
-      auth: {
-        token: token,
-        deviceId: storedDeviceId,
-        deviceInfo: deviceData,
-      },
-      reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      timeout: 10000,
-      autoConnect: true,
-    });
-
-    // ============================================
-    // 📥 SOCKET EVENT LISTENERS
-    // ============================================
-
-    // ✅ Connection established
-    socket.on("connect", () => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("🚀 SOCKET CONNECTED");
-      // console.log("   Socket ID:", socket.id);
-      // console.log("   Transport:", socket.io.engine.transport.name);
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      // Emit authentication
-      console.log("📤 Emitting authenticate event...");
-      socket.emit("authenticate", {
-        token: token,
-        deviceId: storedDeviceId,
-        deviceInfo: deviceData,
-      });
-
-      // Validate token
-      console.log("📤 Emitting token:validate...");
-      socket.emit('token:validate', { token: token }, (response) => {
-        console.log("✅ Token validation response:", response);
-      });
-    });
-
-    // ✅ Authentication successful
-    socket.once("authenticated", (response) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 AUTHENTICATED EVENT RECEIVED");
-      // console.log("   Status:", response.status);
-      // console.log("   Message:", response.message);
-      // console.log("   Data:", JSON.stringify(response.data, null, 2));
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (response.status === true) {
-        console.log("✅ Authentication successful!");
-        sessionId = response.data?.sessionId || '';
-        console.log("   Session ID:", sessionId);
-        
-        // Emit device events after successful auth
-        emitDeviceEvents();
-      } else {
-        console.log("❌ Authentication failed:", response.message);
-        
-        if (response.message === "Token expired" || response.message === "Invalid token") {
-          console.log("🔄 Token issue detected, re-authenticating...");
-          reauthenticateSocket(navigation);
-        }
-      }
-    });
-
-    // ✅ Re-authentication successful
-    socket.once("reauthenticated", async (response) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 RE-AUTHENTICATED EVENT RECEIVED");
-      // console.log("   Status:", response.status);
-      // console.log("   Message:", response.message);
-      // console.log("   Data:", JSON.stringify(response.data, null, 2));
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (response.status === true) {
-        console.log("✅ Re-authentication successful!");
-        
-        // Save new tokens
-        if (response.data?.accessToken && response.data?.refreshTokenHash) {
-          await saveTokens(response.data.accessToken, response.data.refreshTokenHash);
-          sessionId = response.data?.sessionId || sessionId;
-          console.log("   New Session ID:", sessionId);
-        }
-        
-        // Emit device events
-        emitDeviceEvents();
-      } else {
-        console.log("❌ Re-authentication failed:", response.message);
-        await handleLogout(navigation);
-      }
-    });
-
-    // 🔌 Socket disconnected
-    socket.on("disconnect", async (reason) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("🔌 SOCKET DISCONNECTED");
-      // console.log("   Reason:", reason);
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (reason === "io server disconnect") {
-        console.log("🔄 Server requested disconnect. Re-authenticating...");
-        await reauthenticateSocket(navigation);
-      } else if (reason === "transport close" || reason === "ping timeout") {
-        console.log("⏳ Connection lost. Will auto-reconnect...");
-      }
-    });
-
-    // ❌ Connection error
-    socket.on("connect_error", (err) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("❌ SOCKET CONNECTION ERROR");
-      // console.log("   Message:", err.message);
-      // console.log("   Description:", err.description);
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    });
-
-    // 🔄 Reconnection attempt
-    socket.on("reconnect_attempt", (attemptNumber) => {
-      console.log(`🔄 Reconnection attempt #${attemptNumber}...`);
-    });
-
-    // ✅ Reconnection successful
-    socket.on("reconnect", (attemptNumber) => {
-      console.log(`✅ Reconnected successfully after ${attemptNumber} attempts`);
-    });
-
-    // ❌ Reconnection failed
-    socket.on("reconnect_failed", () => {
-      console.log("❌ Reconnection failed after all attempts");
-    });
-
-    // 📨 Token validation result
-    socket.on("token:validation:result", (response) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 TOKEN VALIDATION RESULT");
-      // console.log("   Status:", response.status);
-      // console.log("   Message:", response.message);
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    });
-
-    // 📱 Device sessions list
-    socket.on("device:sessions:list", (response) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 DEVICE SESSIONS LIST");
-      // console.log("   Status:", response.status);
-      // console.log("   Data:", JSON.stringify(response.data, null, 2));
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    });
-
-    // 🚫 Device terminated
-    socket.on("device:terminated", (response) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 DEVICE TERMINATED");
-      // console.log("   Status:", response.status);
-      // console.log("   Message:", response.message);
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    });
-
-    // 💬 Quick message acknowledgment
-    socket.on('message:quick:ack', (payload, callback) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 MESSAGE QUICK ACK");
-      // console.log("   Payload:", JSON.stringify(payload, null, 2));
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      const response = { 
-        status: true, 
-        message: 'Message received successfully',
-        timestamp: new Date().toISOString()
-      };
-
-      if (callback && typeof callback === 'function') {
-        callback(response);
-        console.log("✅ Callback response sent:", response);
-      }
-    });
-
-    // 🚪 Logout event
-    socket.on("logout", (data) => {
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      // console.log("📥 LOGOUT EVENT RECEIVED");
-      // console.log("   Data:", JSON.stringify(data, null, 2));
-      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      handleLogout(navigation);
+    // Initialize socket with tokens
+    await initializeSocketWithTokens(deviceInfo, navigation, {
+      accessToken,
+      refreshToken,
+      deviceId: storedDeviceId,
+      userData
     });
 
     console.log("✅ Socket initialization completed");
 
   } catch (error) {
-    // console.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    // console.error("❌ ERROR INITIALIZING SOCKET");
-    // console.error("   Error:", error.message);
-    // console.error("   Stack:", error.stack);
-    // console.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.error("❌ ERROR INITIALIZING SOCKET");
+    console.error("   Error:", error.message);
+    console.error("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   }
 };
 
@@ -406,42 +475,36 @@ export const initSocket = async (deviceInfo, navigation) => {
 // 📱 APP STATE CHANGE HANDLER
 // ============================================
 export const setupAppStateListener = (navigation) => {
+  // Store navigation reference
+  navigationRef = navigation;
+
   const handleAppStateChange = async (nextAppState) => {
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    // console.log("📱 APP STATE CHANGED");
-    // console.log("   From:", appState);
-    // console.log("   To:", nextAppState);
-    // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("📱 APP STATE CHANGED");
+    console.log("   From:", appState);
+    console.log("   To:", nextAppState);
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // App came to foreground from background
     if (appState.match(/inactive|background/) && nextAppState === 'active') {
       console.log("✅ App returned to foreground");
       
-      // Check if socket is connected
-      if (socket && !socket.connected) {
-        console.log("🔄 Socket disconnected, re-authenticating...");
-        await reauthenticateSocket(navigation);
-      } else if (socket && socket.connected) {
-        console.log("✅ Socket already connected");
-        
-        // Validate token
-        const token = await getAccessToken();
-        if (token) {
-          socket.emit('token:validate', { token }, (response) => {
-            console.log("✅ Token re-validated on foreground:", response);
-            
-            if (!response.status) {
-              console.log("❌ Token invalid, re-authenticating...");
-              reauthenticateSocket(navigation);
-            }
-          });
-        }
+      // Check if user is still logged in
+      const userData = await getUserData();
+      const deviceId = await getDeviceId();
+      
+      if (!userData || !deviceId) {
+        console.log("ℹ️ User not logged in, skipping socket operations");
+        return;
       }
-    }
 
-    // App went to background
-    if (appState === 'active' && nextAppState.match(/inactive|background/)) {
-      console.log("⏸️ App moved to background");
+      // Check socket connection
+      if (socket && !socket.connected) {
+        console.log("🔄 Socket disconnected, reconnecting...");
+        socket.connect();
+      } else if (!socket) {
+        console.log("🔧 Socket not initialized, will be initialized by chat");
+      }
     }
 
     appState = nextAppState;
@@ -451,6 +514,10 @@ export const setupAppStateListener = (navigation) => {
   
   return () => {
     subscription.remove();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     console.log("🔇 App state listener removed");
   };
 };
@@ -469,23 +536,20 @@ export const emitDeviceTerminate = (targetSessionId = null) => {
     return;
   }
 
-  // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  // console.log("📤 EMITTING DEVICE TERMINATE");
-  // console.log("   Socket ID:", socket.id);
-  // console.log("   Session ID:", targetSessionId || sessionId);
-  // console.log("   Device ID:", deviceId);
-  // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+  console.log("📤 EMITTING DEVICE TERMINATE");
+  console.log("   Session ID:", targetSessionId || sessionId);
+  console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   socket.emit('device:terminate', { 
     socketId: socket.id, 
     sessionId: targetSessionId || sessionId, 
     deviceId 
   }, (response) => {
-    // console.log("✅ Device terminate response:", {
-    //   status: response.status,
-    //   message: response.message,
-    //   data: response.data
-    // });
+    console.log("✅ Device terminate response:", {
+      status: response?.status,
+      message: response?.message
+    });
   });
 };
 
@@ -493,16 +557,10 @@ export const emitDeviceTerminate = (targetSessionId = null) => {
 // 🔧 UTILITY FUNCTIONS
 // ============================================
 export const getSocket = () => {
-  if (!socket) {
-    console.warn("⚠️ Socket not initialized");
-  }
   return socket;
 };
 
 export const getSessionId = () => {
-  if (!sessionId) {
-    console.warn("⚠️ No session ID available");
-  }
   return sessionId;
 };
 
@@ -511,18 +569,58 @@ export const isSocketConnected = () => {
 };
 
 export const disconnectSocket = () => {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  
   if (socket) {
     console.log("🔌 Manually disconnecting socket...");
+    socket.removeAllListeners();
     socket.disconnect();
     socket = null;
     sessionId = '';
+    isInitialized = false;
     console.log("✅ Socket disconnected");
   }
 };
 
-export const reconnectSocket = async (navigation) => {
+export const reconnectSocket = async (deviceInfo = null) => {
   console.log("🔄 Manual reconnection requested...");
-  await reauthenticateSocket(navigation);
+  
+  // Check if user is logged in
+  const userData = await getUserData();
+  const deviceId = await getDeviceId();
+  
+  if (!userData || !deviceId) {
+    console.log("ℹ️ User not logged in, skipping reconnection");
+    return;
+  }
+  
+  await reauthenticateSocket(deviceInfo);
+};
+
+export const setNavigationRef = (navigation) => {
+  navigationRef = navigation;
+};
+
+export const resetReconnectAttempts = () => {
+  reconnectAttempts = 0;
+};
+
+export const checkUserLoginStatus = async () => {
+  try {
+    const [userData, accessToken, deviceId] = await Promise.all([
+      AsyncStorage.getItem('userData'),
+      AsyncStorage.getItem('accessToken'),
+      AsyncStorage.getItem('deviceId')
+    ]);
+    
+    return !!(userData && accessToken && deviceId);
+  } catch (error) {
+    console.error('❌ Error checking login status:', error);
+    return false;
+  }
 };
 
 export default {
@@ -534,4 +632,7 @@ export default {
   isSocketConnected,
   disconnectSocket,
   reconnectSocket,
+  setNavigationRef,
+  resetReconnectAttempts,
+  checkUserLoginStatus
 };
