@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useContext } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { View, Text, Image, Animated, TouchableOpacity, ScrollView, Alert, Platform, ToastAndroid, ActivityIndicator, TextInput } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -35,18 +35,31 @@ export default function EditProfile({ navigation, route }) {
       fullName: '',
       email: '',
       about: '',
+      profileImage: '',
     });
 
-    useEffect(() => {
-      // Pre-fill form with existing profile data if available
-      if (profileData) {
-        setForm({
-          fullName: profileData.fullName || '',
-          email: profileData.email || '',
-          about: profileData.about || '',
-        });
-      }
-    }, [profileData]);
+    // useEffect(() => {
+    //   // Pre-fill form with existing profile data if available
+    //   if (profileData) {
+    //     setForm({
+    //       fullName: profileData.fullName || '',
+    //       email: profileData.email || '',
+    //       about: profileData.about || '',
+    //       profileImage: profileData.profileImage || '',
+    //     });
+    //   }
+    // }, [profileData]);
+
+    const getUploadedImageUrl = (result = {}) => {
+      return (
+        result?.data?.profileImageUrl ||
+        result?.data?.profileImage ||
+        result?.data?.url ||
+        result?.profileImageUrl ||
+        result?.profileImage ||
+        ''
+      );
+    };
 
     useEffect(() => {
       // Fetch profile data if not available
@@ -84,12 +97,12 @@ export default function EditProfile({ navigation, route }) {
       let newErrors = {};
   
       if (!form.fullName?.trim()) newErrors.fullName = 'Full Name is required';
-      if (!form.email?.trim()) newErrors.email = 'Email is required';
-      else {
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(form.email)) newErrors.email = 'Please enter a valid email address';
-      }
-      if (!form.about?.trim()) newErrors.about = 'About is required';
+      // if (!form.email?.trim()) newErrors.email = 'Email is required';
+      // else {
+      //   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      //   if (!emailRegex.test(form.email)) newErrors.email = 'Please enter a valid email address';
+      // }
+      // if (!form.about?.trim()) newErrors.about = 'About is required';
       if (!phoneNumber?.trim()) newErrors.phoneNumber = 'Phone number is required';
   
       setFormErrors(newErrors);
@@ -175,9 +188,9 @@ export default function EditProfile({ navigation, route }) {
       );
     };
 
-    const imageEdit = async () => {
+    const imageEdit = async ({ silent = false } = {}) => {
       if (!selectedImage) {
-        showToast('No image selected');
+        if (!silent) showToast('No image selected');
         return;
       }
 
@@ -208,22 +221,33 @@ export default function EditProfile({ navigation, route }) {
 
         const response = await fetch(`${BACKEND_URL}user/profile/picture`, requestOptions);
         const result = await response.json();
+        console.log("Image upload response:", result);
 
         if (result?.statusCode === 200) {
-          showToast("Profile image updated");
+          const uploadedImageUrl = getUploadedImageUrl(result);
+
+          if (!uploadedImageUrl) {
+            throw new Error('Uploaded image URL not found in response');
+          }
+
+          if (!silent) showToast("Profile image updated");
           setImageUploadLoader(false);
           dispatch(profileDetail());
-          setSelectedImage(null); // Clear selected image after successful upload
+          setSelectedImage(null);
+          setForm(prev => ({ ...prev, profileImage: uploadedImageUrl }));
+          return uploadedImageUrl;
         } else {
           console.error("Image upload failed with response:", result);
           const msg = result?.message || "Image upload failed";
-          showToast(msg);
+          if (!silent) showToast(msg);
           setImageUploadLoader(false);
+          return null;
         }
       } catch (error) {
         console.error("Network request failed:", error);
-        showToast("Network request failed");
+        if (!silent) showToast(error?.message || "Network request failed");
         setImageUploadLoader(false);
+        return null;
       }
     };
 
@@ -238,24 +262,46 @@ export default function EditProfile({ navigation, route }) {
 
     const handleUpdateProfile = async () => {
       if (!validateForm()) return;
+
+      let finalProfileImage = form.profileImage || profileData?.profileImage || '';
+
+      if (selectedImage) {
+        const uploadedImageUrl = await imageEdit({ silent: true });
+        if (!uploadedImageUrl) {
+          showToast('Please upload profile image again');
+          return;
+        }
+        finalProfileImage = uploadedImageUrl;
+      }
       
       const payload = {
         fullName: form.fullName,
         email: form.email,
         about: form.about,
-        profileImage: '',
+        profileImage: finalProfileImage,
         mobile: {
             code: selectedCountry?.code || '',
             number: phoneNumber || ''
         },
       };
+      // console.log("Updating profile with payload:", payload);
   
       try {
         const response = await dispatch(editProfile(payload)).unwrap();
         showToast("Profile updated successfully");
         dispatch(profileDetail());
-        setForm({ fullName: '', email: '', about: '' }); 
-        navigation.navigate('ChatList')
+        setForm(prev => ({
+          ...prev,
+          fullName: form.fullName,
+          email: form.email,
+          about: form.about,
+          profileImage: finalProfileImage,
+        }));
+        navigation.reset({
+          index: 0,
+          routes: [{ name: "ChatList"}],
+        });
+        // navigation.navigate('ChatList')
       } catch (error) {
         console.error("Profile update failed", error);
         showToast(error?.message || "Profile update failed");
@@ -362,7 +408,7 @@ export default function EditProfile({ navigation, route }) {
                           {formErrors.about && <Text style={{ fontSize: 12, fontFamily:"Poppins-Medium", color: 'red', marginTop: 5 }}>{formErrors.about}</Text>}
                           </View>
                           
-                          <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, marginBottom:10, borderWidth:1, borderColor:theme.colors.borderColor }} >
+                          {/* <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, marginBottom:10, borderWidth:1, borderColor:theme.colors.borderColor }} >
                               <TextInput 
                                 editable={false}
                                 placeholderTextColor={theme.colors.placeHolderTextColor} 
@@ -372,7 +418,7 @@ export default function EditProfile({ navigation, route }) {
                           </View>
                           <Text style={{ fontFamily:'Poppins-Medium', fontSize:12, color:theme.colors.placeHolderTextColor, textAlign:'center', marginTop:5 }}>
                             Phone number cannot be changed
-                          </Text>
+                          </Text> */}
                         </View>
                     </View>
                 </ScrollView>

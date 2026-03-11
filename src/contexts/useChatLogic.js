@@ -1,26 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AppState, Keyboard, Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as FileSystem from 'expo-file-system/legacy';
 import moment from "moment";
 import { useDispatch, useSelector } from "react-redux";
-import { chatMessage, chatListData, mediaUpload, downloadMedia } from "../Redux/Reducer/Chat/Chat.reducer";
+import { chatMessage, chatListData, mediaUpload } from "../Redux/Reducer/Chat/Chat.reducer";
 import { getSocket, isSocketConnected, reconnectSocket } from "../Redux/Services/Socket/socket";
 import { useNetwork } from "../contexts/NetworkContext";
 import { useImage } from "../contexts/ImageProvider";
 import { useFocusEffect } from "@react-navigation/native";
 import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../utils/presence";
 import { useRealtimeChat } from "./RealtimeChatContext";
-
-/* mediaService: copyToAppFolder, saveFileToMediaLibrary, normalizeUri, uploadMediaFile, downloadAndOpenMedia */
+import localStorageService from '../services/LocalStorageService';
+import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
+import { apiCall } from '../Config/Https';
 import {
-  copyToAppFolder,
-  saveFileToMediaLibrary,
+  clearChatLocalArtifacts,
+  getChatClearedAt,
+  getChatMessagesKey,
+  removeMessagesByChatId,
+} from '../utils/chatClearStorage';
+
+import {
   normalizeUri,
   uploadMediaFile,
-  downloadAndOpenMedia,
-  SENT_DIR,
-  APP_FOLDER,
-  downloadRemoteToReceived,
 } from "../utils/mediaService";
 
 /* Constants */
@@ -32,9 +35,17 @@ const PRESENCE_POLL_INTERVAL = 45000;
 const PRESENCE_BACKGROUND_AWAY_DELAY = 30000;
 const PRESENCE_IDLE_TIMEOUT = 5 * 60 * 1000;
 const MANUAL_PRESENCE_QUEUE_KEY = "presence_manual_queue";
+const MEDIA_STATUS_QUEUE_KEY = 'media_status_update_queue';
 const DELETED_TOMBSTONES_PREFIX = "chat_deleted_tombstones_";
 const READ_MARK_DELAY = 800;
 const SOCKET_FETCH_LIMIT = 50;
+const LOCAL_SAVE_DEBOUNCE_MS = 220;
+const MEDIA_STATUS_ACK_TIMEOUT_MS = 9000;
+const MEDIA_STATUS_MAX_RETRIES = 5;
+const MEDIA_STATUS_BASE_RETRY_DELAY_MS = 2000;
+const MEDIA_UPLOAD_QUEUE_KEY = 'media_upload_queue';
+const MEDIA_UPLOAD_MAX_RETRIES = 4;
+const MEDIA_UPLOAD_TIMEOUT_MS = 30000;
 
 const normalizeId = (value) => {
   if (value == null) return null;
@@ -55,6 +66,27 @@ const sameId = (a, b) => {
   return Boolean(left && right && left === right);
 };
 
+const isDeletedForUser = (deletedFor, userId) => {
+  const normalizedUserId = normalizeId(userId);
+  if (!deletedFor) return false;
+
+  if (typeof deletedFor === 'string') {
+    return deletedFor.toLowerCase() === 'everyone' || sameId(deletedFor, normalizedUserId);
+  }
+
+  if (Array.isArray(deletedFor)) {
+    return deletedFor.some((id) => sameId(id, normalizedUserId));
+  }
+
+  if (typeof deletedFor === 'object') {
+    const users = Array.isArray(deletedFor?.users) ? deletedFor.users : [];
+    if (users.some((id) => sameId(id, normalizedUserId))) return true;
+    return sameId(deletedFor?.userId || deletedFor?._id || deletedFor?.id, normalizedUserId);
+  }
+
+  return false;
+};
+
 const computeSenderType = (senderId, currentUserId) => (
   sameId(senderId, currentUserId) ? 'self' : 'other'
 );
@@ -63,12 +95,91 @@ const buildDeletePlaceholderText = (isDeletedBySelf) => (
   isDeletedBySelf ? '🗑 You deleted this message' : '🗑 This message was deleted'
 );
 
+const generateClientMessageId = () => (
+  `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+);
+
+const extractFileName = (nameOrUri = '') => {
+  const value = String(nameOrUri || '').trim();
+  if (!value) return 'media';
+  const withoutQuery = value.split('?')[0];
+  const parts = withoutQuery.split('/').filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : 'media';
+};
+
+const resolveUploadMediaId = (uploadData = {}) => {
+  if (uploadData?.mediaId) return String(uploadData.mediaId);
+  if (uploadData?._id?.$oid) return String(uploadData._id.$oid);
+  if (uploadData?._id) return String(uploadData._id);
+  if (uploadData?.id) return String(uploadData.id);
+  return null;
+};
+
 export default function useChatLogic({ navigation, route }) {
   const dispatch = useDispatch();
   const { isConnected, networkType } = useNetwork();
   const { pickMedia } = useImage();
   const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview } = useRealtimeChat();
+
+  const deferRealtimeUpdate = useCallback((fn) => {
+    // Ensure provider mutations run after current render/commit cycle.
+    setTimeout(() => {
+      try {
+        fn?.();
+      } catch (error) {
+        console.warn('deferRealtimeUpdate error', error);
+      }
+    }, 0);
+  }, []);
   const chatMessagesData = useSelector(state => state.chat?.chatMessagesData || state.chat?.data || state.chat);
+  
+  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system']);
+  const MEDIA_MESSAGE_TYPES = new Set(['image', 'photo', 'video', 'audio', 'file', 'document']);
+
+  const normalizeOutboundMessageType = (value) => {
+    const type = String(value || '').toLowerCase();
+    if (type === 'photo') return 'image';
+    if (type === 'document') return 'file';
+    if (ENUM_MESSAGE_TYPES.has(type)) return type;
+    return 'file';
+  };
+  
+  const isMediaMessageType = (value) => {
+    const type = String(value || '').toLowerCase();
+    return MEDIA_MESSAGE_TYPES.has(type);
+  };
+  
+  const normalizeMessagePayloadWithDownloadFlag = (messageType, payload = {}) => {
+    const base = payload && typeof payload === 'object' ? { ...payload } : {};
+    if (isMediaMessageType(messageType)) {
+      return {
+        ...base,
+        isMediaDownloaded: Boolean(base?.isMediaDownloaded),
+      };
+    }
+    if ('isMediaDownloaded' in base) {
+      delete base.isMediaDownloaded;
+    }
+    return base;
+  };
+
+  const mergePayloadKeepingDownloadState = (existingMessage = {}, incomingMessage = {}) => {
+    const resolvedType = incomingMessage?.type || incomingMessage?.mediaType || incomingMessage?.messageType || existingMessage?.type || 'text';
+    const mergedLocalUri = incomingMessage?.localUri || existingMessage?.localUri || null;
+    const isDownloaded = Boolean(
+      existingMessage?.payload?.isMediaDownloaded ||
+      incomingMessage?.payload?.isMediaDownloaded ||
+      existingMessage?.isMediaDownloaded ||
+      incomingMessage?.isMediaDownloaded ||
+      mergedLocalUri
+    );
+
+    return normalizeMessagePayloadWithDownloadFlag(resolvedType, {
+      ...(existingMessage?.payload || {}),
+      ...(incomingMessage?.payload || {}),
+      isMediaDownloaded: isDownloaded,
+    });
+  };
 
   // Build chatData safely from route.params (supports both `item` and `user`)
   const { item, chatId: routeChatId, user } = (route && route.params) || {};
@@ -106,6 +217,12 @@ export default function useChatLogic({ navigation, route }) {
   const backgroundAwayTimeoutRef = useRef(null);
   const lastInteractionAtRef = useRef(Date.now());
   const queuedManualPresenceRef = useRef([]);
+  const queuedMediaStatusRef = useRef([]);
+  const queuedMediaUploadsRef = useRef([]);
+  const mediaUploadQueueInFlightRef = useRef(false);
+  const flushQueuedMediaUploadsRef = useRef(async () => {});
+  const mediaStatusInFlightRef = useRef(false);
+  const mediaStatusProcessedRef = useRef(new Set());
   const presenceUpdateVersionRef = useRef(0);
   const readMarkTimeoutRef = useRef(null);
   const lastMessageSyncAtRef = useRef(0);
@@ -117,6 +234,8 @@ export default function useChatLogic({ navigation, route }) {
   const isHardReloadingRef = useRef(false);
   const deletedTombstonesRef = useRef({});
   const pendingPreviewSyncRef = useRef(false);
+  const localSaveTimeoutRef = useRef(null);
+  const socketHandlerRegistryRef = useRef(new Map());
 
   // State
   const [text, setText] = useState("");
@@ -153,8 +272,361 @@ export default function useChatLogic({ navigation, route }) {
   const [mediaViewer, setMediaViewer] = useState({ visible: false, uri: null, type: null });
   const [pendingMedia, setPendingMedia] = useState(null);
   const [downloadProgress, setDownloadProgress] = useState({});
+  const [uploadProgress, setUploadProgress] = useState({});
+  const [mediaDownloadStates, setMediaDownloadStates] = useState({});
   const [isChatMuted, setIsChatMuted] = useState(Boolean(item?.isMuted));
   const [muteUntil, setMuteUntil] = useState(item?.muteUntil || null);
+  const [editingMessage, setEditingMessage] = useState(null);
+
+  const buildMediaStatusQueueStorageKey = useCallback(
+    () => `${MEDIA_STATUS_QUEUE_KEY}_${currentUserIdRef.current || 'anon'}`,
+    []
+  );
+
+  const buildMediaUploadQueueStorageKey = useCallback(
+    () => `${MEDIA_UPLOAD_QUEUE_KEY}_${currentUserIdRef.current || 'anon'}`,
+    []
+  );
+
+  const buildMediaStatusEventKey = useCallback((chatIdValue, messageIdValue) => {
+    const normalizedChatId = normalizeId(chatIdValue);
+    const normalizedMessageId = normalizeId(messageIdValue);
+    if (!normalizedChatId || !normalizedMessageId) return null;
+    return `${normalizedChatId}:${normalizedMessageId}:downloaded`;
+  }, []);
+
+  const getOrCreateDeviceId = useCallback(async () => {
+    try {
+      const existing = await AsyncStorage.getItem('deviceId');
+      if (existing && String(existing).trim()) {
+        return String(existing);
+      }
+      const generated = `device_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
+      await AsyncStorage.setItem('deviceId', generated);
+      return generated;
+    } catch (error) {
+      console.error('getOrCreateDeviceId error', error);
+      return `device_fallback_${Date.now()}`;
+    }
+  }, []);
+
+  const validateMediaMessagePayload = useCallback((messagePayload = {}) => {
+    const missing = [];
+    if (!messagePayload?.mediaId) missing.push('mediaId');
+    if (!messagePayload?.mediaUrl) missing.push('mediaUrl');
+    if (!messagePayload?.mediaThumbnailUrl) missing.push('mediaThumbnailUrl');
+    if (!messagePayload?.mediaMeta || typeof messagePayload.mediaMeta !== 'object') {
+      missing.push('mediaMeta');
+    }
+    return {
+      isValid: missing.length === 0,
+      missing,
+    };
+  }, []);
+
+  const createMediaMessagePayload = useCallback(({
+    uploadResponse,
+    file,
+    messageType,
+    senderId,
+    senderDeviceId,
+    receiverId,
+    chatId,
+    messageId,
+  }) => {
+    const uploadData = uploadResponse?.data || uploadResponse || {};
+    const normalizedMessageType = normalizeOutboundMessageType(
+      uploadData?.fileCategory || messageType || file?.type || 'file'
+    );
+    const generatedMessageId = String(
+      messageId ||
+      uploadData?.messageId ||
+      uploadData?._id?.$oid ||
+      uploadData?._id ||
+      generateClientMessageId()
+    );
+    const resolvedFileName = file?.name || extractFileName(file?.uri || uploadData?.previewUrl || uploadData?.thumbnailUrl);
+    const resolvedMimeType = file?.type || uploadData?.mimeType || `application/${normalizedMessageType}`;
+    const mediaId = resolveUploadMediaId(uploadData) || generatedMessageId;
+
+    return {
+      chatId,
+      chatType: 'private',
+      messageId: generatedMessageId,
+      senderId,
+      senderDeviceId,
+      receiverId,
+      messageType: normalizedMessageType,
+      mediaId,
+      mediaUrl: uploadData?.previewUrl || uploadData?.mediaUrl || '',
+      mediaThumbnailUrl: uploadData?.thumbnailUrl || uploadData?.previewUrl || '',
+      mediaMeta: {
+        fileName: resolvedFileName,
+        fileSize: uploadData?.sizeAfter || file?.size || null,
+        mimeType: resolvedMimeType,
+        width: uploadData?.width || null,
+        height: uploadData?.height || null,
+      },
+      status: 'sent',
+      text: file?.name || '',
+      createdAt: uploadData?.createdAt || new Date().toISOString(),
+    };
+  }, [normalizeOutboundMessageType]);
+
+  const persistMediaStatusQueue = useCallback(async (queueItems) => {
+    try {
+      await AsyncStorage.setItem(buildMediaStatusQueueStorageKey(), JSON.stringify(queueItems || []));
+    } catch (error) {
+      console.error('persistMediaStatusQueue error', error);
+    }
+  }, [buildMediaStatusQueueStorageKey]);
+
+  const loadQueuedMediaStatusUpdates = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(buildMediaStatusQueueStorageKey());
+      const parsed = raw ? JSON.parse(raw) : [];
+      const queue = Array.isArray(parsed) ? parsed : [];
+      queuedMediaStatusRef.current = queue;
+      queue.forEach((item) => {
+        const key = buildMediaStatusEventKey(item?.chatId, item?.messageId);
+        if (key && item?.isMediaDownloaded === true) {
+          mediaStatusProcessedRef.current.add(key);
+        }
+      });
+    } catch (error) {
+      console.error('loadQueuedMediaStatusUpdates error', error);
+      queuedMediaStatusRef.current = [];
+    }
+  }, [buildMediaStatusQueueStorageKey, buildMediaStatusEventKey]);
+
+  const persistMediaUploadQueue = useCallback(async (queueItems) => {
+    try {
+      await AsyncStorage.setItem(buildMediaUploadQueueStorageKey(), JSON.stringify(queueItems || []));
+    } catch (error) {
+      console.error('persistMediaUploadQueue error', error);
+    }
+  }, [buildMediaUploadQueueStorageKey]);
+
+  const loadQueuedMediaUploads = useCallback(async () => {
+    try {
+      const raw = await AsyncStorage.getItem(buildMediaUploadQueueStorageKey());
+      const parsed = raw ? JSON.parse(raw) : [];
+      queuedMediaUploadsRef.current = Array.isArray(parsed) ? parsed : [];
+    } catch (error) {
+      console.error('loadQueuedMediaUploads error', error);
+      queuedMediaUploadsRef.current = [];
+    }
+  }, [buildMediaUploadQueueStorageKey]);
+
+  const persistMessagesForChatImmediate = useCallback(async (chatIdValue, nextMessages) => {
+    try {
+      const normalizedChatId = normalizeId(chatIdValue || chatIdRef.current);
+      if (!normalizedChatId) return;
+      const localKey = getChatMessagesKey(normalizedChatId);
+      if (!localKey) return;
+      const rows = Array.isArray(nextMessages) ? nextMessages.slice(0, MAX_LOCAL_SAVE) : [];
+      await AsyncStorage.setItem(localKey, JSON.stringify(rows));
+    } catch (error) {
+      console.error('persistMessagesForChatImmediate error', error);
+    }
+  }, []);
+
+  const applyMediaDownloadedStateLocally = useCallback(async ({ messageId, chatId: targetChatId, isMediaDownloaded = true, localUri = null }) => {
+    const normalizedMessageId = normalizeId(messageId);
+    if (!normalizedMessageId) return;
+
+    const applyPatch = (msg) => {
+      const msgId = normalizeId(msg?.serverMessageId || msg?.id || msg?.tempId || msg?.mediaId);
+      if (!sameId(msgId, normalizedMessageId)) return msg;
+      if (msg?.isDeleted || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system') {
+        return msg;
+      }
+
+      const nextPayload = normalizeMessagePayloadWithDownloadFlag(
+        msg.type || msg.mediaType || msg.messageType,
+        { ...(msg.payload || {}), isMediaDownloaded: Boolean(isMediaDownloaded) }
+      );
+
+      return {
+        ...msg,
+        localUri: localUri || msg.localUri || null,
+        payload: nextPayload,
+        isMediaDownloaded: Boolean(nextPayload?.isMediaDownloaded || localUri || msg?.localUri),
+        downloadStatus: Boolean(isMediaDownloaded)
+          ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
+          : (msg?.downloadStatus || MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED),
+      };
+    };
+
+    setMessages((prev) => prev.map(applyPatch));
+
+    let cachedUpdated = null;
+    setAllMessages((prev) => {
+      const updated = prev.map(applyPatch);
+      cachedUpdated = updated;
+      return updated;
+    });
+
+    if (cachedUpdated) {
+      await persistMessagesForChatImmediate(targetChatId || chatIdRef.current, cachedUpdated);
+    }
+  }, [persistMessagesForChatImmediate]);
+
+  const markMediaRemovedLocally = useCallback(async (mediaIds = []) => {
+    const normalizedIds = Array.isArray(mediaIds)
+      ? mediaIds.map(normalizeId).filter(Boolean)
+      : [];
+
+    if (normalizedIds.length === 0) return;
+
+    const idSet = new Set(normalizedIds);
+    const matchesMedia = (msg = {}) => {
+      const candidates = [
+        normalizeId(msg?.mediaId),
+        normalizeId(msg?.serverMessageId),
+        normalizeId(msg?.id),
+        normalizeId(msg?.tempId),
+      ].filter(Boolean);
+      return candidates.some((candidate) => idSet.has(candidate));
+    };
+
+    const applyPatch = (msg = {}) => {
+      if (!matchesMedia(msg)) return msg;
+      const nextPayload = normalizeMessagePayloadWithDownloadFlag(
+        msg.type || msg.mediaType || msg.messageType,
+        { ...(msg.payload || {}), isMediaDownloaded: false }
+      );
+
+      return {
+        ...msg,
+        localUri: null,
+        payload: nextPayload,
+        isMediaDownloaded: false,
+        downloadStatus: MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+      };
+    };
+
+    setDownloadedMedia((prev) => {
+      const next = { ...prev };
+      normalizedIds.forEach((id) => {
+        delete next[id];
+      });
+      return next;
+    });
+
+    setMediaDownloadStates((prev) => {
+      const next = { ...prev };
+      normalizedIds.forEach((id) => {
+        next[id] = {
+          ...(next[id] || { mediaId: id }),
+          status: MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+          progress: 0,
+          localPath: null,
+          error: null,
+          updatedAt: Date.now(),
+        };
+      });
+      return next;
+    });
+
+    setMessages((prev) => prev.map(applyPatch));
+
+    let cachedUpdated = null;
+    setAllMessages((prev) => {
+      const updated = prev.map(applyPatch);
+      cachedUpdated = updated;
+      return updated;
+    });
+
+    if (cachedUpdated) {
+      await persistMessagesForChatImmediate(chatIdRef.current, cachedUpdated);
+    }
+  }, [persistMessagesForChatImmediate]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const bootstrap = async () => {
+      try {
+        await mediaDownloadManager.rehydrate();
+        const cachedMap = await mediaDownloadManager.getCachedMediaMap();
+        if (!mounted) return;
+
+        const nextDownloaded = {};
+        const nextStates = {};
+
+        Object.entries(cachedMap || {}).forEach(([mediaId, row]) => {
+          if (!mediaId) return;
+          if (row?.localPath) {
+            nextDownloaded[String(mediaId)] = row.localPath;
+          }
+          nextStates[String(mediaId)] = {
+            mediaId: String(mediaId),
+            status: row?.downloadStatus || MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+            progress: row?.downloadStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED ? 100 : 0,
+            localPath: row?.localPath || null,
+            error: null,
+          };
+        });
+
+        setDownloadedMedia((prev) => ({ ...prev, ...nextDownloaded }));
+        setMediaDownloadStates((prev) => ({ ...prev, ...nextStates }));
+      } catch (error) {
+        console.warn('media download bootstrap failed', error);
+      }
+    };
+
+    bootstrap().catch(() => {});
+
+    const unsubscribe = mediaDownloadManager.subscribe((event) => {
+      if (!mounted || !event?.mediaId) return;
+
+      const mediaId = String(event.mediaId);
+      const state = event?.state || {};
+      const stateStatus = String(state?.status || '').toUpperCase();
+
+      setMediaDownloadStates((prev) => ({
+        ...prev,
+        [mediaId]: {
+          ...(prev[mediaId] || { mediaId, status: MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED, progress: 0 }),
+          status: stateStatus || MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+          progress: Number(state?.progress || 0),
+          localPath: state?.localPath || null,
+          error: state?.error || null,
+          updatedAt: Date.now(),
+        },
+      }));
+
+      if (stateStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADING) {
+        setDownloadProgress((prev) => ({
+          ...prev,
+          [mediaId]: Math.max(0, Math.min(1, Number(state?.progress || 0) / 100)),
+        }));
+      }
+
+      if (stateStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && state?.localPath) {
+        setDownloadedMedia((prev) => ({ ...prev, [mediaId]: state.localPath }));
+        setDownloadProgress((prev) => {
+          const copy = { ...prev };
+          delete copy[mediaId];
+          return copy;
+        });
+      }
+
+      if (stateStatus === MEDIA_DOWNLOAD_STATUS.FAILED) {
+        setDownloadProgress((prev) => {
+          const copy = { ...prev };
+          delete copy[mediaId];
+          return copy;
+        });
+      }
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Color helper
   const pastelColors = [
@@ -195,6 +667,10 @@ export default function useChatLogic({ navigation, route }) {
       if (idleTimeoutRef.current) clearTimeout(idleTimeoutRef.current);
       if (backgroundAwayTimeoutRef.current) clearTimeout(backgroundAwayTimeoutRef.current);
       if (heartbeatIntervalRef.current) clearInterval(heartbeatIntervalRef.current);
+      if (localSaveTimeoutRef.current) {
+        clearTimeout(localSaveTimeoutRef.current);
+        localSaveTimeoutRef.current = null;
+      }
     };
   }, []);
 
@@ -226,6 +702,12 @@ export default function useChatLogic({ navigation, route }) {
       checkAndReconnectSocket();
       if (queuedManualPresenceRef.current.length > 0) {
         flushQueuedManualPresence();
+      }
+      if (queuedMediaStatusRef.current.length > 0) {
+        flushQueuedMediaStatusUpdates();
+      }
+      if (queuedMediaUploadsRef.current.length > 0) {
+        flushQueuedMediaUploadsRef.current();
       }
     } else {
       setUserStatus("offline");
@@ -428,7 +910,7 @@ export default function useChatLogic({ navigation, route }) {
         markMessagesAsRead(unreadOnExit);
       }
 
-      setActiveChat(null);
+      deferRealtimeUpdate(() => setActiveChat(null));
       
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
@@ -503,6 +985,7 @@ export default function useChatLogic({ navigation, route }) {
               markUserOnline("socket-reconnect");
               startHeartbeat();
               flushQueuedManualPresence();
+              flushQueuedMediaStatusUpdates();
               requestUserPresence();
             }
           } else {
@@ -553,14 +1036,18 @@ export default function useChatLogic({ navigation, route }) {
       }
       setChatId(generatedChatId);
       chatIdRef.current = generatedChatId;
-      setActiveChat(generatedChatId);
-      markChatRead(generatedChatId);
+      deferRealtimeUpdate(() => {
+        setActiveChat(generatedChatId);
+        markChatRead(generatedChatId);
+      });
       lastInitializedChatRef.current = generatedChatId;
 
       setMessages([]);
       setAllMessages([]);
 
       await loadQueuedManualPresence();
+      await loadQueuedMediaStatusUpdates();
+      await loadQueuedMediaUploads();
       await loadDeletedTombstones(generatedChatId);
 
       const localCount = await loadMessagesFromLocal(generatedChatId);
@@ -574,10 +1061,14 @@ export default function useChatLogic({ navigation, route }) {
         requestUserPresence();
         socket.emit('user:status', { userId, status: 'online', chatId: generatedChatId });
         socket.emit('chat:join', { chatId: generatedChatId, userId }, (response) => {});
+        // Emit message:read:all — mark all messages as read when user opens the chat
+        socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
         markUserOnline("chat-init");
         startHeartbeat();
         resetIdleTimer();
         flushQueuedManualPresence();
+        flushQueuedMediaStatusUpdates();
+        flushQueuedMediaUploadsRef.current();
         presenceCheckInterval.current = setInterval(() => {
           if (isSocketConnected()) requestUserPresence();
           else checkAndReconnectSocket();
@@ -607,25 +1098,43 @@ export default function useChatLogic({ navigation, route }) {
   /* ========== Local storage helpers ========== */
   const loadMessagesFromLocal = async (chatIdParam) => {
     try {
-      const localKey = `chat_messages_${chatIdParam}`;
+      const localKey = getChatMessagesKey(chatIdParam);
+      if (!localKey) return 0;
       const savedMessages = await AsyncStorage.getItem(localKey);
-      console.log("savedMessages from local - -", savedMessages)
+      const clearedAt = await getChatClearedAt(chatIdParam);
   
       if (!savedMessages) return 0;
   
       const parsed = JSON.parse(savedMessages);
+      const filteredParsed = Array.isArray(parsed)
+        ? parsed.filter((msg) => {
+            const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
+            if (!clearedAt || !ts) return true;
+            return ts > clearedAt;
+          })
+        : [];
       
-      const processed = parsed.map(msg => {
+      const processed = filteredParsed.map(msg => {
         const normalizedSenderId = normalizeId(msg.senderId);
         const normalizedReceiverId = normalizeId(msg.receiverId);
         const normalizedCurrentUser = normalizeId(currentUserIdRef.current);
         const normalizedPeer = normalizeId(chatData?.peerUser?._id);
 
+        // Fix stale 'sending'/'uploaded' status for messages that already have a serverMessageId
+        // This means the upload succeeded but the status wasn't updated before the user left the screen
+        let resolvedStatus = msg.status;
+        if ((resolvedStatus === 'sending' || resolvedStatus === 'uploaded') && msg.serverMessageId && msg.synced) {
+          resolvedStatus = 'sent';
+        }
+
         let base = {
           ...msg,
+          status: resolvedStatus,
           senderId: normalizedSenderId,
           senderType: msg.senderType || computeSenderType(normalizedSenderId, normalizedCurrentUser),
           receiverId: normalizedReceiverId,
+          payload: normalizeMessagePayloadWithDownloadFlag(msg?.type || msg?.mediaType || msg?.messageType || 'text', msg?.payload || {}),
+          isMediaDownloaded: Boolean(msg?.payload?.isMediaDownloaded || msg?.isMediaDownloaded || msg?.localUri),
         };
 
         if (!base.chatId && normalizedCurrentUser && normalizedPeer) {
@@ -697,10 +1206,22 @@ export default function useChatLogic({ navigation, route }) {
     if (s === 'seen') return 'seen';
     if (s === 'delivered') return 'delivered';
     if (s === 'sent') return 'sent';
+    if (s === 'uploaded') return 'uploaded';
     if (s === 'sending') return 'sending';
     if (s === 'failed') return 'failed';
     return undefined;
   }, []);
+
+  const getMessageStatusPriority = useCallback((status) => {
+    const normalized = normalizeMessageStatus(status) || status;
+    if (normalized === 'seen') return 5;
+    if (normalized === 'delivered') return 4;
+    if (normalized === 'sent') return 3;
+    if (normalized === 'uploaded') return 2;
+    if (normalized === 'sending') return 1;
+    if (normalized === 'failed') return 0;
+    return 0;
+  }, [normalizeMessageStatus]);
 
   const deletedKeyForChat = useCallback((chatIdParam) => `${DELETED_TOMBSTONES_PREFIX}${chatIdParam}`, []);
 
@@ -753,7 +1274,16 @@ export default function useChatLogic({ navigation, route }) {
   }, [persistDeletedTombstones]);
 
   const normalizeIncomingMessage = useCallback((apiMsg) => {
+    const mediaMeta = apiMsg?.mediaMeta || apiMsg?.payload?.mediaMeta || {};
     const serverId = apiMsg?._id || apiMsg?.messageId || apiMsg?.id;
+    const normalizedMediaId = normalizeId(
+      apiMsg?.mediaId ||
+      mediaMeta?.mediaId ||
+      apiMsg?.serverMessageId ||
+      apiMsg?._id ||
+      apiMsg?.messageId ||
+      apiMsg?.id
+    );
     const createdAtRaw = apiMsg?.createdAt || apiMsg?.timestamp || new Date().toISOString();
     const createdAt = typeof createdAtRaw === 'number' ? new Date(createdAtRaw).toISOString() : createdAtRaw;
 
@@ -763,17 +1293,77 @@ export default function useChatLogic({ navigation, route }) {
     const normalizedServerId = normalizeId(serverId);
     const tombstone = normalizedServerId ? deletedTombstonesRef.current?.[normalizedServerId] : null;
     const resolvedDeletedFor = apiMsg?.deletedFor ?? apiMsg?.deleteFor ?? apiMsg?.delete_type ?? null;
-    const resolvedIsDeleted = apiMsg?.isDeleted === true || resolvedDeletedFor === 'everyone' || Boolean(tombstone);
+    const resolvedIsDeleted = apiMsg?.isDeleted === true || isDeletedForUser(resolvedDeletedFor, normalizedCurrentUser) || Boolean(tombstone);
     const resolvedDeletedBy = normalizeId(apiMsg?.deletedBy) || normalizeId(tombstone?.deletedBy) || null;
     const isDeletedBySelf = sameId(resolvedDeletedBy, normalizedCurrentUser);
     const resolvedPlaceholderText = apiMsg?.placeholderText || tombstone?.placeholderText || buildDeletePlaceholderText(isDeletedBySelf);
+
+    const incomingRawType = String(apiMsg?.messageType || apiMsg?.fileCategory || apiMsg?.type || '').toLowerCase();
+    const incomingCategory = String(apiMsg?.fileCategory || mediaMeta?.fileCategory || '').toLowerCase();
+    const hasMediaHints = Boolean(
+      apiMsg?.mediaUrl ||
+      apiMsg?.mediaThumbnailUrl ||
+      apiMsg?.url ||
+      apiMsg?.previewUrl ||
+      apiMsg?.thumbnailUrl ||
+      apiMsg?.payload?.mediaUrl ||
+      apiMsg?.payload?.mediaThumbnailUrl ||
+      apiMsg?.payload?.previewUrl ||
+      apiMsg?.payload?.thumbnailUrl ||
+      apiMsg?.payload?.file?.uri ||
+      apiMsg?.payload?.file?.url ||
+      apiMsg?.payload?.file?.previewUrl ||
+      apiMsg?.payload?.file?.thumbnailUrl ||
+      apiMsg?.payload?.fileName ||
+      apiMsg?.mimeType
+    );
+    const resolvedMessageType = incomingRawType === 'media'
+      ? (incomingCategory || 'file')
+      : (isMediaMessageType(incomingRawType)
+        ? incomingRawType
+        : (ENUM_MESSAGE_TYPES.has(incomingRawType)
+          ? incomingRawType
+          : (hasMediaHints ? 'file' : 'text')));
+    const payloadFile = apiMsg?.payload?.file || {};
+    const resolvedMediaUrl =
+      apiMsg?.mediaUrl ||
+      apiMsg?.payload?.mediaUrl ||
+      apiMsg?.previewUrl ||
+      apiMsg?.payload?.previewUrl ||
+      apiMsg?.url ||
+      payloadFile?.url ||
+      payloadFile?.uri ||
+      null;
+    const resolvedMediaThumbnailUrl =
+      apiMsg?.mediaThumbnailUrl ||
+      apiMsg?.payload?.mediaThumbnailUrl ||
+      apiMsg?.thumbnailUrl ||
+      apiMsg?.payload?.thumbnailUrl ||
+      payloadFile?.thumbnailUrl ||
+      payloadFile?.previewUrl ||
+      apiMsg?.previewUrl ||
+      apiMsg?.payload?.previewUrl ||
+      resolvedMediaUrl;
+    const incomingLocalUri = apiMsg?.localUri || apiMsg?.payload?.localUri || apiMsg?.payload?.file?.uri || null;
+    const normalizedPayload = normalizeMessagePayloadWithDownloadFlag(
+      resolvedMessageType,
+      {
+        ...(apiMsg?.payload || {}),
+        isMediaDownloaded: Boolean(
+          apiMsg?.payload?.isMediaDownloaded ||
+          apiMsg?.isMediaDownloaded ||
+          incomingLocalUri
+        ),
+      }
+    );
 
     console.log({
         id: serverId,
         serverMessageId: serverId,
         tempId: serverId,
-        type: apiMsg?.messageType || apiMsg?.fileCategory || apiMsg?.type || "text",
-        mediaType: apiMsg?.fileCategory || null,
+      mediaId: normalizedMediaId,
+        type: resolvedMessageType,
+        mediaType: apiMsg?.fileCategory || (isMediaMessageType(resolvedMessageType) ? resolvedMessageType : null),
         text: apiMsg?.text || apiMsg?.content || "",
         time: moment(createdAt).format("hh:mm A"),
         date: moment(createdAt).format("YYYY-MM-DD"),
@@ -783,12 +1373,14 @@ export default function useChatLogic({ navigation, route }) {
         status: sameId(normalizedSenderId, normalizedCurrentUser)
           ? (normalizeMessageStatus(apiMsg?.status) || "sent")
           : normalizeMessageStatus(apiMsg?.status),
-        mediaUrl: apiMsg?.mediaUrl || apiMsg?.url || null,
-        previewUrl: apiMsg?.previewUrl || apiMsg?.thumbnailUrl || apiMsg?.mediaUrl || apiMsg?.url || null,
+        mediaUrl: resolvedMediaUrl,
+        mediaThumbnailUrl: resolvedMediaThumbnailUrl,
+        previewUrl: incomingLocalUri || resolvedMediaThumbnailUrl || resolvedMediaUrl,
         createdAt,
         timestamp: new Date(createdAt).getTime(),
         synced: true,
         chatId: apiMsg?.chatId || chatIdRef.current,
+        isMediaDownloaded: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri),
         isDeleted: resolvedIsDeleted,
         deletedFor: resolvedDeletedFor,
         deletedBy: resolvedDeletedBy,
@@ -799,8 +1391,9 @@ export default function useChatLogic({ navigation, route }) {
       id: serverId,
       serverMessageId: serverId,
       tempId: serverId,
-      type: apiMsg?.messageType || apiMsg?.fileCategory || apiMsg?.type || "text",
-      mediaType: apiMsg?.fileCategory || null,
+      mediaId: normalizedMediaId,
+      type: resolvedMessageType,
+      mediaType: apiMsg?.fileCategory || (isMediaMessageType(resolvedMessageType) ? resolvedMessageType : null),
       text: apiMsg?.text || apiMsg?.content || "",
       time: moment(createdAt).format("hh:mm A"),
       date: moment(createdAt).format("YYYY-MM-DD"),
@@ -810,12 +1403,20 @@ export default function useChatLogic({ navigation, route }) {
       status: sameId(normalizedSenderId, normalizedCurrentUser)
         ? (normalizeMessageStatus(apiMsg?.status) || "sent")
         : normalizeMessageStatus(apiMsg?.status),
-      mediaUrl: apiMsg?.mediaUrl || apiMsg?.url || null,
-      previewUrl: apiMsg?.previewUrl || apiMsg?.thumbnailUrl || apiMsg?.mediaUrl || apiMsg?.url || null,
+      mediaUrl: resolvedMediaUrl,
+      mediaThumbnailUrl: resolvedMediaThumbnailUrl,
+      previewUrl: incomingLocalUri || resolvedMediaThumbnailUrl || resolvedMediaUrl,
       createdAt,
       timestamp: new Date(createdAt).getTime(),
       synced: true,
       chatId: apiMsg?.chatId || chatIdRef.current,
+      localUri: incomingLocalUri,
+      payload: normalizedPayload,
+      mediaMeta,
+      isMediaDownloaded: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri),
+      downloadStatus: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri)
+        ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
+        : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
       isDeleted: resolvedIsDeleted,
       deletedFor: resolvedDeletedFor,
       deletedBy: resolvedDeletedBy,
@@ -859,6 +1460,12 @@ export default function useChatLogic({ navigation, route }) {
           const existing = mergedMessages[existingIndex];
           const keepDeletedPlaceholder = existing?.isDeleted === true && formattedMessage?.isDeleted !== true;
 
+          const mergedLocalUri = keepDeletedPlaceholder ? null : (formattedMessage.localUri || existing?.localUri || null);
+          const mergedPayload = mergePayloadKeepingDownloadState(existing, {
+            ...formattedMessage,
+            localUri: mergedLocalUri,
+          });
+
           mergedMessages[existingIndex] = {
             ...existing,
             ...formattedMessage,
@@ -869,7 +1476,12 @@ export default function useChatLogic({ navigation, route }) {
             type: keepDeletedPlaceholder ? (existing?.type || 'system') : formattedMessage.type,
             mediaUrl: keepDeletedPlaceholder ? null : formattedMessage.mediaUrl,
             previewUrl: keepDeletedPlaceholder ? null : formattedMessage.previewUrl,
-            localUri: keepDeletedPlaceholder ? null : (formattedMessage.localUri || existing?.localUri || null),
+            localUri: mergedLocalUri,
+            payload: mergedPayload,
+            isMediaDownloaded: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri),
+            downloadStatus: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri)
+              ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
+              : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
           };
         } else {
           mergedMessages.push(formattedMessage);
@@ -881,7 +1493,7 @@ export default function useChatLogic({ navigation, route }) {
       saveMessagesToLocal(sorted);
       return sorted;
     });
-  }, [deduplicateMessages, normalizeIncomingMessage, saveMessagesToLocal]);
+  }, [deduplicateMessages, mergePayloadKeepingDownloadState, normalizeIncomingMessage, saveMessagesToLocal]);
 
   const replaceMessagesForChat = useCallback((incomingMessages = [], targetChatId = null) => {
     const effectiveChatId = targetChatId || chatIdRef.current;
@@ -902,7 +1514,7 @@ export default function useChatLogic({ navigation, route }) {
       );
 
       const preservedDeleted = existingSameChat.filter((msg) => {
-        const isDeletedMessage = Boolean(msg?.isDeleted) || msg?.deletedFor === 'everyone' || msg?.type === 'system';
+        const isDeletedMessage = Boolean(msg?.isDeleted) || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system';
         if (!isDeletedMessage) return false;
         const msgId = normalizeId(msg?.serverMessageId || msg?.id || msg?.tempId);
         if (!msgId) return false;
@@ -929,10 +1541,11 @@ export default function useChatLogic({ navigation, route }) {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return;
 
     const socket = socketRef.current || getSocket();
-    if (socket && isSocketConnected() && chatIdRef.current) {
+    if (socket && isSocketConnected() && chatIdRef.current && currentUserIdRef.current) {
       socket.emit('message:read:bulk', {
         chatId: chatIdRef.current,
         messageIds,
+        senderId: currentUserIdRef.current,
         timestamp: Date.now(),
       });
     }
@@ -948,9 +1561,15 @@ export default function useChatLogic({ navigation, route }) {
     });
 
     if (chatIdRef.current) {
-      markChatRead(chatIdRef.current);
+      const targetChatId = chatIdRef.current;
+      // Defer provider update to next macrotask to avoid render-phase update warnings.
+      deferRealtimeUpdate(() => {
+        if (targetChatId) {
+          markChatRead(targetChatId);
+        }
+      });
     }
-  }, [markChatRead, saveMessagesToLocal]);
+  }, [markChatRead, saveMessagesToLocal, deferRealtimeUpdate]);
 
   const markVisibleIncomingAsRead = useCallback((visibleMessageIds = []) => {
     if (!Array.isArray(visibleMessageIds) || visibleMessageIds.length === 0) return;
@@ -974,11 +1593,18 @@ export default function useChatLogic({ navigation, route }) {
       if (unreadVisibleIds.length === 0) return;
 
       const socket = socketRef.current || getSocket();
-      if (socket && isSocketConnected() && chatIdRef.current && unreadVisibleIds.length === 1) {
+      if (socket && isSocketConnected() && chatIdRef.current && currentUserIdRef.current && unreadVisibleIds.length === 1) {
         socket.emit('message:read', {
           messageId: unreadVisibleIds[0],
           chatId: chatIdRef.current,
+          senderId: currentUserIdRef.current,
           timestamp: Date.now(),
+        });
+
+        // Also emit message:seen for the visible message
+        socket.emit('message:seen', {
+          messageId: unreadVisibleIds[0],
+          chatId: chatIdRef.current,
         });
       }
 
@@ -1010,21 +1636,43 @@ export default function useChatLogic({ navigation, route }) {
 
   const deduplicateMessages = useCallback((messagesArray) => {
     const uniqueMap = new Map();
+    // Track tempId→serverMessageId links so temp and server versions merge
+    const tempToServerMap = new Map();
 
     messagesArray.forEach(msg => {
-      const key =
+      // Build cross-reference: if a message has both tempId and serverMessageId, link them
+      if (msg.tempId && msg.serverMessageId && msg.tempId !== msg.serverMessageId) {
+        tempToServerMap.set(msg.tempId, msg.serverMessageId);
+      }
+    });
+
+    messagesArray.forEach(msg => {
+      const sender = normalizeId(msg?.senderId) || 'unknown';
+      const receiver = normalizeId(msg?.receiverId) || 'unknown';
+      const type = (msg?.type || msg?.messageType || 'text').toString();
+      const tsBucket = Number(msg?.timestamp || 0);
+      const textBucket = (msg?.text || '').toString().slice(0, 48);
+
+      // Primary key: prefer serverMessageId, then check if tempId maps to a known serverMessageId
+      let key =
         msg.serverMessageId ||
+        (msg.tempId && tempToServerMap.get(msg.tempId)) ||
         msg.id ||
         msg.tempId ||
-        `${msg.senderId}_${msg.timestamp}`;
+        `${sender}_${receiver}_${type}_${tsBucket}_${textBucket}`;
 
       if (!key) return;
 
       if (uniqueMap.has(key)) {
         const existing = uniqueMap.get(key);
 
+        // Prefer the version with serverMessageId (server-confirmed)
         if (msg.serverMessageId && !existing.serverMessageId) {
-          uniqueMap.set(key, msg);
+          // Merge: keep localUri from existing if new doesn't have it
+          const merged = { ...msg };
+          if (existing.localUri && !merged.localUri) merged.localUri = existing.localUri;
+          if (existing.previewUrl && !merged.previewUrl) merged.previewUrl = existing.previewUrl;
+          uniqueMap.set(key, merged);
           return;
         }
 
@@ -1049,21 +1697,40 @@ export default function useChatLogic({ navigation, route }) {
   const saveMessagesToLocal = useCallback(async (msgs) => {
     try {
       if (!chatIdRef.current || !msgs) return;
-      const localKey = `chat_messages_${chatIdRef.current}`;
-      
+      const localKey = getChatMessagesKey(chatIdRef.current);
+      if (!localKey) return;
+
       const uniqueMessages = deduplicateMessages(msgs);
       const messagesToSave = uniqueMessages.slice(0, MAX_LOCAL_SAVE);
-      
-      console.log('💾 [SAVE TO LOCAL] Saving', messagesToSave.length, 'messages');
-      
+
       const cleanMessages = messagesToSave.map(msg => ({
         ...msg,
         senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
         localUri: msg.localUri || null,
       }));
-      
-      await AsyncStorage.setItem(localKey, JSON.stringify(cleanMessages));
-      console.log('💾 [SAVE TO LOCAL] Save complete');
+
+      if (localSaveTimeoutRef.current) {
+        clearTimeout(localSaveTimeoutRef.current);
+      }
+
+      localSaveTimeoutRef.current = setTimeout(async () => {
+        try {
+          const clearedAt = await getChatClearedAt(chatIdRef.current);
+          const newestTimestamp = cleanMessages.reduce((latest, msg) => {
+            const candidate = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
+            return candidate > latest ? candidate : latest;
+          }, 0);
+
+          if (clearedAt > 0 && newestTimestamp > 0 && newestTimestamp <= clearedAt) {
+            await AsyncStorage.setItem(localKey, JSON.stringify([]));
+            return;
+          }
+
+          await AsyncStorage.setItem(localKey, JSON.stringify(cleanMessages));
+        } catch (err) {
+          console.error("Failed to save to local storage:", err);
+        }
+      }, LOCAL_SAVE_DEBOUNCE_MS);
     } catch (err) {
       console.error("Failed to save to local storage:", err);
     }
@@ -1072,7 +1739,8 @@ export default function useChatLogic({ navigation, route }) {
   const applyDeleteToLocalStorage = useCallback(async (messageId, isDeletedForEveryone, options = {}) => {
     try {
       if (!chatIdRef.current || !messageId) return;
-      const localKey = `chat_messages_${chatIdRef.current}`;
+      const localKey = getChatMessagesKey(chatIdRef.current);
+      if (!localKey) return;
       const savedMessages = await AsyncStorage.getItem(localKey);
       if (!savedMessages) return;
 
@@ -1120,7 +1788,10 @@ export default function useChatLogic({ navigation, route }) {
         return { ok: false, updated: false, reason: 'missing-required-fields' };
       }
 
-      const localKey = `chat_messages_${normalizedChatId}`;
+      const localKey = getChatMessagesKey(normalizedChatId);
+      if (!localKey) {
+        return { ok: false, updated: false, reason: 'invalid-local-key' };
+      }
       const savedMessages = await AsyncStorage.getItem(localKey);
       if (!savedMessages) {
         return { ok: true, updated: false, reason: 'chat-not-found', localKey };
@@ -1211,7 +1882,7 @@ export default function useChatLogic({ navigation, route }) {
       })
       .sort((a, b) => Number(b?.timestamp || 0) - Number(a?.timestamp || 0));
 
-    const latestVisible = sameChatMessages.find((msg) => !(msg?.isDeleted || msg?.deletedFor === 'everyone' || msg?.type === 'system'));
+    const latestVisible = sameChatMessages.find((msg) => !(msg?.isDeleted || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system'));
 
     if (latestVisible) {
       updateLocalLastMessagePreview({
@@ -1247,6 +1918,122 @@ export default function useChatLogic({ navigation, route }) {
     });
   }, [updateLocalLastMessagePreview, chatData?.peerUser?._id]);
 
+  const applyChatClearedLocally = useCallback(async (targetChatId, scope = 'me') => {
+    const normalizedChatId = normalizeId(targetChatId || chatIdRef.current);
+    if (!normalizedChatId) return;
+
+    const isCurrentChat = sameId(normalizedChatId, chatIdRef.current);
+    deferRealtimeUpdate(() => markChatRead(normalizedChatId));
+
+    if (isCurrentChat) {
+      if (localSaveTimeoutRef.current) {
+        clearTimeout(localSaveTimeoutRef.current);
+        localSaveTimeoutRef.current = null;
+      }
+      setMessages([]);
+      setAllMessages([]);
+      setHasMoreMessages(false);
+      setCurrentPage(1);
+    }
+
+    try {
+      await clearChatLocalArtifacts(normalizedChatId, { markCleared: true });
+      await AsyncStorage.removeItem(deletedKeyForChat(normalizedChatId));
+      if (isCurrentChat) {
+        deletedTombstonesRef.current = {};
+      }
+    } catch (error) {
+      console.error('applyChatClearedLocally storage cleanup error', error);
+    }
+
+    updateLocalLastMessagePreview({
+      chatId: normalizedChatId,
+      lastMessage: {
+        text: scope === 'everyone' ? 'Chat cleared' : 'No messages yet',
+        type: 'text',
+        senderId: null,
+        status: null,
+        createdAt: null,
+        isDeleted: false,
+      },
+      lastMessageAt: null,
+      lastMessageType: 'text',
+      lastMessageSender: null,
+    });
+  }, [deletedKeyForChat, markChatRead, updateLocalLastMessagePreview, deferRealtimeUpdate]);
+
+  const clearChatForMe = useCallback(async () => {
+    const targetChatId = normalizeId(chatIdRef.current);
+    const userId = normalizeId(currentUserIdRef.current);
+    if (!targetChatId || !userId) {
+      throw new Error('Missing chat or user id');
+    }
+
+    try {
+      const response = await apiCall('POST', 'user/chat/clear/me', {
+        chatId: targetChatId,
+        userId,
+      });
+
+      const hasFailure = response && (
+        response.success === false ||
+        response.status === false ||
+        response.ok === false ||
+        response.error
+      );
+      if (hasFailure) {
+        throw new Error(response?.message || 'clear/me failed');
+      }
+      const clearType = String(response?.clearType || response?.data?.clearType || '').toLowerCase();
+      if (clearType && clearType !== 'me') {
+        throw new Error(`Unexpected clearType: ${clearType}`);
+      }
+
+      await removeMessagesByChatId(targetChatId);
+      await applyChatClearedLocally(targetChatId, 'me');
+      return { success: true };
+    } catch (error) {
+      console.error('clearChatForMe API error', error);
+      throw error;
+    }
+  }, [applyChatClearedLocally]);
+
+  const clearChatForEveryone = useCallback(async () => {
+    const targetChatId = normalizeId(chatIdRef.current);
+    const userId = normalizeId(currentUserIdRef.current);
+    if (!targetChatId || !userId) {
+      throw new Error('Missing chat or user id');
+    }
+
+    try {
+      const response = await apiCall('POST', 'user/chat/clear/everyone', {
+        chatId: targetChatId,
+        userId,
+      });
+
+      const hasFailure = response && (
+        response.success === false ||
+        response.status === false ||
+        response.ok === false ||
+        response.error
+      );
+      if (hasFailure) {
+        throw new Error(response?.message || 'clear/everyone failed');
+      }
+      const clearType = String(response?.clearType || response?.data?.clearType || '').toLowerCase();
+      if (clearType && clearType !== 'everyone') {
+        throw new Error(`Unexpected clearType: ${clearType}`);
+      }
+
+      await removeMessagesByChatId(targetChatId);
+      await applyChatClearedLocally(targetChatId, 'everyone');
+      return { success: true };
+    } catch (error) {
+      console.error('clearChatForEveryone API error', error);
+      throw error;
+    }
+  }, [applyChatClearedLocally]);
+
   /* ========== API fetch handler ========= */
   const fetchMessagesFromAPI = async (chatIdParam) => {
     try {
@@ -1266,12 +2053,18 @@ export default function useChatLogic({ navigation, route }) {
     const force = options?.force === true;
     const syncOnly = options?.syncOnly === true;
 
-    const latestTs = allMessages.reduce((acc, msg) => {
+    const latestMessage = allMessages.reduce((candidate, msg) => {
       const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
-      return Math.max(acc, Number.isNaN(ts) ? 0 : ts);
-    }, 0);
+      if (!candidate) return { msg, ts };
+      return ts > candidate.ts ? { msg, ts } : candidate;
+    }, null);
 
-    const syncFromTs = Math.max(lastMessageSyncAtRef.current || 0, latestTs || 0);
+    const lastMessageId = String(
+      latestMessage?.msg?.serverMessageId ||
+      latestMessage?.msg?.id ||
+      latestMessage?.msg?.tempId ||
+      ''
+    ) || null;
 
     if (!syncOnly) {
       socket.emit('message:fetch', {
@@ -1292,7 +2085,8 @@ export default function useChatLogic({ navigation, route }) {
     if (!force) {
       socket.emit('message:sync', {
         chatId: chatIdParam,
-        fromTimestamp: syncFromTs || 0,
+        lastMessageId,
+        limit: Number(limit) > 0 ? Number(limit) : 50,
       });
     }
   }, [allMessages]);
@@ -1344,6 +2138,11 @@ export default function useChatLogic({ navigation, route }) {
         if (existingIndex !== -1) {
           const existing = mergedMessages[existingIndex];
           const keepDeletedPlaceholder = existing?.isDeleted === true && formattedMessage?.isDeleted !== true;
+          const mergedLocalUri = keepDeletedPlaceholder ? null : (formattedMessage.localUri || existing?.localUri || null);
+          const mergedPayload = mergePayloadKeepingDownloadState(existing, {
+            ...formattedMessage,
+            localUri: mergedLocalUri,
+          });
 
           mergedMessages[existingIndex] = {
             ...existing,
@@ -1355,7 +2154,12 @@ export default function useChatLogic({ navigation, route }) {
             type: keepDeletedPlaceholder ? (existing?.type || 'system') : formattedMessage.type,
             mediaUrl: keepDeletedPlaceholder ? null : formattedMessage.mediaUrl,
             previewUrl: keepDeletedPlaceholder ? null : formattedMessage.previewUrl,
-            localUri: keepDeletedPlaceholder ? null : (formattedMessage.localUri || existing?.localUri || null),
+            localUri: mergedLocalUri,
+            payload: mergedPayload,
+            isMediaDownloaded: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri),
+            downloadStatus: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri)
+              ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
+              : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
           };
         } else {
           mergedMessages.push(formattedMessage);
@@ -1377,12 +2181,13 @@ export default function useChatLogic({ navigation, route }) {
       return sorted;
     });
 
-  }, [deduplicateMessages, saveMessagesToLocal, normalizeIncomingMessage]);
+  }, [deduplicateMessages, saveMessagesToLocal, normalizeIncomingMessage, mergePayloadKeepingDownloadState]);
 
   const syncMessagesToAPI = async () => {
     try {
       if (!chatIdRef.current) return;
-      const localKey = `chat_messages_${chatIdRef.current}`;
+      const localKey = getChatMessagesKey(chatIdRef.current);
+      if (!localKey) return;
       const savedMessages = await AsyncStorage.getItem(localKey);
       if (!savedMessages) return;
       const parsedMessages = JSON.parse(savedMessages);
@@ -1560,6 +2365,204 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, []);
 
+  const emitMediaStatusUpdate = useCallback((payload) => {
+    return new Promise((resolve, reject) => {
+      const socket = socketRef.current || getSocket();
+      if (!socket || !isSocketConnected()) {
+        reject(new Error('socket_not_connected'));
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        reject(new Error('media_status_timeout'));
+      }, MEDIA_STATUS_ACK_TIMEOUT_MS);
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        socket.off('message:media:update:response', onResponse);
+      };
+
+      const matchesPayload = (source = {}) => {
+        const responseMessageId = normalizeId(source?.messageId || source?.id || source?._id);
+        const responseChatId = normalizeId(source?.chatId || source?.chat || source?.roomId);
+        return sameId(responseMessageId, payload?.messageId) && sameId(responseChatId, payload?.chatId);
+      };
+
+      const onResponse = (responseData) => {
+        const source = responseData?.data || responseData || {};
+        if (!matchesPayload(source)) return;
+        cleanup();
+        if (source?.status === false || source?.success === false || responseData?.status === false) {
+          reject(new Error(source?.message || responseData?.message || 'media_status_update_failed'));
+          return;
+        }
+        resolve(responseData);
+      };
+
+      socket.on('message:media:update:response', onResponse);
+
+      socket.emit('message:media:update', payload, (ack) => {
+        if (!ack) return;
+        const ackSource = ack?.data || ack;
+        if (!matchesPayload(ackSource)) return;
+        cleanup();
+        if (ack?.status === false || ackSource?.status === false || ackSource?.success === false) {
+          reject(new Error(ackSource?.message || ack?.message || 'media_status_update_failed'));
+          return;
+        }
+        resolve(ack);
+      });
+    });
+  }, []);
+
+  const flushQueuedMediaStatusUpdates = useCallback(async () => {
+    if (mediaStatusInFlightRef.current) return;
+
+    const socket = socketRef.current || getSocket();
+    if (!socket || !isSocketConnected() || !isConnected) {
+      return;
+    }
+
+    mediaStatusInFlightRef.current = true;
+    try {
+      const nowTs = Date.now();
+      const queue = [...(queuedMediaStatusRef.current || [])];
+      const nextQueue = [];
+
+      for (const queued of queue) {
+        const normalizedMessageId = normalizeId(queued?.messageId);
+        const normalizedChatId = normalizeId(queued?.chatId);
+        const eventKey = buildMediaStatusEventKey(normalizedChatId, normalizedMessageId);
+
+        if (!normalizedMessageId || !normalizedChatId) {
+          continue;
+        }
+
+        const messageDeleted = allMessages.some((msg) => {
+          const msgId = normalizeId(msg?.serverMessageId || msg?.id || msg?.tempId || msg?.mediaId);
+          if (!sameId(msgId, normalizedMessageId)) return false;
+          return msg?.isDeleted || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system';
+        });
+        if (messageDeleted) {
+          if (eventKey) mediaStatusProcessedRef.current.delete(eventKey);
+          continue;
+        }
+
+        if (Number(queued?.nextAttemptAt || 0) > nowTs) {
+          nextQueue.push(queued);
+          continue;
+        }
+
+        try {
+          await emitMediaStatusUpdate({
+            messageId: normalizedMessageId,
+            chatId: normalizedChatId,
+            deviceId: queued?.deviceId,
+            isMediaDownloaded: true,
+          });
+          if (eventKey) mediaStatusProcessedRef.current.add(eventKey);
+        } catch (error) {
+          const attempts = Number(queued?.attempts || 0) + 1;
+          const cappedAttempts = Math.min(attempts, MEDIA_STATUS_MAX_RETRIES);
+          const retryDelay = MEDIA_STATUS_BASE_RETRY_DELAY_MS * Math.pow(2, Math.max(0, cappedAttempts - 1));
+          nextQueue.push({
+            ...queued,
+            attempts: cappedAttempts,
+            nextAttemptAt: Date.now() + retryDelay,
+            lastError: error?.message || 'media_status_update_failed',
+          });
+        }
+      }
+
+      queuedMediaStatusRef.current = nextQueue;
+      await persistMediaStatusQueue(nextQueue);
+    } finally {
+      mediaStatusInFlightRef.current = false;
+    }
+  }, [allMessages, buildMediaStatusEventKey, emitMediaStatusUpdate, isConnected, persistMediaStatusQueue]);
+
+  const queueMediaStatusUpdate = useCallback(async ({ messageId, chatId: targetChatId, deviceId, isMediaDownloaded = true }) => {
+    const normalizedMessageId = normalizeId(messageId);
+    const normalizedChatId = normalizeId(targetChatId || chatIdRef.current);
+    if (!normalizedMessageId || !normalizedChatId || !isMediaDownloaded) return;
+
+    const eventKey = buildMediaStatusEventKey(normalizedChatId, normalizedMessageId);
+    if (!eventKey) return;
+
+    const existingQueue = [...(queuedMediaStatusRef.current || [])];
+    const existingIdx = existingQueue.findIndex((item) => (
+      sameId(item?.messageId, normalizedMessageId) && sameId(item?.chatId, normalizedChatId)
+    ));
+
+    const queueItem = {
+      messageId: normalizedMessageId,
+      chatId: normalizedChatId,
+      deviceId,
+      isMediaDownloaded: true,
+      attempts: 0,
+      nextAttemptAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    if (existingIdx >= 0) {
+      existingQueue[existingIdx] = {
+        ...existingQueue[existingIdx],
+        ...queueItem,
+      };
+    } else if (!mediaStatusProcessedRef.current.has(eventKey)) {
+      existingQueue.push(queueItem);
+    }
+
+    queuedMediaStatusRef.current = existingQueue;
+    await persistMediaStatusQueue(existingQueue);
+    await flushQueuedMediaStatusUpdates();
+  }, [buildMediaStatusEventKey, flushQueuedMediaStatusUpdates, persistMediaStatusQueue]);
+
+  const retryMediaStatusUpdate = useCallback(async ({ messageId, chatId: targetChatId }) => {
+    const normalizedMessageId = normalizeId(messageId);
+    const normalizedChatId = normalizeId(targetChatId || chatIdRef.current);
+    if (!normalizedMessageId || !normalizedChatId) return;
+
+    const deviceId = await getOrCreateDeviceId();
+    const nextQueue = [...(queuedMediaStatusRef.current || [])];
+    const idx = nextQueue.findIndex((item) => (
+      sameId(item?.messageId, normalizedMessageId) && sameId(item?.chatId, normalizedChatId)
+    ));
+
+    const patch = {
+      messageId: normalizedMessageId,
+      chatId: normalizedChatId,
+      deviceId,
+      isMediaDownloaded: true,
+      attempts: 0,
+      nextAttemptAt: Date.now(),
+      lastError: null,
+      updatedAt: Date.now(),
+    };
+
+    if (idx >= 0) {
+      nextQueue[idx] = { ...nextQueue[idx], ...patch };
+    } else {
+      nextQueue.push(patch);
+    }
+
+    queuedMediaStatusRef.current = nextQueue;
+    await persistMediaStatusQueue(nextQueue);
+    await flushQueuedMediaStatusUpdates();
+  }, [flushQueuedMediaStatusUpdates, getOrCreateDeviceId, persistMediaStatusQueue]);
+
+  const retryAllFailedMediaStatusUpdates = useCallback(async () => {
+    const nextQueue = (queuedMediaStatusRef.current || []).map((item) => ({
+      ...item,
+      nextAttemptAt: Date.now(),
+      lastError: null,
+    }));
+    queuedMediaStatusRef.current = nextQueue;
+    await persistMediaStatusQueue(nextQueue);
+    await flushQueuedMediaStatusUpdates();
+  }, [flushQueuedMediaStatusUpdates, persistMediaStatusQueue]);
+
   const requestUserPresence = useCallback(() => {
     const socket = socketRef.current || getSocket();
     if (!socket || !isSocketConnected() || !chatData.peerUser?._id) {
@@ -1655,67 +2658,57 @@ export default function useChatLogic({ navigation, route }) {
   /* ========== Socket listeners setup ========== */
   const removeSocketListeners = useCallback((socket) => {
     if (!socket) return;
-    socket.off('message:sent:ack');
-    socket.off('message:sent');
-    socket.off('message:new');
-    socket.off('message:received');
-    socket.off('message:delivered');
-    socket.off('message:read');
-    socket.off('message:read:bulk');
-    socket.off('message:status');
-    socket.off('message:fetch:response');
-    socket.off('message:sync:response');
-    socket.off('message:deleted');
-    // socket.off('message:delete:sync');
-    socket.off('message:delete:everyone');
-    socket.off('message:delete:me');
-    socket.off('message:delete:response');
-    socket.off('message:delete:everyone:response');
-    socket.off('message:delete:me:response');
-    socket.off('presence:update');
-    socket.off('presence:get:response');
-    socket.off('presence:status:response');
-    socket.off('presence:manual:updated');
-    socket.off('user:online');
-    socket.off('user:offline');
-    socket.off('typing:start');
-    socket.off('typing:stop');
-    socket.off('typing:recording');
-    socket.off('typing:recording:update');
-    socket.off('disconnect');
-    socket.off('connect');
+
+    socketHandlerRegistryRef.current.forEach((handlers, eventName) => {
+      handlers.forEach((handler) => {
+        socket.off(eventName, handler);
+      });
+    });
+
+    socketHandlerRegistryRef.current.clear();
   }, []);
 
   // FIXED: Setup socket listeners with proper typing handlers
   const setupSocketListeners = useCallback((socket, currentChatId) => {
     removeSocketListeners(socket);
 
-    socket.on('message:sent:ack', (data) => {
+    const registerSocketHandler = (eventName, handler) => {
+      if (!eventName || typeof handler !== 'function') return;
+      socket.on(eventName, handler);
+      const existing = socketHandlerRegistryRef.current.get(eventName) || new Set();
+      existing.add(handler);
+      socketHandlerRegistryRef.current.set(eventName, existing);
+    };
+
+    const onMessageSentAck = (data) => {
       const messageId = data.messageId || data._id || data.data?.messageId || data.data?._id;
       const tempId = data.tempId || data.data?.tempId;
       if (data.persistenceConfirmed === true || data.status === true || messageId) {
         updateMessageStatus(tempId, 'sent', { messageId, ...data });
       }
-    });
+    };
+    registerSocketHandler('message:sent:ack', onMessageSentAck);
 
-    socket.on('message:sent', (data) => {
+    const onMessageSent = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id;
       const tempId = source?.tempId;
       if (tempId || messageId) {
         updateMessageStatus(tempId || messageId, 'sent', { messageId, ...source });
       }
-    });
+    };
+    registerSocketHandler('message:sent', onMessageSent);
 
-    socket.on('message:new', (data) => {
+    const onMessageNew = (data) => {
       const chatInPayload = data.chatId || data.chat || data.roomId;
       if (chatInPayload && chatInPayload !== currentChatId) return;
       handleReceivedMessage(data);
-    });
+    };
+    registerSocketHandler('message:new', onMessageNew);
 
-    socket.on('message:received', (data) => { handleReceivedMessage(data); });
-    socket.on('message:delivered', (data) => { if (data.messageId) updateMessageStatus(data.messageId, 'delivered', data); });
-    socket.on('message:read', (data) => {
+    const onMessageReceived = (data) => { handleReceivedMessage(data); };
+    const onMessageDelivered = (data) => { if (data.messageId) updateMessageStatus(data.messageId, 'delivered', data); };
+    const onMessageRead = (data) => {
       const source = data?.data || data;
       if (source?.messageId) {
         updateMessageStatus(source.messageId, 'seen', source);
@@ -1725,44 +2718,219 @@ export default function useChatLogic({ navigation, route }) {
       const sourceChatId = source?.chatId || source?.chat;
       if (sourceChatId && sourceChatId === currentChatId) {
         setAllMessages(prev => {
+          let changed = false;
           const updated = prev.map(msg => {
             const isMine = msg.senderId === currentUserIdRef.current;
             if (!isMine) return msg;
             if (msg.status === 'sent' || msg.status === 'delivered') {
+              changed = true;
               return { ...msg, status: 'seen' };
             }
             return msg;
           });
-          saveMessagesToLocal(updated);
-          return updated;
+          if (changed) {
+            saveMessagesToLocal(updated);
+            updateChatListLastMessagePreview(updated);
+            return updated;
+          }
+          return prev;
         });
       }
-    });
-    socket.on('message:read:bulk', (data) => {
+    };
+    registerSocketHandler('message:received', onMessageReceived);
+    registerSocketHandler('message:delivered', onMessageDelivered);
+    registerSocketHandler('message:read', onMessageRead);
+
+    const onMessageReadBulk = (data) => {
       const source = data?.data || data;
       const messageIds = Array.isArray(source?.messageIds) ? source.messageIds : [];
       if (messageIds.length > 0) {
         setAllMessages(prev => {
+          const idSet = new Set(messageIds.map((id) => String(id)));
+          let changed = false;
           const updated = prev.map(msg => {
-            const id = msg.serverMessageId || msg.id || msg.tempId;
-            if (!messageIds.includes(id)) return msg;
+            const id = String(msg.serverMessageId || msg.id || msg.tempId || '');
+            if (!idSet.has(id)) return msg;
+            if (msg.status === 'seen' || msg.status === 'read') return msg;
+            changed = true;
             return { ...msg, status: 'seen' };
           });
-          saveMessagesToLocal(updated);
-          return updated;
+          if (changed) {
+            saveMessagesToLocal(updated);
+            updateChatListLastMessagePreview(updated);
+            return updated;
+          }
+          return prev;
         });
       }
-    });
+    };
+    registerSocketHandler('message:read:bulk', onMessageReadBulk);
 
-    socket.on('message:status', (data) => {
+    const onMessageStatus = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId;
       const status = source?.status;
       if (!messageId || !status) return;
       updateMessageStatus(messageId, status, source);
-    });
+    };
+    registerSocketHandler('message:status', onMessageStatus);
 
-    socket.on('message:fetch:response', (data) => {
+    // ─── RESPONSE LISTENERS for delivery/read/seen events ───
+
+    const onDeliveredResponse = (data) => {
+      const source = data?.data || data;
+      const messageId = source?.messageId;
+      if (!messageId) return;
+      updateMessageStatus(messageId, 'delivered', source);
+    };
+    registerSocketHandler('message:delivered:response', onDeliveredResponse);
+
+    const onReadResponse = (data) => {
+      const source = data?.data || data;
+      const messageId = source?.messageId;
+      if (!messageId) return;
+      updateMessageStatus(messageId, 'seen', source);
+    };
+    registerSocketHandler('message:read:response', onReadResponse);
+
+    const onReadBulkResponse = (data) => {
+      const source = data?.data || data;
+      const results = Array.isArray(source?.results) ? source.results : [];
+      const successIds = results.filter(r => r?.success).map(r => String(r?.messageId)).filter(Boolean);
+      if (successIds.length === 0) return;
+
+      setAllMessages(prev => {
+        const idSet = new Set(successIds);
+        let changed = false;
+        const updated = prev.map(msg => {
+          const id = String(msg.serverMessageId || msg.id || msg.tempId || '');
+          if (!idSet.has(id)) return msg;
+          if (msg.status === 'seen' || msg.status === 'read') return msg;
+          changed = true;
+          return { ...msg, status: 'seen' };
+        });
+        if (changed) {
+          saveMessagesToLocal(updated);
+          updateChatListLastMessagePreview(updated);
+        }
+        return changed ? updated : prev;
+      });
+    };
+    registerSocketHandler('message:read:bulk:response', onReadBulkResponse);
+
+    const onReadAllResponse = (data) => {
+      const source = data?.data || data;
+      const responseChatId = source?.chatId;
+      if (!responseChatId || !sameId(responseChatId, currentChatId)) return;
+
+      // All messages sent by current user in this chat are now read by the peer
+      setAllMessages(prev => {
+        let changed = false;
+        const updated = prev.map(msg => {
+          if (msg.chatId !== currentChatId) return msg;
+          if (msg.senderId !== currentUserIdRef.current) return msg;
+          if (msg.status === 'seen' || msg.status === 'read') return msg;
+          changed = true;
+          return { ...msg, status: 'seen' };
+        });
+        if (changed) {
+          saveMessagesToLocal(updated);
+          updateChatListLastMessagePreview(updated);
+        }
+        return changed ? updated : prev;
+      });
+    };
+    registerSocketHandler('message:read:all:response', onReadAllResponse);
+
+    const onSeenResponse = (data) => {
+      const source = data?.data || data;
+      const messageId = source?.messageId;
+      if (!messageId) return;
+      updateMessageStatus(messageId, 'seen', source);
+    };
+    registerSocketHandler('message:seen:response', onSeenResponse);
+
+    // ─── MESSAGE EDIT RESPONSE ───
+    const onEditResponse = (data) => {
+      const source = data?.data || data || {};
+      if (source?.status === false || data?.status === false) return;
+
+      const messageId = source?.messageId || source?.id;
+      const newText = source?.text || source?.newText;
+      const editedChatId = source?.chatId;
+      if (!messageId) return;
+
+      // Only apply if it's for this chat
+      if (editedChatId && !sameId(editedChatId, currentChatId)) return;
+
+      setAllMessages(prev => {
+        let changed = false;
+        const updated = prev.map(msg => {
+          const id = msg.serverMessageId || msg.id || msg.tempId;
+          if (String(id) !== String(messageId)) return msg;
+          changed = true;
+          return {
+            ...msg,
+            text: newText || msg.text,
+            isEdited: true,
+            editedAt: source?.editedAt || Date.now(),
+          };
+        });
+        if (changed) saveMessagesToLocal(updated);
+        return changed ? updated : prev;
+      });
+    };
+    registerSocketHandler('message:edit:response', onEditResponse);
+
+    const handleMediaDownloadedUpdate = (data) => {
+      const source = data?.data || data || {};
+      const updatedMessageId = String(source?.messageId || source?.id || source?._id || '');
+      const sourceChatId = source?.chatId || source?.chat || source?.roomId;
+      const isMediaDownloaded = Boolean(source?.isMediaDownloaded);
+
+      if (!updatedMessageId || !sameId(sourceChatId, currentChatId)) {
+        return;
+      }
+
+      applyMediaDownloadedStateLocally({
+        messageId: updatedMessageId,
+        chatId: sourceChatId,
+        isMediaDownloaded,
+        localUri: source?.localUri || source?.path || null,
+      });
+    };
+
+    const handleMediaUpdateResponse = async (data) => {
+      const source = data?.data || data || {};
+      const responseMessageId = source?.messageId || source?.id || source?._id;
+      const responseChatId = source?.chatId || source?.chat || source?.roomId;
+      if (!responseMessageId || !responseChatId) {
+        return;
+      }
+
+      if (source?.status === false || source?.success === false || data?.status === false) {
+        const deviceId = await getOrCreateDeviceId();
+        await queueMediaStatusUpdate({
+          messageId: responseMessageId,
+          chatId: responseChatId,
+          deviceId,
+          isMediaDownloaded: true,
+        });
+        return;
+      }
+
+      if (sameId(responseChatId, currentChatId)) {
+        handleMediaDownloadedUpdate(source);
+      }
+    };
+
+    registerSocketHandler('message:media:update', handleMediaDownloadedUpdate);
+    registerSocketHandler('message:media:update:response', handleMediaUpdateResponse);
+    registerSocketHandler('message:media:downloaded:update', handleMediaDownloadedUpdate);
+    registerSocketHandler('message:media:downloaded:response', handleMediaUpdateResponse);
+    registerSocketHandler('message:media:downloaded', handleMediaDownloadedUpdate);
+
+    const onMessageFetchResponse = (data) => {
       const source = data?.data || data;
       const rows = source?.messages || source?.docs || [];
       if (Array.isArray(rows) && rows.length > 0) {
@@ -1785,9 +2953,10 @@ export default function useChatLogic({ navigation, route }) {
       loadMoreInFlightRef.current = false;
       fetchOlderCursorRef.current = null;
       isHardReloadingRef.current = false;
-    });
+    };
+    registerSocketHandler('message:fetch:response', onMessageFetchResponse);
 
-    socket.on('message:sync:response', (data) => {
+    const onMessageSyncResponse = (data) => {
       if (isHardReloadingRef.current) {
         return;
       }
@@ -1804,9 +2973,10 @@ export default function useChatLogic({ navigation, route }) {
           lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
         }
       }
-    });
+    };
+    registerSocketHandler('message:sync:response', onMessageSyncResponse);
 
-    socket.on('message:delete:everyone', (data) => {
+    const onMessageDeleteEveryone = (data) => {
       console.log('🧪 [B:SOCKET:DELETE:RECV]', {
         event: 'message:delete:everyone',
         raw: data,
@@ -1816,9 +2986,10 @@ export default function useChatLogic({ navigation, route }) {
       const chatId = source?.chatId || source?.chat || source?.roomId;
       if (!sameId(chatId, currentChatId)) return;
       handleDeleteMessage(messageId, true, { deletedBy: source?.deletedBy || source?.senderId || source?.userId });
-    });
+    };
+    registerSocketHandler('message:delete:everyone', onMessageDeleteEveryone);
 
-    socket.on('message:delete:me', (data) => {
+    const onMessageDeleteMe = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id || source?.id;
       const chatId = source?.chatId || source?.chat || source?.roomId;
@@ -1834,26 +3005,29 @@ export default function useChatLogic({ navigation, route }) {
       if (!deletedBy || sameId(deletedBy, currentUserIdRef.current)) {
         handleDeleteMessage(messageId, false, { deletedBy });
       }
-    });
+    };
+    registerSocketHandler('message:delete:me', onMessageDeleteMe);
 
-    socket.on('message:deleted', (data) => {
+    const onMessageDeleted = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id || source?.id;
       const chatIdInPayload = source?.chatId || source?.chat || source?.roomId;
       const deleteFor = source?.deleteFor || source?.delete_type || (source?.isDeletedForEveryone ? 'everyone' : 'me') || 'everyone';
       if (!messageId || (chatIdInPayload && !sameId(chatIdInPayload, currentChatId))) return;
       handleDeleteMessage(messageId, deleteFor === 'everyone', { deletedBy: source?.deletedBy || source?.senderId || source?.userId });
-    });
+    };
+    registerSocketHandler('message:deleted', onMessageDeleted);
 
-    socket.on('message:delete:sync', (data) => {
+    const onMessageDeleteSync = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id || source?.id;
       const chatIdInPayload = source?.chatId || source?.chat || source?.roomId;
       if (!messageId || (chatIdInPayload && !sameId(chatIdInPayload, currentChatId))) return;
       handleDeleteMessage(messageId, false, { deletedBy: source?.deletedBy || source?.senderId || source?.userId });
-    });
+    };
+    registerSocketHandler('message:delete:sync', onMessageDeleteSync);
 
-    socket.on('message:delete:everyone:response', async (data) => {
+    const onMessageDeleteEveryoneResponse = async (data) => {
       console.log('🧪 [B:SOCKET:DELETE:RECV]', {
         event: 'message:delete:everyone:response',
         raw: data,
@@ -1890,9 +3064,10 @@ export default function useChatLogic({ navigation, route }) {
           reason: result?.reason,
         });
       }
-    });
+    };
+    registerSocketHandler('message:delete:everyone:response', onMessageDeleteEveryoneResponse);
 
-    socket.on('message:delete:response', async (data) => {
+    const onMessageDeleteResponse = async (data) => {
       console.log('🧪 [B:SOCKET:DELETE:RECV]', {
         event: 'message:delete:response',
         raw: data,
@@ -1921,52 +3096,63 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       await applyDeleteEveryoneToChatStorage(normalizedResponseChatId, messageId, { deletedBy });
-    });
-    socket.on('message:delete:me:response', (data) => { if (data.status === false) Alert.alert("Error", data.message || "Failed to delete message"); });
+    };
+    registerSocketHandler('message:delete:response', onMessageDeleteResponse);
 
-    socket.on('presence:update', (data) => {
+    const onMessageDeleteMeResponse = (data) => {
+      if (data.status === false) Alert.alert("Error", data.message || "Failed to delete message");
+    };
+    registerSocketHandler('message:delete:me:response', onMessageDeleteMeResponse);
+
+    const onPresenceUpdate = (data) => {
       if (data.userId === chatData.peerUser._id || data?.data?.userId === chatData.peerUser._id) {
         applyPresenceState(data);
       }
-    });
+    };
+    registerSocketHandler('presence:update', onPresenceUpdate);
 
-    socket.on('presence:get:response', (data) => {
+    const onPresenceGetResponse = (data) => {
       if (data.userId === chatData.peerUser._id || data?.data?.userId === chatData.peerUser._id) {
         applyPresenceState(data);
       }
-    });
+    };
+    registerSocketHandler('presence:get:response', onPresenceGetResponse);
 
-    socket.on('presence:status:response', (data) => {
+    const onPresenceStatusResponse = (data) => {
       if (data.userId === chatData.peerUser._id || data?.data?.userId === chatData.peerUser._id) {
         applyPresenceState(data);
       }
-    });
+    };
+    registerSocketHandler('presence:status:response', onPresenceStatusResponse);
 
-    socket.on('presence:manual:updated', (data) => {
+    const onPresenceManualUpdated = (data) => {
       const sourceUserId = data.userId || data?.data?.userId;
       if (sourceUserId === chatData.peerUser._id) {
         applyPresenceState(data);
       }
-    });
+    };
+    registerSocketHandler('presence:manual:updated', onPresenceManualUpdated);
 
-    socket.on('user:online', (data) => {
+    const onUserOnline = (data) => {
       console.log("user:online", data);
       if (data.userId === chatData.peerUser._id) { 
         setUserStatus(PRESENCE_STATUS.ONLINE);
         setLastSeen(null); 
       }
-    });
+    };
+    registerSocketHandler('user:online', onUserOnline);
 
-    socket.on('user:offline', (data) => {
+    const onUserOffline = (data) => {
       console.log("user:offline", data);
       if (data.userId === chatData.peerUser._id) { 
         setUserStatus(PRESENCE_STATUS.OFFLINE);
         setLastSeen(data.lastSeen || new Date().toISOString()); 
       }
-    });
+    };
+    registerSocketHandler('user:offline', onUserOffline);
 
     // FIXED: Typing event handlers
-    socket.on('typing:start', (data) => {
+    const onTypingStart = (data) => {
       console.log('📨 [TYPING] Received typing:start:', data);
       
       const senderId = data.userId || data.senderId || data.from;
@@ -1991,9 +3177,10 @@ export default function useChatLogic({ navigation, route }) {
           peerTypingTimeoutRef.current = null;
         }, TYPING_TIMEOUT);
       }
-    });
+    };
+    registerSocketHandler('typing:start', onTypingStart);
 
-    socket.on('typing:stop', (data) => {
+    const onTypingStop = (data) => {
       console.log('📨 [TYPING] Received typing:stop:', data);
       
       const senderId = data.userId || data.senderId || data.from;
@@ -2011,10 +3198,11 @@ export default function useChatLogic({ navigation, route }) {
           peerTypingTimeoutRef.current = null;
         }
       }
-    });
+    };
+    registerSocketHandler('typing:stop', onTypingStop);
 
     // Handle recording as typing
-    socket.on('typing:recording', (data) => {
+    const onTypingRecording = (data) => {
       const senderId = data.userId || data.senderId || data.from;
       const chatIdInPayload = data.chatId || data.roomId;
       
@@ -2031,9 +3219,10 @@ export default function useChatLogic({ navigation, route }) {
           peerTypingTimeoutRef.current = null;
         }, TYPING_TIMEOUT);
       }
-    });
+    };
+    registerSocketHandler('typing:recording', onTypingRecording);
 
-    socket.on('typing:recording:update', (data) => {
+    const onTypingRecordingUpdate = (data) => {
       const senderId = data.userId || data.senderId || data.from;
       const chatIdInPayload = data.chatId || data.roomId;
       
@@ -2050,19 +3239,22 @@ export default function useChatLogic({ navigation, route }) {
           peerTypingTimeoutRef.current = null;
         }, TYPING_TIMEOUT);
       }
-    });
+    };
+    registerSocketHandler('typing:recording:update', onTypingRecordingUpdate);
 
-    socket.on('disconnect', () => {
+    const onDisconnect = () => {
       setUserStatus(PRESENCE_STATUS.OFFLINE);
       setIsPeerTyping(false); // Reset typing state on disconnect
       stopHeartbeat();
       setTimeout(() => { if (isComponentMounted.current) checkAndReconnectSocket(); }, 2000);
-    });
+    };
+    registerSocketHandler('disconnect', onDisconnect);
 
-    socket.on('connect', () => {
+    const onConnect = () => {
       reconnectAttempts.current = 0;
       requestUserPresence();
       flushQueuedManualPresence();
+      flushQueuedMediaStatusUpdates();
       startHeartbeat();
       markUserOnline("socket-connect");
       socket.emit('chat:join', { chatId: currentChatId, userId: currentUserIdRef.current });
@@ -2072,7 +3264,24 @@ export default function useChatLogic({ navigation, route }) {
       } else {
         fetchAndSyncMessagesViaSocket(currentChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
       }
-    });
+    };
+    registerSocketHandler('connect', onConnect);
+
+    const onChatClearedMe = (data) => {
+      const source = data?.data || data || {};
+      const targetChatId = source?.chatId || source?.chat || source?.roomId;
+      if (!targetChatId) return;
+      applyChatClearedLocally(targetChatId, 'me');
+    };
+    registerSocketHandler('chat:cleared:me', onChatClearedMe);
+
+    const onChatClearedEveryone = (data) => {
+      const source = data?.data || data || {};
+      const targetChatId = source?.chatId || source?.chat || source?.roomId;
+      if (!targetChatId) return;
+      applyChatClearedLocally(targetChatId, 'everyone');
+    };
+    registerSocketHandler('chat:cleared:everyone', onChatClearedEveryone);
   }, [
     chatData.peerUser,
     removeSocketListeners,
@@ -2080,6 +3289,7 @@ export default function useChatLogic({ navigation, route }) {
     checkAndReconnectSocket,
     applyPresenceState,
     flushQueuedManualPresence,
+    flushQueuedMediaStatusUpdates,
     startHeartbeat,
     stopHeartbeat,
     markUserOnline,
@@ -2087,7 +3297,11 @@ export default function useChatLogic({ navigation, route }) {
     mergeMessagesIntoState,
     replaceMessagesForChat,
     applyDeleteEveryoneToChatStorage,
+    applyMediaDownloadedStateLocally,
+    getOrCreateDeviceId,
+    queueMediaStatusUpdate,
     saveMessagesToLocal,
+    applyChatClearedLocally,
   ]);
 
   const removeDuplicateMessages = useCallback((messagesArr) => {
@@ -2108,6 +3322,7 @@ export default function useChatLogic({ navigation, route }) {
   const updateMessageStatus = useCallback((tempId, status, serverData = null) => {
     const normalizedStatus = normalizeMessageStatus(status) || status;
     setAllMessages((prevMessages) => {
+      let changed = false;
       const updated = prevMessages.map((msg) => {
         const isMatch =
           msg.tempId === tempId ||
@@ -2123,7 +3338,14 @@ export default function useChatLogic({ navigation, route }) {
         const preservedLocalUri = msg.localUri;
         const preservedPreview = msg.previewUrl;
 
-        const updatedMsg = { ...msg, status: normalizedStatus };
+        const currentStatus = normalizeMessageStatus(msg.status) || msg.status;
+        const currentPriority = getMessageStatusPriority(currentStatus);
+        const incomingPriority = getMessageStatusPriority(normalizedStatus);
+        const resolvedStatus = incomingPriority >= currentPriority
+          ? (normalizedStatus || currentStatus)
+          : currentStatus;
+
+        const updatedMsg = { ...msg, status: resolvedStatus };
         if (serverData) {
           const serverMessageId = serverData.messageId || serverData._id;
           if (serverMessageId) {
@@ -2138,14 +3360,34 @@ export default function useChatLogic({ navigation, route }) {
         if (preservedLocalUri) updatedMsg.localUri = preservedLocalUri;
         if (preservedPreview && !updatedMsg.previewUrl) updatedMsg.previewUrl = preservedPreview;
 
+        if (updatedMsg !== msg) {
+          const hasChanged =
+            updatedMsg.status !== msg.status ||
+            updatedMsg.id !== msg.id ||
+            updatedMsg.serverMessageId !== msg.serverMessageId ||
+            updatedMsg.synced !== msg.synced ||
+            updatedMsg.mediaUrl !== msg.mediaUrl ||
+            updatedMsg.previewUrl !== msg.previewUrl;
+          if (hasChanged) changed = true;
+        }
+
         return updatedMsg;
       });
 
+      if (!changed) return prevMessages;
+
       const uniqueMessages = removeDuplicateMessages(updated);
       saveMessagesToLocal(uniqueMessages);
+      updateChatListLastMessagePreview(uniqueMessages);
       return uniqueMessages;
     });
-  }, [removeDuplicateMessages, saveMessagesToLocal, normalizeMessageStatus]);
+  }, [
+    removeDuplicateMessages,
+    saveMessagesToLocal,
+    normalizeMessageStatus,
+    getMessageStatusPriority,
+    updateChatListLastMessagePreview,
+  ]);
 
   const sendMessageViaSocket = useCallback((payload, tempId) => {
     return new Promise(async (resolve, reject) => {
@@ -2157,7 +3399,11 @@ export default function useChatLogic({ navigation, route }) {
           return reject(new Error('socket not connected'));
         }
 
-        updateMessageStatus(tempId, 'sending');
+        // Only set 'sending' if not already uploaded (media messages set 'uploaded' after upload completes)
+        const isMediaPayload = payload?.mediaUrl || payload?.messageType === 'image' || payload?.messageType === 'video' || payload?.messageType === 'audio' || payload?.messageType === 'file';
+        if (!isMediaPayload) {
+          updateMessageStatus(tempId, 'sending');
+        }
 
         socket.emit('message:send', payload, (response) => {
           if (response && (response.status === true || response.success === true || response.data)) {
@@ -2188,12 +3434,7 @@ export default function useChatLogic({ navigation, route }) {
   /* ========== Text send flow ========== */
   const handleSendText = useCallback(async () => {
     if (!text.trim()) return;
-    if (!isSocketConnected()) {
-      Alert.alert("Connection Error", "Unable to send message. Reconnecting...", [{ text: "OK" }]);
-      await checkAndReconnectSocket();
-      return;
-    }
-    
+
     const tempId = `temp_${Date.now()}_${Math.random()}`;
     const timestamp = new Date().toISOString();
     
@@ -2216,6 +3457,12 @@ export default function useChatLogic({ navigation, route }) {
       senderId: currentUserIdRef.current,
       text: text.trim(),
       createdAt: timestamp,
+      peerUser: chatData?.peerUser
+        ? {
+            ...chatData.peerUser,
+            _id: chatData.peerUser._id || chatData.peerUser.userId || chatData.peerUser.id || null,
+          }
+        : null,
     });
     
     const newMessage = {
@@ -2261,44 +3508,178 @@ export default function useChatLogic({ navigation, route }) {
     try {
       if (!socket || !isSocketConnected()) {
         updateMessageStatus(tempId, 'failed');
+        await checkAndReconnectSocket();
         return;
       }
 
-      socket.emit('message:send', payload, (response) => {
-        if (response && response.status === true) {
-          const serverMessageId = response.data?.messageId || response.data?._id || response.messageId || response._id;
-          updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response.data });
-        } else {
-          updateMessageStatus(tempId, 'failed');
-        }
-      });
+      await sendMessageViaSocket(payload, tempId);
     } catch (error) {
       console.error("❌ Send message failed:", error);
       updateMessageStatus(tempId, 'failed');
     }
+  }, [text, chatData.peerUser, sendTypingStatus, removeDuplicateMessages, saveMessagesToLocal, updateMessageStatus, checkAndReconnectSocket, isLocalTyping, markUserOnline, onLocalOutgoingMessage, sendMessageViaSocket]);
 
-    dispatch(chatListData(''));
-  }, [text, chatData.peerUser, sendTypingStatus, removeDuplicateMessages, saveMessagesToLocal, updateMessageStatus, dispatch, checkAndReconnectSocket, isLocalTyping, markUserOnline, onLocalOutgoingMessage]);
+  const sendLocationMessage = useCallback(async ({ latitude, longitude, address = '', mapPreviewUrl = '' } = {}) => {
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      throw new Error('invalid location coordinates');
+    }
+
+    const tempId = `temp_location_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = new Date().toISOString();
+
+    const payload = {
+      receiverId: chatData.peerUser._id,
+      messageType: 'location',
+      text: address || 'Shared location',
+      mediaUrl: mapPreviewUrl || `https://maps.google.com/?q=${lat},${lng}`,
+      mediaMeta: {
+        latitude: lat,
+        longitude: lng,
+        address: address || '',
+        mapPreviewUrl: mapPreviewUrl || `https://maps.google.com/?q=${lat},${lng}`,
+      },
+      replyTo: null,
+      forwardedFrom: null,
+      chatId: chatIdRef.current,
+      senderId: currentUserIdRef.current,
+      tempId,
+      createdAt: timestamp,
+    };
+
+    onLocalOutgoingMessage({
+      chatId: chatIdRef.current,
+      senderId: currentUserIdRef.current,
+      text: 'Location',
+      createdAt: timestamp,
+      peerUser: chatData?.peerUser ? {
+        ...chatData.peerUser,
+        _id: chatData.peerUser._id || chatData.peerUser.userId || chatData.peerUser.id || null,
+      } : null,
+    });
+
+    setAllMessages((prev) => {
+      const localMsg = {
+        id: tempId,
+        tempId,
+        type: 'location',
+        mediaType: 'location',
+        text: payload.text,
+        mediaUrl: payload.mediaUrl,
+        previewUrl: payload.mediaUrl,
+        mediaMeta: payload.mediaMeta,
+        time: moment(timestamp).format('hh:mm A'),
+        date: moment(timestamp).format('YYYY-MM-DD'),
+        senderId: currentUserIdRef.current,
+        senderType: 'self',
+        receiverId: chatData.peerUser._id,
+        status: 'sending',
+        createdAt: timestamp,
+        timestamp: new Date(timestamp).getTime(),
+        payload,
+        chatId: chatIdRef.current,
+      };
+      const next = deduplicateMessages([localMsg, ...prev]);
+      saveMessagesToLocal(next);
+      return next;
+    });
+
+    await sendMessageViaSocket(payload, tempId);
+    return { success: true, tempId };
+  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket]);
+
+  const sendContactMessage = useCallback(async ({
+    contactName, phoneNumber, avatar = '',
+    phoneNumbers = [], emails = [], addresses = [],
+    company = '', jobTitle = '', birthday = '', note = '',
+  } = {}) => {
+    const name = String(contactName || '').trim();
+    const phone = String(phoneNumber || '').trim();
+    if (!name || !phone) {
+      throw new Error('missing contact details');
+    }
+
+    const allPhones = phoneNumbers.length > 0 ? phoneNumbers : [{ label: 'mobile', number: phone }];
+
+    const tempId = `temp_contact_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const timestamp = new Date().toISOString();
+
+    const payload = {
+      receiverId: chatData.peerUser._id,
+      messageType: 'contact',
+      text: name,
+      mediaUrl: avatar || '',
+      mediaMeta: {
+        contactName: name,
+        phoneNumber: phone,
+        avatar: avatar || '',
+        phoneNumbers: allPhones,
+        emails: emails || [],
+        addresses: addresses || [],
+        company: company || '',
+        jobTitle: jobTitle || '',
+        birthday: birthday || '',
+        note: note || '',
+      },
+      replyTo: null,
+      forwardedFrom: null,
+      chatId: chatIdRef.current,
+      senderId: currentUserIdRef.current,
+      tempId,
+      createdAt: timestamp,
+    };
+
+    onLocalOutgoingMessage({
+      chatId: chatIdRef.current,
+      senderId: currentUserIdRef.current,
+      text: `Contact: ${name}`,
+      createdAt: timestamp,
+      peerUser: chatData?.peerUser ? {
+        ...chatData.peerUser,
+        _id: chatData.peerUser._id || chatData.peerUser.userId || chatData.peerUser.id || null,
+      } : null,
+    });
+
+    setAllMessages((prev) => {
+      const localMsg = {
+        id: tempId,
+        tempId,
+        type: 'contact',
+        mediaType: 'contact',
+        text: name,
+        mediaUrl: avatar || '',
+        previewUrl: avatar || '',
+        mediaMeta: payload.mediaMeta,
+        time: moment(timestamp).format('hh:mm A'),
+        date: moment(timestamp).format('YYYY-MM-DD'),
+        senderId: currentUserIdRef.current,
+        senderType: 'self',
+        receiverId: chatData.peerUser._id,
+        status: 'sending',
+        createdAt: timestamp,
+        timestamp: new Date(timestamp).getTime(),
+        payload,
+        chatId: chatIdRef.current,
+      };
+      const next = deduplicateMessages([localMsg, ...prev]);
+      saveMessagesToLocal(next);
+      return next;
+    });
+
+    await sendMessageViaSocket(payload, tempId);
+    return { success: true, tempId };
+  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket]);
 
   /* ========== FIXED: Text input change handler with proper typing ========== */
   const handleTextChange = useCallback((value) => {
     setText(value);
     resetIdleTimer();
     emitPresenceActivity({ reason: "typing" });
-    
-    const socket = socketRef.current || getSocket();
-    const isSocketOk = socket && isSocketConnected();
-    
-    console.log('📝 [TYPING] Text changed:', { 
-      length: value.length, 
-      socketConnected: isSocketOk,
-      currentTyping: isLocalTyping 
-    });
 
     if (value.length > 0) {
       // If we weren't typing before, send typing:start
       if (!isLocalTyping) {
-        console.log('📝 [TYPING] Starting typing');
         sendTypingStatus(true);
         setIsLocalTyping(true);
       }
@@ -2310,7 +3691,6 @@ export default function useChatLogic({ navigation, route }) {
       
       // Set new timeout to stop typing after inactivity
       typingTimeoutRef.current = setTimeout(() => {
-        console.log('📝 [TYPING] Stopping typing due to timeout');
         if (isLocalTyping) {
           sendTypingStatus(false);
           setIsLocalTyping(false);
@@ -2320,7 +3700,6 @@ export default function useChatLogic({ navigation, route }) {
       
     } else {
       // Text is empty, stop typing
-      console.log('📝 [TYPING] Text empty, stopping typing');
       if (isLocalTyping) {
         sendTypingStatus(false);
         setIsLocalTyping(false);
@@ -2337,45 +3716,55 @@ export default function useChatLogic({ navigation, route }) {
     resetIdleTimer();
 
     const messageId = msg.messageId || msg._id;
-    
-    console.log('📥 [RECEIVED] New message:', { 
-      messageId, 
+    const incomingTempId = msg.tempId;
+
+    console.log('📥 [RECEIVED] New message:', {
+      messageId,
       type: msg.messageType,
+      mediaMeta: msg.mediaMeta ? Object.keys(msg.mediaMeta) : null,
+      hasPayload: !!msg.payload,
     });
-  
+
     setAllMessages((prevMessages) => {
-      const exists = prevMessages.some(m => 
-        m.id === messageId || 
-        m.serverMessageId === messageId ||
-        m.tempId === messageId
+      // Check if this message already exists (by serverMessageId, id, tempId, or mediaId)
+      const exists = prevMessages.some(m =>
+        (messageId && (m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId)) ||
+        (incomingTempId && (m.tempId === incomingTempId || m.id === incomingTempId)) ||
+        (msg.mediaId && (m.mediaId === msg.mediaId))
       );
-      
+
       if (exists) {
+        // If this is our own sent message echoed back, update its status instead of duplicating
+        const updatedMessages = prevMessages.map(m => {
+          const isMatch = (messageId && (m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId)) ||
+            (incomingTempId && (m.tempId === incomingTempId || m.id === incomingTempId)) ||
+            (msg.mediaId && (m.mediaId === msg.mediaId));
+          if (!isMatch) return m;
+          // Update status if the existing message is still in sending/uploaded state
+          if (m.status === 'sending' || m.status === 'uploaded') {
+            return {
+              ...m,
+              status: 'sent',
+              serverMessageId: messageId || m.serverMessageId,
+              id: messageId || m.id,
+              synced: true,
+            };
+          }
+          return m;
+        });
+        const changed = updatedMessages !== prevMessages && updatedMessages.some((m, i) => m !== prevMessages[i]);
+        if (changed) {
+          saveMessagesToLocal(updatedMessages);
+          return updatedMessages;
+        }
         console.log('📥 [RECEIVED] Message already exists, skipping');
         return prevMessages;
       }
-  
-      const receivedMessage = {
-        id: messageId,
-        serverMessageId: messageId,
-        tempId: messageId,
-        type: msg.messageType || msg.fileCategory || "text",
-        mediaType: msg.fileCategory || null,
-        text: msg.text || msg.content || "",
-        time: moment(msg.createdAt || new Date()).format("hh:mm A"),
-        date: moment(msg.createdAt || new Date()).format("YYYY-MM-DD"),
-        senderId: normalizeId(msg.senderId),
-        senderType: computeSenderType(msg.senderId, currentUserIdRef.current),
-        receiverId: normalizeId(msg.receiverId),
-        status: undefined,
-        mediaUrl: msg.mediaUrl || msg.url || null,
-        previewUrl: msg.previewUrl || msg.thumbnailUrl || msg.mediaUrl || msg.url || null,
-        createdAt: msg.createdAt || new Date().toISOString(),
-        timestamp: new Date(msg.createdAt || new Date()).getTime(),
-        synced: true,
-        localUri: null,
-        chatId: msg.chatId || chatIdRef.current,
-      };
+
+      const receivedMessage = normalizeIncomingMessage({
+        ...msg,
+        messageId,
+      });
 
       const updatedMessages = [receivedMessage, ...prevMessages];
       const uniqueMessages = deduplicateMessages(updatedMessages);
@@ -2395,6 +3784,16 @@ export default function useChatLogic({ navigation, route }) {
     if (senderId && senderId !== currentUserIdRef.current) {
       const messageId = msg?.messageId || msg?._id || msg?.id;
       if (messageId) {
+        // Emit message:delivered to server — the message has reached this device
+        const socket = socketRef.current || getSocket();
+        if (socket && isSocketConnected() && chatIdRef.current) {
+          socket.emit('message:delivered', {
+            messageId,
+            chatId: chatIdRef.current,
+            senderId,
+          });
+        }
+
         markMessagesAsRead([messageId]);
       }
     }
@@ -2510,6 +3909,61 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, [messages, selectedMessage, handleDeleteMessage]);
 
+  // ─── MESSAGE EDITING ───
+
+  const startEditMessage = useCallback((msg) => {
+    if (!msg) return;
+    const isMine = sameId(msg.senderId, currentUserIdRef.current);
+    if (!isMine) return;
+    // Only allow editing messages not yet seen
+    if (msg.status === 'seen' || msg.status === 'read') return;
+    setEditingMessage(msg);
+    setSelectedMessages([]);
+  }, []);
+
+  const cancelEditMessage = useCallback(() => {
+    setEditingMessage(null);
+  }, []);
+
+  const submitEditMessage = useCallback(async (newText) => {
+    if (!editingMessage || !newText?.trim()) return;
+
+    const messageId = editingMessage.serverMessageId || editingMessage.id || editingMessage.tempId;
+    const cId = chatIdRef.current;
+    if (!messageId || !cId) return;
+
+    const socket = socketRef.current || getSocket();
+    if (!socket || !isSocketConnected()) {
+      Alert.alert('Error', 'Not connected. Please try again.');
+      return;
+    }
+
+    // Optimistic update
+    setAllMessages(prev => {
+      const updated = prev.map(msg => {
+        const id = msg.serverMessageId || msg.id || msg.tempId;
+        if (String(id) !== String(messageId)) return msg;
+        return {
+          ...msg,
+          text: newText.trim(),
+          isEdited: true,
+          editedAt: Date.now(),
+        };
+      });
+      saveMessagesToLocal(updated);
+      return updated;
+    });
+
+    // Emit socket event
+    socket.emit('message:edit', {
+      messageId,
+      chatId: cId,
+      text: newText.trim(),
+    });
+
+    setEditingMessage(null);
+  }, [editingMessage, saveMessagesToLocal]);
+
   const handleDeleteSelected = useCallback(() => {
     if (selectedMessage.length === 0) return;
     console.log("selectedMessage ---", selectedMessage)
@@ -2581,109 +4035,191 @@ export default function useChatLogic({ navigation, route }) {
   const handleDownloadMedia = async (msg) => {
     try {
       if (!msg) return;
+
+      if (msg?.isDeleted || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system') {
+        return;
+      }
   
-      const messageId = msg.serverMessageId || msg.id;
-      if (!messageId) return;
-  
+      const messageType = String(msg?.type || msg?.mediaType || msg?.messageType || '').toLowerCase();
+      if (!isMediaMessageType(messageType)) {
+        return;
+      }
+
+      const resolvedIdentity = resolveMediaIdentity(msg);
+      const messageId = String(resolvedIdentity?.mediaId || msg?.mediaId || msg?.serverMessageId || msg?.id || '');
+      if (!messageId) {
+        Alert.alert('Download failed', 'Media identifier missing for this message');
+        return;
+      }
+
+      if (!resolvedIdentity?.mediaUrl && !msg?.mediaUrl && !msg?.previewUrl && !msg?.url) {
+        Alert.alert('Download failed', 'Media URL missing for this message');
+        return;
+      }
+
+      const effectiveChatId = normalizeId(msg?.chatId || chatIdRef.current);
+      const eventKey = buildMediaStatusEventKey(effectiveChatId, messageId);
+
+      setMediaDownloadStates((prev) => ({
+        ...prev,
+        [messageId]: {
+          ...(prev[messageId] || { mediaId: messageId }),
+          status: MEDIA_DOWNLOAD_STATUS.DOWNLOADING,
+          progress: 0,
+          error: null,
+          updatedAt: Date.now(),
+        },
+      }));
+
       setDownloadProgress(prev => ({
         ...prev,
         [messageId]: 0
       }));
-  
-      const action = await dispatch(downloadMedia({ mediaId: messageId }));
-      // console.log("action media download ----- ", action)
-  
-      const remoteUrl =
-        action?.payload?.data?.downloadUrl ||
-        action?.payload?.downloadUrl ||
-        msg.mediaUrl ||
-        msg.previewUrl;
-  
-      if (!remoteUrl) {
-        throw new Error("No download URL found");
-      }
-  // console.log("remoteUrl", remoteUrl)
-      const localUri = await downloadRemoteToReceived(
-        remoteUrl,
-        messageId,
-        (progress) => {
-          console.log("progress", progress)
-          setDownloadProgress(prev => ({
-            ...prev,
-            [messageId]: progress
-          }));
+
+      const localUri = await mediaDownloadManager.download(
+        {
+          ...msg,
+          mediaId: messageId,
+          mediaUrl: resolvedIdentity?.mediaUrl || msg?.mediaUrl || msg?.previewUrl || msg?.url,
+          mediaThumbnailUrl: resolvedIdentity?.mediaThumbnailUrl || msg?.mediaThumbnailUrl || msg?.thumbnailUrl || msg?.previewUrl,
+          mediaMeta: resolvedIdentity?.mediaMeta || msg?.mediaMeta || msg?.payload?.mediaMeta || {},
+          messageType: messageType,
+          fileCategory: msg?.fileCategory || resolvedIdentity?.messageType || messageType,
+        },
+        {
+          chatId: effectiveChatId || chatIdRef.current,
+          filename: msg.text || msg.fileName || `${messageId}`,
+          onProgress: (progressPct) => {
+            const normalized = Math.max(0, Math.min(100, Number(progressPct || 0)));
+            setDownloadProgress(prev => ({
+              ...prev,
+              [messageId]: normalized / 100,
+            }));
+          },
         }
       );
-  console.log("localUri", localUri)
+
       if (!localUri) throw new Error("Download failed");
-  
-      try {
-        await saveFileToMediaLibrary(localUri, APP_FOLDER);
-      } catch (_) {}
-  
-      setMessages(prev =>
-        prev.map(m =>
-          (m.serverMessageId === messageId || m.id === messageId)
-            ? { ...m, localUri }
-            : m
-        )
-      );
-  
-      setAllMessages(prev => {
-        const updated = prev.map(m =>
-          (m.serverMessageId === messageId || m.id === messageId)
-            ? { ...m, localUri }
-            : m
-        );
-        saveMessagesToLocal(updated);
-        return updated;
+
+      await localStorageService.upsertMediaFile({
+        mediaId: messageId,
+        id: messageId,
+        serverMessageId: msg.serverMessageId || msg.id || messageId,
+        chatId: msg.chatId || chatIdRef.current,
+        localPath: localUri,
+        messageType: resolvedIdentity?.messageType || msg.type || msg.mediaType || 'file',
+        serverUrl: resolvedIdentity?.mediaUrl || msg.mediaUrl || msg.previewUrl || null,
+        thumbnailUrl: resolvedIdentity?.mediaThumbnailUrl || msg?.mediaThumbnailUrl || msg?.thumbnailUrl || msg.previewUrl || null,
+        metadata: resolvedIdentity?.mediaMeta || msg?.mediaMeta || msg?.payload?.mediaMeta || {},
+        downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+        downloadProgress: 100,
+        downloadedAt: Date.now(),
+        lastError: null,
+        createdAtTs: Number(msg?.timestamp || Date.now()),
       });
+
+      setDownloadedMedia((prev) => ({ ...prev, [messageId]: localUri }));
+      setMediaDownloadStates((prev) => ({
+        ...prev,
+        [messageId]: {
+          ...(prev[messageId] || { mediaId: messageId }),
+          status: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+          progress: 100,
+          localPath: localUri,
+          error: null,
+          updatedAt: Date.now(),
+        },
+      }));
+
+      await applyMediaDownloadedStateLocally({
+        messageId,
+        chatId: effectiveChatId,
+        isMediaDownloaded: true,
+        localUri,
+      });
+
+      if (eventKey && !mediaStatusProcessedRef.current.has(eventKey)) {
+        const deviceId = await getOrCreateDeviceId();
+        await queueMediaStatusUpdate({
+          messageId,
+          chatId: effectiveChatId,
+          deviceId,
+          isMediaDownloaded: true,
+        });
+      }
   
       setDownloadProgress(prev => {
         const copy = { ...prev };
         delete copy[messageId];
         return copy;
       });
+
+      return localUri;
   
     } catch (error) {
       console.log("❌ handleDownloadMedia error:", error);
       Alert.alert("Download failed", error?.message || "Unable to download media");
+
+      const failedId = String(msg?.mediaId || msg?.serverMessageId || msg?.id || '');
+      if (failedId) {
+        setMediaDownloadStates((prev) => ({
+          ...prev,
+          [failedId]: {
+            ...(prev[failedId] || { mediaId: failedId }),
+            status: MEDIA_DOWNLOAD_STATUS.FAILED,
+            progress: Number((prev[failedId]?.progress || 0)),
+            localPath: prev[failedId]?.localPath || null,
+            error: error?.message || 'download failed',
+            updatedAt: Date.now(),
+          },
+        }));
+      }
   
       setDownloadProgress(prev => {
         const copy = { ...prev };
-        delete copy[msg?.id];
+        delete copy[String(msg?.mediaId || msg?.serverMessageId || msg?.id || '')];
         return copy;
       });
+
+      return null;
     }
   };
 
-  const sendMedia = useCallback(async (mediaObj) => {
-    // console.log("mediaObj --------", mediaObj)
-    if (!mediaObj || !mediaObj.file) return;
-    const { file, type } = mediaObj;
-    const tempId = `temp_media_${Date.now()}_${Math.random()}`;
-    const timestamp = new Date().toISOString();
-  
-    let persistentUri;
+  const cleanupTempMediaUri = useCallback(async (uri) => {
     try {
-      const suggestedName = `sent_${chatIdRef.current || 'chat'}_${Date.now()}_${(file.name || '').replace(/\s+/g, '_')}`;
-      const copied = await copyToAppFolder(file.uri, suggestedName, SENT_DIR, (p) => setDownloadProgress(prev => ({ ...prev, [tempId]: p })));
-      persistentUri = copied ? normalizeUri(copied) : normalizeUri(file.uri);
-      
-      console.log('🔵 [SEND MEDIA] File copied to SENT_DIR:', persistentUri);
-    } catch (err) {
-      console.warn('Could not persist file, using original uri', err);
-      persistentUri = normalizeUri(file.uri);
+      if (!uri) return;
+      const normalized = normalizeUri(uri);
+      const cacheDir = normalizeUri(FileSystem.cacheDirectory || '');
+      if (!normalized || !cacheDir || !normalized.startsWith(cacheDir)) return;
+      const info = await FileSystem.getInfoAsync(normalized);
+      if (info?.exists) {
+        await FileSystem.deleteAsync(normalized, { idempotent: true });
+      }
+    } catch (error) {
+      console.warn('cleanupTempMediaUri failed', error);
     }
-  
+  }, []);
+
+  const sendMedia = useCallback(async (mediaObj, options = {}) => {
+    if (!mediaObj || !mediaObj.file) return { success: false, error: 'invalid media payload' };
+
+    const { file, type } = mediaObj;
+    const normalizedType = type === 'document' ? 'file' : type;
+    const tempId = options?.tempId || `temp_media_${Date.now()}_${Math.random()}`;
+    const timestamp = options?.createdAt || new Date().toISOString();
+    const localSourceUri = normalizeUri(file.uri);
+    const shouldInsertLocal = !options?.skipLocalInsert;
+
     const localMsg = {
       id: tempId,
       tempId,
-      type: type === 'document' ? 'file' : type,
+      type: normalizedType,
+      mediaType: normalizedType,
       text: file.name || '',
       mediaUrl: '',
-      previewUrl: persistentUri,
-      localUri: persistentUri,
+      mediaThumbnailUrl: localSourceUri,
+      previewUrl: localSourceUri,
+      localUri: localSourceUri,
       time: moment(timestamp).format("hh:mm A"),
       date: moment(timestamp).format("YYYY-MM-DD"),
       senderId: currentUserIdRef.current,
@@ -2692,153 +4228,383 @@ export default function useChatLogic({ navigation, route }) {
       status: 'sending',
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
-      payload: { 
-        chatId: chatIdRef.current, 
-        file: { ...file, uri: persistentUri }, 
-        tempId 
+      payload: {
+        chatId: chatIdRef.current,
+        file: { ...file, uri: localSourceUri },
+        tempId,
+        isMediaDownloaded: true,
+        uploadQueued: false,
       },
+      downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+      isMediaDownloaded: true,
       synced: false,
       chatId: chatIdRef.current,
-      useLocalForSender: true
+      useLocalForSender: true,
     };
-  
-    setAllMessages(prev => {
-      const updated = [localMsg, ...prev];
-      const uniqueMessages = deduplicateMessages(updated);
-      saveMessagesToLocal(uniqueMessages);
-      return uniqueMessages;
-    });
-  
-    try {
-      console.log('📤 [SEND MEDIA] Uploading to server...');
-      const action = await uploadMediaFile({ 
-        file: { ...file, uri: persistentUri }, 
-        chatId: chatIdRef.current, 
-        dispatch, 
-        mediaUploadAction: mediaUpload 
+
+    if (shouldInsertLocal) {
+      setAllMessages((prev) => {
+        const updated = [localMsg, ...prev];
+        const uniqueMessages = deduplicateMessages(updated);
+        saveMessagesToLocal(uniqueMessages);
+        return uniqueMessages;
       });
-      
-      // console.log("action?.payload", action?.payload)
+    }
+
+    if (!isConnected) {
+      const queue = [...(queuedMediaUploadsRef.current || [])];
+      const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
+      const queuedTask = {
+        tempId,
+        mediaObj: {
+          ...mediaObj,
+          file: { ...file, uri: localSourceUri },
+        },
+        createdAt: timestamp,
+        retries: Number(queue[existingIndex]?.retries || 0),
+      };
+      if (existingIndex >= 0) queue[existingIndex] = queuedTask;
+      else queue.push(queuedTask);
+      queuedMediaUploadsRef.current = queue;
+      await persistMediaUploadQueue(queue);
+
+      setAllMessages((prev) => prev.map((m) => (
+        m.tempId === tempId
+          ? {
+              ...m,
+              status: 'failed',
+              payload: {
+                ...(m.payload || {}),
+                uploadQueued: true,
+              },
+            }
+          : m
+      )));
+
+      return { success: false, queued: true, error: 'offline queued' };
+    }
+
+    let uploadTick = 0;
+    const uploadTimer = setInterval(() => {
+      uploadTick += 1;
+      setUploadProgress((prev) => {
+        const current = Number(prev[tempId] || 0);
+        if (current >= 0.92) return prev;
+        const next = Math.min(0.92, current + 0.08);
+        return { ...prev, [tempId]: next };
+      });
+      if (uploadTick > 40) clearInterval(uploadTimer);
+    }, 250);
+
+    setUploadProgress((prev) => ({ ...prev, [tempId]: 0.05 }));
+
+    try {
+      const uploadPromise = uploadMediaFile({
+        file: { ...file, uri: localSourceUri },
+        chatId: chatIdRef.current,
+        dispatch,
+        mediaUploadAction: mediaUpload,
+      });
+
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`upload timeout after ${MEDIA_UPLOAD_TIMEOUT_MS}ms`)), MEDIA_UPLOAD_TIMEOUT_MS);
+      });
+
+      const action = await Promise.race([uploadPromise, timeoutPromise]);
+      const uploadedLocalUri = normalizeUri(action?.localUri || localSourceUri);
       const payloadData = action?.payload || action;
       const success = payloadData && (payloadData.status === true || payloadData.statusCode === 200 || payloadData.success === true);
-      
+
       if (!success) {
-        console.error('❌ [SEND MEDIA] Upload failed:', payloadData);
-        setAllMessages(prev => prev.map(m => m.tempId === tempId ? { ...m, status: 'failed' } : m));
-        return;
+        setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
+        setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+        return { success: false, error: payloadData?.message || 'upload failed' };
       }
-  
-      // console.log("payloadData", payloadData)
-      const responseData = payloadData.data || payloadData;
-      // console.log("responseData", responseData)
-      const mediaUrl = responseData?.url || responseData?.mediaUrl || responseData?.path || responseData?.filePath || null;
-      const previewUrl = responseData?.previewUrl || responseData?.thumbnailUrl || mediaUrl;
-      const serverMessageId = responseData?.messageId || responseData?._id || null;
-  
-      console.log('✅ [SEND MEDIA] Upload successful. Server URLs:', { mediaUrl, previewUrl });
-  
-      setAllMessages(prevMessages => {
-        const withoutTemp = prevMessages.filter(m => m.tempId !== tempId && m.id !== tempId);
-        
+
+      clearInterval(uploadTimer);
+      setUploadProgress((prev) => ({ ...prev, [tempId]: 1 }));
+
+      const uploadResponse = payloadData;
+      const responseData = uploadResponse.data || uploadResponse;
+      const deviceId = await getOrCreateDeviceId();
+      const messagePayload = createMediaMessagePayload({
+        uploadResponse: responseData,
+        file,
+        messageType: type,
+        senderId: currentUserIdRef.current,
+        senderDeviceId: deviceId,
+        receiverId: chatData.peerUser._id,
+        chatId: chatIdRef.current,
+        messageId: responseData?.messageId,
+      });
+
+      const payloadValidation = validateMediaMessagePayload(messagePayload);
+      if (!payloadValidation.isValid) {
+        setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
+        setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+        return { success: false, error: `missing fields: ${payloadValidation.missing.join(',')}` };
+      }
+
+      const uploadedPreviewUrl = messagePayload.mediaUrl || '';
+      const uploadedThumbnailUrl = messagePayload.mediaThumbnailUrl || '';
+      const serverMessageId = messagePayload.messageId;
+      const mediaId = messagePayload.mediaId;
+      const normalizedCategory = messagePayload.messageType;
+      const mediaMeta = messagePayload.mediaMeta;
+
+      // For sender, always ensure mediaUrl/previewUrl are usable — fall back to localUri
+      const resolvedMediaUrl = uploadedPreviewUrl || uploadedLocalUri;
+      const resolvedPreviewUrl = uploadedThumbnailUrl || uploadedPreviewUrl || uploadedLocalUri;
+
+      setAllMessages((prevMessages) => {
+        const withoutTemp = prevMessages.filter((m) => m.tempId !== tempId && m.id !== tempId);
         const permanentMsg = {
-          id: serverMessageId || `msg_${Date.now()}`,
-          serverMessageId: serverMessageId,
-          tempId: serverMessageId,
-          type: type === 'document' ? 'file' : type,
+          id: serverMessageId,
+          serverMessageId,
+          tempId,
+          type: normalizedCategory,
+          mediaType: normalizedCategory,
           text: file.name || '',
-          mediaUrl: persistentUri,
-          previewUrl: persistentUri,
-          localUri: persistentUri,
-          serverMediaUrl: mediaUrl,
-          serverPreviewUrl: previewUrl,
+          mediaUrl: resolvedMediaUrl,
+          mediaThumbnailUrl: resolvedPreviewUrl,
+          previewUrl: resolvedPreviewUrl,
+          localUri: uploadedLocalUri,
+          serverMediaUrl: uploadedPreviewUrl,
+          serverPreviewUrl: uploadedThumbnailUrl,
           time: moment(timestamp).format("hh:mm A"),
           date: moment(timestamp).format("YYYY-MM-DD"),
           senderId: currentUserIdRef.current,
           senderType: 'self',
           receiverId: chatData.peerUser._id,
-          status: 'sent',
+          status: 'uploaded',
           createdAt: timestamp,
           timestamp: new Date(timestamp).getTime(),
           synced: true,
-          payload: { 
-            file: { ...file, uri: persistentUri } 
+          payload: {
+            ...messagePayload,
+            file: { ...file, uri: uploadedLocalUri },
+            isMediaDownloaded: true,
+            uploadQueued: false,
           },
+          mediaMeta,
+          downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+          isMediaDownloaded: true,
           chatId: chatIdRef.current,
           useLocalForSender: true,
-          mediaId: responseData?.mediaId || responseData?.id || null
+          mediaId,
         };
-  
-        console.log('✅ [SEND MEDIA] Created permanent message with localUri:', persistentUri);
-  
+
         const updated = [permanentMsg, ...withoutTemp];
         const uniqueMessages = deduplicateMessages(updated);
         const sorted = uniqueMessages.sort((a, b) => b.timestamp - a.timestamp);
-        
         saveMessagesToLocal(sorted);
         return sorted;
       });
-  
-      if (mediaUrl || previewUrl) {
-        // Always use _id.$oid for MongoDB if present
-        let mediaId = null;
-        if (responseData?._id && responseData._id.$oid) {
-          mediaId = String(responseData._id.$oid);
-        } else if (responseData?._id) {
-          mediaId = String(responseData._id);
-        } else if (responseData?.mediaId) {
-          mediaId = String(responseData.mediaId);
-        } else if (serverMessageId) {
-          mediaId = String(serverMessageId);
+
+      await sendMessageViaSocket({ ...messagePayload, tempId }, tempId).catch((err) => {
+        console.warn('media socket ack failed', err?.message || err);
+      });
+
+      const queue = [...(queuedMediaUploadsRef.current || [])].filter((item) => item?.tempId !== tempId);
+      queuedMediaUploadsRef.current = queue;
+      await persistMediaUploadQueue(queue);
+      return { success: true, tempId, messageId: serverMessageId };
+    } catch (err) {
+      const message = String(err?.message || err || 'upload failed');
+      const isNetworkFailure = /network request failed|timeout|aborted|socket not connected/i.test(message);
+
+      console.error('❌ [SEND MEDIA] Error:', {
+        message,
+        isConnected,
+        networkType,
+        fileUri: localSourceUri,
+        fileType: file?.type,
+        fileName: file?.name,
+      });
+
+      setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
+      setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+
+      if (isNetworkFailure) {
+        const queue = [...(queuedMediaUploadsRef.current || [])];
+        const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
+        const nextRetries = Number((existingIndex >= 0 ? queue[existingIndex]?.retries : 0) || 0);
+        const task = {
+          tempId,
+          mediaObj: {
+            ...mediaObj,
+            file: { ...file, uri: localSourceUri },
+          },
+          createdAt: timestamp,
+          retries: nextRetries,
+        };
+        if (existingIndex >= 0) queue[existingIndex] = task;
+        else queue.push(task);
+        queuedMediaUploadsRef.current = queue;
+        await persistMediaUploadQueue(queue);
+      }
+
+      return { success: false, error: message };
+    } finally {
+      clearInterval(uploadTimer);
+      if (!options?.fromQueue) {
+        setPendingMedia(null);
+      }
+      setDownloadProgress((prev) => {
+        const p = { ...prev };
+        delete p[tempId];
+        return p;
+      });
+      setTimeout(() => {
+        setUploadProgress((prev) => {
+          const next = { ...prev };
+          delete next[tempId];
+          return next;
+        });
+      }, 900);
+
+      // Safety net: if the message is still stuck at 'sending'/'uploaded' after 5s,
+      // check if it has a serverMessageId and promote it to 'sent'
+      setTimeout(() => {
+        setAllMessages((prev) => {
+          let changed = false;
+          const updated = prev.map((m) => {
+            if (m.tempId !== tempId) return m;
+            if ((m.status === 'sending' || m.status === 'uploaded') && m.serverMessageId) {
+              changed = true;
+              return { ...m, status: 'sent', synced: true };
+            }
+            return m;
+          });
+          if (changed) {
+            saveMessagesToLocal(updated);
+            return updated;
+          }
+          return prev;
+        });
+      }, 5000);
+    }
+  }, [
+    isConnected,
+    networkType,
+    dispatch,
+    chatData.peerUser,
+    deduplicateMessages,
+    saveMessagesToLocal,
+    getOrCreateDeviceId,
+    createMediaMessagePayload,
+    validateMediaMessagePayload,
+    sendMessageViaSocket,
+    persistMediaUploadQueue,
+  ]);
+
+  const flushQueuedMediaUploads = useCallback(async () => {
+    if (mediaUploadQueueInFlightRef.current) return;
+    if (!isConnected) return;
+
+    const queue = [...(queuedMediaUploadsRef.current || [])];
+    if (queue.length === 0) return;
+
+    mediaUploadQueueInFlightRef.current = true;
+    try {
+      let working = [...queue];
+      for (const item of queue) {
+        const retries = Number(item?.retries || 0);
+        if (retries >= MEDIA_UPLOAD_MAX_RETRIES) {
+          working = working.filter((q) => q?.tempId !== item?.tempId);
+          continue;
         }
 
-        const socketPayload = {
-          chatId: chatIdRef.current,
-          senderId: currentUserIdRef.current,
-          receiverId: chatData.peerUser._id,
-          messageType: type === 'document' ? 'file' : type,
-          mediaUrl: mediaUrl || previewUrl,
-          previewUrl: previewUrl || mediaUrl,
-          text: file.name || '',
-          messageId: serverMessageId,
-          createdAt: timestamp,
-          mediaId,
-        };
-  
-        try {
-          const socket = socketRef.current || getSocket();
-          if (socket && isSocketConnected()) {
-            socket.emit('message:send', socketPayload);
-            console.log('📨 [SEND MEDIA] Sent to receiver with server URLs');
-          }
-        } catch (err) {
-          console.warn('⚠️ [SEND MEDIA] Socket send failed:', err);
+        const result = await sendMedia(item?.mediaObj, {
+          tempId: item?.tempId,
+          skipLocalInsert: true,
+          fromQueue: true,
+          createdAt: item?.createdAt,
+        });
+
+        if (result?.success) {
+          working = working.filter((q) => q?.tempId !== item?.tempId);
+        } else {
+          working = working.map((q) => (
+            q?.tempId === item?.tempId
+              ? { ...q, retries: retries + 1 }
+              : q
+          ));
         }
       }
-  
-    } catch (err) {
-      console.error('❌ [SEND MEDIA] Error:', err);
-      setAllMessages(prev => prev.map(m => m.tempId === tempId ? { ...m, status: 'failed' } : m));
+
+      queuedMediaUploadsRef.current = working;
+      await persistMediaUploadQueue(working);
+    } catch (error) {
+      console.error('flushQueuedMediaUploads error', error);
     } finally {
-      setPendingMedia(null);
-      setDownloadProgress(prev => { const p = { ...prev }; delete p[tempId]; return p; });
+      mediaUploadQueueInFlightRef.current = false;
     }
-  }, [dispatch, chatData.peerUser, deduplicateMessages, saveMessagesToLocal]);
+  }, [isConnected, persistMediaUploadQueue, sendMedia]);
+
+  flushQueuedMediaUploadsRef.current = flushQueuedMediaUploads;
 
   const resendMessage = useCallback(async (msg) => {
     if (!msg) return;
     if (msg.mediaUrl) {
-      const payload = {
+      const normalizedCategory = normalizeOutboundMessageType(
+        msg?.mediaType || msg?.type || msg?.fileCategory || 'file'
+      );
+
+      const deviceId = await getOrCreateDeviceId();
+
+      const resolvedThumb =
+        msg?.mediaThumbnailUrl ||
+        msg?.thumbnailUrl ||
+        msg?.payload?.mediaThumbnailUrl ||
+        msg?.payload?.thumbnailUrl ||
+        msg?.payload?.file?.mediaThumbnailUrl ||
+        msg?.payload?.file?.thumbnailUrl ||
+        msg?.payload?.file?.previewUrl ||
+        msg?.previewUrl ||
+        msg?.mediaUrl;
+      const resolvedMediaUrl = msg?.mediaUrl || msg?.previewUrl || msg?.payload?.mediaUrl || '';
+      const existingMeta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
+      const messagePayload = {
         chatId: chatIdRef.current,
+        chatType: 'private',
+        messageId: String(msg?.serverMessageId || msg?.id || msg?.tempId || generateClientMessageId()),
         senderId: currentUserIdRef.current,
+        senderDeviceId: deviceId,
         receiverId: chatData.peerUser._id,
-        messageType: msg.type,
-        mediaUrl: msg.mediaUrl,
-        previewUrl: msg.previewUrl || msg.mediaUrl,
+        messageType: normalizedCategory,
+        mediaId: String(msg?.mediaId || existingMeta?.mediaId || msg?.serverMessageId || msg?.id || ''),
+        mediaUrl: resolvedMediaUrl,
+        mediaThumbnailUrl: resolvedThumb || resolvedMediaUrl,
+        mediaMeta: {
+          fileName: existingMeta?.fileName || msg?.text || extractFileName(resolvedMediaUrl),
+          fileSize: existingMeta?.fileSize || existingMeta?.sizeAfter || null,
+          mimeType: existingMeta?.mimeType || msg?.payload?.file?.type || `application/${normalizedCategory}`,
+          width: existingMeta?.width || null,
+          height: existingMeta?.height || null,
+        },
+        status: 'sent',
         text: msg.text || '',
-        tempId: msg.tempId || `temp_retry_${Date.now()}`,
         createdAt: new Date().toISOString(),
-        mediaId: msg.mediaId || null
       };
+
+      const payloadValidation = validateMediaMessagePayload(messagePayload);
+      if (!payloadValidation.isValid) {
+        console.warn('❌ resendMessage: missing required media fields', payloadValidation.missing);
+        updateMessageStatus(msg.tempId || msg.id, 'failed');
+        return;
+      }
+
+      console.log("MESSAGE PAYLOAD", messagePayload);
+      const payload = {
+        ...messagePayload,
+        fileCategory: normalizedCategory,
+        previewUrl: messagePayload.mediaThumbnailUrl,
+        thumbnailUrl: messagePayload.mediaThumbnailUrl,
+        tempId: msg.tempId || `temp_retry_${Date.now()}`,
+      };
+
+      console.log('🔄 Resending media message with payload: *******', payload);
       try {
         await sendMessageViaSocket(payload, msg.tempId || payload.tempId);
       } catch (err) {
@@ -2857,7 +4623,15 @@ export default function useChatLogic({ navigation, route }) {
         createdAt: new Date().toISOString(),
       }, msg.tempId || `temp_retry_${Date.now()}`);
     }
-  }, [sendMessageViaSocket, sendMedia, chatData.peerUser]);
+  }, [
+    sendMessageViaSocket,
+    sendMedia,
+    chatData.peerUser,
+    getOrCreateDeviceId,
+    normalizeOutboundMessageType,
+    validateMediaMessagePayload,
+    updateMessageStatus,
+  ]);
 
   const onRefresh = useCallback(async () => {
     setIsRefreshing(true);
@@ -2949,8 +4723,8 @@ export default function useChatLogic({ navigation, route }) {
     if (!hasMoreMessages) return;
 
     const nextPage = currentPage + 1;
-    const oldest = allMessages.length > 0
-      ? allMessages.reduce((acc, msg) => {
+    const oldest = messages.length > 0
+      ? messages.reduce((acc, msg) => {
           const ts = Number(msg?.timestamp || 0);
           if (!acc || ts < acc) return ts;
           return acc;
@@ -2972,16 +4746,10 @@ export default function useChatLogic({ navigation, route }) {
     });
 
     dispatch(chatMessage({ chatId: chatIdRef.current, search: '', page: nextPage, limit: 50 }));
-  }, [isLoadingMore, hasMoreMessages, currentPage, dispatch, allMessages, fetchAndSyncMessagesViaSocket]);
+  }, [isLoadingMore, hasMoreMessages, currentPage, dispatch, messages, fetchAndSyncMessagesViaSocket]);
 
   /* ========== FIXED: Render status helper ========== */
   const renderStatusText = useCallback(() => {
-    console.log('📊 [STATUS] Rendering status:', { 
-      isPeerTyping, 
-      userStatus, 
-      lastSeen 
-    });
-    
     if (isPeerTyping) {
       return 'typing...';
     }
@@ -3019,42 +4787,15 @@ export default function useChatLogic({ navigation, route }) {
   }, [pickMedia]);
 
   useEffect(() => {
-    if (allMessages.length > 0) {
-      const ids = new Set();
-      const duplicates = [];
-      
-      allMessages.forEach(msg => {
-        const msgId = msg.serverMessageId || msg.id;
-        if (ids.has(msgId)) {
-          duplicates.push(msg);
-        } else {
-          ids.add(msgId);
-        }
-      });
-      
-      if (duplicates.length > 0) {
-        console.log('🧹 Found duplicates:', duplicates.length);
-        
-        const uniqueMessages = [];
-        const seenIds = new Set();
-        
-        allMessages.forEach(msg => {
-          const msgId = msg.serverMessageId || msg.id;
-          if (!seenIds.has(msgId)) {
-            seenIds.add(msgId);
-            uniqueMessages.push(msg);
-          }
-        });
-        
-        const sorted = uniqueMessages.sort((a, b) => 
-          (b.timestamp || 0) - (a.timestamp || 0)
-        );
-        
-        setAllMessages(sorted);
-        saveMessagesToLocal(sorted);
-      }
-    }
-  }, [allMessages.length, saveMessagesToLocal]);
+    if (!Array.isArray(allMessages) || allMessages.length < 2) return;
+
+    const deduped = deduplicateMessages(allMessages);
+    if (deduped.length === allMessages.length) return;
+
+    const sorted = deduped.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    setAllMessages(sorted);
+    saveMessagesToLocal(sorted);
+  }, [allMessages, deduplicateMessages, saveMessagesToLocal]);
 
   useEffect(() => {
     console.log("📱 ChatScreen received params:", {
@@ -3078,13 +4819,19 @@ export default function useChatLogic({ navigation, route }) {
     search, handleSearch, clearSearch, goToNextResult, goToPreviousResult, searchResults, currentSearchIndex,
     selectedMessage, handleToggleSelectMessages, handleDeleteSelected,
     text, setText, handleTextChange, handleSendText,
+    sendLocationMessage, sendContactMessage,
     pendingMedia, setPendingMedia, sendMedia, handlePickMedia, showMediaOptions, openMediaOptions, closeMediaOptions,
-    mediaViewer, closeMediaViewer, handleDownloadMedia, downloadedMedia, downloadProgress,
+    mediaViewer, closeMediaViewer, handleDownloadMedia, downloadedMedia, downloadProgress, uploadProgress, mediaDownloadStates,
+    markMediaRemovedLocally,
+    retryMediaStatusUpdate, retryAllFailedMediaStatusUpdates,
     onRefresh, loadMoreMessages, isLoadingMore, hasMoreMessages,
     manualReloadMessages,
     refreshMessagesFromLocal,
     isChatMuted, muteUntil, toggleChatMute,
+    clearChatForMe,
+    clearChatForEveryone,
     markVisibleIncomingAsRead,
     setMessages, saveMessagesToLocal, resendMessage,
+    editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
   };
 }

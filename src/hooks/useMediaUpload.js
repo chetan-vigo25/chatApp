@@ -77,7 +77,7 @@ export default function useMediaUpload() {
       await mediaService.persistMediaRecord({
         mediaId,
         chatId,
-        localPath: processedFile?.uri,
+        localPath: null,
         previewUrl: serverData.previewUrl,
         thumbnailUrl: serverData.thumbnailUrl || thumbnailUri,
         messageType,

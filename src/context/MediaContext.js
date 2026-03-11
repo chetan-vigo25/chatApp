@@ -92,7 +92,7 @@ export function MediaProvider({ children }) {
         await mediaService.persistMediaRecord({
           mediaId,
           chatId: item.chatId,
-          localPath: item?.processedFile?.uri || item?.file?.uri || null,
+          localPath: null,
           previewUrl: server.previewUrl,
           thumbnailUrl: server.thumbnailUrl || item.thumbnailUri,
           messageType: item.messageType,

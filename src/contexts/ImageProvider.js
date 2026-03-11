@@ -15,13 +15,30 @@ export const ImageProvider = ({ children }) => {
     try {
       if (mediaType === 'document') {
         // pick document
-        const result = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: false });
-        if (result.type === 'cancel') return null;
+        const result = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
+        if (result.canceled) return null;
+        const asset = result.assets?.[0];
+        if (!asset?.uri) return null;
+
+        let finalUri = asset.uri;
+
+        // Android: copy content:// URIs to cache so upload can read them
+        if (Platform.OS === 'android' && finalUri.startsWith('content://')) {
+          try {
+            const destName = asset.name || `file_${Date.now()}`;
+            const dest = `${FileSystem.cacheDirectory}${destName}`;
+            const downloadRes = await FileSystem.downloadAsync(finalUri, dest);
+            if (downloadRes?.uri) finalUri = downloadRes.uri;
+          } catch (err) {
+            console.warn('Failed to copy content:// uri to cache for document', err);
+          }
+        }
+
         const file = {
-          uri: result.uri,
-          name: result.name || `file_${Date.now()}`,
-          type: result.mimeType || 'application/octet-stream',
-          size: result.size || 0,
+          uri: finalUri,
+          name: asset.name || `file_${Date.now()}`,
+          type: asset.mimeType || 'application/octet-stream',
+          size: asset.size || 0,
         };
         setImage(file);
         return file;

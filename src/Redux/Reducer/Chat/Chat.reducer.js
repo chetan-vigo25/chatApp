@@ -1,4 +1,5 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { chatServices } from '../../Services/Chat/Chat.Services';
 
 // ============================================
@@ -11,11 +12,17 @@ export const chatListData = createAsyncThunk(
   async (searchValue, { rejectWithValue }) => {
     try {
       const response = await chatServices.chatListData(searchValue);
+      const rawUser = await AsyncStorage.getItem('userInfo');
+      const parsedUser = rawUser ? JSON.parse(rawUser) : null;
+      const ownerUserId = parsedUser?._id || parsedUser?.id || null;
       if (!response?.data) {
-        return [];
+        return { docs: [], ownerUserId };
       }
       const docs = response.data.docs;
-      return Array.isArray(docs) ? docs : [];
+      return {
+        docs: Array.isArray(docs) ? docs : [],
+        ownerUserId,
+      };
 
     } catch (error) {
       return rejectWithValue(error.message);
@@ -143,6 +150,7 @@ const chatSlice = createSlice({
     isLoading: false,
     error: null,
     otpMessage: '',
+    ownerUserId: null,
     
     // Pagination state
     currentPage: 1,
@@ -190,7 +198,8 @@ const chatSlice = createSlice({
       })
       .addCase(chatListData.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.chatsData = action.payload || null;
+        state.chatsData = action.payload?.docs || [];
+        state.ownerUserId = action.payload?.ownerUserId || null;
         state.error = null;
       })
       .addCase(chatListData.rejected, (state, action) => {

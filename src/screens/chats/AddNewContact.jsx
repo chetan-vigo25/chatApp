@@ -28,6 +28,10 @@ export default function AddNewContact({ navigation }) {
     const searchTimeoutRef = useRef(null);
     const isSocketListenerActive = useRef(false);
     const pendingUserDataRef = useRef(null); // Add this to store user data persistently
+    const socketHandlersRef = useRef({
+      onSearchResponse: null,
+      onChatCreateResponse: null,
+    });
 
     useEffect(() => {
       const timer = setTimeout(() => {
@@ -107,7 +111,7 @@ export default function AddNewContact({ navigation }) {
 
         console.log('🎧 Setting up socket listeners for contact search');
         
-        socket.on('user:search:mobile:response', (response) => {
+        const onSearchResponse = (response) => {
           console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           console.log("📥 SEARCH USER BY MOBILE RESPONSE");
           console.log("   Status:", response.status);
@@ -143,9 +147,11 @@ export default function AddNewContact({ navigation }) {
               message: response?.message || 'User not found'
             });
           }
-        });
+        };
+        socketHandlersRef.current.onSearchResponse = onSearchResponse;
+        socket.on('user:search:mobile:response', onSearchResponse);
 
-        socket.on('chat:create:response', (response) => {
+        const onChatCreateResponse = (response) => {
           console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           console.log("📥 CREATE CHAT RESPONSE");
           console.log("   Response:", JSON.stringify(response, null, 2));
@@ -194,7 +200,9 @@ export default function AddNewContact({ navigation }) {
             console.error("❌ Failed to create chat:", response.message);
             Alert.alert('Error', response.message || 'Failed to create chat');
           }
-        });
+        };
+        socketHandlersRef.current.onChatCreateResponse = onChatCreateResponse;
+        socket.on('chat:create:response', onChatCreateResponse);
 
         isSocketListenerActive.current = true;
     }
@@ -222,8 +230,14 @@ export default function AddNewContact({ navigation }) {
         }
         
         console.log("🔇 Removing socket listeners for contact search");
-        socket.off('user:search:mobile:response');
-        socket.off('chat:create:response');
+        if (socketHandlersRef.current.onSearchResponse) {
+          socket.off('user:search:mobile:response', socketHandlersRef.current.onSearchResponse);
+        }
+        if (socketHandlersRef.current.onChatCreateResponse) {
+          socket.off('chat:create:response', socketHandlersRef.current.onChatCreateResponse);
+        }
+        socketHandlersRef.current.onSearchResponse = null;
+        socketHandlersRef.current.onChatCreateResponse = null;
         isSocketListenerActive.current = false;
     }; 
 

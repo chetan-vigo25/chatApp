@@ -1,5 +1,5 @@
 // src/AppContent.js
-import React, { useEffect } from 'react';
+import React from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import RootNavigator from '../navigations/RootNavigator';
@@ -7,13 +7,7 @@ import { useFonts } from 'expo-font';
 import { useTheme } from '../contexts/ThemeContext';
 import { useNetwork } from '../contexts/NetworkContext';
 import NoInternet from '../screens/NoInternet';
-
-// 🔔 Import updated FCM service
-import { 
-  getFCMToken, 
-  setupNotificationCategory, 
-  initializeNotifications 
-} from '../firebase/fcmService';
+import AppBannerHost from '../../src/components/AppBannerHost';
 
 export default function AppContent() {
   const { theme, isDarkMode } = useTheme();
@@ -31,37 +25,12 @@ export default function AppContent() {
     'Poppins-SemiBold': require('../../assets/fonts/Poppins-SemiBold.ttf'),
   });
 
-  useEffect(() => {
-    let isMounted = true;
-    const initFCM = async () => {
-      // 1️⃣ Setup Comment category for notifications
-      await setupNotificationCategory();
-      // 2️⃣ Get FCM token
-      const token = await getFCMToken();
-      if (token && isMounted) {
-        console.log('FCM token ready for Backend:', token);
-      } 
-      // 3️⃣ Initialize notifications (foreground + background + Comment button)
-      const unsubscribe = initializeNotifications();
-      return unsubscribe; // will be used in cleanup
-    };
-
-    let cleanup;
-    initFCM().then(unsub => {
-      cleanup = unsub;
-    });
-
-    return () => {
-      isMounted = false;
-      if (cleanup) cleanup();
-    };
-  }, []);
-
   if (!fontsLoaded) return null;
   if (!isConnected) return <NoInternet />;
 
   return (
     <SafeAreaProvider style={{ flex: 1, backgroundColor: theme.colors.background }}>
+      <AppBannerHost />
       <RootNavigator />
       <StatusBar style={isDarkMode ? 'light' : 'dark'} />
     </SafeAreaProvider>

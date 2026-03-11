@@ -30,7 +30,7 @@ const CATEGORY_OPTIONS = [
   // Optional: Location, Contact
 ];
 
-export default function WhatsAppUploadButton({ onSelectCategory }) {
+export default function AppUploadButton({ onSelectCategory }) {
   const [expanded, setExpanded] = useState(false);
   const animation = useRef(new Animated.Value(0)).current;
 

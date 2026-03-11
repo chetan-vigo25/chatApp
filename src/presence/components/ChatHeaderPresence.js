@@ -44,15 +44,17 @@ export default function ChatHeaderPresence({
       'offline'
     );
 
-  const borderColor = normalizedStatus === 'online' ? '#2CC84D' : '#9E9E9E';
+  const borderColor = normalizedStatus === 'online' ? '#2CC84D' : '#ececec';
 
   return (
-    <View style={{ width: '100%', flexDirection: 'row', alignItems: 'center', padding: 10, borderBottomWidth: 0, borderBottomColor: theme.colors.borderColor, gap: 10 }}>
+    <View style={{ width: '100%', flexDirection: 'row', alignItems: 'center', padding: 10, gap: 10, backgroundColor: theme.colors.background,
+        // borderBottomWidth: 1,
+        borderBottomColor: theme.colors.borderColor,}} >
       <TouchableOpacity onPress={onBack} style={{ width: 40, height: 40, justifyContent: 'center', alignItems: 'center' }}>
         <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={onPressProfile} style={{ width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor }}>
+      <TouchableOpacity onPress={onPressProfile} style={{ width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor }}>
         {user?.profileImage ? (
           <Image source={{ uri: user.profileImage }} style={{ width: '100%', height: '100%', borderRadius: 24 }} />
         ) : (

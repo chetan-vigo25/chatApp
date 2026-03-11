@@ -71,6 +71,7 @@ export default function Profile({ navigation }) {
           // 🔹 Immediately upload the selected image
           await imageEdit(uri);
         }
+         
       } catch (error) {
         console.error('Error picking image:', error);
         showToast('Failed to pick image');
@@ -220,122 +221,144 @@ export default function Profile({ navigation }) {
       return null;
     };
 
+    // console.log("profile data---", profileData)
     return (
       <Animated.View style={{ flex: 1, opacity: fadeAnim }}>
         <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
-          <View style={{ width: '100%', flexDirection: 'row', gap: 20, borderBottomWidth: 0.5, borderBottomColor: theme.colors.borderColor, padding: 10 }}>
-            <TouchableOpacity onPress={() => navigation.goBack()} style={{ width: 30, height: 30, justifyContent: 'center', alignItems: 'flex-end' }}>
+          <View style={{ width: '100%', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 12 }}>
+            <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={{ width: 40, height: 40, justifyContent: 'center', alignItems: 'center', borderRadius: 20 }}>
               <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
             </TouchableOpacity>
-            <View style={{ flex: 1, alignItems: 'flex-start', justifyContent: 'center' }}>
-              <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 16, color: theme.colors.primaryTextColor }}>Profile</Text>
-            </View>
+            <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 18, color: theme.colors.primaryTextColor, marginLeft: 12 }}>Profile</Text>
           </View>
-          <ScrollView style={{ flex: 1, padding: 20 }} showsVerticalScrollIndicator={false}>
+          <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 40 }}>
             <View>
-              <View style={{ width: 150, height: 150, alignSelf: 'center', alignItems: 'center', justifyContent: 'center', borderRadius: 75, overflow: 'hidden', marginBottom: 10 }}>
-                <View style={{ width: 150, height: 150, backgroundColor: '#ccc', borderRadius: 100, overflow: 'hidden', justifyContent: 'center', alignItems: "center" }}>
-                  {loader ? (
-                    <ActivityIndicator size="large" color={theme.colors.themeColor} />
-                  ) : (
-                    <>
-                      {getImageSource() ? (
-                        <Image
-                          resizeMode="cover"
-                          source={getImageSource()}
-                          style={{ width: '100%', height: '100%' }}
-                        />
-                      ) : (
-                        <FontAwesome5 name="user-alt" size={80} color="#fff" />
-                      )}
-                    </>
-                  )}
+              {/* Avatar Section */}
+              <View style={{ alignItems: 'center', paddingTop: 24, paddingBottom: 24 }}>
+                <View style={{ position: 'relative', marginBottom: 16 }}>
+                  <View style={{ width: 120, height: 120, borderRadius: 60, overflow: 'hidden', backgroundColor: theme.colors.menuBackground || '#e0e0e0' }}>
+                    {loader ? (
+                      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+                        <ActivityIndicator size="large" color={theme.colors.themeColor} />
+                      </View>
+                    ) : (
+                      <>
+                        {getImageSource() ? (
+                          <Image
+                            resizeMode="cover"
+                            source={getImageSource()}
+                            style={{ width: '100%', height: '100%' }}
+                          />
+                        ) : (
+                          <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+                            <FontAwesome5 name="user-alt" size={50} color={theme.colors.placeHolderTextColor || '#aaa'} />
+                          </View>
+                        )}
+                      </>
+                    )}
+                  </View>
+                  <TouchableOpacity
+                    onPress={showImagePickerOptions}
+                    disabled={loader}
+                    activeOpacity={0.7}
+                    style={{
+                      position: 'absolute',
+                      bottom: 0,
+                      right: 0,
+                      width: 38,
+                      height: 38,
+                      borderRadius: 19,
+                      backgroundColor: theme.colors.themeColor,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      borderWidth: 3,
+                      borderColor: theme.colors.background,
+                    }}
+                  >
+                    <Ionicons name="camera" size={18} color="#fff" />
+                  </TouchableOpacity>
                 </View>
-                <TouchableOpacity 
-                  onPress={showImagePickerOptions} 
-                  disabled={loader}
-                  style={{ 
-                    width: 150, 
-                    height: 35, 
-                    justifyContent: 'center', 
-                    alignItems: 'center', 
-                    backgroundColor: '#00000080', 
-                    position: 'absolute', 
-                    bottom: 0, 
-                    borderBottomLeftRadius: 100, 
-                    borderBottomRightRadius: 100 
-                  }}
-                >
-                  <Ionicons name="camera-reverse" size={24} color="#fff" />
-                </TouchableOpacity>
-              </View>
-              
-              {profileData?.profileImage && (
-                <TouchableOpacity onPress={removeDp} disabled={loader}>
-                  <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Medium', fontSize: 14, textAlign: "center" }}>
-                    Remove Picture
+
+                {profileData?.fullName && (
+                  <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 22, color: theme.colors.primaryTextColor, textTransform: 'capitalize' }}>
+                    {profileData.fullName}
                   </Text>
+                )}
+                {profileData?.about ? (
+                  <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor, marginTop: 2, paddingHorizontal: 40, textAlign: 'center' }} numberOfLines={2}>
+                    {profileData.about}
+                  </Text>
+                ) : null}
+
+                {profileData?.profileImage && (
+                  <TouchableOpacity onPress={removeDp} disabled={loader} activeOpacity={0.6} style={{ marginTop: 14 }}>
+                    <Text style={{ color: '#E53935', fontFamily: 'Poppins-Medium', fontSize: 13 }}>
+                      Remove Photo
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {/* Divider */}
+              <View style={{ height: 6, backgroundColor: theme.colors.menuBackground || (isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)') }} />
+
+              {/* Info Rows — flat, no card container */}
+              <View style={{ paddingTop: 8 }}>
+
+                {/* Name */}
+                <TouchableOpacity
+                  onPress={() => navigation.navigate('PersonalInfoEdit', { field: 'fullName', value: profileData?.fullName })}
+                  activeOpacity={0.5}
+                  style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 14 }}
+                >
+                  <Ionicons name="person-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
+                  <View style={{ flex: 1, marginLeft: 16 }}>
+                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Name</Text>
+                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, textTransform: 'capitalize', lineHeight: 22 }}>{profileData?.fullName}</Text>
+                  </View>
+                  <Ionicons name="pencil-outline" size={18} color={theme.colors.placeHolderTextColor} />
                 </TouchableOpacity>
-              )}
-              
-              <View style={{ width: '100%', marginTop: 40 }}>
-                <View style={{ width: '100%', marginBottom: 20 }}>
-                  <TouchableOpacity 
-                    onPress={() => navigation.navigate('PersonalInfoEdit', { field: 'fullName', value: profileData?.fullName })} 
-                    activeOpacity={0.9} 
-                    style={{ width: '100%', height: 40, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 0.4, borderBottomColor: theme.colors.borderColor, marginBottom: 10 }}
-                  >
-                    <View style={{ width: 30, height: 30, justifyContent: "center", alignItems: 'center', borderRadius: 50 }}>
-                      <FontAwesome5 name="user" size={20} color={theme.colors.placeHolderTextColor} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.primaryTextColor }}>Name</Text>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 12, color: theme.colors.placeHolderTextColor }}>{profileData?.fullName}</Text>
-                    </View>
-                  </TouchableOpacity>
-                </View>
-                
-                <View style={{ width: '100%', marginBottom: 20 }}>
-                  <TouchableOpacity 
-                    onPress={() => navigation.navigate('PersonalInfoEdit', { field: 'about', value: profileData?.about })} 
-                    activeOpacity={0.9} 
-                    style={{ width: '100%', height: 40, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 0.4, borderBottomColor: theme.colors.borderColor, marginBottom: 10 }}
-                  >
-                    <View style={{ width: 30, height: 30, justifyContent: "center", alignItems: 'center', borderRadius: 50 }}>
-                      <AntDesign name="exclamation-circle" size={20} color={theme.colors.placeHolderTextColor} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.primaryTextColor }}>About</Text>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 12, color: theme.colors.placeHolderTextColor }}>{profileData?.about || 'N/A'}</Text>
-                    </View>
-                  </TouchableOpacity>
-                </View>
-                
-                <View style={{ width: '100%', marginBottom: 20 }}>
-                  <View style={{ width: '100%', height: 40, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 0.4, borderBottomColor: theme.colors.borderColor, marginBottom: 10 }}>
-                    <View style={{ width: 30, height: 30, justifyContent: "center", alignItems: 'center', borderRadius: 50 }}>
-                      <MaterialIcons name="call" size={20} color={theme.colors.placeHolderTextColor} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.primaryTextColor }}>Phone</Text>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 12, color: theme.colors.placeHolderTextColor }}>
-                        {profileData?.mobile?.code} {profileData?.mobile?.number}
-                      </Text>
-                    </View>
+
+                <View style={{ height: 0.5, backgroundColor: theme.colors.borderColor, marginLeft: 64, opacity: 0.35 }} />
+
+                {/* About */}
+                <TouchableOpacity
+                  onPress={() => navigation.navigate('PersonalInfoEdit', { field: 'about', value: profileData?.about })}
+                  activeOpacity={0.5}
+                  style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 14 }}
+                >
+                  <Ionicons name="information-circle-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
+                  <View style={{ flex: 1, marginLeft: 16 }}>
+                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>About</Text>
+                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }} numberOfLines={1}>{profileData?.about || 'Add about'}</Text>
+                  </View>
+                  <Ionicons name="pencil-outline" size={18} color={theme.colors.placeHolderTextColor} />
+                </TouchableOpacity>
+
+                <View style={{ height: 0.5, backgroundColor: theme.colors.borderColor, marginLeft: 64, opacity: 0.35 }} />
+
+                {/* Phone */}
+                <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 14 }}>
+                  <Ionicons name="call-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
+                  <View style={{ flex: 1, marginLeft: 16 }}>
+                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Phone</Text>
+                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }}>
+                      {profileData?.mobile?.code} {profileData?.mobile?.number}
+                    </Text>
                   </View>
                 </View>
-                
-                <View style={{ width: '100%', marginBottom: 20 }}>
-                  <View style={{ width: '100%', height: 40, flexDirection: 'row', gap: 10, alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: 0.4, borderBottomColor: theme.colors.borderColor, marginBottom: 10 }}>
-                    <View style={{ width: 30, height: 30, justifyContent: "center", alignItems: 'center', borderRadius: 50 }}>
-                      <MaterialIcons name="email" size={20} color={theme.colors.placeHolderTextColor} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.primaryTextColor }}>Email</Text>
-                      <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 12, color: theme.colors.placeHolderTextColor }}>{profileData?.email}</Text>
-                    </View>
+
+                <View style={{ height: 0.5, backgroundColor: theme.colors.borderColor, marginLeft: 64, opacity: 0.35 }} />
+
+                {/* Email */}
+                <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 14 }}>
+                  <Ionicons name="mail-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
+                  <View style={{ flex: 1, marginLeft: 16 }}>
+                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Email</Text>
+                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }}>{profileData?.email || "N/A"}</Text>
                   </View>
                 </View>
+
               </View>
             </View>
           </ScrollView>

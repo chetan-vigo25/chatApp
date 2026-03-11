@@ -30,6 +30,19 @@ const ensureDir = async (dirPath) => {
 };
 
 class LocalStorageService {
+  async _getFileFingerprint(filePath) {
+    if (!filePath) return null;
+    try {
+      const info = await FileSystem.getInfoAsync(filePath, { md5: true });
+      if (!info?.exists) return null;
+      const md5 = info?.md5 || 'nomd5';
+      const size = Number(info?.size || 0);
+      return `${md5}:${size}`;
+    } catch {
+      return null;
+    }
+  }
+
     /**
      * Hydrate downloaded media from persistent storage, verify file existence, remove stale DB entries.
      * Returns a map of valid downloaded media { mediaId: localPath }
@@ -118,9 +131,34 @@ class LocalStorageService {
     const mediaMap = await this._readObject(KEY_MEDIA_FILES);
     const key = String(record?.id || record?.mediaId || record?.serverMessageId || Date.now());
 
+    const incomingFingerprint = record?.localPath
+      ? await this._getFileFingerprint(record.localPath)
+      : null;
+
+    if (incomingFingerprint) {
+      for (const [existingKey, existingRecord] of Object.entries(mediaMap)) {
+        if (existingKey === key) continue;
+        const existingFingerprint = existingRecord?.fingerprint || null;
+        if (existingFingerprint && existingFingerprint === incomingFingerprint) {
+          mediaMap[key] = {
+            ...(mediaMap[key] || {}),
+            ...existingRecord,
+            ...record,
+            localPath: existingRecord.localPath,
+            fingerprint: incomingFingerprint,
+            mediaId: key,
+            updatedAt: Date.now(),
+          };
+          await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+          return mediaMap[key];
+        }
+      }
+    }
+
     mediaMap[key] = {
       ...(mediaMap[key] || {}),
       ...record,
+      fingerprint: incomingFingerprint || mediaMap[key]?.fingerprint || null,
       mediaId: key,
       updatedAt: Date.now(),
     };
@@ -135,12 +173,238 @@ class LocalStorageService {
     return mediaMap[String(mediaId)] || null;
   }
 
+  async getMediaCache(mediaId) {
+    if (!mediaId) return null;
+    const record = await this.getMediaFile(mediaId);
+    if (!record) return null;
+
+    return {
+      mediaId: String(mediaId),
+      localPath: record?.localPath || null,
+      downloadStatus:
+        String(record?.downloadStatus || '').toUpperCase() ||
+        (record?.localPath ? 'DOWNLOADED' : 'NOT_DOWNLOADED'),
+      downloadedAt: record?.downloadedAt || null,
+      updatedAt: record?.updatedAt || null,
+      lastError: record?.lastError || null,
+    };
+  }
+
+  async getAllMediaCache() {
+    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+    const output = {};
+
+    Object.entries(mediaMap || {}).forEach(([mediaId, record]) => {
+      output[String(mediaId)] = {
+        mediaId: String(mediaId),
+        localPath: record?.localPath || null,
+        downloadStatus:
+          String(record?.downloadStatus || '').toUpperCase() ||
+          (record?.localPath ? 'DOWNLOADED' : 'NOT_DOWNLOADED'),
+        downloadedAt: record?.downloadedAt || null,
+        updatedAt: record?.updatedAt || null,
+        lastError: record?.lastError || null,
+      };
+    });
+
+    return output;
+  }
+
+  async removeDownloadedMedia(mediaId) {
+    return this.removeMediaFile(mediaId);
+  }
+
+  async getStorageUsage() {
+    await this.init();
+    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+    const thumbnails = await this._readObject(KEY_THUMBNAILS);
+
+    let totalBytes = 0;
+    let mediaBytes = 0;
+    let thumbnailBytes = 0;
+    let fileCount = 0;
+
+    for (const item of Object.values(mediaMap || {})) {
+      if (!item?.localPath) continue;
+      try {
+        const info = await FileSystem.getInfoAsync(item.localPath);
+        if (!info?.exists) continue;
+        const size = Number(info?.size || 0);
+        totalBytes += size;
+        mediaBytes += size;
+        fileCount += 1;
+      } catch {}
+    }
+
+    for (const item of Object.values(thumbnails || {})) {
+      if (!item?.path) continue;
+      try {
+        const info = await FileSystem.getInfoAsync(item.path);
+        if (!info?.exists) continue;
+        const size = Number(info?.size || 0);
+        totalBytes += size;
+        thumbnailBytes += size;
+      } catch {}
+    }
+
+    return {
+      totalBytes,
+      mediaBytes,
+      thumbnailBytes,
+      fileCount,
+      totalMB: Number((totalBytes / 1024 / 1024).toFixed(2)),
+    };
+  }
+
+  async cleanupOrphanedMedia() {
+    await this.init();
+    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+    const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
+    const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
+
+    let removed = 0;
+
+    for (const [mediaId, record] of Object.entries(mediaMap)) {
+      const localPath = record?.localPath;
+      if (!localPath) continue;
+      try {
+        const info = await FileSystem.getInfoAsync(localPath);
+        if (!info?.exists) {
+          delete mediaMap[mediaId];
+          delete queueMap[mediaId];
+          removed += 1;
+        }
+      } catch {
+        delete mediaMap[mediaId];
+        delete queueMap[mediaId];
+        removed += 1;
+      }
+    }
+
+    for (const [mediaId, thumb] of Object.entries(thumbnailMap)) {
+      const thumbPath = thumb?.path;
+      if (!thumbPath) {
+        delete thumbnailMap[mediaId];
+        continue;
+      }
+      try {
+        const info = await FileSystem.getInfoAsync(thumbPath);
+        if (!info?.exists) {
+          delete thumbnailMap[mediaId];
+          removed += 1;
+        }
+      } catch {
+        delete thumbnailMap[mediaId];
+        removed += 1;
+      }
+    }
+
+    await Promise.all([
+      this._writeObject(KEY_MEDIA_FILES, mediaMap),
+      this._writeObject(KEY_THUMBNAILS, thumbnailMap),
+      this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap),
+    ]);
+
+    return removed;
+  }
+
+  async clearCache({ clearThumbnails = true, clearFailedQueue = true } = {}) {
+    await this.init();
+    let removed = 0;
+
+    if (clearThumbnails) {
+      const thumbnails = await this._readObject(KEY_THUMBNAILS);
+      for (const item of Object.values(thumbnails || {})) {
+        if (!item?.path) continue;
+        try {
+          const info = await FileSystem.getInfoAsync(item.path);
+          if (info?.exists) {
+            await FileSystem.deleteAsync(item.path, { idempotent: true });
+            removed += 1;
+          }
+        } catch {}
+      }
+      await this._writeObject(KEY_THUMBNAILS, {});
+    }
+
+    if (clearFailedQueue) {
+      const queue = await this._readObject(KEY_DOWNLOAD_QUEUE);
+      const next = {};
+      Object.entries(queue || {}).forEach(([k, v]) => {
+        if (!['failed', 'cancelled'].includes(v?.status)) {
+          next[k] = v;
+        }
+      });
+      await this._writeObject(KEY_DOWNLOAD_QUEUE, next);
+    }
+
+    return removed;
+  }
+
+  async enforceStorageQuota(maxBytes = 1024 * 1024 * 1024) {
+    await this.init();
+    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+    const records = Object.entries(mediaMap || []).map(([mediaId, record]) => ({
+      mediaId,
+      ...record,
+      ts: Number(record?.updatedAt || record?.createdAtTs || 0),
+    }));
+
+    const withSize = [];
+    let total = 0;
+    for (const record of records) {
+      if (!record?.localPath) continue;
+      try {
+        const info = await FileSystem.getInfoAsync(record.localPath);
+        if (!info?.exists) continue;
+        const size = Number(info?.size || 0);
+        total += size;
+        withSize.push({ ...record, size });
+      } catch {}
+    }
+
+    if (total <= maxBytes) {
+      return { evicted: 0, totalBytes: total };
+    }
+
+    const sortedOldest = withSize.sort((a, b) => a.ts - b.ts);
+    let evicted = 0;
+
+    for (const item of sortedOldest) {
+      if (total <= maxBytes) break;
+      try {
+        await FileSystem.deleteAsync(item.localPath, { idempotent: true });
+      } catch {}
+      delete mediaMap[String(item.mediaId)];
+      total -= Number(item.size || 0);
+      evicted += 1;
+    }
+
+    await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+    return { evicted, totalBytes: total };
+  }
+
   async getMediaFilesByChat(chatId) {
     const mediaMap = await this._readObject(KEY_MEDIA_FILES);
     const all = Object.values(mediaMap || {});
     return all
       .filter((item) => !chatId || String(item?.chatId) === String(chatId))
       .sort((a, b) => Number(b?.createdAtTs || b?.updatedAt || 0) - Number(a?.createdAtTs || a?.updatedAt || 0));
+  }
+
+  async clearMediaByChatId(chatId) {
+    if (!chatId) return 0;
+    const normalized = String(chatId);
+    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+    const mediaItems = Object.entries(mediaMap || {}).filter(([, item]) => String(item?.chatId || '') === normalized);
+
+    if (mediaItems.length === 0) return 0;
+
+    await Promise.all(mediaItems.map(async ([mediaId]) => {
+      await this.removeMediaFile(mediaId);
+    }));
+
+    return mediaItems.length;
   }
 
   async removeMediaFile(mediaId) {
@@ -199,7 +463,35 @@ class LocalStorageService {
     if (!mediaId) return null;
     const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
     const hit = thumbnailMap[String(mediaId)] || null;
-    return hit?.path || null;
+    return hit?.path || hit?.url || null;
+  }
+
+  async saveThumbnailReference(mediaId, thumbnailUrl, mediaType = 'image') {
+    if (!mediaId || !thumbnailUrl) return null;
+    const key = String(mediaId);
+    const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
+    thumbnailMap[key] = {
+      ...(thumbnailMap[key] || {}),
+      mediaId: key,
+      url: String(thumbnailUrl),
+      mediaType: String(mediaType || 'image'),
+      timestamp: Date.now(),
+    };
+    await this._writeObject(KEY_THUMBNAILS, thumbnailMap);
+    return thumbnailMap[key];
+  }
+
+  async getThumbnailReference(mediaId) {
+    if (!mediaId) return null;
+    const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
+    const hit = thumbnailMap[String(mediaId)] || null;
+    if (!hit) return null;
+    return {
+      mediaId: String(mediaId),
+      thumbnailUrl: hit?.url || hit?.path || null,
+      mediaType: hit?.mediaType || null,
+      timestamp: Number(hit?.timestamp || 0),
+    };
   }
 
   async queueDownload(mediaId, payload = {}) {

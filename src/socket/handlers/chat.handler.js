@@ -37,6 +37,7 @@ const MESSAGE_EVENTS = new Set([
   'message:forward:multiple',
   'message:reply',
   'message:quote',
+  'message:media:update',
 ]);
 
 const REQUIRED_FIELDS = {
@@ -57,7 +58,7 @@ const REQUIRED_FIELDS = {
   'message:reaction:add': ['messageId', 'chatId', 'emoji'],
   'message:reaction:remove': ['messageId', 'chatId', 'emoji'],
   'message:reaction:list': ['messageId'],
-  'message:sync': ['chatId'],
+  'message:sync': ['chatId', 'limit'],
   'message:fetch': ['chatId'],
   'message:fetch:unread': ['chatId'],
   'message:search': ['chatId', 'query'],
@@ -66,6 +67,7 @@ const REQUIRED_FIELDS = {
   'message:forward:multiple': ['messageIds', 'receiverIds'],
   'message:reply': ['receiverId', 'text', 'replyToMessageId'],
   'message:quote': ['receiverId', 'text', 'quotedMessageId'],
+  'message:media:update': ['messageId', 'chatId', 'deviceId', 'isMediaDownloaded'],
   'chat:create': ['userId'],
   'chat:info': ['chatId'],
   'chat:pin': ['chatId'],
@@ -115,18 +117,54 @@ const hasEmptyValue = (value) => {
 
 const validatePayload = (event, payload = {}) => {
   const required = REQUIRED_FIELDS[event] || [];
-  if (required.length === 0) return null;
+  if (required.length > 0) {
+    const missing = required.filter((field) => hasEmptyValue(payload[field]));
+    if (missing.length > 0) {
+      return createErrorResponse(event, {
+        code: 'VALIDATION_ERROR',
+        message: `Missing required fields: ${missing.join(', ')}`,
+        category: ERROR_CATEGORIES.VALIDATION,
+        details: { missingFields: missing },
+        retryable: false,
+      });
+    }
+  }
 
-  const missing = required.filter((field) => hasEmptyValue(payload[field]));
-  if (missing.length === 0) return null;
+  if (event === 'message:media:update') {
+    if (typeof payload?.isMediaDownloaded !== 'boolean') {
+      return createErrorResponse(event, {
+        code: 'VALIDATION_ERROR',
+        message: 'isMediaDownloaded must be boolean',
+        category: ERROR_CATEGORIES.VALIDATION,
+        details: { isMediaDownloaded: payload?.isMediaDownloaded },
+        retryable: false,
+      });
+    }
+  }
 
-  return createErrorResponse(event, {
-    code: 'VALIDATION_ERROR',
-    message: `Missing required fields: ${missing.join(', ')}`,
-    category: ERROR_CATEGORIES.VALIDATION,
-    details: { missingFields: missing },
-    retryable: false,
-  });
+  if (event === 'message:sync') {
+    if (!Number.isFinite(Number(payload?.limit)) || Number(payload?.limit) <= 0) {
+      return createErrorResponse(event, {
+        code: 'VALIDATION_ERROR',
+        message: 'limit must be a positive number',
+        category: ERROR_CATEGORIES.VALIDATION,
+        details: { limit: payload?.limit },
+        retryable: false,
+      });
+    }
+
+    if (payload?.lastMessageId != null && typeof payload?.lastMessageId !== 'string') {
+      return createErrorResponse(event, {
+        code: 'VALIDATION_ERROR',
+        message: 'lastMessageId must be a string or null',
+        category: ERROR_CATEGORIES.VALIDATION,
+        details: { lastMessageId: payload?.lastMessageId },
+        retryable: false,
+      });
+    }
+  }
+
+  return null;
 };
 
 const normalizePayload = (event, payload = {}) => {
@@ -141,6 +179,14 @@ const normalizePayload = (event, payload = {}) => {
     return {
       ...payload,
       countryCodes: Array.isArray(payload.countryCodes) && payload.countryCodes.length > 0 ? payload.countryCodes : ['+91'],
+    };
+  }
+
+  if (event === 'message:sync') {
+    return {
+      ...payload,
+      limit: Number(payload?.limit) > 0 ? Number(payload.limit) : 50,
+      lastMessageId: payload?.lastMessageId == null ? null : String(payload.lastMessageId),
     };
   }
 
@@ -319,6 +365,8 @@ export const chatEventEmitters = {
   messageForwardMultiple: createEmitter('message:forward:multiple'),
   messageReply: createEmitter('message:reply'),
   messageQuote: createEmitter('message:quote'),
+  messageMediaUpdate: createEmitter('message:media:update'),
+  messageMediaDownloaded: createEmitter('message:media:update'),
 
   chatCreate: createEmitter('chat:create'),
   chatList: createEmitter('chat:list'),
@@ -344,10 +392,19 @@ export const chatServerEvents = {
   onMessageQuickAck: (socket, cb) => createOnEvent(socket, 'message:quick:ack', cb),
   onMessageReceived: (socket, cb) => createOnEvent(socket, 'message:received', cb),
   onQuickMessageReceived: (socket, cb) => createOnEvent(socket, 'message:quick:received', cb),
+  onMessageMediaUpdate: (socket, cb) => createOnEvent(socket, 'message:media:update', cb),
+  onMessageMediaUpdateResponse: (socket, cb) => createOnEvent(socket, 'message:media:update:response', cb),
+  onMessageMediaDownloadedUpdate: (socket, cb) => createOnEvent(socket, 'message:media:update', cb),
+  onMessageMediaDownloadedResponse: (socket, cb) => createOnEvent(socket, 'message:media:update:response', cb),
   onMessageDelivered: (socket, cb) => createOnEvent(socket, 'message:delivered', cb),
+  onMessageDeliveredResponse: (socket, cb) => createOnEvent(socket, 'message:delivered:response', cb),
   onMessageRead: (socket, cb) => createOnEvent(socket, 'message:read', cb),
+  onMessageReadResponse: (socket, cb) => createOnEvent(socket, 'message:read:response', cb),
   onMessageReadBulkAck: (socket, cb) => createOnEvent(socket, 'message:read:bulk:ack', cb),
+  onMessageReadBulkResponse: (socket, cb) => createOnEvent(socket, 'message:read:bulk:response', cb),
   onMessageReadAllAck: (socket, cb) => createOnEvent(socket, 'message:read:all:ack', cb),
+  onMessageReadAllResponse: (socket, cb) => createOnEvent(socket, 'message:read:all:response', cb),
+  onMessageSeenResponse: (socket, cb) => createOnEvent(socket, 'message:seen:response', cb),
   onReactionAdded: (socket, cb) => createOnEvent(socket, 'message:reaction:added', cb),
   onReactionRemoved: (socket, cb) => createOnEvent(socket, 'message:reaction:removed', cb),
   onNotificationStatusUpdate: (socket, cb) => createOnEvent(socket, 'notification:status:update', cb),

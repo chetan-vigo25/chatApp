@@ -14,7 +14,6 @@ import { ImageProvider } from './src/contexts/ImageProvider';
 import { PresenceProvider } from './src/presence/store/PresenceContext';
 import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
-import { AuthProvider } from './src/contexts/AuthContext';
 import {  getFCMToken, initializeNotifications, setupNotificationCategory } from './src/firebase/fcmService';
 import 'react-native-get-random-values';
 import NoInternet from './src/screens/NoInternet';
@@ -24,25 +23,30 @@ import 'react-native-gesture-handler';
 export default function App() {
 
     useEffect(() => {
-     let cleanup;
-   
-     const setup = async () => {
-       try {
-         const token = await getFCMToken();
-         if (token) {
-           await AsyncStorage.setItem('fcmToken', token);
-          //  console.log('Device FCM token saved:', token);
-         }
-         cleanup = initializeNotifications();
-       } catch (error) {
-         console.log('FCM setup error:', error);
-       }
-     };
-     setup();
-     return () => {
-       if (cleanup) cleanup();
-     };
-   }, []);
+      let cleanup;
+      const setup = async () => {
+        try {
+          // Setup iOS notification categories (reply buttons etc.)
+          await setupNotificationCategory();
+
+          // Get and store FCM token
+          const token = await getFCMToken();
+          if (token) {
+            await AsyncStorage.setItem('fcmToken', token);
+            console.log('FCM token stored');
+          }
+
+          // Setup foreground listeners (background handler is in index.js)
+          cleanup = initializeNotifications();
+        } catch (error) {
+          console.error('FCM setup error:', error);
+        }
+      };
+      setup();
+      return () => {
+        if (cleanup) cleanup();
+      };
+    }, []);
 
   return (
     <ThemeProvider>
@@ -54,12 +58,10 @@ export default function App() {
              <DeviceLocationProvider>
                 <PresenceProvider>
                   <RealtimeChatProvider>
-                    <AuthProvider>
-                      <AppContent />
-                    </AuthProvider>
+                    <AppContent />
                   </RealtimeChatProvider>
                 </PresenceProvider>
-             </DeviceLocationProvider>
+              </DeviceLocationProvider>
             </ImageProvider>
            </ContactProvider>
          </DeviceInfoProvider>

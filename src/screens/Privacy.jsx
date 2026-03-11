@@ -1,12 +1,27 @@
 import React from 'react';
-import { View, Text } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
+import { WebView } from 'react-native-webview';
 
-export default function Privacy({ navigation }) {
+export default function Privacy() {
   const { theme } = useTheme();
+
   return (
-    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
-      <Text style={{ fontSize: 24, fontWeight: 'bold', color: theme.colors.primaryTextColor }} >Privacy Screen</Text>
+    <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
+      <WebView
+        source={{ uri: 'https://www.google.com/' }}
+        style={{ flex:1 }}
+        startInLoadingState={true}  // shows a loader while loading
+      />
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  webview: {
+    flex: 1,
+  },
+});
