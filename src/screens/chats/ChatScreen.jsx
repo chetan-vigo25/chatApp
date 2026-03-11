@@ -1248,7 +1248,11 @@ export default function ChatScreen({ navigation, route }) {
     if (Platform.OS === 'android') {
       try {
         // Convert file:// URI to content:// URI for Android app chooser
-        const contentUri = await FileSystem.getContentUriAsync(uri);
+        // getContentUriAsync is available in both legacy and non-legacy expo-file-system
+        let contentUri = uri;
+        if (uri.startsWith('file://') && FileSystem.getContentUriAsync) {
+          contentUri = await FileSystem.getContentUriAsync(uri);
+        }
         await IntentLauncher.startActivityAsync('android.intent.action.VIEW', {
           data: contentUri,
           flags: 1, // FLAG_GRANT_READ_URI_PERMISSION
@@ -1257,7 +1261,7 @@ export default function ChatScreen({ navigation, route }) {
         return;
       } catch (err) {
         console.warn('IntentLauncher failed:', err?.message);
-        // Fallback: try Sharing
+        // Fallback: try Sharing which also opens app chooser on Android
         try {
           if (await Sharing.isAvailableAsync()) {
             await Sharing.shareAsync(uri, { mimeType, UTI: mimeType, dialogTitle: 'Open with' });
@@ -1267,14 +1271,13 @@ export default function ChatScreen({ navigation, route }) {
         Alert.alert('No app found', 'No app found to open this document. Please install a compatible viewer.');
       }
     } else {
-      // iOS: use Sharing which presents the app chooser / Quick Look
+      // iOS: Sharing presents Quick Look / app chooser
       try {
         if (await Sharing.isAvailableAsync()) {
           await Sharing.shareAsync(uri, { mimeType, dialogTitle: 'Open' });
           return;
         }
       } catch (_) {}
-      // Fallback to Linking
       try {
         await Linking.openURL(uri);
       } catch (_) {
