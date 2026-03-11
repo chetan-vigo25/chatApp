@@ -34,6 +34,7 @@ import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
@@ -41,6 +42,8 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
 import { mediaDownloadSigned } from '../../utils/mediaService';
@@ -372,23 +375,196 @@ const ChatInputBar = React.memo(function ChatInputBar({
   );
 });
 
-const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme, isDarkMode, onClose }) {
+// ── Smooth seekable audio progress bar ──
+const AudioSeekBar = React.memo(function AudioSeekBar({
+  isThisPlaying, isDownloading, totalMs, seekRatio, progress,
+  trackBg, trackFill, subColor, posLabel, durLabel, dlStatus, onSeek,
+}) {
+  const trackWidthRef = useRef(0);
+  const canSeekRef = useRef(false);
+  const onSeekRef = useRef(onSeek);
+  const totalMsRef = useRef(totalMs);
+  const isDraggingRef = useRef(false);
+  const dragRatioRef = useRef(0);
+
+  // fillAnim  → drives fill bar width (JS driver only, layout prop)
+  // thumbScale → drives thumb grow/shrink (native driver only, transform)
+  // thumbPx    → plain state for thumb left position (avoids mixing drivers)
+  const fillAnim = useRef(new Animated.Value(0)).current;
+  const thumbScale = useRef(new Animated.Value(1)).current;
+  const [thumbPx, setThumbPx] = useState(0);
+  const [dragLabel, setDragLabel] = useState(null);
+
+  const canSeek = isThisPlaying && totalMs > 0;
+  canSeekRef.current = canSeek;
+  onSeekRef.current = onSeek;
+  totalMsRef.current = totalMs;
+
+  // Sync fill to playback position when not dragging
+  useEffect(() => {
+    if (isDraggingRef.current) return;
+    const w = trackWidthRef.current;
+    if (w > 0) {
+      const px = seekRatio * w;
+      fillAnim.setValue(px);
+      setThumbPx(px);
+    }
+  }, [seekRatio, fillAnim]);
+
+  const clampPx = (px) => Math.min(Math.max(px, 0), trackWidthRef.current || 1);
+
+  const formatMsLabel = (ms) => {
+    const s = Math.floor(ms / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+
+  const setPosition = (px) => {
+    fillAnim.setValue(px);
+    setThumbPx(px);
+    dragRatioRef.current = px / (trackWidthRef.current || 1);
+    setDragLabel(formatMsLabel(dragRatioRef.current * totalMsRef.current));
+  };
+
+  const panResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => canSeekRef.current,
+    onMoveShouldSetPanResponder: (_, gs) => canSeekRef.current && Math.abs(gs.dx) > 1,
+    onPanResponderGrant: (evt) => {
+      if (!canSeekRef.current) return;
+      isDraggingRef.current = true;
+      setPosition(clampPx(evt.nativeEvent.locationX));
+      Animated.spring(thumbScale, { toValue: 1.4, useNativeDriver: true, friction: 8, tension: 200 }).start();
+    },
+    onPanResponderMove: (evt) => {
+      if (!isDraggingRef.current) return;
+      setPosition(clampPx(evt.nativeEvent.locationX));
+    },
+    onPanResponderRelease: () => {
+      if (!isDraggingRef.current) return;
+      isDraggingRef.current = false;
+      Animated.spring(thumbScale, { toValue: 1, useNativeDriver: true, friction: 8, tension: 200 }).start();
+      setDragLabel(null);
+      onSeekRef.current?.(dragRatioRef.current);
+    },
+    onPanResponderTerminate: () => {
+      isDraggingRef.current = false;
+      Animated.spring(thumbScale, { toValue: 1, useNativeDriver: true, friction: 8, tension: 200 }).start();
+      setDragLabel(null);
+    },
+  }), [fillAnim, thumbScale]);
+
+  // Tap-to-seek
+  const handleTapSeek = useCallback((evt) => {
+    if (!canSeekRef.current || isDraggingRef.current) return;
+    const px = clampPx(evt.nativeEvent.locationX);
+    const ratio = px / (trackWidthRef.current || 1);
+    Animated.timing(fillAnim, { toValue: px, duration: 100, useNativeDriver: false }).start();
+    setThumbPx(px);
+    onSeekRef.current?.(ratio);
+  }, [fillAnim]);
+
+  const showThumb = canSeek || (isThisPlaying && seekRatio > 0);
+  const shownPosLabel = dragLabel !== null ? dragLabel : posLabel;
+
+  return (
+    <View style={{ flex: 1, marginLeft: 10 }}>
+      <View
+        onLayout={(e) => {
+          const newW = e.nativeEvent.layout.width;
+          trackWidthRef.current = newW;
+          if (!isDraggingRef.current) {
+            const px = seekRatio * newW;
+            fillAnim.setValue(px);
+            setThumbPx(px);
+          }
+        }}
+        {...panResponder.panHandlers}
+        onTouchEnd={handleTapSeek}
+        style={{ height: 28, justifyContent: 'center' }}
+      >
+        {/* Track bg */}
+        <View style={{ height: 3.5, borderRadius: 3, backgroundColor: trackBg, overflow: 'hidden' }}>
+          {isDownloading ? (
+            <View style={{
+              width: `${Math.round(Math.max(6, progress * 100))}%`,
+              height: 3.5, borderRadius: 3, backgroundColor: trackFill,
+            }} />
+          ) : (
+            <Animated.View style={{
+              width: fillAnim,
+              maxWidth: '100%',
+              height: 3.5, borderRadius: 3, backgroundColor: trackFill,
+            }} />
+          )}
+        </View>
+
+        {/* Thumb — plain View for position, Animated.View only for native scale */}
+        {showThumb && (
+          <View
+            pointerEvents="none"
+            style={{
+              position: 'absolute',
+              left: thumbPx - 6,
+              top: 8,
+              width: 12,
+              height: 12,
+            }}
+          >
+            <Animated.View
+              style={{
+                width: 12,
+                height: 12,
+                borderRadius: 6,
+                backgroundColor: trackFill,
+                transform: [{ scale: thumbScale }],
+                elevation: 2,
+                shadowColor: '#000',
+                shadowOffset: { width: 0, height: 1 },
+                shadowOpacity: 0.18,
+                shadowRadius: 1.5,
+              }}
+            />
+          </View>
+        )}
+      </View>
+
+      {/* Time labels */}
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Poppins-Regular' }}>
+          {isDownloading
+            ? `${Math.round(progress * 100)}%`
+            : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
+              ? 'Failed'
+              : shownPosLabel}
+        </Text>
+        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Poppins-Regular' }}>
+          {isDownloading ? 'downloading...' : durLabel}
+        </Text>
+      </View>
+    </View>
+  );
+});
+
+const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme, isDarkMode, onClose, onMessageContact }) {
   if (!data) return null;
 
   const {
-    contactName = 'Contact',
+    fullName = 'Contact',
+    contactName,
+    profileImage = '',
     avatar = '',
-    phoneNumbers = [],
-    phoneNumber = '',
-    emails = [],
-    addresses = [],
-    company = '',
-    jobTitle = '',
-    birthday = '',
-    note = '',
+    countryCode = '',
+    mobileNumber = '',
+    phoneNumber,
+    isRegistered = false,
+    userId = null,
   } = data;
 
-  const allPhones = phoneNumbers.length > 0 ? phoneNumbers : (phoneNumber ? [{ label: 'mobile', number: phoneNumber }] : []);
+  const name = fullName || contactName || 'Contact';
+  const image = profileImage || avatar || '';
+  const phone = mobileNumber || phoneNumber || '';
+  const displayPhone = countryCode ? `${countryCode} ${phone}` : phone;
+  const fullPhone = countryCode ? `${countryCode}${phone}` : phone;
+
   const bgColor = isDarkMode ? '#0f1b27' : '#f5f5f5';
   const cardBg = isDarkMode ? '#1a2b3c' : '#fff';
   const textColor = isDarkMode ? '#EDF6FC' : '#111';
@@ -398,101 +574,82 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
 
   const saveContactToDevice = async () => {
     try {
-      const permission = await Contacts.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission required', 'Contacts permission is required to save contact.');
-        return;
+      let perm = await Contacts.getPermissionsAsync();
+      if (perm.status !== 'granted') {
+        perm = await Contacts.requestPermissionsAsync();
+        if (perm.status !== 'granted') return;
       }
-      const contactData = {
-        firstName: contactName,
-        phoneNumbers: allPhones.map(p => ({ label: p.label || 'mobile', number: p.number })),
-      };
-      if (emails.length > 0) {
-        contactData.emails = emails.map(e => ({ label: e.label || 'home', email: e.email }));
-      }
-      if (company) contactData.company = company;
-      if (jobTitle) contactData.jobTitle = jobTitle;
-      if (note) contactData.note = note;
-
-      await Contacts.addContactAsync(contactData);
-      Alert.alert('Saved', `${contactName} has been saved to your contacts.`);
+      await Contacts.addContactAsync({
+        firstName: name,
+        phoneNumbers: [{ label: 'mobile', number: fullPhone }],
+      });
+      Alert.alert('Saved', `${name} has been saved to your contacts.`);
     } catch (error) {
       console.error('save contact error', error);
       Alert.alert('Error', 'Unable to save contact.');
     }
   };
 
-  const DetailRow = ({ icon, label, value, onPress, actionIcon }) => (
-    <Pressable
-      onPress={onPress}
-      disabled={!onPress}
-      style={{
-        flexDirection: 'row',
-        alignItems: 'center',
-        paddingVertical: 13,
-        paddingHorizontal: 16,
-        borderBottomWidth: 0.5,
-        borderBottomColor: borderColor,
-      }}
-    >
-      <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: accentColor + '15', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
-        <Ionicons name={icon} size={18} color={accentColor} />
-      </View>
-      <View style={{ flex: 1 }}>
-        <Text style={{ fontSize: 10, color: subColor, fontFamily: 'Poppins-Regular', textTransform: 'uppercase', letterSpacing: 0.5 }}>{label}</Text>
-        <Text style={{ fontSize: 14, color: textColor, fontFamily: 'Poppins-Medium', marginTop: 1 }} selectable>{value}</Text>
-      </View>
-      {actionIcon && <Ionicons name={actionIcon} size={20} color={accentColor} style={{ marginLeft: 8 }} />}
-    </Pressable>
-  );
-
   return (
     <View style={{ flex: 1, backgroundColor: bgColor }}>
       {/* Header */}
       <View style={{ backgroundColor: cardBg, paddingTop: Platform.OS === 'ios' ? 65 : 60, paddingBottom: 20, alignItems: 'center', borderBottomWidth: 0.5, borderBottomColor: borderColor }}>
-        <Pressable onPress={onClose} style={{ position: 'absolute', top: Platform.OS === 'ios' ? 60 : 50, left: 16, flexDirection: 'row', alignItems: 'center' }}>
+        <Pressable onPress={onClose} style={{ position: 'absolute', top: Platform.OS === 'ios' ? 60 : 50, left: 16 }}>
           <Ionicons name="arrow-back" size={24} color={accentColor} />
         </Pressable>
 
-        {avatar ? (
-          <Image source={{ uri: avatar }} style={{ width: 80, height: 80, borderRadius: 40 }} />
+        {image ? (
+          <Image source={{ uri: image }} style={{ width: 80, height: 80, borderRadius: 40 }} />
         ) : (
           <View style={{ width: 80, height: 80, borderRadius: 40, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
             <Ionicons name="person" size={40} color={accentColor} />
           </View>
         )}
-        <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Poppins-SemiBold', marginTop: 12 }}>{contactName}</Text>
-        {(company || jobTitle) && (
-          <Text style={{ fontSize: 13, color: subColor, fontFamily: 'Poppins-Regular', marginTop: 2 }}>
-            {[jobTitle, company].filter(Boolean).join(' at ')}
-          </Text>
+        <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Poppins-SemiBold', marginTop: 12 }}>{name}</Text>
+        {isRegistered && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
+            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
+            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Poppins-Medium' }}>On BaatCheet</Text>
+          </View>
         )}
 
         {/* Action buttons row */}
-        <View style={{ flexDirection: 'row', marginTop: 16, gap: 24 }}>
+        <View style={{ flexDirection: 'row', marginTop: 18, gap: 24 }}>
           <Pressable
-            onPress={() => Linking.openURL(`tel:${allPhones[0]?.number}`).catch(() => {})}
+            onPress={() => Linking.openURL(`tel:${fullPhone}`).catch(() => {})}
             style={{ alignItems: 'center' }}
           >
-            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#22C55E' + '20', alignItems: 'center', justifyContent: 'center' }}>
+            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#22C55E20', alignItems: 'center', justifyContent: 'center' }}>
               <Ionicons name="call" size={20} color="#22C55E" />
             </View>
             <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Call</Text>
           </Pressable>
-          <Pressable
-            onPress={() => Linking.openURL(`sms:${allPhones[0]?.number}`).catch(() => {})}
-            style={{ alignItems: 'center' }}
-          >
-            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
-              <Ionicons name="chatbubble" size={20} color={accentColor} />
-            </View>
-            <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Message</Text>
-          </Pressable>
+          {isRegistered && userId ? (
+            <Pressable
+              onPress={() => { onClose(); onMessageContact?.(userId, name, image); }}
+              style={{ alignItems: 'center' }}
+            >
+              <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
+                <Ionicons name="chatbubble" size={20} color={accentColor} />
+              </View>
+              <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Message</Text>
+            </Pressable>
+          ) : (
+            <Pressable
+              onPress={() => Linking.openURL(`sms:${fullPhone}`).catch(() => {})}
+              style={{ alignItems: 'center' }}
+            >
+              <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
+                <Ionicons name="chatbubble" size={20} color={accentColor} />
+              </View>
+              <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>SMS</Text>
+            </Pressable>
+          )}
           <Pressable
             onPress={saveContactToDevice}
             style={{ alignItems: 'center' }}
           >
-            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#8B5CF6' + '20', alignItems: 'center', justifyContent: 'center' }}>
+            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#8B5CF620', alignItems: 'center', justifyContent: 'center' }}>
               <Ionicons name="person-add" size={20} color="#8B5CF6" />
             </View>
             <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Save</Text>
@@ -500,69 +657,23 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         </View>
       </View>
 
-      {/* Detail sections */}
+      {/* Phone number detail */}
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 }}>
-        {/* Phone numbers */}
-        {allPhones.length > 0 && (
-          <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
-            {allPhones.map((p, i) => (
-              <DetailRow
-                key={`phone_${i}`}
-                icon="call-outline"
-                label={p.label || 'Phone'}
-                value={p.number}
-                onPress={() => Linking.openURL(`tel:${p.number}`).catch(() => {})}
-                actionIcon="call"
-              />
-            ))}
-          </View>
-        )}
-
-        {/* Emails */}
-        {emails.length > 0 && (
-          <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
-            {emails.map((e, i) => (
-              <DetailRow
-                key={`email_${i}`}
-                icon="mail-outline"
-                label={e.label || 'Email'}
-                value={e.email}
-                onPress={() => Linking.openURL(`mailto:${e.email}`).catch(() => {})}
-                actionIcon="mail"
-              />
-            ))}
-          </View>
-        )}
-
-        {/* Addresses */}
-        {addresses.length > 0 && (
-          <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
-            {addresses.map((a, i) => (
-              <DetailRow
-                key={`addr_${i}`}
-                icon="location-outline"
-                label={a.label || 'Address'}
-                value={a.formatted || a.street || ''}
-                onPress={() => Linking.openURL(`https://maps.google.com/?q=${encodeURIComponent(a.formatted || a.street || '')}`).catch(() => {})}
-                actionIcon="navigate"
-              />
-            ))}
-          </View>
-        )}
-
-        {/* Birthday */}
-        {birthday ? (
-          <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
-            <DetailRow icon="gift-outline" label="Birthday" value={birthday} />
-          </View>
-        ) : null}
-
-        {/* Note */}
-        {note ? (
-          <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
-            <DetailRow icon="document-text-outline" label="Note" value={note} />
-          </View>
-        ) : null}
+        <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
+          <Pressable
+            onPress={() => Linking.openURL(`tel:${fullPhone}`).catch(() => {})}
+            style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 16, borderBottomWidth: 0.5, borderBottomColor: borderColor }}
+          >
+            <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: accentColor + '15', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+              <Ionicons name="call-outline" size={18} color={accentColor} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: 10, color: subColor, fontFamily: 'Poppins-Regular', textTransform: 'uppercase', letterSpacing: 0.5 }}>Mobile</Text>
+              <Text style={{ fontSize: 14, color: textColor, fontFamily: 'Poppins-Medium', marginTop: 1 }} selectable>{displayPhone}</Text>
+            </View>
+            <Ionicons name="call" size={20} color={accentColor} style={{ marginLeft: 8 }} />
+          </Pressable>
+        </View>
       </ScrollView>
     </View>
   );
@@ -645,9 +756,9 @@ export default function ChatScreen({ navigation, route }) {
   const getDateLabel = useCallback((dateKey) => {
     const today = moment().format('YYYY-MM-DD');
     const yesterday = moment().subtract(1, 'days').format('YYYY-MM-DD');
-    if (dateKey === today) return 'Today';
-    if (dateKey === yesterday) return 'Yesterday';
-    return moment(dateKey).format('DD MMMM YYYY');
+    if (dateKey === today) return 'TODAY';
+    if (dateKey === yesterday) return 'YESTERDAY';
+    return moment(dateKey).format('D MMMM YYYY').toUpperCase();
   }, []);
 
   // Normalization functions
@@ -843,31 +954,45 @@ export default function ChatScreen({ navigation, route }) {
   const isMediaDownloaded = (msg) => {
     if (!msg) return false;
 
+    // Check persisted download flag on the message itself (survives app restart)
+    if (msg.isMediaDownloaded === true || msg.downloadStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED) {
+      return true;
+    }
+
+    // Check payload download flag
+    if (msg.payload?.isMediaDownloaded === true) {
+      return true;
+    }
+
     const state = resolveMediaState(msg);
     if (state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && state?.localPath) {
       return true;
     }
-    
+
     const keys = getMediaKeyCandidates(msg);
-    
+
     // Check in downloadedMedia state
     for (const key of keys) {
       if (downloadedMedia[key]) {
-        // Verify the file still exists on disk
-        return true; // We'll assume it exists, but you could add file existence check if needed
+        return true;
       }
     }
-    
+
     // Also check msg.localUri
     if (msg.localUri) {
       return true;
     }
-    
+
     return false;
   };
 
   const resolveDownloadedUri = (msg) => {
     if (!msg) return null;
+
+    // Check msg.localUri first (persisted across app restarts)
+    if (msg.localUri) {
+      return msg.localUri;
+    }
 
     const state = resolveMediaState(msg);
     if (state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && state?.localPath) {
@@ -876,16 +1001,11 @@ export default function ChatScreen({ navigation, route }) {
 
     const keys = getMediaKeyCandidates(msg);
 
-    // First check downloadedMedia state
+    // Check downloadedMedia state
     for (const key of keys) {
       if (downloadedMedia[key]) {
         return downloadedMedia[key];
       }
-    }
-
-    // Then check msg.localUri
-    if (msg.localUri) {
-      return msg.localUri;
     }
 
     // Fallback: check payload file uri (sender's own media)
@@ -1013,6 +1133,8 @@ export default function ChatScreen({ navigation, route }) {
     message: null,
     isDownloaded: false
   });
+  const [viewerSavedToast, setViewerSavedToast] = useState(false);
+  const viewerToastTimer = useRef(null);
 
   // Media handling functions
   const verifyFileExists = async (uri) => {
@@ -1363,25 +1485,18 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
 
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission needed', 'Please grant permission to access media library');
-        return;
+      // Check existing permission first — only prompt if not yet granted
+      let perm = await MediaLibrary.getPermissionsAsync();
+      if (perm.status !== 'granted') {
+        perm = await MediaLibrary.requestPermissionsAsync();
+        if (perm.status !== 'granted') return;
       }
 
-      const asset = await MediaLibrary.createAssetAsync(localUri);
-      await MediaLibrary.createAlbumAsync('BaatCheet', asset, false);
-      
-      // Show success message
-      Alert.alert('Success', 'Media saved to gallery');
+      await MediaLibrary.createAssetAsync(localUri);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      
-      // IMPORTANT: Don't delete or modify the downloaded file after saving to gallery
-      // The file remains in app storage for future use
-      
+
     } catch (error) {
       console.error('Error saving to library:', error);
-      Alert.alert('Error', 'Failed to save to gallery');
     }
   };
 
@@ -1489,6 +1604,8 @@ export default function ChatScreen({ navigation, route }) {
 
   const closeLocalMediaViewer = () => {
     setLocalMediaViewer(prev => ({ ...prev, visible: false }));
+    setViewerSavedToast(false);
+    if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
   };
 
   // Scroll handling
@@ -1928,13 +2045,7 @@ export default function ChatScreen({ navigation, route }) {
 
       const full = await Contacts.getContactByIdAsync(selected.id, [
         Contacts.Fields.PhoneNumbers,
-        Contacts.Fields.Emails,
-        Contacts.Fields.Addresses,
-        Contacts.Fields.Company,
-        Contacts.Fields.JobTitle,
-        Contacts.Fields.Birthday,
         Contacts.Fields.Image,
-        Contacts.Fields.Note,
       ]);
 
       const contactName = full?.name || full?.firstName || 'Unknown contact';
@@ -1943,39 +2054,62 @@ export default function ChatScreen({ navigation, route }) {
         number: p.number || '',
       })).filter(p => p.number);
       const primaryPhone = phoneNumbers[0]?.number || '';
-      const avatar = full?.imageAvailable && full?.image?.uri ? full.image.uri : '';
 
       if (!primaryPhone) {
         Alert.alert('No phone number', 'Selected contact has no phone number.');
         return;
       }
 
-      const emails = (full?.emails || []).map(e => ({
-        label: e.label || 'home',
-        email: e.email || '',
-      })).filter(e => e.email);
+      // Extract country code and clean number
+      const phoneClean = primaryPhone.replace(/[\s\-()]/g, '');
+      let countryCode = '';
+      let mobileNumber = phoneClean;
+      if (phoneClean.startsWith('+')) {
+        // Try to split country code (assume 1-3 digits after +)
+        const match = phoneClean.match(/^(\+\d{1,3})(.+)$/);
+        if (match) {
+          countryCode = match[1];
+          mobileNumber = match[2];
+        }
+      }
 
-      const addresses = (full?.addresses || []).map(a => ({
-        label: a.label || 'home',
-        street: a.street || '',
-        city: a.city || '',
-        region: a.region || '',
-        postalCode: a.postalCode || '',
-        country: a.country || '',
-        formatted: [a.street, a.city, a.region, a.postalCode, a.country].filter(Boolean).join(', '),
-      })).filter(a => a.formatted);
+      // Check if this contact is registered in the app
+      // Try to find in existing chat list or matched contacts
+      let isRegistered = false;
+      let registeredUserId = null;
+      let registeredProfileImage = '';
+
+      // Check from chatData list in useChatLogic (via allMessages sender/receiver IDs won't help)
+      // We'll use the API discover approach — but for simplicity, check local storage for synced contacts
+      try {
+        const syncedRaw = await AsyncStorage.getItem('@matched_contacts');
+        if (syncedRaw) {
+          const contacts = JSON.parse(syncedRaw);
+          if (Array.isArray(contacts)) {
+            const normalizedPhone = phoneClean.replace(/^\+/, '');
+            const found = contacts.find(c => {
+              if (!c) return false;
+              const cPhone = (c.mobileFormatted || c.mobile?.number || c.phone || '').replace(/[\s\-()+ ]/g, '');
+              return cPhone && (normalizedPhone.endsWith(cPhone) || cPhone.endsWith(normalizedPhone));
+            });
+            if (found && (found.type === 'registered' || found.userId)) {
+              isRegistered = true;
+              registeredUserId = found.userId || found._id || null;
+              registeredProfileImage = found.profileImage || found.profilePicture || '';
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore lookup errors
+      }
 
       await sendContactMessage({
-        contactName,
-        phoneNumber: primaryPhone,
-        avatar,
-        phoneNumbers,
-        emails,
-        addresses,
-        company: full?.company || '',
-        jobTitle: full?.jobTitle || '',
-        birthday: full?.birthday ? `${full.birthday.year || ''}-${String(full.birthday.month || '').padStart(2, '0')}-${String(full.birthday.day || '').padStart(2, '0')}` : '',
-        note: full?.note || '',
+        fullName: contactName,
+        countryCode,
+        mobileNumber,
+        userId: registeredUserId,
+        profileImage: registeredProfileImage,
+        isRegistered,
       });
     } catch (error) {
       console.error('share contact error', error);
@@ -2060,12 +2194,18 @@ export default function ChatScreen({ navigation, route }) {
     },
   }), [closeMediaPanelAnimated, mediaBackdropAnim, mediaSheetAnim]);
 
-  // Keyboard handling
+  // Keyboard handling — debounce hide to prevent flicker when switching keyboard types (text ↔ emoji)
+  const kbHideTimerRef = useRef(null);
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
     const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
 
     const showSub = Keyboard.addListener(showEvent, (event) => {
+      // Cancel any pending hide — keyboard is back (e.g. emoji switch)
+      if (kbHideTimerRef.current) {
+        clearTimeout(kbHideTimerRef.current);
+        kbHideTimerRef.current = null;
+      }
       const nextHeight = event?.endCoordinates?.height || 0;
       setKeyboardHeight(nextHeight);
       setIsInputFocused(true);
@@ -2073,13 +2213,18 @@ export default function ChatScreen({ navigation, route }) {
     });
 
     const hideSub = Keyboard.addListener(hideEvent, () => {
-      setKeyboardHeight(0);
-      setIsInputFocused(false);
+      // Delay hide so switching keyboard types doesn't flash paddingBottom to 0
+      kbHideTimerRef.current = setTimeout(() => {
+        kbHideTimerRef.current = null;
+        setKeyboardHeight(0);
+        setIsInputFocused(false);
+      }, 150);
     });
 
     return () => {
       showSub.remove();
       hideSub.remove();
+      if (kbHideTimerRef.current) clearTimeout(kbHideTimerRef.current);
     };
   }, []);
 
@@ -2244,15 +2389,37 @@ export default function ChatScreen({ navigation, route }) {
   }, [clearChatForMe, clearChatForEveryone]);
 
   const renderChatEmptyState = useCallback(() => (
-    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, paddingVertical: 40, transform: [{ scaleY: -1 }] }}>
-      <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 16, fontFamily: 'Poppins-Medium' }}>
-        No messages here yet
-      </Text>
-      <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 12, marginTop: 6 }}>
-        Start a conversation
-      </Text>
+    <View style={{ flexGrow: 1, justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 24, paddingBottom: 20, transform: [{ rotate: '180deg' }] }}>
+      <View style={{
+        backgroundColor: isDarkMode ? 'rgba(25,40,55,0.85)' : 'rgba(225,230,236,0.85)',
+        paddingHorizontal: 14,
+        paddingVertical: 5,
+        borderRadius: 8,
+        marginBottom: 10,
+      }}>
+        <Text style={{
+          fontSize: 11.5,
+          color: isDarkMode ? 'rgba(210,220,230,0.85)' : '#5f6769',
+          fontFamily: 'Poppins-Medium',
+          letterSpacing: 0.1,
+        }}>
+          TODAY
+        </Text>
+      </View>
+      <View style={{
+        backgroundColor: isDarkMode ? 'rgba(25,40,55,0.75)' : 'rgba(225,230,236,0.75)',
+        paddingHorizontal: 16,
+        paddingVertical: 8,
+        borderRadius: 8,
+        alignItems: 'center',
+        maxWidth: '85%',
+      }}>
+        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11.5, fontFamily: 'Poppins-Regular', textAlign: 'center' }}>
+          Messages and calls are end-to-end encrypted. Only people in this chat can read, listen to, or share them.
+        </Text>
+      </View>
     </View>
-  ), [theme.colors.placeHolderTextColor]);
+  ), [theme.colors.placeHolderTextColor, isDarkMode]);
 
   useEffect(() => {
     if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -2261,38 +2428,46 @@ export default function ChatScreen({ navigation, route }) {
   }, []);
 
   // Render functions
-  const renderDateSeparator = (msg, index, messagesArray) => {
-    const dateKey = getMessageDateKey(msg);
-    const nextDateKey = index < messagesArray.length - 1 ? getMessageDateKey(messagesArray[index + 1]) : null;
+  const renderDateBadge = useCallback((dateKey) => {
     const displayDate = getDateLabel(dateKey);
-    const showSeparator = index === messagesArray.length - 1 || nextDateKey !== dateKey;
-    if (!showSeparator) return null;
-    
     return (
-      <View style={{ alignItems: "center", paddingVertical: 12 }}>
-        <View style={{ 
-          backgroundColor: theme.colors.menuBackground, 
-          paddingHorizontal: 16, 
-          paddingVertical: 6, 
-          borderRadius: 20,
-          shadowColor: "#000",
-          shadowOffset: { width: 0, height: 1 },
-          shadowOpacity: 0.1,
+      <View style={{ alignItems: 'center', marginVertical: 8 }}>
+        <View style={{
+          backgroundColor: isDarkMode ? 'rgba(25,40,55,0.92)' : 'rgba(225,230,236,0.92)',
+          paddingHorizontal: 12,
+          paddingVertical: 5,
+          borderRadius: 8,
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 0.5 },
+          shadowOpacity: 0.08,
           shadowRadius: 2,
-          elevation: 2,
+          elevation: 1,
         }}>
-          <Text style={{ 
-            fontSize: 11, 
-            color: theme.colors.placeHolderTextColor, 
-            fontFamily: "Poppins-Medium",
-            letterSpacing: 0.3
+          <Text style={{
+            fontSize: 11.5,
+            color: isDarkMode ? 'rgba(210,220,230,0.85)' : '#5f6769',
+            fontFamily: 'Poppins-Medium',
+            letterSpacing: 0.1,
           }}>
             {displayDate}
           </Text>
         </View>
       </View>
     );
-  };
+  }, [isDarkMode, getDateLabel]);
+
+  // In inverted FlatList: index 0 = newest (bottom), last = oldest (top)
+  // We render the badge AFTER the message item in JSX → appears ABOVE in inverted view
+  // Show badge when this message's date differs from the next item (older) — meaning
+  // this is the LAST message of its date group when scrolling up
+  const shouldShowDateAbove = useCallback((msg, index, messagesArray) => {
+    const dateKey = getMessageDateKey(msg);
+    // Always show for the oldest message (top of chat)
+    if (index === messagesArray.length - 1) return dateKey;
+    const olderDateKey = getMessageDateKey(messagesArray[index + 1]);
+    if (dateKey !== olderDateKey) return dateKey;
+    return null;
+  }, [getMessageDateKey]);
 
   const highlightSearchText = (textToHighlight) => {
     if (!isSearching || !search.trim()) return textToHighlight;
@@ -2593,56 +2768,31 @@ export default function ChatScreen({ navigation, route }) {
     const isFailed = status === MEDIA_DOWNLOAD_STATUS.FAILED;
 
     return (
-      <View
-        style={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          top: 0,
-          bottom: 0,
-          backgroundColor: 'rgba(0,0,0,0.36)',
-          alignItems: 'center',
-          justifyContent: 'center',
-        }}
-      >
-        <View
-          style={{
-            backgroundColor: 'rgba(0,0,0,0.6)',
-            borderRadius: 14,
-            paddingHorizontal: 14,
-            paddingVertical: 12,
-            alignItems: 'center',
-            minWidth: 130,
-          }}
-        >
-          {isFailed ? (
-            <Ionicons name="refresh" size={28} color="#fff" />
-          ) : isDownloading ? (
-            <ActivityIndicator size="small" color="#fff" />
-          ) : (
-            <Ionicons name="cloud-download" size={28} color="#fff" />
-          )}
-
-          <Text style={{ color: '#fff', fontSize: 12, marginTop: 6, fontFamily: 'Poppins-Medium' }}>
-            {isFailed
-              ? 'Download failed'
-              : (isDownloading ? `${Math.round(progress * 100)}% downloading...` : 'Download')}
-          </Text>
-
-          <Text style={{ color: 'rgba(255,255,255,0.86)', fontSize: 10, marginTop: 3 }}>
-            {mediaInfo.sizeLabel} • {isVideo ? 'video' : mediaInfo.typeLabel}
-          </Text>
-
-          {!isConnected && (
-            <Text style={{ color: '#FFD166', fontSize: 10, marginTop: 3 }}>Offline</Text>
-          )}
-
-          {isFailed && (
-            <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 10, marginTop: 2 }}>
-              Tap to retry
-            </Text>
-          )}
-        </View>
+      <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' }}>
+        {/* WhatsApp-style download button */}
+        {isDownloading ? (
+          <View style={{ alignItems: 'center' }}>
+            <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' }}>
+              <ActivityIndicator size="small" color="#fff" />
+            </View>
+            <View style={{ backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6 }}>
+              <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
+                {Math.round(progress * 100)}%
+              </Text>
+            </View>
+          </View>
+        ) : (
+          <View style={{ alignItems: 'center' }}>
+            <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' }}>
+              <Ionicons name={isFailed ? 'refresh' : 'arrow-down'} size={22} color="#fff" />
+            </View>
+            <View style={{ backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6 }}>
+              <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
+                {mediaInfo.sizeLabel}
+              </Text>
+            </View>
+          </View>
+        )}
       </View>
     );
   };
@@ -2910,52 +3060,20 @@ export default function ChatScreen({ navigation, route }) {
           </TouchableOpacity>
 
           {/* Progress bar + time */}
-          <View style={{ flex: 1, marginLeft: 10 }}>
-            {/* Seekable track */}
-            <Pressable
-              onPress={(e) => {
-                if (!isThisPlaying || totalMs <= 0) return;
-                const x = e.nativeEvent.locationX;
-                const width = e.nativeEvent.target ? undefined : 200;
-                // We get locationX relative to this view
-                // Approximate width from layout — use a measured approach
-              }}
-              onLayout={() => {}}
-              style={{ height: 20, justifyContent: 'center' }}
-            >
-              <View style={{ height: 4, borderRadius: 4, backgroundColor: trackBg, overflow: 'hidden' }}>
-                <View style={{
-                  width: isDownloading ? `${Math.round(Math.max(0.06, progress) * 100)}%` : `${Math.round(Math.max(0.02, seekRatio) * 100)}%`,
-                  height: 4, borderRadius: 4, backgroundColor: trackFill,
-                }} />
-              </View>
-              {/* Seek thumb */}
-              {isThisPlaying && totalMs > 0 && (
-                <View style={{
-                  position: 'absolute',
-                  left: `${Math.round(seekRatio * 100)}%`,
-                  top: 6,
-                  width: 8, height: 8, borderRadius: 4,
-                  backgroundColor: trackFill,
-                  marginLeft: -4,
-                }} />
-              )}
-            </Pressable>
-
-            {/* Time labels */}
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 2 }}>
-              <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Poppins-Regular' }}>
-                {isDownloading
-                  ? `${Math.round(progress * 100)}%`
-                  : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
-                    ? 'Failed'
-                    : posLabel}
-              </Text>
-              <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Poppins-Regular' }}>
-                {isDownloading ? 'downloading...' : durLabel}
-              </Text>
-            </View>
-          </View>
+          <AudioSeekBar
+            isThisPlaying={isThisPlaying}
+            isDownloading={isDownloading}
+            totalMs={totalMs}
+            seekRatio={seekRatio}
+            progress={progress}
+            trackBg={trackBg}
+            trackFill={trackFill}
+            subColor={subColor}
+            posLabel={posLabel}
+            durLabel={durLabel}
+            dlStatus={dlStatus}
+            onSeek={handleSeekAudio}
+          />
         </View>
         {renderMediaTimeOverlay(msg, isMyMessage)}
       </View>
@@ -3112,29 +3230,69 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   const renderContactMessage = (msg, isMyMessage) => {
-    const meta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
-    const contactName = meta.contactName || msg?.text || 'Contact';
-    const phoneNumber = meta.phoneNumber || '';
-    const avatar = meta.avatar || msg?.mediaUrl || '';
-    const phoneNumbers = meta.phoneNumbers || (phoneNumber ? [{ label: 'mobile', number: phoneNumber }] : []);
-    const phoneCount = phoneNumbers.length;
-    const bubbleColor = isMyMessage
-      ? (chatColor || '#1DA1F2')
-      : (isDarkMode ? 'rgba(30, 45, 60, 0.95)' : '#fff');
+    // Support both old format (mediaMeta.contactName) and new format (mediaMeta.fullName / contact)
+    const meta = msg?.mediaMeta || msg?.payload?.mediaMeta || msg?.payload?.contact || {};
+    const contact = msg?.payload?.contact || meta;
+    const contactName = contact.fullName || meta.contactName || msg?.text || 'Contact';
+    const countryCode = contact.countryCode || '';
+    const mobileNumber = contact.mobileNumber || meta.phoneNumber || '';
+    const displayPhone = countryCode ? `${countryCode} ${mobileNumber}` : mobileNumber;
+    const profileImage = contact.profileImage || meta.avatar || msg?.mediaUrl || '';
+    const isRegistered = contact.isRegistered === true;
+    const contactUserId = contact.userId || null;
+
     const textColor = isMyMessage ? '#fff' : theme.colors.primaryTextColor;
     const subColor = isMyMessage ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;
     const dividerColor = isMyMessage ? 'rgba(255,255,255,0.18)' : theme.colors.borderColor;
+    const btnColor = isMyMessage ? '#fff' : theme.colors.themeColor;
 
     const openContactDetail = () => {
-      setContactViewer({ visible: true, data: { ...meta, contactName, phoneNumber, avatar, phoneNumbers } });
+      setContactViewer({ visible: true, data: { ...contact, fullName: contactName, countryCode, mobileNumber, profileImage, isRegistered, userId: contactUserId } });
+    };
+
+    const handleMessageContact = () => {
+      if (!isRegistered || !contactUserId) return;
+      // Navigate to chat with this registered user
+      navigation.navigate('ChatScreen', {
+        user: {
+          _id: contactUserId,
+          userId: contactUserId,
+          id: contactUserId,
+          name: contactName,
+          fullName: contactName,
+          profilePicture: profileImage,
+        },
+        chatId: null,
+        hasExistingChat: false,
+      });
+    };
+
+    const handleSaveContact = async () => {
+      try {
+        let perm = await Contacts.getPermissionsAsync();
+        if (perm.status !== 'granted') {
+          perm = await Contacts.requestPermissionsAsync();
+          if (perm.status !== 'granted') return;
+        }
+        const contactData = {
+          firstName: contactName,
+          phoneNumbers: [{ label: 'mobile', number: countryCode ? `${countryCode}${mobileNumber}` : mobileNumber }],
+        };
+        await Contacts.addContactAsync(contactData);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        Alert.alert('Saved', `${contactName} has been saved to your contacts.`);
+      } catch (error) {
+        console.error('save contact error', error);
+        Alert.alert('Error', 'Unable to save contact.');
+      }
     };
 
     return (
       <View style={{ width: Math.min(280, MAX_MEDIA_BUBBLE_WIDTH), borderRadius: 12, overflow: 'hidden' }}>
         {/* Contact card top — tappable */}
-        <Pressable onPress={openContactDetail} style={{ flexDirection: 'row', alignItems: 'center', padding: 10, paddingBottom: 10 }}>
-          {avatar ? (
-            <Image source={{ uri: avatar }} style={{ width: 46, height: 46, borderRadius: 23 }} />
+        <Pressable onPress={openContactDetail} style={{ flexDirection: 'row', alignItems: 'center', padding: 10 }}>
+          {profileImage ? (
+            <Image source={{ uri: profileImage }} style={{ width: 46, height: 46, borderRadius: 23 }} />
           ) : (
             <View style={{ width: 46, height: 46, borderRadius: 23, backgroundColor: isMyMessage ? 'rgba(255,255,255,0.2)' : (theme.colors.themeColor + '20'), alignItems: 'center', justifyContent: 'center' }}>
               <Ionicons name="person" size={24} color={isMyMessage ? '#fff' : theme.colors.themeColor} />
@@ -3145,22 +3303,40 @@ export default function ChatScreen({ navigation, route }) {
               {contactName}
             </Text>
             <Text style={{ color: subColor, fontSize: 12, marginTop: 1 }} numberOfLines={1}>
-              {phoneCount > 1 ? `${phoneNumber}  +${phoneCount - 1} more` : phoneNumber}
+              {displayPhone}
             </Text>
+            {isRegistered && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
+                <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
+                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
+                  On BaatCheet
+                </Text>
+              </View>
+            )}
           </View>
-          <Ionicons name="chevron-forward" size={18} color={subColor} />
         </Pressable>
 
-        {/* Divider + View contact button (WhatsApp style) */}
-        <View style={{ height: 0.5, backgroundColor: dividerColor, marginHorizontal: 0 }} />
-        <Pressable
-          onPress={openContactDetail}
-          style={{ paddingVertical: 9, alignItems: 'center' }}
-        >
-          <Text style={{ color: isMyMessage ? '#fff' : theme.colors.themeColor, fontFamily: 'Poppins-Medium', fontSize: 13 }}>
-            View contact
-          </Text>
-        </Pressable>
+        {/* Divider + Action buttons (WhatsApp style) */}
+        <View style={{ height: 0.5, backgroundColor: dividerColor }} />
+        <View style={{ flexDirection: 'row' }}>
+          {isRegistered && contactUserId && (
+            <>
+              <Pressable
+                onPress={handleMessageContact}
+                style={{ flex: 1, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' }}
+              >
+                <Text style={{ color: btnColor, fontFamily: 'Poppins-Medium', fontSize: 13 }}>Message</Text>
+              </Pressable>
+              <View style={{ width: 0.5, backgroundColor: dividerColor }} />
+            </>
+          )}
+          <Pressable
+            onPress={handleSaveContact}
+            style={{ flex: 1, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' }}
+          >
+            <Text style={{ color: btnColor, fontFamily: 'Poppins-Medium', fontSize: 13 }}>Save Contact</Text>
+          </Pressable>
+        </View>
         {renderMediaTimeOverlay(msg, isMyMessage)}
       </View>
     );
@@ -3195,10 +3371,11 @@ export default function ChatScreen({ navigation, route }) {
     const isMediaMessage = isImage || isVideo || isAudio || isFile || isLocation || isContact;
     const inlineMediaTime = !isDeletedMessage && (isImage || isVideo || isAudio || isLocation || isContact);
 
+    const dateBadgeKey = shouldShowDateAbove(msg, index, messages);
+
     return (
       <React.Fragment>
-        {renderDateSeparator(msg, index, messages)}
-        <Pressable 
+        <Pressable
           onPress={() => {
             if (selectedMessage.length > 0) {
               handleToggleSelectMessages(messageKey);
@@ -3337,6 +3514,7 @@ export default function ChatScreen({ navigation, route }) {
             </View>
           </View>
         </Pressable>
+        {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
   };
@@ -3461,7 +3639,7 @@ export default function ChatScreen({ navigation, route }) {
       enabled
     >
       <StatusBar backgroundColor={theme.colors.background} barStyle="dark-content" />
-      <Animated.View style={{ flex: 1, paddingBottom: Platform.OS === 'android' ? keyboardHeight : 0 }}>
+      <View style={{ flex: 1, paddingBottom: Platform.OS === 'android' ? keyboardHeight : 0 }}>
         <ChatWallpaperLayer isDarkMode={isDarkMode} />
         
         {/* Header */}
@@ -4257,26 +4435,97 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {/* Media viewer modal */}
-        <Modal visible={localMediaViewer.visible} transparent animationType="fade" onRequestClose={closeLocalMediaViewer}>
-          <View style={{ flex:1, backgroundColor: '#000' }}>
-            <TouchableOpacity 
-              onPress={closeLocalMediaViewer}
-              style={{ position: 'absolute',
-                top: Platform.OS === 'ios' ? 50 : 30,
-                right: 20, zIndex: 10, width: 40, height: 40, borderRadius: 20,
-                backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center' }} >
-              <Ionicons name="close" size={24} color="#fff" />
-            </TouchableOpacity>
+        {/* WhatsApp-style Media viewer modal */}
+        <Modal visible={localMediaViewer.visible} transparent animationType="fade" onRequestClose={closeLocalMediaViewer} statusBarTranslucent>
+          <View style={{ flex: 1, backgroundColor: '#000' }}>
+            {/* ── Top bar ── */}
+            <View style={{
+              position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20,
+              paddingTop: Platform.OS === 'ios' ? 54 : (StatusBar.currentHeight || 24) + 10,
+              paddingHorizontal: 12, paddingBottom: 10,
+              backgroundColor: 'rgba(0,0,0,0.5)',
+              flexDirection: 'row', alignItems: 'center',
+            }}>
+              <TouchableOpacity onPress={closeLocalMediaViewer} style={{ padding: 6 }}>
+                <Ionicons name="arrow-back" size={24} color="#fff" />
+              </TouchableOpacity>
+              <View style={{ flex: 1, marginLeft: 12 }}>
+                <Text style={{ color: '#fff', fontSize: 15, fontFamily: 'Poppins-SemiBold' }} numberOfLines={1}>
+                  {localMediaViewer.message?.senderName || (localMediaViewer.message?.senderId === currentUserId ? 'You' : chatData?.peerUser?.name || 'Photo')}
+                </Text>
+                {localMediaViewer.message?.time && (
+                  <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: 'Poppins-Regular' }}>
+                    {localMediaViewer.message?.date ? `${localMediaViewer.message.date} • ${localMediaViewer.message.time}` : localMediaViewer.message.time}
+                  </Text>
+                )}
+              </View>
+              {/* Action icons — right side */}
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                {/* Share */}
+                <TouchableOpacity
+                  onPress={async () => {
+                    const msg = localMediaViewer.message;
+                    try {
+                      const localUri = await resolveFileForOpen(msg);
+                      if (localUri && await Sharing.isAvailableAsync()) {
+                        await Sharing.shareAsync(localUri);
+                      }
+                    } catch (e) {
+                      console.error('Share error:', e);
+                    }
+                  }}
+                  style={{ padding: 8 }}
+                >
+                  <Ionicons name="share-social-outline" size={22} color="#fff" />
+                </TouchableOpacity>
+                {/* Save to gallery — one tap, no repeat permission prompt */}
+                <TouchableOpacity
+                  onPress={async () => {
+                    const msg = localMediaViewer.message;
+                    try {
+                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                      const localUri = await resolveFileForOpen(msg);
+                      if (!localUri) return;
+                      // Check existing permission first — only prompt if undetermined
+                      let perm = await MediaLibrary.getPermissionsAsync();
+                      if (perm.status !== 'granted') {
+                        perm = await MediaLibrary.requestPermissionsAsync();
+                        if (perm.status !== 'granted') return;
+                      }
+                      await MediaLibrary.createAssetAsync(localUri);
+                      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                      setViewerSavedToast(true);
+                      if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
+                      viewerToastTimer.current = setTimeout(() => setViewerSavedToast(false), 2000);
+                    } catch (e) {
+                      console.error('Save error:', e);
+                    }
+                  }}
+                  style={{ padding: 8 }}
+                >
+                  <Ionicons name="download-outline" size={22} color="#fff" />
+                </TouchableOpacity>
+              </View>
+            </View>
 
+            {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
-              <Image 
-                source={{ uri: localMediaViewer.uri }} 
-                style={{ width: '100%', height: '100%' }} 
-                resizeMode="contain"
-              />
+              <GestureHandlerRootView style={{ flex: 1 }}>
+                <ImageZoom
+                  uri={localMediaViewer.uri}
+                  minScale={1}
+                  maxScale={5}
+                  doubleTapScale={3}
+                  minPanPointers={1}
+                  isSingleTapEnabled
+                  isDoubleTapEnabled
+                  style={{ flex: 1 }}
+                  resizeMode="contain"
+                />
+              </GestureHandlerRootView>
             )}
 
+            {/* ── Video player ── */}
             {localMediaViewer.type === 'video' && localMediaViewer.uri && (
               <Video
                 ref={ref => { videoRefs.current[localMediaViewer.uri] = ref; }}
@@ -4288,27 +4537,19 @@ export default function ChatScreen({ navigation, route }) {
               />
             )}
 
-            {/* Options button */}
-            {localMediaViewer.message && (
-              <TouchableOpacity
-                onPress={() => {
-                  const msg = localMediaViewer.message;
-                  Alert.alert(
-                    localMediaViewer.type === 'image' ? 'Image Options' : 'Video Options',
-                    'Choose an action',
-                    [
-                      { text: 'Cancel', style: 'cancel' },
-                      { text: 'Share', onPress: () => handleShareMedia(msg) },
-                      { text: 'Save to Gallery', onPress: () => handleSaveToGallery(msg) },
-                      { text: 'Delete', onPress: () => handleDeleteMedia(msg), style: 'destructive' },
-                    ]
-                  );
-                }}
-                style={{ position: 'absolute', bottom: 40, alignSelf: 'center', backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 30, flexDirection: 'row', alignItems: 'center', gap: 8 }} >
-                <Ionicons name="ellipsis-horizontal" size={20} color="#fff" />
-                <Text style={{ color: '#fff', fontSize: 14 }}>Options</Text>
-              </TouchableOpacity>
+            {/* ── Saved toast ── */}
+            {viewerSavedToast && (
+              <View style={{
+                position: 'absolute', bottom: 30, alignSelf: 'center', zIndex: 30,
+                backgroundColor: 'rgba(0,0,0,0.75)', borderRadius: 20,
+                paddingHorizontal: 18, paddingVertical: 10,
+                flexDirection: 'row', alignItems: 'center', gap: 8,
+              }}>
+                <Ionicons name="checkmark-circle" size={18} color="#25D366" />
+                <Text style={{ color: '#fff', fontSize: 13, fontFamily: 'Poppins-Medium' }}>Saved</Text>
+              </View>
             )}
+
           </View>
         </Modal>
 
@@ -4319,9 +4560,17 @@ export default function ChatScreen({ navigation, route }) {
             theme={theme}
             isDarkMode={isDarkMode}
             onClose={() => setContactViewer({ visible: false, data: null })}
+            onMessageContact={(userId, name, profilePicture) => {
+              setContactViewer({ visible: false, data: null });
+              navigation.navigate('ChatScreen', {
+                user: { _id: userId, userId, id: userId, name, fullName: name, profilePicture: profilePicture || '' },
+                chatId: null,
+                hasExistingChat: false,
+              });
+            }}
           />
         </Modal>
-      </Animated.View>
+      </View>
     </KeyboardAvoidingView>
   );
 }

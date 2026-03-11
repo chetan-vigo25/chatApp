@@ -1274,7 +1274,7 @@ export default function useChatLogic({ navigation, route }) {
   }, [persistDeletedTombstones]);
 
   const normalizeIncomingMessage = useCallback((apiMsg) => {
-    const mediaMeta = apiMsg?.mediaMeta || apiMsg?.payload?.mediaMeta || {};
+    const mediaMeta = apiMsg?.mediaMeta || apiMsg?.contact || apiMsg?.payload?.mediaMeta || apiMsg?.payload?.contact || {};
     const serverId = apiMsg?._id || apiMsg?.messageId || apiMsg?.id;
     const normalizedMediaId = normalizeId(
       apiMsg?.mediaId ||
@@ -1345,10 +1345,15 @@ export default function useChatLogic({ navigation, route }) {
       apiMsg?.payload?.previewUrl ||
       resolvedMediaUrl;
     const incomingLocalUri = apiMsg?.localUri || apiMsg?.payload?.localUri || apiMsg?.payload?.file?.uri || null;
+    const basePayload = apiMsg?.payload || {};
+    // Ensure contact data is preserved in payload
+    if (resolvedMessageType === 'contact' && !basePayload.contact && apiMsg?.contact) {
+      basePayload.contact = apiMsg.contact;
+    }
     const normalizedPayload = normalizeMessagePayloadWithDownloadFlag(
       resolvedMessageType,
       {
-        ...(apiMsg?.payload || {}),
+        ...basePayload,
         isMediaDownloaded: Boolean(
           apiMsg?.payload?.isMediaDownloaded ||
           apiMsg?.isMediaDownloaded ||
@@ -3590,45 +3595,46 @@ export default function useChatLogic({ navigation, route }) {
   }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket]);
 
   const sendContactMessage = useCallback(async ({
-    contactName, phoneNumber, avatar = '',
-    phoneNumbers = [], emails = [], addresses = [],
-    company = '', jobTitle = '', birthday = '', note = '',
+    fullName, countryCode = '', mobileNumber,
+    userId = null, profileImage = '', isRegistered = false,
   } = {}) => {
-    const name = String(contactName || '').trim();
-    const phone = String(phoneNumber || '').trim();
+    const name = String(fullName || '').trim();
+    const phone = String(mobileNumber || '').trim();
     if (!name || !phone) {
       throw new Error('missing contact details');
     }
 
-    const allPhones = phoneNumbers.length > 0 ? phoneNumbers : [{ label: 'mobile', number: phone }];
-
     const tempId = `temp_contact_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const messageId = generateClientMessageId();
     const timestamp = new Date().toISOString();
 
+    const contactData = {
+      fullName: name,
+      countryCode: countryCode || '',
+      mobileNumber: phone,
+      userId: userId || null,
+      profileImage: profileImage || '',
+      isRegistered: !!isRegistered,
+    };
+
     const payload = {
+      chatId: chatIdRef.current,
+      messageId,
+      chatType: 'private',
+      senderId: currentUserIdRef.current,
       receiverId: chatData.peerUser._id,
       messageType: 'contact',
       text: name,
-      mediaUrl: avatar || '',
-      mediaMeta: {
-        contactName: name,
-        phoneNumber: phone,
-        avatar: avatar || '',
-        phoneNumbers: allPhones,
-        emails: emails || [],
-        addresses: addresses || [],
-        company: company || '',
-        jobTitle: jobTitle || '',
-        birthday: birthday || '',
-        note: note || '',
-      },
+      contact: contactData,
+      mediaMeta: contactData,
       replyTo: null,
       forwardedFrom: null,
-      chatId: chatIdRef.current,
-      senderId: currentUserIdRef.current,
       tempId,
       createdAt: timestamp,
+      timestamp: new Date(timestamp).getTime(),
     };
+
+    console.log('📤 [CONTACT:SEND] payload:', JSON.stringify(payload));
 
     onLocalOutgoingMessage({
       chatId: chatIdRef.current,
@@ -3645,12 +3651,14 @@ export default function useChatLogic({ navigation, route }) {
       const localMsg = {
         id: tempId,
         tempId,
+        serverMessageId: messageId,
         type: 'contact',
         mediaType: 'contact',
         text: name,
-        mediaUrl: avatar || '',
-        previewUrl: avatar || '',
-        mediaMeta: payload.mediaMeta,
+        mediaUrl: profileImage || '',
+        previewUrl: profileImage || '',
+        mediaMeta: contactData,
+        payload: { contact: contactData, isMediaDownloaded: false },
         time: moment(timestamp).format('hh:mm A'),
         date: moment(timestamp).format('YYYY-MM-DD'),
         senderId: currentUserIdRef.current,
@@ -3659,7 +3667,7 @@ export default function useChatLogic({ navigation, route }) {
         status: 'sending',
         createdAt: timestamp,
         timestamp: new Date(timestamp).getTime(),
-        payload,
+        synced: false,
         chatId: chatIdRef.current,
       };
       const next = deduplicateMessages([localMsg, ...prev]);

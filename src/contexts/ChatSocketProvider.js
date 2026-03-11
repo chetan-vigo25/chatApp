@@ -118,8 +118,8 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
         synced: true,
         localUri: null,
         chatId,
-        mediaMeta: data.mediaMeta || data.payload?.mediaMeta || null,
-        payload: data.payload || null,
+        mediaMeta: data.mediaMeta || data.contact || data.payload?.mediaMeta || data.payload?.contact || null,
+        payload: data.payload || (data.contact ? { contact: data.contact } : null),
       };
       console.log("msg", msg)
 

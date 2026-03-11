@@ -28,8 +28,10 @@ import ChatCard from '../../components/ChatCard';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 const MUTE_OPTIONS = [
   { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
@@ -68,6 +70,7 @@ export default function ChatList({ navigation }) {
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
+  const [imageViewerVisible, setImageViewerVisible] = useState(false);
 
   // Profile modal animations
   const profileOpacityAnim = useRef(new Animated.Value(0)).current;
@@ -827,7 +830,14 @@ export default function ChatList({ navigation }) {
               transform: [{ scale: profileScaleAnim }],
             }
           ]}>
-            <View style={[styles.profileImageWrap, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }]}>
+            <TouchableOpacity
+              activeOpacity={0.9}
+              onPress={() => {
+                setProfilePreviewVisible(false);
+                setTimeout(() => setImageViewerVisible(true), 200);
+              }}
+              style={[styles.profileImageWrap, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }]}
+            >
               {previewImage ? (
                 <Image resizeMode="cover" source={{ uri: previewImage }} style={StyleSheet.absoluteFill} />
               ) : (
@@ -866,9 +876,54 @@ export default function ChatList({ navigation }) {
                   <Ionicons name="information-circle-outline" size={21} color="#fff" />
                 </TouchableOpacity>
               </View>
-            </View>
+            </TouchableOpacity>
           </Animated.View>
         </TouchableOpacity>
+      </Modal>
+
+      {/* Full-screen Image Viewer with zoom */}
+      <Modal
+        visible={imageViewerVisible}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => setImageViewerVisible(false)}
+      >
+        <View style={styles.imageViewerContainer}>
+          {/* Top bar with back button and name */}
+          <View style={styles.imageViewerTopBar}>
+            <TouchableOpacity
+              onPress={() => setImageViewerVisible(false)}
+              style={styles.imageViewerBackBtn}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="arrow-back" size={24} color="#fff" />
+            </TouchableOpacity>
+            <Text style={styles.imageViewerName} numberOfLines={1}>{previewName}</Text>
+          </View>
+
+          {previewImage ? (
+            <GestureHandlerRootView style={{ flex: 1 }}>
+              <ImageZoom
+                uri={previewImage}
+                minScale={1}
+                maxScale={5}
+                doubleTapScale={3}
+                style={{ flex: 1 }}
+                resizeMode="contain"
+              />
+            </GestureHandlerRootView>
+          ) : (
+            <View style={styles.imageViewerNoPhoto}>
+              <View style={[styles.imageViewerFallbackCircle, { backgroundColor: previewAvatarColor }]}>
+                <Text style={styles.imageViewerFallbackLetter}>
+                  {(previewName || '?').charAt(0).toUpperCase()}
+                </Text>
+              </View>
+              <Text style={styles.imageViewerNoPhotoText}>No profile photo</Text>
+            </View>
+          )}
+        </View>
       </Modal>
     </Animated.View>
   );
@@ -1328,5 +1383,59 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.3)',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+
+  // ─── IMAGE VIEWER ───
+  imageViewerContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  imageViewerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingTop: Platform.OS === 'ios' ? 54 : 38,
+    paddingBottom: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    zIndex: 10,
+  },
+  imageViewerBackBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerName: {
+    flex: 1,
+    color: '#fff',
+    fontSize: 18,
+    fontFamily: 'Poppins-SemiBold',
+    marginLeft: 8,
+    textTransform: 'capitalize',
+  },
+  imageViewerNoPhoto: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerFallbackCircle: {
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerFallbackLetter: {
+    color: '#fff',
+    fontSize: 64,
+    fontFamily: 'Poppins-SemiBold',
+    textTransform: 'uppercase',
+  },
+  imageViewerNoPhotoText: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: 15,
+    fontFamily: 'Poppins-Regular',
+    marginTop: 20,
   },
 });
