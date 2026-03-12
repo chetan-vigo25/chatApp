@@ -720,6 +720,10 @@ export default function ChatScreen({ navigation, route }) {
   const [pendingVisibleReadIds, setPendingVisibleReadIds] = useState([]);
   const pendingVisibleReadSignatureRef = useRef('');
   const stickyDateOpacity = useRef(new Animated.Value(0)).current;
+  const stickyDateScale = useRef(new Animated.Value(0.96)).current;
+  const stickyDateHideTimerRef = useRef(null);
+  const isUserScrollingRef = useRef(false);
+  const topVisibleIndexRef = useRef(-1);
   const mediaBackdropAnim = useRef(new Animated.Value(0)).current;
   const mediaSheetAnim = useRef(new Animated.Value(MEDIA_PANEL_SHEET_HEIGHT)).current;
   const mediaOptionEntryAnims = useRef(MEDIA_PANEL_OPTIONS.map(() => new Animated.Value(0))).current;
@@ -760,6 +764,59 @@ export default function ChatScreen({ navigation, route }) {
     if (dateKey === yesterday) return 'YESTERDAY';
     return moment(dateKey).format('D MMMM YYYY').toUpperCase();
   }, []);
+
+  const getFloatingDateLabel = useCallback((dateKey) => {
+    const targetDate = moment(dateKey, 'YYYY-MM-DD', true);
+    if (!targetDate.isValid()) return '';
+
+    const today = moment().startOf('day');
+    if (targetDate.isSame(today, 'day')) return 'Today';
+    if (targetDate.isSame(moment(today).subtract(1, 'day'), 'day')) return 'Yesterday';
+    return targetDate.format('D MMMM YYYY');
+  }, []);
+
+  const clearStickyDateHideTimer = useCallback(() => {
+    if (stickyDateHideTimerRef.current) {
+      clearTimeout(stickyDateHideTimerRef.current);
+      stickyDateHideTimerRef.current = null;
+    }
+  }, []);
+
+  const showStickyDateBadge = useCallback(() => {
+    clearStickyDateHideTimer();
+    Animated.parallel([
+      Animated.timing(stickyDateOpacity, {
+        toValue: 1,
+        duration: 120,
+        useNativeDriver: true,
+      }),
+      Animated.spring(stickyDateScale, {
+        toValue: 1,
+        damping: 20,
+        stiffness: 280,
+        mass: 0.7,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [clearStickyDateHideTimer, stickyDateOpacity, stickyDateScale]);
+
+  const hideStickyDateBadge = useCallback((delayMs = 950) => {
+    clearStickyDateHideTimer();
+    stickyDateHideTimerRef.current = setTimeout(() => {
+      Animated.parallel([
+        Animated.timing(stickyDateOpacity, {
+          toValue: 0,
+          duration: 190,
+          useNativeDriver: true,
+        }),
+        Animated.timing(stickyDateScale, {
+          toValue: 0.96,
+          duration: 190,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }, delayMs);
+  }, [clearStickyDateHideTimer, stickyDateOpacity, stickyDateScale]);
 
   // Normalization functions
   const normalizeId = (value) => {
@@ -1638,6 +1695,26 @@ export default function ChatScreen({ navigation, route }) {
     }
   };
 
+  const handleScrollBeginDrag = useCallback(() => {
+    isUserScrollingRef.current = true;
+    showStickyDateBadge();
+  }, [showStickyDateBadge]);
+
+  const handleScrollEndDrag = useCallback(() => {
+    isUserScrollingRef.current = false;
+    hideStickyDateBadge(950);
+  }, [hideStickyDateBadge]);
+
+  const handleMomentumScrollBegin = useCallback(() => {
+    isUserScrollingRef.current = true;
+    showStickyDateBadge();
+  }, [showStickyDateBadge]);
+
+  const handleMomentumScrollEnd = useCallback(() => {
+    isUserScrollingRef.current = false;
+    hideStickyDateBadge(950);
+  }, [hideStickyDateBadge]);
+
   const handleScrollToLatest = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     flatListRef?.current?.scrollToOffset?.({ offset: 0, animated: true });
@@ -1673,10 +1750,23 @@ export default function ChatScreen({ navigation, route }) {
       }
     }
 
-    const topVisible = list[0]?.item;
-    if (topVisible) {
-      const nextLabel = getDateLabel(getMessageDateKey(topVisible));
+    let topVisibleEntry = null;
+    for (let i = 0; i < list.length; i += 1) {
+      const entry = list[i];
+      if (typeof entry?.index !== 'number') continue;
+      if (!topVisibleEntry || entry.index > topVisibleEntry.index) {
+        topVisibleEntry = entry;
+      }
+    }
+
+    const topVisible = topVisibleEntry?.item;
+    if (topVisible && topVisibleEntry && topVisibleEntry.index !== topVisibleIndexRef.current) {
+      topVisibleIndexRef.current = topVisibleEntry.index;
+      const nextLabel = getFloatingDateLabel(getMessageDateKey(topVisible));
       setStickyDateLabel((prevLabel) => (prevLabel === nextLabel ? prevLabel : nextLabel));
+      if (isUserScrollingRef.current) {
+        showStickyDateBadge();
+      }
     }
   }).current;
 
@@ -2274,13 +2364,9 @@ export default function ChatScreen({ navigation, route }) {
     ]).start();
   }, [showMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaOptionEntryAnims]);
 
-  useEffect(() => {
-    Animated.timing(stickyDateOpacity, {
-      toValue: stickyDateLabel ? 1 : 0,
-      duration: 170,
-      useNativeDriver: true,
-    }).start();
-  }, [stickyDateLabel, stickyDateOpacity]);
+  useEffect(() => () => {
+    clearStickyDateHideTimer();
+  }, [clearStickyDateHideTimer]);
 
   // New messages counter
   useEffect(() => {
@@ -2299,10 +2385,11 @@ export default function ChatScreen({ navigation, route }) {
   useEffect(() => {
     if (!messages?.length) {
       setStickyDateLabel('');
+      topVisibleIndexRef.current = -1;
       return;
     }
-    setStickyDateLabel((prev) => prev || getDateLabel(getMessageDateKey(messages[0])));
-  }, [messages, getDateLabel, getMessageDateKey]);
+    setStickyDateLabel((prev) => prev || getFloatingDateLabel(getMessageDateKey(messages[0])));
+  }, [messages, getFloatingDateLabel, getMessageDateKey]);
 
   // Menu handlers
   const handleToggleSearchBar = () => {
@@ -3843,6 +3930,10 @@ export default function ChatScreen({ navigation, route }) {
             onEndReachedThreshold={0.1} 
             
             onScroll={handleScroll}
+            onScrollBeginDrag={handleScrollBeginDrag}
+            onScrollEndDrag={handleScrollEndDrag}
+            onMomentumScrollBegin={handleMomentumScrollBegin}
+            onMomentumScrollEnd={handleMomentumScrollEnd}
             scrollEventThrottle={16}
             onViewableItemsChanged={onViewableItemsChanged}
             viewabilityConfig={viewabilityConfig}
@@ -3873,6 +3964,7 @@ export default function ChatScreen({ navigation, route }) {
             alignItems: 'center',
             opacity: stickyDateOpacity,
             transform: [
+              { scale: stickyDateScale },
               {
                 translateY: stickyDateOpacity.interpolate({ inputRange: [0, 1], outputRange: [-6, 0] }),
               },
@@ -3886,8 +3978,8 @@ export default function ChatScreen({ navigation, route }) {
               borderRadius: 14,
               overflow: 'hidden',
               borderWidth: 1,
-              borderColor: 'rgba(255,255,255,0.2)',
-              backgroundColor: 'rgba(20, 40, 56, 0.34)',
+              borderColor: isDarkMode ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.08)',
+              backgroundColor: isDarkMode ? 'rgba(25,40,55,0.92)' : 'rgba(225,230,236,0.96)',
               shadowColor: '#000',
               shadowOffset: { width: 0, height: 2 },
               shadowOpacity: 0.16,
@@ -3899,7 +3991,7 @@ export default function ChatScreen({ navigation, route }) {
             <Text
               style={{
                 fontSize: 11,
-                color: '#EAF5FD',
+                color: isDarkMode ? 'rgba(233,245,255,0.96)' : '#4f5a60',
                 fontFamily: 'Poppins-Medium',
                 textAlign: 'center',
                 paddingHorizontal: 12,

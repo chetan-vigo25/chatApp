@@ -3607,6 +3607,7 @@ export default function useChatLogic({ navigation, route }) {
     const tempId = `temp_contact_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const messageId = generateClientMessageId();
     const timestamp = new Date().toISOString();
+    const senderDeviceId = await getOrCreateDeviceId();
 
     const contactData = {
       fullName: name,
@@ -3622,11 +3623,15 @@ export default function useChatLogic({ navigation, route }) {
       messageId,
       chatType: 'private',
       senderId: currentUserIdRef.current,
+      senderDeviceId,
       receiverId: chatData.peerUser._id,
       messageType: 'contact',
       text: name,
       contact: contactData,
-      mediaMeta: contactData,
+      mediaId: null,
+      mediaUrl: null,
+      mediaThumbnailUrl: null,
+      mediaMeta: {},
       replyTo: null,
       forwardedFrom: null,
       tempId,
@@ -3677,7 +3682,7 @@ export default function useChatLogic({ navigation, route }) {
 
     await sendMessageViaSocket(payload, tempId);
     return { success: true, tempId };
-  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket]);
+  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, getOrCreateDeviceId]);
 
   /* ========== FIXED: Text input change handler with proper typing ========== */
   const handleTextChange = useCallback((value) => {
