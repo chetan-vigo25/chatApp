@@ -31,7 +31,7 @@ import * as Location from "expo-location";
 import * as Contacts from "expo-contacts";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
-import { FontAwesome6, AntDesign, Ionicons, MaterialIcons } from "@expo/vector-icons";
+import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -100,7 +100,7 @@ const EMOJI_SECTIONS = {
   activities: ['⚽', '🏀', '🏏', '🏸', '🎮', '🎯', '🎸', '🎹', '🎬', '📸', '✈️', '🏖️', '🚴', '🏃', '🧘', '🎉', '🎁', '🏆', '🎲', '🧩'],
 };
 
-const ChatInputBar = React.memo(function ChatInputBar({
+const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   theme,
   isDarkMode,
   chatColor,
@@ -109,6 +109,7 @@ const ChatInputBar = React.memo(function ChatInputBar({
   inputHeight,
   isInputFocused,
   isSearching,
+  showEmojiPanel,
   onTextChange,
   onInputContentSizeChange,
   onFocus,
@@ -117,10 +118,10 @@ const ChatInputBar = React.memo(function ChatInputBar({
   onOpenAttachment,
   onRemovePendingMedia,
   onSubmit,
-}) {
+}, ref) {
   const hasContent = Boolean(text.trim() || pendingMedia);
   const showAttachment = !hasContent;
-  const iconColor = isDarkMode ? 'rgba(233,245,255,0.92)' : '#111111';
+  const iconColor = isDarkMode ? 'rgba(212,229,240,0.68)': '#111111';
   const inputTextColor = isDarkMode ? '#F2F8FC' : '#111111';
   const pendingTextColor = isDarkMode ? '#E8F2F8' : '#111111';
   const placeholderColor = isDarkMode ? 'rgba(212,229,240,0.68)' : 'rgba(17,17,17,0.58)';
@@ -208,7 +209,7 @@ const ChatInputBar = React.memo(function ChatInputBar({
           <TouchableOpacity
             onPress={onOpenEmoji}
             accessibilityRole="button"
-            accessibilityLabel="Open emoji panel"
+            accessibilityLabel={showEmojiPanel ? "Open keyboard" : "Open emoji panel"}
             activeOpacity={0.75}
             style={{
               width: 42,
@@ -218,7 +219,7 @@ const ChatInputBar = React.memo(function ChatInputBar({
               justifyContent: 'center',
             }}
           >
-            <Ionicons name="happy-outline" size={26} color={iconColor} />
+            <Entypo name={showEmojiPanel ? "keyboard" : "emoji-happy"} size={22} color={iconColor} />
           </TouchableOpacity>
 
           <Animated.View
@@ -249,6 +250,7 @@ const ChatInputBar = React.memo(function ChatInputBar({
               </View>
             ) : (
               <TextInput
+                ref={ref}
                 placeholder="Message"
                 value={text}
                 onChangeText={onTextChange}
@@ -359,7 +361,7 @@ const ChatInputBar = React.memo(function ChatInputBar({
       </Animated.View>
     </View>
   );
-});
+}));
 
 // ── Smooth seekable audio progress bar ──
 const AudioSeekBar = React.memo(function AudioSeekBar({
@@ -687,6 +689,10 @@ export default function ChatScreen({ navigation, route }) {
   const [recordingDurationMs, setRecordingDurationMs] = useState(0);
   const audioRecordingRef = useRef(null);
   const audioDurationIntervalRef = useRef(null);
+  const recPulseAnim = useRef(new Animated.Value(1)).current;
+  const recSlideAnim = useRef(new Animated.Value(0)).current;
+  const recBarAnim = useRef(new Animated.Value(0)).current;
+  const recWaveAnims = useRef(Array.from({ length: 28 }, () => new Animated.Value(0.3))).current;
   const [playingAudioId, setPlayingAudioId] = useState(null);
   const [audioPlaybackStatus, setAudioPlaybackStatus] = useState({});
   const audioSoundRef = useRef(null);
@@ -695,6 +701,7 @@ export default function ChatScreen({ navigation, route }) {
   const [contactViewer, setContactViewer] = useState({ visible: false, data: null });
   const videoRefs = useRef({});
   const mediaAnimRef = useRef({});
+  const chatInputRef = useRef(null);
   const emojiPanelAnim = useRef(new Animated.Value(0)).current;
   const richParseCacheRef = useRef(new Map());
   const [visibleMessageKeys, setVisibleMessageKeys] = useState({});
@@ -1802,8 +1809,17 @@ export default function ChatScreen({ navigation, route }) {
 
   const handleOpenEmojiPanel = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    Keyboard.dismiss();
-    setShowEmojiPanel((prev) => !prev);
+    setShowEmojiPanel((prev) => {
+      if (prev) {
+        // Emoji panel is open → close it and show keyboard
+        chatInputRef.current?.focus();
+        return false;
+      } else {
+        // Emoji panel is closed → dismiss keyboard and show emoji panel
+        Keyboard.dismiss();
+        return true;
+      }
+    });
   }, []);
 
   const handleSelectEmoji = useCallback((emoji) => {
@@ -1826,6 +1842,14 @@ export default function ChatScreen({ navigation, route }) {
   const stopVoiceRecording = useCallback(async ({ cancel = false } = {}) => {
     try {
       clearRecordingInterval();
+      // Stop recording animations
+      if (recPulseAnim._pulseRef) { recPulseAnim._pulseRef.stop(); recPulseAnim._pulseRef = null; }
+      if (recWaveAnims._loops) { recWaveAnims._loops.forEach(l => l.stop()); recWaveAnims._loops = null; }
+      recWaveAnims.forEach(a => a.setValue(0.3));
+      recPulseAnim.setValue(1);
+      recSlideAnim.setValue(0);
+      Animated.timing(recBarAnim, { toValue: 0, duration: 200, useNativeDriver: true }).start();
+
       const recording = audioRecordingRef.current;
       audioRecordingRef.current = null;
       setIsRecordingAudio(false);
@@ -1892,6 +1916,33 @@ export default function ChatScreen({ navigation, route }) {
       audioRecordingRef.current = recording;
       setIsRecordingAudio(true);
       setRecordingDurationMs(0);
+
+      // Start recording animations
+      recBarAnim.setValue(0);
+      Animated.spring(recBarAnim, { toValue: 1, tension: 60, friction: 8, useNativeDriver: true }).start();
+      // Pulse red dot
+      const pulse = Animated.loop(
+        Animated.sequence([
+          Animated.timing(recPulseAnim, { toValue: 0.3, duration: 600, useNativeDriver: true }),
+          Animated.timing(recPulseAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
+        ])
+      );
+      pulse.start();
+      recPulseAnim._pulseRef = pulse;
+      // Waveform bars animation
+      const waveLoops = recWaveAnims.map((anim, i) => {
+        const delay = i * 60;
+        const duration = 300 + Math.random() * 400;
+        const loop = Animated.loop(
+          Animated.sequence([
+            Animated.timing(anim, { toValue: 0.4 + Math.random() * 0.6, duration, delay, useNativeDriver: true }),
+            Animated.timing(anim, { toValue: 0.15 + Math.random() * 0.2, duration: duration * 0.8, useNativeDriver: true }),
+          ])
+        );
+        loop.start();
+        return loop;
+      });
+      recWaveAnims._loops = waveLoops;
 
       clearRecordingInterval();
       audioDurationIntervalRef.current = setInterval(() => {
@@ -2299,7 +2350,8 @@ export default function ChatScreen({ navigation, route }) {
       kbHideTimerRef.current = setTimeout(() => {
         kbHideTimerRef.current = null;
         const duration = Platform.OS === 'ios' ? (event?.duration || 250) : 200;
-        setKeyboardHeight(0);
+        // Don't reset keyboard height if emoji panel is opening (keeps panel same height)
+        setKeyboardHeight((prev) => prev);
         setIsInputFocused(false);
         Animated.timing(keyboardAnim, {
           toValue: 0,
@@ -2325,13 +2377,7 @@ export default function ChatScreen({ navigation, route }) {
     };
   }, [clearRecordingInterval]);
 
-  useEffect(() => {
-    Animated.timing(emojiPanelAnim, {
-      toValue: showEmojiPanel ? 1 : 0,
-      duration: 180,
-      useNativeDriver: true,
-    }).start();
-  }, [emojiPanelAnim, showEmojiPanel]);
+  // emojiPanelAnim no longer needed — emoji panel is inline below input bar
 
   useEffect(() => {
     if (!showMediaOptions) {
@@ -4098,137 +4144,61 @@ export default function ChatScreen({ navigation, route }) {
           </TouchableOpacity>
         )}
 
-        <Animated.View
-          pointerEvents={showEmojiPanel ? 'auto' : 'none'}
-          style={{
-            position: 'absolute',
-            left: 8,
-            right: 8,
-            bottom: (Platform.OS === 'ios' ? 86 : 76),
-            borderRadius: 22,
-            overflow: 'hidden',
-            borderWidth: 1,
-            borderColor: 'rgba(255,255,255,0.16)',
-            backgroundColor: 'rgba(18, 37, 52, 0.42)',
-            opacity: emojiPanelAnim,
-            transform: [
-              {
-                translateY: emojiPanelAnim.interpolate({ inputRange: [0, 1], outputRange: [26, 0] }),
-              },
-            ],
-            zIndex: 25,
-            shadowColor: '#000',
-            shadowOffset: { width: 0, height: 3 },
-            shadowOpacity: 0.2,
-            shadowRadius: 6,
-            elevation: 6,
-          }}
-        >
-          <BlurView
-            tint="dark"
-            intensity={86}
-            experimentalBlurMethod="dimezisBlurView"
-            style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }}
-          />
-
-          <View style={{ paddingTop: 10, paddingBottom: 12 }}>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 8, gap: 6 }}>
-              {emojiSectionsMeta.map((section) => {
-                const active = section.key === activeEmojiSection;
-                return (
-                  <TouchableOpacity
-                    key={section.key}
-                    onPress={() => setActiveEmojiSection(section.key)}
-                    activeOpacity={0.8}
-                    style={{
-                      flexDirection: 'row',
-                      alignItems: 'center',
-                      gap: 5,
-                      borderRadius: 14,
-                      paddingVertical: 6,
-                      paddingHorizontal: 10,
-                      backgroundColor: active ? 'rgba(67, 157, 214, 0.3)' : 'rgba(255,255,255,0.08)',
-                    }}
-                  >
-                    <Ionicons name={section.icon} size={14} color={active ? '#DDF3FF' : 'rgba(224,236,245,0.92)'} />
-                    <Text style={{ fontSize: 11, color: active ? '#E8F6FF' : 'rgba(224,236,245,0.88)', fontFamily: 'Poppins-Medium' }}>
-                      {section.label}
-                    </Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-
-            <ScrollView
-              showsVerticalScrollIndicator={false}
-              style={{ maxHeight: 220, marginTop: 10 }}
-              contentContainerStyle={{
-                flexDirection: 'row',
-                flexWrap: 'wrap',
-                paddingHorizontal: 10,
-                paddingBottom: 6,
-              }}
-            >
-              {activeEmojiList.map((emoji, index) => (
-                <TouchableOpacity
-                  key={`${emoji}_${index}`}
-                  onPress={() => handleSelectEmoji(emoji)}
-                  activeOpacity={0.78}
-                  style={{
-                    width: '14.28%',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    paddingVertical: 8,
-                  }}
-                >
-                  <Text style={{ fontSize: 27 }}>{emoji}</Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
-          </View>
-        </Animated.View>
-
         {isRecordingAudio && (
-          <View
+          <Animated.View
             style={{
-              marginHorizontal: 14,
-              marginBottom: 8,
-              borderRadius: 18,
-              paddingHorizontal: 12,
-              paddingVertical: 10,
-              backgroundColor: 'rgba(140, 18, 28, 0.28)',
-              borderWidth: 1,
-              borderColor: 'rgba(255,255,255,0.14)',
               flexDirection: 'row',
               alignItems: 'center',
-              justifyContent: 'space-between',
+              paddingHorizontal: 14,
+              paddingVertical: 10,
+              backgroundColor: isDarkMode ? theme.colors.cardBackground : '#fff',
+              opacity: recBarAnim,
+              transform: [{ translateY: recBarAnim.interpolate({ inputRange: [0, 1], outputRange: [30, 0] }) }],
             }}
           >
-            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: '#FF6B6B', marginRight: 8 }} />
-              <Text style={{ color: '#FDEBEC', fontFamily: 'Poppins-Medium', fontSize: 13 }}>
-                Recording {recordingDurationLabel}
-              </Text>
+            {/* Red pulsing dot + timer */}
+            <Animated.View style={{ opacity: recPulseAnim, width: 12, height: 12, borderRadius: 6, backgroundColor: '#FF3B30', marginRight: 10 }} />
+            <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium', fontSize: 16, minWidth: 50 }}>
+              {recordingDurationLabel}
+            </Text>
+
+            {/* Voice waveform bars */}
+            <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', height: 32, marginHorizontal: 8 }}>
+              {recWaveAnims.map((anim, i) => (
+                <Animated.View
+                  key={i}
+                  style={{
+                    width: 3,
+                    marginHorizontal: 1,
+                    borderRadius: 1.5,
+                    backgroundColor: theme.colors.themeColor,
+                    height: 28,
+                    transform: [{ scaleY: anim }],
+                  }}
+                />
+              ))}
             </View>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-              <TouchableOpacity
-                onPress={() => stopVoiceRecording({ cancel: true })}
-                accessibilityRole="button"
-                accessibilityLabel="Cancel voice recording"
-                style={{ paddingHorizontal: 10, paddingVertical: 6, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.14)' }}
-              >
-                <Text style={{ color: '#FFD4D8', fontSize: 12, fontFamily: 'Poppins-Medium' }}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => stopVoiceRecording({ cancel: false })}
-                accessibilityRole="button"
-                accessibilityLabel="Stop voice recording"
-                style={{ paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, backgroundColor: 'rgba(255,255,255,0.2)' }}
-              >
-                <Text style={{ color: '#FFFFFF', fontSize: 12, fontFamily: 'Poppins-SemiBold' }}>Stop</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
+
+            {/* Delete (cancel) button */}
+            <TouchableOpacity
+              onPress={() => stopVoiceRecording({ cancel: true })}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel voice recording"
+              style={{ width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center', marginRight: 6 }}
+            >
+              <Ionicons name="trash-outline" size={22} color="#FF3B30" />
+            </TouchableOpacity>
+
+            {/* Send (stop + send) button */}
+            <TouchableOpacity
+              onPress={() => stopVoiceRecording({ cancel: false })}
+              accessibilityRole="button"
+              accessibilityLabel="Send voice recording"
+              style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: theme.colors.themeColor, justifyContent: 'center', alignItems: 'center' }}
+            >
+              <Ionicons name="send" size={18} color="#fff" style={{ marginLeft: 2 }} />
+            </TouchableOpacity>
+          </Animated.View>
         )}
 
         {/* Edit mode bar */}
@@ -4282,6 +4252,7 @@ export default function ChatScreen({ navigation, route }) {
         )}
 
         <ChatInputBar
+          ref={chatInputRef}
           theme={theme}
           isDarkMode={isDarkMode}
           chatColor={chatColor}
@@ -4290,15 +4261,116 @@ export default function ChatScreen({ navigation, route }) {
           inputHeight={inputHeight}
           isInputFocused={isInputFocused}
           isSearching={isSearching}
+          showEmojiPanel={showEmojiPanel}
           onTextChange={handleTextChange}
           onInputContentSizeChange={handleInputContentSizeChange}
-          onFocus={() => setIsInputFocused(true)}
+          onFocus={() => { setIsInputFocused(true); setShowEmojiPanel(false); }}
           onBlur={() => setIsInputFocused(false)}
           onOpenEmoji={handleOpenEmojiPanel}
           onOpenAttachment={editingMessage ? undefined : handleToggleMediaOptions}
           onRemovePendingMedia={() => setPendingMedia(null)}
           onSubmit={handleSubmitInput}
         />
+
+        {/* Emoji Panel — WhatsApp style, replaces keyboard */}
+        {showEmojiPanel && (
+          <View style={{
+            height: Math.max(keyboardHeight, 280),
+            backgroundColor: isDarkMode ? theme.colors.cardBackground : '#F0F2F5',
+            borderTopWidth: 0,
+            borderTopColor: theme.colors.borderColor,
+          }}>
+            <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', paddingHorizontal: 16, paddingTop: 6, paddingBottom: 4, gap: 20 }}>
+              {emojiSectionsMeta.map((section) => {
+                const active = section.key === activeEmojiSection;
+                return (
+                  <TouchableOpacity
+                    key={section.key}
+                    onPress={() => setActiveEmojiSection(section.key)}
+                    activeOpacity={0.7}
+                    style={{
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      paddingVertical: 4,
+                      paddingHorizontal: 6,
+                      borderBottomWidth: active ? 2 : 0,
+                      borderBottomColor: theme.colors.themeColor,
+                    }}
+                  >
+                    <Ionicons
+                      name={section.icon}
+                      size={20}
+                      color={active
+                        ? theme.colors.themeColor
+                        : (isDarkMode ? 'rgba(224,236,245,0.5)' : '#999')}
+                    />
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <ScrollView
+              showsVerticalScrollIndicator={false}
+              style={{ flex: 1, }}
+              contentContainerStyle={{
+                flexDirection: 'row',
+                flexWrap: 'wrap',
+                paddingHorizontal: 6,
+                paddingBottom: 10,
+              }}
+            >
+              {activeEmojiList.map((emoji, index) => (
+                <TouchableOpacity
+                  key={`${emoji}_${index}`}
+                  onPress={() => handleSelectEmoji(emoji)}
+                  activeOpacity={0.7}
+                  style={{
+                    width: '14.28%',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    paddingVertical: 7,
+                  }}
+                >
+                  <Text style={{ fontSize: 28 }}>{emoji}</Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+
+            {/* Backspace button */}
+            <View style={{
+              flexDirection: 'row',
+              justifyContent: 'flex-end',
+              paddingHorizontal: 16,
+              paddingBottom: Platform.OS === 'ios' ? 20 : 8,
+              paddingTop: 4,
+              borderTopWidth: 0.5,
+              borderTopColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+            }}>
+              <TouchableOpacity
+                onPress={() => {
+                  // Remove last emoji or character
+                  if (text && text.length > 0) {
+                    // Handle multi-codepoint emoji
+                    const arr = [...text];
+                    arr.pop();
+                    handleTextChange(arr.join(''));
+                  }
+                }}
+                activeOpacity={0.7}
+                style={{
+                  width: 44,
+                  height: 36,
+                  borderRadius: 8,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  backgroundColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.06)',
+                }}
+              >
+                <Ionicons name="backspace-outline" size={22} color={isDarkMode ? '#ccc' : '#555'} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
 
         {/* Menu Modal */}
         <Modal visible={showMenu} transparent animationType="fade" onRequestClose={() => setShowMenu(false)}>
