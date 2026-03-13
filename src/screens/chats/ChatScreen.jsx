@@ -9,7 +9,6 @@ import {
   Image,
   TextInput,
   ScrollView,
-  KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
   RefreshControl,
@@ -23,6 +22,7 @@ import {
   UIManager,
   PanResponder,
   useWindowDimensions,
+  StyleSheet
 } from "react-native";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
@@ -70,41 +70,27 @@ const MEDIA_PANEL_OPTIONS = [
   { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', color: '#10B981' },
 ];
 
-const CHAT_WALLPAPER_TEXTURE = require('../../../assets/images/chat-msg.png');
+const CHAT_WALLPAPER_TEXTURE = require('../../../assets/images/chat-background.jpg');
 
 const ChatWallpaperLayer = React.memo(function ChatWallpaperLayer({ isDarkMode }) {
-  const palette = isDarkMode
-    ? {
-        base: '#182631',
-        textureTint: '#90A0AE',
-        textureOpacity: 0.09,
-        overlay: 'rgba(0,0,0,0.34)',
-      }
-    : {
-        base: '#ffe0b8c0',
-        textureTint: '#A2ABB3',
-        textureOpacity: 0.11,
-        overlay: 'rgba(255,255,255,0.52)',
-      };
-
   return (
-    <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: palette.base }}>
+    <View pointerEvents="none" style={wpStyles.container}>
       <Image
         source={CHAT_WALLPAPER_TEXTURE}
-        resizeMode="repeat"
-        style={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          top: 0,
-          bottom: 0,
-          opacity: palette.textureOpacity,
-          tintColor: palette.textureTint,
-        }}
+        resizeMode="cover"
+        style={wpStyles.image}
       />
-      <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: palette.overlay }} />
+      <View style={[wpStyles.overlay, {
+        backgroundColor: isDarkMode ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.15)',
+      }]} />
     </View>
   );
+});
+
+const wpStyles = StyleSheet.create({
+  container: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: '#0B141A' },
+  image: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, width: '100%', height: '100%' },
+  overlay: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 },
 });
 
 const EMOJI_SECTIONS = {
@@ -684,6 +670,7 @@ export default function ChatScreen({ navigation, route }) {
   const { isConnected, networkType } = useNetwork();
   const { width: windowWidth } = useWindowDimensions();
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const keyboardAnim = useRef(new Animated.Value(0)).current;
   const [isAtTop, setIsAtTop] = useState(false);
   const [isAtLatest, setIsAtLatest] = useState(true);
   const [showSearchBar, setShowSearchBar] = useState(false);
@@ -724,6 +711,7 @@ export default function ChatScreen({ navigation, route }) {
   const stickyDateHideTimerRef = useRef(null);
   const isUserScrollingRef = useRef(false);
   const topVisibleIndexRef = useRef(-1);
+  const scrollBtnAnim = useRef(new Animated.Value(0)).current;
   const mediaBackdropAnim = useRef(new Animated.Value(0)).current;
   const mediaSheetAnim = useRef(new Animated.Value(MEDIA_PANEL_SHEET_HEIGHT)).current;
   const mediaOptionEntryAnims = useRef(MEDIA_PANEL_OPTIONS.map(() => new Animated.Value(0))).current;
@@ -2284,31 +2272,41 @@ export default function ChatScreen({ navigation, route }) {
     },
   }), [closeMediaPanelAnimated, mediaBackdropAnim, mediaSheetAnim]);
 
-  // Keyboard handling — debounce hide to prevent flicker when switching keyboard types (text ↔ emoji)
+  // Keyboard handling — smooth animated transitions like WhatsApp
   const kbHideTimerRef = useRef(null);
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
     const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
 
     const showSub = Keyboard.addListener(showEvent, (event) => {
-      // Cancel any pending hide — keyboard is back (e.g. emoji switch)
       if (kbHideTimerRef.current) {
         clearTimeout(kbHideTimerRef.current);
         kbHideTimerRef.current = null;
       }
       const nextHeight = event?.endCoordinates?.height || 0;
+      const duration = Platform.OS === 'ios' ? (event?.duration || 250) : 220;
       setKeyboardHeight(nextHeight);
       setIsInputFocused(true);
       setShowEmojiPanel(false);
+      Animated.timing(keyboardAnim, {
+        toValue: nextHeight,
+        duration,
+        useNativeDriver: false,
+      }).start();
     });
 
-    const hideSub = Keyboard.addListener(hideEvent, () => {
-      // Delay hide so switching keyboard types doesn't flash paddingBottom to 0
+    const hideSub = Keyboard.addListener(hideEvent, (event) => {
       kbHideTimerRef.current = setTimeout(() => {
         kbHideTimerRef.current = null;
+        const duration = Platform.OS === 'ios' ? (event?.duration || 250) : 200;
         setKeyboardHeight(0);
         setIsInputFocused(false);
-      }, 150);
+        Animated.timing(keyboardAnim, {
+          toValue: 0,
+          duration,
+          useNativeDriver: false,
+        }).start();
+      }, 80);
     });
 
     return () => {
@@ -2316,7 +2314,7 @@ export default function ChatScreen({ navigation, route }) {
       hideSub.remove();
       if (kbHideTimerRef.current) clearTimeout(kbHideTimerRef.current);
     };
-  }, []);
+  }, [keyboardAnim]);
 
   useEffect(() => {
     return () => {
@@ -2367,6 +2365,17 @@ export default function ChatScreen({ navigation, route }) {
   useEffect(() => () => {
     clearStickyDateHideTimer();
   }, [clearStickyDateHideTimer]);
+
+  // Animate scroll-to-bottom button
+  useEffect(() => {
+    Animated.spring(scrollBtnAnim, {
+      toValue: showScrollButton ? 1 : 0,
+      damping: 18,
+      stiffness: 280,
+      mass: 0.6,
+      useNativeDriver: true,
+    }).start();
+  }, [showScrollButton, scrollBtnAnim]);
 
   // New messages counter
   useEffect(() => {
@@ -3430,7 +3439,7 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   // Main message renderer
-  const renderChatsItem = ({ item: msg, index }) => {
+  const renderChatsItem = useCallback(({ item: msg, index }) => {
     const messageKey = getMessageKey(msg);
     const isSelected = selectedMessage.some(sel => sameId(sel, messageKey));
     const isMyMessage = msg?.senderType
@@ -3604,7 +3613,7 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  };
+  }, [messages, selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, search, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia]);
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -3719,14 +3728,9 @@ export default function ChatScreen({ navigation, route }) {
   }
 
   return (
-    <KeyboardAvoidingView 
-      style={{ flex: 1, backgroundColor: theme.colors.background }} 
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-      keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
-      enabled
-    >
-      <StatusBar backgroundColor={theme.colors.background} barStyle="dark-content" />
-      <View style={{ flex: 1, paddingBottom: Platform.OS === 'android' ? keyboardHeight : 0 }}>
+    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+      <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+      <Animated.View style={{ flex: 1, paddingBottom: Platform.OS === 'android' ? keyboardAnim : 0 }}>
         <ChatWallpaperLayer isDarkMode={isDarkMode} />
         
         {/* Header */}
@@ -3938,10 +3942,10 @@ export default function ChatScreen({ navigation, route }) {
             onViewableItemsChanged={onViewableItemsChanged}
             viewabilityConfig={viewabilityConfig}
             
-            removeClippedSubviews={false}
-            maxToRenderPerBatch={10}
-            updateCellsBatchingPeriod={40}
-            windowSize={11}
+            removeClippedSubviews={Platform.OS !== 'web'}
+            maxToRenderPerBatch={8}
+            updateCellsBatchingPeriod={50}
+            windowSize={9}
             ListFooterComponent={!isSearching ? renderFooter : null}
             ListEmptyComponent={!isSearching ? renderChatEmptyState : null}
             maintainVisibleContentPosition={{
@@ -4057,13 +4061,13 @@ export default function ChatScreen({ navigation, route }) {
               backgroundColor: theme.colors.cardBackground, 
               alignItems: 'center', 
               justifyContent: 'center', 
-              borderWidth: 1, 
-              borderColor: theme.colors.themeColor,
-              shadowColor: "#000",
-              shadowOffset: { width: 0, height: 2 },
-              shadowOpacity: 0.2,
-              shadowRadius: 3,
-              elevation: 4,
+              // borderWidth: 1, 
+              // borderColor: theme.colors.themeColor,
+              // shadowColor: "#000",
+              // shadowOffset: { width: 0, height: 2 },
+              // shadowOpacity: 0.2,
+              // shadowRadius: 3,
+              // elevation: 4,
             }}
           >
             <Ionicons name="arrow-down" size={20} color={theme.colors.themeColor} />
@@ -4383,7 +4387,7 @@ export default function ChatScreen({ navigation, route }) {
                 </Text>
               </TouchableOpacity>
 
-              <TouchableOpacity
+              {/* <TouchableOpacity
                 onPress={handleClearChatOptions}
                 style={{
                   paddingVertical: 14,
@@ -4397,7 +4401,7 @@ export default function ChatScreen({ navigation, route }) {
                 <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>
                   Clear Chat
                 </Text>
-              </TouchableOpacity>
+              </TouchableOpacity> */}
             </View>
           </TouchableOpacity>
         </Modal>
@@ -4662,7 +4666,7 @@ export default function ChatScreen({ navigation, route }) {
             }}
           />
         </Modal>
-      </View>
-    </KeyboardAvoidingView>
+      </Animated.View>
+    </View>
   );
 }

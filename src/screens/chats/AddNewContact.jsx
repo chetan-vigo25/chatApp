@@ -112,11 +112,11 @@ export default function AddNewContact({ navigation }) {
         console.log('🎧 Setting up socket listeners for contact search');
         
         const onSearchResponse = (response) => {
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          console.log("📥 SEARCH USER BY MOBILE RESPONSE");
-          console.log("   Status:", response.status);
-          console.log("   Data:", JSON.stringify(response.data, null, 2));
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("📥 SEARCH USER BY MOBILE RESPONSE");
+          // console.log("   Status:", response.status);
+          // console.log("   Data:", JSON.stringify(response.data, null, 2));
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           
           setIsSearching(false);
           
@@ -152,10 +152,10 @@ export default function AddNewContact({ navigation }) {
         socket.on('user:search:mobile:response', onSearchResponse);
 
         const onChatCreateResponse = (response) => {
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          console.log("📥 CREATE CHAT RESPONSE");
-          console.log("   Response:", JSON.stringify(response, null, 2));
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("📥 CREATE CHAT RESPONSE");
+          // console.log("   Response:", JSON.stringify(response, null, 2));
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           
           if (response.status && response.data) {
             console.log("✅ Chat created successfully, navigating to ChatScreen");
@@ -307,10 +307,10 @@ export default function AddNewContact({ navigation }) {
 
     const handleCreateChat = async (userId) => {
       try {
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          console.log("💬 CREATING CHAT");
-          console.log("   User ID:", userId);
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("💬 CREATING CHAT");
+          // console.log("   User ID:", userId);
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           
           // Use the stored user data from ref instead of searchResult
           const userData = pendingUserDataRef.current;
@@ -386,14 +386,14 @@ export default function AddNewContact({ navigation }) {
       // Store user data in ref for persistence
       pendingUserDataRef.current = searchResult.user;
       
-      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      console.log("📱 ADDING CONTACT");
-      console.log("   User:", searchResult.user?.fullName || searchResult.user?.name);
-      console.log("   User ID:", searchResult.user?._id);
-      console.log("   Chat ID:", searchResult.chatId);
-      console.log("   Has Existing Chat:", searchResult.hasExistingChat);
-      console.log("   Is Contact:", searchResult.isContact);
-      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      // console.log("📱 ADDING CONTACT");
+      // console.log("   User:", searchResult.user?.fullName || searchResult.user?.name);
+      // console.log("   User ID:", searchResult.user?._id);
+      // console.log("   Chat ID:", searchResult.chatId);
+      // console.log("   Has Existing Chat:", searchResult.hasExistingChat);
+      // console.log("   Is Contact:", searchResult.isContact);
+      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
       
       // If chat already exists, navigate directly
       if (searchResult.hasExistingChat && searchResult.chatId) {
@@ -512,6 +512,9 @@ export default function AddNewContact({ navigation }) {
                 onChangeText={handlePhoneNumberChange}
                 activeOutlineColor={ theme.colors.themeColor }
                 outlineColor={ theme.colors.themeColor }
+                textColor={ theme.colors.primaryTextColor }
+                style={{ backgroundColor: 'transparent' }}
+                theme={{ colors: { background: theme.colors.background, surfaceVariant: 'transparent', onSurfaceVariant: theme.colors.placeHolderTextColor } }}
                 right={
                     isSearching ? (
                       <TextInput.Icon

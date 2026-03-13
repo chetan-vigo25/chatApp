@@ -90,13 +90,14 @@ export default function Setting({ navigation }) {
           subtitle: isDarkMode ? 'Dark theme' : 'Light theme',
           onPress: () => navigation.navigate('ChatColorTheme'),
         },
-        {
-          icon: 'link-outline',
-          iconColor: '#0984E3',
-          iconBg: '#0984E31A',
-          label: 'Linked Devices',
-          onPress: () => navigation.navigate('LinkDevice'),
-        },
+        // {
+        //   icon: 'link-outline',
+        //   iconColor: '#0984E3',
+        //   iconBg: '#0984E31A',
+        //   label: 'Linked Devices',
+        
+        //   onPress: () => navigation.navigate('LinkDevice'),
+        // },
       ],
     },
     {

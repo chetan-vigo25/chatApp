@@ -25,6 +25,7 @@ export default function Otp({ navigation, route }) {
     const dispatch = useDispatch();
     const { isLoading, otpMessage, error } = useSelector((state) => state.authentication);
     const fadeAnim = useRef(new Animated.Value(0)).current;
+    const otpInputRef = useRef(null);
     const { theme, isDarkMode, toggleTheme } = useTheme();
     const [otp, setOtp] = useState("");
     const [seconds, setSeconds] = useState(60);
@@ -145,10 +146,13 @@ export default function Otp({ navigation, route }) {
               });
               // navigation.navigate("ChatList");
             }
+            otpInputRef.current?.clear();
             setOtp("");
           } catch (error) {
             console.error("OTP Verification Failed:", error);
             showToast(error);
+            otpInputRef.current?.clear();
+            setOtp("");
           }
         };
 
@@ -166,6 +170,7 @@ export default function Otp({ navigation, route }) {
               startOtpTimer(60);
               console.log("OTP Resend:", otpMessage);
               showToast(otpMessage);
+              otpInputRef.current?.clear();
               setOtp("");
             })
             .catch((error) => {
@@ -186,6 +191,7 @@ export default function Otp({ navigation, route }) {
           </View>
           <View style={{ width:'50%', justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:50,}} >
            <OtpInput
+             ref={otpInputRef}
              numberOfDigits={6}
             focusColor={ theme.colors.themeColor }
             autoFocus={false}
@@ -268,7 +274,7 @@ export default function Otp({ navigation, route }) {
                 <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: seconds > 0 ? theme.colors.themeColor : theme.colors.placeHolderTextColor, }} >{formatTime(seconds)}</Text>
              </View>
           </View>
-          <TouchableOpacity onPress={handleVerifyOtp} disabled={seconds <= 0} style={{ width:'50%', height:40, backgroundColor:seconds > 0 ? theme.colors.themeColor : theme.colors.placeHolderTextColor, justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40 }} >
+          <TouchableOpacity onPress={handleVerifyOtp} disabled={isLoading || otp.length !== 6} style={{ width:'50%', height:40, backgroundColor:(otp.length === 6 && !isLoading) ? theme.colors.themeColor : theme.colors.placeHolderTextColor, justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40 }} >
             {
               isLoading ? <ActivityIndicator size="small" color={theme.colors.textWhite} /> :
               <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.textWhite, }} >Verify OTP</Text>

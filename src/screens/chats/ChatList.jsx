@@ -454,13 +454,13 @@ export default function ChatList({ navigation }) {
       onPress: onViewInfo,
     });
 
-    opts.push({
-      icon: 'delete-outline',
-      label: 'Delete Chat',
-      iconColor: '#E06A6A',
-      onPress: onDeleteChat,
-      isDanger: true,
-    });
+    // opts.push({
+    //   icon: 'delete-outline',
+    //   label: 'Delete Chat',
+    //   iconColor: '#E06A6A',
+    //   onPress: onDeleteChat,
+    //   isDanger: true,
+    // });
 
     return opts;
   }, [selectedChatItem, onTogglePin, onPressMute, onToggleArchive, onViewInfo, onDeleteChat]);
@@ -597,12 +597,12 @@ export default function ChatList({ navigation }) {
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
-            <Menu.Item
+            {/* <Menu.Item
               onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
               title="Linked Devices"
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="phone-portrait-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            />
+            /> */}
           </Menu>
         </View>
       </View>

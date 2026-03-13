@@ -1,7 +1,8 @@
-import React, { useCallback, useMemo, useState } from 'react';
-import { Alert, FlatList, Image, Modal, Text, TouchableOpacity, View } from 'react-native';
+import React, { useCallback, useMemo, useState, useRef } from 'react';
+import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
-import { BlurView } from 'expo-blur';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
@@ -13,7 +14,7 @@ const MUTE_OPTIONS = [
 ];
 
 export default function ArchivedChats({ navigation }) {
-  const { theme } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const {
     archivedChatList,
     requestChatInfo,
@@ -29,6 +30,10 @@ export default function ArchivedChats({ navigation }) {
   const [actionSheetVisible, setActionSheetVisible] = useState(false);
   const [muteSheetVisible, setMuteSheetVisible] = useState(false);
   const [profilePreviewVisible, setProfilePreviewVisible] = useState(false);
+  const [imageViewerVisible, setImageViewerVisible] = useState(false);
+
+  const profileOpacityAnim = useRef(new Animated.Value(0)).current;
+  const profileScaleAnim = useRef(new Animated.Value(0)).current;
 
   const getPreviewText = (text, maxLength = 20) => {
     if (!text) return '';
@@ -104,12 +109,40 @@ export default function ArchivedChats({ navigation }) {
   const openProfilePreview = useCallback((item) => {
     setSelectedChatItem(item);
     setProfilePreviewVisible(true);
-  }, []);
+    profileScaleAnim.setValue(0);
+    profileOpacityAnim.setValue(0);
+    Animated.parallel([
+      Animated.spring(profileScaleAnim, {
+        toValue: 1,
+        tension: 65,
+        friction: 8,
+        useNativeDriver: true,
+      }),
+      Animated.timing(profileOpacityAnim, {
+        toValue: 1,
+        duration: 200,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [profileScaleAnim, profileOpacityAnim]);
 
   const closeProfilePreview = useCallback(() => {
-    setProfilePreviewVisible(false);
-    setSelectedChatItem(null);
-  }, []);
+    Animated.parallel([
+      Animated.timing(profileScaleAnim, {
+        toValue: 0,
+        duration: 180,
+        useNativeDriver: true,
+      }),
+      Animated.timing(profileOpacityAnim, {
+        toValue: 0,
+        duration: 180,
+        useNativeDriver: true,
+      }),
+    ]).start(() => {
+      setProfilePreviewVisible(false);
+      setSelectedChatItem(null);
+    });
+  }, [profileScaleAnim, profileOpacityAnim]);
 
   const onTogglePin = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
@@ -165,6 +198,10 @@ export default function ArchivedChats({ navigation }) {
       </View>
     );
   }, [theme.colors.placeHolderTextColor]);
+
+  const previewName = selectedChatItem?.peerUser?.fullName || 'Unknown User';
+  const previewImage = selectedChatItem?.peerUser?.profileImage;
+  const previewAvatarColor = getUserColor(previewName);
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background, paddingHorizontal: 10, paddingTop: 8 }}>
@@ -276,55 +313,228 @@ export default function ArchivedChats({ navigation }) {
         </TouchableOpacity>
       </Modal>
 
-      <Modal animationType="slide" transparent visible={profilePreviewVisible} onRequestClose={closeProfilePreview}>
-        <TouchableOpacity activeOpacity={1} onPress={closeProfilePreview} style={{ flex: 1, justifyContent: 'flex-end' }}>
-          <BlurView intensity={50} tint={theme.colors.background === '#ffffff' ? 'light' : 'dark'} style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }} />
-          <TouchableOpacity activeOpacity={1} style={{ backgroundColor: theme.colors.cardBackground, borderTopLeftRadius: 24, borderTopRightRadius: 24, paddingHorizontal: 20, paddingTop: 20, paddingBottom: 28, alignItems: 'center' }}>
-            <View style={{ width: 88, height: 88, borderRadius: 44, backgroundColor: theme.colors.menuBackground, alignItems: 'center', justifyContent: 'center' }}>
-              {selectedChatItem?.peerUser?.profileImage ? (
-                <Image source={{ uri: selectedChatItem.peerUser.profileImage }} style={{ width: 88, height: 88, borderRadius: 44 }} />
+      {/* Profile Preview Modal — same style as ChatList */}
+      <Modal transparent visible={profilePreviewVisible} onRequestClose={closeProfilePreview} statusBarTranslucent>
+        <TouchableOpacity onPress={closeProfilePreview} activeOpacity={1} style={styles.profileOverlay}>
+          <Animated.View style={[
+            styles.profileCard,
+            {
+              backgroundColor: theme.colors.cardBackground,
+              opacity: profileOpacityAnim,
+              transform: [{ scale: profileScaleAnim }],
+            }
+          ]}>
+            <TouchableOpacity
+              activeOpacity={0.9}
+              onPress={() => {
+                setProfilePreviewVisible(false);
+                setTimeout(() => setImageViewerVisible(true), 200);
+              }}
+              style={[styles.profileImageWrap, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }]}
+            >
+              {previewImage ? (
+                <Image resizeMode="cover" source={{ uri: previewImage }} style={StyleSheet.absoluteFill} />
               ) : (
-                <Text style={{ color: theme.colors.primaryTextColor, fontSize: 34, fontFamily: 'Poppins-Bold' }}>
-                  {(selectedChatItem?.peerUser?.fullName || '?').charAt(0).toUpperCase()}
-                </Text>
+                <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
+                  <Text style={styles.profileFallbackText}>
+                    {(previewName || '?').charAt(0).toUpperCase()}
+                  </Text>
+                </View>
               )}
-            </View>
-            <Text style={{ marginTop: 12, color: theme.colors.primaryTextColor, fontSize: 18, fontFamily: 'Poppins-SemiBold' }}>
-              {selectedChatItem?.peerUser?.fullName || 'Unknown User'}
-            </Text>
-            <Text style={{ marginTop: 4, color: theme.colors.placeHolderTextColor, fontSize: 13 }}>
-              {selectedChatItem?.peerUser?.mobileNumber || selectedChatItem?.peerUser?.phoneNumber || 'Phone not available'}
-            </Text>
-            <Text style={{ marginTop: 2, color: theme.colors.placeHolderTextColor, fontSize: 12 }} numberOfLines={2}>
-              {selectedChatItem?.peerUser?.bio || selectedChatItem?.peerUser?.status || 'Available'}
-            </Text>
 
-            <View style={{ marginTop: 18, width: '100%', flexDirection: 'row', justifyContent: 'space-between' }}>
-              <TouchableOpacity
-                onPress={() => {
-                  if (selectedChatItem) navigation.navigate('ChatScreen', { item: selectedChatItem });
-                  closeProfilePreview();
-                }}
-                style={{ flex: 1, height: 46, borderRadius: 12, backgroundColor: theme.colors.themeColor, alignItems: 'center', justifyContent: 'center', marginRight: 8 }}
-              >
-                <Text style={{ color: theme.colors.textWhite, fontFamily: 'Poppins-Medium' }}>Message</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={{ flex: 1, height: 46, borderRadius: 12, backgroundColor: theme.colors.menuBackground, alignItems: 'center', justifyContent: 'center', marginHorizontal: 4 }}>
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium' }}>Call</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => {
-                  if (selectedChatItem) navigation.navigate('UserB', { item: selectedChatItem });
-                  closeProfilePreview();
-                }}
-                style={{ flex: 1, height: 46, borderRadius: 12, backgroundColor: theme.colors.menuBackground, alignItems: 'center', justifyContent: 'center', marginLeft: 8 }}
-              >
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium' }}>Profile</Text>
-              </TouchableOpacity>
-            </View>
-          </TouchableOpacity>
+              {/* Name overlay */}
+              <View style={styles.profileNameOverlay}>
+                <Text style={styles.profileNameText} numberOfLines={1}>{previewName}</Text>
+              </View>
+
+              {/* Action buttons */}
+              <View style={styles.profileActions}>
+                <TouchableOpacity
+                  onPress={() => {
+                    if (selectedChatItem) navigation.navigate('ChatScreen', { item: selectedChatItem });
+                    closeProfilePreview();
+                  }}
+                  activeOpacity={0.8}
+                  style={styles.profileActionBtn}
+                >
+                  <Ionicons name="chatbubble-outline" size={20} color="#fff" />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={() => {
+                    if (selectedChatItem) navigation.navigate('UserB', { item: selectedChatItem });
+                    closeProfilePreview();
+                  }}
+                  activeOpacity={0.8}
+                  style={styles.profileActionBtn}
+                >
+                  <Ionicons name="information-circle-outline" size={21} color="#fff" />
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          </Animated.View>
         </TouchableOpacity>
+      </Modal>
+
+      {/* Full-screen Image Viewer with zoom */}
+      <Modal
+        visible={imageViewerVisible}
+        transparent
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => setImageViewerVisible(false)}
+      >
+        <View style={styles.imageViewerContainer}>
+          <View style={styles.imageViewerTopBar}>
+            <TouchableOpacity
+              onPress={() => setImageViewerVisible(false)}
+              style={styles.imageViewerBackBtn}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="arrow-back" size={24} color="#fff" />
+            </TouchableOpacity>
+            <Text style={styles.imageViewerName} numberOfLines={1}>{previewName}</Text>
+          </View>
+
+          {previewImage ? (
+            <GestureHandlerRootView style={{ flex: 1 }}>
+              <ImageZoom
+                uri={previewImage}
+                minScale={1}
+                maxScale={5}
+                doubleTapScale={3}
+                style={{ flex: 1 }}
+                resizeMode="contain"
+              />
+            </GestureHandlerRootView>
+          ) : (
+            <View style={styles.imageViewerNoPhoto}>
+              <View style={[styles.imageViewerFallbackCircle, { backgroundColor: previewAvatarColor }]}>
+                <Text style={styles.imageViewerFallbackLetter}>
+                  {(previewName || '?').charAt(0).toUpperCase()}
+                </Text>
+              </View>
+              <Text style={styles.imageViewerNoPhotoText}>No profile photo</Text>
+            </View>
+          )}
+        </View>
       </Modal>
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  profileOverlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    padding: 24,
+  },
+  profileCard: {
+    width: '74%',
+    borderRadius: 18,
+    overflow: 'hidden',
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3,
+    shadowRadius: 14,
+  },
+  profileImageWrap: {
+    width: '100%',
+    height: 280,
+  },
+  profileFallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  profileFallbackText: {
+    color: '#fff',
+    fontFamily: 'Poppins-SemiBold',
+    fontSize: 72,
+    textTransform: 'uppercase',
+  },
+  profileNameOverlay: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+  },
+  profileNameText: {
+    color: '#fff',
+    fontFamily: 'Poppins-SemiBold',
+    fontSize: 17,
+    textTransform: 'capitalize',
+  },
+  profileActions: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    flexDirection: 'column',
+    gap: 8,
+  },
+  profileActionBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  imageViewerTopBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingTop: Platform.OS === 'ios' ? 54 : 38,
+    paddingBottom: 12,
+    paddingHorizontal: 12,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    zIndex: 10,
+  },
+  imageViewerBackBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerName: {
+    flex: 1,
+    color: '#fff',
+    fontSize: 18,
+    fontFamily: 'Poppins-SemiBold',
+    marginLeft: 8,
+    textTransform: 'capitalize',
+  },
+  imageViewerNoPhoto: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerFallbackCircle: {
+    width: 140,
+    height: 140,
+    borderRadius: 70,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  imageViewerFallbackLetter: {
+    color: '#fff',
+    fontSize: 64,
+    fontFamily: 'Poppins-SemiBold',
+    textTransform: 'uppercase',
+  },
+  imageViewerNoPhotoText: {
+    color: 'rgba(255,255,255,0.6)',
+    fontSize: 15,
+    fontFamily: 'Poppins-Regular',
+    marginTop: 20,
+  },
+});
