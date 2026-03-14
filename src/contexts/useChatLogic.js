@@ -3680,9 +3680,45 @@ export default function useChatLogic({ navigation, route }) {
       return next;
     });
 
-    await sendMessageViaSocket(payload, tempId);
+    try {
+      const socket = socketRef.current || getSocket();
+      if (!socket || !isSocketConnected()) {
+        updateMessageStatus(tempId, 'failed');
+        await checkAndReconnectSocket();
+        return { success: false, tempId };
+      }
+
+      // Contact data is inline (no upload needed), so add a timeout fallback
+      // If server ack doesn't arrive within 4s, mark as sent anyway
+      let ackReceived = false;
+      const ackTimeout = setTimeout(() => {
+        if (!ackReceived) {
+          console.log('⏱️ [CONTACT:SEND] ack timeout, marking as sent');
+          updateMessageStatus(tempId, 'sent', { messageId });
+        }
+      }, 4000);
+
+      await sendMessageViaSocket(payload, tempId)
+        .then((res) => {
+          ackReceived = true;
+          clearTimeout(ackTimeout);
+          return res;
+        })
+        .catch((err) => {
+          ackReceived = true;
+          clearTimeout(ackTimeout);
+          // If socket emitted but ack format was unexpected, still mark as sent
+          // since contact data is inline and doesn't need upload
+          console.warn('⚠️ [CONTACT:SEND] ack issue, marking as sent:', err?.message);
+          updateMessageStatus(tempId, 'sent', { messageId });
+        });
+    } catch (error) {
+      console.error('❌ Send contact message failed:', error);
+      updateMessageStatus(tempId, 'failed');
+    }
+
     return { success: true, tempId };
-  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, getOrCreateDeviceId]);
+  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, getOrCreateDeviceId, updateMessageStatus, checkAndReconnectSocket]);
 
   /* ========== FIXED: Text input change handler with proper typing ========== */
   const handleTextChange = useCallback((value) => {

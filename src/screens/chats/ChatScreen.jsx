@@ -560,22 +560,38 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
   const accentColor = theme.colors.themeColor || '#1DA1F2';
   const borderColor = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
 
-  const saveContactToDevice = async () => {
-    try {
-      let perm = await Contacts.getPermissionsAsync();
-      if (perm.status !== 'granted') {
-        perm = await Contacts.requestPermissionsAsync();
-        if (perm.status !== 'granted') return;
-      }
-      await Contacts.addContactAsync({
-        firstName: name,
-        phoneNumbers: [{ label: 'mobile', number: fullPhone }],
-      });
-      Alert.alert('Saved', `${name} has been saved to your contacts.`);
-    } catch (error) {
-      console.error('save contact error', error);
-      Alert.alert('Error', 'Unable to save contact.');
-    }
+  const saveContactToDevice = () => {
+    Alert.alert(
+      'Save Contact',
+      `Do you want to save ${name} to your contacts?`,
+      [
+        {
+          text: 'Cancel',
+          style: 'cancel',
+        },
+        {
+          text: 'OK',
+          onPress: async () => {
+            try {
+              let perm = await Contacts.getPermissionsAsync();
+              if (perm.status !== 'granted') {
+                perm = await Contacts.requestPermissionsAsync();
+                if (perm.status !== 'granted') return;
+              }
+              await Contacts.addContactAsync({
+                firstName: name,
+                phoneNumbers: [{ label: 'mobile', number: fullPhone }],
+              });
+              Alert.alert('Saved', `${name} has been saved to your contacts.`);
+            } catch (error) {
+              console.error('save contact error', error);
+              Alert.alert('Error', 'Unable to save contact.');
+            }
+          },
+        },
+      ],
+      { cancelable: true }
+    );
   };
 
   return (
@@ -597,7 +613,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
             <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Poppins-Medium' }}>On BaatCheet</Text>
+            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Poppins-Medium' }}>On VibeConnect</Text>
           </View>
         )}
 
@@ -3409,24 +3425,40 @@ export default function ChatScreen({ navigation, route }) {
       });
     };
 
-    const handleSaveContact = async () => {
-      try {
-        let perm = await Contacts.getPermissionsAsync();
-        if (perm.status !== 'granted') {
-          perm = await Contacts.requestPermissionsAsync();
-          if (perm.status !== 'granted') return;
-        }
-        const contactData = {
-          firstName: contactName,
-          phoneNumbers: [{ label: 'mobile', number: countryCode ? `${countryCode}${mobileNumber}` : mobileNumber }],
-        };
-        await Contacts.addContactAsync(contactData);
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        Alert.alert('Saved', `${contactName} has been saved to your contacts.`);
-      } catch (error) {
-        console.error('save contact error', error);
-        Alert.alert('Error', 'Unable to save contact.');
-      }
+    const handleSaveContact = () => {
+      Alert.alert(
+        'Save Contact',
+        `Do you want to save ${contactName} to your contacts?`,
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+          },
+          {
+            text: 'OK',
+            onPress: async () => {
+              try {
+                let perm = await Contacts.getPermissionsAsync();
+                if (perm.status !== 'granted') {
+                  perm = await Contacts.requestPermissionsAsync();
+                  if (perm.status !== 'granted') return;
+                }
+                const contactData = {
+                  firstName: contactName,
+                  phoneNumbers: [{ label: 'mobile', number: countryCode ? `${countryCode}${mobileNumber}` : mobileNumber }],
+                };
+                await Contacts.addContactAsync(contactData);
+                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                Alert.alert('Saved', `${contactName} has been saved to your contacts.`);
+              } catch (error) {
+                console.error('save contact error', error);
+                Alert.alert('Error', 'Unable to save contact.');
+              }
+            },
+          },
+        ],
+        { cancelable: true }
+      );
     };
 
     return (
@@ -3451,7 +3483,7 @@ export default function ChatScreen({ navigation, route }) {
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
                 <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
-                  On BaatCheet
+                  On VibeConnect
                 </Text>
               </View>
             )}

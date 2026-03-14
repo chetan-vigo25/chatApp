@@ -7,7 +7,7 @@ const KEY_THUMBNAILS = `${KEY_PREFIX}:thumbnails_cache`;
 const KEY_DOWNLOAD_QUEUE = `${KEY_PREFIX}:download_queue`;
 const KEY_PENDING_UPLOADS = `${KEY_PREFIX}:pending_uploads`;
 
-const APP_MEDIA_ROOT = `${FileSystem.documentDirectory}baatCheet/media/`;
+const APP_MEDIA_ROOT = `${FileSystem.documentDirectory}VibeConnect/media/`;
 const APP_MEDIA_IMAGES = `${APP_MEDIA_ROOT}images/`;
 const APP_MEDIA_VIDEOS = `${APP_MEDIA_ROOT}videos/`;
 const APP_MEDIA_DOCUMENTS = `${APP_MEDIA_ROOT}documents/`;

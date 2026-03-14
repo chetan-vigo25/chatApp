@@ -1,10 +1,10 @@
 {
   "expo": {
-    "name": "baatCheet",
+    "name": "VibeConnect",
     "slug": "baatCheet",
     "version": "1.0.0",
     "orientation": "portrait",
-    "scheme": "baatcheet",
+    "scheme": "VibeConnect",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "icon": "./assets/icon.png",
@@ -39,13 +39,15 @@
         "ACCESS_FINE_LOCATION",
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
-        "CAMERA",
-        "RECORD_AUDIO",
-        "ACCESS_FINE_LOCATION",
-        "android.permission.CAMERA",
-        "android.permission.RECORD_AUDIO",
         "READ_EXTERNAL_STORAGE",
-        "WRITE_EXTERNAL_STORAGE"
+        "WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.ACCESS_MEDIA_LOCATION",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
       ],
       "notification": {
         "icon": "./assets/ic_notification.png",
@@ -66,7 +68,9 @@
       [
         "expo-notifications",
         {
-          "sounds": ["./assets/sounds/notification_sound.wav"]
+          "sounds": [
+            "./assets/sounds/notification_sound.wav"
+          ]
         }
       ],
       "@react-native-firebase/app",
@@ -99,6 +103,7 @@
     },
     "updates": {
       "url": "https://u.expo.dev/499f98f8-2c96-4c91-bd66-f52356fa0ad3"
-    }
+    },
+    "owner": "vigorous"
   }
 }

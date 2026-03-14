@@ -115,7 +115,7 @@ export default function Otp({ navigation, route }) {
           try {
             const loginData = await dispatch(otpVerify(payload)).unwrap();
         
-            console.log("OTP Verified with login data:", loginData);
+            // console.log("OTP Verified with login data:", loginData);
             await performSessionReset({
               reason: 'user_switch_login',
               resetNavigation: false,
