@@ -59,7 +59,7 @@ export default function ChatHeaderPresence({
           <Image source={{ uri: user.profileImage }} style={{ width: '100%', height: '100%', borderRadius: 24 }} />
         ) : (
           <View style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: getUserColor?.(user?._id || '') || '#888' }}>
-            <Text style={{ color: theme.colors.textWhite, fontFamily: 'Poppins-Medium', fontSize: 18 }}>
+            <Text style={{ color: theme.colors.textWhite, fontFamily: 'Roboto-Medium', fontSize: 18 }}>
               {user?.fullName?.charAt(0).toUpperCase() || '?'}
             </Text>
           </View>
@@ -67,13 +67,13 @@ export default function ChatHeaderPresence({
       </TouchableOpacity>
 
       <View style={{ flex: 1 }}>
-        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium', fontSize: 16 }}>
+        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16 }}>
           {user?.fullName || 'Unknown User'}
         </Text>
         <Text
           style={{
             color: (isPeerTyping || isRealtimeTyping) ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
-            fontFamily: 'Poppins-Medium',
+            fontFamily: 'Roboto-Medium',
             fontSize: 12,
             fontStyle: (isPeerTyping || isRealtimeTyping) ? 'italic' : 'normal',
           }}

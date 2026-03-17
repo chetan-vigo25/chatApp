@@ -229,7 +229,7 @@ export default function Profile({ navigation }) {
             <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={{ width: 40, height: 40, justifyContent: 'center', alignItems: 'center', borderRadius: 20 }}>
               <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
             </TouchableOpacity>
-            <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 18, color: theme.colors.primaryTextColor, marginLeft: 12 }}>Profile</Text>
+            <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 18, color: theme.colors.primaryTextColor, marginLeft: 12 }}>Profile</Text>
           </View>
           <ScrollView style={{ flex: 1 }} showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 40 }}>
             <View>
@@ -280,19 +280,19 @@ export default function Profile({ navigation }) {
                 </View>
 
                 {profileData?.fullName && (
-                  <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 22, color: theme.colors.primaryTextColor, textTransform: 'capitalize' }}>
+                  <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 22, color: theme.colors.primaryTextColor, textTransform: 'capitalize' }}>
                     {profileData.fullName}
                   </Text>
                 )}
                 {profileData?.about ? (
-                  <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor, marginTop: 2, paddingHorizontal: 40, textAlign: 'center' }} numberOfLines={2}>
+                  <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor, marginTop: 2, paddingHorizontal: 40, textAlign: 'center' }} numberOfLines={2}>
                     {profileData.about}
                   </Text>
                 ) : null}
 
                 {profileData?.profileImage && (
                   <TouchableOpacity onPress={removeDp} disabled={loader} activeOpacity={0.6} style={{ marginTop: 14 }}>
-                    <Text style={{ color: '#E53935', fontFamily: 'Poppins-Medium', fontSize: 13 }}>
+                    <Text style={{ color: '#E53935', fontFamily: 'Roboto-Medium', fontSize: 13 }}>
                       Remove Photo
                     </Text>
                   </TouchableOpacity>
@@ -313,8 +313,8 @@ export default function Profile({ navigation }) {
                 >
                   <Ionicons name="person-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
                   <View style={{ flex: 1, marginLeft: 16 }}>
-                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Name</Text>
-                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, textTransform: 'capitalize', lineHeight: 22 }}>{profileData?.fullName}</Text>
+                    <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Name</Text>
+                    <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.primaryTextColor, textTransform: 'capitalize', lineHeight: 22 }}>{profileData?.fullName}</Text>
                   </View>
                   <Ionicons name="pencil-outline" size={18} color={theme.colors.placeHolderTextColor} />
                 </TouchableOpacity>
@@ -329,8 +329,8 @@ export default function Profile({ navigation }) {
                 >
                   <Ionicons name="information-circle-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
                   <View style={{ flex: 1, marginLeft: 16 }}>
-                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>About</Text>
-                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }} numberOfLines={1}>{profileData?.about || 'Add about'}</Text>
+                    <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>About</Text>
+                    <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }} numberOfLines={1}>{profileData?.about || 'Add about'}</Text>
                   </View>
                   <Ionicons name="pencil-outline" size={18} color={theme.colors.placeHolderTextColor} />
                 </TouchableOpacity>
@@ -341,8 +341,8 @@ export default function Profile({ navigation }) {
                 <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 14 }}>
                   <Ionicons name="call-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
                   <View style={{ flex: 1, marginLeft: 16 }}>
-                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Phone</Text>
-                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }}>
+                    <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Phone</Text>
+                    <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }}>
                       {profileData?.mobile?.code} {profileData?.mobile?.number}
                     </Text>
                   </View>
@@ -354,8 +354,8 @@ export default function Profile({ navigation }) {
                 <View style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 14 }}>
                   <Ionicons name="mail-outline" size={22} color={theme.colors.placeHolderTextColor} style={{ width: 28 }} />
                   <View style={{ flex: 1, marginLeft: 16 }}>
-                    <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Email</Text>
-                    <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }}>{profileData?.email || "N/A"}</Text>
+                    <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 11, color: theme.colors.placeHolderTextColor, lineHeight: 14 }}>Email</Text>
+                    <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.primaryTextColor, lineHeight: 22 }}>{profileData?.email || "N/A"}</Text>
                   </View>
                 </View>
 

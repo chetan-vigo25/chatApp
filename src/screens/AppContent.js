@@ -14,15 +14,12 @@ export default function AppContent() {
   const { isConnected } = useNetwork();
 
   const [fontsLoaded] = useFonts({
+    'Roboto-Black': require('../../assets/fonts/Roboto-Black.ttf'),
     'Roboto-Bold': require('../../assets/fonts/Roboto-Bold.ttf'),
     'Roboto-Light': require('../../assets/fonts/Roboto-Light.ttf'),
     'Roboto-Medium': require('../../assets/fonts/Roboto-Medium.ttf'),
     'Roboto-Regular': require('../../assets/fonts/Roboto-Regular.ttf'),
     'Roboto-SemiBold': require('../../assets/fonts/Roboto-SemiBold.ttf'),
-    'Poppins-Regular': require('../../assets/fonts/Poppins-Regular.ttf'),
-    'Poppins-Bold': require('../../assets/fonts/Poppins-Bold.ttf'),
-    'Poppins-Medium': require('../../assets/fonts/Poppins-Medium.ttf'),
-    'Poppins-SemiBold': require('../../assets/fonts/Poppins-SemiBold.ttf'),
   });
 
   if (!fontsLoaded) return null;

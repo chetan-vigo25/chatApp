@@ -39,6 +39,8 @@ const MUTE_OPTIONS = [
   { key: 'always', label: 'Always', icon: 'bell-off-outline', duration: 0 },
 ];
 
+const name = APP_TAG_NAME
+
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#D63031', '#A29BFE'];
 
 const getAvatarColor = (name) => {
@@ -178,16 +180,22 @@ export default function ChatList({ navigation }) {
   const getRelativeTime = (value) => {
     const ts = value ? new Date(value).getTime() : 0;
     if (!ts) return '';
-    const diffMs = Date.now() - ts;
-    if (diffMs < 60000) return 'Just now';
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 60) return `${diffMin}m`;
-    const diffHr = Math.floor(diffMin / 60);
-    if (diffHr < 24) return `${diffHr}h`;
-    const diffDay = Math.floor(diffHr / 24);
-    if (diffDay < 7) return new Date(ts).toLocaleDateString(undefined, { weekday: 'short' });
-    const date = new Date(ts);
-    return `${`${date.getDate()}`.padStart(2, '0')}/${`${date.getMonth() + 1}`.padStart(2, '0')}`;
+    const msgDate = new Date(ts);
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const yesterdayStart = todayStart - 86400000;
+    const weekAgoStart = todayStart - 6 * 86400000;
+    const formatTime = (d) => {
+      let h = d.getHours();
+      const m = String(d.getMinutes()).padStart(2, '0');
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+      return `${h}:${m} ${ampm}`;
+    };
+    if (ts >= todayStart) return formatTime(msgDate);
+    if (ts >= yesterdayStart) return 'Yesterday';
+    if (ts >= weekAgoStart) return msgDate.toLocaleDateString(undefined, { weekday: 'long' });
+    return `${String(msgDate.getDate()).padStart(2, '0')}/${String(msgDate.getMonth() + 1).padStart(2, '0')}/${String(msgDate.getFullYear()).slice(-2)}`;
   };
 
   const getLastMessageText = (item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || 'No messages yet';
@@ -559,7 +567,10 @@ export default function ChatList({ navigation }) {
       {/* ─── HEADER ─── */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>{APP_TAG_NAME}</Text>
+          <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>
+            <Text style={{ color: theme.colors.themeColor, fontSize: 22, fontFamily: 'Roboto-SemiBold' }}>{name.slice(0,4)}</Text>
+            <Text style={{ color: theme.colors.themeColor, fontSize: 22, fontFamily: 'Roboto-Regular' }}>{name.slice(4)}</Text>
+          </Text>
           {Number(realtimeState?.totalUnread || 0) > 0 && (
             <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Text style={styles.unreadBadgeText}>
@@ -950,7 +961,7 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     fontSize: 24,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     textTransform: 'capitalize',
     letterSpacing: 0.2,
   },
@@ -964,7 +975,7 @@ const styles = StyleSheet.create({
   },
   unreadBadgeText: {
     fontSize: 10,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     color: '#fff',
   },
   headerRight: {
@@ -988,7 +999,7 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
   },
   menuItemText: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 14,
   },
 
@@ -1013,7 +1024,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   loadingText: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
   },
 
@@ -1030,7 +1041,7 @@ const styles = StyleSheet.create({
   searchInput: {
     flex: 1,
     fontSize: 14,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     paddingVertical: 0,
     height: '100%',
   },
@@ -1058,12 +1069,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   archiveLabel: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
     flex: 1,
   },
   archiveCount: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginRight: 2,
   },
@@ -1084,12 +1095,12 @@ const styles = StyleSheet.create({
     marginBottom: 18,
   },
   emptyTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     marginBottom: 6,
   },
   emptySubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     textAlign: 'center',
     lineHeight: 19,
@@ -1154,11 +1165,11 @@ const styles = StyleSheet.create({
   },
   sheetUserInitial: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 16,
   },
   sheetUserName: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 16,
     flex: 1,
     textTransform: 'capitalize',
@@ -1181,7 +1192,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   sheetOptionLabel: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14.5,
     flex: 1,
   },
@@ -1209,12 +1220,12 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   muteTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     marginBottom: 4,
   },
   muteSubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     marginBottom: 18,
   },
@@ -1232,7 +1243,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   muteOptionText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
   },
   muteCancelBtn: {
@@ -1240,7 +1251,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   muteCancelText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
   },
 
@@ -1268,12 +1279,12 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   deleteTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     marginBottom: 6,
   },
   deleteSubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     textAlign: 'center',
     lineHeight: 19,
@@ -1286,7 +1297,7 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
   },
   deleteCheckLabel: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13.5,
   },
   deleteActions: {
@@ -1304,7 +1315,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   deleteCancelText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
   },
   deleteConfirmBtn: {
@@ -1317,7 +1328,7 @@ const styles = StyleSheet.create({
   },
   deleteConfirmText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 14,
   },
 
@@ -1350,7 +1361,7 @@ const styles = StyleSheet.create({
   },
   profileFallbackText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 72,
     textTransform: 'uppercase',
   },
@@ -1365,7 +1376,7 @@ const styles = StyleSheet.create({
   },
   profileNameText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     textTransform: 'capitalize',
   },
@@ -1410,7 +1421,7 @@ const styles = StyleSheet.create({
     flex: 1,
     color: '#fff',
     fontSize: 18,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     marginLeft: 8,
     textTransform: 'capitalize',
   },
@@ -1429,13 +1440,13 @@ const styles = StyleSheet.create({
   imageViewerFallbackLetter: {
     color: '#fff',
     fontSize: 64,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     textTransform: 'uppercase',
   },
   imageViewerNoPhotoText: {
     color: 'rgba(255,255,255,0.6)',
     fontSize: 15,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     marginTop: 20,
   },
 });

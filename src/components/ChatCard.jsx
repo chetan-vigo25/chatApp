@@ -168,7 +168,7 @@ const ChatCard = ({
                     {
                       color: isTyping ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
                       fontStyle: isTyping ? 'italic' : 'normal',
-                      fontFamily: hasUnread ? 'Poppins-Medium' : 'Poppins-Regular',
+                      fontFamily: hasUnread ? 'Roboto-Medium' : 'Roboto-Regular',
                     },
                   ]}
                 >
@@ -227,8 +227,8 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   avatarInitial: {
-    fontSize: 20,
-    fontFamily: 'Poppins-SemiBold',
+    fontSize: 24,
+    fontFamily: 'Roboto-SemiBold',
     color: '#fff',
   },
   onlineDot: {
@@ -255,16 +255,16 @@ const styles = StyleSheet.create({
     marginBottom: 3,
   },
   nameText: {
-    fontSize: 15.5,
-    fontFamily: 'Poppins-SemiBold',
+    fontSize: 16,
+    fontFamily: 'Roboto-SemiBold',
     textTransform: 'capitalize',
     flex: 1,
     marginRight: 10,
     letterSpacing: 0.1,
   },
   timeText: {
-    fontSize: 11,
-    fontFamily: 'Poppins-Regular',
+    fontSize: 14,
+    fontFamily: 'Roboto-Medium',
   },
   bottomRow: {
     flexDirection: 'row',
@@ -278,9 +278,10 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   previewText: {
-    fontSize: 13,
+    fontSize: 14,
     flexShrink: 1,
     lineHeight: 18,
+    fontFamily: 'Roboto-Regular'
   },
   metaWrap: {
     flexDirection: 'row',
@@ -296,7 +297,7 @@ const styles = StyleSheet.create({
   },
   unreadText: {
     fontSize: 10,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     color: '#fff',
   },
 
@@ -338,7 +339,7 @@ const styles = StyleSheet.create({
   swipeBtnText: {
     color: '#fff',
     fontSize: 10,
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     marginTop: 2,
   },
 });

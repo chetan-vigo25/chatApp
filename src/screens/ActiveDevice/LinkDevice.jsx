@@ -136,7 +136,7 @@ export default function LinkDevice({ navigation }) {
                <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
             </TouchableOpacity>
             <View style={{ width:'68%' }} >
-                <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-SemiBold', fontSize:16, textTransform:'capitalize' }} >Linked Devices</Text>
+                <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-SemiBold', fontSize:16, textTransform:'capitalize' }} >Linked Devices</Text>
             </View>
           </View>
           <View style={{ flex: 1 }}>
@@ -146,11 +146,11 @@ export default function LinkDevice({ navigation }) {
                </View>
                {/* <TouchableOpacity activeOpacity={0.9} style={{ width:'100%', height:45, flexDirection:'row', gap:5, backgroundColor:theme.colors.themeColor, alignItems:'center', justifyContent:'center', borderRadius:40, marginVertical:10 }} >
                  <Entypo name="plus" size={20} color={theme.colors.textWhite} />
-                 <Text style={{ color:theme.colors.textWhite, fontFamily:'Poppins-Medium', fontSize:16, }} >Link a device</Text>
+                 <Text style={{ color:theme.colors.textWhite, fontFamily:'Roboto-Medium', fontSize:16, }} >Link a device</Text>
                </TouchableOpacity> */}
                  <View>
-                    <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Poppins-Medium', fontSize:14, }} >Linked Devices</Text>
-                    <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Poppins-Regular', fontSize:12, }} >Tap a device to logout</Text>
+                    <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Roboto-Medium', fontSize:14, }} >Linked Devices</Text>
+                    <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Roboto-Regular', fontSize:12, }} >Tap a device to logout</Text>
                  </View>
                  <View style={{marginTop:15,}} >
                    {activeLinkedDevices && activeLinkedDevices.length > 0 ? (
@@ -163,12 +163,12 @@ export default function LinkDevice({ navigation }) {
                                  ):(<></>)
                                }
                                <View>
-                                   <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:14 }}>
+                                   <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:14 }}>
                                        { item.deviceInfo?.deviceName || 'N/A' } {''} 
                                        { item.deviceInfo?.deviceType || 'N/A' } {''}
                                        { item.deviceInfo?.os || 'N/A' }
                                    </Text>
-                                   <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Poppins-Medium', fontSize:12 }}>
+                                   <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Roboto-Medium', fontSize:12 }}>
                                        Last Activity: {moment(item.lastActivity).format('hh:mm A') || 'N/A'}
                                    </Text>
                                </View>
@@ -188,7 +188,7 @@ export default function LinkDevice({ navigation }) {
                     }}>
                       <View style={{ flex:1, justifyContent:'center',  backgroundColor:'#00000060', padding:20 }} >
                         <View style={{ width:'100%', backgroundColor:theme.colors.cardBackground, padding:20, borderRadius:10, shadowOffset: { width: 0, height: 5, }, shadowOpacity: 0.25, shadowRadius: 4, elevation: 2, }} >
-                          <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-SemiBold', fontSize:16,}} >You want to logout from this device</Text>
+                          <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-SemiBold', fontSize:16,}} >You want to logout from this device</Text>
                           <View style={{ marginVertical:15 }} >
                             {
                               selectedDevice && (
@@ -200,12 +200,12 @@ export default function LinkDevice({ navigation }) {
                                      ):(<></>)
                                    }
                                    <View>
-                                       <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:14 }}>
+                                       <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:14 }}>
                                            { selectedDevice.deviceInfo?.deviceName || 'N/A' }
                                            { selectedDevice.deviceInfo?.deviceType || 'N/A' }
                                            { selectedDevice.deviceInfo?.os || 'N/A' }
                                        </Text>
-                                       <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Poppins-Medium', fontSize:12 }}>
+                                       <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Roboto-Medium', fontSize:12 }}>
                                            Last Activity: {moment(selectedDevice.lastActivity).format('hh:mm A') || 'N/A'}
                                        </Text>
                                    </View>
@@ -215,10 +215,10 @@ export default function LinkDevice({ navigation }) {
                           </View>
                           <View style={{ width:'40%', flexDirection:'row', gap:20, alignItems:'center', justifyContent:'center', alignSelf:'flex-end', marginTop:10 }} >
                             <TouchableOpacity onPress={() => handleCloseModal()} style={{ alignItems:'center', justifyContent:'center', }} >
-                              <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:14, }} >Cencel</Text>
+                              <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:14, }} >Cencel</Text>
                             </TouchableOpacity>
                             <TouchableOpacity onPress={() => handleLogoutDevice(selectedDevice)} style={{ alignItems:'center', justifyContent:'center', }} >
-                              <Text style={{ color:'#FF0000', fontFamily:'Poppins-Medium', fontSize:14, }} >Logout</Text>
+                              <Text style={{ color:'#FF0000', fontFamily:'Roboto-Medium', fontSize:14, }} >Logout</Text>
                             </TouchableOpacity>
                           </View>
                         </View>

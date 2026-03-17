@@ -184,9 +184,9 @@ export default function RootNavigator() {
           screenOptions={{ 
             headerShown: false,
             cardStyle: { backgroundColor: theme.colors.background },
-            gestureEnabled: true,
+            gestureEnabled: false,
             gestureResponseDistance: 50,
-            ...TransitionPresets.SlideFromRightIOS,
+            // ...TransitionPresets.SlideFromRightIOS,
             transitionSpec: {
               open: {
                 animation: 'spring',

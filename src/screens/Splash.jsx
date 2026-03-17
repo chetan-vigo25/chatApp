@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Text, Animated, Dimensions, AppState } from 'react-native';
+import { StyleSheet, View, Text, Animated, Dimensions, AppState, Image } from 'react-native';
 import LottieView from 'lottie-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
@@ -103,7 +103,7 @@ export default function Splash({ navigation }) {
                     });
                 }
                 setIsChecking(false);
-            }, 3500); // Wait for animation to complete
+            }, 500); // Wait for animation to complete
  
         } catch (error) {
             console.error('❌ Auth check failed:', error);
@@ -115,23 +115,26 @@ export default function Splash({ navigation }) {
                     routes: [{ name: 'UserAgree' }],
                 });
                 setIsChecking(false);
-            }, 3500);
+            }, 500);
         }
     };
  
     return (
         <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: theme.colors.background}}>
             <Animated.View style={{ opacity: fadeAnim, alignItems: 'center' }}>
-                <LottieView
+                {/* <LottieView
                     style={{ width: 220, height: 220 }}
                     source={require('../../assets/lottie/Chat.json')}
                     autoPlay
                     loop
-                />
+                /> */}
+                <View style={{ width: 220, height: 220 }}>
+                    <Image source={require('../../assets/icon0.png')} resizeMode='contain' style={{ width:'100%', height:"100%" }} />
+                </View>
             </Animated.View>
            
             <View style={styles.versionContainer}>
-                <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 12, color: theme.colors.primaryTextColor, textAlign: 'center'}}> © 2026 {APP_TAG_NAME}</Text>
+                <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 12, color: theme.colors.primaryTextColor, textAlign: 'center'}}> © 2026 {APP_TAG_NAME}</Text>
             </View>
         </SafeAreaView>
     );

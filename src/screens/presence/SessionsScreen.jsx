@@ -13,7 +13,7 @@ export default function SessionsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background, padding: 16 }}>
-      <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Bold', fontSize: 20 }}>Active Sessions</Text>
+      <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Bold', fontSize: 20 }}>Active Sessions</Text>
 
       <TouchableOpacity onPress={terminateOtherSessions} style={{ marginTop: 12, alignSelf: 'flex-start', backgroundColor: '#FF3B30', borderRadius: 8, paddingVertical: 8, paddingHorizontal: 12 }}>
         <Text style={{ color: '#fff' }}>Terminate Other Sessions</Text>

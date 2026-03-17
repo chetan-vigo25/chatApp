@@ -313,7 +313,7 @@ export default function EditProfile({ navigation, route }) {
             <View style={{ flex:1, backgroundColor: theme.colors.background }} >
                 <View style={{ width:'100%', flexDirection:'row', borderBottomWidth:.5, borderBottomColor:theme.colors.borderColor, padding:10,}} >
                     <View style={{ flex:1, alignItems:'center', justifyContent:'center' }} >
-                        <Text style={{ fontFamily:'Poppins-SemiBold', fontSize:16, color:theme.colors.primaryTextColor }} >Edit Profile</Text>
+                        <Text style={{ fontFamily:'Roboto-SemiBold', fontSize:16, color:theme.colors.primaryTextColor }} >Edit Profile</Text>
                     </View>
                     <View style={{ width:40 }} />
                 </View>
@@ -353,9 +353,9 @@ export default function EditProfile({ navigation, route }) {
                             disabled={imageUploadLoader}
                             style={{ marginBottom: 20 }}
                           >
-                            <Text style={{ color: theme.colors.themeColor, fontFamily: 'Poppins-Medium', fontSize: 14 }}>
+                            {/* <Text style={{ color: theme.colors.themeColor, fontFamily: 'Roboto-Medium', fontSize: 14 }}>
                               {imageUploadLoader ? 'Uploading...' : 'Upload Image'}
-                            </Text>
+                            </Text> */}
                           </TouchableOpacity>
                         )}
                         
@@ -365,14 +365,14 @@ export default function EditProfile({ navigation, route }) {
                                 <TextInput 
                                   placeholder="Full Name" 
                                   placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                  style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:16, }} 
+                                  style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
                                   value={form.fullName}
                                   onChangeText={(value) => handleChange('fullName', value)}
                                   onFocus={() => setFocusedInput('fullName')}
                                   onBlur={() => setFocusedInput(null)}
                                 />
                             </View>
-                            {formErrors.fullName && <Text style={{ fontSize: 12, fontFamily:"Poppins-Medium", color: 'red', marginTop: 5 }}>{formErrors.fullName}</Text>}
+                            {formErrors.fullName && <Text style={{ fontSize: 12, fontFamily:"Roboto-Medium", color: 'red', marginTop: 5 }}>{formErrors.fullName}</Text>}
                           </View>
                           
                           <View style={{ width:'100%', marginBottom:20 }} >
@@ -380,7 +380,7 @@ export default function EditProfile({ navigation, route }) {
                                <TextInput 
                                  placeholder="Email" 
                                  placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                 style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:16, }} 
+                                 style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
                                  value={form.email}
                                  keyboardType="email-address"
                                  autoCapitalize="none"
@@ -389,7 +389,7 @@ export default function EditProfile({ navigation, route }) {
                                  onBlur={() => setFocusedInput(null)}
                                />
                            </View>
-                           {formErrors.email && <Text style={{ fontSize: 12, fontFamily:"Poppins-Medium", color: 'red', marginTop: 5 }}>{formErrors.email}</Text>}
+                           {formErrors.email && <Text style={{ fontSize: 12, fontFamily:"Roboto-Medium", color: 'red', marginTop: 5 }}>{formErrors.email}</Text>}
                           </View>
                           
                           <View style={{ width:'100%', marginBottom:20 }} >
@@ -397,7 +397,7 @@ export default function EditProfile({ navigation, route }) {
                               <TextInput 
                                 placeholder="About" 
                                 placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:16, }} 
+                                style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
                                 value={form.about}
                                 onChangeText={(value) => handleChange('about', value)}
                                 onFocus={() => setFocusedInput('about')}
@@ -405,18 +405,18 @@ export default function EditProfile({ navigation, route }) {
                                 multiline={false}
                               />
                           </View>
-                          {formErrors.about && <Text style={{ fontSize: 12, fontFamily:"Poppins-Medium", color: 'red', marginTop: 5 }}>{formErrors.about}</Text>}
+                          {formErrors.about && <Text style={{ fontSize: 12, fontFamily:"Roboto-Medium", color: 'red', marginTop: 5 }}>{formErrors.about}</Text>}
                           </View>
                           
                           {/* <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, marginBottom:10, borderWidth:1, borderColor:theme.colors.borderColor }} >
                               <TextInput 
                                 editable={false}
                                 placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:16, }} 
+                                style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
                                 value={fullNumber}
                               />
                           </View>
-                          <Text style={{ fontFamily:'Poppins-Medium', fontSize:12, color:theme.colors.placeHolderTextColor, textAlign:'center', marginTop:5 }}>
+                          <Text style={{ fontFamily:'Roboto-Medium', fontSize:12, color:theme.colors.placeHolderTextColor, textAlign:'center', marginTop:5 }}>
                             Phone number cannot be changed
                           </Text> */}
                         </View>

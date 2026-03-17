@@ -20,7 +20,7 @@ export default function StatusScreen() {
 
   return (
     <ScrollView style={{ flex: 1, backgroundColor: theme.colors.background, padding: 16 }}>
-      <Text style={{ color: theme.colors.primaryTextColor, fontSize: 20, fontFamily: 'Poppins-Bold' }}>My Status</Text>
+      <Text style={{ color: theme.colors.primaryTextColor, fontSize: 20, fontFamily: 'Roboto-Bold' }}>My Status</Text>
 
       <View style={{ marginTop: 16, gap: 10 }}>
         {STATUS_OPTIONS.map((status) => (
@@ -40,7 +40,7 @@ export default function StatusScreen() {
         ))}
       </View>
 
-      <Text style={{ color: theme.colors.primaryTextColor, marginTop: 20, marginBottom: 8, fontFamily: 'Poppins-Medium' }}>Custom status</Text>
+      <Text style={{ color: theme.colors.primaryTextColor, marginTop: 20, marginBottom: 8, fontFamily: 'Roboto-Medium' }}>Custom status</Text>
       <TextInput
         value={customStatus}
         onChangeText={setCustom}
@@ -66,7 +66,7 @@ export default function StatusScreen() {
       </View>
 
       <View style={{ marginTop: 24, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium' }}>Invisible mode</Text>
+        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium' }}>Invisible mode</Text>
         <Switch value={presence.isInvisible} onValueChange={(value) => setInvisible(value)} />
       </View>
 

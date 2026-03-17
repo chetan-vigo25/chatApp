@@ -133,7 +133,7 @@ const CountryCodeContact = ({
         activeOpacity={0.7}
         style={{ width: 60, height: 52, justifyContent: 'center', alignItems: 'center' }}
       >
-        <Text style={{ fontFamily: 'Poppins-Regular', fontSize: 14, color: theme.colors.primaryTextColor }}>
+        <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 14, color: theme.colors.primaryTextColor }}>
           {selectedCountry?.code || ''}
         </Text>
       </TouchableOpacity>
@@ -283,7 +283,7 @@ const styles = StyleSheet.create({
   },
   modalTitle: {
     fontSize: 18,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
   },
   closeBtn: {
     width: 32,
@@ -303,7 +303,7 @@ const styles = StyleSheet.create({
   },
   searchInput: {
     flex: 1,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 14,
     paddingVertical: 0,
   },
@@ -332,12 +332,12 @@ const styles = StyleSheet.create({
   },
   countryName: {
     fontSize: 15,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     flex: 1,
   },
   countryCode: {
     fontSize: 14,
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     marginLeft: 8,
   },
   separator: {
@@ -352,7 +352,7 @@ const styles = StyleSheet.create({
   },
   emptyText: {
     fontSize: 15,
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
   },
 });
 

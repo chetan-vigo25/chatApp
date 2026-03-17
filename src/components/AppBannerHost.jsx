@@ -397,7 +397,7 @@ export default function WhatsAppBannerHost() {
           {banner.avatarUrl ? (
             <Image source={{ uri: banner.avatarUrl }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
           ) : (
-            <Text style={{ color: theme.colors.textWhite, fontFamily: 'Poppins-SemiBold', fontSize: 16 }}>
+            <Text style={{ color: theme.colors.textWhite, fontFamily: 'Roboto-SemiBold', fontSize: 16 }}>
               {(banner.senderName || 'U').charAt(0).toUpperCase()}
             </Text>
           )}
@@ -405,21 +405,21 @@ export default function WhatsAppBannerHost() {
 
         <View style={{ flex: 1, paddingRight: 10 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Text numberOfLines={1} style={{ flexShrink: 1, color: theme.colors.primaryTextColor, fontFamily: 'Poppins-SemiBold', fontSize: 14 }}>
+            <Text numberOfLines={1} style={{ flexShrink: 1, color: theme.colors.primaryTextColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
               {banner.senderName}
             </Text>
             {banner.isGroup ? (
               <View style={{ marginLeft: 6, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 8, backgroundColor: theme.colors.menuBackground }}>
-                <Text style={{ fontSize: 10, color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Medium' }}>Group</Text>
+                <Text style={{ fontSize: 10, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>Group</Text>
               </View>
             ) : null}
           </View>
-          <Text numberOfLines={1} style={{ marginTop: 2, color: theme.colors.placeHolderTextColor, fontSize: 13, fontFamily: 'Poppins-Regular' }}>
+          <Text numberOfLines={1} style={{ marginTop: 2, color: theme.colors.placeHolderTextColor, fontSize: 13, fontFamily: 'Roboto-Regular' }}>
             {banner.body || 'New message'}
           </Text>
         </View>
 
-        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11, fontFamily: 'Poppins-Medium' }}>
+        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11, fontFamily: 'Roboto-Medium' }}>
           {timeLabel}
         </Text>
       </View>

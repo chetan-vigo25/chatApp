@@ -38,7 +38,7 @@ export default function UserAgree({ navigation }) {
           <Image resizeMode="cover" source={require('../../assets/images/sticker.png')} style={{ width: '100%', height: '100%', borderRadius: 150, overflow: 'hidden' }}/>
         </View>
         <View style={{ marginVertical: 24 }} >
-          <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 22, color: theme.colors.primaryTextColor }} >Welcome to {APP_TAG_NAME}</Text>
+          <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 22, color: theme.colors.primaryTextColor }} >Welcome to {APP_TAG_NAME}</Text>
         </View>
         <View style={{ marginBottom: 40, alignItems:'center',}} >
           <View flexDirection="row" style={{ alignItems:'center',}} >
@@ -53,7 +53,7 @@ export default function UserAgree({ navigation }) {
           </View>
         </View>
         <TouchableOpacity onPress={() => navigation.navigate('Login')} style={{ width:'80%', height:50, backgroundColor: theme.colors.themeColor, borderRadius:8, alignItems:'center', justifyContent:'center', }} >
-          <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.textWhite, }} >AGREE AND CONTINUE</Text>
+          <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.textWhite, }} >AGREE AND CONTINUE</Text>
         </TouchableOpacity>
         {/* <Pressable
           onPress={toggleTheme}

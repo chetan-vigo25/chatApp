@@ -47,6 +47,7 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
 import { mediaDownloadSigned } from '../../utils/mediaService';
+import ReportBottomSheet from '../../components/ReportBottomSheet';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -81,7 +82,7 @@ const ChatWallpaperLayer = React.memo(function ChatWallpaperLayer({ isDarkMode }
         style={wpStyles.image}
       />
       <View style={[wpStyles.overlay, {
-        backgroundColor: isDarkMode ? 'rgba(0,0,0,0.45)' : 'rgba(255,255,255,0.15)',
+        backgroundColor: isDarkMode ? 'rgba(0,0,0,0.45)' : 'rgba(192, 192, 192, 0.15)',
       }]} />
     </View>
   );
@@ -266,7 +267,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                   flex: 1,
                   fontSize: 15,
                   color: inputTextColor,
-                  fontFamily: 'Poppins-Regular',
+                  fontFamily: 'Roboto-Regular',
                   minHeight: 32,
                   maxHeight: 96,
                   paddingTop: Platform.OS === 'ios' ? 5 : 2,
@@ -517,14 +518,14 @@ const AudioSeekBar = React.memo(function AudioSeekBar({
 
       {/* Time labels */}
       <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Poppins-Regular' }}>
+        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Roboto-Regular' }}>
           {isDownloading
             ? `${Math.round(progress * 100)}%`
             : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
               ? 'Failed'
               : shownPosLabel}
         </Text>
-        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Poppins-Regular' }}>
+        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Roboto-Regular' }}>
           {isDownloading ? 'downloading...' : durLabel}
         </Text>
       </View>
@@ -609,11 +610,11 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
             <Ionicons name="person" size={40} color={accentColor} />
           </View>
         )}
-        <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Poppins-SemiBold', marginTop: 12 }}>{name}</Text>
+        <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Roboto-SemiBold', marginTop: 12 }}>{name}</Text>
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
             <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Poppins-Medium' }}>On VibeConnect</Text>
+            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On VibeConnect</Text>
           </View>
         )}
 
@@ -626,7 +627,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
             <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#22C55E20', alignItems: 'center', justifyContent: 'center' }}>
               <Ionicons name="call" size={20} color="#22C55E" />
             </View>
-            <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Call</Text>
+            <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Roboto-Medium', marginTop: 4 }}>Call</Text>
           </Pressable>
           {isRegistered && userId ? (
             <Pressable
@@ -636,7 +637,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
               <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name="chatbubble" size={20} color={accentColor} />
               </View>
-              <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Message</Text>
+              <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Roboto-Medium', marginTop: 4 }}>Message</Text>
             </Pressable>
           ) : (
             <Pressable
@@ -646,7 +647,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
               <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name="chatbubble" size={20} color={accentColor} />
               </View>
-              <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>SMS</Text>
+              <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Roboto-Medium', marginTop: 4 }}>SMS</Text>
             </Pressable>
           )}
           <Pressable
@@ -656,7 +657,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
             <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#8B5CF620', alignItems: 'center', justifyContent: 'center' }}>
               <Ionicons name="person-add" size={20} color="#8B5CF6" />
             </View>
-            <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Poppins-Medium', marginTop: 4 }}>Save</Text>
+            <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Roboto-Medium', marginTop: 4 }}>Save</Text>
           </Pressable>
         </View>
       </View>
@@ -672,8 +673,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
               <Ionicons name="call-outline" size={18} color={accentColor} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={{ fontSize: 10, color: subColor, fontFamily: 'Poppins-Regular', textTransform: 'uppercase', letterSpacing: 0.5 }}>Mobile</Text>
-              <Text style={{ fontSize: 14, color: textColor, fontFamily: 'Poppins-Medium', marginTop: 1 }} selectable>{displayPhone}</Text>
+              <Text style={{ fontSize: 10, color: subColor, fontFamily: 'Roboto-Regular', textTransform: 'uppercase', letterSpacing: 0.5 }}>Mobile</Text>
+              <Text style={{ fontSize: 14, color: textColor, fontFamily: 'Roboto-Medium', marginTop: 1 }} selectable>{displayPhone}</Text>
             </View>
             <Ionicons name="call" size={20} color={accentColor} style={{ marginLeft: 8 }} />
           </Pressable>
@@ -684,6 +685,42 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
 });
 
 export default function ChatScreen({ navigation, route }) {
+  // Reporting state
+  const [reportModalVisible, setReportModalVisible] = useState(false);
+  const [reportPayload, setReportPayload] = useState({});
+  const [reportAnalytics, setReportAnalytics] = useState({
+    report_opened: () => {/* analytics event */},
+    report_submitted: () => {/* analytics event */},
+    report_failed: () => {/* analytics event */},
+  });
+
+  // Open report modal for message
+  const handleReportMessage = useCallback((msg) => {
+    setReportPayload({
+      reportType: 'message',
+      chatId: chatData.chatId || chatData?._id || route?.params?.chatId,
+      messageId: msg.id || msg.serverMessageId || msg.tempId,
+      reportedUserId: msg.senderId,
+    });
+    setReportModalVisible(true);
+  }, [chatData, route]);
+
+  // Open report modal for chat
+  const handleReportChat = useCallback(() => {
+    setReportPayload({
+      reportType: 'chat',
+      chatId: chatData.chatId || chatData?._id || route?.params?.chatId,
+      reportedUserId: chatData.peerUser?._id || chatData.peerUser?.userId,
+    });
+    setReportModalVisible(true);
+  }, [chatData, route]);
+
+  // Add report chat option to menu
+  const handleMenuReportChat = () => {
+    setShowMenu(false);
+    handleReportChat();
+  };
+
   const { theme, chatColor, isDarkMode } = useTheme();
   const { isConnected, networkType } = useNetwork();
   const { width: windowWidth } = useWindowDimensions();
@@ -2558,7 +2595,7 @@ export default function ChatScreen({ navigation, route }) {
         <Text style={{
           fontSize: 11.5,
           color: isDarkMode ? 'rgba(210,220,230,0.85)' : '#5f6769',
-          fontFamily: 'Poppins-Medium',
+          fontFamily: 'Roboto-Medium',
           letterSpacing: 0.1,
         }}>
           TODAY
@@ -2572,7 +2609,7 @@ export default function ChatScreen({ navigation, route }) {
         alignItems: 'center',
         maxWidth: '85%',
       }}>
-        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11.5, fontFamily: 'Poppins-Regular', textAlign: 'center' }}>
+        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11.5, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
           Messages and calls are end-to-end encrypted. Only people in this chat can read, listen to, or share them.
         </Text>
       </View>
@@ -2604,7 +2641,7 @@ export default function ChatScreen({ navigation, route }) {
           <Text style={{
             fontSize: 11.5,
             color: isDarkMode ? 'rgba(210,220,230,0.85)' : '#5f6769',
-            fontFamily: 'Poppins-Medium',
+            fontFamily: 'Roboto-Medium',
             letterSpacing: 0.1,
           }}>
             {displayDate}
@@ -2813,7 +2850,7 @@ export default function ChatScreen({ navigation, route }) {
                   style={{
                     color: linkColor,
                     textDecorationLine: 'underline',
-                    fontFamily: 'Poppins-Medium',
+                    fontFamily: 'Roboto-Medium',
                   }}
                 >
                   {token.text}
@@ -2836,14 +2873,14 @@ export default function ChatScreen({ navigation, route }) {
             }
             if (token.type === 'bold') {
               return (
-                <Text key={key} style={{ fontFamily: 'Poppins-SemiBold', color: baseColor }}>
+                <Text key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
                   {token.text}
                 </Text>
               );
             }
             if (token.type === 'italic') {
               return (
-                <Text key={key} style={{ fontFamily: 'Poppins-Regular', fontStyle: 'italic', color: baseColor }}>
+                <Text key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
                   {token.text}
                 </Text>
               );
@@ -2876,7 +2913,7 @@ export default function ChatScreen({ navigation, route }) {
             zIndex: -1,
             fontSize: 14,
             color: baseColor,
-            fontFamily: 'Poppins-Regular',
+            fontFamily: 'Roboto-Regular',
             lineHeight: 18,
           }}
         >
@@ -2889,7 +2926,7 @@ export default function ChatScreen({ navigation, route }) {
           style={{
             fontSize: 14,
             color: baseColor,
-            fontFamily: 'Poppins-Regular',
+            fontFamily: 'Roboto-Regular',
             lineHeight: 18,
           }}
         >
@@ -2907,7 +2944,7 @@ export default function ChatScreen({ navigation, route }) {
             <Text
               style={{
                 fontSize: 12,
-                fontFamily: 'Poppins-Medium',
+                fontFamily: 'Roboto-Medium',
                 color: isMyMessage ? '#D8ECFF' : theme.colors.themeColor,
                 textDecorationLine: 'underline',
               }}
@@ -2934,7 +2971,7 @@ export default function ChatScreen({ navigation, route }) {
               <ActivityIndicator size="small" color="#fff" />
             </View>
             <View style={{ backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6 }}>
-              <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
+              <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
                 {Math.round(progress * 100)}%
               </Text>
             </View>
@@ -2945,7 +2982,7 @@ export default function ChatScreen({ navigation, route }) {
               <Ionicons name={isFailed ? 'refresh' : 'arrow-down'} size={22} color="#fff" />
             </View>
             <View style={{ backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6 }}>
-              <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
+              <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
                 {mediaInfo.sizeLabel}
               </Text>
             </View>
@@ -2997,11 +3034,11 @@ export default function ChatScreen({ navigation, route }) {
       }}
     >
       {edited && (
-        <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 9, marginRight: 3, fontFamily: 'Poppins-Regular' }}>
+        <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 9, marginRight: 3, fontFamily: 'Roboto-Regular' }}>
           edited
         </Text>
       )}
-      <Text style={{ color: '#fff', fontSize: 9, fontFamily: 'Poppins-Medium' }}>{msg?.time}</Text>
+      <Text style={{ color: '#fff', fontSize: 9, fontFamily: 'Roboto-Medium' }}>{msg?.time}</Text>
       {renderTick()}
     </View>
     );
@@ -3312,7 +3349,7 @@ export default function ChatScreen({ navigation, route }) {
         </View>
 
         <View style={{ flex: 1 }}>
-          <Text style={{ color: theme.colors.primaryTextColor, fontSize: 13, fontFamily: 'Poppins-Medium' }} numberOfLines={1}>
+          <Text style={{ color: theme.colors.primaryTextColor, fontSize: 13, fontFamily: 'Roboto-Medium' }} numberOfLines={1}>
             {fileName}
           </Text>
 
@@ -3375,7 +3412,7 @@ export default function ChatScreen({ navigation, route }) {
           style={{ width: '100%', height: 124 }}
         />
         <View style={{ paddingHorizontal: 10, paddingVertical: 8 }}>
-          <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-SemiBold', fontSize: 12 }} numberOfLines={2}>
+          <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-SemiBold', fontSize: 12 }} numberOfLines={2}>
             {address}
           </Text>
           <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 10, marginTop: 2 }}>
@@ -3473,7 +3510,7 @@ export default function ChatScreen({ navigation, route }) {
             </View>
           )}
           <View style={{ flex: 1, marginLeft: 10 }}>
-            <Text style={{ color: textColor, fontFamily: 'Poppins-SemiBold', fontSize: 14 }} numberOfLines={1}>
+            <Text style={{ color: textColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }} numberOfLines={1}>
               {contactName}
             </Text>
             <Text style={{ color: subColor, fontSize: 12, marginTop: 1 }} numberOfLines={1}>
@@ -3482,7 +3519,7 @@ export default function ChatScreen({ navigation, route }) {
             {isRegistered && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
-                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Poppins-Medium' }}>
+                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
                   On VibeConnect
                 </Text>
               </View>
@@ -3499,7 +3536,7 @@ export default function ChatScreen({ navigation, route }) {
                 onPress={handleMessageContact}
                 style={{ flex: 1, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' }}
               >
-                <Text style={{ color: btnColor, fontFamily: 'Poppins-Medium', fontSize: 13 }}>Message</Text>
+                <Text style={{ color: btnColor, fontFamily: 'Roboto-Medium', fontSize: 13 }}>Message</Text>
               </Pressable>
               <View style={{ width: 0.5, backgroundColor: dividerColor }} />
             </>
@@ -3508,7 +3545,7 @@ export default function ChatScreen({ navigation, route }) {
             onPress={handleSaveContact}
             style={{ flex: 1, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' }}
           >
-            <Text style={{ color: btnColor, fontFamily: 'Poppins-Medium', fontSize: 13 }}>Save Contact</Text>
+            <Text style={{ color: btnColor, fontFamily: 'Roboto-Medium', fontSize: 13 }}>Save Contact</Text>
           </Pressable>
         </View>
         {renderMediaTimeOverlay(msg, isMyMessage)}
@@ -3562,6 +3599,20 @@ export default function ChatScreen({ navigation, route }) {
               handleToggleSelectMessages(messageKey);
             }
           }} 
+
+          // onLongPress={() => {
+          //   if (!isDeletedMessage) {
+          //     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+          //     handleToggleSelectMessages(messageKey);
+          //     if (!isMyMessage) {
+          //       Alert.alert('Message Options', '', [
+          //         { text: 'Cancel', style: 'cancel' },
+          //         { text: 'Report Message', onPress: () => handleReportMessage(msg), style: 'destructive' },
+          //       ]);
+          //     }
+          //   }
+          // }} 
+
           style={{ 
             alignItems: isMyMessage ? "flex-end" : "flex-start", 
             paddingVertical: 2, 
@@ -3597,7 +3648,7 @@ export default function ChatScreen({ navigation, route }) {
               <Text style={{ 
                 fontSize: 11, 
                 color: getUserColor?.(msg.senderId) || theme.colors.themeColor,
-                fontFamily: "Poppins-Medium",
+                fontFamily: "Roboto-Medium",
                 marginBottom: 2,
               }}>
                 {msg.senderName || 'Unknown'}
@@ -3614,7 +3665,7 @@ export default function ChatScreen({ navigation, route }) {
               <Text style={{ 
                 fontSize: 13, 
                 color: theme.colors.placeHolderTextColor,
-                fontFamily: "Poppins-Regular", 
+                fontFamily: "Roboto-Regular", 
                 fontStyle: 'italic',
               }}>
                 {deletedText}
@@ -3643,7 +3694,7 @@ export default function ChatScreen({ navigation, route }) {
                   color: isMyMessage
                     ? 'rgba(255,255,255,0.55)'
                     : theme.colors.placeHolderTextColor,
-                  fontFamily: "Poppins-Regular",
+                  fontFamily: "Roboto-Regular",
                   fontStyle: 'italic',
                 }}>
                   edited
@@ -3655,7 +3706,7 @@ export default function ChatScreen({ navigation, route }) {
                   color: isMyMessage
                     ? 'rgba(255,255,255,0.7)'
                     : theme.colors.placeHolderTextColor,
-                  fontFamily: "Poppins-Medium"
+                  fontFamily: "Roboto-Medium"
                 }}>
                   {msg.time}
                 </Text>
@@ -3727,7 +3778,7 @@ export default function ChatScreen({ navigation, route }) {
               />
             ))}
           </View>
-          <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: "Poppins-Medium", fontStyle: 'italic', marginLeft: 4 }}>
+          <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: "Roboto-Medium", fontStyle: 'italic', marginLeft: 4 }}>
             {chatData?.peerUser?.name || 'User'} is typing...
           </Text>
         </View>
@@ -3773,7 +3824,7 @@ export default function ChatScreen({ navigation, route }) {
           marginTop: 16, 
           fontSize: 14, 
           color: theme.colors.primaryTextColor,
-          fontFamily: "Poppins-Regular",
+          fontFamily: "Roboto-Regular",
         }}>
           Loading chat...
         </Text>
@@ -3791,13 +3842,13 @@ export default function ChatScreen({ navigation, route }) {
         padding: 20 
       }}>
         <FontAwesome6 name="exclamation-triangle" size={50} color={theme.colors.themeColor} />
-        <Text style={{ marginTop: 16, fontSize: 14, color: theme.colors.primaryTextColor, textAlign: "center", fontFamily: "Poppins-Regular" }}>
+        <Text style={{ marginTop: 16, fontSize: 14, color: theme.colors.primaryTextColor, textAlign: "center", fontFamily: "Roboto-Regular" }}>
           Unable to load chat. User information is missing.
         </Text>
         <TouchableOpacity 
           onPress={() => navigation.goBack()} 
           style={{ marginTop: 24, paddingHorizontal: 32, paddingVertical: 12, backgroundColor: theme.colors.themeColor, borderRadius: 24 }} >
-          <Text style={{ color: '#FFFFFF', fontFamily: "Poppins-Medium" }}>
+          <Text style={{ color: '#FFFFFF', fontFamily: "Roboto-Medium" }}>
             Go Back
           </Text>
         </TouchableOpacity>
@@ -3836,14 +3887,16 @@ export default function ChatScreen({ navigation, route }) {
                   && !selMsg.isDeleted;
                 if (!canEdit) return null;
                 return (
-                  <TouchableOpacity
-                    onPress={() => {
-                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-                      startEditMessage(selMsg);
-                    }}
-                    style={{ padding: 10, borderRadius: 20, backgroundColor: theme.colors.themeColor, marginRight: 8 }}>
-                    <MaterialIcons name="edit" size={18} color="#fff" />
-                  </TouchableOpacity>
+                  <></>
+                 // Edit message
+                  // <TouchableOpacity
+                  //   onPress={() => {
+                  //     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                  //     startEditMessage(selMsg);
+                  //   }}
+                  //   style={{ padding: 10, borderRadius: 20, backgroundColor: theme.colors.themeColor, marginRight: 8 }}>
+                  //   <MaterialIcons name="edit" size={18} color="#fff" />
+                  // </TouchableOpacity>
                 );
               })()}
               <TouchableOpacity
@@ -3856,7 +3909,7 @@ export default function ChatScreen({ navigation, route }) {
               </TouchableOpacity>
               <View style={{ paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, backgroundColor: theme.colors.menuBackground }}>
                 <Text style={{
-                  fontFamily: "Poppins-Medium",
+                  fontFamily: "Roboto-Medium",
                   fontSize: 12,
                   color: theme.colors.primaryTextColor
                 }}>
@@ -3912,7 +3965,7 @@ export default function ChatScreen({ navigation, route }) {
                   flex: 1, 
                   fontSize: 14, 
                   color: theme.colors.primaryTextColor, 
-                  fontFamily: "Poppins-Regular",
+                  fontFamily: "Roboto-Regular",
                   paddingVertical: Platform.OS === "ios" ? 8 : 4,
                 }} 
               />
@@ -3984,7 +4037,7 @@ export default function ChatScreen({ navigation, route }) {
               fontSize: 15, 
               color: theme.colors.placeHolderTextColor,
               textAlign: 'center',
-              fontFamily: "Poppins-Regular",
+              fontFamily: "Roboto-Regular",
             }}>
               No messages found
             </Text>
@@ -4074,7 +4127,7 @@ export default function ChatScreen({ navigation, route }) {
               style={{
                 fontSize: 11,
                 color: isDarkMode ? 'rgba(233,245,255,0.96)' : '#4f5a60',
-                fontFamily: 'Poppins-Medium',
+                fontFamily: 'Roboto-Medium',
                 textAlign: 'center',
                 paddingHorizontal: 12,
                 paddingVertical: 5,
@@ -4117,7 +4170,7 @@ export default function ChatScreen({ navigation, route }) {
                 marginLeft: 8, 
                 color: theme.colors.primaryTextColor, 
                 fontSize: 12,
-                fontFamily: "Poppins-Medium",
+                fontFamily: "Roboto-Medium",
               }}>
                 Reloading messages...
               </Text>
@@ -4167,7 +4220,7 @@ export default function ChatScreen({ navigation, route }) {
                 <Text style={{ 
                   fontSize: 9, 
                   color: '#FFFFFF', 
-                  fontFamily: 'Poppins-Medium',
+                  fontFamily: 'Roboto-Medium',
                 }}>
                   {newMessagesCount > 99 ? '99+' : newMessagesCount}
                 </Text>
@@ -4190,7 +4243,7 @@ export default function ChatScreen({ navigation, route }) {
           >
             {/* Red pulsing dot + timer */}
             <Animated.View style={{ opacity: recPulseAnim, width: 12, height: 12, borderRadius: 6, backgroundColor: '#FF3B30', marginRight: 10 }} />
-            <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium', fontSize: 16, minWidth: 50 }}>
+            <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16, minWidth: 50 }}>
               {recordingDurationLabel}
             </Text>
 
@@ -4255,7 +4308,7 @@ export default function ChatScreen({ navigation, route }) {
             <View style={{ flex: 1 }}>
               <Text style={{
                 fontSize: 12,
-                fontFamily: 'Poppins-SemiBold',
+                fontFamily: 'Roboto-SemiBold',
                 color: theme.colors.themeColor,
               }}>
                 Editing
@@ -4264,7 +4317,7 @@ export default function ChatScreen({ navigation, route }) {
                 numberOfLines={1}
                 style={{
                   fontSize: 13,
-                  fontFamily: 'Poppins-Regular',
+                  fontFamily: 'Roboto-Regular',
                   color: theme.colors.secondaryTextColor,
                 }}
               >
@@ -4438,7 +4491,7 @@ export default function ChatScreen({ navigation, route }) {
                 }}
               >
                 <Ionicons name="search" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>
+                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
                   Search
                 </Text>
               </TouchableOpacity>
@@ -4454,7 +4507,7 @@ export default function ChatScreen({ navigation, route }) {
                 }}
               >
                 <Ionicons name="refresh" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>
+                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
                   Reload
                 </Text>
               </TouchableOpacity>
@@ -4470,7 +4523,7 @@ export default function ChatScreen({ navigation, route }) {
                 }}
               >
                 <MaterialIcons name="restore" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>
+                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
                   Refresh
                 </Text>
               </TouchableOpacity>
@@ -4486,8 +4539,23 @@ export default function ChatScreen({ navigation, route }) {
                 }}
               >
                 <Ionicons name="person" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>
+                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
                   Contact Info
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity 
+                onPress={handleMenuReportChat} 
+                style={{ 
+                  paddingVertical: 14, 
+                  paddingHorizontal: 16,
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: 10,
+                }}
+              >
+                <Ionicons name="flag" size={18} color="#E53935" />
+                <Text style={{ color: '#E53935', fontFamily: 'Roboto-Regular' }}>
+                  Report Chat
                 </Text>
               </TouchableOpacity>
 
@@ -4502,7 +4570,7 @@ export default function ChatScreen({ navigation, route }) {
                 }}
               >
                 <MaterialIcons name="delete-sweep" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Regular' }}>
+                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
                   Clear Chat
                 </Text>
               </TouchableOpacity> */}
@@ -4553,7 +4621,7 @@ export default function ChatScreen({ navigation, route }) {
                   fontSize: 16,
                   textAlign: 'center',
                   color: isDarkMode ? '#EDF6FC' : '#111',
-                  fontFamily: 'Poppins-SemiBold',
+                  fontFamily: 'Roboto-SemiBold',
                   marginTop: 6,
                   marginBottom: 16,
                 }}
@@ -4605,7 +4673,7 @@ export default function ChatScreen({ navigation, route }) {
                             marginTop: 6,
                             fontSize: 12,
                             color: isDarkMode ? '#C8D8E4' : '#444',
-                            fontFamily: 'Poppins-Medium',
+                            fontFamily: 'Roboto-Medium',
                             textAlign: 'center',
                           }}
                         >
@@ -4629,7 +4697,7 @@ export default function ChatScreen({ navigation, route }) {
                   backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
                 }}
               >
-                <Text style={{ color: '#F97373', fontFamily: 'Poppins-SemiBold', fontSize: 13 }}>Close</Text>
+                <Text style={{ color: '#F97373', fontFamily: 'Roboto-SemiBold', fontSize: 13 }}>Close</Text>
               </Pressable>
             </Animated.View>
           </View>
@@ -4650,11 +4718,11 @@ export default function ChatScreen({ navigation, route }) {
                 <Ionicons name="arrow-back" size={24} color="#fff" />
               </TouchableOpacity>
               <View style={{ flex: 1, marginLeft: 12 }}>
-                <Text style={{ color: '#fff', fontSize: 15, fontFamily: 'Poppins-SemiBold' }} numberOfLines={1}>
+                <Text style={{ color: '#fff', fontSize: 15, fontFamily: 'Roboto-SemiBold' }} numberOfLines={1}>
                   {localMediaViewer.message?.senderName || (localMediaViewer.message?.senderId === currentUserId ? 'You' : chatData?.peerUser?.name || 'Photo')}
                 </Text>
                 {localMediaViewer.message?.time && (
-                  <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: 'Poppins-Regular' }}>
+                  <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: 'Roboto-Regular' }}>
                     {localMediaViewer.message?.date ? `${localMediaViewer.message.date} • ${localMediaViewer.message.time}` : localMediaViewer.message.time}
                   </Text>
                 )}
@@ -4746,7 +4814,7 @@ export default function ChatScreen({ navigation, route }) {
                 flexDirection: 'row', alignItems: 'center', gap: 8,
               }}>
                 <Ionicons name="checkmark-circle" size={18} color="#25D366" />
-                <Text style={{ color: '#fff', fontSize: 13, fontFamily: 'Poppins-Medium' }}>Saved</Text>
+                <Text style={{ color: '#fff', fontSize: 13, fontFamily: 'Roboto-Medium' }}>Saved</Text>
               </View>
             )}
 
@@ -4770,6 +4838,13 @@ export default function ChatScreen({ navigation, route }) {
             }}
           />
         </Modal>
+      {/* Report Modal */}
+      <ReportBottomSheet
+        visible={reportModalVisible}
+        onClose={() => setReportModalVisible(false)}
+        payload={reportPayload}
+        analytics={reportAnalytics}
+      />
       </Animated.View>
     </View>
   );

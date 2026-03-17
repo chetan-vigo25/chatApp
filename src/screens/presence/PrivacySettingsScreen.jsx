@@ -11,7 +11,7 @@ export default function PrivacySettingsScreen() {
 
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background, padding: 16 }}>
-      <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Bold', fontSize: 20 }}>Privacy Settings</Text>
+      <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Bold', fontSize: 20 }}>Privacy Settings</Text>
 
       <View style={{ marginTop: 16, gap: 12 }}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>

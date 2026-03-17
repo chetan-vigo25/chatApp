@@ -352,7 +352,7 @@ const styles = StyleSheet.create({
   },
   headerTitle: {
     fontSize: 18,
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
   },
   cropContainer: {
     width: CROP_SIZE,
@@ -438,7 +438,7 @@ const styles = StyleSheet.create({
   hintText: {
     marginTop: 20,
     fontSize: 14,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     textAlign: 'center',
   },
   modalContainer: {
@@ -455,6 +455,6 @@ const styles = StyleSheet.create({
   },
   modalText: {
     fontSize: 16,
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
   },
 });

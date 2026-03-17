@@ -5,7 +5,7 @@ import { Platform, Alert, Linking } from 'react-native';
 import { apiCall } from '../Config/Https';
 
 // Define all directories - using FileSystem.documentDirectory for compatibility
-export const APP_FOLDER = 'baatCheet';
+export const APP_FOLDER = 'VibeConnect';
 export const SENT_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Sent/`;
 export const RECEIVED_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Received/`;
 export const THUMBNAIL_DIR = `${FileSystem.documentDirectory}${APP_FOLDER}/Thumbnails/`;

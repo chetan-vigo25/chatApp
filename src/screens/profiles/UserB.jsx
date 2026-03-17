@@ -335,8 +335,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 4,
-    paddingTop: STATUS_BAR_HEIGHT,
-    height: TOP_BAR_HEIGHT,
+    // paddingTop: STATUS_BAR_HEIGHT,
+    // height: TOP_BAR_HEIGHT,
   },
   topBarBtn: {
     width: 44,
@@ -351,19 +351,19 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   collapsedName: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 16,
     lineHeight: 20,
   },
   collapsedSub: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 11,
     lineHeight: 14,
   },
   // Profile Header
   profileHeader: {
     alignItems: 'center',
-    paddingTop: TOP_BAR_HEIGHT + 10,
+    paddingTop: TOP_BAR_HEIGHT + 0,
     paddingBottom: 20,
     borderBottomWidth: 0.5,
   },
@@ -381,19 +381,19 @@ const styles = StyleSheet.create({
   },
   avatarInitial: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 46,
     textTransform: 'uppercase',
     includeFontPadding: false,
   },
   profileName: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 22,
     textAlign: 'center',
     paddingHorizontal: 20,
   },
   profileSub: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     textAlign: 'center',
     marginTop: 2,
@@ -419,7 +419,7 @@ const styles = StyleSheet.create({
     marginBottom: 6,
   },
   actionLabel: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 11,
   },
   // Info Sections
@@ -431,11 +431,11 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
   },
   infoTitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 15,
   },
   infoSub: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: 2,
   },
@@ -447,7 +447,7 @@ const styles = StyleSheet.create({
     borderTopWidth: 0.5,
   },
   addContactText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
   },
   // Mute Modal
@@ -473,12 +473,12 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   muteTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     marginBottom: 4,
   },
   muteSubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     marginBottom: 18,
   },
@@ -496,7 +496,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   muteOptionText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
   },
   muteCancelBtn: {
@@ -504,7 +504,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   muteCancelText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
   },
 });

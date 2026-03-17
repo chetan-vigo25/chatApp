@@ -1,16 +1,18 @@
 import React, { useCallback, useMemo, useState, useRef } from 'react';
-import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
+import { apiCall } from '../../Config/Https';
+import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 
 const MUTE_OPTIONS = [
-  { key: '8h', label: '8 hours', duration: 8 * 60 * 60 * 1000 },
-  { key: '1w', label: '1 week', duration: 7 * 24 * 60 * 60 * 1000 },
-  { key: 'always', label: 'Always', duration: 0 },
+  { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
+  { key: '1w', label: '1 week', icon: 'calendar-week', duration: 7 * 24 * 60 * 60 * 1000 },
+  { key: 'always', label: 'Always', icon: 'bell-off-outline', duration: 0 },
 ];
 
 export default function ArchivedChats({ navigation }) {
@@ -24,6 +26,7 @@ export default function ArchivedChats({ navigation }) {
     unmuteChat,
     archiveChat,
     unarchiveChat,
+    applyChatClearedPreview,
   } = useRealtimeChat();
 
   const [selectedChatItem, setSelectedChatItem] = useState(null);
@@ -31,9 +34,25 @@ export default function ArchivedChats({ navigation }) {
   const [muteSheetVisible, setMuteSheetVisible] = useState(false);
   const [profilePreviewVisible, setProfilePreviewVisible] = useState(false);
   const [imageViewerVisible, setImageViewerVisible] = useState(false);
+  const [deleteModalVisible, setDeleteModalVisible] = useState(false);
+  const [deleteForEveryone, setDeleteForEveryone] = useState(false);
+  const [isDeletingChat, setIsDeletingChat] = useState(false);
 
+  // Animations
   const profileOpacityAnim = useRef(new Animated.Value(0)).current;
   const profileScaleAnim = useRef(new Animated.Value(0)).current;
+  const sheetSlideAnim = useRef(new Animated.Value(300)).current;
+  const sheetBgAnim = useRef(new Animated.Value(0)).current;
+
+  const getUserColor = (str) => {
+    const colors = ['#833AB4', '#1DB954', '#128C7E', '#075E54', '#777737', '#F56040', '#34B7F1', '#25D366'];
+    if (!str) return colors[0];
+    let hash = 0;
+    for (let i = 0; i < (str || '').length; i++) {
+      hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return colors[Math.abs(hash) % colors.length];
+  };
 
   const getPreviewText = (text, maxLength = 20) => {
     if (!text) return '';
@@ -44,13 +63,22 @@ export default function ArchivedChats({ navigation }) {
   const getRelativeTime = (value) => {
     const ts = value ? new Date(value).getTime() : 0;
     if (!ts) return '';
-    const diffMs = Date.now() - ts;
-    if (diffMs < 60000) return 'Just now';
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 60) return `${diffMin}m`;
-    const diffHr = Math.floor(diffMin / 60);
-    if (diffHr < 24) return `${diffHr}h`;
-    return new Date(ts).toLocaleDateString(undefined, { weekday: 'short' });
+    const msgDate = new Date(ts);
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const yesterdayStart = todayStart - 86400000;
+    const weekAgoStart = todayStart - 6 * 86400000;
+    const formatTime = (d) => {
+      let h = d.getHours();
+      const m = String(d.getMinutes()).padStart(2, '0');
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      h = h % 12 || 12;
+      return `${h}:${m} ${ampm}`;
+    };
+    if (ts >= todayStart) return formatTime(msgDate);
+    if (ts >= yesterdayStart) return 'Yesterday';
+    if (ts >= weekAgoStart) return msgDate.toLocaleDateString(undefined, { weekday: 'long' });
+    return `${String(msgDate.getDate()).padStart(2, '0')}/${String(msgDate.getMonth() + 1).padStart(2, '0')}/${String(msgDate.getFullYear()).slice(-2)}`;
   };
 
   const getLastMessageText = (item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || 'No messages yet';
@@ -62,49 +90,60 @@ export default function ArchivedChats({ navigation }) {
   const renderMessageStatus = (item) => {
     const status = (getLastMessageStatus(item) || '').toLowerCase();
     if (!status) return null;
-
     if (status === 'read' || status === 'seen') {
-      return (
-        <View style={{ flexDirection: 'row', marginRight: 4 }}>
-          <Ionicons name="checkmark-done" size={12} color="#34B7F1" />
-        </View>
-      );
+      return <View style={{ flexDirection: 'row', marginRight: 4 }}><Ionicons name="checkmark-done" size={12} color="#34B7F1" /></View>;
     }
-
     if (status === 'delivered') {
-      return (
-        <View style={{ flexDirection: 'row', marginRight: 4 }}>
-          <Ionicons name="checkmark-done" size={12} color={theme.colors.placeHolderTextColor} />
-        </View>
-      );
+      return <View style={{ flexDirection: 'row', marginRight: 4 }}><Ionicons name="checkmark-done" size={12} color={theme.colors.placeHolderTextColor} /></View>;
     }
-
     if (status === 'sent') {
       return <Ionicons name="checkmark" size={12} color={theme.colors.placeHolderTextColor} style={{ marginRight: 4 }} />;
     }
-
     return null;
   };
 
-  const getUserColor = (str) => {
-    const colors = ['#833AB4', '#1DB954', '#128C7E', '#075E54', '#777737', '#F56040', '#34B7F1'];
-    let hash = 0;
-    for (let i = 0; i < (str || '').length; i++) {
-      hash = str.charCodeAt(i) + ((hash << 5) - hash);
-    }
-    return colors[Math.abs(hash) % colors.length];
-  };
-
-  const closeActionMenu = useCallback(() => {
-    setActionSheetVisible(false);
-    setMuteSheetVisible(false);
-    setSelectedChatItem(null);
-  }, []);
+  // ─── ACTION SHEET (animated) ───
 
   const openActionMenu = useCallback((item) => {
     setSelectedChatItem(item);
     setActionSheetVisible(true);
-  }, []);
+    sheetSlideAnim.setValue(300);
+    sheetBgAnim.setValue(0);
+    Animated.parallel([
+      Animated.spring(sheetSlideAnim, {
+        toValue: 0,
+        tension: 65,
+        friction: 11,
+        useNativeDriver: true,
+      }),
+      Animated.timing(sheetBgAnim, {
+        toValue: 1,
+        duration: 250,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [sheetSlideAnim, sheetBgAnim]);
+
+  const closeActionMenu = useCallback(() => {
+    Animated.parallel([
+      Animated.timing(sheetSlideAnim, {
+        toValue: 300,
+        duration: 200,
+        useNativeDriver: true,
+      }),
+      Animated.timing(sheetBgAnim, {
+        toValue: 0,
+        duration: 200,
+        useNativeDriver: true,
+      }),
+    ]).start(() => {
+      setActionSheetVisible(false);
+      setMuteSheetVisible(false);
+      setSelectedChatItem(null);
+    });
+  }, [sheetSlideAnim, sheetBgAnim]);
+
+  // ─── PROFILE PREVIEW ───
 
   const openProfilePreview = useCallback((item) => {
     setSelectedChatItem(item);
@@ -143,6 +182,8 @@ export default function ArchivedChats({ navigation }) {
       setSelectedChatItem(null);
     });
   }, [profileScaleAnim, profileOpacityAnim]);
+
+  // ─── ACTIONS ───
 
   const onTogglePin = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
@@ -187,35 +228,114 @@ export default function ArchivedChats({ navigation }) {
   }, [selectedChatItem, navigation, requestChatInfo, closeActionMenu]);
 
   const onDeleteChat = useCallback(() => {
-    Alert.alert('Delete Chat', 'Delete chat endpoint is not connected yet in this client build.');
-    closeActionMenu();
-  }, [closeActionMenu]);
+    setDeleteForEveryone(false);
+    setDeleteModalVisible(true);
+    setActionSheetVisible(false);
+  }, []);
 
-  const emptyState = useMemo(() => {
-    return (
-      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 15 }}>No archived chats</Text>
-      </View>
-    );
-  }, [theme.colors.placeHolderTextColor]);
+  const closeDeleteModal = useCallback(() => {
+    setDeleteModalVisible(false);
+    setDeleteForEveryone(false);
+    setSelectedChatItem(null);
+  }, []);
+
+  const onConfirmDeleteChat = useCallback(async () => {
+    const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
+    if (!chatId || isDeletingChat) return;
+    setIsDeletingChat(true);
+    try {
+      const scope = deleteForEveryone ? 'everyone' : 'me';
+      const response = await apiCall(`/chats/${normalizeChatStorageId(chatId)}/clear`, 'DELETE', { scope });
+      if (!response || response.error) throw new Error(response?.message || 'Failed');
+      await removeMessagesByChatId(chatId);
+      applyChatClearedPreview(chatId, scope);
+      setDeleteModalVisible(false);
+      setDeleteForEveryone(false);
+      setSelectedChatItem(null);
+    } catch (error) {
+      console.error('Chat delete failed', error);
+      Alert.alert('Delete Chat', 'Could not delete this chat right now. Please try again.');
+    } finally {
+      setIsDeletingChat(false);
+    }
+  }, [selectedChatItem, isDeletingChat, deleteForEveryone, applyChatClearedPreview]);
+
+  // ─── ACTION SHEET OPTIONS ───
+
+  const actionSheetOptions = useMemo(() => {
+    if (!selectedChatItem) return [];
+    const opts = [];
+
+    if (selectedChatItem?.isArchived) {
+      opts.push({
+        icon: 'archive-arrow-up-outline',
+        label: 'Unarchive Chat',
+        iconColor: '#00B894',
+        onPress: onToggleArchive,
+      });
+    }
+
+    opts.push({
+      icon: selectedChatItem?.isPinned ? 'pin-off-outline' : 'pin-outline',
+      label: selectedChatItem?.isPinned ? 'Unpin Chat' : 'Pin Chat',
+      iconColor: '#4D7CFE',
+      onPress: onTogglePin,
+    });
+
+    opts.push({
+      icon: selectedChatItem?.isMuted ? 'volume-high' : 'volume-off',
+      label: selectedChatItem?.isMuted ? 'Unmute Chat' : 'Mute Chat',
+      iconColor: '#F0A030',
+      onPress: onPressMute,
+    });
+
+    if (!selectedChatItem?.isArchived) {
+      opts.push({
+        icon: 'archive-arrow-down-outline',
+        label: 'Archive Chat',
+        iconColor: '#556070',
+        onPress: onToggleArchive,
+      });
+    }
+
+    opts.push({
+      icon: 'information-outline',
+      label: 'View Chat Info',
+      iconColor: '#0984E3',
+      onPress: onViewInfo,
+    });
+
+    return opts;
+  }, [selectedChatItem, onTogglePin, onPressMute, onToggleArchive, onViewInfo]);
+
+  // ─── PREVIEW DATA ───
 
   const previewName = selectedChatItem?.peerUser?.fullName || 'Unknown User';
   const previewImage = selectedChatItem?.peerUser?.profileImage;
   const previewAvatarColor = getUserColor(previewName);
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.background, paddingHorizontal: 10, paddingTop: 8 }}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={{ width: 44, height: 44, alignItems: 'center', justifyContent: 'center' }}>
+    <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
+      {/* Header */}
+      <View style={styles.header}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.headerBackBtn}>
           <Ionicons name="arrow-back" size={22} color={theme.colors.primaryTextColor} />
         </TouchableOpacity>
-        <Text style={{ color: theme.colors.primaryTextColor, fontSize: 20, fontFamily: 'Poppins-SemiBold' }}>
+        <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
           Archived Chats
         </Text>
       </View>
 
       {!Array.isArray(archivedChatList) || archivedChatList.length === 0 ? (
-        emptyState
+        <View style={styles.emptyWrap}>
+          <View style={[styles.emptyIconCircle, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}>
+            <MaterialCommunityIcons name="archive-outline" size={36} color={theme.colors.placeHolderTextColor} />
+          </View>
+          <Text style={[styles.emptyTitle, { color: theme.colors.primaryTextColor }]}>No archived chats</Text>
+          <Text style={[styles.emptySubtitle, { color: theme.colors.placeHolderTextColor }]}>
+            Chats you archive will appear here
+          </Text>
+        </View>
       ) : (
         <FlatList
           data={archivedChatList}
@@ -239,81 +359,157 @@ export default function ArchivedChats({ navigation }) {
           )}
           removeClippedSubviews
           showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingBottom: 30 }}
+          ItemSeparatorComponent={() => (
+            <View style={{ marginLeft: 82, marginRight: 16 }}>
+              <View style={{ height: StyleSheet.hairlineWidth, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)' }} />
+            </View>
+          )}
         />
       )}
 
-      <Modal animationType="fade" transparent visible={actionSheetVisible} onRequestClose={closeActionMenu}>
-        <TouchableOpacity activeOpacity={1} onPress={closeActionMenu} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.34)', justifyContent: 'flex-end' }}>
-          <TouchableOpacity activeOpacity={1} style={{ backgroundColor: theme.colors.cardBackground, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 24, borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
-            <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-SemiBold', fontSize: 16, marginBottom: 12 }}>
-              Chat Options
-            </Text>
+      {/* ─── ACTION SHEET MODAL ─── */}
+      <Modal animationType="none" transparent visible={actionSheetVisible} onRequestClose={closeActionMenu}>
+        <View style={styles.sheetContainer}>
+          <Animated.View style={[styles.sheetBg, { opacity: sheetBgAnim }]}>
+            <TouchableOpacity activeOpacity={1} onPress={closeActionMenu} style={StyleSheet.absoluteFill} />
+          </Animated.View>
 
-            {selectedChatItem?.isArchived && (
-              <TouchableOpacity onPress={onToggleArchive} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-                <MaterialCommunityIcons name="archive-arrow-up-outline" size={20} color={theme.colors.primaryTextColor} />
-                <Text style={{ marginLeft: 10, color: theme.colors.primaryTextColor }}>Unarchive Chat</Text>
-              </TouchableOpacity>
+          <Animated.View style={[styles.sheetCard, { backgroundColor: theme.colors.cardBackground, transform: [{ translateY: sheetSlideAnim }] }]}>
+            <View style={styles.sheetHandle}>
+              <View style={[styles.sheetHandleBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)' }]} />
+            </View>
+
+            {selectedChatItem && (
+              <View style={styles.sheetUserRow}>
+                {selectedChatItem?.peerUser?.profileImage ? (
+                  <Image source={{ uri: selectedChatItem.peerUser.profileImage }} style={styles.sheetUserAvatar} />
+                ) : (
+                  <View style={[styles.sheetUserAvatar, { backgroundColor: getUserColor(selectedChatItem?.peerUser?.fullName || '') }]}>
+                    <Text style={styles.sheetUserInitial}>
+                      {(selectedChatItem?.peerUser?.fullName || '?').charAt(0).toUpperCase()}
+                    </Text>
+                  </View>
+                )}
+                <Text style={[styles.sheetUserName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
+                  {selectedChatItem?.peerUser?.fullName || 'Unknown'}
+                </Text>
+              </View>
             )}
 
-            <TouchableOpacity onPress={onTogglePin} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-              <MaterialCommunityIcons name={selectedChatItem?.isPinned ? 'pin-off-outline' : 'pin-outline'} size={20} color={theme.colors.primaryTextColor} />
-              <Text style={{ marginLeft: 10, color: theme.colors.primaryTextColor }}>{selectedChatItem?.isPinned ? 'Unpin Chat' : 'Pin Chat'}</Text>
-            </TouchableOpacity>
+            <View style={[styles.sheetDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)' }]} />
 
-            <TouchableOpacity onPress={onPressMute} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-              <MaterialCommunityIcons name={selectedChatItem?.isMuted ? 'volume-high' : 'volume-off'} size={20} color={theme.colors.primaryTextColor} />
-              <Text style={{ marginLeft: 10, color: theme.colors.primaryTextColor }}>{selectedChatItem?.isMuted ? 'Unmute Chat' : 'Mute Chat'}</Text>
-            </TouchableOpacity>
-
-            {!selectedChatItem?.isArchived && (
-              <TouchableOpacity onPress={onToggleArchive} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-                <MaterialCommunityIcons name="archive-outline" size={20} color={theme.colors.primaryTextColor} />
-                <Text style={{ marginLeft: 10, color: theme.colors.primaryTextColor }}>Archive Chat</Text>
-              </TouchableOpacity>
-            )}
-
-            <TouchableOpacity onPress={onViewInfo} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-              <MaterialCommunityIcons name="information-outline" size={20} color={theme.colors.primaryTextColor} />
-              <Text style={{ marginLeft: 10, color: theme.colors.primaryTextColor }}>View Chat Info</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity onPress={onDeleteChat} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-              <MaterialCommunityIcons name="delete-outline" size={20} color="#E06A6A" />
-              <Text style={{ marginLeft: 10, color: '#E06A6A' }}>Delete Chat</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity onPress={closeActionMenu} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-              <MaterialCommunityIcons name="close-circle-outline" size={20} color={theme.colors.placeHolderTextColor} />
-              <Text style={{ marginLeft: 10, color: theme.colors.placeHolderTextColor }}>Cancel</Text>
-            </TouchableOpacity>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </Modal>
-
-      <Modal animationType="fade" transparent visible={muteSheetVisible} onRequestClose={() => setMuteSheetVisible(false)}>
-        <TouchableOpacity activeOpacity={1} onPress={() => setMuteSheetVisible(false)} style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.34)', justifyContent: 'flex-end' }}>
-          <TouchableOpacity activeOpacity={1} style={{ backgroundColor: theme.colors.cardBackground, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 24, borderTopLeftRadius: 20, borderTopRightRadius: 20 }}>
-            <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-SemiBold', fontSize: 16, marginBottom: 12 }}>
-              Mute Chat For
-            </Text>
-
-            {MUTE_OPTIONS.map((option) => (
-              <TouchableOpacity key={option.key} onPress={() => onSelectMuteDuration(option.duration)} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-                <MaterialCommunityIcons name="clock-time-four-outline" size={20} color={theme.colors.primaryTextColor} />
-                <Text style={{ marginLeft: 10, color: theme.colors.primaryTextColor }}>{option.label}</Text>
+            {actionSheetOptions.map((opt, i) => (
+              <TouchableOpacity
+                key={i}
+                onPress={opt.onPress}
+                activeOpacity={0.6}
+                style={styles.sheetOption}
+              >
+                <View style={[styles.sheetOptionIcon, { backgroundColor: opt.iconColor + '12' }]}>
+                  <MaterialCommunityIcons name={opt.icon} size={20} color={opt.iconColor} />
+                </View>
+                <Text style={[styles.sheetOptionLabel, { color: opt.isDanger ? '#E06A6A' : theme.colors.primaryTextColor }]}>
+                  {opt.label}
+                </Text>
               </TouchableOpacity>
             ))}
+          </Animated.View>
+        </View>
+      </Modal>
 
-            <TouchableOpacity onPress={() => setMuteSheetVisible(false)} style={{ minHeight: 48, flexDirection: 'row', alignItems: 'center' }}>
-              <MaterialCommunityIcons name="close-circle-outline" size={20} color={theme.colors.placeHolderTextColor} />
-              <Text style={{ marginLeft: 10, color: theme.colors.placeHolderTextColor }}>Cancel</Text>
+      {/* ─── MUTE SHEET MODAL ─── */}
+      <Modal animationType="fade" transparent visible={muteSheetVisible} onRequestClose={() => setMuteSheetVisible(false)}>
+        <TouchableOpacity activeOpacity={1} onPress={() => setMuteSheetVisible(false)} style={styles.muteOverlay}>
+          <TouchableOpacity activeOpacity={1} style={[styles.muteCard, { backgroundColor: theme.colors.cardBackground }]}>
+            <View style={[styles.muteIconWrap, { backgroundColor: '#F0A03012' }]}>
+              <Ionicons name="volume-mute" size={28} color="#F0A030" />
+            </View>
+            <Text style={[styles.muteTitle, { color: theme.colors.primaryTextColor }]}>
+              Mute notifications
+            </Text>
+            <Text style={[styles.muteSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+              Choose how long to mute this chat
+            </Text>
+
+            <View style={styles.muteOptionsWrap}>
+              {MUTE_OPTIONS.map((option) => (
+                <TouchableOpacity
+                  key={option.key}
+                  onPress={() => onSelectMuteDuration(option.duration)}
+                  activeOpacity={0.7}
+                  style={[styles.muteOptionBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.03)' }]}
+                >
+                  <MaterialCommunityIcons name={option.icon} size={18} color={theme.colors.themeColor} />
+                  <Text style={[styles.muteOptionText, { color: theme.colors.primaryTextColor }]}>{option.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <TouchableOpacity onPress={() => setMuteSheetVisible(false)} activeOpacity={0.6} style={styles.muteCancelBtn}>
+              <Text style={[styles.muteCancelText, { color: theme.colors.placeHolderTextColor }]}>Cancel</Text>
             </TouchableOpacity>
           </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
 
-      {/* Profile Preview Modal — same style as ChatList */}
+      {/* ─── DELETE MODAL ─── */}
+      <Modal animationType="fade" transparent visible={deleteModalVisible} onRequestClose={closeDeleteModal}>
+        <TouchableOpacity activeOpacity={1} onPress={closeDeleteModal} style={styles.deleteOverlay}>
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+            <View style={styles.deleteIconWrap}>
+              <MaterialCommunityIcons name="delete-alert-outline" size={30} color="#E06A6A" />
+            </View>
+
+            <Text style={[styles.deleteTitle, { color: theme.colors.primaryTextColor }]}>
+              Delete Chat
+            </Text>
+            <Text style={[styles.deleteSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+              This will clear all messages in this chat on your device.
+            </Text>
+
+            <TouchableOpacity
+              onPress={() => setDeleteForEveryone((prev) => !prev)}
+              activeOpacity={0.7}
+              style={styles.deleteCheckRow}
+            >
+              <MaterialCommunityIcons
+                name={deleteForEveryone ? 'checkbox-marked' : 'checkbox-blank-outline'}
+                size={22}
+                color={deleteForEveryone ? theme.colors.themeColor : theme.colors.placeHolderTextColor}
+              />
+              <Text style={[styles.deleteCheckLabel, { color: theme.colors.primaryTextColor }]}>
+                Delete for both users
+              </Text>
+            </TouchableOpacity>
+
+            <View style={styles.deleteActions}>
+              <TouchableOpacity
+                onPress={closeDeleteModal}
+                disabled={isDeletingChat}
+                activeOpacity={0.7}
+                style={[styles.deleteCancelBtn, { borderColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)' }]}
+              >
+                <Text style={[styles.deleteCancelText, { color: theme.colors.primaryTextColor }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={onConfirmDeleteChat}
+                disabled={isDeletingChat}
+                activeOpacity={0.7}
+                style={styles.deleteConfirmBtn}
+              >
+                {isDeletingChat ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.deleteConfirmText}>Delete</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* ─── PROFILE PREVIEW MODAL ─── */}
       <Modal transparent visible={profilePreviewVisible} onRequestClose={closeProfilePreview} statusBarTranslucent>
         <TouchableOpacity onPress={closeProfilePreview} activeOpacity={1} style={styles.profileOverlay}>
           <Animated.View style={[
@@ -342,12 +538,10 @@ export default function ArchivedChats({ navigation }) {
                 </View>
               )}
 
-              {/* Name overlay */}
               <View style={styles.profileNameOverlay}>
                 <Text style={styles.profileNameText} numberOfLines={1}>{previewName}</Text>
               </View>
 
-              {/* Action buttons */}
               <View style={styles.profileActions}>
                 <TouchableOpacity
                   onPress={() => {
@@ -375,7 +569,7 @@ export default function ArchivedChats({ navigation }) {
         </TouchableOpacity>
       </Modal>
 
-      {/* Full-screen Image Viewer with zoom */}
+      {/* ─── IMAGE VIEWER ─── */}
       <Modal
         visible={imageViewerVisible}
         transparent
@@ -423,6 +617,264 @@ export default function ArchivedChats({ navigation }) {
 }
 
 const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingTop: 8,
+    paddingBottom: 10,
+  },
+  headerBackBtn: {
+    width: 44,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerTitle: {
+    fontSize: 20,
+    fontFamily: 'Roboto-SemiBold',
+  },
+
+  // ─── EMPTY STATE ───
+  emptyWrap: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 40,
+  },
+  emptyIconCircle: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 18,
+  },
+  emptyTitle: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 17,
+    marginBottom: 6,
+  },
+  emptySubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 19,
+  },
+
+  // ─── ACTION SHEET ───
+  sheetContainer: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  sheetBg: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
+  sheetCard: {
+    borderTopLeftRadius: 22,
+    borderTopRightRadius: 22,
+    paddingHorizontal: 16,
+    paddingBottom: 30,
+  },
+  sheetHandle: {
+    alignItems: 'center',
+    paddingTop: 10,
+    paddingBottom: 6,
+  },
+  sheetHandleBar: {
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+  },
+  sheetUserRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+    gap: 12,
+  },
+  sheetUserAvatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  sheetUserInitial: {
+    color: '#fff',
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 16,
+  },
+  sheetUserName: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 16,
+    flex: 1,
+    textTransform: 'capitalize',
+  },
+  sheetDivider: {
+    height: StyleSheet.hairlineWidth,
+    marginBottom: 4,
+  },
+  sheetOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 11,
+    gap: 14,
+  },
+  sheetOptionIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sheetOptionLabel: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 14.5,
+    flex: 1,
+  },
+
+  // ─── MUTE MODAL ───
+  muteOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'center',
+    paddingHorizontal: 30,
+  },
+  muteCard: {
+    borderRadius: 20,
+    paddingHorizontal: 20,
+    paddingTop: 28,
+    paddingBottom: 18,
+    alignItems: 'center',
+  },
+  muteIconWrap: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  muteTitle: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 17,
+    marginBottom: 4,
+  },
+  muteSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    marginBottom: 18,
+  },
+  muteOptionsWrap: {
+    width: '100%',
+    gap: 6,
+    marginBottom: 8,
+  },
+  muteOptionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 13,
+    paddingHorizontal: 16,
+    borderRadius: 14,
+    gap: 12,
+  },
+  muteOptionText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 14,
+  },
+  muteCancelBtn: {
+    paddingVertical: 10,
+    marginTop: 4,
+  },
+  muteCancelText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 14,
+  },
+
+  // ─── DELETE MODAL ───
+  deleteOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  deleteCard: {
+    borderRadius: 20,
+    paddingHorizontal: 22,
+    paddingTop: 28,
+    paddingBottom: 20,
+    alignItems: 'center',
+  },
+  deleteIconWrap: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#E06A6A10',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  deleteTitle: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 17,
+    marginBottom: 6,
+  },
+  deleteSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 19,
+  },
+  deleteCheckRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 16,
+    gap: 8,
+    alignSelf: 'flex-start',
+  },
+  deleteCheckLabel: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13.5,
+  },
+  deleteActions: {
+    flexDirection: 'row',
+    marginTop: 22,
+    gap: 10,
+    width: '100%',
+  },
+  deleteCancelBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+  },
+  deleteCancelText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 14,
+  },
+  deleteConfirmBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: '#E06A6A',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  deleteConfirmText: {
+    color: '#fff',
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 14,
+  },
+
+  // ─── PROFILE PREVIEW MODAL ───
   profileOverlay: {
     flex: 1,
     justifyContent: 'center',
@@ -451,7 +903,7 @@ const styles = StyleSheet.create({
   },
   profileFallbackText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 72,
     textTransform: 'uppercase',
   },
@@ -466,7 +918,7 @@ const styles = StyleSheet.create({
   },
   profileNameText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     textTransform: 'capitalize',
   },
@@ -485,6 +937,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+
+  // ─── IMAGE VIEWER ───
   imageViewerContainer: {
     flex: 1,
     backgroundColor: '#000',
@@ -509,7 +963,7 @@ const styles = StyleSheet.create({
     flex: 1,
     color: '#fff',
     fontSize: 18,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     marginLeft: 8,
     textTransform: 'capitalize',
   },
@@ -528,13 +982,13 @@ const styles = StyleSheet.create({
   imageViewerFallbackLetter: {
     color: '#fff',
     fontSize: 64,
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     textTransform: 'uppercase',
   },
   imageViewerNoPhotoText: {
     color: 'rgba(255,255,255,0.6)',
     fontSize: 15,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     marginTop: 20,
   },
 });

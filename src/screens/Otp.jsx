@@ -183,11 +183,11 @@ export default function Otp({ navigation, route }) {
     <Animated.View style={{ flex: 1, opacity: fadeAnim,}}>
          <View style={{ flex: 1, }}>
           <View>
-            <Text style={{ textAlign: 'center', fontFamily: 'Poppins-Medium', fontSize: 18, color: theme.colors.themeColor, paddingVertical:10 }} >Verify {selectedCountry?.code} {phoneNumber}</Text>
+            <Text style={{ textAlign: 'center', fontFamily: 'Roboto-Medium', fontSize: 18, color: theme.colors.themeColor, paddingVertical:10 }} >Verify {selectedCountry?.code} {phoneNumber}</Text>
           </View>
           <View>
-            <Text style={{ textAlign: 'center', fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, }} >Waiting for OTP to be sent {selectedCountry?.code} {phoneNumber}.</Text>
-            <Text onPress={() => navigation.navigate('Login')} style={{ textAlign: 'center', fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.themeColor, }} >Wrong number?</Text>
+            <Text style={{ textAlign: 'center', fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, }} >Waiting for OTP to be sent {selectedCountry?.code} {phoneNumber}.</Text>
+            <Text onPress={() => navigation.navigate('Login')} style={{ textAlign: 'center', fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.themeColor, }} >Wrong number?</Text>
           </View>
           <View style={{ width:'50%', justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:50,}} >
            <OtpInput
@@ -260,7 +260,7 @@ export default function Otp({ navigation, route }) {
              }}
            />
           </View>
-          <Text style={{ textAlign: 'center', fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, marginVertical:10 }} >Enter OTP</Text>
+          <Text style={{ textAlign: 'center', fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, marginVertical:10 }} >Enter OTP</Text>
           <View style={{ width:'100%', flexDirection:'row', borderBottomWidth:1, borderColor: theme.colors.borderColor, paddingHorizontal:10 }} >
              <View style={{ width:40, height:40, justifyContent:'center', alignItems:'flex-start', }} >
                <MaterialCommunityIcons name="message-processing" size={24} color={theme.colors.placeHolderTextColor} />
@@ -268,16 +268,16 @@ export default function Otp({ navigation, route }) {
              <TouchableOpacity onPress={() => {
                   if (seconds <= 0) { handleResendOtp();}}} disabled={seconds > 0} 
                   style={{ flex:1, justifyContent:'center', alignItems:'flex-start',}} >
-                <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: seconds > 0 ? theme.colors.placeHolderTextColor : theme.colors.themeColor, paddingBottom:5 }} >Resend SMS ?</Text>
+                <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: seconds > 0 ? theme.colors.placeHolderTextColor : theme.colors.themeColor, paddingBottom:5 }} >Resend SMS ?</Text>
              </TouchableOpacity>
              <View style={{ flex:1, justifyContent:'center', alignItems:'flex-end',}} >
-                <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: seconds > 0 ? theme.colors.themeColor : theme.colors.placeHolderTextColor, }} >{formatTime(seconds)}</Text>
+                <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: seconds > 0 ? theme.colors.themeColor : theme.colors.placeHolderTextColor, }} >{formatTime(seconds)}</Text>
              </View>
           </View>
           <TouchableOpacity onPress={handleVerifyOtp} disabled={isLoading || otp.length !== 6} style={{ width:'50%', height:40, backgroundColor:(otp.length === 6 && !isLoading) ? theme.colors.themeColor : theme.colors.placeHolderTextColor, justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40 }} >
             {
               isLoading ? <ActivityIndicator size="small" color={theme.colors.textWhite} /> :
-              <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.textWhite, }} >Verify OTP</Text>
+              <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.textWhite, }} >Verify OTP</Text>
             }
           </TouchableOpacity>
         </View>

@@ -290,7 +290,7 @@ const styles = StyleSheet.create({
     borderRadius: 21,
   },
   headerTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 18,
     letterSpacing: 0.2,
   },
@@ -302,7 +302,7 @@ const styles = StyleSheet.create({
 
   // ─── SECTION TITLE ───
   sectionTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 13,
     letterSpacing: 0.5,
     textTransform: 'uppercase',
@@ -317,7 +317,7 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   previewLabel: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 11,
     textTransform: 'uppercase',
     letterSpacing: 0.8,
@@ -344,7 +344,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   previewAvatarText: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 12,
   },
   bubbleReceived: {
@@ -362,12 +362,12 @@ const styles = StyleSheet.create({
     borderBottomRightRadius: 4,
   },
   bubbleText: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     lineHeight: 19,
   },
   bubbleTime: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 10,
     marginTop: 2,
     alignSelf: 'flex-end',
@@ -402,12 +402,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   settingLabel: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
     lineHeight: 20,
   },
   settingValue: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: -1,
   },
@@ -465,7 +465,7 @@ const styles = StyleSheet.create({
 
   // ─── FOOTER ───
   footerHint: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     textAlign: 'center',
     lineHeight: 18,

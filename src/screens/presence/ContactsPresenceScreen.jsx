@@ -17,7 +17,7 @@ export default function ContactsPresenceScreen() {
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <View style={{ padding: 16, borderBottomWidth: 1, borderBottomColor: theme.colors.borderColor }}>
-        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Bold', fontSize: 20 }}>Contacts Presence</Text>
+        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Bold', fontSize: 20 }}>Contacts Presence</Text>
         <Text style={{ color: theme.colors.placeHolderTextColor, marginTop: 4 }}>{onlineCount} online</Text>
         <TextInput
           value={query}

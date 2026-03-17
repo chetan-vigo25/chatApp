@@ -259,7 +259,7 @@ const styles = StyleSheet.create({
     borderRadius: 21,
   },
   headerTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 18,
     letterSpacing: 0.2,
   },
@@ -293,7 +293,7 @@ const styles = StyleSheet.create({
   },
   profileAvatarText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 22,
     textTransform: 'uppercase',
   },
@@ -301,13 +301,13 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   profileName: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
     textTransform: 'capitalize',
     lineHeight: 23,
   },
   profileSub: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     marginTop: 1,
     lineHeight: 18,
@@ -325,7 +325,7 @@ const styles = StyleSheet.create({
     marginBottom: 20,
   },
   sectionTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 12,
     letterSpacing: 0.6,
     textTransform: 'uppercase',
@@ -363,12 +363,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   menuLabel: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 15,
     lineHeight: 21,
   },
   menuSubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: -1,
   },
@@ -390,12 +390,12 @@ const styles = StyleSheet.create({
     borderRadius: 14,
   },
   logoutText: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 15,
     color: '#E53935',
   },
   versionText: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 11,
     marginTop: 4,
   },

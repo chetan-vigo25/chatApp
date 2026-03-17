@@ -79,25 +79,25 @@ export default function Login({ navigation }) {
   return (
     <Animated.View style={{ flex: 1, opacity: fadeAnim,}}>
       <View style={{ flex: 1, backgroundColor: theme.colors.background, }}>
-        <Text style={{ textAlign: 'center', fontFamily: 'Poppins-SemiBold', fontSize: 20, color: theme.colors.themeColor, paddingVertical:10 }} >Enter your phone number</Text>
+        <Text style={{ textAlign: 'center', fontFamily: 'Roboto-SemiBold', fontSize: 20, color: theme.colors.themeColor, paddingVertical:10 }} >Enter your phone number</Text>
         <View style={{ width:'100%', alignItems:'center', paddingHorizontal:20 }} >
-          <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, }} >{APP_TAG_NAME} need to verify your phone number .</Text>
-          <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.themeColor, }} >Whats my number ?</Text>
+          <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, }} >{APP_TAG_NAME} need to verify your phone number.</Text>
+          <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.themeColor, }} >Whats my number ?</Text>
         </View>
-        <CountryCodeSelector
-            selectedCountry={selectedCountry}
-            onCountrySelect={handleCountrySelect}
-            showFlag={true}
-            showCode={true}
-            showName={false}
-          />
+         <CountryCodeSelector
+           selectedCountry={selectedCountry}
+           onCountrySelect={handleCountrySelect}
+           showFlag={true}
+           showCode={true}
+           showName={false}
+         />
         <View style={{ width:'50%', gap:10, flexDirection:'row', justifyContent:'space-between', alignSelf:'center', marginVertical:10, }} >
           <View style={{ width:50, height:40, borderBottomWidth:1.5, borderColor:theme.colors.themeColor, alignItems:'center', justifyContent:'center', }} >
-            <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 16, color: theme.colors.placeHolderTextColor, }} >{selectedCountry?.code}</Text>
+            <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 16, color: theme.colors.placeHolderTextColor, }} >{selectedCountry?.code}</Text>
           </View>
           <View style={{ flex:1, justifyContent:'center', alignItems:'flex-start', borderBottomWidth:1.5, borderColor:theme.colors.themeColor, }} >
             <TextInput
-              style={{ width:'100%', letterSpacing:2, fontFamily: 'Poppins-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, paddingVertical:0, }}
+              style={{ width:'100%', letterSpacing:2, fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, paddingVertical:0, }}
               placeholder="Number"
               value={phoneNumber}
               onChangeText={setPhoneNumber}
@@ -108,14 +108,14 @@ export default function Login({ navigation }) {
           </View>
         </View>
         {/* <TouchableOpacity onPress={() =>navigation.navigate('Otp', {selectedCountry: selectedCountry, phoneNumber: phoneNumber,})} style={{ width:'50%', height:40, backgroundColor:theme.colors.themeColor, justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40 }} >
-          <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.textWhite, }} >NEXT</Text>
+          <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.textWhite, }} >NEXT</Text>
         </TouchableOpacity> */}
         <TouchableOpacity onPress={handleGenerateOtp} disabled={isLoading} style={{ width:'50%', height:40, backgroundColor:theme.colors.themeColor, justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40 }} >
           {
             isLoading ? (
               <ActivityIndicator size="small" color={theme.colors.textWhite} />
             ):(
-              <Text style={{ fontFamily: 'Poppins-Medium', fontSize: 16, color: theme.colors.textWhite, }} >NEXT</Text>
+              <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.textWhite, }} >NEXT</Text>
             )
           }
         </TouchableOpacity>

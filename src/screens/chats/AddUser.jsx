@@ -619,9 +619,9 @@ export default function AddUser({ navigation }) {
               <Text style={styles.avatarInitials}>{initials}</Text>
             </View>
           )}
-          {!showInvite && contact?.type === 'registered' && (
+          {/* {!showInvite && contact?.type === 'registered' && (
             <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
-          )}
+          )} */}
         </TouchableOpacity>
 
         {/* Contact Info */}
@@ -870,12 +870,12 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   headerTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 18,
     letterSpacing: 0.2,
   },
   headerSubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: -2,
   },
@@ -909,7 +909,7 @@ const styles = StyleSheet.create({
   },
   searchInput: {
     flex: 1,
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 14,
     paddingHorizontal: 10,
     paddingVertical: 0,
@@ -931,7 +931,7 @@ const styles = StyleSheet.create({
   },
   newContactText: {
     flex: 1,
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 15,
   },
 
@@ -947,7 +947,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   syncText: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 10,
   },
 
@@ -961,7 +961,7 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   sectionHeaderText: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 13,
     letterSpacing: 0.5,
     textTransform: 'uppercase',
@@ -972,11 +972,11 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   sectionBadgeText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 11,
   },
   sectionEmptyText: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     paddingHorizontal: 16,
     paddingVertical: 12,
@@ -1010,7 +1010,7 @@ const styles = StyleSheet.create({
   },
   avatarInitials: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 18,
   },
   onlineDot: {
@@ -1028,13 +1028,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   contactName: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 15,
     textTransform: 'capitalize',
     lineHeight: 21,
   },
   contactPhone: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     marginTop: 1,
     lineHeight: 18,
@@ -1048,7 +1048,7 @@ const styles = StyleSheet.create({
     minWidth: 70,
   },
   inviteBtnText: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 12,
   },
   infoBtn: {
@@ -1080,19 +1080,19 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
   emptyTitle: {
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 16,
     marginBottom: 6,
   },
   emptySubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 13,
     textAlign: 'center',
     lineHeight: 19,
   },
   emptyError: {
     color: '#ff4444',
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: 8,
     textAlign: 'center',
@@ -1106,7 +1106,7 @@ const styles = StyleSheet.create({
     borderRadius: 22,
   },
   emptyRefreshText: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 13,
   },
 
@@ -1125,12 +1125,12 @@ const styles = StyleSheet.create({
     width: '80%',
   },
   processingTitle: {
-    fontFamily: 'Poppins-Medium',
+    fontFamily: 'Roboto-Medium',
     fontSize: 15,
     marginTop: 16,
   },
   processingSubtitle: {
-    fontFamily: 'Poppins-Regular',
+    fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: 4,
   },
@@ -1164,7 +1164,7 @@ const styles = StyleSheet.create({
   },
   modalFallbackText: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 72,
     textTransform: 'uppercase',
   },
@@ -1179,7 +1179,7 @@ const styles = StyleSheet.create({
   },
   modalName: {
     color: '#fff',
-    fontFamily: 'Poppins-SemiBold',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
   },
   modalActions: {

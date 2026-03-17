@@ -488,7 +488,7 @@ export default function AddNewContact({ navigation }) {
               <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
            </TouchableOpacity>
            <View style={{ flex:1 }} >
-               <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:16, textTransform:'capitalize' }} >New Contact</Text>
+               <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, textTransform:'capitalize' }} >New Contact</Text>
            </View>
          </View>
          <ScrollView style={{ flex:1, padding:20 }} >
@@ -548,12 +548,12 @@ export default function AddNewContact({ navigation }) {
          {searchResult && searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching && (
            <View style={{ marginTop: 20 }}>
              <View style={{ flex: 1 }}>
-               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Medium', fontSize: 14, marginTop: 2 }}>
+               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium', fontSize: 14, marginTop: 2 }}>
                  This phone number is on {APP_TAG_NAME}.
                </Text>
              </View>
              <View style={{ alignSelf:'flex-start', marginTop: 8 }}>
-               <Text style={{ color: theme.colors.themeColor, fontFamily: 'Poppins-SemiBold', fontSize: 14 }}>
+               <Text style={{ color: theme.colors.themeColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
                  View Contact →
                </Text>
              </View>
@@ -582,16 +582,16 @@ export default function AddNewContact({ navigation }) {
                      justifyContent: 'center',
                      alignItems: 'center'
                    }}>
-                     <Text style={{ color: '#fff', fontSize: 18, fontFamily: 'Poppins-Medium' }}>
+                     <Text style={{ color: '#fff', fontSize: 18, fontFamily: 'Roboto-Medium' }}>
                        {(searchResult.user?.fullName || searchResult.user?.name || 'U').charAt(0).toUpperCase()}
                      </Text>
                    </View>
                  )}
                  <View style={{ marginLeft: 12 }}>
-                   <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium', fontSize: 16 }}>
+                   <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16 }}>
                      {searchResult.user?.fullName || searchResult.user?.name || 'User'}
                    </Text>
-                   <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Regular', fontSize: 12 }}>
+                   <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', fontSize: 12 }}>
                      {selectedCountry.code} {phoneNumber}
                    </Text>
                  </View>
@@ -604,7 +604,7 @@ export default function AddNewContact({ navigation }) {
          {searchResult && !searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching && (
            <View style={{ marginTop: 20 }}>
              <View style={{ flex: 1 }}>
-               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Medium', fontSize: 14, marginTop: 2 }}>
+               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium', fontSize: 14, marginTop: 2 }}>
                  This phone number is not on {APP_TAG_NAME}.
                </Text>
              </View>
