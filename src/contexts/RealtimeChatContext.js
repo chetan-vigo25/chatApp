@@ -192,7 +192,7 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping }) => {
   }
 
   const rawLastMessage = chat?.lastMessage;
-  const messageText = typeof rawLastMessage === 'string' ? rawLastMessage : (rawLastMessage?.text || chat?.lastMessage || '');
+  const messageText = typeof rawLastMessage === 'string' ? rawLastMessage : (rawLastMessage?.text || '');
   const messageType = (chat?.lastMessageType || rawLastMessage?.type || 'text').toString().toLowerCase();
   const messageSender = chat?.lastMessageSender || rawLastMessage?.senderId || null;
   const isEdited = Boolean(rawLastMessage?.isEdited || chat?.lastMessageEdited || rawLastMessage?.editedAt);
@@ -313,12 +313,22 @@ const getMessageIdentifier = (message = {}) => {
 
 const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
   const baseLastMessage = existingChat?.lastMessage || {};
-  const messageText =
+  const incomingText =
     item?.lastMessage?.text ||
-    item?.lastMessage ||
+    (typeof item?.lastMessage === 'string' ? item.lastMessage : null) ||
     item?.text ||
-    baseLastMessage?.text ||
     '';
+
+  const incomingMsgId = normalizeId(
+    item?.lastMessage?.serverMessageId || item?.lastMessage?.messageId || item?.messageId || item?.lastMessage?.id || item?.id
+  );
+  const existingMsgId = getMessageIdentifier(baseLastMessage);
+
+  // If the existing lastMessage was edited locally and the incoming update refers to the same message,
+  // preserve the edited text (server may not have caught up yet)
+  const isSameMessage = incomingMsgId && existingMsgId && String(incomingMsgId) === String(existingMsgId);
+  const keepLocalEdit = isSameMessage && baseLastMessage?.isEdited && !item?.lastMessage?.isEdited && !item?.isEdited;
+  const messageText = keepLocalEdit ? baseLastMessage.text : (incomingText || baseLastMessage?.text || '');
 
   const status = pickHighestMessageStatus(
     baseLastMessage?.status,
@@ -332,6 +342,8 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
     tempId: item?.lastMessage?.tempId || item?.tempId || baseLastMessage?.tempId || null,
     id: item?.lastMessage?.id || item?.messageId || item?.id || baseLastMessage?.id || null,
     text: messageText,
+    isEdited: keepLocalEdit ? true : (item?.lastMessage?.isEdited || item?.isEdited || baseLastMessage?.isEdited || false),
+    editedAt: keepLocalEdit ? baseLastMessage.editedAt : (item?.lastMessage?.editedAt || item?.editedAt || baseLastMessage?.editedAt || null),
     type: item?.lastMessageType || item?.lastMessage?.type || baseLastMessage?.type || 'text',
     createdAt: item?.lastMessageAt || item?.lastMessage?.createdAt || fallbackTimestamp || baseLastMessage?.createdAt || Date.now(),
     senderId: item?.lastMessageSender || item?.lastMessage?.senderId || baseLastMessage?.senderId || null,
@@ -496,6 +508,18 @@ const reducer = (state, action) => {
           _id: normalizeId(chat?.peerUser?._id || chat?.peerUser?.userId || chat?.peerUser?.id || prev?.peerUser?._id || prev?.peerUser?.userId || prev?.peerUser?.id || peerUserId),
         };
 
+        // Preserve locally edited lastMessage if server hasn't caught up
+        const prevLastMsg = prev?.lastMessage;
+        const incomingLastMsg = chat?.lastMessage;
+        const prevMsgId = getMessageIdentifier(prevLastMsg || {});
+        const incomingMsgId = normalizeId(
+          incomingLastMsg?.serverMessageId || incomingLastMsg?.messageId || incomingLastMsg?.id ||
+          chat?.lastMessage?.serverMessageId || chat?.lastMessage?.messageId
+        );
+        const sameMsg = prevMsgId && incomingMsgId && String(prevMsgId) === String(incomingMsgId);
+        // Preserve local edit if server hasn't acknowledged the edit yet
+        const preserveEdit = (prevLastMsg?.isEdited || prev?.lastMessageEdited) && !incomingLastMsg?.isEdited && !chat?.lastMessageEdited;
+
         nextMap[chatId] = {
           ...prev,
           ...chat,
@@ -503,6 +527,8 @@ const reducer = (state, action) => {
           chatId,
           peerUser: normalizedPeerUser,
           unreadCount,
+          lastMessage: preserveEdit ? prevLastMsg : (incomingLastMsg || prevLastMsg),
+          lastMessageEdited: preserveEdit ? true : (chat?.lastMessageEdited || prev?.lastMessageEdited || false),
           lastMessageAt: chat?.lastMessageAt || prev?.lastMessageAt || chat?.lastMessage?.createdAt || prev?.lastMessage?.createdAt,
         };
       });
@@ -565,6 +591,8 @@ const reducer = (state, action) => {
         if (!chat) return;
         const existing = nextMap[chat.chatId] || {};
 
+        const cachePreserveEdit = (existing?.lastMessage?.isEdited || existing?.lastMessageEdited) && !chat?.lastMessage?.isEdited && !chat?.lastMessageEdited;
+
         nextMap[chat.chatId] = {
           ...chat,
           ...existing,
@@ -579,6 +607,7 @@ const reducer = (state, action) => {
             ...(existing?.otherUser || {}),
             ...(chat?.otherUser || chat?.peerUser || {}),
           },
+          ...(cachePreserveEdit ? { lastMessage: existing.lastMessage, lastMessageEdited: true } : {}),
           unreadCount: Number(chat?.unreadCount || 0),
           timestamp: chat?.timestamp || getChatTimestampIso(chat),
           lastMessageAt: chat?.lastMessageAt || chat?.timestamp || getChatTimestampIso(chat),
@@ -792,20 +821,39 @@ const reducer = (state, action) => {
 
     case 'LOCAL_LAST_MESSAGE_OVERRIDE': {
       const payload = action.payload || {};
-      const chatId = normalizeId(payload.chatId);
-      if (!chatId) return state;
+      const rawChatId = normalizeId(payload.chatId);
+      if (!rawChatId) return state;
+
+      // Find the chat entry — key might differ from the chatId we have
+      let chatId = rawChatId;
+      if (!state.chatMap[chatId]) {
+        // Extract user IDs from u_xxx_yyy format for reverse match
+        const parts = String(rawChatId).startsWith('u_') ? String(rawChatId).split('_').slice(1) : [];
+        const reversedChatId = parts.length === 2 ? `u_${parts[1]}_${parts[0]}` : null;
+
+        const found = Object.keys(state.chatMap).find(key => {
+          const entry = state.chatMap[key];
+          return String(entry?.chatId) === String(rawChatId) ||
+                 String(entry?._id) === String(rawChatId) ||
+                 String(key) === String(rawChatId) ||
+                 (reversedChatId && (String(key) === reversedChatId || String(entry?.chatId) === reversedChatId));
+        });
+        if (found) chatId = found;
+      }
 
       const existing = state.chatMap[chatId] || { _id: chatId, chatId };
+      const lastMsg = payload.lastMessage || existing.lastMessage || { text: 'No messages yet', type: 'text' };
       const nextMap = {
         ...state.chatMap,
         [chatId]: {
           ...existing,
           chatId,
           _id: normalizeId(existing._id) || chatId,
-          lastMessage: payload.lastMessage || existing.lastMessage || { text: 'No messages yet', type: 'text' },
-          lastMessageType: payload.lastMessageType || payload.lastMessage?.type || existing.lastMessageType || 'text',
-          lastMessageSender: payload.lastMessageSender ?? payload.lastMessage?.senderId ?? existing.lastMessageSender ?? null,
-          lastMessageAt: payload.lastMessageAt || payload.lastMessage?.createdAt || existing.lastMessageAt || null,
+          lastMessage: lastMsg,
+          lastMessageType: payload.lastMessageType || lastMsg?.type || existing.lastMessageType || 'text',
+          lastMessageSender: payload.lastMessageSender ?? lastMsg?.senderId ?? existing.lastMessageSender ?? null,
+          lastMessageAt: payload.lastMessageAt || lastMsg?.createdAt || existing.lastMessageAt || null,
+          lastMessageEdited: lastMsg?.isEdited ? true : (existing.lastMessageEdited || false),
         },
       };
 
@@ -925,12 +973,24 @@ const reducer = (state, action) => {
           _id: normalizeId(item?.peerUser?._id || item?.peerUser?.userId || item?.peerUser?.id || existing?.peerUser?._id || existing?.peerUser?.userId || existing?.peerUser?.id || itemPeerUserId),
         };
 
+        // Check if existing lastMessage was edited locally and server hasn't caught up
+        const existingLastMsg = existing?.lastMessage;
+        const incomingLastMsg = item?.lastMessage;
+        const existingWasEdited = existingLastMsg?.isEdited === true || existing?.lastMessageEdited === true;
+        const incomingAcksEdit = incomingLastMsg?.isEdited === true || item?.isEdited === true;
+        const shouldPreserveEdit = existingWasEdited && !incomingAcksEdit && type !== 'message_edited';
+
         const mergedBase = {
           ...existing,
           ...item,
           _id: normalizeId(item?._id) || normalizeId(existing?._id) || chatId,
           chatId,
           peerUser: mergedPeerUser,
+          // Preserve edited lastMessage over server's old data
+          ...(shouldPreserveEdit ? {
+            lastMessage: existingLastMsg,
+            lastMessageEdited: true,
+          } : {}),
         };
 
         if (typeof item?.unreadCount === 'number') {
@@ -1000,14 +1060,19 @@ const reducer = (state, action) => {
           }
 
           case 'message_edited': {
+            const editedText = item?.lastMessage?.text
+              || (typeof item?.lastMessage === 'string' ? item.lastMessage : null)
+              || item?.text
+              || existing?.lastMessage?.text
+              || '';
             const lastMessage = {
               ...(existing?.lastMessage || {}),
-              text: item?.lastMessage || item?.text || existing?.lastMessage?.text || '',
+              text: editedText,
               type: item?.lastMessageType || existing?.lastMessage?.type || 'text',
-              senderId: item?.lastMessageSender || existing?.lastMessage?.senderId || existing?.lastMessageSender || null,
+              senderId: item?.lastMessageSender || item?.lastMessage?.senderId || existing?.lastMessage?.senderId || existing?.lastMessageSender || null,
               createdAt: item?.lastMessageAt || existing?.lastMessage?.createdAt || existing?.lastMessageAt || timestamp,
               isEdited: true,
-              editedAt: item?.editedAt || timestamp,
+              editedAt: item?.editedAt || item?.lastMessage?.editedAt || timestamp,
             };
 
             nextMap[chatId] = {
@@ -1645,6 +1710,37 @@ export function RealtimeChatProvider({ children }) {
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
 
+    // Handle message edit events — update chat list preview for both sender and receiver
+    const onMessageEditedForChatList = (payload) => {
+      const source = payload?.data || payload || {};
+      const messageId = normalizeId(source?.messageId || source?.id || source?._id);
+      const newText = source?.text || source?.newText;
+      const chatId = normalizeId(source?.chatId);
+      if (!messageId || !chatId || !newText) return;
+
+      // Queue as a message_edited chat list update so it goes through the reducer
+      onChatListUpdate({
+        type: 'message_edited',
+        reason: 'message.edited',
+        chatId,
+        item: {
+          chatId,
+          messageId,
+          lastMessage: {
+            text: newText,
+            serverMessageId: messageId,
+            messageId,
+            isEdited: true,
+            editedAt: source?.editedAt || Date.now(),
+          },
+          lastMessageSender: source?.senderId || null,
+          lastMessageAt: source?.createdAt || null,
+          editedAt: source?.editedAt || Date.now(),
+          isEdited: true,
+        },
+      });
+    };
+
     socket.on('message:new', onMessage);
     socket.on('message:received', onMessage);
     socket.on('message:delivered', onMessageDelivered);
@@ -1669,6 +1765,8 @@ export function RealtimeChatProvider({ children }) {
     socket.on('typing:stop', onTypingStopSocket);
     socket.on('typing:indicator', onTypingIndicator);
     socket.on('chat:list:update', onChatListUpdate);
+    socket.on('message:edit:response', onMessageEditedForChatList);
+    socket.on('message:edited', onMessageEditedForChatList);
     socket.on('chat:info:response', onChatInfoResponse);
     socket.on('chat:pin:response', onChatPinResponse);
     socket.on('chat:unpin:response', onChatUnpinResponse);
@@ -1702,6 +1800,8 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('typing:stop', onTypingStopSocket),
       () => socket.off('typing:indicator', onTypingIndicator),
       () => socket.off('chat:list:update', onChatListUpdate),
+      () => socket.off('message:edit:response', onMessageEditedForChatList),
+      () => socket.off('message:edited', onMessageEditedForChatList),
       () => socket.off('chat:info:response', onChatInfoResponse),
       () => socket.off('chat:pin:response', onChatPinResponse),
       () => socket.off('chat:unpin:response', onChatUnpinResponse),

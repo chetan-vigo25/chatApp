@@ -19,7 +19,6 @@
       }
     },
     "production": {
-      "autoIncrement": true,
       "channel": "production",
       "distribution": "store",
       "android": {

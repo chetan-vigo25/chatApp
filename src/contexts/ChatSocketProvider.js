@@ -394,6 +394,45 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       }
     };
 
+    // Handle chat:list:update for message edits (receiver side)
+    const onChatListUpdateForEdit = async (payload) => {
+      const source = payload?.data || payload || {};
+      const reason = (source?.reason || '').toString().toLowerCase();
+      const type = (source?.type || '').toString().toLowerCase();
+      const isEditEvent = reason === 'message.edited' || reason === 'kafka.message.edited' || type === 'message_edited';
+      if (!isEditEvent) return;
+
+      const item = source?.item || {};
+      const chatId = source?.chatId || item?.chatId || item?._id;
+      const messageId = item?.messageId || item?.lastMessage?.messageId || item?.lastMessage?.serverMessageId || item?.lastMessage?._id;
+      const newText = item?.lastMessage?.text || (typeof item?.lastMessage === 'string' ? item.lastMessage : null) || item?.text;
+      if (!messageId || !chatId || !newText) return;
+
+      const localKey = getChatMessagesKey(chatId);
+      if (!localKey) return;
+
+      try {
+        const raw = await AsyncStorage.getItem(localKey);
+        if (!raw) return;
+        const messages = JSON.parse(raw);
+        if (!Array.isArray(messages)) return;
+
+        let changed = false;
+        const updated = messages.map((msg) => {
+          const id = msg?.serverMessageId || msg?.id || msg?.tempId;
+          if (String(id) !== String(messageId)) return msg;
+          changed = true;
+          return { ...msg, text: newText, isEdited: true, editedAt: item?.editedAt || item?.lastMessage?.editedAt || Date.now() };
+        });
+
+        if (changed) {
+          await AsyncStorage.setItem(localKey, JSON.stringify(updated));
+        }
+      } catch (err) {
+        console.error('ChatSocketProvider: chat:list:update edit failed', err);
+      }
+    };
+
     // Handle message:edit:response — update edited message in local storage
     const onEditResponse = async (payload) => {
       const source = payload?.data || payload || {};
@@ -447,6 +486,8 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:read:all:response', onReadAllResponse);
       socket.off('message:read:bulk:response', onReadBulkResponse);
       socket.off('message:edit:response', onEditResponse);
+      socket.off('message:edited', onEditResponse);
+      socket.off('chat:list:update', onChatListUpdateForEdit);
 
       socket.on('message:new', handleNewMessage);
       socket.on('message:delete:everyone:response', onDeleteEveryoneResponse);
@@ -459,6 +500,8 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.on('message:read:all:response', onReadAllResponse);
       socket.on('message:read:bulk:response', onReadBulkResponse);
       socket.on('message:edit:response', onEditResponse);
+      socket.on('message:edited', onEditResponse);
+      socket.on('chat:list:update', onChatListUpdateForEdit);
     };
 
     const detachMessageListeners = () => {
@@ -474,6 +517,8 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:read:all:response', onReadAllResponse);
       socket.off('message:read:bulk:response', onReadBulkResponse);
       socket.off('message:edit:response', onEditResponse);
+      socket.off('message:edited', onEditResponse);
+      socket.off('chat:list:update', onChatListUpdateForEdit);
     };
 
     const onSocketConnect = () => attachMessageListeners();

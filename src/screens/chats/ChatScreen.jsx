@@ -42,7 +42,7 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
@@ -1189,6 +1189,7 @@ export default function ChatScreen({ navigation, route }) {
     goToPreviousResult,
     selectedMessage,
     handleToggleSelectMessages,
+    clearSelectedMessages,
     handleDeleteSelected,
     text,
     handleTextChange,
@@ -3597,22 +3598,14 @@ export default function ChatScreen({ navigation, route }) {
             if (!isDeletedMessage) {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
               handleToggleSelectMessages(messageKey);
+              if (!isMyMessage) {
+                Alert.alert('Message Options', '', [
+                  { text: 'Cancel', style: 'cancel' },
+                  { text: 'Report Message', onPress: () => handleReportMessage(msg), style: 'destructive' },
+                ]);
+              }
             }
           }} 
-
-          // onLongPress={() => {
-          //   if (!isDeletedMessage) {
-          //     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-          //     handleToggleSelectMessages(messageKey);
-          //     if (!isMyMessage) {
-          //       Alert.alert('Message Options', '', [
-          //         { text: 'Cancel', style: 'cancel' },
-          //         { text: 'Report Message', onPress: () => handleReportMessage(msg), style: 'destructive' },
-          //       ]);
-          //     }
-          //   }
-          // }} 
-
           style={{ 
             alignItems: isMyMessage ? "flex-end" : "flex-start", 
             paddingVertical: 2, 
@@ -3887,16 +3880,14 @@ export default function ChatScreen({ navigation, route }) {
                   && !selMsg.isDeleted;
                 if (!canEdit) return null;
                 return (
-                  <></>
-                 // Edit message
-                  // <TouchableOpacity
-                  //   onPress={() => {
-                  //     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-                  //     startEditMessage(selMsg);
-                  //   }}
-                  //   style={{ padding: 10, borderRadius: 20, backgroundColor: theme.colors.themeColor, marginRight: 8 }}>
-                  //   <MaterialIcons name="edit" size={18} color="#fff" />
-                  // </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => {
+                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                      startEditMessage(selMsg);
+                    }}
+                    style={{ padding: 10, borderRadius: 20, backgroundColor: theme.colors.themeColor, marginRight: 8 }}>
+                    <MaterialIcons name="edit" size={18} color="#fff" />
+                  </TouchableOpacity>
                 );
               })()}
               <TouchableOpacity
@@ -4779,7 +4770,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                <ImageZoom
+                {/* <ImageZoom
                   uri={localMediaViewer.uri}
                   minScale={1}
                   maxScale={5}
@@ -4789,7 +4780,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                />
+                /> */}
               </GestureHandlerRootView>
             )}
 
@@ -4842,6 +4833,7 @@ export default function ChatScreen({ navigation, route }) {
       <ReportBottomSheet
         visible={reportModalVisible}
         onClose={() => setReportModalVisible(false)}
+        onSuccess={() => clearSelectedMessages()}
         payload={reportPayload}
         analytics={reportAnalytics}
       />

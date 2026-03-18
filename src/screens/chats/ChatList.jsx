@@ -55,6 +55,7 @@ const getAvatarColor = (name) => {
 export default function ChatList({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
+  const openSwipeableRef = useRef(null);
   const dispatch = useDispatch();
   const { chatsData, isLoading } = useSelector((state) => state.chat);
 
@@ -635,6 +636,7 @@ export default function ChatList({ navigation }) {
               <ChatCard
                 item={item}
                 theme={theme}
+                openSwipeableRef={openSwipeableRef}
                 onPress={() => navigation.navigate('ChatScreen', { item })}
                 onLongPress={() => openActionMenu(item)}
                 onAvatarPress={() => openProfilePreview(item)}

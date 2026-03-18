@@ -6,6 +6,7 @@ import { Swipeable } from 'react-native-gesture-handler';
 const ChatCard = ({
   item,
   theme,
+  openSwipeableRef,
   onPress,
   onLongPress,
   onAvatarPress,
@@ -33,6 +34,15 @@ const ChatCard = ({
   const closeSwipeable = useCallback(() => {
     swipeableRef.current?.close();
   }, []);
+
+  const onSwipeableOpen = useCallback(() => {
+    if (openSwipeableRef?.current && openSwipeableRef.current !== swipeableRef.current) {
+      openSwipeableRef.current.close();
+    }
+    if (openSwipeableRef) {
+      openSwipeableRef.current = swipeableRef.current;
+    }
+  }, [openSwipeableRef]);
 
   const handleSwipePin = useCallback(() => {
     closeSwipeable();
@@ -98,6 +108,12 @@ const ChatCard = ({
       friction={2}
       renderLeftActions={renderLeftActions}
       renderRightActions={renderRightActions}
+      onSwipeableWillOpen={onSwipeableOpen}
+      onSwipeableClose={() => {
+        if (openSwipeableRef?.current === swipeableRef.current) {
+          openSwipeableRef.current = null;
+        }
+      }}
     >
       <Animated.View style={[styles.cardOuter, { backgroundColor: theme.colors.background, transform: [{ scale }] }]}>
         <TouchableOpacity

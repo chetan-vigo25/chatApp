@@ -60,6 +60,7 @@ const formatClock = (timestamp) => {
 const buildBannerModel = (payload = {}) => {
   const notification = payload?.notificationData?.notification || {};
   const data = payload?.notificationData?.data || {};
+  const avtar = data?.profileImage || payload?.profileImage || null
 
   const senderName =
     data?.senderName ||
@@ -76,12 +77,7 @@ const buildBannerModel = (payload = {}) => {
     senderName,
     title: notification?.title || senderName,
     body: notification?.body || '',
-    avatarUrl:
-      data?.senderProfileImage ||
-      data?.profileImage ||
-      payload?.senderProfileImage ||
-      payload?.profileImage ||
-      null,
+    avatarUrl: avtar,
     timestamp: Number(payload?.timestamp || Date.now()),
     isGroup: String(data?.isGroup || 'false').toLowerCase() === 'true',
     metadata: payload?.metadata || {},
@@ -233,6 +229,7 @@ export default function WhatsAppBannerHost() {
 
   const handleBannerPress = useCallback(() => {
     const current = currentRef.current;
+    console.log("current ================ ", current)
     if (!current) return;
 
     dismissCurrent('navigate', () => {
