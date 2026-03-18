@@ -2712,9 +2712,19 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:new', onMessageNew);
 
     const onMessageReceived = (data) => { handleReceivedMessage(data); };
-    const onMessageDelivered = (data) => { if (data.messageId) updateMessageStatus(data.messageId, 'delivered', data); };
+    const onMessageDelivered = (data) => {
+      const source = data?.data || data;
+      const messageId = source?.messageId || source?._id;
+      if (messageId) updateMessageStatus(messageId, 'delivered', source);
+    };
     const onMessageRead = (data) => {
       const source = data?.data || data;
+
+      // Ignore read events triggered by ourselves (e.g. message:read:all on chat open).
+      // Only mark our outgoing messages as "seen" when the *peer* has read them.
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
+
       if (source?.messageId) {
         updateMessageStatus(source.messageId, 'seen', source);
         return;
@@ -2748,6 +2758,9 @@ export default function useChatLogic({ navigation, route }) {
 
     const onMessageReadBulk = (data) => {
       const source = data?.data || data;
+      // Ignore bulk read events triggered by ourselves
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
       const messageIds = Array.isArray(source?.messageIds) ? source.messageIds : [];
       if (messageIds.length > 0) {
         setAllMessages(prev => {
@@ -2800,6 +2813,9 @@ export default function useChatLogic({ navigation, route }) {
 
     const onReadBulkResponse = (data) => {
       const source = data?.data || data;
+      // This is a response to our own message:read:bulk — we marked incoming messages as read.
+      // These confirmed IDs are incoming messages we read, so just update those specific messages
+      // (not our outgoing ones). Only incoming messages should be set to 'seen' here.
       const results = Array.isArray(source?.results) ? source.results : [];
       const successIds = results.filter(r => r?.success).map(r => String(r?.messageId)).filter(Boolean);
       if (successIds.length === 0) return;
@@ -2810,6 +2826,8 @@ export default function useChatLogic({ navigation, route }) {
         const updated = prev.map(msg => {
           const id = String(msg.serverMessageId || msg.id || msg.tempId || '');
           if (!idSet.has(id)) return msg;
+          // Only update incoming messages (from peer), not our own outgoing messages
+          if (msg.senderId === currentUserIdRef.current) return msg;
           if (msg.status === 'seen' || msg.status === 'read') return msg;
           changed = true;
           return { ...msg, status: 'seen' };
@@ -2828,7 +2846,11 @@ export default function useChatLogic({ navigation, route }) {
       const responseChatId = source?.chatId;
       if (!responseChatId || !sameId(responseChatId, currentChatId)) return;
 
-      // All messages sent by current user in this chat are now read by the peer
+      // This is the response to OUR message:read:all emission (we told the server we read incoming messages).
+      // Only mark our outgoing messages as seen if the server indicates the PEER triggered this read.
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+
       setAllMessages(prev => {
         let changed = false;
         const updated = prev.map(msg => {
