@@ -3935,6 +3935,10 @@ export default function useChatLogic({ navigation, route }) {
     setSelectedMessages((prevSelected) => prevSelected.includes(messageId) ? prevSelected.filter((id) => id !== messageId) : [...prevSelected, messageId]);
   }, []);
 
+  const clearSelectedMessages = useCallback(() => {
+    setSelectedMessages([]);
+  }, []);
+
   const deleteSelectedMessages = useCallback(async (deleteForEveryone) => {
     try {
       const socket = getSocket();
@@ -4888,7 +4892,7 @@ export default function useChatLogic({ navigation, route }) {
     userStatus, customStatus, presenceDetails, manualPresencePending, renderStatusText,
     setManualPresence, clearManualPresence,
     search, handleSearch, clearSearch, goToNextResult, goToPreviousResult, searchResults, currentSearchIndex,
-    selectedMessage, handleToggleSelectMessages, handleDeleteSelected,
+    selectedMessage, handleToggleSelectMessages, clearSelectedMessages, handleDeleteSelected,
     text, setText, handleTextChange, handleSendText,
     sendLocationMessage, sendContactMessage,
     pendingMedia, setPendingMedia, sendMedia, handlePickMedia, showMediaOptions, openMediaOptions, closeMediaOptions,

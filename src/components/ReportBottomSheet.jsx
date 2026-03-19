@@ -58,31 +58,33 @@ export const ReportBottomSheet = ({
       return;
     }
     setLoading(true);
+    let res;
     try {
-      const res = await submitReport({
+      res = await submitReport({
         ...payload,
         reason,
         description,
       });
-      setLoading(false);
-      if (res.success) {
-        if (analytics?.report_submitted) analytics.report_submitted();
-        if (onSuccess) onSuccess();
-        onClose();
-        setTimeout(() => {
-          Alert.alert(
-            'Report Submitted',
-            'Thank you for helping us keep the community safe. We will review your report shortly.',
-            [{ text: 'OK' }],
-          );
-        }, 300);
-      } else {
-        setError(res.message || 'Failed to submit report.');
-        if (analytics?.report_failed) analytics.report_failed();
-      }
     } catch (err) {
       setLoading(false);
       setError('Network error. Please try again.');
+      if (analytics?.report_failed) analytics.report_failed();
+      return;
+    }
+    setLoading(false);
+    if (res.success) {
+      if (analytics?.report_submitted) analytics.report_submitted();
+      try { if (onSuccess) onSuccess(); } catch (e) { console.log('onSuccess error:', e); }
+      try { onClose(); } catch (e) { console.log('onClose error:', e); }
+      setTimeout(() => {
+        Alert.alert(
+          'Report Submitted',
+          'Report submitted successfully.',
+          [{ text: 'OK' }],
+        );
+      }, 300);
+    } else {
+      setError(res.message || 'Failed to submit report.');
       if (analytics?.report_failed) analytics.report_failed();
     }
   };

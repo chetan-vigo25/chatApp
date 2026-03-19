@@ -23,7 +23,7 @@ export default function Otp({ navigation, route }) {
     const deviceInfo = useDeviceInfo();
     const { selectedCountry, phoneNumber, location, address } = route.params;
     const dispatch = useDispatch();
-    const { isLoading, otpMessage, error } = useSelector((state) => state.authentication);
+    const { isLoading, otpMessage, otpData, error } = useSelector((state) => state.authentication);
     const fadeAnim = useRef(new Animated.Value(0)).current;
     const otpInputRef = useRef(null);
     const { theme, isDarkMode, toggleTheme } = useTheme();
@@ -31,6 +31,7 @@ export default function Otp({ navigation, route }) {
     const [seconds, setSeconds] = useState(60);
     const [isActive, setIsActive] = useState(true);
     const [fcmToken, setFcmToken] = useState(null);
+    console.log("sdfsadfds",otpMessage)
 
     useEffect(() => {
         const loadToken = async () => {
@@ -274,10 +275,10 @@ export default function Otp({ navigation, route }) {
                 <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: seconds > 0 ? theme.colors.themeColor : theme.colors.placeHolderTextColor, }} >{formatTime(seconds)}</Text>
              </View>
           </View>
-          <TouchableOpacity onPress={handleVerifyOtp} disabled={isLoading || otp.length !== 6} style={{ width:'50%', height:40, backgroundColor:(otp.length === 6 && !isLoading) ? theme.colors.themeColor : theme.colors.placeHolderTextColor, justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40 }} >
+          <TouchableOpacity onPress={handleVerifyOtp} disabled={isLoading || otp.length !== 6} style={{ width:'50%', height:45, backgroundColor:(otp.length === 6) ? theme.colors.themeColor : '#f1f1f1', justifyContent:'center', alignItems:'center', alignSelf:'center', marginTop:20, borderRadius:5, position:'absolute', bottom:40,  }} >
             {
               isLoading ? <ActivityIndicator size="small" color={theme.colors.textWhite} /> :
-              <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.textWhite, }} >Verify OTP</Text>
+              <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color:(otp.length === 6 && !isLoading)? theme.colors.textWhite : '#999', }} >Verify OTP</Text>
             }
           </TouchableOpacity>
         </View>

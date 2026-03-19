@@ -21,7 +21,7 @@ async function generateOtp(phoneNumber) {
             if (response.statusCode === 200) {
                 console.log("test responce",response.data);
                 showToast(response.message);
-                return { otpMessage: response.message }; 
+                return { otpMessage: response.message, otpData: response.data };
             } else {
                 showToast(response.message)
                 console.error("Unexpected response message:", response.message);

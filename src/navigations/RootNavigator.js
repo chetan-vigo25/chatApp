@@ -154,6 +154,7 @@ import StatusScreen from "../screens/presence/StatusScreen";
 import ContactsPresenceScreen from "../screens/presence/ContactsPresenceScreen";
 import SessionsScreen from "../screens/presence/SessionsScreen";
 import PrivacySettingsScreen from "../screens/presence/PrivacySettingsScreen";
+import BottomTabNavigator from "./BottomTabNavigator";
 
 import { useTheme } from "../contexts/ThemeContext";
 
@@ -177,6 +178,11 @@ export default function RootNavigator() {
             text: theme.colors.text,
             border: theme.colors.border,
             notification: theme.colors.primary,
+          },
+          fonts: theme.fonts || { regular: 'System', medium: 'System', bold: 'System' },
+          typography: {
+            medium: theme.fonts?.medium ?? 'System',
+            bold: theme.fonts?.bold ?? 'System',
           },
         }}
       >
@@ -218,7 +224,7 @@ export default function RootNavigator() {
           <Stack.Screen name="UserAgree" component={UserAgree} />
           <Stack.Screen name="Login" component={Login} />
           <Stack.Screen name="Otp" component={Otp} />
-          <Stack.Screen name="ChatList" component={ChatList} />
+          <Stack.Screen name="ChatList" component={BottomTabNavigator} />
           <Stack.Screen name="ChatScreen" component={ChatScreen} />
           <Stack.Screen name="AddUser" component={AddUser} />
           <Stack.Screen name="Profile" component={Profile} />

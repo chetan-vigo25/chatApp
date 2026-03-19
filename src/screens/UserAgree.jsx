@@ -52,22 +52,9 @@ export default function UserAgree({ navigation }) {
             <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor }} >.</Text>
           </View>
         </View>
-        <TouchableOpacity onPress={() => navigation.navigate('Login')} style={{ width:'80%', height:50, backgroundColor: theme.colors.themeColor, borderRadius:8, alignItems:'center', justifyContent:'center', }} >
-          <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 16, color: theme.colors.textWhite, }} >AGREE AND CONTINUE</Text>
+        <TouchableOpacity onPress={() => navigation.navigate('Login')} style={{ width:'70%', height:45, backgroundColor: theme.colors.themeColor, borderRadius:8, alignItems:'center', justifyContent:'center', }} >
+          <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 15, color: theme.colors.textWhite, }} >AGREE AND CONTINUE</Text>
         </TouchableOpacity>
-        {/* <Pressable
-          onPress={toggleTheme}
-          style={{
-              paddingVertical: 12,
-              paddingHorizontal: 24,
-              borderRadius: 8,
-              backgroundColor: theme.colors.background,
-          }}
-          >
-          <Text style={{ color: theme.colors.primaryTextColor, fontSize: 16, }} >
-            {isDarkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
-          </Text>
-        </Pressable> */}
       </View>
     </Animated.View>
   );

@@ -42,7 +42,7 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
@@ -3772,7 +3772,7 @@ export default function ChatScreen({ navigation, route }) {
             ))}
           </View>
           <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: "Roboto-Medium", fontStyle: 'italic', marginLeft: 4 }}>
-            {chatData?.peerUser?.name || 'User'} is typing...
+            typing...
           </Text>
         </View>
       </View>
@@ -4770,7 +4770,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                {/* <ImageZoom
+                <ImageZoom
                   uri={localMediaViewer.uri}
                   minScale={1}
                   maxScale={5}
@@ -4780,7 +4780,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                /> */}
+                />
               </GestureHandlerRootView>
             )}
 

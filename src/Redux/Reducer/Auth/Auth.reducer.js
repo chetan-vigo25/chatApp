@@ -8,7 +8,7 @@ export const generateOtpAction = createAsyncThunk(
     try {
       const response = await authServices.generateOtp(mobile);
       // console.log("msg test", response)
-      return response.otpMessage;
+      return { otpMessage: response.otpMessage, otpData: response.otpData };
     } catch (error) {
       return rejectWithValue(error.message || "OTP generation failed");
     }
@@ -77,6 +77,7 @@ const authSlice = createSlice({
     isLoading: false,
     error: null,
     otpMessage: '', // State for storing OTP message
+    otpData: null, // State for storing OTP data (dev)
   },
   reducers: {
     logout: (state) => {
@@ -95,7 +96,8 @@ const authSlice = createSlice({
       })
       .addCase(generateOtpAction.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.otpMessage = action.payload; // Store OTP message
+        state.otpMessage = action.payload?.otpMessage || action.payload;
+        state.otpData = action.payload?.otpData || null;
         state.error = null;
       })
       .addCase(generateOtpAction.rejected, (state, action) => {

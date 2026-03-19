@@ -38,6 +38,8 @@ export default function ArchivedChats({ navigation }) {
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
 
+  const openSwipeableRef = useRef(null);
+
   // Animations
   const profileOpacityAnim = useRef(new Animated.Value(0)).current;
   const profileScaleAnim = useRef(new Animated.Value(0)).current;
@@ -344,6 +346,7 @@ export default function ArchivedChats({ navigation }) {
             <ChatCard
               item={item}
               theme={theme}
+              openSwipeableRef={openSwipeableRef}
               onPress={() => navigation.navigate('ChatScreen', { item })}
               onLongPress={() => openActionMenu(item)}
               onAvatarPress={() => openProfilePreview(item)}
