@@ -62,6 +62,7 @@ const initialState = {
   highlightByChat: {},
   totalUnread: 0,
   hasHydratedCache: false,
+  removedChatIds: {}, // Track removed chats to prevent re-hydration
 };
 
 const normalizeId = (value) => {
@@ -76,12 +77,14 @@ const normalizeId = (value) => {
 };
 
 const getPeerUserId = (chatLike = {}) => {
+  // Group chats have no peer user — skip userId field to avoid matching self
+  if (chatLike?.chatType === 'group' || chatLike?.isGroup) return null;
   return normalizeId(
     chatLike?.peerUser?._id ||
     chatLike?.peerUser?.userId ||
     chatLike?.peerUser?.id ||
     chatLike?.participantId ||
-    chatLike?.userId ||
+    chatLike?.peerUserId ||
     null
   );
 };
@@ -484,10 +487,14 @@ const reducer = (state, action) => {
 
       incoming.forEach((chat) => {
         const normalizedChatId = normalizeId(chat?.chatId || chat?._id);
+        const normalizedGroupId = normalizeId(chat?.groupId || chat?.group?._id);
         const peerUserId = getPeerUserId(chat);
         const aliasChatId = findChatIdByPeer(nextMap, peerUserId, normalizedChatId);
         const chatId = normalizedChatId || aliasChatId;
         if (!chatId) return;
+
+        // Skip chats that were removed in this session (prevents re-adding deleted groups)
+        if (state.removedChatIds[chatId] || (normalizedGroupId && state.removedChatIds[normalizedGroupId])) return;
 
         const aliasExisting = aliasChatId && aliasChatId !== chatId ? nextMap[aliasChatId] : null;
         const prev = {
@@ -502,11 +509,14 @@ const reducer = (state, action) => {
 
         const prevUnread = state.unreadByChat[chatId];
         const unreadCount = typeof prevUnread === 'number' ? prevUnread : Number(chat?.unreadCount || 0);
-        const normalizedPeerUser = {
-          ...(prev?.peerUser || {}),
-          ...(chat?.peerUser || {}),
-          _id: normalizeId(chat?.peerUser?._id || chat?.peerUser?.userId || chat?.peerUser?.id || prev?.peerUser?._id || prev?.peerUser?.userId || prev?.peerUser?.id || peerUserId),
-        };
+        const isGroupChat = chat?.chatType === 'group' || chat?.isGroup;
+        const normalizedPeerUser = isGroupChat
+          ? null
+          : {
+              ...(prev?.peerUser || {}),
+              ...(chat?.peerUser || {}),
+              _id: normalizeId(chat?.peerUser?._id || chat?.peerUser?.userId || chat?.peerUser?.id || prev?.peerUser?._id || prev?.peerUser?.userId || prev?.peerUser?.id || peerUserId),
+            };
 
         // Preserve locally edited lastMessage if server hasn't caught up
         const prevLastMsg = prev?.lastMessage;
@@ -1350,6 +1360,199 @@ const reducer = (state, action) => {
       };
     }
 
+    // ─── GROUP: Remove chat from list (after leave/delete) ───
+    case 'REMOVE_CHAT': {
+      const targetId = normalizeId(action.payload);
+      if (!targetId) return state;
+
+      const nextMap = { ...state.chatMap };
+      const unreadByChat = { ...state.unreadByChat };
+      const removedChatIds = { ...state.removedChatIds };
+
+      // Remove by direct ID
+      if (nextMap[targetId]) {
+        delete nextMap[targetId];
+        delete unreadByChat[targetId];
+      }
+
+      // Also remove any entry whose chatId or groupId matches the target
+      Object.keys(nextMap).forEach((key) => {
+        const entry = nextMap[key];
+        const entryChatId = normalizeId(entry?.chatId);
+        const entryGroupId = normalizeId(entry?.groupId || entry?.group?._id);
+        if (entryChatId === targetId || entryGroupId === targetId) {
+          delete nextMap[key];
+          delete unreadByChat[key];
+        }
+      });
+
+      // Track as removed so HYDRATE_CHATS won't re-add it
+      removedChatIds[targetId] = Date.now();
+
+      const sections = buildOrderedSections(nextMap);
+
+      return {
+        ...state,
+        chatMap: nextMap,
+        sortedChatIds: sections.sortedChatIds,
+        pinnedChatIds: sections.pinnedChatIds,
+        regularChatIds: sections.regularChatIds,
+        archivedChatIds: sections.archivedChatIds,
+        unreadByChat,
+        totalUnread: recomputeTotalUnread(unreadByChat),
+        removedChatIds,
+      };
+    }
+
+    // ─── GROUP: Update member list on a group chat ───
+    case 'GROUP_MEMBER_JOINED': {
+      const { groupId, userId, username, timestamp } = action.payload || {};
+      const chatId = normalizeId(groupId);
+      if (!chatId || !state.chatMap[chatId]) return state;
+
+      const chat = state.chatMap[chatId];
+      const existingMembers = Array.isArray(chat.members) ? chat.members : [];
+      const alreadyExists = existingMembers.some((m) => {
+        const mId = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+        return normalizeId(mId) === normalizeId(userId);
+      });
+      if (alreadyExists) return state;
+
+      return {
+        ...state,
+        chatMap: {
+          ...state.chatMap,
+          [chatId]: {
+            ...chat,
+            members: [...existingMembers, { userId, fullName: username, role: 'member', joinedAt: timestamp }],
+            memberCount: (chat.memberCount || existingMembers.length) + 1,
+          },
+        },
+      };
+    }
+
+    case 'GROUP_MEMBER_LEFT': {
+      const { groupId, userId } = action.payload || {};
+      const chatId = normalizeId(groupId);
+      if (!chatId || !state.chatMap[chatId]) return state;
+
+      const chat = state.chatMap[chatId];
+      const existingMembers = Array.isArray(chat.members) ? chat.members : [];
+      const filteredMembers = existingMembers.filter((m) => {
+        const mId = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+        return normalizeId(mId) !== normalizeId(userId);
+      });
+
+      return {
+        ...state,
+        chatMap: {
+          ...state.chatMap,
+          [chatId]: {
+            ...chat,
+            members: filteredMembers,
+            memberCount: filteredMembers.length,
+          },
+        },
+      };
+    }
+
+    // ─── GROUP: Member removed (kicked) ───
+    case 'GROUP_MEMBER_REMOVED': {
+      const { groupId, userId } = action.payload || {};
+      const chatId = normalizeId(groupId);
+      if (!chatId || !state.chatMap[chatId]) return state;
+
+      const chat = state.chatMap[chatId];
+      const members = Array.isArray(chat.members) ? chat.members : [];
+      const filtered = members.filter((m) => {
+        const mId = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+        return normalizeId(mId) !== normalizeId(userId);
+      });
+
+      return {
+        ...state,
+        chatMap: {
+          ...state.chatMap,
+          [chatId]: { ...chat, members: filtered, memberCount: filtered.length },
+        },
+      };
+    }
+
+    // ─── GROUP: Member role changed (promote/demote) ───
+    case 'GROUP_MEMBER_ROLE_CHANGED': {
+      const { groupId, userId, newRole } = action.payload || {};
+      const chatId = normalizeId(groupId);
+      if (!chatId || !state.chatMap[chatId]) return state;
+
+      const chat = state.chatMap[chatId];
+      const members = Array.isArray(chat.members) ? chat.members : [];
+      const updatedMembers = members.map((m) => {
+        const mId = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+        if (normalizeId(mId) === normalizeId(userId)) {
+          return { ...m, role: newRole };
+        }
+        return m;
+      });
+
+      return {
+        ...state,
+        chatMap: {
+          ...state.chatMap,
+          [chatId]: { ...chat, members: updatedMembers },
+        },
+      };
+    }
+
+    // ─── GROUP: Member muted ───
+    case 'GROUP_MEMBER_MUTED': {
+      const { groupId, userId, mutedTill } = action.payload || {};
+      const chatId = normalizeId(groupId);
+      if (!chatId || !state.chatMap[chatId]) return state;
+
+      const chat = state.chatMap[chatId];
+      const members = Array.isArray(chat.members) ? chat.members : [];
+      const updatedMembers = members.map((m) => {
+        const mId = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+        if (normalizeId(mId) === normalizeId(userId)) {
+          return { ...m, isMuted: true, mutedTill };
+        }
+        return m;
+      });
+
+      return {
+        ...state,
+        chatMap: {
+          ...state.chatMap,
+          [chatId]: { ...chat, members: updatedMembers },
+        },
+      };
+    }
+
+    // ─── GROUP: Member unmuted ───
+    case 'GROUP_MEMBER_UNMUTED': {
+      const { groupId, userId } = action.payload || {};
+      const chatId = normalizeId(groupId);
+      if (!chatId || !state.chatMap[chatId]) return state;
+
+      const chat = state.chatMap[chatId];
+      const members = Array.isArray(chat.members) ? chat.members : [];
+      const updatedMembers = members.map((m) => {
+        const mId = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+        if (normalizeId(mId) === normalizeId(userId)) {
+          return { ...m, isMuted: false, mutedTill: null };
+        }
+        return m;
+      });
+
+      return {
+        ...state,
+        chatMap: {
+          ...state.chatMap,
+          [chatId]: { ...chat, members: updatedMembers },
+        },
+      };
+    }
+
     default:
       return state;
   }
@@ -1777,6 +1980,201 @@ export function RealtimeChatProvider({ children }) {
     socket.on('chat:cleared:me', onChatCleared);
     socket.on('chat:cleared:everyone', onChatCleared);
 
+    // ─── GROUP SOCKET LISTENERS ───
+
+    // Confirmation: you successfully joined a group
+    const onGroupJoined = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      console.log('📥 [GROUP] Joined group:', groupId);
+      // Refresh chat list to show the new group
+      // The chat list will pick it up on next hydrate/refresh
+    };
+
+    // Confirmation: you successfully left a group
+    const onGroupLeft = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      console.log('📥 [GROUP] Left group:', groupId);
+      // Remove from chat list
+      dispatch({ type: 'REMOVE_CHAT', payload: groupId });
+    };
+
+    // Broadcast: another member joined the group
+    const onGroupMemberJoined = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member joined:', userId, 'in group:', groupId);
+      dispatch({
+        type: 'GROUP_MEMBER_JOINED',
+        payload: {
+          groupId,
+          userId,
+          username: data?.username || data?.fullName,
+          timestamp: data?.timestamp,
+        },
+      });
+    };
+
+    // Broadcast: another member left the group
+    const onGroupMemberLeft = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member left:', userId, 'from group:', groupId);
+      dispatch({
+        type: 'GROUP_MEMBER_LEFT',
+        payload: { groupId, userId },
+      });
+    };
+
+    // Confirmation: you left all groups
+    const onGroupLeaveAllSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const leftGroupIds = Array.isArray(data?.groupIds) ? data.groupIds : [];
+      console.log('📥 [GROUP] Left all groups:', data?.leftGroups || leftGroupIds.length || 0);
+      // Remove specific group IDs if provided, otherwise will refresh on next hydrate
+      leftGroupIds.forEach((gid) => {
+        const id = normalizeId(gid);
+        if (id) dispatch({ type: 'REMOVE_CHAT', payload: id });
+      });
+    };
+
+    // ─── GROUP MEMBER MANAGEMENT LISTENERS ───
+
+    // Broadcast: member was added to the group
+    const onGroupMemberAdded = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member added:', userId, 'to group:', groupId);
+      dispatch({
+        type: 'GROUP_MEMBER_JOINED',
+        payload: { groupId, userId, username: data?.username || data?.fullName, timestamp: data?.timestamp },
+      });
+    };
+
+    // Broadcast: member was removed (kicked) from the group
+    const onGroupMemberRemoved = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member removed:', userId, 'from group:', groupId);
+      dispatch({ type: 'GROUP_MEMBER_REMOVED', payload: { groupId, userId } });
+    };
+
+    // Personal: you were removed from a group
+    const onGroupRemoved = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      console.log('📥 [GROUP] You were removed from group:', groupId);
+      dispatch({ type: 'REMOVE_CHAT', payload: groupId });
+    };
+
+    // Personal: you were invited to a group
+    const onGroupInvitation = (payload) => {
+      const data = payload?.data || payload;
+      console.log('📥 [GROUP] Invitation received for group:', data?.groupId);
+      // Chat list will pick up the new group on next hydrate/refresh
+    };
+
+    // Broadcast: member was promoted to admin
+    const onGroupMemberPromoted = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member promoted:', userId, 'to', data?.newRole || 'admin');
+      dispatch({
+        type: 'GROUP_MEMBER_ROLE_CHANGED',
+        payload: { groupId, userId, newRole: data?.newRole || 'admin' },
+      });
+    };
+
+    // Broadcast: member was demoted from admin
+    const onGroupMemberDemoted = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member demoted:', userId, 'to member');
+      dispatch({
+        type: 'GROUP_MEMBER_ROLE_CHANGED',
+        payload: { groupId, userId, newRole: 'member' },
+      });
+    };
+
+    // Broadcast: member was muted
+    const onGroupMemberMuted = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member muted:', userId, 'till:', data?.mutedTill);
+      dispatch({
+        type: 'GROUP_MEMBER_MUTED',
+        payload: { groupId, userId, mutedTill: data?.mutedTill },
+      });
+    };
+
+    // Broadcast: member was unmuted
+    const onGroupMemberUnmuted = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const userId = normalizeId(data?.userId);
+      if (!groupId || !userId) return;
+      console.log('📥 [GROUP] Member unmuted:', userId);
+      dispatch({
+        type: 'GROUP_MEMBER_UNMUTED',
+        payload: { groupId, userId },
+      });
+    };
+
+    // Response: member list loaded (no-op for now — handled by Redux thunk in GroupInfo)
+    const onGroupMemberListResponse = (payload) => {
+      console.log('📥 [GROUP] Member list response:', payload?.data?.total || 0, 'members');
+    };
+
+    // Response: single member info (no-op for now)
+    const onGroupMemberInfoResponse = (payload) => {
+      console.log('📥 [GROUP] Member info response:', payload?.data?.userId);
+    };
+
+    socket.on('group:joined', onGroupJoined);
+    socket.on('group:left', onGroupLeft);
+    socket.on('group:member:joined', onGroupMemberJoined);
+    socket.on('group:member:left', onGroupMemberLeft);
+    socket.on('group:leave:all:success', onGroupLeaveAllSuccess);
+    // Member management events
+    socket.on('group:member:added', onGroupMemberAdded);
+    socket.on('group:member:add:success', onGroupMemberAdded);
+    socket.on('group:member:removed', onGroupMemberRemoved);
+    socket.on('group:member:remove:success', onGroupMemberRemoved);
+    socket.on('group:removed', onGroupRemoved);
+    socket.on('group:invitation', onGroupInvitation);
+    socket.on('group:member:promoted', onGroupMemberPromoted);
+    socket.on('group:member:promote:success', onGroupMemberPromoted);
+    socket.on('group:member:demoted', onGroupMemberDemoted);
+    socket.on('group:member:demote:success', onGroupMemberDemoted);
+    socket.on('group:admin:promoted', onGroupMemberPromoted);
+    socket.on('group:admin:demoted', onGroupMemberDemoted);
+    socket.on('group:member:muted', onGroupMemberMuted);
+    socket.on('group:member:mute:success', onGroupMemberMuted);
+    socket.on('group:muted', onGroupMemberMuted);
+    socket.on('group:member:unmuted', onGroupMemberUnmuted);
+    socket.on('group:member:unmute:success', onGroupMemberUnmuted);
+    socket.on('group:unmuted', onGroupMemberUnmuted);
+    socket.on('group:member:list:response', onGroupMemberListResponse);
+    socket.on('group:member:info:response', onGroupMemberInfoResponse);
+
     socketUnsubscribersRef.current = [
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
@@ -1811,6 +2209,31 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:unarchive:response', onChatUnarchiveResponse),
       () => socket.off('chat:cleared:me', onChatCleared),
       () => socket.off('chat:cleared:everyone', onChatCleared),
+      () => socket.off('group:joined', onGroupJoined),
+      () => socket.off('group:left', onGroupLeft),
+      () => socket.off('group:member:joined', onGroupMemberJoined),
+      () => socket.off('group:member:left', onGroupMemberLeft),
+      () => socket.off('group:leave:all:success', onGroupLeaveAllSuccess),
+      () => socket.off('group:member:added', onGroupMemberAdded),
+      () => socket.off('group:member:add:success', onGroupMemberAdded),
+      () => socket.off('group:member:removed', onGroupMemberRemoved),
+      () => socket.off('group:member:remove:success', onGroupMemberRemoved),
+      () => socket.off('group:removed', onGroupRemoved),
+      () => socket.off('group:invitation', onGroupInvitation),
+      () => socket.off('group:member:promoted', onGroupMemberPromoted),
+      () => socket.off('group:member:promote:success', onGroupMemberPromoted),
+      () => socket.off('group:member:demoted', onGroupMemberDemoted),
+      () => socket.off('group:member:demote:success', onGroupMemberDemoted),
+      () => socket.off('group:admin:promoted', onGroupMemberPromoted),
+      () => socket.off('group:admin:demoted', onGroupMemberDemoted),
+      () => socket.off('group:member:muted', onGroupMemberMuted),
+      () => socket.off('group:member:mute:success', onGroupMemberMuted),
+      () => socket.off('group:muted', onGroupMemberMuted),
+      () => socket.off('group:member:unmuted', onGroupMemberUnmuted),
+      () => socket.off('group:member:unmute:success', onGroupMemberUnmuted),
+      () => socket.off('group:unmuted', onGroupMemberUnmuted),
+      () => socket.off('group:member:list:response', onGroupMemberListResponse),
+      () => socket.off('group:member:info:response', onGroupMemberInfoResponse),
     ];
 
     attachedSocketRef.current = socket;
@@ -2010,7 +2433,7 @@ export function RealtimeChatProvider({ children }) {
     emitChatAction('chat:info', { chatId: normalizedChatId });
   }, [emitChatAction]);
 
-  const pinChat = useCallback((chatId) => {
+  const pinChat = useCallback((chatId, chatType) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
     const nowIso = new Date().toISOString();
@@ -2018,20 +2441,20 @@ export function RealtimeChatProvider({ children }) {
       isPinned: true,
       pinnedAt: nowIso,
     });
-    emitChatAction('chat:pin', { chatId: normalizedChatId });
+    emitChatAction('chat:pin', { chatId: normalizedChatId, chatType: chatType || 'private' });
   }, [applyOptimisticAction, emitChatAction]);
 
-  const unpinChat = useCallback((chatId) => {
+  const unpinChat = useCallback((chatId, chatType) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
     applyOptimisticAction(normalizedChatId, {
       isPinned: false,
       pinnedAt: null,
     });
-    emitChatAction('chat:unpin', { chatId: normalizedChatId });
+    emitChatAction('chat:unpin', { chatId: normalizedChatId, chatType: chatType || 'private' });
   }, [applyOptimisticAction, emitChatAction]);
 
-  const muteChat = useCallback((chatId, duration) => {
+  const muteChat = useCallback((chatId, duration, chatType) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
 
@@ -2043,37 +2466,38 @@ export function RealtimeChatProvider({ children }) {
     });
     emitChatAction('chat:mute', {
       chatId: normalizedChatId,
+      chatType: chatType || 'private',
       duration: durationMs > 0 ? durationMs : undefined,
       muteUntil,
     });
   }, [applyOptimisticAction, emitChatAction]);
 
-  const unmuteChat = useCallback((chatId) => {
+  const unmuteChat = useCallback((chatId, chatType) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
     applyOptimisticAction(normalizedChatId, {
       isMuted: false,
       muteUntil: null,
     });
-    emitChatAction('chat:unmute', { chatId: normalizedChatId });
+    emitChatAction('chat:unmute', { chatId: normalizedChatId, chatType: chatType || 'private' });
   }, [applyOptimisticAction, emitChatAction]);
 
-  const archiveChat = useCallback((chatId) => {
+  const archiveChat = useCallback((chatId, chatType) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
     applyOptimisticAction(normalizedChatId, {
       isArchived: true,
     });
-    emitChatAction('chat:archive', { chatId: normalizedChatId });
+    emitChatAction('chat:archive', { chatId: normalizedChatId, chatType: chatType || 'private' });
   }, [applyOptimisticAction, emitChatAction]);
 
-  const unarchiveChat = useCallback((chatId) => {
+  const unarchiveChat = useCallback((chatId, chatType) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
     applyOptimisticAction(normalizedChatId, {
       isArchived: false,
     });
-    emitChatAction('chat:unarchive', { chatId: normalizedChatId });
+    emitChatAction('chat:unarchive', { chatId: normalizedChatId, chatType: chatType || 'private' });
   }, [applyOptimisticAction, emitChatAction]);
 
   const applyChatClearedPreview = useCallback((chatId, scope = 'me') => {
@@ -2096,6 +2520,88 @@ export function RealtimeChatProvider({ children }) {
       unreadCount: 0,
     });
   }, [applyOptimisticAction, markChatRead]);
+
+  // ═══════════════════════════════════════════
+  // GROUP SOCKET ACTIONS
+  // ═══════════════════════════════════════════
+
+  const removeChat = useCallback((chatId) => {
+    const normalizedChatId = normalizeId(chatId);
+    if (!normalizedChatId) return;
+    deferDispatch({ type: 'REMOVE_CHAT', payload: normalizedChatId });
+  }, [deferDispatch]);
+
+  const joinGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:join', { groupId: id });
+  }, [emitChatAction]);
+
+  const leaveGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:leave', { groupId: id });
+  }, [emitChatAction]);
+
+  const leaveAllGroups = useCallback(() => {
+    emitChatAction('group:leave:all', {});
+  }, [emitChatAction]);
+
+  // ─── GROUP MEMBER MANAGEMENT EMITTERS ───
+
+  const addGroupMembers = useCallback((groupId, userIds) => {
+    const id = normalizeId(groupId);
+    if (!id || !Array.isArray(userIds) || userIds.length === 0) return;
+    emitChatAction('group:member:add', { groupId: id, userIds });
+  }, [emitChatAction]);
+
+  const removeGroupMember = useCallback((groupId, userId) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(userId);
+    if (!gid || !uid) return;
+    emitChatAction('group:member:remove', { groupId: gid, userId: uid });
+  }, [emitChatAction]);
+
+  const promoteGroupMember = useCallback((groupId, userId) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(userId);
+    if (!gid || !uid) return;
+    emitChatAction('group:member:promote', { groupId: gid, userId: uid });
+  }, [emitChatAction]);
+
+  const demoteGroupMember = useCallback((groupId, userId) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(userId);
+    if (!gid || !uid) return;
+    emitChatAction('group:member:demote', { groupId: gid, userId: uid });
+  }, [emitChatAction]);
+
+  const muteGroupMember = useCallback((groupId, userId, duration) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(userId);
+    if (!gid || !uid) return;
+    emitChatAction('group:member:mute', { groupId: gid, userId: uid, duration: Number(duration) || 3600 });
+  }, [emitChatAction]);
+
+  const unmuteGroupMember = useCallback((groupId, userId) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(userId);
+    if (!gid || !uid) return;
+    emitChatAction('group:member:unmute', { groupId: gid, userId: uid });
+  }, [emitChatAction]);
+
+  const listGroupMembers = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:member:list', { groupId: id });
+  }, [emitChatAction]);
+
+  const getGroupMemberInfo = useCallback((groupId, userId) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(userId);
+    if (!gid || !uid) return;
+    emitChatAction('group:member:info', { groupId: gid, userId: uid });
+  }, [emitChatAction]);
 
   const chatList = useMemo(() => {
     return state.sortedChatIds.map((chatId) => {
@@ -2185,6 +2691,20 @@ export function RealtimeChatProvider({ children }) {
     archiveChat,
     unarchiveChat,
     applyChatClearedPreview,
+    // Group actions
+    joinGroup,
+    leaveGroup,
+    leaveAllGroups,
+    removeChat,
+    // Group member management
+    addGroupMembers,
+    removeGroupMember,
+    promoteGroupMember,
+    demoteGroupMember,
+    muteGroupMember,
+    unmuteGroupMember,
+    listGroupMembers,
+    getGroupMemberInfo,
   }), [
     state,
     chatList,
@@ -2203,6 +2723,18 @@ export function RealtimeChatProvider({ children }) {
     archiveChat,
     unarchiveChat,
     applyChatClearedPreview,
+    joinGroup,
+    leaveGroup,
+    leaveAllGroups,
+    removeChat,
+    addGroupMembers,
+    removeGroupMember,
+    promoteGroupMember,
+    demoteGroupMember,
+    muteGroupMember,
+    unmuteGroupMember,
+    listGroupMembers,
+    getGroupMemberInfo,
   ]);
 
   return (

@@ -28,7 +28,7 @@ import ChatCard from '../../components/ChatCard';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -74,7 +74,6 @@ export default function ChatList({ navigation }) {
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
   const [imageViewerVisible, setImageViewerVisible] = useState(false);
-
   // Profile modal animations
   const profileOpacityAnim = useRef(new Animated.Value(0)).current;
   const profileScaleAnim = useRef(new Animated.Value(0)).current;
@@ -119,9 +118,12 @@ export default function ChatList({ navigation }) {
       } else {
         const query = searchQuery.toLowerCase().trim();
         const filtered = effectiveChatList.filter((item) => {
-          const fullName = item.peerUser?.fullName?.toLowerCase() || '';
+          const isGroupItem = item?.chatType === 'group' || item?.isGroup;
+          const chatDisplayName = isGroupItem
+            ? (item?.chatName || item?.group?.name || '').toLowerCase()
+            : (item?.peerUser?.fullName || '').toLowerCase();
           const lastMessage = getLastMessageText(item).toLowerCase();
-          return fullName.includes(query) || lastMessage.includes(query);
+          return chatDisplayName.includes(query) || lastMessage.includes(query);
         });
         setFilteredChats(filtered);
         setIsSearching(true);
@@ -199,7 +201,7 @@ export default function ChatList({ navigation }) {
     return `${String(msgDate.getDate()).padStart(2, '0')}/${String(msgDate.getMonth() + 1).padStart(2, '0')}/${String(msgDate.getFullYear()).slice(-2)}`;
   };
 
-  const getLastMessageText = (item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || 'No messages yet';
+  const getLastMessageText = (item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || item?.lastMessage?.text || 'No messages yet';
 
   const getLastMessageStatus = (item) => (
     item?.lastMessageStatus || item?.lastMessage?.status || item?.status || null
@@ -326,17 +328,19 @@ export default function ChatList({ navigation }) {
   const onTogglePin = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
+    const ct = selectedChatItem?.chatType || 'private';
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-    if (selectedChatItem?.isPinned) unpinChat(chatId);
-    else pinChat(chatId);
+    if (selectedChatItem?.isPinned) unpinChat(chatId, ct);
+    else pinChat(chatId, ct);
     closeActionMenu();
   }, [selectedChatItem, pinChat, unpinChat, closeActionMenu]);
 
   const onPressMute = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
+    const ct = selectedChatItem?.chatType || 'private';
     if (selectedChatItem?.isMuted) {
-      unmuteChat(chatId);
+      unmuteChat(chatId, ct);
       closeActionMenu();
       return;
     }
@@ -346,16 +350,18 @@ export default function ChatList({ navigation }) {
   const onSelectMuteDuration = useCallback((duration) => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
-    muteChat(chatId, duration);
+    const ct = selectedChatItem?.chatType || 'private';
+    muteChat(chatId, duration, ct);
     closeActionMenu();
   }, [selectedChatItem, muteChat, closeActionMenu]);
 
   const onToggleArchive = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
+    const ct = selectedChatItem?.chatType || 'private';
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-    if (selectedChatItem?.isArchived) unarchiveChat(chatId);
-    else archiveChat(chatId);
+    if (selectedChatItem?.isArchived) unarchiveChat(chatId, ct);
+    else archiveChat(chatId, ct);
     closeActionMenu();
   }, [selectedChatItem, archiveChat, unarchiveChat, closeActionMenu]);
 
@@ -598,23 +604,17 @@ export default function ChatList({ navigation }) {
             )}
           >
             <Menu.Item
-              onPress={() => { navigation.navigate('Profile'); setVisible(false); }}
+              onPress={() => { navigation.navigate('ProfileTab'); setVisible(false); }}
               title="Profile"
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="person-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
             <Menu.Item
-              onPress={() => { navigation.navigate('Setting'); setVisible(false); }}
+              onPress={() => { navigation.navigate('SettingsTab'); setVisible(false); }}
               title="Settings"
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
-            {/* <Menu.Item
-              onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
-              title="Linked Devices"
-              titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
-              leadingIcon={() => <Ionicons name="phone-portrait-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            /> */}
           </Menu>
         </View>
       </View>
@@ -639,19 +639,31 @@ export default function ChatList({ navigation }) {
                 openSwipeableRef={openSwipeableRef}
                 onPress={() => navigation.navigate('ChatScreen', { item })}
                 onLongPress={() => openActionMenu(item)}
-                onAvatarPress={() => openProfilePreview(item)}
+                onAvatarPress={() => {
+                  if (item?.chatType === 'group' || item?.isGroup) {
+                    navigation.navigate('GroupInfo', {
+                      groupId: item?.groupId || item?.group?._id || item?.chatId,
+                      item,
+                    });
+                  } else {
+                    openProfilePreview(item);
+                  }
+                }}
                 onSwipePin={() => {
-                  if (item?.isPinned) unpinChat(item?.chatId || item?._id);
-                  else pinChat(item?.chatId || item?._id);
+                  const ct = item?.chatType || 'private';
+                  if (item?.isPinned) unpinChat(item?.chatId || item?._id, ct);
+                  else pinChat(item?.chatId || item?._id, ct);
                 }}
                 onSwipeMute={() => {
-                  if (item?.isMuted) unmuteChat(item?.chatId || item?._id);
-                  else muteChat(item?.chatId || item?._id, 8 * 60 * 60 * 1000);
+                  const ct = item?.chatType || 'private';
+                  if (item?.isMuted) unmuteChat(item?.chatId || item?._id, ct);
+                  else muteChat(item?.chatId || item?._id, 8 * 60 * 60 * 1000, ct);
                 }}
                 onSwipeArchive={() => {
                   const chatId = item?.chatId || item?._id;
-                  if (item?.isArchived) unarchiveChat(chatId);
-                  else archiveChat(chatId);
+                  const ct = item?.chatType || 'private';
+                  if (item?.isArchived) unarchiveChat(chatId, ct);
+                  else archiveChat(chatId, ct);
                 }}
                 getUserColor={getUserColor}
                 getPreviewText={getPreviewText}
@@ -683,7 +695,7 @@ export default function ChatList({ navigation }) {
 
       {/* ─── FAB ─── */}
       <TouchableOpacity
-        onPress={() => navigation.navigate('AddUser')}
+        onPress={() => navigation.navigate('ContactsTab')}
         activeOpacity={0.85}
         style={[styles.fab, { backgroundColor: theme.colors.themeColor }]}
       >
@@ -917,14 +929,14 @@ export default function ChatList({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              <ImageZoom
+              {/* <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              />
+              /> */}
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>

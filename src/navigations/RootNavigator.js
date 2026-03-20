@@ -1,4 +1,3 @@
-
 import React, { useRef } from "react";
 import { NavigationContainer } from "@react-navigation/native";
 import { createStackNavigator } from "@react-navigation/stack";
@@ -10,10 +9,7 @@ import Splash from "../screens/Splash";
 import UserAgree from "../screens/UserAgree";
 import Login from "../screens/Login";
 import Otp from "../screens/Otp";
-import ChatList from "../screens/chats/ChatList";
 import ChatScreen from "../screens/chats/ChatScreen";
-import AddUser from "../screens/chats/AddUser";
-import Profile from "../screens/profiles/Profile";
 import Test from "../screens/Test";
 import Term from "../screens/Term";
 import Privacy from "../screens/Privacy";
@@ -21,7 +17,6 @@ import NoInternet from "../screens/NoInternet";
 import LinkDevice from "../screens/ActiveDevice/LinkDevice";
 import EditProfile from "../screens/profiles/EditProfile";
 import PersonalInfoEdit from "../screens/profiles/PersonalInfoEdit";
-import Setting from "../screens/profiles/Setting";
 import UserB from "../screens/profiles/UserB";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
 import ChatMedia from "../screens/chats/ChatMedia";
@@ -31,6 +26,11 @@ import StatusScreen from "../screens/presence/StatusScreen";
 import ContactsPresenceScreen from "../screens/presence/ContactsPresenceScreen";
 import SessionsScreen from "../screens/presence/SessionsScreen";
 import PrivacySettingsScreen from "../screens/presence/PrivacySettingsScreen";
+import CreateGroup from "../screens/group/CreateGroup";
+import GroupInfo from "../screens/group/GroupInfo";
+import EditGroup from "../screens/group/EditGroup";
+import AddGroupMembers from "../screens/group/AddGroupMembers";
+
 import BottomTabNavigator from "./BottomTabNavigator";
 
 import { useTheme } from "../contexts/ThemeContext";
@@ -55,11 +55,6 @@ export default function RootNavigator() {
             text: theme.colors.text,
             border: theme.colors.border,
             notification: theme.colors.primary,
-          },
-          fonts: theme.fonts || { regular: 'System', medium: 'System', bold: 'System' },
-          typography: {
-            medium: theme.fonts?.medium ?? 'System',
-            bold: theme.fonts?.bold ?? 'System',
           },
         }}
       >
@@ -103,8 +98,6 @@ export default function RootNavigator() {
           <Stack.Screen name="Otp" component={Otp} />
           <Stack.Screen name="ChatList" component={BottomTabNavigator} />
           <Stack.Screen name="ChatScreen" component={ChatScreen} />
-          <Stack.Screen name="AddUser" component={AddUser} />
-          <Stack.Screen name="Profile" component={Profile} />
           <Stack.Screen name="NoInternet" component={NoInternet} />
           <Stack.Screen name="LinkDevice" component={LinkDevice} />
           <Stack.Screen name="Test" component={Test} />
@@ -112,7 +105,6 @@ export default function RootNavigator() {
           <Stack.Screen name="Term" component={Term} />
           <Stack.Screen name="EditProfile" component={EditProfile} />
           <Stack.Screen name="PersonalInfoEdit" component={PersonalInfoEdit} />
-          <Stack.Screen name="Setting" component={Setting} />
           <Stack.Screen name="UserB" component={UserB} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
           <Stack.Screen name="ArchivedChats" component={ArchivedChats} />
@@ -121,6 +113,10 @@ export default function RootNavigator() {
           <Stack.Screen name="ContactsPresenceScreen" component={ContactsPresenceScreen} />
           <Stack.Screen name="SessionsScreen" component={SessionsScreen} />
           <Stack.Screen name="PrivacySettingsScreen" component={PrivacySettingsScreen} />
+          <Stack.Screen name="CreateGroup" component={CreateGroup} />
+          <Stack.Screen name="GroupInfo" component={GroupInfo} />
+          <Stack.Screen name="EditGroup" component={EditGroup} />
+          <Stack.Screen name="AddGroupMembers" component={AddGroupMembers} />
         </Stack.Navigator>
       </NavigationContainer>
     </SafeAreaView>

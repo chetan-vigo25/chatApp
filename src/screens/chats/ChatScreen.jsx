@@ -42,7 +42,7 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
@@ -2519,7 +2519,15 @@ export default function ChatScreen({ navigation, route }) {
 
   const handleOpenContactInfo = () => {
     setShowMenu(false);
-    navigation.navigate('UserB', { item: chatData });
+    const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+    if (isGroupChat) {
+      navigation.navigate('GroupInfo', {
+        groupId: chatData?.groupId || chatData?.group?._id || chatData?.chatId || chatData?._id || route?.params?.chatId,
+        item: chatData,
+      });
+    } else {
+      navigation.navigate('UserB', { item: chatData });
+    }
   };
 
   const handleChatMuteOptions = () => {
@@ -3825,7 +3833,7 @@ export default function ChatScreen({ navigation, route }) {
     );
   }
 
-  if (!chatData || !chatData.peerUser) {
+  if (!chatData || (!chatData.peerUser && !chatData.isGroup)) {
     return (
       <View style={{ 
         flex: 1, 
@@ -3849,6 +3857,23 @@ export default function ChatScreen({ navigation, route }) {
     );
   }
 
+  // ─── GROUP MESSAGING PERMISSION ───
+  const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+  const groupSettings = chatData?.group?.settings || {};
+  const adminsOnlyMessaging = Boolean(groupSettings?.adminsOnlyMessaging);
+  const myGroupRole = chatData?.myRole || chatData?.group?.myRole || 'member';
+  const isGroupAdmin = myGroupRole === 'owner' || myGroupRole === 'admin';
+  // Members can't send if adminsOnlyMessaging is on; also check per-member canSendMessage flag
+  const myMemberRecord = (chatData?.members || []).find((m) => {
+    const uid = typeof m.userId === 'object' ? m.userId?._id : m.userId;
+    return uid && String(uid) === String(currentUserId);
+  });
+  const memberCanSend = myMemberRecord?.canSendMessage !== false;
+  const messagingDisabled = isGroupChat && ((adminsOnlyMessaging && !isGroupAdmin) || !memberCanSend);
+  const messagingDisabledText = !memberCanSend
+    ? 'You are restricted from sending messages'
+    : 'Only admins can send messages';
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
@@ -3864,6 +3889,10 @@ export default function ChatScreen({ navigation, route }) {
           onBack={() => navigation.goBack()}
           onPressProfile={handleOpenContactInfo}
           getUserColor={getUserColor}
+          isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup)}
+          groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
+          groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
+          memberCount={chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount}
           rightActions={selectedMessage.length > 0 ? (
             <>
               {/* Edit button - only for single own unseen message */}
@@ -4327,26 +4356,33 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        <ChatInputBar
-          ref={chatInputRef}
-          theme={theme}
-          isDarkMode={isDarkMode}
-          chatColor={chatColor}
-          text={text}
-          pendingMedia={editingMessage ? null : pendingMedia}
-          inputHeight={inputHeight}
-          isInputFocused={isInputFocused}
-          isSearching={isSearching}
-          showEmojiPanel={showEmojiPanel}
-          onTextChange={handleTextChange}
-          onInputContentSizeChange={handleInputContentSizeChange}
-          onFocus={() => { setIsInputFocused(true); setShowEmojiPanel(false); }}
-          onBlur={() => setIsInputFocused(false)}
-          onOpenEmoji={handleOpenEmojiPanel}
-          onOpenAttachment={editingMessage ? undefined : handleToggleMediaOptions}
-          onRemovePendingMedia={() => setPendingMedia(null)}
-          onSubmit={handleSubmitInput}
-        />
+        {messagingDisabled ? (
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 14, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
+            <Ionicons name="lock-closed-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
+            <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>{messagingDisabledText}</Text>
+          </View>
+        ) : (
+          <ChatInputBar
+            ref={chatInputRef}
+            theme={theme}
+            isDarkMode={isDarkMode}
+            chatColor={chatColor}
+            text={text}
+            pendingMedia={editingMessage ? null : pendingMedia}
+            inputHeight={inputHeight}
+            isInputFocused={isInputFocused}
+            isSearching={isSearching}
+            showEmojiPanel={showEmojiPanel}
+            onTextChange={handleTextChange}
+            onInputContentSizeChange={handleInputContentSizeChange}
+            onFocus={() => { setIsInputFocused(true); setShowEmojiPanel(false); }}
+            onBlur={() => setIsInputFocused(false)}
+            onOpenEmoji={handleOpenEmojiPanel}
+            onOpenAttachment={editingMessage ? undefined : handleToggleMediaOptions}
+            onRemovePendingMedia={() => setPendingMedia(null)}
+            onSubmit={handleSubmitInput}
+          />
+        )}
 
         {/* Emoji Panel — WhatsApp style, replaces keyboard */}
         {showEmojiPanel && (
@@ -4770,7 +4806,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                <ImageZoom
+                {/* <ImageZoom
                   uri={localMediaViewer.uri}
                   minScale={1}
                   maxScale={5}
@@ -4780,7 +4816,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                />
+                /> */}
               </GestureHandlerRootView>
             )}
 

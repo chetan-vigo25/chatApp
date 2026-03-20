@@ -173,6 +173,18 @@ const chatSlice = createSlice({
       state.hasMoreMessages = true;
     },
 
+    // Insert a new group chat at the top of chatsData
+    addGroupChat: (state, action) => {
+      const groupChat = action.payload;
+      if (!groupChat) return;
+      const existing = (state.chatsData || []).find(
+        (c) => (c?.chatId || c?._id) === (groupChat?.chatId || groupChat?._id)
+      );
+      if (!existing) {
+        state.chatsData = [groupChat, ...(state.chatsData || [])];
+      }
+    },
+
     // Logout
     logout: (state) => {
       state.user = null;
@@ -250,5 +262,5 @@ const chatSlice = createSlice({
   },
 });
 
-export const { logout, clearChatMessages, resetPagination } = chatSlice.actions;
+export const { logout, clearChatMessages, resetPagination, addGroupChat } = chatSlice.actions;
 export default chatSlice.reducer;

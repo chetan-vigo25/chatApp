@@ -15,11 +15,13 @@ import { combineReducers } from "@reduxjs/toolkit";
 import authSlice from '../Redux/Reducer/Auth/Auth.reducer';
 import chatSlice from '../Redux/Reducer/Chat/Chat.reducer';
 import profileSlice from '../Redux/Reducer/Profile/Profile.reducer';
+import groupSlice from '../Redux/Reducer/Group/Group.reducer';
 
 const appReducer = combineReducers({
     authentication: authSlice,
     chat: chatSlice,
     profile: profileSlice,
+    group: groupSlice,
 });
 
 export const RESET_APP_STATE = 'app/reset_state';

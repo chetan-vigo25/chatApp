@@ -190,9 +190,26 @@ export default function useChatLogic({ navigation, route }) {
         _id: routePeerUser._id || routePeerUser.userId || routePeerUser.id || null,
       }
     : null;
+  // Preserve chatType + group fields from the route item
+  const isGroupChat = item?.chatType === 'group' || item?.isGroup;
+  const chatTypeField = item?.chatType || (isGroupChat ? 'group' : 'private');
+  const groupFields = isGroupChat ? {
+    isGroup: true,
+    groupId: item.groupId || item.group?._id,
+    group: item.group,
+    chatName: item.chatName || item.group?.name,
+    chatAvatar: item.chatAvatar || item.group?.avatar,
+    groupName: item.chatName || item.group?.name,
+    groupAvatar: item.chatAvatar || item.group?.avatar,
+    members: item.members,
+    memberCount: item.members?.length || item.memberCount,
+  } : {};
+
   const chatData = (item && normalizedPeerUser)
-    ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null }
-    : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null } : { peerUser: null, chatId: null });
+    ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField, ...groupFields }
+    : isGroupChat
+      ? { peerUser: null, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField, ...groupFields }
+      : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' });
 
   // Refs
   const fadeAnimRef = useRef(null);
@@ -351,7 +368,7 @@ export default function useChatLogic({ navigation, route }) {
 
     return {
       chatId,
-      chatType: 'private',
+      chatType: chatData?.chatType || 'private',
       messageId: generatedMessageId,
       senderId,
       senderDeviceId,
@@ -2634,7 +2651,8 @@ export default function useChatLogic({ navigation, route }) {
       return;
     }
     
-    if (!chatIdRef.current || !currentUserIdRef.current || !chatData.peerUser?._id) {
+    const isGroupChat = chatData.chatType === 'group' || chatData.isGroup;
+    if (!chatIdRef.current || !currentUserIdRef.current || (!isGroupChat && !chatData.peerUser?._id)) {
       console.warn("⚠️ Cannot send typing status - missing data", {
         chatId: chatIdRef.current,
         userId: currentUserIdRef.current,
@@ -2643,14 +2661,15 @@ export default function useChatLogic({ navigation, route }) {
       return;
     }
 
-    const payload = { 
-      chatId: chatIdRef.current, 
-      senderId: currentUserIdRef.current, 
-      receiverId: chatData.peerUser._id, 
-      isTyping: isTypingNow 
+    const payload = {
+      chatId: chatIdRef.current,
+      chatType: chatData.chatType || 'private',
+      senderId: currentUserIdRef.current,
+      receiverId: chatData.peerUser?._id || null,
+      isTyping: isTypingNow
     };
 
-    console.log('📤 [TYPING] Sending typing status:', { isTypingNow, to: chatData.peerUser._id });
+    console.log('📤 [TYPING] Sending typing status:', { isTypingNow, to: chatData.peerUser?._id, chatType: chatData.chatType });
 
     // Emit appropriate event based on typing state
     if (isTypingNow) {
@@ -3466,8 +3485,9 @@ export default function useChatLogic({ navigation, route }) {
     const timestamp = new Date().toISOString();
     
     const payload = {
-      receiverId: chatData.peerUser._id,
+      receiverId: chatData.peerUser?._id || null,
       messageType: "text",
+      chatType: chatData.chatType || 'private',
       text: text.trim(),
       mediaUrl: '',
       mediaMeta: {},
@@ -3501,7 +3521,8 @@ export default function useChatLogic({ navigation, route }) {
       date: moment(timestamp).format("YYYY-MM-DD"),
       senderId: currentUserIdRef.current,
       senderType: 'self',
-      receiverId: chatData.peerUser._id,
+      receiverId: chatData.peerUser?._id || null,
+      chatType: chatData.chatType || 'private',
       status: "sending",
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
@@ -3557,7 +3578,8 @@ export default function useChatLogic({ navigation, route }) {
     const timestamp = new Date().toISOString();
 
     const payload = {
-      receiverId: chatData.peerUser._id,
+      receiverId: chatData.peerUser?._id || null,
+      chatType: chatData?.chatType || 'private',
       messageType: 'location',
       text: address || 'Shared location',
       mediaUrl: mapPreviewUrl || `https://maps.google.com/?q=${lat},${lng}`,
@@ -3600,7 +3622,7 @@ export default function useChatLogic({ navigation, route }) {
         date: moment(timestamp).format('YYYY-MM-DD'),
         senderId: currentUserIdRef.current,
         senderType: 'self',
-        receiverId: chatData.peerUser._id,
+        receiverId: chatData.peerUser?._id || null,
         status: 'sending',
         createdAt: timestamp,
         timestamp: new Date(timestamp).getTime(),
@@ -3643,10 +3665,10 @@ export default function useChatLogic({ navigation, route }) {
     const payload = {
       chatId: chatIdRef.current,
       messageId,
-      chatType: 'private',
+      chatType: chatData?.chatType || 'private',
       senderId: currentUserIdRef.current,
       senderDeviceId,
-      receiverId: chatData.peerUser._id,
+      receiverId: chatData.peerUser?._id || null,
       messageType: 'contact',
       text: name,
       contact: contactData,
@@ -3690,7 +3712,7 @@ export default function useChatLogic({ navigation, route }) {
         date: moment(timestamp).format('YYYY-MM-DD'),
         senderId: currentUserIdRef.current,
         senderType: 'self',
-        receiverId: chatData.peerUser._id,
+        receiverId: chatData.peerUser?._id || null,
         status: 'sending',
         createdAt: timestamp,
         timestamp: new Date(timestamp).getTime(),
@@ -3933,10 +3955,6 @@ export default function useChatLogic({ navigation, route }) {
   const handleToggleSelectMessages = useCallback((messageId) => {
     console.log("messageId === ", messageId)
     setSelectedMessages((prevSelected) => prevSelected.includes(messageId) ? prevSelected.filter((id) => id !== messageId) : [...prevSelected, messageId]);
-  }, []);
-
-  const clearSelectedMessages = useCallback(() => {
-    setSelectedMessages([]);
   }, []);
 
   const deleteSelectedMessages = useCallback(async (deleteForEveryone) => {
@@ -4299,7 +4317,7 @@ export default function useChatLogic({ navigation, route }) {
       date: moment(timestamp).format("YYYY-MM-DD"),
       senderId: currentUserIdRef.current,
       senderType: 'self',
-      receiverId: chatData.peerUser._id,
+      receiverId: chatData.peerUser?._id || null,
       status: 'sending',
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
@@ -4406,9 +4424,10 @@ export default function useChatLogic({ navigation, route }) {
         uploadResponse: responseData,
         file,
         messageType: type,
+        chatType: chatData?.chatType || 'private',
         senderId: currentUserIdRef.current,
         senderDeviceId: deviceId,
-        receiverId: chatData.peerUser._id,
+        receiverId: chatData.peerUser?._id || null,
         chatId: chatIdRef.current,
         messageId: responseData?.messageId,
       });
@@ -4450,7 +4469,7 @@ export default function useChatLogic({ navigation, route }) {
           date: moment(timestamp).format("YYYY-MM-DD"),
           senderId: currentUserIdRef.current,
           senderType: 'self',
-          receiverId: chatData.peerUser._id,
+          receiverId: chatData.peerUser?._id || null,
           status: 'uploaded',
           createdAt: timestamp,
           timestamp: new Date(timestamp).getTime(),
@@ -4642,11 +4661,11 @@ export default function useChatLogic({ navigation, route }) {
       const existingMeta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
       const messagePayload = {
         chatId: chatIdRef.current,
-        chatType: 'private',
+        chatType: chatData?.chatType || 'private',
         messageId: String(msg?.serverMessageId || msg?.id || msg?.tempId || generateClientMessageId()),
         senderId: currentUserIdRef.current,
         senderDeviceId: deviceId,
-        receiverId: chatData.peerUser._id,
+        receiverId: chatData.peerUser?._id || null,
         messageType: normalizedCategory,
         mediaId: String(msg?.mediaId || existingMeta?.mediaId || msg?.serverMessageId || msg?.id || ''),
         mediaUrl: resolvedMediaUrl,
@@ -4690,8 +4709,9 @@ export default function useChatLogic({ navigation, route }) {
     } else {
       await sendMessageViaSocket({
         chatId: chatIdRef.current,
+        chatType: chatData?.chatType || 'private',
         senderId: currentUserIdRef.current,
-        receiverId: chatData.peerUser._id,
+        receiverId: chatData.peerUser?._id || null,
         messageType: 'text',
         text: msg.text || '',
         tempId: msg.tempId || `temp_retry_${Date.now()}`,
@@ -4892,7 +4912,7 @@ export default function useChatLogic({ navigation, route }) {
     userStatus, customStatus, presenceDetails, manualPresencePending, renderStatusText,
     setManualPresence, clearManualPresence,
     search, handleSearch, clearSearch, goToNextResult, goToPreviousResult, searchResults, currentSearchIndex,
-    selectedMessage, handleToggleSelectMessages, clearSelectedMessages, handleDeleteSelected,
+    selectedMessage, handleToggleSelectMessages, handleDeleteSelected,
     text, setText, handleTextChange, handleSendText,
     sendLocationMessage, sendContactMessage,
     pendingMedia, setPendingMedia, sendMedia, handlePickMedia, showMediaOptions, openMediaOptions, closeMediaOptions,

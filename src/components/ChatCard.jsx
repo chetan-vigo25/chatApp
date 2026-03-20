@@ -62,7 +62,13 @@ const ChatCard = ({
   const isArchived = Boolean(item?.isArchived);
   const hasUnread = Number(item?.unreadCount || 0) > 0;
   const isTyping = item?.realtime?.typing?.isTyping;
-  const peerName = item?.peerUser?.fullName || 'Unknown';
+  const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
+  const peerName = isGroup
+    ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
+    : (item?.peerUser?.fullName || 'Unknown');
+  const groupAvatarUri = isGroup
+    ? (item?.chatAvatar || item?.group?.avatar || item?.groupAvatar)
+    : null;
 
   const renderLeftActions = (progress) => {
     const translateX = progress.interpolate({
@@ -131,7 +137,15 @@ const ChatCard = ({
             activeOpacity={0.85}
             style={styles.avatarTouch}
           >
-            {item?.peerUser?.profileImage ? (
+            {isGroup ? (
+              groupAvatarUri ? (
+                <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={styles.avatarImage} />
+              ) : (
+                <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName) }]}>
+                  <Ionicons name="people" size={22} color="#fff" />
+                </View>
+              )
+            ) : item?.peerUser?.profileImage ? (
               <Image
                 resizeMode="cover"
                 source={{ uri: item.peerUser.profileImage }}
@@ -149,8 +163,8 @@ const ChatCard = ({
                 </Text>
               </View>
             )}
-            {/* Online indicator */}
-            {item?.peerUser?.isOnline && (
+            {/* Online indicator (not for groups) */}
+            {!isGroup && item?.peerUser?.isOnline && (
               <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
             )}
           </TouchableOpacity>
@@ -329,24 +343,24 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   swipePinBtn: {
-    width: 60,
-    height: 50,
+    width: 70,
+    height: 64,
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#4D7CFE',
   },
   swipeMuteBtn: {
-    width: 60,
-    height: 50,
+    width: 70,
+    height: 64,
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: '#F0A030',
   },
   swipeArchiveBtn: {
-    width: 60,
-    height: 50,
+    width: 70,
+    height: 64,
     borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',

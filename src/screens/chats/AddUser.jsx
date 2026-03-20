@@ -65,7 +65,7 @@ export default function AddUser({ navigation }) {
   const lastScrollY = useRef(0);
   const isCollapsed = useRef(false);
   const [headerSearchVisible, setHeaderSearchVisible] = useState(false);
-  const COLLAPSED_MAX_HEIGHT = 130; // enough to fit search + new contact
+  const COLLAPSED_MAX_HEIGHT = 210; // enough to fit search + new contact + new group
 
   const {
     matchedContacts = [],
@@ -105,14 +105,11 @@ export default function AddUser({ navigation }) {
   };
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      Animated.timing(fadeAnim, {
-        toValue: 1,
-        duration: 400,
-        useNativeDriver: true,
-      }).start();
-    }, 400);
-    return () => clearTimeout(timer);
+    Animated.timing(fadeAnim, {
+      toValue: 1,
+      duration: 250,
+      useNativeDriver: true,
+    }).start();
   }, []);
 
   useEffect(() => {
@@ -424,9 +421,9 @@ export default function AddUser({ navigation }) {
     const currentY = event.nativeEvent.contentOffset.y;
     const diff = currentY - lastScrollY.current;
 
-    if (diff > 12 && !isCollapsed.current && currentY > 15) {
+    if (diff > 15 && !isCollapsed.current && currentY > 40) {
       collapseCollapsible();
-    } else if (diff < -12 && isCollapsed.current) {
+    } else if (diff < -15 && isCollapsed.current) {
       expandCollapsible();
     }
 
@@ -473,11 +470,16 @@ export default function AddUser({ navigation }) {
 
   // ─── RENDER FUNCTIONS (UI ONLY CHANGES) ───
 
+  let isInTabNavigator = false;
+  try { isInTabNavigator = navigation.getParent()?.getState()?.type === 'tab'; } catch (e) {}
+
   const renderHeader = () => (
     <View style={[styles.header, { backgroundColor: theme.colors.background }]}>
-      <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={styles.headerBackBtn}>
-        <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
-      </TouchableOpacity>
+      {!isInTabNavigator && (
+        <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={styles.headerBackBtn}>
+          <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
+        </TouchableOpacity>
+      )}
       <View style={styles.headerTitleWrap}>
         <View>
           <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
@@ -570,6 +572,21 @@ export default function AddUser({ navigation }) {
         </View>
         <Text style={[styles.newContactText, { color: theme.colors.primaryTextColor }]}>
           New Contact
+        </Text>
+        <FontAwesome6 name="chevron-right" size={14} color={theme.colors.placeHolderTextColor} />
+      </TouchableOpacity>
+
+      {/* New Group Button */}
+      <TouchableOpacity
+        onPress={() => navigation.navigate('CreateGroup')}
+        activeOpacity={0.7}
+        style={styles.newContactBtn}
+      >
+        <View style={[styles.newContactIcon, { backgroundColor: theme.colors.themeColor }]}>
+          <Ionicons name="people" size={17} color={theme.colors.textWhite} />
+        </View>
+        <Text style={[styles.newContactText, { color: theme.colors.primaryTextColor }]}>
+          New Group
         </Text>
         <FontAwesome6 name="chevron-right" size={14} color={theme.colors.placeHolderTextColor} />
       </TouchableOpacity>

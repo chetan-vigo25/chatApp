@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState, useRef } from 'react';
 import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
@@ -37,8 +37,6 @@ export default function ArchivedChats({ navigation }) {
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
-
-  const openSwipeableRef = useRef(null);
 
   // Animations
   const profileOpacityAnim = useRef(new Animated.Value(0)).current;
@@ -190,16 +188,18 @@ export default function ArchivedChats({ navigation }) {
   const onTogglePin = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
-    if (selectedChatItem?.isPinned) unpinChat(chatId);
-    else pinChat(chatId);
+    const ct = selectedChatItem?.chatType || 'private';
+    if (selectedChatItem?.isPinned) unpinChat(chatId, ct);
+    else pinChat(chatId, ct);
     closeActionMenu();
   }, [selectedChatItem, pinChat, unpinChat, closeActionMenu]);
 
   const onPressMute = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
+    const ct = selectedChatItem?.chatType || 'private';
     if (selectedChatItem?.isMuted) {
-      unmuteChat(chatId);
+      unmuteChat(chatId, ct);
       closeActionMenu();
       return;
     }
@@ -209,15 +209,17 @@ export default function ArchivedChats({ navigation }) {
   const onSelectMuteDuration = useCallback((duration) => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
-    muteChat(chatId, duration);
+    const ct = selectedChatItem?.chatType || 'private';
+    muteChat(chatId, duration, ct);
     closeActionMenu();
   }, [selectedChatItem, muteChat, closeActionMenu]);
 
   const onToggleArchive = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
-    if (selectedChatItem?.isArchived) unarchiveChat(chatId);
-    else archiveChat(chatId);
+    const ct = selectedChatItem?.chatType || 'private';
+    if (selectedChatItem?.isArchived) unarchiveChat(chatId, ct);
+    else archiveChat(chatId, ct);
     closeActionMenu();
   }, [selectedChatItem, archiveChat, unarchiveChat, closeActionMenu]);
 
@@ -346,13 +348,12 @@ export default function ArchivedChats({ navigation }) {
             <ChatCard
               item={item}
               theme={theme}
-              openSwipeableRef={openSwipeableRef}
               onPress={() => navigation.navigate('ChatScreen', { item })}
               onLongPress={() => openActionMenu(item)}
               onAvatarPress={() => openProfilePreview(item)}
-              onSwipePin={() => (item?.isPinned ? unpinChat(item?.chatId || item?._id) : pinChat(item?.chatId || item?._id))}
-              onSwipeMute={() => (item?.isMuted ? unmuteChat(item?.chatId || item?._id) : muteChat(item?.chatId || item?._id, 8 * 60 * 60 * 1000))}
-              onSwipeArchive={() => unarchiveChat(item?.chatId || item?._id)}
+              onSwipePin={() => { const ct = item?.chatType || 'private'; item?.isPinned ? unpinChat(item?.chatId || item?._id, ct) : pinChat(item?.chatId || item?._id, ct); }}
+              onSwipeMute={() => { const ct = item?.chatType || 'private'; item?.isMuted ? unmuteChat(item?.chatId || item?._id, ct) : muteChat(item?.chatId || item?._id, 8 * 60 * 60 * 1000, ct); }}
+              onSwipeArchive={() => unarchiveChat(item?.chatId || item?._id, item?.chatType || 'private')}
               getUserColor={getUserColor}
               getPreviewText={getPreviewText}
               getRelativeTime={getRelativeTime}
@@ -594,14 +595,14 @@ export default function ArchivedChats({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              <ImageZoom
+              {/* <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              />
+              /> */}
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>
