@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { StyleSheet, View, Text, ActivityIndicator, Image, Animated, Pressable, TouchableOpacity, TextInput, Alert, Platform, ToastAndroid, Modal } from 'react-native';
+import { StyleSheet, View, Text, ActivityIndicator, Image, Animated, Pressable, TouchableOpacity, TextInput, Alert, Platform, ToastAndroid, Modal, Dimensions } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -35,6 +36,8 @@ export default function Login({ navigation }) {
   const [generatedOtp, setGeneratedOtp] = useState('');
   const [shouldNavigate, setShouldNavigate] = useState(false);
   const navigationRef = useRef(false);
+  const bannerSlideAnim = useRef(new Animated.Value(-200)).current;
+  const bannerOpacity = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     requestLocationPermission();
@@ -66,14 +69,49 @@ export default function Login({ navigation }) {
     if (Platform.OS === 'android') {
       ToastAndroid.show('OTP copied to clipboard', ToastAndroid.SHORT);
     }
+    handleCloseAlert(true);
   };
 
-  const handleCloseAlert = () => {
-    setOtpAlertVisible(false);
-    // Set flag to navigate after alert closes
-    if (generatedOtp) {
-      setShouldNavigate(true);
-    }
+  const showBanner = () => {
+    setOtpAlertVisible(true);
+    bannerSlideAnim.setValue(-200);
+    bannerOpacity.setValue(0);
+    Animated.parallel([
+      Animated.spring(bannerSlideAnim, {
+        toValue: 0,
+        useNativeDriver: true,
+        tension: 60,
+        friction: 9,
+      }),
+      Animated.timing(bannerOpacity, {
+        toValue: 1,
+        duration: 300,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
+  const handleCloseAlert = (shouldNav = false) => {
+    Animated.parallel([
+      Animated.timing(bannerSlideAnim, {
+        toValue: -200,
+        duration: 250,
+        useNativeDriver: true,
+      }),
+      Animated.timing(bannerOpacity, {
+        toValue: 0,
+        duration: 250,
+        useNativeDriver: true,
+      }),
+    ]).start(() => {
+      setOtpAlertVisible(false);
+      if (shouldNav && generatedOtp) {
+        setShouldNavigate(true);
+      } else {
+        setShouldNavigate(false);
+        setGeneratedOtp('');
+      }
+    });
   };
 
   const performNavigation = () => {
@@ -103,7 +141,7 @@ export default function Login({ navigation }) {
       const data = result.payload?.otpData;
       const otp = data?.otp || data?.code || data;
       setGeneratedOtp(otp);
-      setOtpAlertVisible(true); // Show custom modal alert
+      showBanner();
     } else {
       console.log("Error", result.payload);
       showToast('Failed to generate OTP. Please try again.');
@@ -166,43 +204,98 @@ export default function Login({ navigation }) {
           )}
         </TouchableOpacity>
 
-        {/* Custom OTP Alert Modal */}
+        {/* OTP Notification Banner */}
         <Modal
           visible={otpAlertVisible}
           transparent={true}
-          animationType="fade"
-          onRequestClose={handleCloseAlert}
+          animationType="none"
+          onRequestClose={() => {}}
         >
-          <Pressable 
-            style={styles.modalOverlay}
-          >
-            <Pressable 
-              style={[styles.modalContent, { backgroundColor: theme.colors.background }]}
-              onPress={(e) => e.stopPropagation()} // Prevent closing when tapping inside
+          <View style={styles.bannerOverlay}>
+            <Animated.View
+              style={[
+                styles.bannerContainer,
+                {
+                  backgroundColor: isDarkMode ? '#1E1E2E' : '#FFFFFF',
+                  transform: [{ translateY: bannerSlideAnim }],
+                  opacity: bannerOpacity,
+                },
+              ]}
             >
-              <Text style={[styles.modalTitle, { color: theme.colors.themeColor }]}>
-                Your OTP Code
-              </Text>
-              
-              <Text style={[styles.otpText, { color: theme.colors.primaryTextColor }]}>
-                {generatedOtp}
-              </Text>
+              {/* Banner Header */}
+              <View style={styles.bannerHeader}>
+                <View style={styles.bannerAppInfo}>
+                  <View style={[styles.bannerIconWrap, { backgroundColor: theme.colors.themeColor }]}>
+                    <Ionicons name="chatbubble-ellipses" size={16} color="#fff" />
+                  </View>
+                  <Text style={[styles.bannerAppName, { color: theme.colors.placeHolderTextColor }]}>
+                    {APP_TAG_NAME}
+                  </Text>
+                  <Text style={[styles.bannerTime, { color: theme.colors.placeHolderTextColor }]}>
+                    now
+                  </Text>
+                </View>
+              </View>
 
-              <View style={styles.modalButtons}>
+              {/* Banner Body */}
+              <View style={styles.bannerBody}>
+                {/* <Text style={[styles.bannerSender, { color: theme.colors.primaryTextColor }]}>
+                  {selectedCountry?.code} {phoneNumber}
+                </Text> */}
+                <Text style={[styles.bannerMessage, { color: theme.colors.placeHolderTextColor }]}>
+                  Your verification code is{' '}
+                  <Text style={[styles.bannerOtpCode, { color: theme.colors.themeColor }]}>
+                    {generatedOtp}
+                  </Text>
+                  . Do not share this code with anyone.
+                </Text>
+              </View>
+
+              {/* Banner Actions */}
+              <View style={[styles.bannerActions, { borderTopColor: isDarkMode ? '#333' : '#E8E8E8' }]}>
                 <TouchableOpacity
-                  style={[styles.modalButton, { backgroundColor: theme.colors.themeColor }]}
-                  onPress={() => {
-                    handleCopyOtp();
-                    handleCloseAlert();
-                  }}
+                  style={styles.bannerActionBtn}
+                  onPress={handleCopyOtp}
+                  activeOpacity={0.7}
                 >
-                  <Text style={[styles.modalButtonText, { color: theme.colors.textWhite }]}>
+                  <Ionicons name="copy-outline" size={18} color={theme.colors.themeColor} />
+                  <Text style={[styles.bannerActionText, { color: theme.colors.themeColor }]}>
                     Copy OTP
                   </Text>
                 </TouchableOpacity>
+
+                <View style={[styles.bannerDivider, { backgroundColor: isDarkMode ? '#333' : '#E8E8E8' }]} />
+
+                <TouchableOpacity
+                  style={styles.bannerActionBtn}
+                  onPress={() => {
+                    setShouldNavigate(false);
+                    setGeneratedOtp('');
+                    Animated.parallel([
+                      Animated.timing(bannerSlideAnim, {
+                        toValue: -200,
+                        duration: 250,
+                        useNativeDriver: true,
+                      }),
+                      Animated.timing(bannerOpacity, {
+                        toValue: 0,
+                        duration: 250,
+                        useNativeDriver: true,
+                      }),
+                    ]).start(() => {
+                      setOtpAlertVisible(false);
+                    });
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="close-circle-outline" size={18} color={theme.colors.placeHolderTextColor} />
+                  <Text style={[styles.bannerActionText, { color: theme.colors.placeHolderTextColor }]}>
+                    Dismiss
+                  </Text>
+                </TouchableOpacity>
               </View>
-            </Pressable>
-          </Pressable>
+            </Animated.View>
+          </View>
         </Modal>
       </View>
     </Animated.View>
@@ -210,54 +303,86 @@ export default function Login({ navigation }) {
 }
 
 const styles = StyleSheet.create({
-  modalOverlay: {
+  bannerOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'flex-start',
+    paddingTop: Platform.OS === 'ios' ? 50 : 10,
+    paddingHorizontal: 10,
+  },
+  bannerContainer: {
+    borderRadius: 16,
+    overflow: 'hidden',
+    elevation: 6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    marginTop:40
+  },
+  bannerHeader: {
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 4,
+  },
+  bannerAppInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  bannerIconWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
     justifyContent: 'center',
     alignItems: 'center',
   },
-  modalContent: {
-    width: '80%',
-    borderRadius: 10,
-    padding: 20,
-    alignItems: 'center',
-    elevation: 5,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-  },
-  modalTitle: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 18,
-    marginBottom: 15,
-  },
-  otpText: {
+  bannerAppName: {
     fontFamily: 'Roboto-Medium',
-    fontSize: 24,
-    letterSpacing: 3,
-    marginBottom: 20,
-    padding: 10,
-    borderWidth: 1,
-    borderColor: '#ddd',
-    borderRadius: 5,
-    width: '100%',
-    textAlign: 'center',
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    width: '100%',
-    gap: 10,
-  },
-  modalButton: {
+    fontSize: 13,
+    marginLeft: 8,
     flex: 1,
-    paddingVertical: 12,
-    borderRadius: 5,
-    alignItems: 'center',
   },
-  modalButtonText: {
+  bannerTime: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+  },
+  bannerBody: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  bannerSender: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 15,
+    marginBottom: 3,
+  },
+  bannerMessage: {
     fontFamily: 'Roboto-Medium',
     fontSize: 14,
+    lineHeight: 20,
+  },
+  bannerOtpCode: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 16,
+    letterSpacing: 2,
+  },
+  bannerActions: {
+    flexDirection: 'row',
+    borderTopWidth: 0.8,
+    marginTop: 4,
+  },
+  bannerActionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 11,
+    gap: 6,
+  },
+  bannerActionText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 14,
+  },
+  bannerDivider: {
+    width: 0.8,
+    alignSelf: 'stretch',
   },
 });
