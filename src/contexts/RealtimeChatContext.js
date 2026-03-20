@@ -1360,6 +1360,51 @@ const reducer = (state, action) => {
       };
     }
 
+    // ─── GROUP: Incoming group message — update chat list preview ───
+    case 'INCOMING_GROUP_MESSAGE': {
+      const { chatId, groupId, senderId, senderName, text, createdAt, messageId } = action.payload || {};
+      const resolvedId = normalizeId(chatId || groupId);
+      if (!resolvedId) return state;
+
+      const nextMap = { ...state.chatMap };
+      const existing = nextMap[resolvedId] || {};
+      const lastMessageAt = createdAt || new Date().toISOString();
+
+      nextMap[resolvedId] = {
+        ...existing,
+        chatId: resolvedId,
+        _id: existing._id || resolvedId,
+        lastMessage: {
+          ...(existing.lastMessage || {}),
+          text: text || '',
+          senderId,
+          senderName,
+          messageId,
+          createdAt: lastMessageAt,
+        },
+        lastMessageAt,
+      };
+
+      // Increment unread if not the active chat
+      const unreadByChat = { ...state.unreadByChat };
+      if (senderId && state.currentUserId && String(senderId) !== String(state.currentUserId) && state.activeChatId !== resolvedId) {
+        unreadByChat[resolvedId] = Number(unreadByChat[resolvedId] || existing?.unreadCount || 0) + 1;
+        nextMap[resolvedId].unreadCount = unreadByChat[resolvedId];
+      }
+
+      const sections = buildOrderedSections(nextMap);
+      return {
+        ...state,
+        chatMap: nextMap,
+        sortedChatIds: sections.sortedChatIds,
+        pinnedChatIds: sections.pinnedChatIds,
+        regularChatIds: sections.regularChatIds,
+        archivedChatIds: sections.archivedChatIds,
+        unreadByChat,
+        totalUnread: recomputeTotalUnread(unreadByChat),
+      };
+    }
+
     // ─── GROUP: Remove chat from list (after leave/delete) ───
     case 'REMOVE_CHAT': {
       const targetId = normalizeId(action.payload);
@@ -1980,6 +2025,50 @@ export function RealtimeChatProvider({ children }) {
     socket.on('chat:cleared:me', onChatCleared);
     socket.on('chat:cleared:everyone', onChatCleared);
 
+    // ─── GROUP MESSAGE LISTENERS (chat list updates) ───
+
+    const onGroupMessageNew = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      const chatId = normalizeId(data?.chatId || data?.groupId);
+      if (!chatId) return;
+
+      const senderId = normalizeId(data?.senderId);
+      const senderName = data?.senderName || data?.sender?.fullName || '';
+      const text = data?.text || '';
+      const messageType = data?.messageType || 'text';
+      const createdAt = data?.createdAt || new Date().toISOString();
+
+      // Build preview text for chat list
+      const isSystemMsg = messageType === 'system';
+      let previewText = text;
+      if (messageType === 'image') previewText = 'Photo';
+      else if (messageType === 'video') previewText = 'Video';
+      else if (messageType === 'audio') previewText = 'Audio';
+      else if (messageType === 'file') previewText = 'Document';
+      else if (messageType === 'location') previewText = 'Location';
+
+      // System messages show as-is (no sender prefix)
+      const fullPreview = isSystemMsg ? previewText : (senderName ? `${senderName}: ${previewText}` : previewText);
+
+      dispatch({
+        type: 'INCOMING_GROUP_MESSAGE',
+        payload: {
+          chatId,
+          groupId,
+          senderId,
+          senderName,
+          text: fullPreview,
+          messageType,
+          createdAt,
+          messageId: normalizeId(data?.messageId || data?._id),
+          tempId: data?.tempId,
+        },
+      });
+    };
+
+    socket.on('group:message:new', onGroupMessageNew);
+
     // ─── GROUP SOCKET LISTENERS ───
 
     // Confirmation: you successfully joined a group
@@ -2008,14 +2097,22 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
-      console.log('📥 [GROUP] Member joined:', userId, 'in group:', groupId);
+      const memberName = data?.username || data?.fullName || data?.name || '';
       dispatch({
         type: 'GROUP_MEMBER_JOINED',
+        payload: { groupId, userId, username: memberName, timestamp: data?.timestamp },
+      });
+      // Update chat list preview with system message
+      dispatch({
+        type: 'INCOMING_GROUP_MESSAGE',
         payload: {
+          chatId: groupId,
           groupId,
-          userId,
-          username: data?.username || data?.fullName,
-          timestamp: data?.timestamp,
+          senderId: null,
+          senderName: null,
+          text: memberName ? `${memberName} joined` : 'A member joined',
+          messageType: 'system',
+          createdAt: data?.timestamp || new Date().toISOString(),
         },
       });
     };
@@ -2026,10 +2123,22 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
-      console.log('📥 [GROUP] Member left:', userId, 'from group:', groupId);
+      const memberName = data?.username || data?.fullName || data?.name || '';
       dispatch({
         type: 'GROUP_MEMBER_LEFT',
         payload: { groupId, userId },
+      });
+      dispatch({
+        type: 'INCOMING_GROUP_MESSAGE',
+        payload: {
+          chatId: groupId,
+          groupId,
+          senderId: null,
+          senderName: null,
+          text: memberName ? `${memberName} left` : 'A member left',
+          messageType: 'system',
+          createdAt: data?.timestamp || new Date().toISOString(),
+        },
       });
     };
 
@@ -2053,10 +2162,19 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
-      console.log('📥 [GROUP] Member added:', userId, 'to group:', groupId);
+      const memberName = data?.username || data?.fullName || data?.name || '';
       dispatch({
         type: 'GROUP_MEMBER_JOINED',
-        payload: { groupId, userId, username: data?.username || data?.fullName, timestamp: data?.timestamp },
+        payload: { groupId, userId, username: memberName, timestamp: data?.timestamp },
+      });
+      dispatch({
+        type: 'INCOMING_GROUP_MESSAGE',
+        payload: {
+          chatId: groupId, groupId, senderId: null, senderName: null,
+          text: memberName ? `${memberName} was added` : 'A member was added',
+          messageType: 'system',
+          createdAt: data?.timestamp || new Date().toISOString(),
+        },
       });
     };
 
@@ -2066,8 +2184,17 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
-      console.log('📥 [GROUP] Member removed:', userId, 'from group:', groupId);
+      const memberName = data?.username || data?.fullName || data?.name || '';
       dispatch({ type: 'GROUP_MEMBER_REMOVED', payload: { groupId, userId } });
+      dispatch({
+        type: 'INCOMING_GROUP_MESSAGE',
+        payload: {
+          chatId: groupId, groupId, senderId: null, senderName: null,
+          text: memberName ? `${memberName} was removed` : 'A member was removed',
+          messageType: 'system',
+          createdAt: data?.timestamp || new Date().toISOString(),
+        },
+      });
     };
 
     // Personal: you were removed from a group
@@ -2209,6 +2336,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:unarchive:response', onChatUnarchiveResponse),
       () => socket.off('chat:cleared:me', onChatCleared),
       () => socket.off('chat:cleared:everyone', onChatCleared),
+      () => socket.off('group:message:new', onGroupMessageNew),
       () => socket.off('group:joined', onGroupJoined),
       () => socket.off('group:left', onGroupLeft),
       () => socket.off('group:member:joined', onGroupMemberJoined),

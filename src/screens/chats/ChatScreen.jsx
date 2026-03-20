@@ -1175,6 +1175,7 @@ export default function ChatScreen({ navigation, route }) {
     flatListRef,
     chatData,
     getUserColor,
+    groupMembersMap,
     messages,
     isLoadingInitial,
     isRefreshing,
@@ -3579,7 +3580,8 @@ export default function ChatScreen({ navigation, route }) {
     const isDeletedForCurrentUser = Array.isArray(deletedFor)
       ? deletedFor.some((id) => sameId(id, currentUserId))
       : (typeof deletedFor === 'string' ? (deletedFor.toLowerCase() === 'everyone' || sameId(deletedFor, currentUserId)) : false);
-    const isDeletedMessage = Boolean(msg?.isDeleted) || isDeletedForCurrentUser || msg?.type === 'system';
+    const isSystemMessage = msg?.type === 'system' || msg?.messageType === 'system';
+    const isDeletedMessage = (Boolean(msg?.isDeleted) || isDeletedForCurrentUser) && !isSystemMessage;
     const deletedText = msg?.placeholderText || (isMyMessage ? 'You deleted this message' : 'This message was deleted');
 
     const isImage = msg.type === 'image' || msg.mediaType === 'image' || msg.type === 'photo';
@@ -3593,6 +3595,38 @@ export default function ChatScreen({ navigation, route }) {
 
     const dateBadgeKey = shouldShowDateAbove(msg, index, messages);
 
+    // ── System messages (group created, member joined/left/removed) ──
+    if (isSystemMessage) {
+      const systemText = msg?.text || msg?.content || '';
+
+      // Hide "created the group" system messages — the footer already shows this
+      const isCreatedMsg = /created\s+(the\s+)?group/i.test(systemText);
+      if (isCreatedMsg) return null;
+
+      // Resolve any raw user IDs in system text to actual names
+      const resolvedText = systemText.replace(/\b([a-f0-9]{24})\b/g, (match) => {
+        return groupMembersMap?.[match]?.fullName || match;
+      });
+      return (
+        <React.Fragment>
+          {dateBadgeKey && (
+            <View style={{ alignItems: 'center', paddingVertical: 8 }}>
+              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12 }}>
+                <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>{dateBadgeKey}</Text>
+              </View>
+            </View>
+          )}
+          <View style={{ alignItems: 'center', paddingVertical: 3, paddingHorizontal: 30 }}>
+            <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 10, maxWidth: '85%' }}>
+              <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+                {resolvedText}
+              </Text>
+            </View>
+          </View>
+        </React.Fragment>
+      );
+    }
+
     return (
       <React.Fragment>
         <Pressable
@@ -3601,7 +3635,7 @@ export default function ChatScreen({ navigation, route }) {
               handleToggleSelectMessages(messageKey);
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
             }
-          }} 
+          }}
           onLongPress={() => {
             if (!isDeletedMessage) {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
@@ -3646,13 +3680,15 @@ export default function ChatScreen({ navigation, route }) {
             
             {/* Sender name for group chats */}
             {!isMyMessage && chatData?.isGroup && (
-              <Text style={{ 
-                fontSize: 11, 
+              <Text style={{
+                fontSize: 11,
                 color: getUserColor?.(msg.senderId) || theme.colors.themeColor,
                 fontFamily: "Roboto-Medium",
                 marginBottom: 2,
               }}>
-                {msg.senderName || 'Unknown'}
+                {msg.senderName
+                  || groupMembersMap?.[msg.senderId]?.fullName
+                  || 'Member'}
               </Text>
             )}
             
@@ -3799,13 +3835,40 @@ export default function ChatScreen({ navigation, route }) {
       );
     }
     if (!hasMoreMessages && messages.length > 0 && !isSearching) {
+      const isGrpFooter = chatData?.isGroup || chatData?.chatType === 'group';
+      const creatorId = chatData?.group?.createdBy || chatData?.group?.ownerId;
+      const creatorName = creatorId
+        ? (groupMembersMap?.[String(creatorId)]?.fullName || 'someone')
+        : '';
+      const groupCreatedDate = chatData?.group?.createdAt
+        ? new Date(chatData.group.createdAt).toLocaleDateString('en-US', { day: 'numeric', month: 'short', year: 'numeric' })
+        : '';
+
       return (
-        <View style={{ paddingVertical: 16, alignItems: "center" }}>
-          <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 20, paddingVertical: 6, borderRadius: 20 }}>
-            <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor }}>
-              🏁 Beginning of conversation
-            </Text>
-          </View>
+        <View style={{ paddingVertical: 16, alignItems: "center", paddingHorizontal: 30 }}>
+          {isGrpFooter ? (
+            <View style={{ alignItems: 'center', gap: 6 }}>
+              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 16, paddingVertical: 6, borderRadius: 10 }}>
+                <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+                  {creatorName
+                    ? `${creatorName} created group "${chatData?.chatName || chatData?.groupName || 'this group'}"`
+                    : `Group "${chatData?.chatName || chatData?.groupName || ''}" created`}
+                  {groupCreatedDate ? ` on ${groupCreatedDate}` : ''}
+                </Text>
+              </View>
+              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 16, paddingVertical: 6, borderRadius: 10 }}>
+                <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+                  Messages and calls are end-to-end encrypted. Only people in this chat can read, listen to, or share them.
+                </Text>
+              </View>
+            </View>
+          ) : (
+            <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 20, paddingVertical: 6, borderRadius: 20 }}>
+              <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor }}>
+                Beginning of conversation
+              </Text>
+            </View>
+          )}
         </View>
       );
     }
