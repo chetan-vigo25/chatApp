@@ -2,6 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
+import ChatDatabase from '../services/ChatDatabase';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -945,7 +946,7 @@ const reducer = (state, action) => {
           lastMessageType: payload.lastMessageType || lastMsg?.type || existing.lastMessageType || 'text',
           lastMessageSender: payload.lastMessageSender ?? lastMsg?.senderId ?? existing.lastMessageSender ?? null,
           lastMessageAt: payload.lastMessageAt || lastMsg?.createdAt || existing.lastMessageAt || null,
-          lastMessageEdited: lastMsg?.isEdited ? true : (existing.lastMessageEdited || false),
+          lastMessageEdited: payload.lastMessageEdited || lastMsg?.isEdited ? true : (existing.lastMessageEdited || false),
         },
       };
 
@@ -2642,7 +2643,7 @@ export function RealtimeChatProvider({ children }) {
     dispatch({ type: 'RESET_STATE', payload: { currentUserId: state.currentUserId || null } });
   }, [state.currentUserId]);
 
-  const hydrateChats = useCallback((chats) => {
+  const hydrateChats = useCallback(async (chats) => {
     dispatch({ type: 'HYDRATE_CHATS', payload: chats || [] });
     const tempMap = {};
     (chats || []).forEach((chat) => {
@@ -2650,6 +2651,68 @@ export function RealtimeChatProvider({ children }) {
       if (chatId) tempMap[chatId] = chat;
     });
     subscribePresenceForChats(tempMap);
+
+    // Sync lastMessage from SQLite — SQLite is the source of truth for message content.
+    // The API/cache may have stale lastMessage (before edit/delete).
+    try {
+      const chatIds = Object.keys(tempMap);
+      for (const chatId of chatIds) {
+        // Try chatId first, then groupId for group chats
+        const chat = tempMap[chatId];
+        const groupId = normalizeId(chat?.groupId || chat?.group?._id);
+        let latestMsg = await ChatDatabase.getLatestMessage(chatId);
+        if (!latestMsg && groupId) {
+          latestMsg = await ChatDatabase.getLatestMessage(groupId);
+        }
+        if (!latestMsg) continue;
+
+        const apiLastMsg = tempMap[chatId]?.lastMessage;
+        const apiMsgId = normalizeId(apiLastMsg?.serverMessageId || apiLastMsg?.messageId || apiLastMsg?.id || apiLastMsg?._id);
+        const localMsgId = normalizeId(latestMsg.serverMessageId || latestMsg.id);
+
+        // If SQLite has a locally edited or deleted version that the API doesn't reflect, use SQLite's
+        const localIsEdited = Boolean(latestMsg.isEdited);
+        const localIsDeleted = Boolean(latestMsg.isDeleted);
+        const apiIsEdited = Boolean(apiLastMsg?.isEdited || apiLastMsg?.editedAt);
+        const apiIsDeleted = Boolean(apiLastMsg?.isDeleted);
+
+        const shouldOverride =
+          (localIsEdited && !apiIsEdited) ||
+          (localIsDeleted && !apiIsDeleted) ||
+          // Also override if SQLite has a newer message than the API
+          (latestMsg.timestamp && apiLastMsg?.createdAt &&
+            latestMsg.timestamp > new Date(apiLastMsg.createdAt).getTime());
+
+        if (shouldOverride) {
+          dispatch({
+            type: 'LOCAL_LAST_MESSAGE_OVERRIDE',
+            payload: {
+              chatId,
+              lastMessage: {
+                text: latestMsg.isDeleted ? (latestMsg.placeholderText || 'This message was deleted') : (latestMsg.text || ''),
+                type: latestMsg.type || 'text',
+                senderId: latestMsg.senderId || null,
+                status: latestMsg.status || null,
+                createdAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
+                serverMessageId: latestMsg.serverMessageId || latestMsg.id,
+                messageId: latestMsg.serverMessageId || latestMsg.id,
+                isEdited: localIsEdited,
+                editedAt: latestMsg.editedAt || null,
+                isDeleted: localIsDeleted,
+                deletedFor: latestMsg.deletedFor || null,
+                placeholderText: latestMsg.placeholderText || null,
+              },
+              lastMessageAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
+              lastMessageType: latestMsg.type || 'text',
+              lastMessageSender: latestMsg.senderId || null,
+              lastMessageEdited: localIsEdited,
+            },
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('[RealtimeChat] SQLite sync after hydrate error:', err);
+    }
   }, [subscribePresenceForChats]);
 
   const deferDispatch = useCallback((action) => {

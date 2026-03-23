@@ -482,8 +482,13 @@ export default function ChatList({ navigation }) {
 
   // ─── PREVIEW DATA ───
 
-  const previewName = selectedChatItem?.peerUser?.fullName || 'Unknown User';
-  const previewImage = selectedChatItem?.peerUser?.profileImage;
+  const isPreviewGroup = Boolean(selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup);
+  const previewName = isPreviewGroup
+    ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
+    : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
+  const previewImage = isPreviewGroup
+    ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
+    : selectedChatItem?.peerUser?.profileImage;
   const previewAvatarColor = getAvatarColor(previewName);
 
   // ─── RENDER ───
@@ -639,16 +644,7 @@ export default function ChatList({ navigation }) {
                 openSwipeableRef={openSwipeableRef}
                 onPress={() => navigation.navigate('ChatScreen', { item })}
                 onLongPress={() => openActionMenu(item)}
-                onAvatarPress={() => {
-                  if (item?.chatType === 'group' || item?.isGroup) {
-                    navigation.navigate('GroupInfo', {
-                      groupId: item?.groupId || item?.group?._id || item?.chatId,
-                      item,
-                    });
-                  } else {
-                    openProfilePreview(item);
-                  }
-                }}
+                onAvatarPress={() => openProfilePreview(item)}
                 onSwipePin={() => {
                   const ct = item?.chatType || 'private';
                   if (item?.isPinned) unpinChat(item?.chatId || item?._id, ct);
@@ -867,9 +863,13 @@ export default function ChatList({ navigation }) {
                 <Image resizeMode="cover" source={{ uri: previewImage }} style={StyleSheet.absoluteFill} />
               ) : (
                 <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
-                  <Text style={styles.profileFallbackText}>
-                    {(previewName || '?').charAt(0).toUpperCase()}
-                  </Text>
+                  {isPreviewGroup ? (
+                    <Ionicons name="people" size={48} color="#fff" />
+                  ) : (
+                    <Text style={styles.profileFallbackText}>
+                      {(previewName || '?').charAt(0).toUpperCase()}
+                    </Text>
+                  )}
                 </View>
               )}
 
@@ -892,7 +892,16 @@ export default function ChatList({ navigation }) {
                 </TouchableOpacity>
                 <TouchableOpacity
                   onPress={() => {
-                    if (selectedChatItem) navigation.navigate('UserB', { item: selectedChatItem });
+                    if (selectedChatItem) {
+                      if (isPreviewGroup) {
+                        navigation.navigate('GroupInfo', {
+                          groupId: selectedChatItem?.groupId || selectedChatItem?.group?._id || selectedChatItem?.chatId,
+                          item: selectedChatItem,
+                        });
+                      } else {
+                        navigation.navigate('UserB', { item: selectedChatItem });
+                      }
+                    }
                     closeProfilePreview();
                   }}
                   activeOpacity={0.8}
@@ -941,11 +950,15 @@ export default function ChatList({ navigation }) {
           ) : (
             <View style={styles.imageViewerNoPhoto}>
               <View style={[styles.imageViewerFallbackCircle, { backgroundColor: previewAvatarColor }]}>
-                <Text style={styles.imageViewerFallbackLetter}>
-                  {(previewName || '?').charAt(0).toUpperCase()}
-                </Text>
+                {isPreviewGroup ? (
+                  <Ionicons name="people" size={64} color="#fff" />
+                ) : (
+                  <Text style={styles.imageViewerFallbackLetter}>
+                    {(previewName || '?').charAt(0).toUpperCase()}
+                  </Text>
+                )}
               </View>
-              <Text style={styles.imageViewerNoPhotoText}>No profile photo</Text>
+              <Text style={styles.imageViewerNoPhotoText}>{isPreviewGroup ? 'No group photo' : 'No profile photo'}</Text>
             </View>
           )}
         </View>

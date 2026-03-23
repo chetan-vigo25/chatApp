@@ -322,28 +322,25 @@ const preserveLocalEdits = async (db, msg) => {
   const id = msg.serverMessageId || msg.id || msg.tempId;
   if (!id) return null;
 
-  // Find existing row by any ID
+  // Find existing row by any ID — include reactions column
   let existing = await db.getFirstAsync(
-    `SELECT id, text, is_edited, is_deleted, deleted_for, status, local_uri, temp_id FROM messages
+    `SELECT id, text, is_edited, is_deleted, deleted_for, status, local_uri, temp_id, reactions FROM messages
      WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
     { $id: id }
   );
 
   // If no direct ID match, search for a temp row from the same sender at the same time
-  // This catches the case where sync arrives before ACK (temp row has no serverMessageId yet)
   if (!existing && msg.senderId && msg.timestamp) {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       existing = await db.getFirstAsync(
-        `SELECT id, text, is_edited, is_deleted, deleted_for, status, local_uri, temp_id FROM messages
+        `SELECT id, text, is_edited, is_deleted, deleted_for, status, local_uri, temp_id, reactions FROM messages
          WHERE chat_id = $chatId AND sender_id = $senderId AND id LIKE 'temp_%'
            AND ABS(timestamp - $ts) < 5000
          ORDER BY is_edited DESC LIMIT 1`,
         { $chatId: msg.chatId, $senderId: msg.senderId, $ts: ts }
       );
-      // If we found a temp row, also clean it up (will be replaced by the server row)
       if (existing && existing.id) {
-        // Delete the temp row — the server row will take its place with preserved edits
         await db.runAsync(`DELETE FROM messages WHERE id = $tempId`, { $tempId: existing.id });
       }
     }
@@ -351,14 +348,22 @@ const preserveLocalEdits = async (db, msg) => {
 
   if (!existing) return null;
 
+  // Parse existing reactions from JSON
+  let existingReactions = null;
+  if (existing.reactions) {
+    try { existingReactions = JSON.parse(existing.reactions); } catch { existingReactions = null; }
+  }
+
+  let merged = null;
+
   // If existing was locally edited but incoming is NOT edited — preserve local edit
   if (existing.is_edited && !msg.isEdited && !msg.editedAt) {
-    return { ...msg, text: existing.text, isEdited: true, editedAt: new Date().toISOString() };
+    merged = { ...msg, text: existing.text, isEdited: true, editedAt: new Date().toISOString() };
   }
 
   // If existing was locally deleted but incoming is NOT deleted — preserve delete
-  if (existing.is_deleted && !msg.isDeleted) {
-    return {
+  if (!merged && existing.is_deleted && !msg.isDeleted) {
+    merged = {
       ...msg,
       text: 'This message was deleted',
       isDeleted: true,
@@ -368,18 +373,30 @@ const preserveLocalEdits = async (db, msg) => {
   }
 
   // Preserve localUri if existing has it and incoming doesn't
-  if (existing.local_uri && !msg.localUri) {
-    return { ...msg, localUri: existing.local_uri, previewUrl: msg.previewUrl || existing.local_uri };
+  if (!merged && existing.local_uri && !msg.localUri) {
+    merged = { ...msg, localUri: existing.local_uri, previewUrl: msg.previewUrl || existing.local_uri };
   }
 
   // Preserve higher status (don't regress from 'delivered' to 'sent')
-  const incomingPriority = STATUS_PRIORITY[msg.status] || 0;
-  const existingPriority = STATUS_PRIORITY[existing.status] || 0;
-  if (existingPriority > incomingPriority) {
-    return { ...msg, status: existing.status };
+  if (!merged) {
+    const incomingPriority = STATUS_PRIORITY[msg.status] || 0;
+    const existingPriority = STATUS_PRIORITY[existing.status] || 0;
+    if (existingPriority > incomingPriority) {
+      merged = { ...msg, status: existing.status };
+    }
   }
 
-  return null; // No preservation needed — allow overwrite
+  // Always preserve local reactions if incoming has none
+  // Reactions are local state that the server sync response often doesn't include
+  if (existingReactions && Object.keys(existingReactions).length > 0 && !msg.reactions) {
+    if (merged) {
+      merged.reactions = existingReactions;
+    } else {
+      merged = { ...msg, reactions: existingReactions };
+    }
+  }
+
+  return merged;
 };
 
 /**
