@@ -105,6 +105,21 @@ const findChatIdByPeer = (chatMap = {}, peerUserId, excludeChatId = null) => {
   return null;
 };
 
+const findChatIdByGroupId = (chatMap = {}, groupId) => {
+  if (!groupId) return null;
+  const gid = String(groupId);
+  // Direct key match first
+  if (chatMap[gid]) return gid;
+  // Search entries whose groupId or group._id matches
+  const allIds = Object.keys(chatMap || {});
+  for (const id of allIds) {
+    const entry = chatMap[id];
+    const entryGroupId = normalizeId(entry?.groupId || entry?.group?._id);
+    if (entryGroupId && entryGroupId === gid) return id;
+  }
+  return null;
+};
+
 const toTimestamp = (value) => {
   if (!value) return 0;
   const t = new Date(value).getTime();
@@ -195,13 +210,34 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping }) => {
   }
 
   const rawLastMessage = chat?.lastMessage;
+
+  // Handle deleted messages — show WhatsApp-style placeholder
+  const isMsgDeleted = rawLastMessage?.isDeleted || rawLastMessage?.deletedFor === 'everyone';
+  if (isMsgDeleted) {
+    const deletedText = rawLastMessage?.placeholderText || rawLastMessage?.deletedText || 'This message was deleted';
+    return {
+      text: deletedText,
+      icon: null,
+      prefix: '',
+      isEdited: false,
+      isDeleted: true,
+      fullText: deletedText,
+    };
+  }
+
   const messageText = typeof rawLastMessage === 'string' ? rawLastMessage : (rawLastMessage?.text || '');
   const messageType = (chat?.lastMessageType || rawLastMessage?.type || 'text').toString().toLowerCase();
   const messageSender = chat?.lastMessageSender || rawLastMessage?.senderId || null;
   const isEdited = Boolean(rawLastMessage?.isEdited || chat?.lastMessageEdited || rawLastMessage?.editedAt);
   const icon = MESSAGE_TYPE_ICON_MAP[messageType] || null;
-  const baseText = getMessageTypeDisplayText(messageType, messageText, rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {});
-  const prefix = currentUserId && messageSender && String(currentUserId) === String(messageSender) ? 'You: ' : '';
+  const isGroupChat = chat?.chatType === 'group' || chat?.isGroup;
+
+  // For group chats, the lastMessage.text already contains the sender prefix (e.g. "John: Hello")
+  // so we should not add another "You:" prefix. For private chats, add "You:" if the sender is current user.
+  const baseText = isGroupChat
+    ? (messageText || getMessageTypeDisplayText(messageType, '', rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {}))
+    : getMessageTypeDisplayText(messageType, messageText, rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {});
+  const prefix = (!isGroupChat && currentUserId && messageSender && String(currentUserId) === String(messageSender)) ? 'You: ' : '';
   const editedSuffix = isEdited ? ' (edited)' : '';
 
   return {
@@ -209,7 +245,8 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping }) => {
     icon,
     prefix,
     isEdited,
-    fullText: `${prefix}${icon ? `${icon} ` : ''}${baseText}${editedSuffix}`.trim(),
+    isDeleted: false,
+    fullText: `${prefix}${icon && !isGroupChat ? `${icon} ` : ''}${baseText}${editedSuffix}`.trim(),
   };
 };
 
@@ -261,7 +298,7 @@ const normalizeChatListUpdate = (payload = {}) => {
   const item = source?.item || {};
   const reason = (source?.reason || '').toString().toLowerCase();
   const type = (source?.type || REASON_TYPE_MAP[reason] || reason || 'unknown').toString().toLowerCase();
-  const chatId = normalizeId(source?.chatId || item?.chatId || item?._id || null);
+  const chatId = normalizeId(source?.chatId || item?.chatId || item?._id || source?.groupId || item?.groupId || null);
 
   if (!chatId) return null;
 
@@ -331,7 +368,17 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
   // preserve the edited text (server may not have caught up yet)
   const isSameMessage = incomingMsgId && existingMsgId && String(incomingMsgId) === String(existingMsgId);
   const keepLocalEdit = isSameMessage && baseLastMessage?.isEdited && !item?.lastMessage?.isEdited && !item?.isEdited;
-  const messageText = keepLocalEdit ? baseLastMessage.text : (incomingText || baseLastMessage?.text || '');
+
+  // If the existing lastMessage was deleted locally, preserve the deleted state unless
+  // the incoming is a genuinely different (new) message or acknowledges the delete
+  const existingIsDeleted = baseLastMessage?.isDeleted === true || baseLastMessage?.deletedFor === 'everyone';
+  const incomingAcksDelete = item?.lastMessage?.isDeleted === true || item?.lastMessage?.deletedFor === 'everyone';
+  const isNewDifferentMessage = incomingMsgId && existingMsgId && String(incomingMsgId) !== String(existingMsgId);
+  const keepLocalDelete = existingIsDeleted && !incomingAcksDelete && !isNewDifferentMessage;
+
+  const messageText = keepLocalDelete
+    ? (baseLastMessage.placeholderText || baseLastMessage.text)
+    : (keepLocalEdit ? baseLastMessage.text : (incomingText || baseLastMessage?.text || ''));
 
   const status = pickHighestMessageStatus(
     baseLastMessage?.status,
@@ -347,6 +394,9 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
     text: messageText,
     isEdited: keepLocalEdit ? true : (item?.lastMessage?.isEdited || item?.isEdited || baseLastMessage?.isEdited || false),
     editedAt: keepLocalEdit ? baseLastMessage.editedAt : (item?.lastMessage?.editedAt || item?.editedAt || baseLastMessage?.editedAt || null),
+    isDeleted: keepLocalDelete ? true : (item?.lastMessage?.isDeleted || baseLastMessage?.isDeleted || false),
+    deletedFor: keepLocalDelete ? 'everyone' : (item?.lastMessage?.deletedFor || baseLastMessage?.deletedFor || null),
+    placeholderText: keepLocalDelete ? baseLastMessage.placeholderText : (item?.lastMessage?.placeholderText || baseLastMessage?.placeholderText || null),
     type: item?.lastMessageType || item?.lastMessage?.type || baseLastMessage?.type || 'text',
     createdAt: item?.lastMessageAt || item?.lastMessage?.createdAt || fallbackTimestamp || baseLastMessage?.createdAt || Date.now(),
     senderId: item?.lastMessageSender || item?.lastMessage?.senderId || baseLastMessage?.senderId || null,
@@ -722,17 +772,31 @@ const reducer = (state, action) => {
       };
 
       const lastMessageAt = message.createdAt || new Date().toISOString();
-      const lastMessage = {
-        ...(existing.lastMessage || {}),
-        id: message.id || message.messageId || existing?.lastMessage?.id || null,
-        messageId: message.messageId || message.id || existing?.lastMessage?.messageId || null,
-        serverMessageId: message.serverMessageId || message.messageId || message.id || existing?.lastMessage?.serverMessageId || null,
-        tempId: message.tempId || existing?.lastMessage?.tempId || null,
-        text: message.text || message.content || existing?.lastMessage?.text || '',
-        createdAt: lastMessageAt,
-        senderId: message.senderId,
-        status: pickHighestMessageStatus(existing?.lastMessage?.status, message.status),
-      };
+
+      // Protect deleted lastMessage from being overwritten by stale server echo
+      const existingLastMsg = existing.lastMessage || {};
+      const existingIsDeleted = existingLastMsg?.isDeleted === true || existingLastMsg?.deletedFor === 'everyone';
+      const incomingMsgId = normalizeId(message.messageId || message.id || message.serverMessageId);
+      const existingMsgId = normalizeId(existingLastMsg?.serverMessageId || existingLastMsg?.messageId || existingLastMsg?.id);
+      const isNewDifferentMsg = incomingMsgId && existingMsgId && String(incomingMsgId) !== String(existingMsgId);
+      const preserveDelete = existingIsDeleted && !isNewDifferentMsg;
+
+      const lastMessage = preserveDelete
+        ? {
+            ...existingLastMsg,
+            status: pickHighestMessageStatus(existingLastMsg?.status, message.status),
+          }
+        : {
+            ...existingLastMsg,
+            id: message.id || message.messageId || existingLastMsg?.id || null,
+            messageId: message.messageId || message.id || existingLastMsg?.messageId || null,
+            serverMessageId: message.serverMessageId || message.messageId || message.id || existingLastMsg?.serverMessageId || null,
+            tempId: message.tempId || existingLastMsg?.tempId || null,
+            text: message.text || message.content || existingLastMsg?.text || '',
+            createdAt: lastMessageAt,
+            senderId: message.senderId,
+            status: pickHighestMessageStatus(existingLastMsg?.status, message.status),
+          };
 
       const isIncoming = Boolean(
         senderId &&
@@ -789,18 +853,35 @@ const reducer = (state, action) => {
 
     case 'OUTGOING_MESSAGE': {
       const message = action.payload || {};
-      const chatId = normalizeId(message.chatId);
+      const rawChatId = normalizeId(message.chatId);
+      const rawGroupId = normalizeId(message.groupId);
+      const isGroupMsg = Boolean(rawGroupId || message.chatType === 'group');
+
+      // Resolve chatId: for groups, the chatMap key may differ from chatId
+      const chatId = rawChatId && state.chatMap[rawChatId]
+        ? rawChatId
+        : (rawGroupId && state.chatMap[rawGroupId])
+          ? rawGroupId
+          : (isGroupMsg ? findChatIdByGroupId(state.chatMap, rawGroupId || rawChatId) : null)
+            || rawChatId;
+
       if (!chatId) return state;
 
       const existing = state.chatMap[chatId] || { _id: chatId, chatId };
       const lastMessageAt = message.createdAt || new Date().toISOString();
+
+      // For group chats, format text as "You: <text>" to match the preview format
+      const outgoingText = isGroupMsg
+        ? `You: ${message.text || ''}`
+        : (message.text || existing?.lastMessage?.text || '');
+
       const lastMessage = {
         ...(existing.lastMessage || {}),
         id: message.id || message.messageId || existing?.lastMessage?.id || null,
         messageId: message.messageId || message.id || existing?.lastMessage?.messageId || null,
         serverMessageId: message.serverMessageId || message.messageId || message.id || existing?.lastMessage?.serverMessageId || null,
         tempId: message.tempId || existing?.lastMessage?.tempId || null,
-        text: message.text || existing?.lastMessage?.text || '',
+        text: outgoingText,
         createdAt: lastMessageAt,
         senderId: message.senderId,
         status: pickHighestMessageStatus(existing?.lastMessage?.status, message.status || 'sent'),
@@ -815,6 +896,7 @@ const reducer = (state, action) => {
           peerUser: message?.peerUser ? { ...(existing?.peerUser || {}), ...message.peerUser } : existing?.peerUser,
           lastMessage,
           lastMessageAt,
+          lastMessageSender: message.senderId || existing?.lastMessageSender || null,
         },
       };
 
@@ -961,9 +1043,14 @@ const reducer = (state, action) => {
         const update = normalizeChatListUpdate(rawUpdate);
         if (!update) return;
 
-        const { chatId, type, item, timestamp } = update;
+        const { chatId: rawUpdateChatId, type, item, timestamp } = update;
         const itemPeerUserId = getPeerUserId(item);
-        const aliasChatId = findChatIdByPeer(nextMap, itemPeerUserId, chatId);
+        const aliasChatId = findChatIdByPeer(nextMap, itemPeerUserId, rawUpdateChatId);
+        // For group chats, resolve the chatId if it doesn't directly match a key in chatMap
+        const itemGroupId = normalizeId(item?.groupId || item?.group?._id);
+        const chatId = nextMap[rawUpdateChatId]
+          ? rawUpdateChatId
+          : (aliasChatId || (itemGroupId ? findChatIdByGroupId(nextMap, itemGroupId) : null) || rawUpdateChatId);
         let existing = nextMap[chatId] || { _id: chatId, chatId };
 
         if (aliasChatId && aliasChatId !== chatId && nextMap[aliasChatId]) {
@@ -990,6 +1077,11 @@ const reducer = (state, action) => {
         const incomingAcksEdit = incomingLastMsg?.isEdited === true || item?.isEdited === true;
         const shouldPreserveEdit = existingWasEdited && !incomingAcksEdit && type !== 'message_edited';
 
+        // Check if existing lastMessage was deleted locally and server hasn't caught up
+        const existingWasDeleted = existingLastMsg?.isDeleted === true || existingLastMsg?.deletedFor === 'everyone';
+        const incomingAcksDelete = incomingLastMsg?.isDeleted === true || incomingLastMsg?.deletedFor === 'everyone';
+        const shouldPreserveDelete = existingWasDeleted && !incomingAcksDelete && type !== 'message_deleted';
+
         const mergedBase = {
           ...existing,
           ...item,
@@ -1000,6 +1092,10 @@ const reducer = (state, action) => {
           ...(shouldPreserveEdit ? {
             lastMessage: existingLastMsg,
             lastMessageEdited: true,
+          } : {}),
+          // Preserve deleted lastMessage over server's stale data
+          ...(shouldPreserveDelete ? {
+            lastMessage: existingLastMsg,
           } : {}),
         };
 
@@ -1362,32 +1458,57 @@ const reducer = (state, action) => {
 
     // ─── GROUP: Incoming group message — update chat list preview ───
     case 'INCOMING_GROUP_MESSAGE': {
-      const { chatId, groupId, senderId, senderName, text, createdAt, messageId } = action.payload || {};
-      const resolvedId = normalizeId(chatId || groupId);
+      const { chatId: rawChatId, groupId: rawGroupId, senderId, senderName, text, messageType, createdAt, messageId } = action.payload || {};
+      const normalizedChatId = normalizeId(rawChatId);
+      const normalizedGroupId = normalizeId(rawGroupId);
+
+      // Resolve the actual key in chatMap: try chatId, then groupId, then search by groupId
+      const resolvedId = (normalizedChatId && state.chatMap[normalizedChatId])
+        ? normalizedChatId
+        : (normalizedGroupId && state.chatMap[normalizedGroupId])
+          ? normalizedGroupId
+          : findChatIdByGroupId(state.chatMap, normalizedGroupId || normalizedChatId)
+            || normalizedChatId
+            || normalizedGroupId;
+
       if (!resolvedId) return state;
 
       const nextMap = { ...state.chatMap };
       const existing = nextMap[resolvedId] || {};
       const lastMessageAt = createdAt || new Date().toISOString();
 
+      // Protect deleted lastMessage from being overwritten by stale echo
+      const existingGrpLastMsg = existing.lastMessage || {};
+      const existingGrpDeleted = existingGrpLastMsg?.isDeleted === true || existingGrpLastMsg?.deletedFor === 'everyone';
+      const incomingGrpMsgId = normalizeId(messageId);
+      const existingGrpMsgId = normalizeId(existingGrpLastMsg?.serverMessageId || existingGrpLastMsg?.messageId || existingGrpLastMsg?.id);
+      const isNewDiffGrpMsg = incomingGrpMsgId && existingGrpMsgId && String(incomingGrpMsgId) !== String(existingGrpMsgId);
+      const preserveGrpDelete = existingGrpDeleted && !isNewDiffGrpMsg;
+
       nextMap[resolvedId] = {
         ...existing,
         chatId: resolvedId,
         _id: existing._id || resolvedId,
-        lastMessage: {
+        lastMessage: preserveGrpDelete
+          ? existingGrpLastMsg
+          : {
           ...(existing.lastMessage || {}),
           text: text || '',
+          type: messageType || 'text',
           senderId,
           senderName,
           messageId,
+          serverMessageId: messageId,
           createdAt: lastMessageAt,
         },
-        lastMessageAt,
+        lastMessageAt: preserveGrpDelete ? (existing.lastMessageAt || lastMessageAt) : lastMessageAt,
+        lastMessageType: preserveGrpDelete ? existing.lastMessageType : (messageType || 'text'),
+        lastMessageSender: preserveGrpDelete ? existing.lastMessageSender : (senderId || null),
       };
 
-      // Increment unread if not the active chat
+      // Increment unread if not the active chat — skip if preserving a delete
       const unreadByChat = { ...state.unreadByChat };
-      if (senderId && state.currentUserId && String(senderId) !== String(state.currentUserId) && state.activeChatId !== resolvedId) {
+      if (!preserveGrpDelete && senderId && state.currentUserId && String(senderId) !== String(state.currentUserId) && state.activeChatId !== resolvedId) {
         unreadByChat[resolvedId] = Number(unreadByChat[resolvedId] || existing?.unreadCount || 0) + 1;
         nextMap[resolvedId].unreadCount = unreadByChat[resolvedId];
       }
@@ -1708,14 +1829,42 @@ export function RealtimeChatProvider({ children }) {
     const onMessageRead = (payload) => {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat || null);
-      if (chatId) dispatch({ type: 'MARK_READ', payload: chatId });
-      dispatchLastMessageStatusUpdate(payload, 'read');
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      // MARK_READ clears unread badge — always do this when we read incoming messages
+      if (chatId && readerId && String(readerId) === String(state.currentUserId)) {
+        dispatch({ type: 'MARK_READ', payload: chatId });
+        return; // Don't update lastMessageStatus — this is OUR read, not the peer's
+      }
+      // Only update last message status to 'read' if a peer triggered it
+      if (readerId && String(readerId) !== String(state.currentUserId)) {
+        dispatchLastMessageStatusUpdate(payload, 'read');
+      }
     };
     const onMessageDelivered = (payload) => dispatchLastMessageStatusUpdate(payload, 'delivered');
-    const onMessageReadBulk = (payload) => dispatchLastMessageStatusUpdate(payload, 'read');
-    const onMessageReadBulkResponse = (payload) => dispatchLastMessageStatusUpdate(payload, 'read');
-    const onMessageReadResponse = (payload) => dispatchLastMessageStatusUpdate(payload, 'read');
-    const onMessageSeen = (payload) => dispatchLastMessageStatusUpdate(payload, 'read');
+    const onMessageReadBulk = (payload) => {
+      const source = unwrapPayload(payload);
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      dispatchLastMessageStatusUpdate(payload, 'read');
+    };
+    const onMessageReadBulkResponse = (payload) => {
+      const source = unwrapPayload(payload);
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      dispatchLastMessageStatusUpdate(payload, 'read');
+    };
+    const onMessageReadResponse = (payload) => {
+      const source = unwrapPayload(payload);
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      dispatchLastMessageStatusUpdate(payload, 'read');
+    };
+    const onMessageSeen = (payload) => {
+      const source = unwrapPayload(payload);
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      dispatchLastMessageStatusUpdate(payload, 'read');
+    };
     const onPresence = (payload) => handlePresenceUpdate(payload);
     const onOnline = (payload) => handlePresenceUpdate({ ...payload, status: 'online' });
     const onOffline = (payload) => handlePresenceUpdate({ ...payload, status: 'offline' });
@@ -2030,13 +2179,13 @@ export function RealtimeChatProvider({ children }) {
     const onGroupMessageNew = (payload) => {
       const data = payload?.data || payload;
       const groupId = normalizeId(data?.groupId);
-      const chatId = normalizeId(data?.chatId || data?.groupId);
-      if (!chatId) return;
+      const chatId = normalizeId(data?.chatId);
+      if (!chatId && !groupId) return;
 
       const senderId = normalizeId(data?.senderId);
       const senderName = data?.senderName || data?.sender?.fullName || '';
       const text = data?.text || '';
-      const messageType = data?.messageType || 'text';
+      const messageType = data?.messageType || data?.type || 'text';
       const createdAt = data?.createdAt || new Date().toISOString();
 
       // Build preview text for chat list
@@ -2047,6 +2196,7 @@ export function RealtimeChatProvider({ children }) {
       else if (messageType === 'audio') previewText = 'Audio';
       else if (messageType === 'file') previewText = 'Document';
       else if (messageType === 'location') previewText = 'Location';
+      else if (messageType === 'contact') previewText = 'Contact';
 
       // System messages show as-is (no sender prefix)
       const fullPreview = isSystemMsg ? previewText : (senderName ? `${senderName}: ${previewText}` : previewText);

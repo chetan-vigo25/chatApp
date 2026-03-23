@@ -28,7 +28,7 @@ import ChatCard from '../../components/ChatCard';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
-// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -929,14 +929,14 @@ export default function ChatList({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              {/* <ImageZoom
+              <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              /> */}
+              />
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>

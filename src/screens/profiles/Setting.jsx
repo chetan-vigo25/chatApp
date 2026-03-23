@@ -125,7 +125,7 @@ export default function Setting({ navigation }) {
 
   const renderProfileCard = () => (
     <TouchableOpacity
-      onPress={() => navigation.navigate('Profile')}
+      onPress={() => navigation.navigate('ProfileTab')}
       activeOpacity={0.7}
       style={[styles.profileCard, { backgroundColor: theme.colors.menuBackground }]}
     >
@@ -229,9 +229,7 @@ export default function Setting({ navigation }) {
         contentContainerStyle={styles.scrollContent}
       >
         {renderProfileCard()}
-
         {menuSections.map((section, i) => renderSection(section, i))}
-
         {renderLogout()}
       </ScrollView>
     </Animated.View>

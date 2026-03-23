@@ -62,6 +62,7 @@ const ChatCard = ({
   const isArchived = Boolean(item?.isArchived);
   const hasUnread = Number(item?.unreadCount || 0) > 0;
   const isTyping = item?.realtime?.typing?.isTyping;
+  const isLastMsgDeleted = item?.lastMessageDisplay?.isDeleted || item?.lastMessage?.isDeleted;
   const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
   const peerName = isGroup
     ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
@@ -190,14 +191,14 @@ const ChatCard = ({
             {/* Row 2: Preview + Meta */}
             <View style={styles.bottomRow}>
               <View style={styles.previewWrap}>
-                {!isTyping && renderMessageStatus(item)}
+                {!isTyping && !isLastMsgDeleted && renderMessageStatus(item)}
                 <Text
                   numberOfLines={1}
                   style={[
                     styles.previewText,
                     {
                       color: isTyping ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
-                      fontStyle: isTyping ? 'italic' : 'normal',
+                      fontStyle: (isTyping || isLastMsgDeleted) ? 'italic' : 'normal',
                       fontFamily: hasUnread ? 'Roboto-Medium' : 'Roboto-Regular',
                     },
                   ]}

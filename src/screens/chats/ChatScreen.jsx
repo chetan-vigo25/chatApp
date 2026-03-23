@@ -42,12 +42,14 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
 import { mediaDownloadSigned } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
+import MentionSuggestions, { useMentions } from '../../components/MentionInput';
+import MentionText from '../../components/MentionText';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -113,12 +115,14 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   showEmojiPanel,
   onTextChange,
   onInputContentSizeChange,
+  onSelectionChange,
   onFocus,
   onBlur,
   onOpenEmoji,
   onOpenAttachment,
   onRemovePendingMedia,
   onSubmit,
+  mentionSuggestionsNode,
 }, ref) {
   const hasContent = Boolean(text.trim() || pendingMedia);
   const showAttachment = !hasContent;
@@ -183,10 +187,12 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
         backgroundColor: theme.colors.cardBackground,
         // borderTopWidth: 1,
         borderTopColor: theme.colors.borderColor,
-        overflow: 'hidden',
+        overflow: 'visible',
         borderWidth: 0,
+        zIndex: 10,
       }}
     >
+      {mentionSuggestionsNode}
       <Animated.View
         style={{
           flex: 1,
@@ -257,6 +263,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                 onChangeText={onTextChange}
                 multiline
                 onContentSizeChange={onInputContentSizeChange}
+                onSelectionChange={onSelectionChange}
                 onFocus={onFocus}
                 onBlur={onBlur}
                 placeholderTextColor={placeholderColor}
@@ -1229,7 +1236,69 @@ export default function ChatScreen({ navigation, route }) {
     clearChatForEveryone,
     markVisibleIncomingAsRead,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
+    toggleReaction,
   } = useChatLogic({ navigation, route });
+
+  // ── Mentions ──
+  const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+  const {
+    showSuggestions: showMentionSuggestions,
+    suggestions: mentionSuggestions,
+    handleTextChangeForMentions,
+    handleSelectionChange: handleMentionSelectionChange,
+    handleSelectMention,
+    getMentionsPayload,
+    resetMentions,
+    membersList: mentionMembersList,
+  } = useMentions(isGroupChat ? groupMembersMap : null, currentUserId);
+
+  const handleTextChangeWithMentions = useCallback((newText) => {
+    handleTextChange(newText);
+    if (isGroupChat) {
+      handleTextChangeForMentions(newText);
+    }
+  }, [handleTextChange, isGroupChat, handleTextChangeForMentions]);
+
+  const handleMentionSelect = useCallback((member) => {
+    handleSelectMention(member, text, (newText) => {
+      handleTextChange(newText);
+      handleTextChangeForMentions(newText);
+    });
+  }, [handleSelectMention, text, handleTextChange, handleTextChangeForMentions]);
+
+  // Reaction state
+  const [reactionMsgId, setReactionMsgId] = useState(null);
+  const [reactionDetailModal, setReactionDetailModal] = useState({ visible: false, reactions: null, selectedEmoji: null });
+  const reactionScaleAnims = useRef({}).current;
+
+  const QUICK_EMOJIS = ['❤️', '😂', '😮', '😢', '🙏', '👍'];
+
+  // Get or create a scale animation for a reaction badge
+  const getReactionScale = useCallback((key) => {
+    if (!reactionScaleAnims[key]) {
+      reactionScaleAnims[key] = new Animated.Value(1);
+    }
+    return reactionScaleAnims[key];
+  }, []);
+
+  // Animate a reaction badge (pop effect)
+  const animateReaction = useCallback((key) => {
+    const scale = getReactionScale(key);
+    Animated.sequence([
+      Animated.timing(scale, { toValue: 1.3, duration: 120, useNativeDriver: true }),
+      Animated.spring(scale, { toValue: 1, friction: 4, useNativeDriver: true }),
+    ]).start();
+  }, [getReactionScale]);
+
+  // Resolve userId to display name
+  const getReactionUserName = useCallback((userId) => {
+    if (userId === currentUserId) return 'You';
+    const member = groupMembersMap?.[userId];
+    if (member?.fullName) return member.fullName;
+    // For 1-on-1 chats, use peer name
+    if (chatData?.peerUser?.fullName && !chatData?.isGroup) return chatData.peerUser.fullName;
+    return userId;
+  }, [currentUserId, groupMembersMap, chatData]);
 
   // Local media viewer state
   const [localMediaViewer, setLocalMediaViewer] = useState({
@@ -2045,7 +2114,10 @@ export default function ChatScreen({ navigation, route }) {
       await sendMedia(mediaToSend);
       return;
     }
-    await handleSendText();
+    // Extract mentions before sending (text gets cleared after send)
+    const mentions = isGroupChat ? getMentionsPayload(text) : undefined;
+    await handleSendText(mentions);
+    if (isGroupChat) resetMentions();
   };
 
   const recordingDurationLabel = useMemo(() => {
@@ -2830,6 +2902,40 @@ export default function ChatScreen({ navigation, route }) {
     }));
   }, []);
 
+  // Helper: split a text string on @mention boundaries for highlighting
+  const renderTextWithMentions = (textStr, mentions, baseColor, mentionColor, keyPrefix) => {
+    if (!mentions || mentions.length === 0 || !textStr) {
+      return <Text style={{ color: baseColor }}>{textStr}</Text>;
+    }
+    // Build a set of mentioned display names
+    const mentionNames = mentions
+      .filter((m) => m.displayName)
+      .map((m) => m.displayName);
+    if (mentionNames.length === 0) {
+      return <Text style={{ color: baseColor }}>{textStr}</Text>;
+    }
+    // Escape regex special chars and build pattern
+    const escaped = mentionNames.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const pattern = new RegExp(`(@(?:${escaped.join('|')}))`, 'g');
+    const parts = textStr.split(pattern);
+    if (parts.length <= 1) {
+      return <Text style={{ color: baseColor }}>{textStr}</Text>;
+    }
+    return parts.map((part, i) => {
+      if (pattern.test(part)) {
+        // Reset regex lastIndex after test
+        pattern.lastIndex = 0;
+        return (
+          <Text key={`${keyPrefix}_m${i}`} style={{ color: mentionColor, fontFamily: 'Roboto-SemiBold' }}>
+            {part}
+          </Text>
+        );
+      }
+      pattern.lastIndex = 0;
+      return <Text key={`${keyPrefix}_t${i}`} style={{ color: baseColor }}>{part}</Text>;
+    });
+  };
+
   const renderRichMessageText = (msg, isMyMessage, messageKey) => {
     const parsed = getParsedRichMessage(msg?.text || '');
     const isExpanded = Boolean(expandedRichMessages[messageKey]);
@@ -2838,6 +2944,8 @@ export default function ChatScreen({ navigation, route }) {
 
     const baseColor = isMyMessage ? '#FFFFFF' : theme.colors.primaryTextColor;
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
+    const mentionColor = isMyMessage ? '#D8ECFF' : '#1DA1F2';
+    const msgMentions = msg?.mentions || msg?.payload?.mentions;
 
     const handleMeasureLayout = (event) => {
       const lineCount = event?.nativeEvent?.lines?.length || 0;
@@ -2904,7 +3012,7 @@ export default function ChatScreen({ navigation, route }) {
             }
             return (
               <Text key={key} style={{ color: baseColor }}>
-                {token.text}
+                {msgMentions ? renderTextWithMentions(token.text, msgMentions, baseColor, mentionColor, key) : token.text}
               </Text>
             );
           })}
@@ -3580,8 +3688,8 @@ export default function ChatScreen({ navigation, route }) {
     const isDeletedForCurrentUser = Array.isArray(deletedFor)
       ? deletedFor.some((id) => sameId(id, currentUserId))
       : (typeof deletedFor === 'string' ? (deletedFor.toLowerCase() === 'everyone' || sameId(deletedFor, currentUserId)) : false);
-    const isSystemMessage = msg?.type === 'system' || msg?.messageType === 'system';
-    const isDeletedMessage = (Boolean(msg?.isDeleted) || isDeletedForCurrentUser) && !isSystemMessage;
+    const isDeletedMessage = Boolean(msg?.isDeleted) || isDeletedForCurrentUser;
+    const isSystemMessage = (msg?.type === 'system' || msg?.messageType === 'system') && !isDeletedMessage;
     const deletedText = msg?.placeholderText || (isMyMessage ? 'You deleted this message' : 'This message was deleted');
 
     const isImage = msg.type === 'image' || msg.mediaType === 'image' || msg.type === 'photo';
@@ -3631,6 +3739,11 @@ export default function ChatScreen({ navigation, route }) {
       <React.Fragment>
         <Pressable
           onPress={() => {
+            if (reactionMsgId) {
+              setReactionMsgId(null);
+              clearSelectedMessages();
+              return;
+            }
             if (selectedMessage.length > 0) {
               handleToggleSelectMessages(messageKey);
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -3639,15 +3752,14 @@ export default function ChatScreen({ navigation, route }) {
           onLongPress={() => {
             if (!isDeletedMessage) {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-              handleToggleSelectMessages(messageKey);
-              if (!isMyMessage) {
-                Alert.alert('Message Options', '', [
-                  { text: 'Cancel', style: 'cancel' },
-                  { text: 'Report Message', onPress: () => handleReportMessage(msg), style: 'destructive' },
-                ]);
+              // Show emoji bar + select message for header toolbar
+              setReactionMsgId(prev => prev === messageKey ? null : messageKey);
+              if (!selectedMessage.includes(messageKey)) {
+                handleToggleSelectMessages(messageKey);
               }
             }
-          }} 
+          }}
+          delayLongPress={300} 
           style={{ 
             alignItems: isMyMessage ? "flex-end" : "flex-start", 
             paddingVertical: 2, 
@@ -3774,12 +3886,123 @@ export default function ChatScreen({ navigation, route }) {
                 </>
               )}
             </View>
+
+            {/* Floating emoji reaction bar — WhatsApp style (over the message) */}
+            {reactionMsgId === messageKey && !isDeletedMessage && (
+              <View style={{
+                flexDirection: 'row',
+                alignItems: 'center',
+                backgroundColor: isDarkMode ? '#1F2C34' : '#fff',
+                borderRadius: 28,
+                paddingHorizontal: 4,
+                paddingVertical: 2,
+                marginTop: 6,
+                elevation: 8,
+                shadowColor: '#000',
+                shadowOffset: { width: 0, height: 4 },
+                shadowOpacity: 0.25,
+                shadowRadius: 8,
+                alignSelf: isMyMessage ? 'flex-end' : 'flex-start',
+              }}>
+                {QUICK_EMOJIS.map((emoji) => {
+                  const hasReacted = msg?.reactions?.[emoji]?.users?.includes(currentUserId);
+                  return (
+                    <TouchableOpacity
+                      key={emoji}
+                      onPress={() => {
+                        toggleReaction(messageKey, emoji);
+                        setReactionMsgId(null);
+                        clearSelectedMessages();
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                      }}
+                      style={{
+                        width: 40, height: 40, borderRadius: 20,
+                        alignItems: 'center', justifyContent: 'center',
+                        backgroundColor: hasReacted ? (theme.colors.themeColor + '20') : 'transparent',
+                      }}
+                      activeOpacity={0.6}
+                    >
+                      <Text style={{ fontSize: 24 }}>{emoji}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+                {/* Plus button for more emojis */}
+                <TouchableOpacity
+                  onPress={() => { setReactionMsgId(null); }}
+                  style={{
+                    width: 36, height: 36, borderRadius: 18,
+                    alignItems: 'center', justifyContent: 'center',
+                    backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
+                    marginLeft: 2,
+                  }}
+                  activeOpacity={0.6}
+                >
+                  <Ionicons name="add" size={20} color={theme.colors.placeHolderTextColor} />
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
+
+          {/* Reaction bubbles under message */}
+          {msg?.reactions && Object.keys(msg.reactions).length > 0 && !isDeletedMessage && (
+            <View style={{
+              flexDirection: 'row',
+              flexWrap: 'wrap',
+              gap: 4,
+              marginTop: -4,
+              paddingHorizontal: 4,
+              alignSelf: isMyMessage ? 'flex-end' : 'flex-start',
+              marginRight: isMyMessage ? 12 : 0,
+              marginLeft: isMyMessage ? 0 : 12,
+            }}>
+              {Object.entries(msg.reactions).map(([emoji, data]) => {
+                if (!data?.count || data.count <= 0) return null;
+                const iReacted = data.users?.includes(currentUserId);
+                const badgeKey = `${messageKey}_${emoji}`;
+                return (
+                  <Animated.View key={emoji} style={{ transform: [{ scale: getReactionScale(badgeKey) }] }}>
+                    <TouchableOpacity
+                      onPress={() => {
+                        animateReaction(badgeKey);
+                        toggleReaction(messageKey, emoji);
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                      }}
+                      onLongPress={() => {
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                        setReactionDetailModal({ visible: true, reactions: msg.reactions, selectedEmoji: emoji });
+                      }}
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        backgroundColor: iReacted
+                          ? (theme.colors.themeColor + '18')
+                          : (isDarkMode ? '#1E2C3A' : '#F0F0F0'),
+                        borderRadius: 12,
+                        paddingHorizontal: 7,
+                        paddingVertical: 3,
+                        borderWidth: iReacted ? 1 : 0,
+                        borderColor: theme.colors.themeColor + '40',
+                      }}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={{ fontSize: 14 }}>{emoji}</Text>
+                      <Text style={{
+                        fontSize: 11,
+                        marginLeft: 3,
+                        color: iReacted ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
+                        fontFamily: 'Roboto-Medium',
+                      }}>{data.count}</Text>
+                    </TouchableOpacity>
+                  </Animated.View>
+                );
+              })}
+            </View>
+          )}
         </Pressable>
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [messages, selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, search, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, handleDeleteSelected, startEditMessage, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, getReactionScale, animateReaction]);
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -3921,7 +4144,6 @@ export default function ChatScreen({ navigation, route }) {
   }
 
   // ─── GROUP MESSAGING PERMISSION ───
-  const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
   const groupSettings = chatData?.group?.settings || {};
   const adminsOnlyMessaging = Boolean(groupSettings?.adminsOnlyMessaging);
   const myGroupRole = chatData?.myRole || chatData?.group?.myRole || 'member';
@@ -3956,51 +4178,61 @@ export default function ChatScreen({ navigation, route }) {
           groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
           groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
           memberCount={chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount}
-          rightActions={selectedMessage.length > 0 ? (
-            <>
-              {/* Edit button - only for single own unseen message */}
-              {selectedMessage.length === 1 && (() => {
-                const selMsg = messages.find(m =>
-                  sameId(m.id, selectedMessage[0]) ||
-                  sameId(m.serverMessageId, selectedMessage[0]) ||
-                  sameId(m.tempId, selectedMessage[0])
-                );
-                const canEdit = selMsg
-                  && sameId(selMsg.senderId, currentUserId)
-                  && selMsg.status !== 'seen'
-                  && selMsg.type === 'text'
-                  && !selMsg.isDeleted;
-                if (!canEdit) return null;
-                return (
+          rightActions={selectedMessage.length > 0 ? (() => {
+            const selMsg = selectedMessage.length === 1
+              ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))
+              : null;
+            const isOwnMsg = selMsg && sameId(selMsg?.senderId, currentUserId);
+            const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && selMsg?.status !== 'seen';
+            const isTextMsg = selMsg?.type === 'text';
+            return (
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                {/* Count */}
+                <Text style={{ fontFamily: "Roboto-SemiBold", fontSize: 18, color: theme.colors.primaryTextColor, marginRight: 16, marginLeft: 4 }}>
+                  {selectedMessage.length}
+                </Text>
+                {/* Delete */}
+                <TouchableOpacity
+                  onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+                    setReactionMsgId(null);
+                    handleDeleteSelected();
+                  }}
+                  style={{ padding: 10 }}>
+                  <Ionicons name="trash-outline" size={22} color={theme.colors.primaryTextColor} />
+                </TouchableOpacity>
+                {/* Copy */}
+                {selectedMessage.length === 1 && isTextMsg && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      const Clipboard = require('expo-clipboard');
+                      Clipboard.setStringAsync(selMsg?.text || '');
+                      if (Platform.OS === 'android') {
+                        const { ToastAndroid: T } = require('react-native');
+                        T.show('Copied', T.SHORT);
+                      }
+                      clearSelectedMessages();
+                      setReactionMsgId(null);
+                    }}
+                    style={{ padding: 10 }}>
+                    <Ionicons name="copy-outline" size={22} color={theme.colors.primaryTextColor} />
+                  </TouchableOpacity>
+                )}
+                {/* Edit */}
+                {canEdit && (
                   <TouchableOpacity
                     onPress={() => {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                      setReactionMsgId(null);
                       startEditMessage(selMsg);
                     }}
-                    style={{ padding: 10, borderRadius: 20, backgroundColor: theme.colors.themeColor, marginRight: 8 }}>
-                    <MaterialIcons name="edit" size={18} color="#fff" />
+                    style={{ padding: 10 }}>
+                    <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
-                );
-              })()}
-              <TouchableOpacity
-                onPress={() => {
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-                  handleDeleteSelected();
-                }}
-                style={{ padding: 10, borderRadius: 20, backgroundColor: "#FF5252", marginRight: 8 }}>
-                <Ionicons name="trash" size={18} color="#fff" />
-              </TouchableOpacity>
-              <View style={{ paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, backgroundColor: theme.colors.menuBackground }}>
-                <Text style={{
-                  fontFamily: "Roboto-Medium",
-                  fontSize: 12,
-                  color: theme.colors.primaryTextColor
-                }}>
-                  {selectedMessage.length}
-                </Text>
+                )}
               </View>
-            </>
-          ) : (
+            );
+          })() : (
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               {isChatMuted && (
                 <View style={{ marginRight: 8 }}>
@@ -4126,28 +4358,28 @@ export default function ChatScreen({ navigation, route }) {
             </Text>
           </View>
         ) : (
-          <FlatList 
-            ref={flatListRef} 
-            data={messages} 
-            keyExtractor={(item) => getMessageKey(item)} 
-            renderItem={renderChatsItem} 
-            inverted 
-            keyboardShouldPersistTaps="handled" 
+          <FlatList
+            ref={flatListRef}
+            data={messages}
+            keyExtractor={getMessageKey}
+            renderItem={renderChatsItem}
+            inverted
+            keyboardShouldPersistTaps="handled"
             contentContainerStyle={{
               paddingBottom: 8,
               paddingTop: 8,
               flexGrow: 1,
-            }} 
-            showsVerticalScrollIndicator={false} 
-            initialNumToRender={16}
+            }}
+            showsVerticalScrollIndicator={false}
+            initialNumToRender={15}
             keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
-            
+
             ListHeaderComponent={renderTypingIndicator}
-            
-            onEndReached={!isSearching ? loadMoreMessages : undefined} 
-            onEndReachedThreshold={0.1} 
-            
-            onScroll={handleScroll}
+
+            onEndReached={!isSearching ? loadMoreMessages : undefined}
+            onEndReachedThreshold={0.3}
+
+            onScroll={(e) => { if (reactionMsgId) { setReactionMsgId(null); clearSelectedMessages(); } handleScroll(e); }}
             onScrollBeginDrag={handleScrollBeginDrag}
             onScrollEndDrag={handleScrollEndDrag}
             onMomentumScrollBegin={handleMomentumScrollBegin}
@@ -4155,20 +4387,20 @@ export default function ChatScreen({ navigation, route }) {
             scrollEventThrottle={16}
             onViewableItemsChanged={onViewableItemsChanged}
             viewabilityConfig={viewabilityConfig}
-            
+
             removeClippedSubviews={Platform.OS !== 'web'}
-            maxToRenderPerBatch={8}
-            updateCellsBatchingPeriod={50}
-            windowSize={9}
+            maxToRenderPerBatch={20}
+            updateCellsBatchingPeriod={100}
+            windowSize={17}
             ListFooterComponent={!isSearching ? renderFooter : null}
             ListEmptyComponent={!isSearching ? renderChatEmptyState : null}
             maintainVisibleContentPosition={{
               minIndexForVisible: 0,
               autoscrollToTopThreshold: 5,
             }}
-            onScrollToIndexFailed={(info) => { 
-              console.warn("Scroll to index failed:", info); 
-            }} 
+            onScrollToIndexFailed={(info) => {
+              console.warn("Scroll to index failed:", info);
+            }}
           />
         )}
 
@@ -4436,14 +4668,24 @@ export default function ChatScreen({ navigation, route }) {
             isInputFocused={isInputFocused}
             isSearching={isSearching}
             showEmojiPanel={showEmojiPanel}
-            onTextChange={handleTextChange}
+            onTextChange={handleTextChangeWithMentions}
             onInputContentSizeChange={handleInputContentSizeChange}
+            onSelectionChange={isGroupChat ? handleMentionSelectionChange : undefined}
             onFocus={() => { setIsInputFocused(true); setShowEmojiPanel(false); }}
             onBlur={() => setIsInputFocused(false)}
             onOpenEmoji={handleOpenEmojiPanel}
             onOpenAttachment={editingMessage ? undefined : handleToggleMediaOptions}
             onRemovePendingMedia={() => setPendingMedia(null)}
             onSubmit={handleSubmitInput}
+            mentionSuggestionsNode={isGroupChat ? (
+              <MentionSuggestions
+                suggestions={mentionSuggestions}
+                onSelect={handleMentionSelect}
+                theme={theme}
+                isDarkMode={isDarkMode}
+                visible={showMentionSuggestions}
+              />
+            ) : null}
           />
         )}
 
@@ -4869,7 +5111,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                {/* <ImageZoom
+                <ImageZoom
                   uri={localMediaViewer.uri}
                   minScale={1}
                   maxScale={5}
@@ -4879,7 +5121,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                /> */}
+                />
               </GestureHandlerRootView>
             )}
 
@@ -4928,6 +5170,118 @@ export default function ChatScreen({ navigation, route }) {
             }}
           />
         </Modal>
+      {/* Reaction Detail Modal — shows who reacted */}
+      <Modal
+        transparent
+        visible={reactionDetailModal.visible}
+        animationType="fade"
+        onRequestClose={() => setReactionDetailModal({ visible: false, reactions: null, selectedEmoji: null })}
+      >
+        <TouchableOpacity
+          activeOpacity={1}
+          onPress={() => setReactionDetailModal({ visible: false, reactions: null, selectedEmoji: null })}
+          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' }}
+        >
+          <TouchableOpacity activeOpacity={1} onPress={() => {}} style={{
+            backgroundColor: isDarkMode ? '#1F2C34' : '#fff',
+            borderTopLeftRadius: 20,
+            borderTopRightRadius: 20,
+            maxHeight: Dimensions.get('window').height * 0.55,
+            paddingBottom: 24,
+          }}>
+            {/* Drag handle */}
+            <View style={{ alignItems: 'center', paddingTop: 10, paddingBottom: 6 }}>
+              <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? '#3A4A54' : '#D0D0D0' }} />
+            </View>
+
+            {/* Emoji tabs */}
+            {reactionDetailModal.reactions && (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={{ borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: isDarkMode ? '#2A3A44' : '#E0E0E0' }}
+                contentContainerStyle={{ paddingHorizontal: 12, gap: 4 }}
+              >
+                {Object.entries(reactionDetailModal.reactions).map(([emoji, data]) => {
+                  if (!data?.count || data.count <= 0) return null;
+                  const isSelected = reactionDetailModal.selectedEmoji === emoji;
+                  return (
+                    <TouchableOpacity
+                      key={emoji}
+                      onPress={() => setReactionDetailModal(prev => ({ ...prev, selectedEmoji: emoji }))}
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        paddingHorizontal: 14,
+                        paddingVertical: 8,
+                        borderBottomWidth: 2,
+                        borderBottomColor: isSelected ? theme.colors.themeColor : 'transparent',
+                      }}
+                    >
+                      <Text style={{ fontSize: 20 }}>{emoji}</Text>
+                      <Text style={{
+                        fontSize: 13,
+                        marginLeft: 4,
+                        color: isSelected ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
+                        fontFamily: 'Roboto-Medium',
+                      }}>{data.count}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+
+            {/* User list for selected emoji */}
+            <ScrollView style={{ paddingHorizontal: 16, paddingTop: 8 }}>
+              {reactionDetailModal.reactions?.[reactionDetailModal.selectedEmoji]?.users?.map((userId) => {
+                const displayName = getReactionUserName(userId);
+                const member = groupMembersMap?.[userId];
+                const isMe = userId === currentUserId;
+                return (
+                  <View key={userId} style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    paddingVertical: 10,
+                    borderBottomWidth: StyleSheet.hairlineWidth,
+                    borderBottomColor: isDarkMode ? '#1A2A34' : '#F0F0F0',
+                  }}>
+                    {/* Avatar */}
+                    <View style={{
+                      width: 38, height: 38, borderRadius: 19,
+                      backgroundColor: isDarkMode ? '#2A3A44' : '#E8E8E8',
+                      alignItems: 'center', justifyContent: 'center',
+                      marginRight: 12,
+                      overflow: 'hidden',
+                    }}>
+                      {member?.profileImage ? (
+                        <Image source={{ uri: member.profileImage }} style={{ width: 38, height: 38, borderRadius: 19 }} />
+                      ) : (
+                        <Ionicons name="person" size={18} color={isDarkMode ? '#6A7A84' : '#ADADAD'} />
+                      )}
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={{
+                        fontSize: 15,
+                        color: theme.colors.primaryTextColor,
+                        fontFamily: 'Roboto-Medium',
+                      }}>{displayName}</Text>
+                      {isMe && (
+                        <Text style={{
+                          fontSize: 12,
+                          color: theme.colors.placeHolderTextColor,
+                          marginTop: 1,
+                        }}>Tap to remove</Text>
+                      )}
+                    </View>
+                    <Text style={{ fontSize: 22 }}>{reactionDetailModal.selectedEmoji}</Text>
+                  </View>
+                );
+              })}
+            </ScrollView>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
       {/* Report Modal */}
       <ReportBottomSheet
         visible={reportModalVisible}

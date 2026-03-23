@@ -116,11 +116,18 @@ class MediaService {
     return apiCall('POST', `${API_PREFIX}/delete`, { id });
   }
 
-  async getDownloadUrl(mediaId) {
-    return apiCall('POST', `${API_PREFIX}/download`, { mediaId });
+  async getDownloadUrl(mediaId, chatId = null, extra = {}) {
+    const payload = { mediaId };
+    if (chatId) payload.chatId = chatId;
+    if (extra.messageId) payload.messageId = extra.messageId;
+    if (extra.groupId) payload.groupId = extra.groupId;
+    console.log('=== MEDIA DOWNLOAD REQUEST ===', JSON.stringify(payload));
+    const result = await apiCall('POST', `${API_PREFIX}/download`, payload);
+    console.log('=== MEDIA DOWNLOAD RESPONSE ===', JSON.stringify(result));
+    return result;
   }
 
-  async downloadToLocal({ mediaId, chatId, messageType, filename, onProgress, force = false }) {
+  async downloadToLocal({ mediaId, chatId, messageType, filename, onProgress, force = false, messageId = null, groupId = null }) {
     if (!mediaId) throw new Error('mediaId is required');
 
     const existing = await localStorageService.getMediaFile(mediaId);
@@ -133,7 +140,7 @@ class MediaService {
     }
 
     console.log('[MEDIA:CACHE:MISS]', mediaId);
-    const signed = await this.getDownloadUrl(mediaId);
+    const signed = await this.getDownloadUrl(mediaId, chatId, { messageId, groupId });
     const downloadUrl = signed?.data?.downloadUrl || signed?.downloadUrl || null;
     if (!downloadUrl) {
       throw new Error('Download URL not available');

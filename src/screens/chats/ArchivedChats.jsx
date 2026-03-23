@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState, useRef } from 'react';
 import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
-// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
@@ -595,14 +595,14 @@ export default function ArchivedChats({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              {/* <ImageZoom
+              <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              /> */}
+              />
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>

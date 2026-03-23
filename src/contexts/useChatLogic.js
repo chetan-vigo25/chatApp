@@ -13,6 +13,7 @@ import { useFocusEffect } from "@react-navigation/native";
 import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../utils/presence";
 import { useRealtimeChat } from "./RealtimeChatContext";
 import localStorageService from '../services/LocalStorageService';
+import ChatDatabase from '../services/ChatDatabase';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
 import { apiCall } from '../Config/Https';
 import {
@@ -227,6 +228,7 @@ export default function useChatLogic({ navigation, route }) {
   const currentUserIdRef = useRef(null);
   const currentUserNameRef = useRef('');
   const groupMembersMapRef = useRef({});
+  const allMessagesRef = useRef([]);
   const pendingMessagesRef = useRef([]);
   const socketCheckInterval = useRef(null);
   const isComponentMounted = useRef(true);
@@ -255,6 +257,8 @@ export default function useChatLogic({ navigation, route }) {
   const lastInitializedChatRef = useRef(null);
   const isHardReloadingRef = useRef(false);
   const deletedTombstonesRef = useRef({});
+  // Track tempIds of recently sent messages for dedup against sync responses
+  const sentTempIdsRef = useRef(new Set());
   const pendingPreviewSyncRef = useRef(false);
   const localSaveTimeoutRef = useRef(null);
   const socketHandlerRegistryRef = useRef(new Map());
@@ -371,13 +375,15 @@ export default function useChatLogic({ navigation, route }) {
     const resolvedMimeType = file?.type || uploadData?.mimeType || `application/${normalizedMessageType}`;
     const mediaId = resolveUploadMediaId(uploadData) || generatedMessageId;
 
+    const isGrpPayload = chatData?.chatType === 'group' || chatData?.isGroup;
     return {
       chatId,
       chatType: chatData?.chatType || 'private',
+      ...(isGrpPayload && { groupId: chatData?.groupId || chatData?.group?._id || chatId }),
       messageId: generatedMessageId,
       senderId,
       senderDeviceId,
-      receiverId,
+      receiverId: isGrpPayload ? null : receiverId,
       messageType: normalizedMessageType,
       mediaId,
       mediaUrl: uploadData?.previewUrl || uploadData?.mediaUrl || '',
@@ -444,10 +450,10 @@ export default function useChatLogic({ navigation, route }) {
     try {
       const normalizedChatId = normalizeId(chatIdValue || chatIdRef.current);
       if (!normalizedChatId) return;
-      const localKey = getChatMessagesKey(normalizedChatId);
-      if (!localKey) return;
-      const rows = Array.isArray(nextMessages) ? nextMessages.slice(0, MAX_LOCAL_SAVE) : [];
-      await AsyncStorage.setItem(localKey, JSON.stringify(rows));
+      const rows = Array.isArray(nextMessages) ? nextMessages : [];
+      if (rows.length > 0) {
+        await ChatDatabase.saveMessages(rows.map(m => ({ ...m, chatId: m.chatId || normalizedChatId })));
+      }
     } catch (error) {
       console.error('persistMessagesForChatImmediate error', error);
     }
@@ -672,6 +678,11 @@ export default function useChatLogic({ navigation, route }) {
     currentUserIdRef.current = currentUserId;
   }, [chatId, currentUserId]);
 
+  // Keep allMessagesRef in sync for stale-closure-safe reads
+  useEffect(() => {
+    allMessagesRef.current = allMessages;
+  }, [allMessages]);
+
   // Build group members name lookup map from Redux currentGroup
   useEffect(() => {
     if (!isGroupChat || !currentGroup?.members) return;
@@ -871,33 +882,34 @@ export default function useChatLogic({ navigation, route }) {
     return () => { if (socketCheckInterval.current) clearInterval(socketCheckInterval.current); };
   }, [checkAndReconnectSocket]);
 
-  // Filter messages by current chat ID
+  // Filter messages by current chat ID — always immediate for real-time feel
   useEffect(() => {
-    if (chatId && allMessages.length > 0) {
-      const isGrpFilter = chatData.chatType === 'group' || chatData.isGroup;
-      const filteredMessages = allMessages.filter(msg => {
-        // Match by chatId (works for both groups and 1-on-1)
-        if (msg.chatId && msg.chatId === chatId) return true;
-        // For groups, also match by groupId
-        if (isGrpFilter && msg.groupId && (msg.groupId === chatId || msg.groupId === chatData.groupId)) return true;
+    if (!chatId || allMessages.length === 0) return;
 
-        // 1-on-1 fallback: match by sender/receiver pair
-        const peerId = normalizeId(chatData.peerUser?._id);
-        const myId = normalizeId(currentUserId);
-        if (!peerId || !myId) return false;
+    const isGrpFilter = chatData.chatType === 'group' || chatData.isGroup;
+    const peerId = normalizeId(chatData.peerUser?._id);
+    const myId = normalizeId(currentUserId);
+    const normalizedChatId = normalizeId(chatId);
+    const normalizedGroupId = normalizeId(chatData.groupId);
 
-        return (
-          (sameId(msg.receiverId, myId) && sameId(msg.senderId, peerId)) ||
-          (sameId(msg.senderId, myId) && sameId(msg.receiverId, peerId))
-        );
-      });
-      
-      const sorted = filteredMessages.sort((a, b) => 
-        (b.timestamp || 0) - (a.timestamp || 0)
+    const filteredMessages = allMessages.filter(msg => {
+      // Match by chatId (use sameId for format-safe comparison)
+      if (msg.chatId && sameId(msg.chatId, normalizedChatId)) return true;
+      // For groups, also match by groupId
+      if (isGrpFilter && msg.groupId && (sameId(msg.groupId, normalizedChatId) || sameId(msg.groupId, normalizedGroupId))) return true;
+      // 1-on-1 fallback: match by sender/receiver pair
+      if (!peerId || !myId) return false;
+      return (
+        (sameId(msg.receiverId, myId) && sameId(msg.senderId, peerId)) ||
+        (sameId(msg.senderId, myId) && sameId(msg.receiverId, peerId))
       );
-      
-      setMessages(sorted);
-    }
+    });
+
+    const sorted = filteredMessages.sort((a, b) =>
+      (b.timestamp || 0) - (a.timestamp || 0)
+    );
+
+    setMessages(sorted);
   }, [chatId, allMessages, chatData.peerUser?._id, currentUserId]);
 
   useEffect(() => {
@@ -1102,6 +1114,7 @@ export default function useChatLogic({ navigation, route }) {
         initialLoadDoneRef.current = true;
         return;
       }
+      const isSameChat = lastInitializedChatRef.current === generatedChatId;
       setChatId(generatedChatId);
       chatIdRef.current = generatedChatId;
       deferRealtimeUpdate(() => {
@@ -1110,8 +1123,11 @@ export default function useChatLogic({ navigation, route }) {
       });
       lastInitializedChatRef.current = generatedChatId;
 
-      setMessages([]);
-      setAllMessages([]);
+      // Only clear messages if switching to a DIFFERENT chat — preserve state for same chat
+      if (!isSameChat) {
+        setMessages([]);
+        setAllMessages([]);
+      }
 
       // Fetch group members for sender name resolution
       if (isGrpInit) {
@@ -1124,10 +1140,8 @@ export default function useChatLogic({ navigation, route }) {
       await loadQueuedMediaUploads();
       await loadDeletedTombstones(generatedChatId);
 
-      const localCount = await loadMessagesFromLocal(generatedChatId);
-
+      // Step 1: Setup socket FIRST so no real-time messages are missed
       await checkAndReconnectSocket();
-
       const socket = getSocket();
       if (socket && isSocketConnected()) {
         socketRef.current = socket;
@@ -1135,7 +1149,6 @@ export default function useChatLogic({ navigation, route }) {
         requestUserPresence();
         socket.emit('user:status', { userId, status: 'online', chatId: generatedChatId });
         socket.emit('chat:join', { chatId: generatedChatId, userId }, (response) => {});
-        // Emit message:read:all — mark all messages as read when user opens the chat
         socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
         markUserOnline("chat-init");
         startHeartbeat();
@@ -1151,10 +1164,15 @@ export default function useChatLogic({ navigation, route }) {
         setUserStatus("offline");
       }
 
+      // Step 2: Load from SQLite (instant display — WhatsApp pattern)
+      const localCount = isSameChat ? allMessages.length : await loadMessagesFromLocal(generatedChatId);
+
+      // Step 3: Single sync — fetch delta only, never triple-fetch
       if (localCount === 0) {
+        // No local messages — full fetch from server (single path)
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
-        fetchMessagesFromAPI(generatedChatId);
       } else {
+        // Has local messages — only sync new messages since last known
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
       }
       scheduleMarkVisibleUnreadAsRead();
@@ -1172,21 +1190,41 @@ export default function useChatLogic({ navigation, route }) {
   /* ========== Local storage helpers ========== */
   const loadMessagesFromLocal = async (chatIdParam) => {
     try {
-      const localKey = getChatMessagesKey(chatIdParam);
-      if (!localKey) return 0;
-      const savedMessages = await AsyncStorage.getItem(localKey);
-      const clearedAt = await getChatClearedAt(chatIdParam);
-  
-      if (!savedMessages) return 0;
-  
-      const parsed = JSON.parse(savedMessages);
-      const filteredParsed = Array.isArray(parsed)
-        ? parsed.filter((msg) => {
-            const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
-            if (!clearedAt || !ts) return true;
-            return ts > clearedAt;
-          })
-        : [];
+      if (!chatIdParam) return 0;
+
+      // Clean up any duplicate rows first, then load
+      await ChatDatabase.deduplicateChat(chatIdParam).catch(() => {});
+      const clearedAt = await ChatDatabase.getClearedAt(chatIdParam) || 0;
+      let dbMessages = await ChatDatabase.loadMessages(chatIdParam, { limit: 500, afterTimestamp: clearedAt });
+
+      // One-time migration: if SQLite is empty, pull from AsyncStorage and migrate
+      if (dbMessages.length === 0) {
+        const localKey = getChatMessagesKey(chatIdParam);
+        if (localKey) {
+          const savedMessages = await AsyncStorage.getItem(localKey);
+          if (savedMessages) {
+            const parsed = JSON.parse(savedMessages);
+            const asyncClearedAt = await getChatClearedAt(chatIdParam) || 0;
+            const filtered = Array.isArray(parsed)
+              ? parsed.filter(msg => {
+                  const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
+                  if (!asyncClearedAt || !ts) return true;
+                  return ts > asyncClearedAt;
+                })
+              : [];
+            if (filtered.length > 0) {
+              dbMessages = filtered;
+              // Migrate to SQLite in background
+              ChatDatabase.saveMessages(filtered).catch(err =>
+                console.warn('[ChatDB] Migration from AsyncStorage:', err)
+              );
+            }
+          }
+        }
+      }
+
+      const filteredParsed = dbMessages;
+      if (filteredParsed.length === 0) return 0;
       
       const processed = filteredParsed.map(msg => {
         const normalizedSenderId = normalizeId(msg.senderId);
@@ -1201,12 +1239,21 @@ export default function useChatLogic({ navigation, route }) {
           resolvedStatus = 'sent';
         }
 
+        // Ensure time/date are always computed from timestamp or createdAt
+        const msgCreatedAt = msg.createdAt || (msg.timestamp ? new Date(msg.timestamp).toISOString() : null);
+        const msgTime = msg.time || (msgCreatedAt ? moment(msgCreatedAt).format("hh:mm A") : null);
+        const msgDate = msg.date || (msgCreatedAt ? moment(msgCreatedAt).format("YYYY-MM-DD") : null);
+
         let base = {
           ...msg,
           status: resolvedStatus,
           senderId: normalizedSenderId,
-          senderType: msg.senderType || computeSenderType(normalizedSenderId, normalizedCurrentUser),
+          // Always recompute senderType — never trust stored value
+          senderType: computeSenderType(normalizedSenderId, normalizedCurrentUser),
           receiverId: normalizedReceiverId,
+          chatId: msg.chatId || chatIdParam,
+          time: msgTime,
+          date: msgDate,
           payload: normalizeMessagePayloadWithDownloadFlag(msg?.type || msg?.mediaType || msg?.messageType || 'text', msg?.payload || {}),
           isMediaDownloaded: Boolean(msg?.payload?.isMediaDownloaded || msg?.isMediaDownloaded || msg?.localUri),
         };
@@ -1251,19 +1298,25 @@ export default function useChatLogic({ navigation, route }) {
       );
   
       setAllMessages(prev => {
-        const existingMap = new Map();
+        // Build a Set of ALL known IDs from existing in-memory messages
+        const existingIds = new Set();
         prev.forEach(m => {
-          const key = m.serverMessageId || m.id || m.tempId;
-          if (key) existingMap.set(key, m);
+          if (m.serverMessageId) existingIds.add(String(m.serverMessageId));
+          if (m.id) existingIds.add(String(m.id));
+          if (m.tempId) existingIds.add(String(m.tempId));
         });
-        
+
         const newMessages = sorted.filter(m => {
-          const key = m.serverMessageId || m.id || m.tempId;
-          return !existingMap.has(key);
+          // Check if ANY of this message's IDs already exist in memory
+          const ids = [m.serverMessageId, m.id, m.tempId].filter(Boolean).map(String);
+          return ids.length === 0 || !ids.some(id => existingIds.has(id));
         });
-        
-        console.log('📖 Loaded', newMessages.length, 'new messages from local');
-        return [...prev, ...newMessages];
+
+        if (newMessages.length === 0) return prev;
+
+        // Merge and deduplicate, then ensure time/date on all messages
+        const merged = deduplicateMessages([...prev, ...newMessages]);
+        return merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       });
 
       return sorted.length;
@@ -1349,7 +1402,7 @@ export default function useChatLogic({ navigation, route }) {
 
   const normalizeIncomingMessage = useCallback((apiMsg) => {
     const mediaMeta = apiMsg?.mediaMeta || apiMsg?.contact || apiMsg?.payload?.mediaMeta || apiMsg?.payload?.contact || {};
-    const serverId = apiMsg?._id || apiMsg?.messageId || apiMsg?.id;
+    const serverId = normalizeId(apiMsg?._id || apiMsg?.messageId || apiMsg?.id);
     const normalizedMediaId = normalizeId(
       apiMsg?.mediaId ||
       mediaMeta?.mediaId ||
@@ -1436,40 +1489,13 @@ export default function useChatLogic({ navigation, route }) {
       }
     );
 
-    console.log({
-        id: serverId,
-        serverMessageId: serverId,
-        tempId: serverId,
-      mediaId: normalizedMediaId,
-        type: resolvedMessageType,
-        mediaType: apiMsg?.fileCategory || (isMediaMessageType(resolvedMessageType) ? resolvedMessageType : null),
-        text: apiMsg?.text || apiMsg?.content || "",
-        time: moment(createdAt).format("hh:mm A"),
-        date: moment(createdAt).format("YYYY-MM-DD"),
-        senderId: normalizedSenderId,
-        senderType: computeSenderType(normalizedSenderId, normalizedCurrentUser),
-        receiverId: normalizedReceiverId,
-        status: sameId(normalizedSenderId, normalizedCurrentUser)
-          ? (normalizeMessageStatus(apiMsg?.status) || "sent")
-          : normalizeMessageStatus(apiMsg?.status),
-        mediaUrl: resolvedMediaUrl,
-        mediaThumbnailUrl: resolvedMediaThumbnailUrl,
-        previewUrl: incomingLocalUri || resolvedMediaThumbnailUrl || resolvedMediaUrl,
-        createdAt,
-        timestamp: new Date(createdAt).getTime(),
-        synced: true,
-        chatId: apiMsg?.chatId || chatIdRef.current,
-        isMediaDownloaded: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri),
-        isDeleted: resolvedIsDeleted,
-        deletedFor: resolvedDeletedFor,
-        deletedBy: resolvedDeletedBy,
-        placeholderText: resolvedIsDeleted ? resolvedPlaceholderText : null,
-    })
+    // Preserve the original tempId if present — it's the link to the optimistic message
+    const originalTempId = normalizeId(apiMsg?.tempId || apiMsg?.payload?.tempId);
 
     return {
       id: serverId,
       serverMessageId: serverId,
-      tempId: serverId,
+      tempId: originalTempId || serverId,
       mediaId: normalizedMediaId,
       type: resolvedMessageType,
       mediaType: apiMsg?.fileCategory || (isMediaMessageType(resolvedMessageType) ? resolvedMessageType : null),
@@ -1498,6 +1524,7 @@ export default function useChatLogic({ navigation, route }) {
       downloadStatus: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri)
         ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
         : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+      reactions: apiMsg?.reactions || null,
       isDeleted: resolvedIsDeleted,
       deletedFor: resolvedDeletedFor,
       deletedBy: resolvedDeletedBy,
@@ -1514,20 +1541,25 @@ export default function useChatLogic({ navigation, route }) {
       incomingMessages.forEach(raw => {
         const formattedMessage = normalizeIncomingMessage(raw);
         const serverId = formattedMessage.serverMessageId;
+        const incomingTempId = formattedMessage.tempId;
+        // Also check raw tempId from server payload (not normalized away)
+        const rawTempId = normalizeId(raw?.tempId || raw?.payload?.tempId);
 
+        // Primary match: check all ID combinations
         let existingIndex = mergedMessages.findIndex(m =>
-          m.serverMessageId === serverId ||
-          m.id === serverId ||
-          m.tempId === serverId
+          (serverId && (sameId(m.serverMessageId, serverId) || sameId(m.id, serverId) || sameId(m.tempId, serverId))) ||
+          (incomingTempId && incomingTempId !== serverId && (sameId(m.tempId, incomingTempId) || sameId(m.id, incomingTempId))) ||
+          (rawTempId && (sameId(m.tempId, rawTempId) || sameId(m.id, rawTempId)))
         );
 
+        // Fallback: match by sender + same text + close timestamp (within 3s)
         if (existingIndex === -1) {
+          const incomingTs = new Date(formattedMessage.createdAt).getTime();
+          const incomingText = (formattedMessage.text || '').trim();
           existingIndex = mergedMessages.findIndex(localMsg =>
-            localMsg.senderId === formattedMessage.senderId &&
-            Math.abs(
-              new Date(localMsg.createdAt).getTime() -
-              new Date(formattedMessage.createdAt).getTime()
-            ) < 5000
+            sameId(localMsg.senderId, formattedMessage.senderId) &&
+            (localMsg.text || '').trim() === incomingText &&
+            Math.abs(new Date(localMsg.createdAt).getTime() - incomingTs) < 3000
           );
         }
 
@@ -1547,9 +1579,12 @@ export default function useChatLogic({ navigation, route }) {
             localUri: mergedLocalUri,
           });
 
+          const mergedReactions = formattedMessage.reactions || existing?.reactions || null;
           mergedMessages[existingIndex] = {
             ...existing,
             ...formattedMessage,
+            reactions: mergedReactions,
+            senderName: formattedMessage.senderName || existing?.senderName || null,
             senderType: formattedMessage.senderType || existing.senderType,
             isDeleted: keepDeletedPlaceholder ? true : formattedMessage.isDeleted,
             deletedFor: keepDeletedPlaceholder ? (existing?.deletedFor || 'everyone') : formattedMessage.deletedFor,
@@ -1621,29 +1656,22 @@ export default function useChatLogic({ navigation, route }) {
   const markMessagesAsRead = useCallback((messageIds = []) => {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return;
 
-    const socket = socketRef.current || getSocket();
-    if (socket && isSocketConnected() && chatIdRef.current && currentUserIdRef.current) {
-      socket.emit('message:read:bulk', {
-        chatId: chatIdRef.current,
-        messageIds,
-        senderId: currentUserIdRef.current,
-        timestamp: Date.now(),
-      });
-    }
-
     setAllMessages(prev => {
+      const idSet = new Set(messageIds.map(String));
+      let changed = false;
       const updated = prev.map(msg => {
         const id = msg.serverMessageId || msg.id || msg.tempId;
-        if (!messageIds.includes(id)) return msg;
+        if (!id || !idSet.has(String(id))) return msg;
+        if (msg.status === 'seen' || msg.status === 'read') return msg;
+        changed = true;
         return { ...msg, status: 'seen' };
       });
-      saveMessagesToLocal(updated);
-      return updated;
+      if (changed) saveMessagesToLocal(updated);
+      return changed ? updated : prev;
     });
 
     if (chatIdRef.current) {
       const targetChatId = chatIdRef.current;
-      // Defer provider update to next macrotask to avoid render-phase update warnings.
       deferRealtimeUpdate(() => {
         if (targetChatId) {
           markChatRead(targetChatId);
@@ -1660,13 +1688,15 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     visibilityReadTimeoutRef.current = setTimeout(() => {
-      const unreadVisibleIds = allMessages
+      // Use ref for latest messages to avoid stale closure
+      const latestMessages = allMessagesRef.current || [];
+      const unreadVisibleIds = latestMessages
         .filter(msg => {
           const id = msg.serverMessageId || msg.id || msg.tempId;
           if (!id || !visibleMessageIds.includes(id)) return false;
           if (msg.chatId !== chatIdRef.current) return false;
           if (!msg.senderId || msg.senderId === currentUserIdRef.current) return false;
-          return msg.status !== 'seen';
+          return msg.status !== 'seen' && msg.status !== 'read';
         })
         .map(msg => msg.serverMessageId || msg.id || msg.tempId)
         .filter(Boolean);
@@ -1683,23 +1713,43 @@ export default function useChatLogic({ navigation, route }) {
             userId: currentUserIdRef.current,
             readAt: new Date().toISOString(),
           });
-        } else if (unreadVisibleIds.length === 1) {
-          socket.emit('message:read', {
-            messageId: unreadVisibleIds[0],
-            chatId: chatIdRef.current,
-            senderId: currentUserIdRef.current,
-            timestamp: Date.now(),
-          });
-          socket.emit('message:seen', {
-            messageId: unreadVisibleIds[0],
-            chatId: chatIdRef.current,
+        } else {
+          // Emit individual read + seen for each message, plus bulk
+          unreadVisibleIds.forEach(msgId => {
+            socket.emit('message:read', {
+              messageId: msgId,
+              chatId: chatIdRef.current,
+              senderId: currentUserIdRef.current,
+              timestamp: Date.now(),
+            });
+            socket.emit('message:seen', {
+              messageId: msgId,
+              chatId: chatIdRef.current,
+            });
           });
         }
       }
 
-      markMessagesAsRead(unreadVisibleIds);
+      // Update local state to 'seen'
+      setAllMessages(prev => {
+        const idSet = new Set(unreadVisibleIds);
+        let changed = false;
+        const updated = prev.map(msg => {
+          const id = msg.serverMessageId || msg.id || msg.tempId;
+          if (!id || !idSet.has(id)) return msg;
+          if (msg.status === 'seen' || msg.status === 'read') return msg;
+          changed = true;
+          return { ...msg, status: 'seen' };
+        });
+        if (changed) saveMessagesToLocal(updated);
+        return changed ? updated : prev;
+      });
+
+      if (chatIdRef.current) {
+        deferRealtimeUpdate(() => markChatRead(chatIdRef.current));
+      }
     }, 500);
-  }, [allMessages, markMessagesAsRead]);
+  }, [saveMessagesToLocal, markChatRead, deferRealtimeUpdate, chatData]);
 
   const scheduleMarkVisibleUnreadAsRead = useCallback(() => {
     if (readMarkTimeoutRef.current) {
@@ -1707,26 +1757,50 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     readMarkTimeoutRef.current = setTimeout(() => {
-      const unreadIds = allMessages
+      const latestMessages = allMessagesRef.current || [];
+      const unreadIds = latestMessages
         .filter(msg =>
           (msg.chatId === chatIdRef.current) &&
           msg.senderId &&
           msg.senderId !== currentUserIdRef.current &&
-          msg.status !== 'seen'
+          msg.status !== 'seen' && msg.status !== 'read'
         )
         .map(msg => msg.serverMessageId || msg.id || msg.tempId)
         .filter(Boolean);
 
-      if (unreadIds.length > 0) {
-        markMessagesAsRead(unreadIds);
+      if (unreadIds.length === 0) return;
+
+      // Emit read events to server
+      const socket = socketRef.current || getSocket();
+      const isGrp = chatData?.chatType === 'group' || chatData?.isGroup;
+      if (socket && isSocketConnected() && chatIdRef.current && currentUserIdRef.current) {
+        if (isGrp) {
+          socket.emit('group:message:read', {
+            groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
+            messageIds: unreadIds,
+            userId: currentUserIdRef.current,
+            readAt: new Date().toISOString(),
+          });
+        } else {
+          socket.emit('message:read:bulk', {
+            chatId: chatIdRef.current,
+            messageIds: unreadIds,
+            senderId: currentUserIdRef.current,
+            timestamp: Date.now(),
+          });
+        }
       }
+
+      markMessagesAsRead(unreadIds);
     }, READ_MARK_DELAY);
-  }, [allMessages, markMessagesAsRead]);
+  }, [markMessagesAsRead, chatData]);
 
   const deduplicateMessages = useCallback((messagesArray) => {
     const uniqueMap = new Map();
     // Track tempId→serverMessageId links so temp and server versions merge
     const tempToServerMap = new Map();
+    // Secondary index: content-based dedup for messages with same sender+text+time
+    const contentKeyMap = new Map();
 
     messagesArray.forEach(msg => {
       // Build cross-reference: if a message has both tempId and serverMessageId, link them
@@ -1735,33 +1809,24 @@ export default function useChatLogic({ navigation, route }) {
       }
     });
 
-    messagesArray.forEach(msg => {
-      const sender = normalizeId(msg?.senderId) || 'unknown';
-      const receiver = normalizeId(msg?.receiverId) || 'unknown';
-      const type = (msg?.type || msg?.messageType || 'text').toString();
-      const tsBucket = Number(msg?.timestamp || 0);
-      const textBucket = (msg?.text || '').toString().slice(0, 48);
-
-      // Primary key: prefer serverMessageId, then check if tempId maps to a known serverMessageId
-      let key =
-        msg.serverMessageId ||
-        (msg.tempId && tempToServerMap.get(msg.tempId)) ||
-        msg.id ||
-        msg.tempId ||
-        `${sender}_${receiver}_${type}_${tsBucket}_${textBucket}`;
-
-      if (!key) return;
-
+    const mergeInto = (key, msg) => {
       if (uniqueMap.has(key)) {
         const existing = uniqueMap.get(key);
 
         // Prefer the version with serverMessageId (server-confirmed)
         if (msg.serverMessageId && !existing.serverMessageId) {
-          // Merge: keep localUri from existing if new doesn't have it
           const merged = { ...msg };
           if (existing.localUri && !merged.localUri) merged.localUri = existing.localUri;
           if (existing.previewUrl && !merged.previewUrl) merged.previewUrl = existing.previewUrl;
+          if (existing.time && !merged.time) merged.time = existing.time;
+          if (existing.date && !merged.date) merged.date = existing.date;
           uniqueMap.set(key, merged);
+          return;
+        }
+
+        // Prefer version with time/date
+        if (msg.time && !existing.time) {
+          uniqueMap.set(key, { ...existing, ...msg });
           return;
         }
 
@@ -1774,56 +1839,95 @@ export default function useChatLogic({ navigation, route }) {
           uniqueMap.set(key, msg);
           return;
         }
-
       } else {
         uniqueMap.set(key, msg);
       }
+    };
+
+    messagesArray.forEach(msg => {
+      // Primary key: prefer serverMessageId, then check if tempId maps to a known serverMessageId
+      let key =
+        msg.serverMessageId ||
+        (msg.tempId && tempToServerMap.get(msg.tempId)) ||
+        msg.id ||
+        msg.tempId ||
+        msg.mediaId ||
+        null;
+
+      // Content-based fallback: match by sender + text + ~5s time window
+      // Use 5-second buckets; check both current and adjacent bucket to handle boundaries
+      const sender = normalizeId(msg?.senderId) || 'unknown';
+      const rawTs = Number(msg?.timestamp || 0);
+      const textSlice = (msg?.text || '').toString().trim().slice(0, 48);
+      const bucketSize = 5000;
+      const bucket = rawTs > 0 ? Math.floor(rawTs / bucketSize) : 0;
+      const contentKeys = bucket > 0
+        ? [`content_${sender}_${bucket}_${textSlice}`, `content_${sender}_${bucket - 1}_${textSlice}`, `content_${sender}_${bucket + 1}_${textSlice}`]
+        : [];
+
+      if (!key) {
+        // No ID-based key — use content key or generate a truly unique one
+        key = (contentKeys.length > 0 ? contentKeys[0] : null) || `fallback_${sender}_${Date.now()}_${Math.random()}`;
+      }
+
+      // Check if this message already exists under a different key via content matching
+      let matchedExistingKey = null;
+      for (const ck of contentKeys) {
+        if (contentKeyMap.has(ck)) {
+          const existingKey = contentKeyMap.get(ck);
+          if (existingKey !== key && uniqueMap.has(existingKey)) {
+            matchedExistingKey = existingKey;
+            break;
+          }
+        }
+      }
+      if (matchedExistingKey) {
+        mergeInto(matchedExistingKey, msg);
+        return;
+      }
+
+      for (const ck of contentKeys) {
+        contentKeyMap.set(ck, key);
+      }
+
+      mergeInto(key, msg);
     });
 
     return Array.from(uniqueMap.values());
   }, []);
 
+  const sqliteSaveTimerRef = useRef(null);
+  const sqlitePendingMsgsRef = useRef(null);
+
   const saveMessagesToLocal = useCallback(async (msgs) => {
     try {
       if (!chatIdRef.current || !msgs) return;
-      const localKey = getChatMessagesKey(chatIdRef.current);
-      if (!localKey) return;
 
-      const uniqueMessages = deduplicateMessages(msgs);
-      const messagesToSave = uniqueMessages.slice(0, MAX_LOCAL_SAVE);
+      // Store latest messages for debounced save
+      sqlitePendingMsgsRef.current = msgs;
 
-      const cleanMessages = messagesToSave.map(msg => ({
-        ...msg,
-        senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
-        localUri: msg.localUri || null,
-      }));
+      // Debounce: collapse rapid saves into one batch write
+      if (sqliteSaveTimerRef.current) clearTimeout(sqliteSaveTimerRef.current);
+      sqliteSaveTimerRef.current = setTimeout(() => {
+        const pending = sqlitePendingMsgsRef.current;
+        if (!pending || pending.length === 0) return;
+        sqlitePendingMsgsRef.current = null;
 
-      if (localSaveTimeoutRef.current) {
-        clearTimeout(localSaveTimeoutRef.current);
-      }
+        const cleanMessages = pending.map(msg => ({
+          ...msg,
+          chatId: msg.chatId || chatIdRef.current,
+          senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
+          localUri: msg.localUri || null,
+        }));
 
-      localSaveTimeoutRef.current = setTimeout(async () => {
-        try {
-          const clearedAt = await getChatClearedAt(chatIdRef.current);
-          const newestTimestamp = cleanMessages.reduce((latest, msg) => {
-            const candidate = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
-            return candidate > latest ? candidate : latest;
-          }, 0);
-
-          if (clearedAt > 0 && newestTimestamp > 0 && newestTimestamp <= clearedAt) {
-            await AsyncStorage.setItem(localKey, JSON.stringify([]));
-            return;
-          }
-
-          await AsyncStorage.setItem(localKey, JSON.stringify(cleanMessages));
-        } catch (err) {
-          console.error("Failed to save to local storage:", err);
-        }
-      }, LOCAL_SAVE_DEBOUNCE_MS);
+        ChatDatabase.saveMessages(cleanMessages).catch(err =>
+          console.warn('[ChatDB] saveMessages error:', err)
+        );
+      }, 300);
     } catch (err) {
-      console.error("Failed to save to local storage:", err);
+      console.error("[ChatDB] saveMessagesToLocal error:", err);
     }
-  }, [deduplicateMessages]);
+  }, []);
 
   const applyDeleteToLocalStorage = useCallback(async (messageId, isDeletedForEveryone, options = {}) => {
     try {
@@ -1836,8 +1940,8 @@ export default function useChatLogic({ navigation, route }) {
       const parsed = JSON.parse(savedMessages);
       if (!Array.isArray(parsed) || parsed.length === 0) return;
 
-      const deletedBy = normalizeId(options?.deletedBy) || normalizeId(currentUserIdRef.current);
-      const isDeletedBySelf = sameId(deletedBy, currentUserIdRef.current);
+      const deletedBy = normalizeId(options?.deletedBy) || null;
+      const isDeletedBySelf = deletedBy ? sameId(deletedBy, currentUserIdRef.current) : false;
 
       const updated = isDeletedForEveryone
         ? parsed.map((msg) => {
@@ -1908,8 +2012,8 @@ export default function useChatLogic({ navigation, route }) {
         ),
       });
 
-      const deletedBy = normalizeId(options?.deletedBy) || normalizeId(currentUserIdRef.current);
-      const isDeletedBySelf = sameId(deletedBy, currentUserIdRef.current);
+      const deletedBy = normalizeId(options?.deletedBy) || null;
+      const isDeletedBySelf = deletedBy ? sameId(deletedBy, currentUserIdRef.current) : false;
 
       let didUpdate = false;
       const updated = parsed.map((msg) => {
@@ -1971,24 +2075,75 @@ export default function useChatLogic({ navigation, route }) {
       })
       .sort((a, b) => Number(b?.timestamp || 0) - Number(a?.timestamp || 0));
 
-    const latestVisible = sameChatMessages.find((msg) => !(msg?.isDeleted || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system'));
+    // Get the most recent message (could be deleted)
+    const latestMsg = sameChatMessages[0];
 
-    if (latestVisible) {
-      updateLocalLastMessagePreview({
-        chatId: chatIdRef.current,
-        lastMessage: {
-          text: latestVisible.text || '',
-          type: latestVisible.type || 'text',
-          senderId: latestVisible.senderId || null,
-          status: latestVisible.status || null,
-          createdAt: latestVisible.createdAt || new Date(latestVisible.timestamp || Date.now()).toISOString(),
-          isDeleted: false,
-        },
-        lastMessageAt: latestVisible.createdAt || new Date(latestVisible.timestamp || Date.now()).toISOString(),
-        lastMessageType: latestVisible.type || 'text',
-        lastMessageSender: latestVisible.senderId || null,
-      });
-      return;
+    if (latestMsg) {
+      const isMsgDeleted = latestMsg.isDeleted || isDeletedForUser(latestMsg.deletedFor, currentUserIdRef.current);
+      const isSystem = latestMsg.type === 'system' && !isMsgDeleted;
+
+      if (isMsgDeleted) {
+        // Show WhatsApp-style deleted placeholder in chat list
+        const deletedBySelf = sameId(latestMsg.deletedBy, currentUserIdRef.current) ||
+          sameId(latestMsg.senderId, currentUserIdRef.current);
+        const deletedText = latestMsg.placeholderText ||
+          (deletedBySelf ? 'You deleted this message' : 'This message was deleted');
+        updateLocalLastMessagePreview({
+          chatId: chatIdRef.current,
+          lastMessage: {
+            text: deletedText,
+            placeholderText: deletedText,
+            type: 'text',
+            senderId: latestMsg.senderId || null,
+            status: latestMsg.status || null,
+            createdAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
+            isDeleted: true,
+            deletedFor: 'everyone',
+          },
+          lastMessageAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
+          lastMessageType: 'text',
+          lastMessageSender: latestMsg.senderId || null,
+        });
+        return;
+      }
+
+      if (!isSystem) {
+        updateLocalLastMessagePreview({
+          chatId: chatIdRef.current,
+          lastMessage: {
+            text: latestMsg.text || '',
+            type: latestMsg.type || 'text',
+            senderId: latestMsg.senderId || null,
+            status: latestMsg.status || null,
+            createdAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
+            isDeleted: false,
+          },
+          lastMessageAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
+          lastMessageType: latestMsg.type || 'text',
+          lastMessageSender: latestMsg.senderId || null,
+        });
+        return;
+      }
+
+      // Latest is a system message — find the next non-system message
+      const nextVisible = sameChatMessages.find((msg) => msg.type !== 'system');
+      if (nextVisible) {
+        updateLocalLastMessagePreview({
+          chatId: chatIdRef.current,
+          lastMessage: {
+            text: nextVisible.text || '',
+            type: nextVisible.type || 'text',
+            senderId: nextVisible.senderId || null,
+            status: nextVisible.status || null,
+            createdAt: nextVisible.createdAt || new Date(nextVisible.timestamp || Date.now()).toISOString(),
+            isDeleted: false,
+          },
+          lastMessageAt: nextVisible.createdAt || new Date(nextVisible.timestamp || Date.now()).toISOString(),
+          lastMessageType: nextVisible.type || 'text',
+          lastMessageSender: nextVisible.senderId || null,
+        });
+        return;
+      }
     }
 
     updateLocalLastMessagePreview({
@@ -2028,6 +2183,8 @@ export default function useChatLogic({ navigation, route }) {
     try {
       await clearChatLocalArtifacts(normalizedChatId, { markCleared: true });
       await AsyncStorage.removeItem(deletedKeyForChat(normalizedChatId));
+      // Clear from SQLite
+      await ChatDatabase.clearChat(normalizedChatId);
       if (isCurrentChat) {
         deletedTombstonesRef.current = {};
       }
@@ -2142,22 +2299,14 @@ export default function useChatLogic({ navigation, route }) {
     const force = options?.force === true;
     const syncOnly = options?.syncOnly === true;
 
-    const latestMessage = allMessages.reduce((candidate, msg) => {
-      const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
-      if (!candidate) return { msg, ts };
-      return ts > candidate.ts ? { msg, ts } : candidate;
-    }, null);
-
-    const lastMessageId = String(
-      latestMessage?.msg?.serverMessageId ||
-      latestMessage?.msg?.id ||
-      latestMessage?.msg?.tempId ||
-      ''
-    ) || null;
-
     const isGrpSync = chatData?.chatType === 'group' || chatData?.isGroup;
 
-    if (!syncOnly) {
+    if (force) {
+      forceReloadPendingRef.current = true;
+      isHardReloadingRef.current = true;
+      lastMessageSyncAtRef.current = 0;
+
+      // Force reload — single full fetch
       if (isGrpSync) {
         socket.emit('group:message:sync', {
           groupId: chatData?.groupId || chatData?.group?._id || chatIdParam,
@@ -2170,18 +2319,28 @@ export default function useChatLogic({ navigation, route }) {
           page: 1,
           limit,
           before,
-          force,
+          force: true,
         });
       }
+      return;
     }
 
-    if (force) {
-      forceReloadPendingRef.current = true;
-      isHardReloadingRef.current = true;
-      lastMessageSyncAtRef.current = 0;
-    }
+    if (syncOnly) {
+      // Delta sync only — fetch messages after last known
+      const currentMessages = allMessagesRef.current || [];
+      const latestMessage = currentMessages.reduce((candidate, msg) => {
+        const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
+        if (!candidate) return { msg, ts };
+        return ts > candidate.ts ? { msg, ts } : candidate;
+      }, null);
 
-    if (!force) {
+      const lastMessageId = String(
+        latestMessage?.msg?.serverMessageId ||
+        latestMessage?.msg?.id ||
+        latestMessage?.msg?.tempId ||
+        ''
+      ) || null;
+
       if (isGrpSync) {
         socket.emit('group:message:sync', {
           groupId: chatData?.groupId || chatData?.group?._id || chatIdParam,
@@ -2195,8 +2354,25 @@ export default function useChatLogic({ navigation, route }) {
           limit: Number(limit) > 0 ? Number(limit) : 50,
         });
       }
+      return;
     }
-  }, [allMessages]);
+
+    // Full fetch (no local messages) — single request only
+    if (isGrpSync) {
+      socket.emit('group:message:sync', {
+        groupId: chatData?.groupId || chatData?.group?._id || chatIdParam,
+        lastMessageId: null,
+        limit,
+      });
+    } else {
+      socket.emit('message:fetch', {
+        chatId: chatIdParam,
+        page: 1,
+        limit,
+        before,
+      });
+    }
+  }, [chatData]);
 
   useEffect(() => {
     const docs = chatMessagesData?.data?.docs || chatMessagesData?.docs || null;
@@ -2211,8 +2387,6 @@ export default function useChatLogic({ navigation, route }) {
   }, [chatMessagesData, currentUserId, chatId, hasLoadedFromAPI, currentPage, isLoadingMore]);
 
   const processAPIResponse = useCallback((apiMessages) => {
-    console.log('🔄 [PROCESS API] Processing', apiMessages.length, 'API messages');
-
     setAllMessages(prevMessages => {
       const existingMessages = [...prevMessages];
       const mergedMessages = [...existingMessages];
@@ -2220,19 +2394,22 @@ export default function useChatLogic({ navigation, route }) {
       apiMessages.forEach(apiMsg => {
         const formattedMessage = normalizeIncomingMessage(apiMsg);
         const serverId = formattedMessage.serverMessageId;
+        const rawTempId = normalizeId(apiMsg?.tempId || apiMsg?.payload?.tempId);
 
+        // Primary match: all ID combinations
         let existingIndex = mergedMessages.findIndex(m =>
-          m.serverMessageId === serverId ||
-          m.id === serverId
+          (serverId && (sameId(m.serverMessageId, serverId) || sameId(m.id, serverId) || sameId(m.tempId, serverId))) ||
+          (rawTempId && (sameId(m.tempId, rawTempId) || sameId(m.id, rawTempId)))
         );
 
+        // Fallback: same sender + same text + close timestamp
         if (existingIndex === -1) {
+          const incomingTs = new Date(formattedMessage.createdAt).getTime();
+          const incomingText = (formattedMessage.text || '').trim();
           existingIndex = mergedMessages.findIndex(localMsg =>
             sameId(localMsg.senderId, formattedMessage.senderId) &&
-            Math.abs(
-              new Date(localMsg.createdAt).getTime() -
-              new Date(apiMsg.createdAt).getTime()
-            ) < 5000
+            (localMsg.text || '').trim() === incomingText &&
+            Math.abs(new Date(localMsg.createdAt).getTime() - incomingTs) < 3000
           );
         }
 
@@ -2251,9 +2428,12 @@ export default function useChatLogic({ navigation, route }) {
             localUri: mergedLocalUri,
           });
 
+          const mergedReactions = formattedMessage.reactions || existing?.reactions || null;
           mergedMessages[existingIndex] = {
             ...existing,
             ...formattedMessage,
+            reactions: mergedReactions,
+            senderName: formattedMessage.senderName || existing?.senderName || null,
             senderType: formattedMessage.senderType || existing.senderType,
             isDeleted: keepDeletedPlaceholder ? true : formattedMessage.isDeleted,
             deletedFor: keepDeletedPlaceholder ? (existing?.deletedFor || 'everyone') : formattedMessage.deletedFor,
@@ -2711,7 +2891,6 @@ export default function useChatLogic({ navigation, route }) {
           resolve({ queued: false, success: true, response });
           return;
         }
-
         await queueManualPresence(payload);
         resolve({ queued: true, success: false, response });
       });
@@ -2793,6 +2972,10 @@ export default function useChatLogic({ navigation, route }) {
       const tempId = data.tempId || data.data?.tempId;
       if (data.persistenceConfirmed === true || data.status === true || messageId) {
         updateMessageStatus(tempId, 'sent', { messageId, ...data });
+        // Update SQLite: replace temp row with server ID
+        if (tempId && messageId) {
+          ChatDatabase.acknowledgeMessage(tempId, messageId).catch(() => {});
+        }
       }
     };
     registerSocketHandler('message:sent:ack', onMessageSentAck);
@@ -2803,18 +2986,35 @@ export default function useChatLogic({ navigation, route }) {
       const tempId = source?.tempId;
       if (tempId || messageId) {
         updateMessageStatus(tempId || messageId, 'sent', { messageId, ...source });
+        if (tempId && messageId) {
+          ChatDatabase.acknowledgeMessage(tempId, messageId).catch(() => {});
+        }
       }
     };
     registerSocketHandler('message:sent', onMessageSent);
 
+    // Track which messageIds we've already processed to prevent duplicates
+    // from message:new + message:received firing for the same message
+    const handledMsgIds = new Set();
+
     const onMessageNew = (data) => {
-      const chatInPayload = data.chatId || data.chat || data.roomId;
-      if (chatInPayload && chatInPayload !== currentChatId) return;
-      handleReceivedMessage(data);
+      const source = data?.data || data;
+      const chatInPayload = source?.chatId || source?.chat || source?.roomId;
+      if (chatInPayload && !sameId(chatInPayload, currentChatId)) return;
+      const msgId = source?.messageId || source?._id || source?.id;
+      if (msgId) handledMsgIds.add(String(msgId));
+      handleReceivedMessage(source);
     };
     registerSocketHandler('message:new', onMessageNew);
 
-    const onMessageReceived = (data) => { handleReceivedMessage(data); };
+    const onMessageReceived = (data) => {
+      const source = data?.data || data;
+      const msgId = source?.messageId || source?._id || source?.id;
+      // Skip if already handled by message:new
+      if (msgId && handledMsgIds.has(String(msgId))) return;
+      if (msgId) handledMsgIds.add(String(msgId));
+      handleReceivedMessage(source);
+    };
     const onMessageDelivered = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id;
@@ -2822,17 +3022,22 @@ export default function useChatLogic({ navigation, route }) {
     };
     const onMessageRead = (data) => {
       const source = data?.data || data;
-
-      // Ignore read events triggered by ourselves (e.g. message:read:all on chat open).
-      // Only mark our outgoing messages as "seen" when the *peer* has read them.
+      // Determine WHO triggered the read — must be the PEER, not ourselves
       const readerId = source?.senderId || source?.readBy || source?.userId;
+
+      // If readerId is us, ignore (we triggered this via message:read:all on chat open)
       if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
 
+      // If no readerId at all, we can't confirm a peer read — ignore to prevent false blue ticks
+      if (!readerId) return;
+
+      // Single message read — only mark if it's our outgoing message being read by the peer
       if (source?.messageId) {
         updateMessageStatus(source.messageId, 'seen', source);
         return;
       }
 
+      // Bulk read by chatId — peer has read all messages in this chat
       const sourceChatId = source?.chatId || source?.chat;
       if (sourceChatId && sourceChatId === currentChatId) {
         setAllMessages(prev => {
@@ -2861,9 +3066,9 @@ export default function useChatLogic({ navigation, route }) {
 
     const onMessageReadBulk = (data) => {
       const source = data?.data || data;
-      // Ignore bulk read events triggered by ourselves
+      // Must have a readerId that is NOT us — only peer reads should turn ticks blue
       const readerId = source?.senderId || source?.readBy || source?.userId;
-      if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       const messageIds = Array.isArray(source?.messageIds) ? source.messageIds : [];
       if (messageIds.length > 0) {
         setAllMessages(prev => {
@@ -2910,6 +3115,9 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       const messageId = source?.messageId;
       if (!messageId) return;
+      // Only mark as 'seen' if the reader is the peer, not ourselves
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
       updateMessageStatus(messageId, 'seen', source);
     };
     registerSocketHandler('message:read:response', onReadResponse);
@@ -2976,9 +3184,13 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       const messageId = source?.messageId;
       if (!messageId) return;
+      // Only mark as 'seen' if the reader is the peer, not ourselves
+      const readerId = source?.senderId || source?.readBy || source?.userId;
+      if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
       updateMessageStatus(messageId, 'seen', source);
     };
     registerSocketHandler('message:seen:response', onSeenResponse);
+    registerSocketHandler('message:seen', onSeenResponse);
 
     // ─── MESSAGE EDIT RESPONSE ───
     const onEditResponse = (data) => {
@@ -3109,11 +3321,19 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('group:message:sync:response', onMessageSyncResponse);
 
     // ─── GROUP-SPECIFIC MESSAGE LISTENERS ───
+    const groupOwnId = chatData?.groupId || chatData?.group?._id;
+    const isGroupEvent = (source) => {
+      const gid = source?.groupId || source?.group?._id || source?.group;
+      const cid = source?.chatId || source?.chat;
+      return sameId(gid, currentChatId) || sameId(cid, currentChatId) || sameId(gid, groupOwnId) || sameId(cid, groupOwnId);
+    };
+
     const onGroupMessageNew = (data) => {
       const source = data?.data || data;
-      const groupId = source?.groupId;
-      const chatId = source?.chatId || groupId;
-      if (!sameId(chatId, currentChatId) && !sameId(groupId, currentChatId)) return;
+      if (!isGroupEvent(source)) return;
+      const msgId = source?.messageId || source?._id || source?.id;
+      if (msgId && handledMsgIds.has(String(msgId))) return;
+      if (msgId) handledMsgIds.add(String(msgId));
       handleReceivedMessage({
         ...source,
         chatId: currentChatId,
@@ -3123,8 +3343,7 @@ export default function useChatLogic({ navigation, route }) {
 
     const onGroupMessageEdited = (data) => {
       const source = data?.data || data;
-      const groupId = source?.groupId;
-      if (!sameId(groupId, currentChatId) && !sameId(source?.chatId, currentChatId)) return;
+      if (!isGroupEvent(source)) return;
       const messageId = source?.messageId || source?._id;
       if (!messageId) return;
       setAllMessages((prev) => {
@@ -3143,59 +3362,167 @@ export default function useChatLogic({ navigation, route }) {
 
     const onGroupMessageDeleted = (data) => {
       const source = data?.data || data;
-      const groupId = source?.groupId;
-      if (!sameId(groupId, currentChatId) && !sameId(source?.chatId, currentChatId)) return;
-      const messageId = source?.messageId || source?._id;
-      const deleteFor = source?.deleteFor || 'everyone';
+      console.log('[DELETE:GROUP:RAW]', JSON.stringify(source));
+      if (!isGroupEvent(source)) {
+        console.log('[DELETE:GROUP:SKIP] isGroupEvent false', { groupId: source?.groupId, group: source?.group, chatId: source?.chatId, currentChatId, groupOwnId });
+        return;
+      }
+      const messageId = source?.messageId || source?.message || source?._id || source?.id;
+      if (!messageId) return;
+      const deleteFor = source?.deleteFor || source?.delete_type || (source?.isDeletedForEveryone ? 'everyone' : null) || 'everyone';
+      const deletedBy = source?.deletedBy || source?.senderId || source?.userId;
       if (deleteFor === 'everyone') {
-        handleDeleteMessage(messageId, true, { deletedBy: source?.deletedBy || source?.senderId });
+        handleDeleteMessage(messageId, true, { deletedBy });
       } else {
-        handleDeleteMessage(messageId, false);
+        // Delete for me — only apply if current user is the one who deleted
+        if (!deletedBy || sameId(deletedBy, currentUserIdRef.current)) {
+          handleDeleteMessage(messageId, false);
+        }
       }
     };
     registerSocketHandler('group:message:deleted', onGroupMessageDeleted);
+    registerSocketHandler('group:message:delete', onGroupMessageDeleted);
+    registerSocketHandler('group:message:delete:everyone', onGroupMessageDeleted);
 
     const onGroupMessageDelivered = (data) => {
       const source = data?.data || data;
-      const groupId = source?.groupId;
-      if (!sameId(groupId, currentChatId) && !sameId(source?.chatId, currentChatId)) return;
+      if (!isGroupEvent(source)) return;
       const messageIds = source?.messageIds || [source?.messageId].filter(Boolean);
+      const userId = source?.userId;
+      const deliveredAt = source?.deliveredAt || new Date().toISOString();
       setAllMessages((prev) => {
         let changed = false;
         const updated = prev.map((msg) => {
           const id = msg.serverMessageId || msg.id || msg.tempId;
-          if (messageIds.some(mid => sameId(mid, id)) && msg.status !== 'read') {
+          if (!messageIds.some(mid => sameId(mid, id))) return msg;
+          // Track per-user delivery
+          const deliveredTo = { ...(msg.deliveredTo || {}) };
+          if (userId && !deliveredTo[userId]) {
+            deliveredTo[userId] = deliveredAt;
             changed = true;
-            return { ...msg, status: 'delivered' };
+          }
+          // Advance status to 'delivered' if not already seen/read
+          const newStatus = (msg.status === 'seen' || msg.status === 'read') ? msg.status : 'delivered';
+          if (newStatus !== msg.status || changed) {
+            return { ...msg, status: newStatus, deliveredTo };
           }
           return msg;
         });
-        if (changed) saveMessagesToLocal(updated);
+        if (changed) {
+          saveMessagesToLocal(updated);
+          updateChatListLastMessagePreview(updated);
+        }
         return changed ? updated : prev;
       });
     };
     registerSocketHandler('group:message:delivered:update', onGroupMessageDelivered);
+    registerSocketHandler('group:message:delivered', onGroupMessageDelivered);
 
     const onGroupMessageRead = (data) => {
       const source = data?.data || data;
-      const groupId = source?.groupId;
-      if (!sameId(groupId, currentChatId) && !sameId(source?.chatId, currentChatId)) return;
+      if (!isGroupEvent(source)) return;
       const messageIds = source?.messageIds || [source?.messageId].filter(Boolean);
-      markMessagesAsRead(messageIds);
+      const userId = source?.userId;
+      const readAt = source?.readAt || new Date().toISOString();
+      // Ignore our own read events
+      if (userId && sameId(userId, currentUserIdRef.current)) return;
+      setAllMessages((prev) => {
+        let changed = false;
+        const updated = prev.map((msg) => {
+          const id = msg.serverMessageId || msg.id || msg.tempId;
+          if (!messageIds.some(mid => sameId(mid, id))) return msg;
+          // Track per-user read
+          const readBy = { ...(msg.readBy || {}) };
+          if (userId && !readBy[userId]) {
+            readBy[userId] = readAt;
+            changed = true;
+          }
+          // Advance status to 'seen'
+          if (msg.status !== 'seen' && msg.status !== 'read') {
+            changed = true;
+          }
+          return changed ? { ...msg, status: 'seen', readBy } : msg;
+        });
+        if (changed) {
+          saveMessagesToLocal(updated);
+          updateChatListLastMessagePreview(updated);
+        }
+        return changed ? updated : prev;
+      });
     };
     registerSocketHandler('group:message:read:update', onGroupMessageRead);
+    registerSocketHandler('group:message:read', onGroupMessageRead);
 
     const onGroupReactionUpdate = (data) => {
       const source = data?.data || data;
-      const groupId = source?.groupId;
-      if (!sameId(groupId, currentChatId) && !sameId(source?.chatId, currentChatId)) return;
-      const messageId = source?.messageId || source?._id;
+      console.log('[REACTION:GROUP:RAW]', JSON.stringify(source));
+      if (!isGroupEvent(source)) {
+        console.log('[REACTION:GROUP:SKIP] isGroupEvent false', { groupId: source?.groupId, group: source?.group, chatId: source?.chatId, currentChatId, groupOwnId });
+        return;
+      }
+      const messageId = source?.messageId || source?.message || source?._id || source?.id;
       if (!messageId) return;
       setAllMessages((prev) => {
         const updated = prev.map((msg) => {
           const id = msg.serverMessageId || msg.id || msg.tempId;
-          if (sameId(id, messageId)) {
-            return { ...msg, reactions: source?.reactions || msg.reactions };
+          if (!sameId(id, messageId) && !sameId(msg._id, messageId)) return msg;
+
+          // If server sends full reactions map, use it
+          if (source?.reactions && typeof source.reactions === 'object') {
+            return { ...msg, reactions: source.reactions };
+          }
+
+          // Incremental update
+          const emoji = source?.emoji;
+          const userId = source?.userId;
+          const action = source?.action;
+          if (!emoji || !userId) return msg;
+
+          const reactions = { ...(msg.reactions || {}) };
+          const existing = reactions[emoji] || { count: 0, users: [] };
+          if (action === 'add' && !existing.users.includes(userId)) {
+            reactions[emoji] = { count: existing.count + 1, users: [...existing.users, userId] };
+          } else if (action === 'remove') {
+            reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== userId) };
+            if (reactions[emoji].count === 0) delete reactions[emoji];
+          }
+          return { ...msg, reactions };
+        });
+        saveMessagesToLocal(updated);
+        return updated;
+      });
+    };
+    registerSocketHandler('group:message:reaction:update', onGroupReactionUpdate);
+    registerSocketHandler('group:message:reaction', onGroupReactionUpdate);
+    registerSocketHandler('group:message:reacted', onGroupReactionUpdate);
+
+    // 1-on-1 reaction updates (reuse same handler — structure is identical)
+    const onMessageReactionUpdate = (data) => {
+      const source = data?.data || data;
+      const chatId = source?.chatId || source?.chat;
+      if (!sameId(chatId, currentChatId)) return;
+      const messageId = source?.messageId || source?.message || source?._id || source?.id;
+      if (!messageId) return;
+      setAllMessages((prev) => {
+        const updated = prev.map((msg) => {
+          const id = msg.serverMessageId || msg.id || msg.tempId;
+          if (sameId(id, messageId) || sameId(msg._id, messageId)) {
+            if (source?.reactions) return { ...msg, reactions: source.reactions };
+            // Incremental update
+            const reactions = { ...(msg.reactions || {}) };
+            const emoji = source?.emoji;
+            const userId = source?.userId;
+            const action = source?.action;
+            if (emoji && userId) {
+              const existing = reactions[emoji] || { count: 0, users: [] };
+              if (action === 'add' && !existing.users.includes(userId)) {
+                reactions[emoji] = { count: existing.count + 1, users: [...existing.users, userId] };
+              } else if (action === 'remove') {
+                reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== userId) };
+                if (reactions[emoji].count === 0) delete reactions[emoji];
+              }
+            }
+            return { ...msg, reactions };
           }
           return msg;
         });
@@ -3203,7 +3530,8 @@ export default function useChatLogic({ navigation, route }) {
         return updated;
       });
     };
-    registerSocketHandler('group:message:reaction:update', onGroupReactionUpdate);
+    registerSocketHandler('message:reaction', onMessageReactionUpdate);
+    registerSocketHandler('message:reaction:update', onMessageReactionUpdate);
 
     const onMessageDeleteEveryone = (data) => {
       console.log('🧪 [B:SOCKET:DELETE:RECV]', {
@@ -3213,7 +3541,9 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id || source?.id;
       const chatId = source?.chatId || source?.chat || source?.roomId;
-      if (!sameId(chatId, currentChatId)) return;
+      const gid = source?.groupId || source?.group?._id || source?.group;
+      // Match by chatId OR groupId (group deletes may arrive on generic events)
+      if (!sameId(chatId, currentChatId) && !sameId(gid, currentChatId) && !sameId(gid, groupOwnId)) return;
       handleDeleteMessage(messageId, true, { deletedBy: source?.deletedBy || source?.senderId || source?.userId });
     };
     registerSocketHandler('message:delete:everyone', onMessageDeleteEveryone);
@@ -3241,8 +3571,12 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id || source?.id;
       const chatIdInPayload = source?.chatId || source?.chat || source?.roomId;
+      const gidInPayload = source?.groupId || source?.group?._id || source?.group;
       const deleteFor = source?.deleteFor || source?.delete_type || (source?.isDeletedForEveryone ? 'everyone' : 'me') || 'everyone';
-      if (!messageId || (chatIdInPayload && !sameId(chatIdInPayload, currentChatId))) return;
+      // Match by chatId OR groupId
+      const matchesChat = chatIdInPayload ? sameId(chatIdInPayload, currentChatId) : false;
+      const matchesGroup = gidInPayload ? (sameId(gidInPayload, currentChatId) || sameId(gidInPayload, groupOwnId)) : false;
+      if (!messageId || (!matchesChat && !matchesGroup && chatIdInPayload)) return;
       handleDeleteMessage(messageId, deleteFor === 'everyone', { deletedBy: source?.deletedBy || source?.senderId || source?.userId });
     };
     registerSocketHandler('message:deleted', onMessageDeleted);
@@ -3535,15 +3869,11 @@ export default function useChatLogic({ navigation, route }) {
 
   const removeDuplicateMessages = useCallback((messagesArr) => {
     const seen = new Set();
-    const seenByContent = new Map();
     return messagesArr.filter((msg) => {
-      const ids = [msg.serverMessageId, msg.id, msg.tempId].filter(Boolean);
+      const ids = [msg.serverMessageId, msg.id, msg.tempId].filter(Boolean).map(String);
+      if (ids.length === 0) return true; // no IDs → keep (can't dedup)
       if (ids.some(id => seen.has(id))) return false;
-      const timestamp = new Date(msg.createdAt).getTime();
-      const contentKey = `${msg.text}_${msg.senderId}_${Math.floor(timestamp / 5000)}`;
-      if (seenByContent.has(contentKey)) return false;
       ids.forEach(id => seen.add(id));
-      seenByContent.set(contentKey, true);
       return true;
     });
   }, []);
@@ -3554,13 +3884,13 @@ export default function useChatLogic({ navigation, route }) {
       let changed = false;
       const updated = prevMessages.map((msg) => {
         const isMatch =
-          msg.tempId === tempId ||
-          msg.id === tempId ||
-          msg.serverMessageId === tempId ||
+          sameId(msg.tempId, tempId) ||
+          sameId(msg.id, tempId) ||
+          sameId(msg.serverMessageId, tempId) ||
           (serverData?.messageId && (
-            msg.id === serverData.messageId ||
-            msg.serverMessageId === serverData.messageId ||
-            msg.tempId === tempId
+            sameId(msg.id, serverData.messageId) ||
+            sameId(msg.serverMessageId, serverData.messageId) ||
+            sameId(msg.tempId, tempId)
           ));
         if (!isMatch) return msg;
 
@@ -3655,6 +3985,7 @@ export default function useChatLogic({ navigation, route }) {
           if (response && (response.status === true || response.success === true || response.data)) {
             const serverMessageId = response.data?.messageId || response.data?._id || response.messageId || response._id;
             updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response.data });
+            if (serverMessageId && tempId) ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
             return resolve(response);
           } else if (response && response.status === false) {
             updateMessageStatus(tempId, 'failed');
@@ -3663,6 +3994,7 @@ export default function useChatLogic({ navigation, route }) {
             const serverMessageId = response?.messageId || response?._id;
             if (serverMessageId) {
               updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response });
+              if (tempId) ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
               return resolve(response);
             }
             // No ack data but also no error — treat as sent optimistically
@@ -3679,13 +4011,15 @@ export default function useChatLogic({ navigation, route }) {
   }, [updateMessageStatus]);
 
   /* ========== Text send flow ========== */
-  const handleSendText = useCallback(async () => {
+  const handleSendText = useCallback(async (mentions) => {
     if (!text.trim()) return;
 
     const tempId = `temp_${Date.now()}_${Math.random()}`;
     const timestamp = new Date().toISOString();
-    
+    sentTempIdsRef.current.add(tempId);
+
     const isGrpSend = chatData.chatType === 'group' || chatData.isGroup;
+    const mentionsArray = Array.isArray(mentions) && mentions.length > 0 ? mentions : undefined;
     const payload = {
       receiverId: isGrpSend ? null : (chatData.peerUser?._id || null),
       messageType: "text",
@@ -3701,6 +4035,7 @@ export default function useChatLogic({ navigation, route }) {
       tempId,
       createdAt: timestamp,
       ...(isGrpSend && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
+      ...(mentionsArray && { mentions: mentionsArray }),
     };
 
     onLocalOutgoingMessage({
@@ -3739,6 +4074,7 @@ export default function useChatLogic({ navigation, route }) {
       synced: false,
       chatId: chatIdRef.current,
       ...(isGrpSend && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
+      ...(mentionsArray && { mentions: mentionsArray }),
     };
 
     setText("");
@@ -3755,11 +4091,14 @@ export default function useChatLogic({ navigation, route }) {
       typingTimeoutRef.current = null;
     }
 
+    // Save to SQLite IMMEDIATELY (not debounced) — WhatsApp pattern
+    ChatDatabase.saveMessageSync({ ...newMessage, chatId: chatIdRef.current }).catch(err =>
+      console.warn('[ChatDB] immediate save error:', err)
+    );
+
     setAllMessages((prevMessages) => {
       const updatedMessages = [newMessage, ...prevMessages];
-      const uniqueMessages = removeDuplicateMessages(updatedMessages);
-      saveMessagesToLocal(uniqueMessages);
-      return uniqueMessages;
+      return removeDuplicateMessages(updatedMessages);
     });
 
     const socket = socketRef.current || getSocket();
@@ -3787,9 +4126,11 @@ export default function useChatLogic({ navigation, route }) {
     const tempId = `temp_location_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const timestamp = new Date().toISOString();
 
+    const isGrpLoc = chatData?.chatType === 'group' || chatData?.isGroup;
     const payload = {
-      receiverId: chatData.peerUser?._id || null,
+      receiverId: isGrpLoc ? null : (chatData.peerUser?._id || null),
       chatType: chatData?.chatType || 'private',
+      ...(isGrpLoc && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
       messageType: 'location',
       text: address || 'Shared location',
       mediaUrl: mapPreviewUrl || `https://maps.google.com/?q=${lat},${lng}`,
@@ -3803,6 +4144,7 @@ export default function useChatLogic({ navigation, route }) {
       forwardedFrom: null,
       chatId: chatIdRef.current,
       senderId: currentUserIdRef.current,
+      senderName: currentUserNameRef.current || '',
       tempId,
       createdAt: timestamp,
     };
@@ -3872,13 +4214,16 @@ export default function useChatLogic({ navigation, route }) {
       isRegistered: !!isRegistered,
     };
 
+    const isGrpContact = chatData?.chatType === 'group' || chatData?.isGroup;
     const payload = {
       chatId: chatIdRef.current,
       messageId,
       chatType: chatData?.chatType || 'private',
+      ...(isGrpContact && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
       senderId: currentUserIdRef.current,
+      senderName: currentUserNameRef.current || '',
       senderDeviceId,
-      receiverId: chatData.peerUser?._id || null,
+      receiverId: isGrpContact ? null : (chatData.peerUser?._id || null),
       messageType: 'contact',
       text: name,
       contact: contactData,
@@ -3892,8 +4237,6 @@ export default function useChatLogic({ navigation, route }) {
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
     };
-
-    console.log('📤 [CONTACT:SEND] payload:', JSON.stringify(payload));
 
     onLocalOutgoingMessage({
       chatId: chatIdRef.current,
@@ -4018,73 +4361,86 @@ export default function useChatLogic({ navigation, route }) {
   const handleReceivedMessage = useCallback(async (msg) => {
     resetIdleTimer();
 
-    const messageId = msg.messageId || msg._id;
-    const incomingTempId = msg.tempId;
-
-    console.log('📥 [RECEIVED] New message:', {
-      messageId,
-      type: msg.messageType,
-      mediaMeta: msg.mediaMeta ? Object.keys(msg.mediaMeta) : null,
-      hasPayload: !!msg.payload,
-    });
+    const messageId = normalizeId(msg.messageId || msg._id);
+    const incomingTempId = normalizeId(msg.tempId);
+    const incomingSenderId = msg?.senderId;
+    const isSelfMessage = incomingSenderId && sameId(incomingSenderId, currentUserIdRef.current);
 
     setAllMessages((prevMessages) => {
-      // Check if this message already exists (by serverMessageId, id, tempId, or mediaId)
-      const exists = prevMessages.some(m =>
-        (messageId && (m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId)) ||
-        (incomingTempId && (m.tempId === incomingTempId || m.id === incomingTempId)) ||
-        (msg.mediaId && (m.mediaId === msg.mediaId))
+      // ── Check if this message already exists by any ID ──
+      const existingIndex = prevMessages.findIndex(m =>
+        (messageId && (sameId(m.id, messageId) || sameId(m.serverMessageId, messageId) || sameId(m.tempId, messageId))) ||
+        (incomingTempId && (sameId(m.tempId, incomingTempId) || sameId(m.id, incomingTempId))) ||
+        (msg.mediaId && m.mediaId && sameId(m.mediaId, msg.mediaId))
       );
 
-      if (exists) {
-        // If this is our own sent message echoed back, update its status instead of duplicating
-        const updatedMessages = prevMessages.map(m => {
-          const isMatch = (messageId && (m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId)) ||
-            (incomingTempId && (m.tempId === incomingTempId || m.id === incomingTempId)) ||
-            (msg.mediaId && (m.mediaId === msg.mediaId));
-          if (!isMatch) return m;
-          // Update status if the existing message is still in sending/uploaded state
-          if (m.status === 'sending' || m.status === 'uploaded') {
-            return {
-              ...m,
-              status: 'sent',
-              serverMessageId: messageId || m.serverMessageId,
-              id: messageId || m.id,
-              synced: true,
-            };
+      if (existingIndex !== -1) {
+        const existing = prevMessages[existingIndex];
+        // Update IDs and status on the existing message
+        if (existing.status === 'sending' || existing.status === 'uploaded' || (!existing.serverMessageId && messageId)) {
+          const updatedMessages = [...prevMessages];
+          updatedMessages[existingIndex] = {
+            ...existing,
+            status: existing.status === 'sending' || existing.status === 'uploaded' ? 'sent' : existing.status,
+            serverMessageId: messageId || existing.serverMessageId,
+            id: messageId || existing.id,
+            synced: true,
+          };
+          if (existing.tempId && messageId && existing.tempId !== messageId) {
+            ChatDatabase.acknowledgeMessage(existing.tempId, messageId).catch(() => {});
           }
-          return m;
-        });
-        const changed = updatedMessages !== prevMessages && updatedMessages.some((m, i) => m !== prevMessages[i]);
-        if (changed) {
           saveMessagesToLocal(updatedMessages);
           return updatedMessages;
         }
-        console.log('📥 [RECEIVED] Message already exists, skipping');
         return prevMessages;
+      }
+
+      // ── Self-echo: we already have this message from optimistic insert. ──
+      // For self messages not matched by ID, also check by content (sender+text+time)
+      // to catch cases where ACK hasn't arrived yet (tempId ≠ serverId)
+      if (isSelfMessage) {
+        const incomingText = (msg?.text || msg?.content || '').trim();
+        const incomingTs = new Date(msg?.createdAt || msg?.timestamp || 0).getTime();
+        const contentMatch = prevMessages.some(m =>
+          sameId(m.senderId, incomingSenderId) &&
+          (m.text || '').trim() === incomingText &&
+          Math.abs((m.timestamp || 0) - incomingTs) < 5000
+        );
+        if (contentMatch) return prevMessages;
+        // If no content match, it might be a message sent from another device — allow adding
       }
 
       const receivedMessage = normalizeIncomingMessage({
         ...msg,
         messageId,
+        // Ensure chatId is always set so the filter effect picks it up
+        chatId: msg?.chatId || chatIdRef.current,
       });
+
+      // Force correct senderType for proper left/right rendering
+      if (receivedMessage.senderId) {
+        receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
+      }
+
+      // Save to SQLite immediately — single source of truth
+      ChatDatabase.saveMessageSync({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(err =>
+        console.warn('[ChatDB] immediate recv save error:', err)
+      );
 
       const updatedMessages = [receivedMessage, ...prevMessages];
       const uniqueMessages = deduplicateMessages(updatedMessages);
       const sorted = uniqueMessages.sort((a, b) => b.timestamp - a.timestamp);
-      
-      saveMessagesToLocal(sorted);
 
       const latestTs = sorted.length > 0 ? Number(sorted[0]?.timestamp || 0) : 0;
       if (latestTs > 0) {
         lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
       }
-      
+
       return sorted;
     });
 
     const senderId = msg?.senderId;
-    if (senderId && senderId !== currentUserIdRef.current) {
+    if (senderId && !sameId(senderId, currentUserIdRef.current)) {
       const messageId = msg?.messageId || msg?._id || msg?.id;
       if (messageId) {
         // Emit message:delivered to server — the message has reached this device
@@ -4107,23 +4463,44 @@ export default function useChatLogic({ navigation, route }) {
           }
         }
 
-        markMessagesAsRead([messageId]);
+        // Mark as 'delivered' locally — NOT 'seen'. Seen is triggered by visibility detection.
+        setAllMessages(prev => {
+          let changed = false;
+          const updated = prev.map(m => {
+            const id = m.serverMessageId || m.id || m.tempId;
+            if (!sameId(id, messageId)) return m;
+            if (m.status === 'seen' || m.status === 'read' || m.status === 'delivered') return m;
+            changed = true;
+            return { ...m, status: 'delivered' };
+          });
+          if (changed) saveMessagesToLocal(updated);
+          return changed ? updated : prev;
+        });
       }
     }
   }, [saveMessagesToLocal, deduplicateMessages, resetIdleTimer, markMessagesAsRead]);
 
   const handleDeleteMessage = useCallback((messageId, isDeletedForEveryone, options = {}) => {
-    console.log("callback here --- ")
-    const deletedBy = normalizeId(options?.deletedBy) || normalizeId(currentUserIdRef.current);
-    const isDeletedBySelf = sameId(deletedBy, currentUserIdRef.current);
+    const deletedBy = normalizeId(options?.deletedBy) || null;
+    // Only treat as "self-deleted" if we have explicit confirmation that the deleter is the current user
+    // If deletedBy is unknown (null), check if we initiated the delete (not receiving from socket)
+    const isDeletedBySelf = deletedBy
+      ? sameId(deletedBy, currentUserIdRef.current)
+      : Boolean(options?._initiatedLocally);
 
     if (isDeletedForEveryone) {
       registerDeletedTombstone(messageId, {
         deletedBy,
         placeholderText: buildDeletePlaceholderText(isDeletedBySelf),
       });
+      // Persist delete to SQLite
+      ChatDatabase.markMessageDeleted(messageId, deletedBy, buildDeletePlaceholderText(isDeletedBySelf))
+        .catch(err => console.warn('[ChatDB] markMessageDeleted error:', err));
     } else {
       removeDeletedTombstone(messageId);
+      // Remove from SQLite for delete-for-me
+      ChatDatabase.deleteMessageForMe(messageId)
+        .catch(err => console.warn('[ChatDB] deleteMessageForMe error:', err));
     }
 
     applyDeleteToLocalStorage(messageId, isDeletedForEveryone, { deletedBy });
@@ -4135,16 +4512,20 @@ export default function useChatLogic({ navigation, route }) {
           sameId(msg.serverMessageId, messageId) ||
           sameId(msg.tempId, messageId)
         ));
+        saveMessagesToLocal(filtered);
         return filtered;
       }
 
+      let found = false;
       const updated = prevMessages.map(msg => {
         const isMatch = sameId(msg.id, messageId) || sameId(msg.serverMessageId, messageId) || sameId(msg.tempId, messageId);
         if (!isMatch) return msg;
+        found = true;
+        console.log('[DELETE:MATCH]', { messageId, msgId: msg.id, serverMessageId: msg.serverMessageId, tempId: msg.tempId });
         return {
           ...msg,
-          type: 'system',
           text: 'This message was deleted',
+          type: msg.type === 'system' ? 'text' : msg.type,
           status: msg.status,
           isDeleted: true,
           deletedFor: 'everyone',
@@ -4156,6 +4537,11 @@ export default function useChatLogic({ navigation, route }) {
         };
       });
 
+      if (!found) {
+        console.warn('[DELETE:NOT_FOUND]', { messageId, totalMessages: prevMessages.length });
+      }
+
+      saveMessagesToLocal(updated);
       return updated;
     });
     pendingPreviewSyncRef.current = true;
@@ -4181,13 +4567,18 @@ export default function useChatLogic({ navigation, route }) {
     try {
       const socket = getSocket();
 
+      // Read latest allMessages via ref to avoid stale closure
+      const latestMessages = allMessagesRef.current || [];
+
       const selectedResolved = selectedMessage
         .map((messageId) => {
-          const found = messages.find(m =>
+          // Search in latest allMessages (not stale `messages` closure)
+          const found = latestMessages.find(m =>
             sameId(m.id, messageId) ||
             sameId(m.serverMessageId, messageId) ||
             sameId(m.tempId, messageId)
           );
+          // Always prefer serverMessageId for the emit — server doesn't know temp IDs
           const resolvedId = found?.serverMessageId || found?.id || found?.tempId || messageId;
           return { found, resolvedId };
         })
@@ -4195,30 +4586,28 @@ export default function useChatLogic({ navigation, route }) {
 
       selectedResolved.forEach(({ resolvedId }) => {
         handleDeleteMessage(resolvedId, deleteForEveryone, {
-          deletedBy: deleteForEveryone ? currentUserIdRef.current : null,
+          deletedBy: currentUserIdRef.current,
+          _initiatedLocally: true,
         });
       });
 
       if (socket && isSocketConnected()) {
         for (const { resolvedId, found } of selectedResolved) {
-          console.log('🧪 [A:EMIT:DELETE]', {
-            messageId: resolvedId,
-            chatId: chatIdRef.current,
-            deleteFor: deleteForEveryone ? 'everyone' : 'me',
-          });
-          console.log('🗑️ Deleting message:', { messageId: resolvedId, chatId: chatIdRef.current, deleteForEveryone });
           const isGroupDel = chatData?.chatType === 'group' || chatData?.isGroup;
-          const groupPayload = isGroupDel ? { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current } : {};
+          const groupId = isGroupDel ? (chatData?.groupId || chatData?.group?._id || chatIdRef.current) : null;
           if (deleteForEveryone && found && sameId(found.senderId, currentUserIdRef.current)) {
             if (isGroupDel) {
-              socket.emit('group:message:delete', { messageId: resolvedId, chatId: chatIdRef.current, ...groupPayload, deleteFor: 'everyone' });
+              const payload = { messageId: resolvedId, chatId: chatIdRef.current, groupId, deleteFor: 'everyone', senderId: currentUserIdRef.current };
+              socket.emit('group:message:delete', payload);
+              console.log('[DELETE:GROUP:EMIT]', payload);
             } else {
-              socket.emit('message:delete', { messageId: resolvedId, chatId: chatIdRef.current, deleteFor: 'everyone' });
-              socket.emit('message:delete:everyone', { messageId: resolvedId, chatId: chatIdRef.current });
+              socket.emit('message:delete', { messageId: resolvedId, chatId: chatIdRef.current, deleteFor: 'everyone', senderId: currentUserIdRef.current });
+              socket.emit('message:delete:everyone', { messageId: resolvedId, chatId: chatIdRef.current, senderId: currentUserIdRef.current });
+              console.log('[DELETE:1on1:EMIT]', { messageId: resolvedId, chatId: chatIdRef.current });
             }
           } else {
             if (isGroupDel) {
-              socket.emit('group:message:delete', { messageId: resolvedId, chatId: chatIdRef.current, ...groupPayload, deleteFor: 'me' });
+              socket.emit('group:message:delete', { messageId: resolvedId, chatId: chatIdRef.current, groupId, deleteFor: 'me', senderId: currentUserIdRef.current });
             } else {
               socket.emit('message:delete', { messageId: resolvedId, chatId: chatIdRef.current, deleteFor: 'me' });
               socket.emit('message:delete:me', { messageId: resolvedId, chatId: chatIdRef.current });
@@ -4230,7 +4619,7 @@ export default function useChatLogic({ navigation, route }) {
     } catch (error) {
       Alert.alert("Error", "Failed to delete messages");
     }
-  }, [messages, selectedMessage, handleDeleteMessage]);
+  }, [selectedMessage, handleDeleteMessage, chatData]);
 
   // ─── MESSAGE EDITING ───
 
@@ -4292,9 +4681,9 @@ export default function useChatLogic({ navigation, route }) {
 
   const handleDeleteSelected = useCallback(() => {
     if (selectedMessage.length === 0) return;
-    console.log("selectedMessage ---", selectedMessage)
+    const latestMessages = allMessagesRef.current || [];
     const allMyMessages = selectedMessage.every(msgId => {
-      const msg = messages.find(m =>
+      const msg = latestMessages.find(m =>
         sameId(m.id, msgId) || sameId(m.serverMessageId, msgId) || sameId(m.tempId, msgId)
       );
       return msg && sameId(msg.senderId, currentUserIdRef.current);
@@ -4302,7 +4691,7 @@ export default function useChatLogic({ navigation, route }) {
     const options = [{ text: "Cancel", style: "cancel" }, { text: "Delete for me", onPress: () => deleteSelectedMessages(false) }];
     if (allMyMessages) options.push({ text: "Delete for everyone", style: "destructive", onPress: () => deleteSelectedMessages(true) });
     Alert.alert("Delete Messages", `Delete ${selectedMessage.length} message(s)?`, options);
-  }, [selectedMessage, messages, deleteSelectedMessages]);
+  }, [selectedMessage, deleteSelectedMessages]);
 
   const handleSearch = useCallback((searchText) => {
     if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
@@ -4372,7 +4761,20 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       const resolvedIdentity = resolveMediaIdentity(msg);
-      const messageId = String(resolvedIdentity?.mediaId || msg?.mediaId || msg?.serverMessageId || msg?.id || '');
+      const messageId = String(resolvedIdentity?.mediaId || msg?.mediaId || msg?.serverMessageId || msg?.id || msg?.messageId || '');
+      console.log('=== DOWNLOAD MSG DATA ===', JSON.stringify({
+        messageId,
+        mediaId: msg?.mediaId,
+        serverMessageId: msg?.serverMessageId,
+        id: msg?.id,
+        mediaUrl: msg?.mediaUrl,
+        previewUrl: msg?.previewUrl,
+        chatId: msg?.chatId,
+        groupId: msg?.groupId,
+        mediaMeta: msg?.mediaMeta ? Object.keys(msg.mediaMeta) : null,
+        resolvedMediaId: resolvedIdentity?.mediaId,
+        resolvedMediaUrl: resolvedIdentity?.mediaUrl,
+      }));
       if (!messageId) {
         Alert.alert('Download failed', 'Media identifier missing for this message');
         return;
@@ -4383,7 +4785,7 @@ export default function useChatLogic({ navigation, route }) {
         return;
       }
 
-      const effectiveChatId = normalizeId(msg?.chatId || chatIdRef.current);
+      const effectiveChatId = normalizeId(msg?.chatId || msg?.groupId || chatIdRef.current);
       const eventKey = buildMediaStatusEventKey(effectiveChatId, messageId);
 
       setMediaDownloadStates((prev) => ({
@@ -4406,11 +4808,14 @@ export default function useChatLogic({ navigation, route }) {
         {
           ...msg,
           mediaId: messageId,
+          messageId: msg?.serverMessageId || msg?.id || msg?.messageId || messageId,
           mediaUrl: resolvedIdentity?.mediaUrl || msg?.mediaUrl || msg?.previewUrl || msg?.url,
           mediaThumbnailUrl: resolvedIdentity?.mediaThumbnailUrl || msg?.mediaThumbnailUrl || msg?.thumbnailUrl || msg?.previewUrl,
           mediaMeta: resolvedIdentity?.mediaMeta || msg?.mediaMeta || msg?.payload?.mediaMeta || {},
           messageType: messageType,
           fileCategory: msg?.fileCategory || resolvedIdentity?.messageType || messageType,
+          chatId: effectiveChatId || chatIdRef.current,
+          groupId: msg?.groupId || chatData?.groupId || chatData?.group?._id || null,
         },
         {
           chatId: effectiveChatId || chatIdRef.current,
@@ -4536,6 +4941,7 @@ export default function useChatLogic({ navigation, route }) {
     const localSourceUri = normalizeUri(file.uri);
     const shouldInsertLocal = !options?.skipLocalInsert;
 
+    const isGrpMedia = chatData?.chatType === 'group' || chatData?.isGroup;
     const localMsg = {
       id: tempId,
       tempId,
@@ -4549,8 +4955,10 @@ export default function useChatLogic({ navigation, route }) {
       time: moment(timestamp).format("hh:mm A"),
       date: moment(timestamp).format("YYYY-MM-DD"),
       senderId: currentUserIdRef.current,
+      senderName: currentUserNameRef.current || '',
       senderType: 'self',
-      receiverId: chatData.peerUser?._id || null,
+      receiverId: isGrpMedia ? null : (chatData.peerUser?._id || null),
+      chatType: chatData?.chatType || 'private',
       status: 'sending',
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
@@ -4565,6 +4973,7 @@ export default function useChatLogic({ navigation, route }) {
       isMediaDownloaded: true,
       synced: false,
       chatId: chatIdRef.current,
+      ...(isGrpMedia && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
       useLocalForSender: true,
     };
 
@@ -4701,8 +5110,10 @@ export default function useChatLogic({ navigation, route }) {
           time: moment(timestamp).format("hh:mm A"),
           date: moment(timestamp).format("YYYY-MM-DD"),
           senderId: currentUserIdRef.current,
+          senderName: currentUserNameRef.current || '',
           senderType: 'self',
-          receiverId: chatData.peerUser?._id || null,
+          receiverId: isGrpMedia ? null : (chatData.peerUser?._id || null),
+          chatType: chatData?.chatType || 'private',
           status: 'uploaded',
           createdAt: timestamp,
           timestamp: new Date(timestamp).getTime(),
@@ -4717,6 +5128,7 @@ export default function useChatLogic({ navigation, route }) {
           downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
           isMediaDownloaded: true,
           chatId: chatIdRef.current,
+          ...(isGrpMedia && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
           useLocalForSender: true,
           mediaId,
         };
@@ -5135,6 +5547,70 @@ export default function useChatLogic({ navigation, route }) {
     });
   }, [route.params]);
 
+  // ─── MESSAGE REACTIONS ───
+  const toggleReaction = useCallback((msgId, emoji) => {
+    if (!msgId || !emoji || !currentUserIdRef.current) return;
+
+    const uid = currentUserIdRef.current;
+    const isGrpReact = chatData?.chatType === 'group' || chatData?.isGroup;
+    let resolvedAction = null;
+
+    // Optimistic update + determine action from latest state
+    setAllMessages((prev) => {
+      const updated = prev.map((msg) => {
+        const id = msg.serverMessageId || msg.id || msg.tempId;
+        if (!sameId(id, msgId)) return msg;
+
+        const reactions = { ...(msg.reactions || {}) };
+        const existing = reactions[emoji] || { count: 0, users: [] };
+        const hasReacted = existing.users?.includes(uid);
+
+        // Capture the action for the socket emit
+        resolvedAction = hasReacted ? 'remove' : 'add';
+
+        if (hasReacted) {
+          reactions[emoji] = {
+            count: Math.max(0, existing.count - 1),
+            users: existing.users.filter((u) => u !== uid),
+          };
+          if (reactions[emoji].count === 0) delete reactions[emoji];
+        } else {
+          reactions[emoji] = {
+            count: existing.count + 1,
+            users: [...(existing.users || []), uid],
+          };
+        }
+        return { ...msg, reactions };
+      });
+      saveMessagesToLocal(updated);
+      return updated;
+    });
+
+    // Emit to server (resolvedAction is set synchronously by the updater above)
+    const action = resolvedAction || 'add';
+    const socket = socketRef.current || getSocket();
+    if (socket && isSocketConnected()) {
+      if (isGrpReact) {
+        socket.emit('group:message:reaction', {
+          groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
+          messageId: msgId,
+          emoji,
+          action,
+          userId: uid,
+        });
+      } else {
+        socket.emit('message:reaction', {
+          chatId: chatIdRef.current,
+          messageId: msgId,
+          emoji,
+          action,
+          userId: uid,
+        });
+      }
+      console.log('[REACTION:EMIT]', { event: isGrpReact ? 'group:message:reaction' : 'message:reaction', msgId, emoji, action });
+    }
+  }, [chatData]);
+
   return {
     fadeAnimRef, flatListRef,
     chatData, chatId, currentUserId, getUserColor, groupMembersMap: groupMembersMapRef.current,
@@ -5161,5 +5637,7 @@ export default function useChatLogic({ navigation, route }) {
     markVisibleIncomingAsRead,
     setMessages, saveMessagesToLocal, resendMessage,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
+    toggleReaction,
+    clearSelectedMessages: () => setSelectedMessages([]),
   };
 }

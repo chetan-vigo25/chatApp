@@ -255,6 +255,8 @@ class MediaDownloadManager {
             messageType: identity.messageType,
             filename: options?.filename || message?.text || message?.fileName || key,
             force,
+            messageId: message?.messageId || message?.serverMessageId || message?.id || null,
+            groupId: message?.groupId || null,
             onProgress: (progressPct) => {
               const normalized = Math.max(0, Math.min(100, Number(progressPct || 0)));
               this.setState(key, {
