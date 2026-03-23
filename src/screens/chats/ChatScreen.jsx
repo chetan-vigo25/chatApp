@@ -890,13 +890,14 @@ export default function ChatScreen({ navigation, route }) {
     return Boolean(left && right && left === right);
   };
 
-  const getMessageKey = (msg) => (
-    normalizeId(msg?.serverMessageId) ||
-    normalizeId(msg?.mediaId) ||
-    normalizeId(msg?.id) ||
-    normalizeId(msg?.tempId) ||
-    `${normalizeId(msg?.senderId) || "unknown"}_${Number(msg?.timestamp || 0)}`
-  );
+  const getMessageKey = (msg, index) => {
+    const key = normalizeId(msg?.serverMessageId) ||
+      normalizeId(msg?.id) ||
+      normalizeId(msg?.tempId) ||
+      normalizeId(msg?.mediaId) ||
+      `${normalizeId(msg?.senderId) || "unknown"}_${Number(msg?.timestamp || 0)}`;
+    return key || `msg_${index || 0}`;
+  };
 
   const getMediaKeyCandidates = (msg) => {
     const set = new Set([
@@ -4183,8 +4184,11 @@ export default function ChatScreen({ navigation, route }) {
               ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))
               : null;
             const isOwnMsg = selMsg && sameId(selMsg?.senderId, currentUserId);
-            const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && selMsg?.status !== 'seen';
+            const msgStatus = (selMsg?.status || '').toLowerCase();
+            const isSeen = msgStatus === 'seen' || msgStatus === 'read';
+            const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && !isSeen;
             const isTextMsg = selMsg?.type === 'text';
+            const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
             return (
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                 {/* Count */}
@@ -4218,7 +4222,7 @@ export default function ChatScreen({ navigation, route }) {
                     <Ionicons name="copy-outline" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
-                {/* Edit */}
+                {/* Edit — only if NOT seen/read */}
                 {canEdit && (
                   <TouchableOpacity
                     onPress={() => {
@@ -4228,6 +4232,18 @@ export default function ChatScreen({ navigation, route }) {
                     }}
                     style={{ padding: 10 }}>
                     <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
+                  </TouchableOpacity>
+                )}
+                {/* Report Message — only for other's messages */}
+                {canReport && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      setReactionMsgId(null);
+                      clearSelectedMessages();
+                      handleReportMessage(selMsg);
+                    }}
+                    style={{ padding: 10 }}>
+                    <Ionicons name="flag-outline" size={22} color="#E53935" />
                   </TouchableOpacity>
                 )}
               </View>
@@ -4875,21 +4891,7 @@ export default function ChatScreen({ navigation, route }) {
                   Contact Info
                 </Text>
               </TouchableOpacity>
-              <TouchableOpacity 
-                onPress={handleMenuReportChat} 
-                style={{ 
-                  paddingVertical: 14, 
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                }}
-              >
-                <Ionicons name="flag" size={18} color="#E53935" />
-                <Text style={{ color: '#E53935', fontFamily: 'Roboto-Regular' }}>
-                  Report Chat
-                </Text>
-              </TouchableOpacity>
+{/* Report Chat removed — use Report Message via long press instead */}
 
               {/* <TouchableOpacity
                 onPress={handleClearChatOptions}

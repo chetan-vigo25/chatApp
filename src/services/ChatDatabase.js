@@ -10,6 +10,7 @@ const getDB = async () => {
   if (_db) return _db;
   _db = await SQLite.openDatabaseAsync(DB_NAME);
   await _db.execAsync('PRAGMA journal_mode = WAL;');
+  await _db.execAsync('PRAGMA synchronous = NORMAL;');
   await _db.execAsync('PRAGMA foreign_keys = ON;');
   await runMigrations(_db);
   return _db;
@@ -104,10 +105,33 @@ const runMigrations = async (db) => {
   }
 };
 
-// ─── MESSAGE HELPERS ────────────────────────────────────
+// ─── HELPERS ────────────────────────────────────────────
+
+const formatTime = (ts, createdAt) => {
+  if (!ts && !createdAt) return null;
+  const d = ts ? new Date(ts) : new Date(createdAt);
+  if (isNaN(d.getTime())) return null;
+  let h = d.getHours();
+  const m = String(d.getMinutes()).padStart(2, '0');
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return `${String(h).padStart(2, '0')}:${m} ${ampm}`;
+};
+
+const formatDate = (ts, createdAt) => {
+  if (!ts && !createdAt) return null;
+  const d = ts ? new Date(ts) : new Date(createdAt);
+  if (isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${mo}-${day}`;
+};
+
+const STATUS_PRIORITY = { sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
 
 const msgToRow = (msg) => {
-  const id = msg.serverMessageId || msg.id || msg.tempId || `unknown_${Date.now()}`;
+  const id = msg.serverMessageId || msg.id || msg.tempId || `unknown_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   return {
     $id: id,
     $server_message_id: msg.serverMessageId || null,
@@ -118,7 +142,7 @@ const msgToRow = (msg) => {
     $sender_name: msg.senderName || null,
     $sender_type: msg.senderType || null,
     $receiver_id: msg.receiverId || null,
-    $text: msg.text || null,
+    $text: msg.text ?? null,
     $type: msg.type || 'text',
     $status: msg.status || 'sent',
     $timestamp: Number(msg.timestamp || new Date(msg.createdAt || 0).getTime() || 0),
@@ -141,27 +165,6 @@ const msgToRow = (msg) => {
     $payload: msg.payload ? JSON.stringify(msg.payload) : null,
     $extra: null,
   };
-};
-
-const formatTime = (ts, createdAt) => {
-  if (!ts && !createdAt) return null;
-  const d = ts ? new Date(ts) : new Date(createdAt);
-  if (isNaN(d.getTime())) return null;
-  let h = d.getHours();
-  const m = String(d.getMinutes()).padStart(2, '0');
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  h = h % 12 || 12;
-  return `${String(h).padStart(2, '0')}:${m} ${ampm}`;
-};
-
-const formatDate = (ts, createdAt) => {
-  if (!ts && !createdAt) return null;
-  const d = ts ? new Date(ts) : new Date(createdAt);
-  if (isNaN(d.getTime())) return null;
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
 };
 
 const rowToMsg = (row) => {
@@ -210,12 +213,8 @@ const rowToMsg = (row) => {
   };
 };
 
-// ─── PUBLIC API ─────────────────────────────────────────
+// ─── UPSERT SQL ─────────────────────────────────────────
 
-/**
- * Save/upsert an array of messages for a chat.
- * Uses INSERT OR REPLACE for deduplication by primary key.
- */
 const UPSERT_SQL = `INSERT OR REPLACE INTO messages (
   id, server_message_id, temp_id, chat_id, group_id,
   sender_id, sender_name, sender_type, receiver_id,
@@ -233,52 +232,173 @@ const UPSERT_SQL = `INSERT OR REPLACE INTO messages (
 )`;
 
 /**
- * Remove duplicate rows before inserting — handles temp→server ID transition.
- * Deletes any existing row where temp_id or server_message_id matches the new message.
+ * Clean up old temp/server rows before insert to prevent duplicates.
+ * This is the KEY to zero-duplicate architecture.
+ * Handles: tempId→serverId transition, re-inserts, and content-based duplicates.
  */
-const removeDuplicateRows = async (db, msg) => {
+const cleanBeforeUpsert = async (db, msg) => {
   const id = msg.serverMessageId || msg.id || msg.tempId;
   const tempId = msg.tempId;
   const serverId = msg.serverMessageId;
 
-  // If we have a server ID, delete any old temp row for this message
+  // If server confirmed: delete old temp row
   if (serverId && tempId && serverId !== tempId) {
     await db.runAsync(
-      `DELETE FROM messages WHERE id = $tempId AND id != $serverId`,
+      `DELETE FROM messages WHERE (id = $tempId OR temp_id = $tempId) AND id != $serverId`,
       { $tempId: tempId, $serverId: serverId }
     );
   }
-  // Also clean up if temp_id column matches but id is different
-  if (tempId) {
+  // Clean up any other row with same temp_id but different primary id
+  if (tempId && tempId !== id) {
     await db.runAsync(
       `DELETE FROM messages WHERE temp_id = $tempId AND id != $id`,
       { $tempId: tempId, $id: id }
     );
   }
+  // Clean up any other row with same server_message_id but different primary id
   if (serverId) {
     await db.runAsync(
       `DELETE FROM messages WHERE server_message_id = $sid AND id != $id`,
       { $sid: serverId, $id: id }
     );
   }
+  // Content-based cleanup: if this is a server-confirmed message, delete any temp row
+  // from the same sender with matching content within 5 seconds (covers missing tempId linkage)
+  if (serverId && msg.senderId && msg.timestamp) {
+    const ts = Number(msg.timestamp || 0);
+    if (ts > 0) {
+      const msgType = (msg.type || 'text').toLowerCase();
+      const isMedia = msgType !== 'text' && msgType !== 'system';
+
+      if (isMedia) {
+        // For media messages: match by type + (mediaId OR mediaUrl) + sender + time
+        // This prevents accidentally deleting a different media message sent at the same time
+        const mediaId = msg.mediaId || null;
+        const mediaUrl = msg.mediaUrl || null;
+        if (mediaId) {
+          await db.runAsync(
+            `DELETE FROM messages
+             WHERE chat_id = $chatId AND sender_id = $senderId AND id != $id AND id LIKE 'temp_%'
+               AND type = $type AND media_id = $mediaId AND ABS(timestamp - $ts) < 5000`,
+            { $chatId: msg.chatId, $senderId: msg.senderId, $id: id, $type: msgType, $mediaId: mediaId, $ts: ts }
+          );
+        } else if (mediaUrl) {
+          await db.runAsync(
+            `DELETE FROM messages
+             WHERE chat_id = $chatId AND sender_id = $senderId AND id != $id AND id LIKE 'temp_%'
+               AND type = $type AND media_url = $mediaUrl AND ABS(timestamp - $ts) < 5000`,
+            { $chatId: msg.chatId, $senderId: msg.senderId, $id: id, $type: msgType, $mediaUrl: mediaUrl, $ts: ts }
+          );
+        } else {
+          // Fallback for media without mediaId/mediaUrl: match by type + sender + time
+          await db.runAsync(
+            `DELETE FROM messages
+             WHERE chat_id = $chatId AND sender_id = $senderId AND id != $id AND id LIKE 'temp_%'
+               AND type = $type AND ABS(timestamp - $ts) < 3000`,
+            { $chatId: msg.chatId, $senderId: msg.senderId, $id: id, $type: msgType, $ts: ts }
+          );
+        }
+      } else {
+        // For text messages: match by text content + sender + time
+        await db.runAsync(
+          `DELETE FROM messages
+           WHERE chat_id = $chatId AND sender_id = $senderId AND id != $id AND id LIKE 'temp_%'
+             AND text = $text AND ABS(timestamp - $ts) < 5000`,
+          { $chatId: msg.chatId, $senderId: msg.senderId, $id: id, $text: msg.text || '', $ts: ts }
+        );
+      }
+    }
+  }
+};
+
+// ─── PUBLIC API ─────────────────────────────────────────
+
+/**
+ * Check if existing row should be preserved (locally edited/deleted state).
+ * Also finds temp rows by sender+timestamp that might be the same message (pre-ACK).
+ * Returns the merged message if existing should be preserved, or null to allow overwrite.
+ */
+const preserveLocalEdits = async (db, msg) => {
+  const id = msg.serverMessageId || msg.id || msg.tempId;
+  if (!id) return null;
+
+  // Find existing row by any ID
+  let existing = await db.getFirstAsync(
+    `SELECT id, text, is_edited, is_deleted, deleted_for, status, local_uri, temp_id FROM messages
+     WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+    { $id: id }
+  );
+
+  // If no direct ID match, search for a temp row from the same sender at the same time
+  // This catches the case where sync arrives before ACK (temp row has no serverMessageId yet)
+  if (!existing && msg.senderId && msg.timestamp) {
+    const ts = Number(msg.timestamp || 0);
+    if (ts > 0) {
+      existing = await db.getFirstAsync(
+        `SELECT id, text, is_edited, is_deleted, deleted_for, status, local_uri, temp_id FROM messages
+         WHERE chat_id = $chatId AND sender_id = $senderId AND id LIKE 'temp_%'
+           AND ABS(timestamp - $ts) < 5000
+         ORDER BY is_edited DESC LIMIT 1`,
+        { $chatId: msg.chatId, $senderId: msg.senderId, $ts: ts }
+      );
+      // If we found a temp row, also clean it up (will be replaced by the server row)
+      if (existing && existing.id) {
+        // Delete the temp row — the server row will take its place with preserved edits
+        await db.runAsync(`DELETE FROM messages WHERE id = $tempId`, { $tempId: existing.id });
+      }
+    }
+  }
+
+  if (!existing) return null;
+
+  // If existing was locally edited but incoming is NOT edited — preserve local edit
+  if (existing.is_edited && !msg.isEdited && !msg.editedAt) {
+    return { ...msg, text: existing.text, isEdited: true, editedAt: new Date().toISOString() };
+  }
+
+  // If existing was locally deleted but incoming is NOT deleted — preserve delete
+  if (existing.is_deleted && !msg.isDeleted) {
+    return {
+      ...msg,
+      text: 'This message was deleted',
+      isDeleted: true,
+      deletedFor: existing.deleted_for,
+      mediaUrl: null, previewUrl: null, localUri: null,
+    };
+  }
+
+  // Preserve localUri if existing has it and incoming doesn't
+  if (existing.local_uri && !msg.localUri) {
+    return { ...msg, localUri: existing.local_uri, previewUrl: msg.previewUrl || existing.local_uri };
+  }
+
+  // Preserve higher status (don't regress from 'delivered' to 'sent')
+  const incomingPriority = STATUS_PRIORITY[msg.status] || 0;
+  const existingPriority = STATUS_PRIORITY[existing.status] || 0;
+  if (existingPriority > incomingPriority) {
+    return { ...msg, status: existing.status };
+  }
+
+  return null; // No preservation needed — allow overwrite
 };
 
 /**
- * Save a single message instantly (for send — no batching).
+ * Upsert a single message — IMMEDIATE, not batched.
+ * Preserves locally edited/deleted state if server sends stale data.
  */
-const saveMessageSync = async (msg) => {
+const upsertMessage = async (msg) => {
   if (!msg) return;
   const db = await getDB();
-  await removeDuplicateRows(db, msg);
-  const row = msgToRow(msg);
-  await db.runAsync(UPSERT_SQL, row);
+  await cleanBeforeUpsert(db, msg);
+  const merged = await preserveLocalEdits(db, msg);
+  await db.runAsync(UPSERT_SQL, msgToRow(merged || msg));
 };
 
 /**
- * Save/upsert an array of messages for a chat.
- * Uses a single transaction with runAsync for speed.
+ * Upsert an array of messages in a single transaction.
+ * Used for sync responses and batch imports.
  */
-const saveMessages = async (messages) => {
+const upsertMessages = async (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) return;
   const db = await getDB();
 
@@ -287,17 +407,19 @@ const saveMessages = async (messages) => {
     const batch = messages.slice(i, i + BATCH_SIZE);
     await db.withTransactionAsync(async () => {
       for (const msg of batch) {
-        await removeDuplicateRows(db, msg);
-        await db.runAsync(UPSERT_SQL, msgToRow(msg));
+        await cleanBeforeUpsert(db, msg);
+        const merged = await preserveLocalEdits(db, msg);
+        await db.runAsync(UPSERT_SQL, msgToRow(merged || msg));
       }
     });
   }
 };
 
 /**
- * Load messages for a chatId, sorted by timestamp DESC, with optional limit/offset.
+ * Load messages for a chatId, sorted by timestamp DESC.
+ * This is the ONLY way UI should get messages — single source of truth.
  */
-const loadMessages = async (chatId, { limit = 300, offset = 0, afterTimestamp = 0 } = {}) => {
+const loadMessages = async (chatId, { limit = 50, offset = 0, afterTimestamp = 0 } = {}) => {
   if (!chatId) return [];
   const db = await getDB();
 
@@ -328,29 +450,87 @@ const getMessage = async (messageId) => {
 };
 
 /**
- * Update message status (sent/delivered/seen).
- * Only advances status, never regresses.
+ * Check if a message exists by any of its IDs.
  */
-const updateMessageStatus = async (messageId, newStatus) => {
-  if (!messageId || !newStatus) return;
+const messageExists = async (messageId) => {
+  if (!messageId) return false;
+  const db = await getDB();
+  const row = await db.getFirstAsync(
+    `SELECT 1 FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+    { $id: messageId }
+  );
+  return Boolean(row);
+};
+
+/**
+ * ACK: transition tempId → serverMessageId.
+ * Updates the existing temp row in place — no duplicate created.
+ * Preserves edited state if the message was edited before ACK arrived.
+ */
+const acknowledgeMessage = async (tempId, serverMessageId) => {
+  if (!tempId || !serverMessageId) return;
   const db = await getDB();
 
-  const priorities = { sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
-  const newPriority = priorities[newStatus] || 0;
+  // Check if a server row already exists (from sync response arriving before ACK)
+  const serverRow = await db.getFirstAsync(
+    `SELECT id, is_edited, text FROM messages WHERE id = $serverId OR server_message_id = $serverId LIMIT 1`,
+    { $serverId: serverMessageId }
+  );
+  // Check the temp row
+  const tempRow = await db.getFirstAsync(
+    `SELECT id, is_edited, text FROM messages WHERE id = $tempId OR temp_id = $tempId LIMIT 1`,
+    { $tempId: tempId }
+  );
 
-  // Read current status to prevent regression
+  if (serverRow && tempRow && serverRow.id !== tempRow.id) {
+    // Both rows exist — keep the one with the latest edit state
+    const keepTemp = tempRow.is_edited && !serverRow.is_edited;
+    if (keepTemp) {
+      // Temp row has edits that server row doesn't — delete server row, upgrade temp row
+      await db.runAsync(`DELETE FROM messages WHERE id = $serverId`, { $serverId: serverRow.id });
+      await db.runAsync(
+        `UPDATE messages SET id = $serverId, server_message_id = $serverId, synced = 1, status = 'sent'
+         WHERE id = $tempId`,
+        { $serverId: serverMessageId, $tempId: tempRow.id }
+      );
+    } else {
+      // Server row is up to date — delete temp row
+      await db.runAsync(`DELETE FROM messages WHERE id = $tempId`, { $tempId: tempRow.id });
+    }
+  } else if (tempRow && !serverRow) {
+    // Only temp row exists — just upgrade it
+    await db.runAsync(
+      `UPDATE messages SET id = $serverId, server_message_id = $serverId, synced = 1, status = 'sent'
+       WHERE temp_id = $tempId OR id = $tempId`,
+      { $serverId: serverMessageId, $tempId: tempId }
+    );
+  }
+  // If only serverRow exists (no temp), nothing to do — already acknowledged
+};
+
+/**
+ * Update message status. Only advances, never regresses.
+ * Returns true if status changed.
+ */
+const updateMessageStatus = async (messageId, newStatus) => {
+  if (!messageId || !newStatus) return false;
+  const db = await getDB();
+
+  const newPriority = STATUS_PRIORITY[newStatus] || 0;
   const current = await db.getFirstAsync(
     `SELECT status FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
     { $id: messageId }
   );
-  const currentPriority = priorities[current?.status] || 0;
-  if (newPriority <= currentPriority) return;
+  if (!current) return false;
+  const currentPriority = STATUS_PRIORITY[current.status] || 0;
+  if (newPriority <= currentPriority) return false;
 
   await db.runAsync(
     `UPDATE messages SET status = $status
      WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
     { $status: newStatus, $id: messageId }
   );
+  return true;
 };
 
 /**
@@ -387,26 +567,6 @@ const deleteMessageForMe = async (messageId) => {
 };
 
 /**
- * Update message after server ACK (set serverMessageId, status to sent).
- */
-const acknowledgeMessage = async (tempId, serverMessageId) => {
-  if (!tempId || !serverMessageId) return;
-  const db = await getDB();
-  // Delete any existing row with the server ID to prevent duplicates
-  await db.runAsync(
-    `DELETE FROM messages WHERE id = $serverId AND temp_id != $tempId`,
-    { $serverId: serverMessageId, $tempId: tempId }
-  );
-  // Update the temp row to use the server ID
-  await db.runAsync(
-    `UPDATE messages SET
-       server_message_id = $serverId, id = $serverId, synced = 1, status = 'sent'
-     WHERE temp_id = $tempId OR id = $tempId`,
-    { $serverId: serverMessageId, $tempId: tempId }
-  );
-};
-
-/**
  * Update reactions JSON for a message.
  */
 const updateReactions = async (messageId, reactions) => {
@@ -423,17 +583,46 @@ const updateReactions = async (messageId, reactions) => {
  * Update edit state for a message.
  */
 const updateMessageEdit = async (messageId, newText, editedAt) => {
-  if (!messageId) return;
+  if (!messageId || !newText) return;
   const db = await getDB();
-  await db.runAsync(
-    `UPDATE messages SET text = $text, is_edited = 1, edited_at = $editedAt
-     WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
-    { $id: messageId, $text: newText, $editedAt: editedAt || new Date().toISOString() }
-  );
+
+  try {
+    // Update the message text in ALL matching rows
+    await db.runAsync(
+      `UPDATE messages SET text = $text, is_edited = 1, edited_at = $editedAt
+       WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+      { $id: messageId, $text: newText, $editedAt: editedAt || new Date().toISOString() }
+    );
+
+    // Clean up duplicate rows after edit
+    const row = await db.getFirstAsync(
+      `SELECT chat_id, sender_id, timestamp FROM messages
+       WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+      { $id: messageId }
+    );
+
+    if (row) {
+      // Delete temp duplicates that have the same edited text
+      await db.runAsync(
+        `DELETE FROM messages
+         WHERE chat_id = $chatId AND sender_id = $senderId AND text = $text
+           AND ABS(timestamp - $ts) < 5000 AND id LIKE 'temp_%'
+           AND EXISTS (
+             SELECT 1 FROM messages s
+             WHERE s.chat_id = $chatId AND s.id NOT LIKE 'temp_%'
+               AND s.sender_id = $senderId AND s.text = $text
+               AND ABS(s.timestamp - $ts) < 5000
+           )`,
+        { $chatId: row.chat_id, $senderId: row.sender_id, $text: newText, $ts: row.timestamp }
+      );
+    }
+  } catch (err) {
+    console.warn('[ChatDB] updateMessageEdit error:', err);
+  }
 };
 
 /**
- * Clear all messages for a chat (with optional timestamp filter).
+ * Clear all messages for a chat.
  */
 const clearChat = async (chatId, clearedAtTimestamp = null) => {
   if (!chatId) return;
@@ -443,24 +632,16 @@ const clearChat = async (chatId, clearedAtTimestamp = null) => {
       `DELETE FROM messages WHERE chat_id = $chatId AND timestamp <= $ts`,
       { $chatId: chatId, $ts: clearedAtTimestamp }
     );
-    await db.runAsync(
-      `INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at)
-       VALUES ($chatId, $ts, $now)`,
-      { $chatId: chatId, $ts: clearedAtTimestamp, $now: Date.now() }
-    );
   } else {
     await db.runAsync(`DELETE FROM messages WHERE chat_id = $chatId`, { $chatId: chatId });
-    await db.runAsync(
-      `INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at)
-       VALUES ($chatId, $ts, $now)`,
-      { $chatId: chatId, $ts: Date.now(), $now: Date.now() }
-    );
   }
+  await db.runAsync(
+    `INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at)
+     VALUES ($chatId, $ts, $now)`,
+    { $chatId: chatId, $ts: clearedAtTimestamp || Date.now(), $now: Date.now() }
+  );
 };
 
-/**
- * Get the cleared_at timestamp for a chat.
- */
 const getClearedAt = async (chatId) => {
   if (!chatId) return 0;
   const db = await getDB();
@@ -471,9 +652,6 @@ const getClearedAt = async (chatId) => {
   return row?.cleared_at || 0;
 };
 
-/**
- * Get message count for a chat.
- */
 const getMessageCount = async (chatId) => {
   if (!chatId) return 0;
   const db = await getDB();
@@ -484,22 +662,13 @@ const getMessageCount = async (chatId) => {
   return row?.count || 0;
 };
 
-/**
- * Update deliveredTo/readBy maps for group messages.
- */
 const updateGroupMessageTracking = async (messageId, { deliveredTo, readBy } = {}) => {
   if (!messageId) return;
   const db = await getDB();
   const updates = [];
   const params = { $id: messageId };
-  if (deliveredTo) {
-    updates.push('delivered_to = $dt');
-    params.$dt = JSON.stringify(deliveredTo);
-  }
-  if (readBy) {
-    updates.push('read_by = $rb');
-    params.$rb = JSON.stringify(readBy);
-  }
+  if (deliveredTo) { updates.push('delivered_to = $dt'); params.$dt = JSON.stringify(deliveredTo); }
+  if (readBy) { updates.push('read_by = $rb'); params.$rb = JSON.stringify(readBy); }
   if (updates.length === 0) return;
   await db.runAsync(
     `UPDATE messages SET ${updates.join(', ')}
@@ -508,9 +677,6 @@ const updateGroupMessageTracking = async (messageId, { deliveredTo, readBy } = {
   );
 };
 
-/**
- * Search messages in a chat by text.
- */
 const searchMessages = async (chatId, query, limit = 50) => {
   if (!chatId || !query) return [];
   const db = await getDB();
@@ -523,9 +689,6 @@ const searchMessages = async (chatId, query, limit = 50) => {
   return rows.map(rowToMsg);
 };
 
-/**
- * Get the latest message for a chat (for chat list preview).
- */
 const getLatestMessage = async (chatId) => {
   if (!chatId) return null;
   const db = await getDB();
@@ -537,14 +700,14 @@ const getLatestMessage = async (chatId) => {
 };
 
 /**
- * Remove duplicate messages in a chat — keeps the one with server_message_id.
- * Run once on chat open to clean up any accumulated duplicates.
+ * Run dedup cleanup on a chat — idempotent safety net.
+ * Runs on chat open to clean up any accumulated duplicates from race conditions.
  */
 const deduplicateChat = async (chatId) => {
   if (!chatId) return;
   const db = await getDB();
-  // Only remove rows that have the EXACT same primary id (true duplicates)
-  // Keep the row with server_message_id if both exist
+
+  // 1. Remove exact primary key duplicates (shouldn't happen but safety net)
   await db.runAsync(`
     DELETE FROM messages WHERE rowid NOT IN (
       SELECT MIN(rowid) FROM messages
@@ -552,7 +715,8 @@ const deduplicateChat = async (chatId) => {
       GROUP BY id
     ) AND chat_id = $chatId
   `, { $chatId: chatId });
-  // Also remove temp rows that have a corresponding server row
+
+  // 2. Remove temp rows that have a corresponding server-confirmed row (by temp_id link)
   await db.runAsync(`
     DELETE FROM messages WHERE chat_id = $chatId
       AND server_message_id IS NULL
@@ -561,11 +725,71 @@ const deduplicateChat = async (chatId) => {
         SELECT temp_id FROM messages WHERE chat_id = $chatId AND server_message_id IS NOT NULL
       )
   `, { $chatId: chatId });
+
+  // 3. Remove temp TEXT rows that have a matching server-confirmed row
+  await db.runAsync(`
+    DELETE FROM messages WHERE chat_id = $chatId
+      AND id LIKE 'temp_%'
+      AND (type = 'text' OR type IS NULL)
+      AND EXISTS (
+        SELECT 1 FROM messages s
+        WHERE s.chat_id = $chatId
+          AND s.id NOT LIKE 'temp_%'
+          AND s.sender_id = messages.sender_id
+          AND s.text = messages.text
+          AND ABS(s.timestamp - messages.timestamp) < 5000
+      )
+  `, { $chatId: chatId });
+
+  // 4. Remove temp MEDIA rows that have a matching server-confirmed row (by media_id or media_url)
+  await db.runAsync(`
+    DELETE FROM messages WHERE chat_id = $chatId
+      AND id LIKE 'temp_%'
+      AND type NOT IN ('text', 'system')
+      AND EXISTS (
+        SELECT 1 FROM messages s
+        WHERE s.chat_id = $chatId
+          AND s.id NOT LIKE 'temp_%'
+          AND s.sender_id = messages.sender_id
+          AND s.type = messages.type
+          AND ABS(s.timestamp - messages.timestamp) < 5000
+          AND (
+            (s.media_id IS NOT NULL AND s.media_id = messages.media_id)
+            OR (s.media_url IS NOT NULL AND s.media_url = messages.media_url)
+            OR (s.media_id IS NULL AND s.media_url IS NULL)
+          )
+      )
+  `, { $chatId: chatId });
 };
 
 /**
- * Close the database connection.
+ * Bulk update status for multiple messages (e.g., mark all as read).
  */
+const bulkUpdateStatus = async (chatId, newStatus, options = {}) => {
+  if (!chatId || !newStatus) return;
+  const db = await getDB();
+  const { senderIdNot = null } = options;
+
+  if (senderIdNot) {
+    // Only update messages NOT sent by this user (incoming messages)
+    const currentStatuses = Object.entries(STATUS_PRIORITY)
+      .filter(([, p]) => p < (STATUS_PRIORITY[newStatus] || 0))
+      .map(([s]) => `'${s}'`)
+      .join(',');
+    if (!currentStatuses) return;
+    await db.runAsync(
+      `UPDATE messages SET status = $status
+       WHERE chat_id = $chatId AND sender_id != $senderId AND status IN (${currentStatuses})`,
+      { $status: newStatus, $chatId: chatId, $senderId: senderIdNot }
+    );
+  } else {
+    await db.runAsync(
+      `UPDATE messages SET status = $status WHERE chat_id = $chatId`,
+      { $status: newStatus, $chatId: chatId }
+    );
+  }
+};
+
 const closeDB = async () => {
   if (_db) {
     await _db.closeAsync();
@@ -573,24 +797,38 @@ const closeDB = async () => {
   }
 };
 
+// Legacy aliases for backward compatibility
+const saveMessageSync = upsertMessage;
+const saveMessages = upsertMessages;
+
 export default {
   getDB,
-  saveMessageSync,
-  saveMessages,
+  // Primary write operations
+  upsertMessage,
+  upsertMessages,
+  acknowledgeMessage,
+  updateMessageStatus,
+  // Read operations
   loadMessages,
   getMessage,
-  updateMessageStatus,
+  messageExists,
+  getLatestMessage,
+  getMessageCount,
+  searchMessages,
+  getClearedAt,
+  // Delete operations
   markMessageDeleted,
   deleteMessageForMe,
-  acknowledgeMessage,
+  clearChat,
+  deduplicateChat,
+  // Update operations
   updateReactions,
   updateMessageEdit,
-  clearChat,
-  getClearedAt,
-  getMessageCount,
   updateGroupMessageTracking,
-  searchMessages,
-  getLatestMessage,
-  deduplicateChat,
+  bulkUpdateStatus,
+  // Lifecycle
   closeDB,
+  // Legacy aliases
+  saveMessageSync,
+  saveMessages,
 };

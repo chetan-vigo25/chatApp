@@ -909,7 +909,21 @@ export default function useChatLogic({ navigation, route }) {
       (b.timestamp || 0) - (a.timestamp || 0)
     );
 
-    setMessages(sorted);
+    // Final dedup — ensure no duplicate keys reach the FlatList
+    const seenKeys = new Set();
+    const deduped = sorted.filter(msg => {
+      const key = normalizeId(msg.serverMessageId) || normalizeId(msg.id) || normalizeId(msg.tempId);
+      if (!key) return true;
+      if (seenKeys.has(key)) return false;
+      seenKeys.add(key);
+      // Also register all other IDs of this message
+      if (msg.serverMessageId) seenKeys.add(normalizeId(msg.serverMessageId));
+      if (msg.id) seenKeys.add(normalizeId(msg.id));
+      if (msg.tempId) seenKeys.add(normalizeId(msg.tempId));
+      return true;
+    });
+
+    setMessages(deduped);
   }, [chatId, allMessages, chatData.peerUser?._id, currentUserId]);
 
   useEffect(() => {
@@ -1192,135 +1206,29 @@ export default function useChatLogic({ navigation, route }) {
     try {
       if (!chatIdParam) return 0;
 
-      // Clean up any duplicate rows first, then load
+      // Clean up any duplicate rows on first load
       await ChatDatabase.deduplicateChat(chatIdParam).catch(() => {});
-      const clearedAt = await ChatDatabase.getClearedAt(chatIdParam) || 0;
-      let dbMessages = await ChatDatabase.loadMessages(chatIdParam, { limit: 500, afterTimestamp: clearedAt });
 
-      // One-time migration: if SQLite is empty, pull from AsyncStorage and migrate
-      if (dbMessages.length === 0) {
+      // One-time migration: if SQLite is empty, pull from AsyncStorage
+      const count = await ChatDatabase.getMessageCount(chatIdParam);
+      if (count === 0) {
         const localKey = getChatMessagesKey(chatIdParam);
         if (localKey) {
           const savedMessages = await AsyncStorage.getItem(localKey);
           if (savedMessages) {
             const parsed = JSON.parse(savedMessages);
-            const asyncClearedAt = await getChatClearedAt(chatIdParam) || 0;
-            const filtered = Array.isArray(parsed)
-              ? parsed.filter(msg => {
-                  const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
-                  if (!asyncClearedAt || !ts) return true;
-                  return ts > asyncClearedAt;
-                })
-              : [];
-            if (filtered.length > 0) {
-              dbMessages = filtered;
-              // Migrate to SQLite in background
-              ChatDatabase.saveMessages(filtered).catch(err =>
-                console.warn('[ChatDB] Migration from AsyncStorage:', err)
-              );
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              await ChatDatabase.upsertMessages(parsed.map(m => ({ ...m, chatId: m.chatId || chatIdParam })));
             }
           }
         }
       }
 
-      const filteredParsed = dbMessages;
-      if (filteredParsed.length === 0) return 0;
-      
-      const processed = filteredParsed.map(msg => {
-        const normalizedSenderId = normalizeId(msg.senderId);
-        const normalizedReceiverId = normalizeId(msg.receiverId);
-        const normalizedCurrentUser = normalizeId(currentUserIdRef.current);
-        const normalizedPeer = normalizeId(chatData?.peerUser?._id);
+      // Load from SQLite → set UI state directly (single source of truth)
+      refreshMessagesFromDB(true);
 
-        // Fix stale 'sending'/'uploaded' status for messages that already have a serverMessageId
-        // This means the upload succeeded but the status wasn't updated before the user left the screen
-        let resolvedStatus = msg.status;
-        if ((resolvedStatus === 'sending' || resolvedStatus === 'uploaded') && msg.serverMessageId && msg.synced) {
-          resolvedStatus = 'sent';
-        }
-
-        // Ensure time/date are always computed from timestamp or createdAt
-        const msgCreatedAt = msg.createdAt || (msg.timestamp ? new Date(msg.timestamp).toISOString() : null);
-        const msgTime = msg.time || (msgCreatedAt ? moment(msgCreatedAt).format("hh:mm A") : null);
-        const msgDate = msg.date || (msgCreatedAt ? moment(msgCreatedAt).format("YYYY-MM-DD") : null);
-
-        let base = {
-          ...msg,
-          status: resolvedStatus,
-          senderId: normalizedSenderId,
-          // Always recompute senderType — never trust stored value
-          senderType: computeSenderType(normalizedSenderId, normalizedCurrentUser),
-          receiverId: normalizedReceiverId,
-          chatId: msg.chatId || chatIdParam,
-          time: msgTime,
-          date: msgDate,
-          payload: normalizeMessagePayloadWithDownloadFlag(msg?.type || msg?.mediaType || msg?.messageType || 'text', msg?.payload || {}),
-          isMediaDownloaded: Boolean(msg?.payload?.isMediaDownloaded || msg?.isMediaDownloaded || msg?.localUri),
-        };
-
-        if (!base.chatId && normalizedCurrentUser && normalizedPeer) {
-          const belongsToCurrentChat = (
-            (sameId(normalizedSenderId, normalizedCurrentUser) && sameId(normalizedReceiverId, normalizedPeer)) ||
-            (sameId(normalizedSenderId, normalizedPeer) && sameId(normalizedReceiverId, normalizedCurrentUser))
-          );
-          if (belongsToCurrentChat) {
-            base.chatId = chatIdParam;
-          }
-        }
-
-        if (sameId(normalizedSenderId, normalizedCurrentUser) && base.type !== 'text') {
-          if (msg.localUri) {
-            console.log('📖 Loading sender media with localUri:', msg.id, msg.localUri);
-            return {
-              ...base,
-              previewUrl: msg.localUri,
-              mediaUrl: msg.localUri,
-              localUri: msg.localUri
-            };
-          }
-          
-          if (msg.payload?.file?.uri) {
-            console.log('📖 Recovering localUri from payload:', msg.id);
-            return {
-              ...base,
-              localUri: msg.payload.file.uri,
-              previewUrl: msg.payload.file.uri,
-              mediaUrl: msg.payload.file.uri
-            };
-          }
-        }
-        return base;
-      });
-  
-      const uniqueMessages = deduplicateMessages(processed);
-      const sorted = uniqueMessages.sort(
-        (a, b) => (b.timestamp || 0) - (a.timestamp || 0)
-      );
-  
-      setAllMessages(prev => {
-        // Build a Set of ALL known IDs from existing in-memory messages
-        const existingIds = new Set();
-        prev.forEach(m => {
-          if (m.serverMessageId) existingIds.add(String(m.serverMessageId));
-          if (m.id) existingIds.add(String(m.id));
-          if (m.tempId) existingIds.add(String(m.tempId));
-        });
-
-        const newMessages = sorted.filter(m => {
-          // Check if ANY of this message's IDs already exist in memory
-          const ids = [m.serverMessageId, m.id, m.tempId].filter(Boolean).map(String);
-          return ids.length === 0 || !ids.some(id => existingIds.has(id));
-        });
-
-        if (newMessages.length === 0) return prev;
-
-        // Merge and deduplicate, then ensure time/date on all messages
-        const merged = deduplicateMessages([...prev, ...newMessages]);
-        return merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      });
-
-      return sorted.length;
-  
+      const finalCount = await ChatDatabase.getMessageCount(chatIdParam);
+      return finalCount;
     } catch (err) {
       console.error("Error loading from local storage:", err);
       return 0;
@@ -1525,6 +1433,8 @@ export default function useChatLogic({ navigation, route }) {
         ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
         : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
       reactions: apiMsg?.reactions || null,
+      isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited),
+      editedAt: apiMsg?.editedAt || apiMsg?.edited_at || null,
       isDeleted: resolvedIsDeleted,
       deletedFor: resolvedDeletedFor,
       deletedBy: resolvedDeletedBy,
@@ -1532,126 +1442,40 @@ export default function useChatLogic({ navigation, route }) {
     };
   }, [normalizeMessageStatus]);
 
-  const mergeMessagesIntoState = useCallback((incomingMessages = []) => {
+  const mergeMessagesIntoState = useCallback(async (incomingMessages = []) => {
     if (!Array.isArray(incomingMessages) || incomingMessages.length === 0) return;
 
-    setAllMessages(prevMessages => {
-      const mergedMessages = [...prevMessages];
-
-      incomingMessages.forEach(raw => {
-        const formattedMessage = normalizeIncomingMessage(raw);
-        const serverId = formattedMessage.serverMessageId;
-        const incomingTempId = formattedMessage.tempId;
-        // Also check raw tempId from server payload (not normalized away)
-        const rawTempId = normalizeId(raw?.tempId || raw?.payload?.tempId);
-
-        // Primary match: check all ID combinations
-        let existingIndex = mergedMessages.findIndex(m =>
-          (serverId && (sameId(m.serverMessageId, serverId) || sameId(m.id, serverId) || sameId(m.tempId, serverId))) ||
-          (incomingTempId && incomingTempId !== serverId && (sameId(m.tempId, incomingTempId) || sameId(m.id, incomingTempId))) ||
-          (rawTempId && (sameId(m.tempId, rawTempId) || sameId(m.id, rawTempId)))
-        );
-
-        // Fallback: match by sender + same text + close timestamp (within 3s)
-        if (existingIndex === -1) {
-          const incomingTs = new Date(formattedMessage.createdAt).getTime();
-          const incomingText = (formattedMessage.text || '').trim();
-          existingIndex = mergedMessages.findIndex(localMsg =>
-            sameId(localMsg.senderId, formattedMessage.senderId) &&
-            (localMsg.text || '').trim() === incomingText &&
-            Math.abs(new Date(localMsg.createdAt).getTime() - incomingTs) < 3000
-          );
-        }
-
-        if (existingIndex !== -1 && mergedMessages[existingIndex]?.localUri) {
-          formattedMessage.localUri = mergedMessages[existingIndex].localUri;
-          formattedMessage.previewUrl = mergedMessages[existingIndex].localUri;
-          formattedMessage.mediaUrl = mergedMessages[existingIndex].localUri;
-        }
-
-        if (existingIndex !== -1) {
-          const existing = mergedMessages[existingIndex];
-          const keepDeletedPlaceholder = existing?.isDeleted === true && formattedMessage?.isDeleted !== true;
-
-          const mergedLocalUri = keepDeletedPlaceholder ? null : (formattedMessage.localUri || existing?.localUri || null);
-          const mergedPayload = mergePayloadKeepingDownloadState(existing, {
-            ...formattedMessage,
-            localUri: mergedLocalUri,
-          });
-
-          const mergedReactions = formattedMessage.reactions || existing?.reactions || null;
-          mergedMessages[existingIndex] = {
-            ...existing,
-            ...formattedMessage,
-            reactions: mergedReactions,
-            senderName: formattedMessage.senderName || existing?.senderName || null,
-            senderType: formattedMessage.senderType || existing.senderType,
-            isDeleted: keepDeletedPlaceholder ? true : formattedMessage.isDeleted,
-            deletedFor: keepDeletedPlaceholder ? (existing?.deletedFor || 'everyone') : formattedMessage.deletedFor,
-            text: keepDeletedPlaceholder ? (existing?.text || 'This message was deleted') : formattedMessage.text,
-            type: keepDeletedPlaceholder ? (existing?.type || 'system') : formattedMessage.type,
-            mediaUrl: keepDeletedPlaceholder ? null : formattedMessage.mediaUrl,
-            previewUrl: keepDeletedPlaceholder ? null : formattedMessage.previewUrl,
-            localUri: mergedLocalUri,
-            payload: mergedPayload,
-            isMediaDownloaded: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri),
-            downloadStatus: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri)
-              ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
-              : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
-          };
-        } else {
-          mergedMessages.push(formattedMessage);
-        }
-      });
-
-      const uniqueMessages = deduplicateMessages(mergedMessages);
-      const sorted = uniqueMessages.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      saveMessagesToLocal(sorted);
-      return sorted;
+    // SQLite-first: normalize all incoming, batch write to SQLite, then refresh UI
+    const normalized = incomingMessages.map(raw => {
+      const msg = normalizeIncomingMessage(raw);
+      if (msg.senderId) {
+        msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+      }
+      msg.chatId = msg.chatId || chatIdRef.current;
+      return msg;
     });
-  }, [deduplicateMessages, mergePayloadKeepingDownloadState, normalizeIncomingMessage, saveMessagesToLocal]);
 
-  const replaceMessagesForChat = useCallback((incomingMessages = [], targetChatId = null) => {
+    await ChatDatabase.upsertMessages(normalized);
+    refreshMessagesFromDB();
+  }, [normalizeIncomingMessage, refreshMessagesFromDB]);
+
+  const replaceMessagesForChat = useCallback(async (incomingMessages = [], targetChatId = null) => {
     const effectiveChatId = targetChatId || chatIdRef.current;
     if (!effectiveChatId) return;
 
     const normalizedIncoming = Array.isArray(incomingMessages)
-      ? incomingMessages.map(normalizeIncomingMessage)
+      ? incomingMessages.map(raw => {
+          const msg = normalizeIncomingMessage(raw);
+          msg.chatId = msg.chatId || effectiveChatId;
+          if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+          return msg;
+        })
       : [];
 
-    setAllMessages(prevMessages => {
-      const otherChats = prevMessages.filter(msg => msg.chatId !== effectiveChatId);
-      const existingSameChat = prevMessages.filter(msg => msg.chatId === effectiveChatId);
-
-      const incomingIdSet = new Set(
-        normalizedIncoming
-          .map(msg => normalizeId(msg?.serverMessageId || msg?.id || msg?.tempId))
-          .filter(Boolean)
-      );
-
-      const preservedDeleted = existingSameChat.filter((msg) => {
-        const isDeletedMessage = Boolean(msg?.isDeleted) || isDeletedForUser(msg?.deletedFor, currentUserIdRef.current) || msg?.type === 'system';
-        if (!isDeletedMessage) return false;
-        const msgId = normalizeId(msg?.serverMessageId || msg?.id || msg?.tempId);
-        if (!msgId) return false;
-        return !incomingIdSet.has(msgId);
-      });
-
-      const merged = deduplicateMessages([...otherChats, ...normalizedIncoming, ...preservedDeleted]);
-      const sorted = merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-      saveMessagesToLocal(sorted);
-
-      const latestTs = sorted
-        .filter(msg => msg.chatId === effectiveChatId)
-        .reduce((acc, msg) => Math.max(acc, Number(msg?.timestamp || 0)), 0);
-
-      if (latestTs > 0) {
-        lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
-      }
-
-      return sorted;
-    });
-  }, [deduplicateMessages, normalizeIncomingMessage, saveMessagesToLocal]);
+    // SQLite-first: batch write then refresh
+    await ChatDatabase.upsertMessages(normalizedIncoming);
+    refreshMessagesFromDB(true);
+  }, [normalizeIncomingMessage, refreshMessagesFromDB]);
 
   const markMessagesAsRead = useCallback((messageIds = []) => {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return;
@@ -1896,38 +1720,90 @@ export default function useChatLogic({ navigation, route }) {
     return Array.from(uniqueMap.values());
   }, []);
 
-  const sqliteSaveTimerRef = useRef(null);
-  const sqlitePendingMsgsRef = useRef(null);
+  const refreshTimerRef = useRef(null);
 
+  /**
+   * CORE: Reload messages from SQLite → UI. This is the ONLY path to update displayed messages.
+   * Debounced to collapse rapid writes (e.g., multiple socket events in quick succession).
+   */
+  const refreshMessagesFromDB = useCallback((immediate = false) => {
+    const doRefresh = async () => {
+      try {
+        const cid = chatIdRef.current;
+        if (!cid) return;
+        const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
+        const dbMessages = await ChatDatabase.loadMessages(cid, { limit: 500, afterTimestamp: clearedAt });
+
+        const currentUser = currentUserIdRef.current;
+
+        // Deduplicate by key — even if SQLite has dupes, UI must never show them
+        const seen = new Set();
+        const unique = [];
+        for (const msg of dbMessages) {
+          const key = msg.serverMessageId || msg.id || msg.tempId;
+          if (!key || seen.has(key)) continue;
+          // Also check if temp row duplicates a server row (same sender+text+close time)
+          if (msg.id && msg.id.startsWith('temp_') && msg.serverMessageId) {
+            // This temp row has a serverMessageId — use serverMessageId as key
+            if (seen.has(msg.serverMessageId)) continue;
+            seen.add(msg.serverMessageId);
+          }
+          seen.add(key);
+          // Also add all IDs of this message to prevent other rows matching
+          if (msg.serverMessageId) seen.add(msg.serverMessageId);
+          if (msg.id) seen.add(msg.id);
+          if (msg.tempId && msg.tempId !== msg.id) seen.add(msg.tempId);
+          unique.push(msg);
+        }
+
+        const enriched = unique.map(msg => {
+          let status = msg.status;
+          if ((status === 'sending' || status === 'uploaded') && msg.serverMessageId && msg.synced) {
+            status = 'sent';
+          }
+          return {
+            ...msg,
+            status,
+            senderType: computeSenderType(msg.senderId, currentUser),
+            ...(msg.localUri && msg.type !== 'text' ? {
+              previewUrl: msg.previewUrl || msg.localUri,
+              mediaUrl: msg.mediaUrl || msg.localUri,
+            } : {}),
+          };
+        });
+
+        setAllMessages(enriched);
+      } catch (err) {
+        console.warn('[ChatDB] refreshMessagesFromDB error:', err);
+      }
+    };
+
+    if (immediate) {
+      if (refreshTimerRef.current) { clearTimeout(refreshTimerRef.current); refreshTimerRef.current = null; }
+      doRefresh();
+    } else {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(doRefresh, 50);
+    }
+  }, []);
+
+  /**
+   * Legacy-compatible wrapper — writes to SQLite then refreshes UI.
+   * Used by code paths that still pass message arrays (e.g., reactions, status updates).
+   */
   const saveMessagesToLocal = useCallback(async (msgs) => {
     try {
       if (!chatIdRef.current || !msgs) return;
-
-      // Store latest messages for debounced save
-      sqlitePendingMsgsRef.current = msgs;
-
-      // Debounce: collapse rapid saves into one batch write
-      if (sqliteSaveTimerRef.current) clearTimeout(sqliteSaveTimerRef.current);
-      sqliteSaveTimerRef.current = setTimeout(() => {
-        const pending = sqlitePendingMsgsRef.current;
-        if (!pending || pending.length === 0) return;
-        sqlitePendingMsgsRef.current = null;
-
-        const cleanMessages = pending.map(msg => ({
-          ...msg,
-          chatId: msg.chatId || chatIdRef.current,
-          senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
-          localUri: msg.localUri || null,
-        }));
-
-        ChatDatabase.saveMessages(cleanMessages).catch(err =>
-          console.warn('[ChatDB] saveMessages error:', err)
-        );
-      }, 300);
+      await ChatDatabase.upsertMessages(msgs.map(msg => ({
+        ...msg,
+        chatId: msg.chatId || chatIdRef.current,
+        senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
+      })));
+      refreshMessagesFromDB();
     } catch (err) {
-      console.error("[ChatDB] saveMessagesToLocal error:", err);
+      console.warn('[ChatDB] saveMessagesToLocal error:', err);
     }
-  }, []);
+  }, [refreshMessagesFromDB]);
 
   const applyDeleteToLocalStorage = useCallback(async (messageId, isDeletedForEveryone, options = {}) => {
     try {
@@ -2386,89 +2262,17 @@ export default function useChatLogic({ navigation, route }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatMessagesData, currentUserId, chatId, hasLoadedFromAPI, currentPage, isLoadingMore]);
 
-  const processAPIResponse = useCallback((apiMessages) => {
-    setAllMessages(prevMessages => {
-      const existingMessages = [...prevMessages];
-      const mergedMessages = [...existingMessages];
-
-      apiMessages.forEach(apiMsg => {
-        const formattedMessage = normalizeIncomingMessage(apiMsg);
-        const serverId = formattedMessage.serverMessageId;
-        const rawTempId = normalizeId(apiMsg?.tempId || apiMsg?.payload?.tempId);
-
-        // Primary match: all ID combinations
-        let existingIndex = mergedMessages.findIndex(m =>
-          (serverId && (sameId(m.serverMessageId, serverId) || sameId(m.id, serverId) || sameId(m.tempId, serverId))) ||
-          (rawTempId && (sameId(m.tempId, rawTempId) || sameId(m.id, rawTempId)))
-        );
-
-        // Fallback: same sender + same text + close timestamp
-        if (existingIndex === -1) {
-          const incomingTs = new Date(formattedMessage.createdAt).getTime();
-          const incomingText = (formattedMessage.text || '').trim();
-          existingIndex = mergedMessages.findIndex(localMsg =>
-            sameId(localMsg.senderId, formattedMessage.senderId) &&
-            (localMsg.text || '').trim() === incomingText &&
-            Math.abs(new Date(localMsg.createdAt).getTime() - incomingTs) < 3000
-          );
-        }
-
-        if (existingIndex !== -1 && mergedMessages[existingIndex]?.localUri) {
-          formattedMessage.localUri = mergedMessages[existingIndex].localUri;
-          formattedMessage.previewUrl = mergedMessages[existingIndex].localUri;
-          formattedMessage.mediaUrl = mergedMessages[existingIndex].localUri;
-        }
-
-        if (existingIndex !== -1) {
-          const existing = mergedMessages[existingIndex];
-          const keepDeletedPlaceholder = existing?.isDeleted === true && formattedMessage?.isDeleted !== true;
-          const mergedLocalUri = keepDeletedPlaceholder ? null : (formattedMessage.localUri || existing?.localUri || null);
-          const mergedPayload = mergePayloadKeepingDownloadState(existing, {
-            ...formattedMessage,
-            localUri: mergedLocalUri,
-          });
-
-          const mergedReactions = formattedMessage.reactions || existing?.reactions || null;
-          mergedMessages[existingIndex] = {
-            ...existing,
-            ...formattedMessage,
-            reactions: mergedReactions,
-            senderName: formattedMessage.senderName || existing?.senderName || null,
-            senderType: formattedMessage.senderType || existing.senderType,
-            isDeleted: keepDeletedPlaceholder ? true : formattedMessage.isDeleted,
-            deletedFor: keepDeletedPlaceholder ? (existing?.deletedFor || 'everyone') : formattedMessage.deletedFor,
-            text: keepDeletedPlaceholder ? (existing?.text || 'This message was deleted') : formattedMessage.text,
-            type: keepDeletedPlaceholder ? (existing?.type || 'system') : formattedMessage.type,
-            mediaUrl: keepDeletedPlaceholder ? null : formattedMessage.mediaUrl,
-            previewUrl: keepDeletedPlaceholder ? null : formattedMessage.previewUrl,
-            localUri: mergedLocalUri,
-            payload: mergedPayload,
-            isMediaDownloaded: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri),
-            downloadStatus: Boolean(mergedPayload?.isMediaDownloaded || mergedLocalUri)
-              ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
-              : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
-          };
-        } else {
-          mergedMessages.push(formattedMessage);
-        }
-      });
-
-      const uniqueMessages = deduplicateMessages(mergedMessages);
-      const sorted = uniqueMessages.sort(
-        (a, b) => (b.timestamp || 0) - (a.timestamp || 0)
-      );
-
-      saveMessagesToLocal(sorted);
-      const latestTs = sorted.reduce((acc, msg) => Math.max(acc, Number(msg?.timestamp || 0)), 0);
-      if (latestTs > 0) {
-        lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
-      }
-      console.log('✅ [PROCESS API] Final message count:', sorted.length);
-
-      return sorted;
+  const processAPIResponse = useCallback(async (apiMessages) => {
+    // SQLite-first: normalize, batch write, refresh
+    const normalized = apiMessages.map(raw => {
+      const msg = normalizeIncomingMessage(raw);
+      msg.chatId = msg.chatId || chatIdRef.current;
+      if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+      return msg;
     });
-
-  }, [deduplicateMessages, saveMessagesToLocal, normalizeIncomingMessage, mergePayloadKeepingDownloadState]);
+    await ChatDatabase.upsertMessages(normalized);
+    refreshMessagesFromDB();
+  }, [normalizeIncomingMessage, refreshMessagesFromDB]);
 
   const syncMessagesToAPI = async () => {
     try {
@@ -3193,7 +2997,7 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:seen', onSeenResponse);
 
     // ─── MESSAGE EDIT RESPONSE ───
-    const onEditResponse = (data) => {
+    const onEditResponse = async (data) => {
       const source = data?.data || data || {};
       if (source?.status === false || data?.status === false) return;
 
@@ -3202,25 +3006,11 @@ export default function useChatLogic({ navigation, route }) {
       const editedChatId = source?.chatId;
       if (!messageId) return;
 
-      // Only apply if it's for this chat
       if (editedChatId && !sameId(editedChatId, currentChatId)) return;
 
-      setAllMessages(prev => {
-        let changed = false;
-        const updated = prev.map(msg => {
-          const id = msg.serverMessageId || msg.id || msg.tempId;
-          if (String(id) !== String(messageId)) return msg;
-          changed = true;
-          return {
-            ...msg,
-            text: newText || msg.text,
-            isEdited: true,
-            editedAt: source?.editedAt || Date.now(),
-          };
-        });
-        if (changed) saveMessagesToLocal(updated);
-        return changed ? updated : prev;
-      });
+      // SQLite-first: update in DB then refresh UI
+      await ChatDatabase.updateMessageEdit(messageId, newText, source?.editedAt || new Date().toISOString());
+      refreshMessagesFromDB();
     };
     registerSocketHandler('message:edit:response', onEditResponse);
 
@@ -3341,22 +3131,14 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('group:message:new', onGroupMessageNew);
 
-    const onGroupMessageEdited = (data) => {
+    const onGroupMessageEdited = async (data) => {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
       const messageId = source?.messageId || source?._id;
       if (!messageId) return;
-      setAllMessages((prev) => {
-        const updated = prev.map((msg) => {
-          const id = msg.serverMessageId || msg.id || msg.tempId;
-          if (sameId(id, messageId)) {
-            return { ...msg, text: source?.text || msg.text, isEdited: true, editedAt: source?.editedAt || Date.now() };
-          }
-          return msg;
-        });
-        saveMessagesToLocal(updated);
-        return updated;
-      });
+      // SQLite-first: update in DB then refresh UI
+      await ChatDatabase.updateMessageEdit(messageId, source?.text, source?.editedAt || new Date().toISOString());
+      refreshMessagesFromDB();
     };
     registerSocketHandler('group:message:edited', onGroupMessageEdited);
 
@@ -3878,73 +3660,34 @@ export default function useChatLogic({ navigation, route }) {
     });
   }, []);
 
-  const updateMessageStatus = useCallback((tempId, status, serverData = null) => {
+  const updateMessageStatus = useCallback(async (tempId, status, serverData = null) => {
     const normalizedStatus = normalizeMessageStatus(status) || status;
-    setAllMessages((prevMessages) => {
-      let changed = false;
-      const updated = prevMessages.map((msg) => {
-        const isMatch =
-          sameId(msg.tempId, tempId) ||
-          sameId(msg.id, tempId) ||
-          sameId(msg.serverMessageId, tempId) ||
-          (serverData?.messageId && (
-            sameId(msg.id, serverData.messageId) ||
-            sameId(msg.serverMessageId, serverData.messageId) ||
-            sameId(msg.tempId, tempId)
-          ));
-        if (!isMatch) return msg;
 
-        const preservedLocalUri = msg.localUri;
-        const preservedPreview = msg.previewUrl;
+    // SQLite-first: update status in DB
+    const serverMessageId = serverData?.messageId || serverData?._id;
 
-        const currentStatus = normalizeMessageStatus(msg.status) || msg.status;
-        const currentPriority = getMessageStatusPriority(currentStatus);
-        const incomingPriority = getMessageStatusPriority(normalizedStatus);
-        const resolvedStatus = incomingPriority >= currentPriority
-          ? (normalizedStatus || currentStatus)
-          : currentStatus;
+    // If server provided a messageId, do the ACK transition (tempId → serverMessageId)
+    if (serverMessageId && tempId && serverMessageId !== tempId) {
+      await ChatDatabase.acknowledgeMessage(tempId, serverMessageId);
+    }
 
-        const updatedMsg = { ...msg, status: resolvedStatus };
-        if (serverData) {
-          const serverMessageId = serverData.messageId || serverData._id;
-          if (serverMessageId) {
-            updatedMsg.serverMessageId = serverMessageId;
-            updatedMsg.id = serverMessageId;
-            updatedMsg.synced = true;
-          }
-          if (serverData.mediaUrl) updatedMsg.mediaUrl = serverData.mediaUrl;
-          if (serverData.previewUrl) updatedMsg.previewUrl = serverData.previewUrl;
-        }
+    // Update status in SQLite (only advances, never regresses)
+    const targetId = serverMessageId || tempId;
+    if (targetId) {
+      await ChatDatabase.updateMessageStatus(targetId, normalizedStatus);
+    }
 
-        if (preservedLocalUri) updatedMsg.localUri = preservedLocalUri;
-        if (preservedPreview && !updatedMsg.previewUrl) updatedMsg.previewUrl = preservedPreview;
+    // Refresh UI from SQLite
+    refreshMessagesFromDB();
 
-        if (updatedMsg !== msg) {
-          const hasChanged =
-            updatedMsg.status !== msg.status ||
-            updatedMsg.id !== msg.id ||
-            updatedMsg.serverMessageId !== msg.serverMessageId ||
-            updatedMsg.synced !== msg.synced ||
-            updatedMsg.mediaUrl !== msg.mediaUrl ||
-            updatedMsg.previewUrl !== msg.previewUrl;
-          if (hasChanged) changed = true;
-        }
-
-        return updatedMsg;
-      });
-
-      if (!changed) return prevMessages;
-
-      const uniqueMessages = removeDuplicateMessages(updated);
-      saveMessagesToLocal(uniqueMessages);
-      updateChatListLastMessagePreview(uniqueMessages);
-      return uniqueMessages;
-    });
+    // Update chat list preview
+    const currentMsgs = allMessagesRef.current || [];
+    if (currentMsgs.length > 0) {
+      updateChatListLastMessagePreview(currentMsgs);
+    }
   }, [
-    removeDuplicateMessages,
-    saveMessagesToLocal,
     normalizeMessageStatus,
-    getMessageStatusPriority,
+    refreshMessagesFromDB,
     updateChatListLastMessagePreview,
   ]);
 
@@ -4091,15 +3834,9 @@ export default function useChatLogic({ navigation, route }) {
       typingTimeoutRef.current = null;
     }
 
-    // Save to SQLite IMMEDIATELY (not debounced) — WhatsApp pattern
-    ChatDatabase.saveMessageSync({ ...newMessage, chatId: chatIdRef.current }).catch(err =>
-      console.warn('[ChatDB] immediate save error:', err)
-    );
-
-    setAllMessages((prevMessages) => {
-      const updatedMessages = [newMessage, ...prevMessages];
-      return removeDuplicateMessages(updatedMessages);
-    });
+    // SQLite-first: write to DB immediately, then refresh UI from DB
+    await ChatDatabase.upsertMessage({ ...newMessage, chatId: chatIdRef.current });
+    refreshMessagesFromDB(true);
 
     const socket = socketRef.current || getSocket();
     try {
@@ -4366,187 +4103,94 @@ export default function useChatLogic({ navigation, route }) {
     const incomingSenderId = msg?.senderId;
     const isSelfMessage = incomingSenderId && sameId(incomingSenderId, currentUserIdRef.current);
 
-    setAllMessages((prevMessages) => {
-      // ── Check if this message already exists by any ID ──
-      const existingIndex = prevMessages.findIndex(m =>
-        (messageId && (sameId(m.id, messageId) || sameId(m.serverMessageId, messageId) || sameId(m.tempId, messageId))) ||
-        (incomingTempId && (sameId(m.tempId, incomingTempId) || sameId(m.id, incomingTempId))) ||
-        (msg.mediaId && m.mediaId && sameId(m.mediaId, msg.mediaId))
-      );
-
-      if (existingIndex !== -1) {
-        const existing = prevMessages[existingIndex];
-        // Update IDs and status on the existing message
-        if (existing.status === 'sending' || existing.status === 'uploaded' || (!existing.serverMessageId && messageId)) {
-          const updatedMessages = [...prevMessages];
-          updatedMessages[existingIndex] = {
-            ...existing,
-            status: existing.status === 'sending' || existing.status === 'uploaded' ? 'sent' : existing.status,
-            serverMessageId: messageId || existing.serverMessageId,
-            id: messageId || existing.id,
-            synced: true,
-          };
-          if (existing.tempId && messageId && existing.tempId !== messageId) {
-            ChatDatabase.acknowledgeMessage(existing.tempId, messageId).catch(() => {});
-          }
-          saveMessagesToLocal(updatedMessages);
-          return updatedMessages;
+    // Self-echo: if we sent this message, the ACK handler already wrote it to SQLite.
+    // Just update the temp row with the server ID if needed.
+    if (isSelfMessage && incomingTempId && messageId && incomingTempId !== messageId) {
+      await ChatDatabase.acknowledgeMessage(incomingTempId, messageId);
+      refreshMessagesFromDB();
+      return;
+    }
+    if (isSelfMessage && messageId) {
+      // Check if already in SQLite (from our optimistic insert)
+      const exists = await ChatDatabase.messageExists(messageId);
+      if (exists) return; // Already have it — skip
+      // Also check by tempId
+      if (incomingTempId) {
+        const existsByTemp = await ChatDatabase.messageExists(incomingTempId);
+        if (existsByTemp) {
+          // We have the temp version — upgrade it
+          await ChatDatabase.acknowledgeMessage(incomingTempId, messageId);
+          refreshMessagesFromDB();
+          return;
         }
-        return prevMessages;
-      }
-
-      // ── Self-echo: we already have this message from optimistic insert. ──
-      // For self messages not matched by ID, also check by content (sender+text+time)
-      // to catch cases where ACK hasn't arrived yet (tempId ≠ serverId)
-      if (isSelfMessage) {
-        const incomingText = (msg?.text || msg?.content || '').trim();
-        const incomingTs = new Date(msg?.createdAt || msg?.timestamp || 0).getTime();
-        const contentMatch = prevMessages.some(m =>
-          sameId(m.senderId, incomingSenderId) &&
-          (m.text || '').trim() === incomingText &&
-          Math.abs((m.timestamp || 0) - incomingTs) < 5000
-        );
-        if (contentMatch) return prevMessages;
-        // If no content match, it might be a message sent from another device — allow adding
-      }
-
-      const receivedMessage = normalizeIncomingMessage({
-        ...msg,
-        messageId,
-        // Ensure chatId is always set so the filter effect picks it up
-        chatId: msg?.chatId || chatIdRef.current,
-      });
-
-      // Force correct senderType for proper left/right rendering
-      if (receivedMessage.senderId) {
-        receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
-      }
-
-      // Save to SQLite immediately — single source of truth
-      ChatDatabase.saveMessageSync({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(err =>
-        console.warn('[ChatDB] immediate recv save error:', err)
-      );
-
-      const updatedMessages = [receivedMessage, ...prevMessages];
-      const uniqueMessages = deduplicateMessages(updatedMessages);
-      const sorted = uniqueMessages.sort((a, b) => b.timestamp - a.timestamp);
-
-      const latestTs = sorted.length > 0 ? Number(sorted[0]?.timestamp || 0) : 0;
-      if (latestTs > 0) {
-        lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
-      }
-
-      return sorted;
-    });
-
-    const senderId = msg?.senderId;
-    if (senderId && !sameId(senderId, currentUserIdRef.current)) {
-      const messageId = msg?.messageId || msg?._id || msg?.id;
-      if (messageId) {
-        // Emit message:delivered to server — the message has reached this device
-        const socket = socketRef.current || getSocket();
-        if (socket && isSocketConnected() && chatIdRef.current) {
-          const isGrpDel = chatData?.chatType === 'group' || chatData?.isGroup;
-          if (isGrpDel) {
-            socket.emit('group:message:delivered', {
-              groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
-              messageIds: [messageId],
-              userId: currentUserIdRef.current,
-              deliveredAt: new Date().toISOString(),
-            });
-          } else {
-            socket.emit('message:delivered', {
-              messageId,
-              chatId: chatIdRef.current,
-              senderId,
-            });
-          }
-        }
-
-        // Mark as 'delivered' locally — NOT 'seen'. Seen is triggered by visibility detection.
-        setAllMessages(prev => {
-          let changed = false;
-          const updated = prev.map(m => {
-            const id = m.serverMessageId || m.id || m.tempId;
-            if (!sameId(id, messageId)) return m;
-            if (m.status === 'seen' || m.status === 'read' || m.status === 'delivered') return m;
-            changed = true;
-            return { ...m, status: 'delivered' };
-          });
-          if (changed) saveMessagesToLocal(updated);
-          return changed ? updated : prev;
-        });
       }
     }
-  }, [saveMessagesToLocal, deduplicateMessages, resetIdleTimer, markMessagesAsRead]);
 
-  const handleDeleteMessage = useCallback((messageId, isDeletedForEveryone, options = {}) => {
+    // Normalize the incoming message
+    const receivedMessage = normalizeIncomingMessage({
+      ...msg,
+      messageId,
+      chatId: msg?.chatId || chatIdRef.current,
+    });
+    if (receivedMessage.senderId) {
+      receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
+    }
+
+    // SQLite-first: write to DB, then refresh UI
+    await ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current });
+    refreshMessagesFromDB();
+
+    // Emit delivery receipt for incoming messages from others
+    const senderId = msg?.senderId;
+    if (senderId && !sameId(senderId, currentUserIdRef.current) && messageId) {
+      const socket = socketRef.current || getSocket();
+      if (socket && isSocketConnected() && chatIdRef.current) {
+        const isGrpDel = chatData?.chatType === 'group' || chatData?.isGroup;
+        if (isGrpDel) {
+          socket.emit('group:message:delivered', {
+            groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
+            messageIds: [messageId],
+            userId: currentUserIdRef.current,
+            deliveredAt: new Date().toISOString(),
+          });
+        } else {
+          socket.emit('message:delivered', {
+            messageId,
+            chatId: chatIdRef.current,
+            senderId,
+          });
+        }
+      }
+
+      // Mark as 'delivered' in SQLite
+      const changed = await ChatDatabase.updateMessageStatus(messageId, 'delivered');
+      if (changed) refreshMessagesFromDB();
+    }
+  }, [refreshMessagesFromDB, resetIdleTimer]);
+
+  const handleDeleteMessage = useCallback(async (messageId, isDeletedForEveryone, options = {}) => {
     const deletedBy = normalizeId(options?.deletedBy) || null;
-    // Only treat as "self-deleted" if we have explicit confirmation that the deleter is the current user
-    // If deletedBy is unknown (null), check if we initiated the delete (not receiving from socket)
     const isDeletedBySelf = deletedBy
       ? sameId(deletedBy, currentUserIdRef.current)
       : Boolean(options?._initiatedLocally);
 
+    // SQLite-first: write to DB then refresh UI
     if (isDeletedForEveryone) {
       registerDeletedTombstone(messageId, {
         deletedBy,
         placeholderText: buildDeletePlaceholderText(isDeletedBySelf),
       });
-      // Persist delete to SQLite
-      ChatDatabase.markMessageDeleted(messageId, deletedBy, buildDeletePlaceholderText(isDeletedBySelf))
-        .catch(err => console.warn('[ChatDB] markMessageDeleted error:', err));
+      await ChatDatabase.markMessageDeleted(messageId, deletedBy, buildDeletePlaceholderText(isDeletedBySelf));
     } else {
       removeDeletedTombstone(messageId);
-      // Remove from SQLite for delete-for-me
-      ChatDatabase.deleteMessageForMe(messageId)
-        .catch(err => console.warn('[ChatDB] deleteMessageForMe error:', err));
+      await ChatDatabase.deleteMessageForMe(messageId);
     }
 
-    applyDeleteToLocalStorage(messageId, isDeletedForEveryone, { deletedBy });
-
-    setAllMessages(prevMessages => {
-      if (!isDeletedForEveryone) {
-        const filtered = prevMessages.filter(msg => !(
-          sameId(msg.id, messageId) ||
-          sameId(msg.serverMessageId, messageId) ||
-          sameId(msg.tempId, messageId)
-        ));
-        saveMessagesToLocal(filtered);
-        return filtered;
-      }
-
-      let found = false;
-      const updated = prevMessages.map(msg => {
-        const isMatch = sameId(msg.id, messageId) || sameId(msg.serverMessageId, messageId) || sameId(msg.tempId, messageId);
-        if (!isMatch) return msg;
-        found = true;
-        console.log('[DELETE:MATCH]', { messageId, msgId: msg.id, serverMessageId: msg.serverMessageId, tempId: msg.tempId });
-        return {
-          ...msg,
-          text: 'This message was deleted',
-          type: msg.type === 'system' ? 'text' : msg.type,
-          status: msg.status,
-          isDeleted: true,
-          deletedFor: 'everyone',
-          deletedBy,
-          placeholderText: buildDeletePlaceholderText(isDeletedBySelf),
-          mediaUrl: null,
-          previewUrl: null,
-          localUri: null,
-        };
-      });
-
-      if (!found) {
-        console.warn('[DELETE:NOT_FOUND]', { messageId, totalMessages: prevMessages.length });
-      }
-
-      saveMessagesToLocal(updated);
-      return updated;
-    });
+    // Refresh UI from SQLite — single source of truth
+    refreshMessagesFromDB(true);
     pendingPreviewSyncRef.current = true;
   }, [
-    applyDeleteToLocalStorage,
+    refreshMessagesFromDB,
     registerDeletedTombstone,
     removeDeletedTombstone,
   ]);
@@ -4644,40 +4288,32 @@ export default function useChatLogic({ navigation, route }) {
     const cId = chatIdRef.current;
     if (!messageId || !cId) return;
 
-    const socket = socketRef.current || getSocket();
-    if (!socket || !isSocketConnected()) {
-      Alert.alert('Error', 'Not connected. Please try again.');
-      return;
-    }
+    try {
+      const socket = socketRef.current || getSocket();
+      if (!socket || !isSocketConnected()) {
+        Alert.alert('Error', 'Not connected. Please try again.');
+        return;
+      }
 
-    // Optimistic update
-    setAllMessages(prev => {
-      const updated = prev.map(msg => {
-        const id = msg.serverMessageId || msg.id || msg.tempId;
-        if (String(id) !== String(messageId)) return msg;
-        return {
-          ...msg,
-          text: newText.trim(),
-          isEdited: true,
-          editedAt: Date.now(),
-        };
+      // SQLite-first: update in DB then refresh UI
+      await ChatDatabase.updateMessageEdit(messageId, newText.trim(), new Date().toISOString());
+      refreshMessagesFromDB(true);
+
+      // Emit socket event
+      const isGroupEdit = chatData?.chatType === 'group' || chatData?.isGroup;
+      const editEvent = isGroupEdit ? 'group:message:edit' : 'message:edit';
+      socket.emit(editEvent, {
+        messageId,
+        chatId: cId,
+        ...(isGroupEdit && { groupId: chatData?.groupId || chatData?.group?._id || cId }),
+        text: newText.trim(),
       });
-      saveMessagesToLocal(updated);
-      return updated;
-    });
-
-    // Emit socket event — use group event if group chat
-    const isGroupEdit = chatData?.chatType === 'group' || chatData?.isGroup;
-    const editEvent = isGroupEdit ? 'group:message:edit' : 'message:edit';
-    socket.emit(editEvent, {
-      messageId,
-      chatId: cId,
-      ...(isGroupEdit && { groupId: chatData?.groupId || chatData?.group?._id || cId }),
-      text: newText.trim(),
-    });
-
-    setEditingMessage(null);
-  }, [editingMessage, saveMessagesToLocal]);
+    } catch (err) {
+      console.warn('[EDIT] submitEditMessage error:', err);
+    } finally {
+      setEditingMessage(null);
+    }
+  }, [editingMessage, refreshMessagesFromDB]);
 
   const handleDeleteSelected = useCallback(() => {
     if (selectedMessage.length === 0) return;
@@ -5526,16 +5162,8 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, [pickMedia]);
 
-  useEffect(() => {
-    if (!Array.isArray(allMessages) || allMessages.length < 2) return;
-
-    const deduped = deduplicateMessages(allMessages);
-    if (deduped.length === allMessages.length) return;
-
-    const sorted = deduped.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-    setAllMessages(sorted);
-    saveMessagesToLocal(sorted);
-  }, [allMessages, deduplicateMessages, saveMessagesToLocal]);
+  // SQLite is the single source of truth — no in-memory dedup needed.
+  // The periodic dedup cleanup runs via ChatDatabase.deduplicateChat() on chat open.
 
   useEffect(() => {
     console.log("📱 ChatScreen received params:", {
