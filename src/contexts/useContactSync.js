@@ -69,6 +69,7 @@ export const useContactSync = () => {
   const [matchedRegistered, setMatchedRegistered] = useState([]);
   const [matchedUnregistered, setMatchedUnregistered] = useState([]);
   const [hashedContacts, setHashedContacts] = useState([]);
+  const [isInitialLoading, setIsInitialLoading] = useState(true); // true until first DB load completes
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -513,6 +514,7 @@ export const useContactSync = () => {
         .catch((err) => console.warn('[useContactSync] silent refresh failed:', err?.message));
     } finally {
       screenOpenSyncInProgressRef.current = false;
+      if (mountedRef.current) setIsInitialLoading(false);
     }
   }, [applyFromDB, isConnected, runFullSync, runRefresh]);
 
@@ -617,6 +619,7 @@ export const useContactSync = () => {
       if (bootstrappedRef.current) return;
       bootstrappedRef.current = true;
       await applyFromDB();
+      if (mountedRef.current) setIsInitialLoading(false);
     };
     bootstrap();
   }, [applyFromDB]);
@@ -677,6 +680,7 @@ export const useContactSync = () => {
     matchedRegistered,
     matchedUnregistered,
     hashedContacts,
+    isInitialLoading,
     isProcessing,
     isSyncing,
     isRefreshing,

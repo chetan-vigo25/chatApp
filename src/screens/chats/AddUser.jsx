@@ -156,6 +156,7 @@ export default function AddUser({ navigation }) {
   const {
     matchedContacts = [],
     matchedCount,
+    isInitialLoading,
     isProcessing,
     isSyncing,
     error,
@@ -802,17 +803,19 @@ export default function AddUser({ navigation }) {
       {renderHeader()}
       {renderCollapsibleSection()}
 
-      {isProcessing ? (
+      {(isProcessing || isInitialLoading) ? (
         <View style={styles.processingWrap}>
-          <View style={[styles.processingCard, { backgroundColor: theme.colors.menuBackground }]}>
-            <ActivityIndicator size="large" color={theme.colors.themeColor} />
-            <Text style={[styles.processingTitle, { color: theme.colors.primaryTextColor }]}>
-              Processing contacts...
-            </Text>
-            <Text style={[styles.processingSubtitle, { color: theme.colors.placeHolderTextColor }]}>
-              Securely hashing your contacts
-            </Text>
-          </View>
+          <ActivityIndicator size="large" color={theme.colors.themeColor} />
+          {isProcessing && (
+            <View style={[styles.processingCard, { backgroundColor: theme.colors.menuBackground, marginTop: 16 }]}>
+              <Text style={[styles.processingTitle, { color: theme.colors.primaryTextColor }]}>
+                Processing contacts...
+              </Text>
+              <Text style={[styles.processingSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+                Securely hashing your contacts
+              </Text>
+            </View>
+          )}
         </View>
       ) : (
         <FlatList
