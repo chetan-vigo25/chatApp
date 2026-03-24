@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from "react";
 import {
   View,
   Text,
@@ -16,7 +16,9 @@ import {
   Linking,
   RefreshControl,
   StyleSheet,
-  Dimensions
+  Dimensions,
+  InteractionManager,
+  Keyboard,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { APP_TAG_NAME } from '@env';
@@ -29,7 +31,8 @@ import contactHasher from "../../Redux/Services/Contact/ContactHasher";
 import * as SMS from 'expo-sms';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const COLLAPSIBLE_HEIGHT = 120;
+const COLLAPSED_MAX_HEIGHT = 210;
+const CONTACT_ROW_HEIGHT = 68; // fixed height for getItemLayout
 
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
@@ -46,6 +49,75 @@ const getAvatarColor = (name) => {
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 };
 
+// ─── MEMOIZED CONTACT ROW COMPONENT ───
+const ContactRow = memo(function ContactRow({
+  contact, index, showInvite, theme, isInviting,
+  onPress, onAvatarPress, onInfoPress, onInvitePress, getDisplayPhone,
+}) {
+  const displayName = contact?.name || contact?.fullName || '?';
+  const initials = displayName.charAt(0).toUpperCase();
+  const avatarBg = getAvatarColor(displayName);
+
+  return (
+    <TouchableOpacity
+      activeOpacity={0.6}
+      onPress={showInvite ? undefined : onPress}
+      style={[styles.contactRow, { backgroundColor: theme.colors.background }]}
+    >
+      <TouchableOpacity
+        onPress={showInvite ? undefined : onAvatarPress}
+        activeOpacity={0.8}
+        style={styles.avatarWrap}
+      >
+        {contact.profilePicture ? (
+          <Image
+            resizeMode="cover"
+            source={{ uri: contact.profilePicture }}
+            style={styles.avatarImage}
+            fadeDuration={0}
+          />
+        ) : (
+          <View style={[styles.avatarFallback, { backgroundColor: avatarBg }]}>
+            <Text style={styles.avatarInitials}>{initials}</Text>
+          </View>
+        )}
+      </TouchableOpacity>
+
+      <View style={styles.contactInfo}>
+        <Text style={[styles.contactName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
+          {displayName}
+        </Text>
+        <Text style={[styles.contactPhone, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
+          {getDisplayPhone(contact) || (showInvite ? 'Not on ' + APP_TAG_NAME : 'Registered')}
+        </Text>
+      </View>
+
+      {showInvite ? (
+        <TouchableOpacity
+          onPress={onInvitePress}
+          disabled={isInviting}
+          activeOpacity={0.7}
+          style={[styles.inviteBtn, { backgroundColor: theme.colors.themeColor + '15' }]}
+        >
+          {isInviting ? (
+            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+          ) : (
+            <Text style={[styles.inviteBtnText, { color: theme.colors.themeColor }]}>Invite</Text>
+          )}
+        </TouchableOpacity>
+      ) : (
+        <TouchableOpacity
+          onPress={onInfoPress}
+          activeOpacity={0.6}
+          style={styles.infoBtn}
+        >
+          <Ionicons name="information-circle-outline" size={22} color={theme.colors.placeHolderTextColor} />
+        </TouchableOpacity>
+      )}
+    </TouchableOpacity>
+  );
+});
+
 export default function AddUser({ navigation }) {
   const { theme } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -59,13 +131,15 @@ export default function AddUser({ navigation }) {
   const [refreshing, setRefreshing] = useState(false);
   const [invitingContactId, setInvitingContactId] = useState(null);
 
-  // Scroll-based collapsible animation (maxHeight approach — no white gap)
+  // Scroll-based collapsible animation
   const collapseAnim = useRef(new Animated.Value(1)).current;
   const headerSearchAnim = useRef(new Animated.Value(0)).current;
   const lastScrollY = useRef(0);
   const isCollapsed = useRef(false);
   const [headerSearchVisible, setHeaderSearchVisible] = useState(false);
-  const COLLAPSED_MAX_HEIGHT = 210; // enough to fit search + new contact + new group
+
+  // Search input ref for auto-focus
+  const searchInputRef = useRef(null);
 
   const {
     matchedContacts = [],
@@ -179,7 +253,7 @@ export default function AddUser({ navigation }) {
     else Alert.alert('Info', msg);
   };
 
-  const normalizeChatUser = (contact) => {
+  const normalizeChatUser = useCallback((contact) => {
     if (!contact) return null;
     const resolvedId = contact._id || contact.userId || contact.id || null;
     return {
@@ -191,9 +265,9 @@ export default function AddUser({ navigation }) {
       fullName: contact.fullName || contact.name || 'Unknown',
       profilePicture: contact.profilePicture || contact.profileImage || '',
     };
-  };
+  }, []);
 
-  const handleContactPress = async (contact) => {
+  const handleContactPress = useCallback(async (contact) => {
     if (!contact) return;
 
     const normalizedUser = normalizeChatUser(contact);
@@ -221,7 +295,7 @@ export default function AddUser({ navigation }) {
     }
 
     navigation.navigate('ChatScreen', { user: normalizedUser, chatId: null, hasExistingChat: false });
-  };
+  }, [chatsData, normalizeChatUser, discoverContact, navigation]);
 
   const handleRefresh = useCallback(async () => {
     if (refreshing || isSyncing) return;
@@ -233,7 +307,7 @@ export default function AddUser({ navigation }) {
     } finally { setRefreshing(false); }
   }, [refreshContacts, syncContacts, refreshing, isSyncing]);
 
-  const getDisplayPhone = (contact) => {
+  const getDisplayPhone = useCallback((contact) => {
     if (!contact) return '';
     if (contact.phone) return contact.phone;
     if (contact.number) return contact.number;
@@ -249,20 +323,24 @@ export default function AddUser({ navigation }) {
     }
     if (contact.originalId) return `ID: ${contact.originalId}`;
     return '';
-  };
+  }, []);
 
-  const filteredContacts = matchedContacts.filter(contact => {
+  // ─── MEMOIZED FILTERED DATA ───
+  const { registeredContacts, unregisteredContacts } = useMemo(() => {
     const searchLower = (searchQuery || '').toLowerCase();
-    return ((contact.name || '').toLowerCase().includes(searchLower) ||
-            (contact.fullName || '').toLowerCase().includes(searchLower) ||
-            (contact.username || '').toLowerCase().includes(searchLower) ||
-            (contact.originalPhone || '').includes(searchQuery));
-  });
+    const filtered = matchedContacts.filter(contact =>
+      (contact.name || '').toLowerCase().includes(searchLower) ||
+      (contact.fullName || '').toLowerCase().includes(searchLower) ||
+      (contact.username || '').toLowerCase().includes(searchLower) ||
+      (contact.originalPhone || '').includes(searchQuery)
+    );
+    return {
+      registeredContacts: filtered.filter(c => !!c.userId),
+      unregisteredContacts: filtered.filter(c => !c.userId),
+    };
+  }, [matchedContacts, searchQuery]);
 
-  const registeredContacts = filteredContacts.filter(c => !!c.userId);
-  const unregisteredContacts = filteredContacts.filter(c => !c.userId);
-
-  const onSendInvitationPress = async (contact) => {
+  const onSendInvitationPress = useCallback(async (contact) => {
     if (!contact) return;
 
     const contactId = contact.id || contact.userId || contact.hash || Date.now().toString();
@@ -319,9 +397,9 @@ export default function AddUser({ navigation }) {
     } finally {
       setInvitingContactId(null);
     }
-  };
+  }, [handleSenInvatation]);
 
-  const handleModal = (contact) => {
+  const handleModal = useCallback((contact) => {
     setSelectedChatItem(contact);
     setModalVisible(true);
     Animated.parallel([
@@ -337,15 +415,9 @@ export default function AddUser({ navigation }) {
         useNativeDriver: true,
       }),
     ]).start();
-  };
+  }, [scaleAnim, opacityAnim]);
 
-  const openProfilePreview = (contact) => {
-    const normalized = normalizeChatUser(contact);
-    if (!normalized) return;
-    navigation.navigate('UserB', { item: normalized });
-  };
-
-  const closeModal = () => {
+  const closeModal = useCallback(() => {
     Animated.parallel([
       Animated.timing(scaleAnim, {
         toValue: 0,
@@ -361,7 +433,7 @@ export default function AddUser({ navigation }) {
       setModalVisible(false);
       setSelectedChatItem(null);
     });
-  };
+  }, [scaleAnim, opacityAnim]);
 
   // ─── SCROLL HANDLER FOR COLLAPSIBLE SECTION ───
 
@@ -372,7 +444,6 @@ export default function AddUser({ navigation }) {
     isCollapsed.current = false;
     collapseAnimating.current = true;
 
-    // Fade out header search icon first, then expand section
     Animated.timing(headerSearchAnim, {
       toValue: 0,
       duration: 150,
@@ -387,6 +458,10 @@ export default function AddUser({ navigation }) {
         useNativeDriver: false,
       }).start(() => {
         collapseAnimating.current = false;
+        // Auto-focus search input after expanding
+        InteractionManager.runAfterInteractions(() => {
+          searchInputRef.current?.focus();
+        });
       });
     });
   }, [collapseAnim, headerSearchAnim]);
@@ -396,7 +471,9 @@ export default function AddUser({ navigation }) {
     isCollapsed.current = true;
     collapseAnimating.current = true;
 
-    // Collapse section first, then pop in header search icon
+    // Dismiss keyboard when collapsing
+    Keyboard.dismiss();
+
     Animated.timing(collapseAnim, {
       toValue: 0,
       duration: 260,
@@ -416,7 +493,7 @@ export default function AddUser({ navigation }) {
   }, [collapseAnim, headerSearchAnim]);
 
   const handleScroll = useCallback((event) => {
-    if (collapseAnimating.current) return; // prevent rapid toggling mid-animation
+    if (collapseAnimating.current) return;
 
     const currentY = event.nativeEvent.contentOffset.y;
     const diff = currentY - lastScrollY.current;
@@ -430,12 +507,11 @@ export default function AddUser({ navigation }) {
     lastScrollY.current = currentY;
   }, [collapseCollapsible, expandCollapsible]);
 
-  // ─── BUILD FLATLIST DATA ───
+  // ─── BUILD FLATLIST DATA (MEMOIZED) ───
 
-  const buildListData = useCallback(() => {
+  const listData = useMemo(() => {
     const data = [];
 
-    // Sync info as first item in list (scrolls with content)
     if (lastSyncTime) {
       data.push({ type: 'syncInfo', time: lastSyncTime });
     }
@@ -468,7 +544,7 @@ export default function AddUser({ navigation }) {
     return data;
   }, [registeredContacts, unregisteredContacts, lastSyncTime]);
 
-  // ─── RENDER FUNCTIONS (UI ONLY CHANGES) ───
+  // ─── RENDER FUNCTIONS ───
 
   let isInTabNavigator = false;
   try { isInTabNavigator = navigation.getParent()?.getState()?.type === 'tab'; } catch (e) {}
@@ -490,7 +566,6 @@ export default function AddUser({ navigation }) {
           </Text>
         </View>
         <View style={styles.headerActions}>
-          {/* Search icon — appears when collapsible is hidden */}
           {headerSearchVisible && (
             <Animated.View style={{ opacity: headerSearchAnim, transform: [{ scale: headerSearchAnim }] }}>
               <TouchableOpacity
@@ -502,7 +577,6 @@ export default function AddUser({ navigation }) {
               </TouchableOpacity>
             </Animated.View>
           )}
-          {/* Refresh icon */}
           <TouchableOpacity
             onPress={handleRefresh}
             disabled={isSyncing || refreshing}
@@ -542,16 +616,17 @@ export default function AddUser({ navigation }) {
         },
       ]}
     >
-      {/* Search Bar */}
       <View style={styles.searchBarOuter}>
         <View style={[styles.searchBarInner, { backgroundColor: theme.colors.menuBackground }]}>
           <Ionicons name="search-outline" size={18} color={theme.colors.placeHolderTextColor} style={{ marginLeft: 14 }} />
           <TextInput
+            ref={searchInputRef}
             placeholder="Search contacts..."
             placeholderTextColor={theme.colors.placeHolderTextColor}
             value={searchQuery}
             onChangeText={setSearchQuery}
             style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
+            returnKeyType="search"
           />
           {searchQuery.length > 0 && (
             <TouchableOpacity onPress={() => setSearchQuery('')} activeOpacity={0.6} style={{ marginRight: 12 }}>
@@ -561,7 +636,6 @@ export default function AddUser({ navigation }) {
         </View>
       </View>
 
-      {/* New Contact Button */}
       <TouchableOpacity
         onPress={() => navigation.navigate('AddNewContact')}
         activeOpacity={0.7}
@@ -576,7 +650,6 @@ export default function AddUser({ navigation }) {
         <FontAwesome6 name="chevron-right" size={14} color={theme.colors.placeHolderTextColor} />
       </TouchableOpacity>
 
-      {/* New Group Button */}
       <TouchableOpacity
         onPress={() => navigation.navigate('CreateGroup')}
         activeOpacity={0.7}
@@ -593,135 +666,6 @@ export default function AddUser({ navigation }) {
     </Animated.View>
   );
 
-  const renderSectionHeader = (title, count) => (
-    <View style={styles.sectionHeaderWrap}>
-      <Text style={[styles.sectionHeaderText, { color: theme.colors.themeColor }]}>
-        {title}
-      </Text>
-      {count != null && (
-        <View style={[styles.sectionBadge, { backgroundColor: theme.colors.themeColor + '18' }]}>
-          <Text style={[styles.sectionBadgeText, { color: theme.colors.themeColor }]}>{count}</Text>
-        </View>
-      )}
-    </View>
-  );
-
-  const renderContactRow = (contact, index, showInvite = false) => {
-    const displayName = contact?.name || contact?.fullName || '?';
-    const initials = displayName.charAt(0).toUpperCase();
-    const contactId = contact.id || contact.userId || contact.hash || index;
-    const isInviting = invitingContactId === contactId;
-    const avatarBg = getAvatarColor(displayName);
-
-    return (
-      <TouchableOpacity
-        activeOpacity={0.6}
-        onPress={() => (showInvite ? null : handleContactPress(contact))}
-        style={[styles.contactRow, { backgroundColor: theme.colors.background }]}
-      >
-        {/* Avatar */}
-        <TouchableOpacity
-          onPress={() => (showInvite ? null : handleModal(contact))}
-          activeOpacity={0.8}
-          style={styles.avatarWrap}
-        >
-          {contact.profilePicture ? (
-            <Image
-              resizeMode="cover"
-              source={{ uri: contact.profilePicture }}
-              style={styles.avatarImage}
-            />
-          ) : (
-            <View style={[styles.avatarFallback, { backgroundColor: avatarBg }]}>
-              <Text style={styles.avatarInitials}>{initials}</Text>
-            </View>
-          )}
-          {/* {!showInvite && contact?.type === 'registered' && (
-            <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
-          )} */}
-        </TouchableOpacity>
-
-        {/* Contact Info */}
-        <View style={styles.contactInfo}>
-          <Text style={[styles.contactName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
-            {displayName}
-          </Text>
-          <Text style={[styles.contactPhone, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
-            {getDisplayPhone(contact) || (showInvite ? 'Not on ' + APP_TAG_NAME : 'Registered')}
-          </Text>
-        </View>
-
-        {/* Right Action */}
-        {showInvite ? (
-          <TouchableOpacity
-            onPress={() => onSendInvitationPress(contact)}
-            disabled={isInviting}
-            activeOpacity={0.7}
-            style={[styles.inviteBtn, { backgroundColor: theme.colors.themeColor + '15' }]}
-          >
-            {isInviting ? (
-              <ActivityIndicator size="small" color={theme.colors.themeColor} />
-            ) : (
-              <Text style={[styles.inviteBtnText, { color: theme.colors.themeColor }]}>Invite</Text>
-            )}
-          </TouchableOpacity>
-        ) : (
-          <TouchableOpacity
-            onPress={() => navigation.navigate('UserB', { item: contact })}
-            activeOpacity={0.6}
-            style={styles.infoBtn}
-          >
-            <Ionicons name="information-circle-outline" size={22} color={theme.colors.placeHolderTextColor} />
-          </TouchableOpacity>
-        )}
-      </TouchableOpacity>
-    );
-  };
-
-  const renderEmptyState = () => (
-    <View style={styles.emptyWrap}>
-      <View style={[styles.emptyIconWrap, { backgroundColor: theme.colors.menuBackground }]}>
-        <FontAwesome6 name="address-book" size={32} color={theme.colors.placeHolderTextColor} />
-      </View>
-      <Text style={[styles.emptyTitle, { color: theme.colors.primaryTextColor }]}>
-        {searchQuery ? 'No matching contacts' : 'No contacts found'}
-      </Text>
-      <Text style={[styles.emptySubtitle, { color: theme.colors.placeHolderTextColor }]}>
-        {searchQuery ? 'Try a different search term' : 'Pull down to refresh or sync your contacts'}
-      </Text>
-      {error && (
-        <Text style={styles.emptyError}>{error}</Text>
-      )}
-      {!searchQuery && (
-        <TouchableOpacity
-          onPress={handleRefresh}
-          disabled={isSyncing || refreshing}
-          activeOpacity={0.7}
-          style={[styles.emptyRefreshBtn, { backgroundColor: theme.colors.themeColor, opacity: (isSyncing || refreshing) ? 0.5 : 1 }]}
-        >
-          <Ionicons name="sync-outline" size={16} color={theme.colors.textWhite} style={{ marginRight: 6 }} />
-          <Text style={[styles.emptyRefreshText, { color: theme.colors.textWhite }]}>
-            {isSyncing || refreshing ? 'Syncing...' : 'Refresh Contacts'}
-          </Text>
-        </TouchableOpacity>
-      )}
-    </View>
-  );
-
-  const renderProcessingState = () => (
-    <View style={styles.processingWrap}>
-      <View style={[styles.processingCard, { backgroundColor: theme.colors.menuBackground }]}>
-        <ActivityIndicator size="large" color={theme.colors.themeColor} />
-        <Text style={[styles.processingTitle, { color: theme.colors.primaryTextColor }]}>
-          Processing contacts...
-        </Text>
-        <Text style={[styles.processingSubtitle, { color: theme.colors.placeHolderTextColor }]}>
-          Securely hashing your contacts
-        </Text>
-      </View>
-    </View>
-  );
-
   const renderItem = useCallback(({ item }) => {
     switch (item.type) {
       case 'syncInfo':
@@ -734,7 +678,18 @@ export default function AddUser({ navigation }) {
           </View>
         );
       case 'sectionHeader':
-        return renderSectionHeader(item.title, item.count);
+        return (
+          <View style={styles.sectionHeaderWrap}>
+            <Text style={[styles.sectionHeaderText, { color: theme.colors.themeColor }]}>
+              {item.title}
+            </Text>
+            {item.count != null && (
+              <View style={[styles.sectionBadge, { backgroundColor: theme.colors.themeColor + '18' }]}>
+                <Text style={[styles.sectionBadgeText, { color: theme.colors.themeColor }]}>{item.count}</Text>
+              </View>
+            )}
+          </View>
+        );
       case 'sectionEmpty':
         return (
           <Text style={[styles.sectionEmptyText, { color: theme.colors.placeHolderTextColor }]}>
@@ -742,24 +697,64 @@ export default function AddUser({ navigation }) {
           </Text>
         );
       case 'contact':
-        return renderContactRow(item.contact, item.index, item.showInvite);
+        const contactId = item.contact.id || item.contact.userId || item.contact.hash || item.index;
+        return (
+          <ContactRow
+            contact={item.contact}
+            index={item.index}
+            showInvite={item.showInvite}
+            theme={theme}
+            isInviting={invitingContactId === contactId}
+            onPress={() => handleContactPress(item.contact)}
+            onAvatarPress={() => handleModal(item.contact)}
+            onInfoPress={() => navigation.navigate('UserB', { item: item.contact })}
+            onInvitePress={() => onSendInvitationPress(item.contact)}
+            getDisplayPhone={getDisplayPhone}
+          />
+        );
       case 'spacer':
         return <View style={{ height: 16 }} />;
       case 'empty':
-        return renderEmptyState();
+        return (
+          <View style={styles.emptyWrap}>
+            <View style={[styles.emptyIconWrap, { backgroundColor: theme.colors.menuBackground }]}>
+              <FontAwesome6 name="address-book" size={32} color={theme.colors.placeHolderTextColor} />
+            </View>
+            <Text style={[styles.emptyTitle, { color: theme.colors.primaryTextColor }]}>
+              {searchQuery ? 'No matching contacts' : 'No contacts found'}
+            </Text>
+            <Text style={[styles.emptySubtitle, { color: theme.colors.placeHolderTextColor }]}>
+              {searchQuery ? 'Try a different search term' : 'Pull down to refresh or sync your contacts'}
+            </Text>
+            {error && (
+              <Text style={styles.emptyError}>{error}</Text>
+            )}
+            {!searchQuery && (
+              <TouchableOpacity
+                onPress={handleRefresh}
+                disabled={isSyncing || refreshing}
+                activeOpacity={0.7}
+                style={[styles.emptyRefreshBtn, { backgroundColor: theme.colors.themeColor, opacity: (isSyncing || refreshing) ? 0.5 : 1 }]}
+              >
+                <Ionicons name="sync-outline" size={16} color={theme.colors.textWhite} style={{ marginRight: 6 }} />
+                <Text style={[styles.emptyRefreshText, { color: theme.colors.textWhite }]}>
+                  {isSyncing || refreshing ? 'Syncing...' : 'Refresh Contacts'}
+                </Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        );
       default:
         return null;
     }
-  }, [theme, invitingContactId, searchQuery, registeredContacts, unregisteredContacts, lastSyncTime]);
+  }, [theme, invitingContactId, handleContactPress, handleModal, onSendInvitationPress, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, navigation]);
 
   const keyExtractor = useCallback((item, index) => {
     if (item.type === 'contact') {
-      return item.contact.id || item.contact.userId || item.contact.hash || `contact-${index}`;
+      return `c-${item.contact.id || item.contact.userId || item.contact.hash || index}`;
     }
     return `${item.type}-${index}`;
   }, []);
-
-  const listData = buildListData();
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: theme.colors.background }]}>
@@ -767,26 +762,50 @@ export default function AddUser({ navigation }) {
       {renderCollapsibleSection()}
 
       {isProcessing ? (
-        renderProcessingState()
+        <View style={styles.processingWrap}>
+          <View style={[styles.processingCard, { backgroundColor: theme.colors.menuBackground }]}>
+            <ActivityIndicator size="large" color={theme.colors.themeColor} />
+            <Text style={[styles.processingTitle, { color: theme.colors.primaryTextColor }]}>
+              Processing contacts...
+            </Text>
+            <Text style={[styles.processingSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+              Securely hashing your contacts
+            </Text>
+          </View>
+        </View>
       ) : (
         <FlatList
-            data={listData}
-            renderItem={renderItem}
-            keyExtractor={keyExtractor}
-            onScroll={handleScroll}
-            scrollEventThrottle={16}
-            contentContainerStyle={styles.listContent}
-            showsVerticalScrollIndicator={false}
-            refreshControl={
-              <RefreshControl
-                refreshing={refreshing || isSyncing}
-                onRefresh={handleRefresh}
-                colors={[theme.colors.themeColor]}
-                tintColor={theme.colors.themeColor}
-                progressBackgroundColor={theme.colors.menuBackground}
-              />
+          data={listData}
+          renderItem={renderItem}
+          keyExtractor={keyExtractor}
+          onScroll={handleScroll}
+          scrollEventThrottle={16}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          // ─── PERFORMANCE OPTIMIZATIONS ───
+          initialNumToRender={15}
+          maxToRenderPerBatch={15}
+          updateCellsBatchingPeriod={50}
+          windowSize={11}
+          removeClippedSubviews={Platform.OS === 'android'}
+          getItemLayout={(data, index) => {
+            // Approximate: most items are contact rows at fixed height
+            const item = data?.[index];
+            if (item?.type === 'contact') {
+              return { length: CONTACT_ROW_HEIGHT, offset: CONTACT_ROW_HEIGHT * index, index };
             }
-          />
+            return { length: 44, offset: 44 * index, index };
+          }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing || isSyncing}
+              onRefresh={handleRefresh}
+              colors={[theme.colors.themeColor]}
+              tintColor={theme.colors.themeColor}
+              progressBackgroundColor={theme.colors.menuBackground}
+            />
+          }
+        />
       )}
 
       {/* Profile Preview Modal */}
@@ -811,6 +830,7 @@ export default function AddUser({ navigation }) {
                   resizeMode="cover"
                   source={{ uri: selectedChatItem?.profilePicture || selectedChatItem?.profileImage }}
                   style={{ width: '100%', height: '100%' }}
+                  fadeDuration={0}
                 />
               ) : (
                 <View style={[styles.modalFallback, { backgroundColor: getAvatarColor(selectedChatItem?.fullName || selectedChatItem?.name) }]}>
@@ -820,14 +840,12 @@ export default function AddUser({ navigation }) {
                 </View>
               )}
 
-              {/* Gradient name overlay */}
               <View style={styles.modalNameOverlay}>
                 <Text style={styles.modalName} numberOfLines={1}>
                   {selectedChatItem?.fullName || selectedChatItem?.name || 'Unknown'}
                 </Text>
               </View>
 
-              {/* Action buttons for registered contacts */}
               {selectedChatItem?.type === "registered" && (
                 <View style={styles.modalActions}>
                   <TouchableOpacity
@@ -1006,6 +1024,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 10,
     gap: 14,
+    height: CONTACT_ROW_HEIGHT,
   },
   avatarWrap: {
     width: 48,
@@ -1148,8 +1167,8 @@ const styles = StyleSheet.create({
   },
   processingSubtitle: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
-    marginTop: 4,
+    fontSize: 13,
+    marginTop: 6,
   },
 
   // ─── MODAL ───
@@ -1158,41 +1177,40 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: 'rgba(0,0,0,0.5)',
-    padding: 24,
   },
   modalCard: {
-    width: '72%',
-    borderRadius: 16,
+    width: SCREEN_WIDTH * 0.72,
+    borderRadius: 6,
     overflow: 'hidden',
     elevation: 10,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 8 },
+    shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.3,
-    shadowRadius: 16,
+    shadowRadius: 10,
   },
   modalImageWrap: {
     width: '100%',
-    height: 280,
+    aspectRatio: 1,
   },
   modalFallback: {
-    flex: 1,
+    width: '100%',
+    height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
   },
   modalFallbackText: {
     color: '#fff',
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 72,
-    textTransform: 'uppercase',
+    fontSize: 60,
   },
   modalNameOverlay: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
+    backgroundColor: 'rgba(0,0,0,0.45)',
     paddingHorizontal: 14,
     paddingVertical: 10,
-    backgroundColor: 'rgba(0,0,0,0.4)',
   },
   modalName: {
     color: '#fff',
@@ -1201,16 +1219,16 @@ const styles = StyleSheet.create({
   },
   modalActions: {
     position: 'absolute',
-    top: 10,
+    bottom: 52,
     right: 10,
-    flexDirection: 'column',
-    gap: 8,
+    flexDirection: 'row',
+    gap: 10,
   },
   modalActionBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(0,0,0,0.35)',
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(0,0,0,0.4)',
     alignItems: 'center',
     justifyContent: 'center',
   },
