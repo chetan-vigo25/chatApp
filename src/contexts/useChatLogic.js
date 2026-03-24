@@ -260,6 +260,10 @@ export default function useChatLogic({ navigation, route }) {
   // Track tempIds of recently sent messages for dedup against sync responses
   const sentTempIdsRef = useRef(new Set());
   const pendingPreviewSyncRef = useRef(false);
+  // Cache reply data by messageId — never lost even if SQLite row is overwritten
+  const replyDataCacheRef = useRef({});
+  // Track pending reply/quote tempIds for response mapping (server doesn't echo tempId)
+  const pendingReplyTempIdRef = useRef(null);
   const localSaveTimeoutRef = useRef(null);
   const socketHandlerRegistryRef = useRef(new Map());
 
@@ -303,6 +307,7 @@ export default function useChatLogic({ navigation, route }) {
   const [isChatMuted, setIsChatMuted] = useState(Boolean(item?.isMuted));
   const [muteUntil, setMuteUntil] = useState(item?.muteUntil || null);
   const [editingMessage, setEditingMessage] = useState(null);
+  const [replyTarget, setReplyTarget] = useState(null);
 
   const buildMediaStatusQueueStorageKey = useCallback(
     () => `${MEDIA_STATUS_QUEUE_KEY}_${currentUserIdRef.current || 'anon'}`,
@@ -909,17 +914,24 @@ export default function useChatLogic({ navigation, route }) {
       (b.timestamp || 0) - (a.timestamp || 0)
     );
 
-    // Final dedup — ensure no duplicate keys reach the FlatList
-    const seenKeys = new Set();
+    // Dedup using same fingerprint approach as loadMessages
+    const seenIds = new Set();
+    const fpMap = new Map();
     const deduped = sorted.filter(msg => {
-      const key = normalizeId(msg.serverMessageId) || normalizeId(msg.id) || normalizeId(msg.tempId);
-      if (!key) return true;
-      if (seenKeys.has(key)) return false;
-      seenKeys.add(key);
-      // Also register all other IDs of this message
-      if (msg.serverMessageId) seenKeys.add(normalizeId(msg.serverMessageId));
-      if (msg.id) seenKeys.add(normalizeId(msg.id));
-      if (msg.tempId) seenKeys.add(normalizeId(msg.tempId));
+      const ids = [normalizeId(msg.serverMessageId), normalizeId(msg.id), normalizeId(msg.tempId)].filter(Boolean);
+      if (ids.some(id => seenIds.has(id))) return false;
+
+      // Fingerprint: sender + text + 30s rounded timestamp
+      if (msg.senderId && msg.text != null) {
+        const roundedTs = Math.round((msg.timestamp || 0) / 30000);
+        const fp = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs}`;
+        const fpPrev = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs - 1}`;
+        const fpNext = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs + 1}`;
+        if (fpMap.has(fp) || fpMap.has(fpPrev) || fpMap.has(fpNext)) return false;
+        fpMap.set(fp, true);
+      }
+
+      for (const id of ids) seenIds.add(id);
       return true;
     });
 
@@ -1439,6 +1451,19 @@ export default function useChatLogic({ navigation, route }) {
       deletedFor: resolvedDeletedFor,
       deletedBy: resolvedDeletedBy,
       placeholderText: resolvedIsDeleted ? resolvedPlaceholderText : null,
+      // Reply/Quote fields — support both local field names and server field names
+      // Handle replyTo being an object (server populates it) vs a plain ID string
+      replyToMessageId: apiMsg?.replyToMessageId || apiMsg?.quotedMessageId
+        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo._id || apiMsg.replyTo.id) : apiMsg?.replyTo)
+        || apiMsg?.reply_to_message_id || null,
+      replyPreviewText: apiMsg?.replyPreviewText || apiMsg?.quotedText || apiMsg?.reply_preview_text
+        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? apiMsg.replyTo.text : null) || null,
+      replyPreviewType: apiMsg?.replyPreviewType || apiMsg?.reply_preview_type
+        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo.messageType || apiMsg.replyTo.type) : null) || null,
+      replySenderName: apiMsg?.replySenderName || apiMsg?.quotedSender || apiMsg?.reply_sender_name
+        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo.senderName || apiMsg.replyTo.sender?.fullName || apiMsg.replyTo.sender?.name) : null) || null,
+      replySenderId: apiMsg?.replySenderId || apiMsg?.reply_sender_id
+        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo.senderId || apiMsg.replyTo.sender?._id || apiMsg.replyTo.sender) : null) || null,
     };
   }, [normalizeMessageStatus]);
 
@@ -1732,39 +1757,34 @@ export default function useChatLogic({ navigation, route }) {
         const cid = chatIdRef.current;
         if (!cid) return;
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
-        const dbMessages = await ChatDatabase.loadMessages(cid, { limit: 500, afterTimestamp: clearedAt });
+        // loadMessagesWithReplies already handles dedup (SQL cleanup + JS fingerprint filter)
+        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, { limit: 500, afterTimestamp: clearedAt });
 
         const currentUser = currentUserIdRef.current;
 
-        // Deduplicate by key — even if SQLite has dupes, UI must never show them
-        const seen = new Set();
-        const unique = [];
-        for (const msg of dbMessages) {
-          const key = msg.serverMessageId || msg.id || msg.tempId;
-          if (!key || seen.has(key)) continue;
-          // Also check if temp row duplicates a server row (same sender+text+close time)
-          if (msg.id && msg.id.startsWith('temp_') && msg.serverMessageId) {
-            // This temp row has a serverMessageId — use serverMessageId as key
-            if (seen.has(msg.serverMessageId)) continue;
-            seen.add(msg.serverMessageId);
-          }
-          seen.add(key);
-          // Also add all IDs of this message to prevent other rows matching
-          if (msg.serverMessageId) seen.add(msg.serverMessageId);
-          if (msg.id) seen.add(msg.id);
-          if (msg.tempId && msg.tempId !== msg.id) seen.add(msg.tempId);
-          unique.push(msg);
-        }
-
-        const enriched = unique.map(msg => {
+        const enriched = dbMessages.map(msg => {
           let status = msg.status;
           if ((status === 'sending' || status === 'uploaded') && msg.serverMessageId && msg.synced) {
             status = 'sent';
           }
+
+          // Resolve missing replySenderName from available context
+          let replySenderName = msg.replySenderName;
+          if (msg.replyToMessageId && !replySenderName && msg.replySenderId) {
+            if (sameId(msg.replySenderId, currentUser)) {
+              replySenderName = currentUserNameRef.current || 'You';
+            } else if (chatData?.peerUser?.fullName) {
+              replySenderName = chatData.peerUser.fullName;
+            } else if (groupMembersMapRef.current?.[msg.replySenderId]?.fullName) {
+              replySenderName = groupMembersMapRef.current[msg.replySenderId].fullName;
+            }
+          }
+
           return {
             ...msg,
             status,
             senderType: computeSenderType(msg.senderId, currentUser),
+            ...(replySenderName && !msg.replySenderName ? { replySenderName } : {}),
             ...(msg.localUri && msg.type !== 'text' ? {
               previewUrl: msg.previewUrl || msg.localUri,
               mediaUrl: msg.mediaUrl || msg.localUri,
@@ -1790,15 +1810,39 @@ export default function useChatLogic({ navigation, route }) {
   /**
    * Legacy-compatible wrapper — writes to SQLite then refreshes UI.
    * Used by code paths that still pass message arrays (e.g., reactions, status updates).
+   * Skips stale temp-ID messages whose server-confirmed version already exists in SQLite.
    */
   const saveMessagesToLocal = useCallback(async (msgs) => {
     try {
       if (!chatIdRef.current || !msgs) return;
-      await ChatDatabase.upsertMessages(msgs.map(msg => ({
-        ...msg,
-        chatId: msg.chatId || chatIdRef.current,
-        senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
-      })));
+      // Filter out stale temp messages: if a message only has a temp ID but SQLite
+      // already has a server-acknowledged version (via acknowledgeMessage), skip it.
+      // This prevents the race where state has a stale temp version while SQLite has
+      // the server version, and writing the temp version back creates a duplicate.
+      const toWrite = [];
+      for (const msg of msgs) {
+        const msgId = msg.id || msg.tempId;
+        if (msgId && String(msgId).startsWith('temp_') && !msg.serverMessageId) {
+          // Check if this temp message was already acknowledged in SQLite
+          const acknowledged = await ChatDatabase.messageExists(msgId);
+          if (acknowledged) {
+            // The temp ID exists in SQLite — check if it was already converted to a server row
+            const existing = await ChatDatabase.getMessage(msgId);
+            if (existing && existing.serverMessageId && existing.id !== msgId) {
+              // Already acknowledged — skip this stale temp version
+              continue;
+            }
+          }
+        }
+        toWrite.push({
+          ...msg,
+          chatId: msg.chatId || chatIdRef.current,
+          senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
+        });
+      }
+      if (toWrite.length > 0) {
+        await ChatDatabase.upsertMessages(toWrite);
+      }
       refreshMessagesFromDB();
     } catch (err) {
       console.warn('[ChatDB] saveMessagesToLocal error:', err);
@@ -2787,6 +2831,23 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('message:sent:ack', onMessageSentAck);
 
+    // Handle message:quote:response and message:reply:response — ACK for quoted/reply messages
+    const onQuoteResponse = (data) => {
+      const source = data?.data || data;
+      const serverMessageId = source?.messageId || source?._id;
+      // Server responses for reply/quote don't include tempId — use our pending tracker
+      const tempId = source?.tempId || pendingReplyTempIdRef.current;
+      if (tempId) pendingReplyTempIdRef.current = null; // consume it
+      if (serverMessageId) {
+        updateMessageStatus(tempId || serverMessageId, 'sent', { messageId: serverMessageId, ...source });
+        if (tempId && serverMessageId && tempId !== serverMessageId) {
+          ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
+        }
+      }
+    };
+    registerSocketHandler('message:quote:response', onQuoteResponse);
+    registerSocketHandler('message:reply:response', onQuoteResponse);
+
     const onMessageSent = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id;
@@ -3677,6 +3738,11 @@ export default function useChatLogic({ navigation, route }) {
     // If server provided a messageId, do the ACK transition (tempId → serverMessageId)
     if (serverMessageId && tempId && serverMessageId !== tempId) {
       await ChatDatabase.acknowledgeMessage(tempId, serverMessageId);
+      // Copy reply data to permanent table under serverId
+      const tempReply = await ChatDatabase.getReplyData(tempId);
+      if (tempReply) {
+        ChatDatabase.saveReplyData(serverMessageId, tempReply).catch(() => {});
+      }
     }
 
     // Update status in SQLite (only advances, never regresses)
@@ -3716,7 +3782,22 @@ export default function useChatLogic({ navigation, route }) {
         }
 
         const isGroupPayload = payload?.chatType === 'group' || payload?.groupId;
-        const sendEvent = isGroupPayload ? 'group:message:send' : 'message:send';
+        const isReplyPayload = Boolean(payload?.replyToMessageId);
+        const isQuotePayload = Boolean(payload?.quotedMessageId && payload?.quotedText);
+        // message:reply for 1-on-1 replies, message:quote for 1-on-1 quotes with embedded text,
+        // group:message:send for groups (reply/quote data embedded in payload)
+        const sendEvent = isGroupPayload
+          ? 'group:message:send'
+          : isQuotePayload
+            ? 'message:quote'
+            : isReplyPayload
+              ? 'message:reply'
+              : 'message:send';
+
+        // Track tempId for reply/quote response handlers (server responses lack tempId)
+        if (sendEvent === 'message:reply' || sendEvent === 'message:quote') {
+          pendingReplyTempIdRef.current = tempId;
+        }
 
         // Timeout: if server doesn't ack within 8s, treat as sent (optimistic)
         let ackReceived = false;
@@ -3771,6 +3852,34 @@ export default function useChatLogic({ navigation, route }) {
 
     const isGrpSend = chatData.chatType === 'group' || chatData.isGroup;
     const mentionsArray = Array.isArray(mentions) && mentions.length > 0 ? mentions : undefined;
+
+    // Build reply metadata if replying
+    const currentReply = replyTarget;
+    const replyToMsgId = currentReply
+      ? (currentReply.serverMessageId || currentReply.id || currentReply.tempId)
+      : null;
+    // Resolve reply sender name — in 1-on-1 chats, senderName may be missing
+    let resolvedReplySenderName = currentReply?.senderName || null;
+    if (!resolvedReplySenderName && currentReply?.senderId) {
+      if (sameId(currentReply.senderId, currentUserIdRef.current)) {
+        resolvedReplySenderName = currentUserNameRef.current || 'You';
+      } else if (chatData?.peerUser?.fullName) {
+        resolvedReplySenderName = chatData.peerUser.fullName;
+      } else if (groupMembersMapRef.current?.[currentReply.senderId]?.fullName) {
+        resolvedReplySenderName = groupMembersMapRef.current[currentReply.senderId].fullName;
+      }
+    }
+    const quotedText = currentReply
+      ? (currentReply.isDeleted ? 'This message was deleted' : (currentReply.text || ''))
+      : null;
+    const replyMeta = currentReply ? {
+      replyToMessageId: replyToMsgId,
+      replyPreviewText: quotedText,
+      replyPreviewType: currentReply.type || 'text',
+      replySenderName: resolvedReplySenderName,
+      replySenderId: currentReply.senderId || null,
+    } : {};
+
     const payload = {
       receiverId: isGrpSend ? null : (chatData.peerUser?._id || null),
       messageType: "text",
@@ -3778,7 +3887,6 @@ export default function useChatLogic({ navigation, route }) {
       text: text.trim(),
       mediaUrl: '',
       mediaMeta: {},
-      replyTo: null,
       forwardedFrom: null,
       chatId: chatIdRef.current,
       senderId: currentUserIdRef.current,
@@ -3787,6 +3895,11 @@ export default function useChatLogic({ navigation, route }) {
       createdAt: timestamp,
       ...(isGrpSend && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
       ...(mentionsArray && { mentions: mentionsArray }),
+      // Reply field for message:reply event (swipe-to-reply in 1-on-1)
+      // For groups, replyToMessageId is embedded in the group:message:send payload
+      ...(replyToMsgId && {
+        replyToMessageId: replyToMsgId,
+      }),
     };
 
     onLocalOutgoingMessage({
@@ -3805,7 +3918,7 @@ export default function useChatLogic({ navigation, route }) {
               : null,
           }),
     });
-    
+
     const newMessage = {
       id: tempId,
       tempId,
@@ -3826,20 +3939,31 @@ export default function useChatLogic({ navigation, route }) {
       chatId: chatIdRef.current,
       ...(isGrpSend && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
       ...(mentionsArray && { mentions: mentionsArray }),
+      ...replyMeta,
     };
 
     setText("");
+    if (currentReply) setReplyTarget(null);
     markUserOnline("send-message");
-    
-    // FIXED: Stop typing indicator when sending
+
     if (isLocalTyping) {
       sendTypingStatus(false);
       setIsLocalTyping(false);
     }
-    
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = null;
+    }
+
+    // Save reply data to permanent reply table (never overwritten)
+    if (newMessage.replyToMessageId) {
+      ChatDatabase.saveReplyData(tempId, {
+        replyToMessageId: newMessage.replyToMessageId,
+        replyPreviewText: newMessage.replyPreviewText,
+        replyPreviewType: newMessage.replyPreviewType,
+        replySenderName: newMessage.replySenderName,
+        replySenderId: newMessage.replySenderId,
+      }).catch(() => {});
     }
 
     // SQLite-first: write to DB immediately, then refresh UI from DB
@@ -3856,10 +3980,10 @@ export default function useChatLogic({ navigation, route }) {
 
       await sendMessageViaSocket(payload, tempId);
     } catch (error) {
-      console.error("❌ Send message failed:", error);
+      console.error("Send message failed:", error);
       updateMessageStatus(tempId, 'failed');
     }
-  }, [text, chatData.peerUser, sendTypingStatus, removeDuplicateMessages, saveMessagesToLocal, updateMessageStatus, checkAndReconnectSocket, isLocalTyping, markUserOnline, onLocalOutgoingMessage, sendMessageViaSocket]);
+  }, [text, replyTarget, chatData.peerUser, sendTypingStatus, updateMessageStatus, checkAndReconnectSocket, isLocalTyping, markUserOnline, onLocalOutgoingMessage, sendMessageViaSocket, refreshMessagesFromDB]);
 
   const sendLocationMessage = useCallback(async ({ latitude, longitude, address = '', mapPreviewUrl = '' } = {}) => {
     const lat = Number(latitude);
@@ -4115,8 +4239,46 @@ export default function useChatLogic({ navigation, route }) {
     // Just update the temp row with the server ID if needed.
     if (isSelfMessage && incomingTempId && messageId && incomingTempId !== messageId) {
       await ChatDatabase.acknowledgeMessage(incomingTempId, messageId);
+      // Copy reply data to server ID in permanent table
+      const rd = await ChatDatabase.getReplyData(incomingTempId);
+      if (rd) ChatDatabase.saveReplyData(messageId, rd).catch(() => {});
       refreshMessagesFromDB();
       return;
+    }
+    // Self-echo without tempId: check if we recently sent a message with matching tempId
+    if (isSelfMessage && messageId && !incomingTempId) {
+      // Check sentTempIdsRef — if any pending temp matches, do the ACK
+      for (const pendingTempId of sentTempIdsRef.current) {
+        const tempExists = await ChatDatabase.messageExists(pendingTempId);
+        if (tempExists) {
+          const tempMsg = await ChatDatabase.getMessage(pendingTempId);
+          // Match by text + close timestamp (within 10s)
+          if (tempMsg && tempMsg.text === (msg.text || msg.message) &&
+              Math.abs((tempMsg.timestamp || 0) - new Date(msg.createdAt || msg.timestamp || 0).getTime()) < 10000) {
+            await ChatDatabase.acknowledgeMessage(pendingTempId, messageId);
+            const rd = await ChatDatabase.getReplyData(pendingTempId);
+            if (rd) ChatDatabase.saveReplyData(messageId, rd).catch(() => {});
+            sentTempIdsRef.current.delete(pendingTempId);
+            refreshMessagesFromDB();
+            return;
+          }
+        }
+      }
+      // Fallback: search SQLite directly for a temp row matching this message's content
+      const matchingTemp = await ChatDatabase.findTempRowByContent(
+        chatIdRef.current,
+        currentUserIdRef.current,
+        msg.text || msg.message || '',
+        new Date(msg.createdAt || msg.timestamp || 0).getTime()
+      );
+      if (matchingTemp) {
+        await ChatDatabase.acknowledgeMessage(matchingTemp.id, messageId);
+        const rd = await ChatDatabase.getReplyData(matchingTemp.id);
+        if (rd) ChatDatabase.saveReplyData(messageId, rd).catch(() => {});
+        sentTempIdsRef.current.delete(matchingTemp.id);
+        refreshMessagesFromDB();
+        return;
+      }
     }
     if (isSelfMessage && messageId) {
       // Check if already in SQLite (from our optimistic insert)
@@ -4142,6 +4304,45 @@ export default function useChatLogic({ navigation, route }) {
     });
     if (receivedMessage.senderId) {
       receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
+    }
+
+    // If this message is a reply but missing preview data, look up the original from SQLite
+    if (receivedMessage.replyToMessageId && !receivedMessage.replyPreviewText) {
+      const originalMsg = await ChatDatabase.getMessage(receivedMessage.replyToMessageId);
+      if (originalMsg) {
+        receivedMessage.replyPreviewText = originalMsg.isDeleted ? 'This message was deleted' : (originalMsg.text || '');
+        receivedMessage.replyPreviewType = originalMsg.type || 'text';
+        receivedMessage.replySenderId = originalMsg.senderId || null;
+        // Resolve sender name for the reply preview
+        let rSenderName = originalMsg.senderName || null;
+        if (!rSenderName && originalMsg.senderId) {
+          if (sameId(originalMsg.senderId, currentUserIdRef.current)) {
+            rSenderName = currentUserNameRef.current || 'You';
+          } else if (chatData?.peerUser?.fullName) {
+            rSenderName = chatData.peerUser.fullName;
+          } else if (groupMembersMapRef.current?.[originalMsg.senderId]?.fullName) {
+            rSenderName = groupMembersMapRef.current[originalMsg.senderId].fullName;
+          }
+        }
+        receivedMessage.replySenderName = rSenderName;
+      } else {
+        receivedMessage.replyPreviewText = 'Message';
+        receivedMessage.replyPreviewType = 'text';
+      }
+    }
+
+    // Save reply data to permanent reply table (never overwritten)
+    if (receivedMessage.replyToMessageId) {
+      const rKey = receivedMessage.serverMessageId || receivedMessage.id || receivedMessage.tempId;
+      if (rKey) {
+        ChatDatabase.saveReplyData(rKey, {
+          replyToMessageId: receivedMessage.replyToMessageId,
+          replyPreviewText: receivedMessage.replyPreviewText,
+          replyPreviewType: receivedMessage.replyPreviewType,
+          replySenderName: receivedMessage.replySenderName,
+          replySenderId: receivedMessage.replySenderId,
+        }).catch(() => {});
+      }
     }
 
     // SQLite-first: write to DB, then refresh UI
@@ -4287,6 +4488,31 @@ export default function useChatLogic({ navigation, route }) {
 
   const cancelEditMessage = useCallback(() => {
     setEditingMessage(null);
+  }, []);
+
+  // ─── REPLY ───
+  const startReply = useCallback((msg) => {
+    if (!msg || msg.isDeleted) return;
+    // Resolve sender name if missing
+    let enriched = msg;
+    if (!msg.senderName && msg.senderId) {
+      let name = null;
+      if (sameId(msg.senderId, currentUserIdRef.current)) {
+        name = currentUserNameRef.current || 'You';
+      } else if (chatData?.peerUser?.fullName) {
+        name = chatData.peerUser.fullName;
+      } else if (groupMembersMapRef.current?.[msg.senderId]?.fullName) {
+        name = groupMembersMapRef.current[msg.senderId].fullName;
+      }
+      if (name) enriched = { ...msg, senderName: name };
+    }
+    setReplyTarget(enriched);
+    setEditingMessage(null);
+    setSelectedMessages([]);
+  }, [chatData?.peerUser?.fullName]);
+
+  const cancelReply = useCallback(() => {
+    setReplyTarget(null);
   }, []);
 
   const submitEditMessage = useCallback(async (newText) => {
@@ -5289,6 +5515,7 @@ export default function useChatLogic({ navigation, route }) {
     markVisibleIncomingAsRead,
     setMessages, saveMessagesToLocal, resendMessage,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
+    replyTarget, startReply, cancelReply,
     toggleReaction,
     clearSelectedMessages: () => setSelectedMessages([]),
   };

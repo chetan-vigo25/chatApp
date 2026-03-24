@@ -50,6 +50,8 @@ import { mediaDownloadSigned } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import MentionText from '../../components/MentionText';
+import ReplyPreviewBox from '../../components/ReplyPreviewBox';
+import ReplyBubble from '../../components/ReplyBubble';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -370,6 +372,43 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
     </View>
   );
 }));
+
+// ── Swipe-to-reply wrapper (proper component so hooks work) ──
+const SWIPE_THRESHOLD = 60;
+const SwipeReplyRow = React.memo(function SwipeReplyRow({ isMyMessage, disabled, onReply, children }) {
+  const translateX = useRef(new Animated.Value(0)).current;
+  const panResponder = useRef(PanResponder.create({
+    onMoveShouldSetPanResponder: (_, gs) => {
+      if (disabled) return false;
+      const isHorizontal = Math.abs(gs.dx) > Math.abs(gs.dy) && Math.abs(gs.dx) > 10;
+      if (!isHorizontal) return false;
+      return isMyMessage ? gs.dx < -10 : gs.dx > 10;
+    },
+    onPanResponderMove: (_, gs) => {
+      const dx = isMyMessage
+        ? Math.min(0, Math.max(gs.dx, -SWIPE_THRESHOLD - 20))
+        : Math.max(0, Math.min(gs.dx, SWIPE_THRESHOLD + 20));
+      translateX.setValue(dx);
+    },
+    onPanResponderRelease: (_, gs) => {
+      const triggered = isMyMessage ? gs.dx < -SWIPE_THRESHOLD : gs.dx > SWIPE_THRESHOLD;
+      if (triggered && onReply) {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+        onReply();
+      }
+      Animated.spring(translateX, { toValue: 0, useNativeDriver: true, friction: 8 }).start();
+    },
+    onPanResponderTerminate: () => {
+      Animated.spring(translateX, { toValue: 0, useNativeDriver: true, friction: 8 }).start();
+    },
+  })).current;
+
+  return (
+    <Animated.View {...panResponder.panHandlers} style={{ transform: [{ translateX }] }}>
+      {children}
+    </Animated.View>
+  );
+});
 
 // ── Smooth seekable audio progress bar ──
 const AudioSeekBar = React.memo(function AudioSeekBar({
@@ -1237,6 +1276,7 @@ export default function ChatScreen({ navigation, route }) {
     clearChatForEveryone,
     markVisibleIncomingAsRead,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
+    replyTarget, startReply, cancelReply,
     toggleReaction,
   } = useChatLogic({ navigation, route });
 
@@ -3738,6 +3778,7 @@ export default function ChatScreen({ navigation, route }) {
 
     return (
       <React.Fragment>
+        <SwipeReplyRow isMyMessage={isMyMessage} disabled={isDeletedMessage || isSystemMessage} onReply={() => startReply(msg)}>
         <Pressable
           onPress={() => {
             if (reactionMsgId) {
@@ -3780,8 +3821,8 @@ export default function ChatScreen({ navigation, route }) {
               : (isMyMessage ? chatColor : theme.colors.cardBackground), 
             borderBottomRightRadius: isMyMessage ? 4 : 16, 
             borderBottomLeftRadius: isMyMessage ? 16 : 4, 
-            paddingVertical: isMediaMessage ? 2 : 7,
-            paddingHorizontal: isMediaMessage ? 3 : 10,
+            paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 2 : 7,
+            paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 10,
             borderWidth: isHighlighted ? 2 : 0, 
             borderColor: '#FFC107',
             shadowColor: "#000",
@@ -3804,7 +3845,34 @@ export default function ChatScreen({ navigation, route }) {
                   || 'Member'}
               </Text>
             )}
-            
+
+            {/* Reply quote bubble */}
+            {msg.replyToMessageId && !isDeletedMessage && (
+              <ReplyBubble
+                replyToMessageId={msg.replyToMessageId}
+                replyPreviewText={msg.replyPreviewText}
+                replyPreviewType={msg.replyPreviewType}
+                replySenderName={msg.replySenderName}
+                replySenderId={msg.replySenderId}
+                currentUserId={currentUserId}
+                isMyMessage={isMyMessage}
+                chatColor={chatColor}
+                theme={theme}
+                onPress={(originalMsgId) => {
+                  const idx = messages.findIndex(m =>
+                    sameId(m.serverMessageId, originalMsgId) ||
+                    sameId(m.id, originalMsgId) ||
+                    sameId(m.tempId, originalMsgId)
+                  );
+                  if (idx !== -1 && flatListRef?.current) {
+                    try {
+                      flatListRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0.5 });
+                    } catch {}
+                  }
+                }}
+              />
+            )}
+
             {/* TEXT MESSAGES */}
             {msg.type === "text" && !isDeletedMessage && (
               renderRichMessageText(msg, isMyMessage, messageKey)
@@ -4000,10 +4068,11 @@ export default function ChatScreen({ navigation, route }) {
             </View>
           )}
         </Pressable>
+        </SwipeReplyRow>
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, handleDeleteSelected, startEditMessage, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, getReactionScale, animateReaction]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, getReactionScale, animateReaction]);
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -4220,6 +4289,19 @@ export default function ChatScreen({ navigation, route }) {
                     }}
                     style={{ padding: 10 }}>
                     <Ionicons name="copy-outline" size={22} color={theme.colors.primaryTextColor} />
+                  </TouchableOpacity>
+                )}
+                {/* Reply */}
+                {selectedMessage.length === 1 && selMsg && !selMsg?.isDeleted && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                      setReactionMsgId(null);
+                      clearSelectedMessages();
+                      startReply(selMsg);
+                    }}
+                    style={{ padding: 10 }}>
+                    <Ionicons name="arrow-undo-outline" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
                 {/* Edit — only if NOT seen/read */}
@@ -4615,6 +4697,18 @@ export default function ChatScreen({ navigation, route }) {
               <Ionicons name="send" size={18} color="#fff" style={{ marginLeft: 2 }} />
             </TouchableOpacity>
           </Animated.View>
+        )}
+
+        {/* Reply preview bar */}
+        {replyTarget && !editingMessage && (
+          <ReplyPreviewBox
+            replyTarget={replyTarget}
+            currentUserId={currentUserId}
+            onClose={cancelReply}
+            theme={theme}
+            chatColor={chatColor}
+            isDarkMode={isDarkMode}
+          />
         )}
 
         {/* Edit mode bar */}
