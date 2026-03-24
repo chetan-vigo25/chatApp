@@ -52,6 +52,7 @@ import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import MentionText from '../../components/MentionText';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
 import ReplyBubble from '../../components/ReplyBubble';
+import LocationBubble from '../../components/LocationBubble';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -3547,39 +3548,36 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   const renderLocationMessage = (msg, isMyMessage) => {
-    const latitude = Number(msg?.mediaMeta?.latitude || msg?.payload?.mediaMeta?.latitude || 0);
-    const longitude = Number(msg?.mediaMeta?.longitude || msg?.payload?.mediaMeta?.longitude || 0);
-    const mapUrl = msg?.mediaMeta?.mapPreviewUrl || msg?.mediaUrl || `https://maps.google.com/?q=${latitude},${longitude}`;
-    const address = msg?.mediaMeta?.address || msg?.text || 'Shared location';
+    // Extract location data from ALL possible sources — bulletproof chain
+    const meta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
+    let latitude = Number(meta?.latitude || msg?.payload?.latitude || 0);
+    let longitude = Number(meta?.longitude || msg?.payload?.longitude || 0);
+
+    // Last resort: parse coordinates from mediaUrl (e.g. "https://maps.google.com/?q=27.17,76.84")
+    if (latitude === 0 && longitude === 0) {
+      const url = msg?.mediaUrl || msg?.previewUrl || meta?.mapPreviewUrl || msg?.payload?.mediaUrl || '';
+      const match = url.match(/[?&]q=([-\d.]+),([-\d.]+)/);
+      if (match) {
+        latitude = Number(match[1]) || 0;
+        longitude = Number(match[2]) || 0;
+      }
+    }
+
+    const address = meta?.address || msg?.payload?.address || (msg?.text !== 'Shared location' && msg?.text !== 'Location' ? msg?.text : '') || 'Shared location';
+    const mapPreviewUrl = meta?.mapPreviewUrl || msg?.mediaUrl || '';
 
     return (
-      <TouchableOpacity
-        onPress={() => Linking.openURL(mapUrl).catch(() => {})}
-        activeOpacity={0.88}
-        style={{
-          width: Math.min(320, MAX_MEDIA_BUBBLE_WIDTH),
-          borderRadius: 12,
-          overflow: 'hidden',
-          backgroundColor: theme.colors.menuBackground,
-          borderWidth: 0.5,
-          borderColor: theme.colors.borderColor,
-        }}
-      >
-        <Image
-          source={{ uri: `https://maps.googleapis.com/maps/api/staticmap?center=${latitude},${longitude}&zoom=15&size=600x260&markers=color:red|${latitude},${longitude}` }}
-          resizeMode="cover"
-          style={{ width: '100%', height: 124 }}
-        />
-        <View style={{ paddingHorizontal: 10, paddingVertical: 8 }}>
-          <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-SemiBold', fontSize: 12 }} numberOfLines={2}>
-            {address}
-          </Text>
-          <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 10, marginTop: 2 }}>
-            {latitude.toFixed(5)}, {longitude.toFixed(5)}
-          </Text>
-        </View>
-        {renderMediaTimeOverlay(msg, isMyMessage)}
-      </TouchableOpacity>
+      <LocationBubble
+        latitude={latitude}
+        longitude={longitude}
+        address={address}
+        mapPreviewUrl={mapPreviewUrl}
+        isMyMessage={isMyMessage}
+        time={msg?.time}
+        status={msg?.status}
+        isEdited={Boolean(msg?.isEdited || msg?.editedAt)}
+        themeColors={theme.colors}
+      />
     );
   };
 

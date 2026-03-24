@@ -50,9 +50,12 @@ const getAvatarColor = (name) => {
 };
 
 // ─── MEMOIZED CONTACT ROW COMPONENT ───
+// Props compared by value: contactHash, showInvite, isInviting, and color strings.
+// Callbacks are looked up from refs inside the parent (never change identity).
 const ContactRow = memo(function ContactRow({
-  contact, index, showInvite, theme, isInviting,
-  onPress, onAvatarPress, onInfoPress, onInvitePress, getDisplayPhone,
+  contactHash, contact, showInvite, isInviting,
+  bgColor, textColor, subTextColor, themeColor, inviteBgColor,
+  onPressContact, onPressAvatar, onPressInfo, onPressInvite, displayPhone,
 }) {
   const displayName = contact?.name || contact?.fullName || '?';
   const initials = displayName.charAt(0).toUpperCase();
@@ -61,11 +64,11 @@ const ContactRow = memo(function ContactRow({
   return (
     <TouchableOpacity
       activeOpacity={0.6}
-      onPress={showInvite ? undefined : onPress}
-      style={[styles.contactRow, { backgroundColor: theme.colors.background }]}
+      onPress={showInvite ? undefined : onPressContact}
+      style={[styles.contactRow, { backgroundColor: bgColor }]}
     >
       <TouchableOpacity
-        onPress={showInvite ? undefined : onAvatarPress}
+        onPress={showInvite ? undefined : onPressAvatar}
         activeOpacity={0.8}
         style={styles.avatarWrap}
       >
@@ -84,38 +87,47 @@ const ContactRow = memo(function ContactRow({
       </TouchableOpacity>
 
       <View style={styles.contactInfo}>
-        <Text style={[styles.contactName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
+        <Text style={[styles.contactName, { color: textColor }]} numberOfLines={1}>
           {displayName}
         </Text>
-        <Text style={[styles.contactPhone, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
-          {getDisplayPhone(contact) || (showInvite ? 'Not on ' + APP_TAG_NAME : 'Registered')}
+        <Text style={[styles.contactPhone, { color: subTextColor }]} numberOfLines={1}>
+          {displayPhone || (showInvite ? 'Not on ' + APP_TAG_NAME : 'Registered')}
         </Text>
       </View>
 
       {showInvite ? (
         <TouchableOpacity
-          onPress={onInvitePress}
+          onPress={onPressInvite}
           disabled={isInviting}
           activeOpacity={0.7}
-          style={[styles.inviteBtn, { backgroundColor: theme.colors.themeColor + '15' }]}
+          style={[styles.inviteBtn, { backgroundColor: inviteBgColor }]}
         >
           {isInviting ? (
-            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+            <ActivityIndicator size="small" color={themeColor} />
           ) : (
-            <Text style={[styles.inviteBtnText, { color: theme.colors.themeColor }]}>Invite</Text>
+            <Text style={[styles.inviteBtnText, { color: themeColor }]}>Invite</Text>
           )}
         </TouchableOpacity>
       ) : (
         <TouchableOpacity
-          onPress={onInfoPress}
+          onPress={onPressInfo}
           activeOpacity={0.6}
           style={styles.infoBtn}
         >
-          <Ionicons name="information-circle-outline" size={22} color={theme.colors.placeHolderTextColor} />
+          <Ionicons name="information-circle-outline" size={22} color={subTextColor} />
         </TouchableOpacity>
       )}
     </TouchableOpacity>
   );
+}, (prev, next) => {
+  // Custom comparison — only re-render when these change:
+  return prev.contactHash === next.contactHash &&
+    prev.showInvite === next.showInvite &&
+    prev.isInviting === next.isInviting &&
+    prev.displayPhone === next.displayPhone &&
+    prev.textColor === next.textColor &&
+    prev.contact?.profilePicture === next.contact?.profilePicture &&
+    prev.contact?.name === next.contact?.name;
 });
 
 export default function AddUser({ navigation }) {
@@ -666,13 +678,36 @@ export default function AddUser({ navigation }) {
     </Animated.View>
   );
 
+  // ─── STABLE CALLBACK REFS (never change identity → memo works) ───
+  const handleContactPressRef = useRef(handleContactPress);
+  handleContactPressRef.current = handleContactPress;
+  const handleModalRef = useRef(handleModal);
+  handleModalRef.current = handleModal;
+  const onSendInvitationPressRef = useRef(onSendInvitationPress);
+  onSendInvitationPressRef.current = onSendInvitationPress;
+  const navigationRef = useRef(navigation);
+  navigationRef.current = navigation;
+
+  // Pre-compute stable color strings so ContactRow gets primitives, not objects
+  const bgColor = theme.colors.background;
+  const textColor = theme.colors.primaryTextColor;
+  const subTextColor = theme.colors.placeHolderTextColor;
+  const themeColor = theme.colors.themeColor;
+  const inviteBgColor = theme.colors.themeColor + '15';
+  const menuBgColor = theme.colors.menuBackground;
+  const badgeBgColor = theme.colors.themeColor + '18';
+  const textWhite = theme.colors.textWhite;
+
+  // Static spacer to avoid re-creating on each render
+  const SpacerItem = useMemo(() => <View style={styles.spacerItem} />, []);
+
   const renderItem = useCallback(({ item }) => {
     switch (item.type) {
       case 'syncInfo':
         return (
-          <View style={[styles.syncBar, { backgroundColor: theme.colors.menuBackground }]}>
-            <Ionicons name="time-outline" size={12} color={theme.colors.placeHolderTextColor} />
-            <Text style={[styles.syncText, { color: theme.colors.placeHolderTextColor }]}>
+          <View style={[styles.syncBar, { backgroundColor: menuBgColor }]}>
+            <Ionicons name="time-outline" size={12} color={subTextColor} />
+            <Text style={[styles.syncText, { color: subTextColor }]}>
               Last sync: {new Date(item.time).toLocaleTimeString()}
             </Text>
           </View>
@@ -680,50 +715,56 @@ export default function AddUser({ navigation }) {
       case 'sectionHeader':
         return (
           <View style={styles.sectionHeaderWrap}>
-            <Text style={[styles.sectionHeaderText, { color: theme.colors.themeColor }]}>
+            <Text style={[styles.sectionHeaderText, { color: themeColor }]}>
               {item.title}
             </Text>
             {item.count != null && (
-              <View style={[styles.sectionBadge, { backgroundColor: theme.colors.themeColor + '18' }]}>
-                <Text style={[styles.sectionBadgeText, { color: theme.colors.themeColor }]}>{item.count}</Text>
+              <View style={[styles.sectionBadge, { backgroundColor: badgeBgColor }]}>
+                <Text style={[styles.sectionBadgeText, { color: themeColor }]}>{item.count}</Text>
               </View>
             )}
           </View>
         );
       case 'sectionEmpty':
         return (
-          <Text style={[styles.sectionEmptyText, { color: theme.colors.placeHolderTextColor }]}>
+          <Text style={[styles.sectionEmptyText, { color: subTextColor }]}>
             {item.title}
           </Text>
         );
-      case 'contact':
-        const contactId = item.contact.id || item.contact.userId || item.contact.hash || item.index;
+      case 'contact': {
+        const c = item.contact;
+        const cHash = c.hash || c.id || c.userId || String(item.index);
         return (
           <ContactRow
-            contact={item.contact}
-            index={item.index}
+            contactHash={cHash}
+            contact={c}
             showInvite={item.showInvite}
-            theme={theme}
-            isInviting={invitingContactId === contactId}
-            onPress={() => handleContactPress(item.contact)}
-            onAvatarPress={() => handleModal(item.contact)}
-            onInfoPress={() => navigation.navigate('UserB', { item: item.contact })}
-            onInvitePress={() => onSendInvitationPress(item.contact)}
-            getDisplayPhone={getDisplayPhone}
+            isInviting={invitingContactId === (c.id || c.userId || c.hash || item.index)}
+            bgColor={bgColor}
+            textColor={textColor}
+            subTextColor={subTextColor}
+            themeColor={themeColor}
+            inviteBgColor={inviteBgColor}
+            displayPhone={getDisplayPhone(c)}
+            onPressContact={() => handleContactPressRef.current(c)}
+            onPressAvatar={() => handleModalRef.current(c)}
+            onPressInfo={() => navigationRef.current.navigate('UserB', { item: c })}
+            onPressInvite={() => onSendInvitationPressRef.current(c)}
           />
         );
+      }
       case 'spacer':
-        return <View style={{ height: 16 }} />;
+        return SpacerItem;
       case 'empty':
         return (
           <View style={styles.emptyWrap}>
-            <View style={[styles.emptyIconWrap, { backgroundColor: theme.colors.menuBackground }]}>
-              <FontAwesome6 name="address-book" size={32} color={theme.colors.placeHolderTextColor} />
+            <View style={[styles.emptyIconWrap, { backgroundColor: menuBgColor }]}>
+              <FontAwesome6 name="address-book" size={32} color={subTextColor} />
             </View>
-            <Text style={[styles.emptyTitle, { color: theme.colors.primaryTextColor }]}>
+            <Text style={[styles.emptyTitle, { color: textColor }]}>
               {searchQuery ? 'No matching contacts' : 'No contacts found'}
             </Text>
-            <Text style={[styles.emptySubtitle, { color: theme.colors.placeHolderTextColor }]}>
+            <Text style={[styles.emptySubtitle, { color: subTextColor }]}>
               {searchQuery ? 'Try a different search term' : 'Pull down to refresh or sync your contacts'}
             </Text>
             {error && (
@@ -734,10 +775,10 @@ export default function AddUser({ navigation }) {
                 onPress={handleRefresh}
                 disabled={isSyncing || refreshing}
                 activeOpacity={0.7}
-                style={[styles.emptyRefreshBtn, { backgroundColor: theme.colors.themeColor, opacity: (isSyncing || refreshing) ? 0.5 : 1 }]}
+                style={[styles.emptyRefreshBtn, { backgroundColor: themeColor, opacity: (isSyncing || refreshing) ? 0.5 : 1 }]}
               >
-                <Ionicons name="sync-outline" size={16} color={theme.colors.textWhite} style={{ marginRight: 6 }} />
-                <Text style={[styles.emptyRefreshText, { color: theme.colors.textWhite }]}>
+                <Ionicons name="sync-outline" size={16} color={textWhite} style={{ marginRight: 6 }} />
+                <Text style={[styles.emptyRefreshText, { color: textWhite }]}>
                   {isSyncing || refreshing ? 'Syncing...' : 'Refresh Contacts'}
                 </Text>
               </TouchableOpacity>
@@ -747,7 +788,7 @@ export default function AddUser({ navigation }) {
       default:
         return null;
     }
-  }, [theme, invitingContactId, handleContactPress, handleModal, onSendInvitationPress, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, navigation]);
+  }, [bgColor, textColor, subTextColor, themeColor, inviteBgColor, menuBgColor, badgeBgColor, textWhite, invitingContactId, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, SpacerItem]);
 
   const keyExtractor = useCallback((item, index) => {
     if (item.type === 'contact') {
@@ -783,19 +824,13 @@ export default function AddUser({ navigation }) {
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
           // ─── PERFORMANCE OPTIMIZATIONS ───
-          initialNumToRender={15}
-          maxToRenderPerBatch={15}
-          updateCellsBatchingPeriod={50}
-          windowSize={11}
+          initialNumToRender={20}
+          maxToRenderPerBatch={20}
+          updateCellsBatchingPeriod={30}
+          windowSize={7}
           removeClippedSubviews={Platform.OS === 'android'}
-          getItemLayout={(data, index) => {
-            // Approximate: most items are contact rows at fixed height
-            const item = data?.[index];
-            if (item?.type === 'contact') {
-              return { length: CONTACT_ROW_HEIGHT, offset: CONTACT_ROW_HEIGHT * index, index };
-            }
-            return { length: 44, offset: 44 * index, index };
-          }}
+          // No getItemLayout — mixed item types have different heights.
+          // Wrong offsets cause scroll jumping which feels worse than no layout hint.
           refreshControl={
             <RefreshControl
               refreshing={refreshing || isSyncing}
@@ -1099,6 +1134,9 @@ const styles = StyleSheet.create({
   listContent: {
     paddingBottom: 30,
   },
+  spacerItem: {
+    height: 16,
+  },
 
   // ─── EMPTY STATE ───
   emptyWrap: {
@@ -1176,10 +1214,10 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'transparent',
   },
   modalCard: {
-    width: SCREEN_WIDTH * 0.72,
+    width: SCREEN_WIDTH * 0.60,
     borderRadius: 6,
     overflow: 'hidden',
     elevation: 10,

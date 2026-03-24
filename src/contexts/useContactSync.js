@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import * as Contacts from 'expo-contacts';
 import { useContacts } from './ContactContext';
 import { useNetwork } from './NetworkContext';
 import { getSocket } from '../Redux/Services/Socket/socket';
@@ -104,9 +105,16 @@ export const useContactSync = () => {
     };
   }, [deviceInfo, getDeviceId]);
 
+  // Ref to hold the latest fresh device contacts (updated by getHashedContacts)
+  const freshDeviceContactsRef = useRef([]);
+
   const buildLocalHashMap = useCallback(() => {
+    // Use fresh device contacts if available, fall back to context
+    const contacts = freshDeviceContactsRef.current.length > 0
+      ? freshDeviceContactsRef.current
+      : (deviceContacts || []);
     const localHashMap = {};
-    for (const localContact of (deviceContacts || [])) {
+    for (const localContact of contacts) {
       try {
         const phone = localContact?.phoneNumbers?.[0]?.number || localContact?.phoneNumber || null;
         if (!phone) continue;
@@ -198,21 +206,37 @@ export const useContactSync = () => {
 
   // ─── HASHING ───
 
-  const ensureDeviceContactsLoaded = useCallback(async () => {
-    if (Array.isArray(deviceContacts) && deviceContacts.length > 0) return true;
-    try { await askPermissionAndLoadContacts?.(); } catch {}
-    return Array.isArray(deviceContacts) && deviceContacts.length > 0;
-  }, [deviceContacts, askPermissionAndLoadContacts]);
+  /**
+   * Read contacts FRESH from device every time. Don't rely on the stale
+   * deviceContacts closure — it won't reflect numbers added after mount.
+   */
+  const readFreshDeviceContacts = useCallback(async () => {
+    try {
+      const { status } = await Contacts.requestPermissionsAsync();
+      if (status !== 'granted') return [];
+      const { data } = await Contacts.getContactsAsync({
+        fields: [Contacts.Fields.PhoneNumbers],
+      });
+      const filtered = (data || []).filter(c => c.phoneNumbers?.length > 0);
+      freshDeviceContactsRef.current = filtered; // save for buildLocalHashMap
+      return filtered;
+    } catch (err) {
+      console.warn('[useContactSync] readFreshDeviceContacts error:', err?.message);
+      return [];
+    }
+  }, []);
 
   const getHashedContacts = useCallback(async () => {
-    await ensureDeviceContactsLoaded();
-    if (!deviceContacts || deviceContacts.length === 0) return [];
-    const hashed = contactHasher.hashContactList(deviceContacts);
+    // Always read fresh from device — this is the ONLY way to pick up newly added numbers
+    const freshContacts = await readFreshDeviceContacts();
+    if (freshContacts.length === 0) return [];
+
+    const hashed = contactHasher.hashContactList(freshContacts);
     const valid = hashed.filter(contact => contactHasher.validateHashedContact(contact));
     if (mountedRef.current) setHashedContacts(valid);
     await AsyncStorage.setItem(STORAGE_KEYS.HASHED_CONTACTS, JSON.stringify(valid));
     return valid;
-  }, [deviceContacts, ensureDeviceContactsLoaded]);
+  }, [readFreshDeviceContacts]);
 
   // ─── SOCKET HELPERS ───
 
@@ -493,6 +517,9 @@ export const useContactSync = () => {
   }, [applyFromDB, isConnected, runFullSync, runRefresh]);
 
   // ─── PUBLIC: refreshContacts (pull-to-refresh) ───
+  // Always does a FULL sync so new device contacts (added since last sync) are discovered.
+  // The incremental runRefresh only handles server-side changes — it never sends device
+  // contact hashes, so new phone numbers would never appear.
 
   const refreshContacts = useCallback(async ({ fallbackToSync = true } = {}) => {
     if (!isConnected) {
@@ -500,13 +527,13 @@ export const useContactSync = () => {
       throw new Error('Offline - refresh queued');
     }
 
-    const sessionId = await ContactDatabase.getSyncSessionId();
-    if (!sessionId) {
-      return runFullSync({ reason: 'pull_to_refresh_no_session', silent: false });
-    }
+    // Re-read device contacts fresh (picks up any newly added numbers)
+    try { await askPermissionAndLoadContacts?.(); } catch {}
 
-    return runRefresh({ reason: 'pull_to_refresh', silent: false, fallbackToSync, incremental: true });
-  }, [isConnected, runFullSync, runRefresh]);
+    // Always full sync: hashes ALL device contacts and sends to server.
+    // Server returns the complete matched list including any new contacts.
+    return runFullSync({ reason: 'pull_to_refresh', silent: false });
+  }, [isConnected, runFullSync, askPermissionAndLoadContacts]);
 
   // ─── PUBLIC: processContacts ───
 

@@ -841,6 +841,7 @@ export default function ChatList({ navigation }) {
       </Modal>
 
       {/* ─── PROFILE PREVIEW MODAL ─── */}
+      {/* Profile Preview Modal — WhatsApp-style (matches AddUser) */}
       <Modal transparent visible={profilePreviewVisible} onRequestClose={closeProfilePreview} statusBarTranslucent>
         <TouchableOpacity onPress={closeProfilePreview} activeOpacity={1} style={styles.profileOverlay}>
           <Animated.View style={[
@@ -851,16 +852,9 @@ export default function ChatList({ navigation }) {
               transform: [{ scale: profileScaleAnim }],
             }
           ]}>
-            <TouchableOpacity
-              activeOpacity={0.9}
-              onPress={() => {
-                setProfilePreviewVisible(false);
-                setTimeout(() => setImageViewerVisible(true), 200);
-              }}
-              style={[styles.profileImageWrap, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }]}
-            >
+            <View style={[styles.profileImageWrap, { backgroundColor: theme.colors.menuBackground }]}>
               {previewImage ? (
-                <Image resizeMode="cover" source={{ uri: previewImage }} style={StyleSheet.absoluteFill} />
+                <Image resizeMode="cover" source={{ uri: previewImage }} style={{ width: '100%', height: '100%' }} fadeDuration={0} />
               ) : (
                 <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
                   {isPreviewGroup ? (
@@ -888,7 +882,7 @@ export default function ChatList({ navigation }) {
                   activeOpacity={0.8}
                   style={styles.profileActionBtn}
                 >
-                  <Ionicons name="chatbubble-outline" size={20} color="#fff" />
+                  <MaterialCommunityIcons name="message-reply-text-outline" size={22} color="#fff" />
                 </TouchableOpacity>
                 <TouchableOpacity
                   onPress={() => {
@@ -907,10 +901,10 @@ export default function ChatList({ navigation }) {
                   activeOpacity={0.8}
                   style={styles.profileActionBtn}
                 >
-                  <Ionicons name="information-circle-outline" size={21} color="#fff" />
+                  <Ionicons name="information-circle-outline" size={22} color="#fff" />
                 </TouchableOpacity>
               </View>
-            </TouchableOpacity>
+            </View>
           </Animated.View>
         </TouchableOpacity>
       </Modal>
@@ -1364,61 +1358,59 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    padding: 24,
+    backgroundColor: 'transparent',
   },
   profileCard: {
-    width: '74%',
-    borderRadius: 18,
+    width: SCREEN_WIDTH * 0.60,
+    borderRadius: 6,
     overflow: 'hidden',
     elevation: 10,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 6 },
     shadowOpacity: 0.3,
-    shadowRadius: 14,
+    shadowRadius: 10,
   },
   profileImageWrap: {
     width: '100%',
-    height: 280,
+    aspectRatio: 1,
   },
   profileFallback: {
-    flex: 1,
+    width: '100%',
+    height: '100%',
     alignItems: 'center',
     justifyContent: 'center',
   },
   profileFallbackText: {
     color: '#fff',
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 72,
-    textTransform: 'uppercase',
+    fontSize: 60,
   },
   profileNameOverlay: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
   },
   profileNameText: {
     color: '#fff',
     fontFamily: 'Roboto-SemiBold',
     fontSize: 17,
-    textTransform: 'capitalize',
   },
   profileActions: {
     position: 'absolute',
-    top: 12,
-    right: 12,
-    flexDirection: 'column',
-    gap: 8,
+    bottom: 52,
+    right: 10,
+    flexDirection: 'row',
+    gap: 10,
   },
   profileActionBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(0,0,0,0.3)',
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(0,0,0,0.4)',
     alignItems: 'center',
     justifyContent: 'center',
   },
