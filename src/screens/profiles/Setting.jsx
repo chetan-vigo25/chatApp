@@ -8,6 +8,7 @@ import {
   ScrollView,
   Alert,
   StyleSheet,
+  ActivityIndicator,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useTheme } from "../../contexts/ThemeContext";
@@ -16,6 +17,7 @@ import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { emitLogoutCurrentDevice, clearLocalStorageAndDisconnect } from "../../Redux/Services/Socket/socket";
 import { Ionicons, FontAwesome6, MaterialCommunityIcons } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
+import ChatBackupService from '../../services/ChatBackupService';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
@@ -73,6 +75,32 @@ export default function Setting({ navigation }) {
     );
   };
 
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [backupStatus, setBackupStatus] = useState('');
+
+  const handleBackup = async () => {
+    if (isBackingUp) return;
+    setIsBackingUp(true);
+    setBackupStatus('Preparing...');
+    try {
+      const result = await ChatBackupService.createAndShareBackup((status) => {
+        setBackupStatus(status);
+      });
+      setBackupStatus('');
+    } catch (err) {
+      if (err?.message?.includes('User did not share')) {
+        // User cancelled the share sheet — not an error
+        setBackupStatus('');
+      } else {
+        console.error('Backup error:', err);
+        Alert.alert('Backup Failed', err?.message || 'Could not create backup. Please try again.');
+        setBackupStatus('');
+      }
+    } finally {
+      setIsBackingUp(false);
+    }
+  };
+
   const avatarBg = AVATAR_COLORS[
     (profileData?.fullName || '').charCodeAt(0) % AVATAR_COLORS.length
   ] || AVATAR_COLORS[0];
@@ -90,16 +118,22 @@ export default function Setting({ navigation }) {
           subtitle: isDarkMode ? 'Dark theme' : 'Light theme',
           onPress: () => navigation.navigate('ChatColorTheme'),
         },
-        // {
-        //   icon: 'link-outline',
-        //   iconColor: '#0984E3',
-        //   iconBg: '#0984E31A',
-        //   label: 'Linked Devices',
-        
-        //   onPress: () => navigation.navigate('LinkDevice'),
-        // },
       ],
     },
+    // {
+    //   title: 'Data & Storage',
+    //   items: [
+    //     {
+    //       icon: 'cloud-download-outline',
+    //       iconColor: '#0984E3',
+    //       iconBg: '#0984E31A',
+    //       label: 'Chat Backup',
+    //       subtitle: isBackingUp ? backupStatus : 'Auto-save to VibeConnect/Databases/',
+    //       onPress: handleBackup,
+    //       isLoading: isBackingUp,
+    //     },
+    //   ],
+    // },
     {
       title: 'Support',
       items: [
@@ -165,20 +199,27 @@ export default function Setting({ navigation }) {
     <TouchableOpacity
       key={index}
       onPress={item.onPress}
+      disabled={item.isLoading}
       activeOpacity={0.6}
       style={styles.menuItem}
     >
       <View style={[styles.menuIconWrap, { backgroundColor: item.iconBg }]}>
-        <Ionicons name={item.icon} size={20} color={item.iconColor} />
+        {item.isLoading ? (
+          <ActivityIndicator size="small" color={item.iconColor} />
+        ) : (
+          <Ionicons name={item.icon} size={20} color={item.iconColor} />
+        )}
       </View>
       <View style={[styles.menuTextWrap, !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: theme.colors.borderColor + '40' }]}>
         <View style={styles.menuLabelWrap}>
           <Text style={[styles.menuLabel, { color: theme.colors.primaryTextColor }]}>{item.label}</Text>
           {item.subtitle && (
-            <Text style={[styles.menuSubtitle, { color: theme.colors.placeHolderTextColor }]}>{item.subtitle}</Text>
+            <Text style={[styles.menuSubtitle, { color: item.isLoading ? theme.colors.themeColor : theme.colors.placeHolderTextColor }]}>{item.subtitle}</Text>
           )}
         </View>
-        <Ionicons name="chevron-forward" size={17} color={theme.colors.placeHolderTextColor} />
+        {!item.isLoading && (
+          <Ionicons name="chevron-forward" size={17} color={theme.colors.placeHolderTextColor} />
+        )}
       </View>
     </TouchableOpacity>
   );

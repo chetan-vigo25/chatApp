@@ -7,11 +7,22 @@ const KEY_THUMBNAILS = `${KEY_PREFIX}:thumbnails_cache`;
 const KEY_DOWNLOAD_QUEUE = `${KEY_PREFIX}:download_queue`;
 const KEY_PENDING_UPLOADS = `${KEY_PREFIX}:pending_uploads`;
 
-const APP_MEDIA_ROOT = `${FileSystem.documentDirectory}VibeConnect/media/`;
-const APP_MEDIA_IMAGES = `${APP_MEDIA_ROOT}images/`;
-const APP_MEDIA_VIDEOS = `${APP_MEDIA_ROOT}videos/`;
-const APP_MEDIA_DOCUMENTS = `${APP_MEDIA_ROOT}documents/`;
-const APP_MEDIA_THUMBNAILS = `${APP_MEDIA_ROOT}cache/thumbnails/`;
+// WhatsApp-style folder structure:
+//   WhatsApp/Media/WhatsApp Images/
+//   WhatsApp/Media/WhatsApp Video/
+//   WhatsApp/Media/WhatsApp Documents/
+// Our equivalent:
+//   VibeConnect/Media/VibeConnect Images/
+//   VibeConnect/Media/VibeConnect Video/
+//   VibeConnect/Media/VibeConnect Documents/
+//   VibeConnect/Media/VibeConnect Audio/
+const APP_NAME = 'VibeConnect';
+const APP_MEDIA_ROOT = `${FileSystem.documentDirectory}${APP_NAME}/Media/`;
+const APP_MEDIA_IMAGES = `${APP_MEDIA_ROOT}${APP_NAME} Images/`;
+const APP_MEDIA_VIDEOS = `${APP_MEDIA_ROOT}${APP_NAME} Video/`;
+const APP_MEDIA_AUDIO = `${APP_MEDIA_ROOT}${APP_NAME} Audio/`;
+const APP_MEDIA_DOCUMENTS = `${APP_MEDIA_ROOT}${APP_NAME} Documents/`;
+const APP_MEDIA_THUMBNAILS = `${APP_MEDIA_ROOT}.Thumbnails/`;
 
 const safeJsonParse = (raw, fallback) => {
   try {
@@ -82,6 +93,7 @@ class LocalStorageService {
     await ensureDir(APP_MEDIA_ROOT);
     await ensureDir(APP_MEDIA_IMAGES);
     await ensureDir(APP_MEDIA_VIDEOS);
+    await ensureDir(APP_MEDIA_AUDIO);
     await ensureDir(APP_MEDIA_DOCUMENTS);
     await ensureDir(APP_MEDIA_THUMBNAILS);
 
@@ -115,6 +127,7 @@ class LocalStorageService {
     const type = (messageType || '').toLowerCase();
     if (type === 'image' || type === 'photo') return APP_MEDIA_IMAGES;
     if (type === 'video') return APP_MEDIA_VIDEOS;
+    if (type === 'audio' || type === 'voice' || type === 'ptt') return APP_MEDIA_AUDIO;
     return APP_MEDIA_DOCUMENTS;
   }
 
@@ -610,6 +623,7 @@ export {
   APP_MEDIA_ROOT,
   APP_MEDIA_IMAGES,
   APP_MEDIA_VIDEOS,
+  APP_MEDIA_AUDIO,
   APP_MEDIA_DOCUMENTS,
   APP_MEDIA_THUMBNAILS,
 };

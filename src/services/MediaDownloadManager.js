@@ -292,6 +292,11 @@ class MediaDownloadManager {
             error: null,
           });
 
+          // Auto-save to device gallery (WhatsApp-style visible folder)
+          try {
+            mediaService.saveToDeviceMedia(localPath, identity.messageType).catch(() => {});
+          } catch {}
+
           return localPath;
         } catch (error) {
           finalError = error;

@@ -1,5 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
+import * as MediaLibrary from 'expo-media-library';
+import { Platform } from 'react-native';
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../Config/Https';
 import localStorageService from './LocalStorageService';
@@ -223,6 +225,56 @@ class MediaService {
 
     console.log('[MEDIA:LOCAL:SAVE]', payload);
     return localStorageService.upsertMediaFile(payload);
+  }
+
+  /**
+   * After downloading, save a copy to device's visible media folder.
+   * This makes the file appear in:
+   *   - Android: internal storage/Android/media/com.chat.baatCheet/VibeConnect/Media/VibeConnect Images/
+   *   - Also visible in Gallery app and file manager
+   *
+   * WhatsApp equivalent:
+   *   internal storage/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images/
+   */
+  async saveToDeviceMedia(localPath, messageType) {
+    if (!localPath) return null;
+    if (Platform.OS !== 'android') return null; // iOS auto-handles via media library
+
+    try {
+      // Check file exists
+      const info = await FileSystem.getInfoAsync(localPath);
+      if (!info.exists) return null;
+
+      const type = (messageType || '').toLowerCase();
+      const isMediaType = type === 'image' || type === 'photo' || type === 'video';
+
+      if (!isMediaType) return null; // only save images/videos to gallery
+
+      // Request media library permission
+      const { status } = await MediaLibrary.requestPermissionsAsync();
+      if (status !== 'granted') return null;
+
+      // Save to media library — this creates the file in:
+      // /storage/emulated/0/Android/media/com.chat.baatCheet/
+      const asset = await MediaLibrary.createAssetAsync(localPath);
+
+      // Create album with WhatsApp-style name
+      const albumName = type === 'video' ? 'VibeConnect Video' : 'VibeConnect Images';
+      const album = await MediaLibrary.getAlbumAsync(albumName);
+
+      if (album) {
+        await MediaLibrary.addAssetsToAlbumAsync([asset], album, false);
+      } else {
+        await MediaLibrary.createAlbumAsync(albumName, asset, false);
+      }
+
+      console.log('[MEDIA:GALLERY:SAVED]', { albumName, uri: asset.uri });
+      return asset.uri;
+    } catch (err) {
+      // Non-critical — file is still in app storage
+      console.warn('[MEDIA:GALLERY:FAIL]', err?.message);
+      return null;
+    }
   }
 }
 
