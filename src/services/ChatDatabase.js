@@ -228,6 +228,9 @@ const rowToMsg = (row) => {
     payload: pp,
     // Restore mediaMeta from payload (not stored as a column)
     mediaMeta: pp?.mediaMeta || pp?.contact || null,
+    // Restore forwarded flag from payload (not a column)
+    isForwarded: Boolean(pp?.isForwarded || pp?._isForwarded || pp?.forwarded || pp?.forwardedMessage),
+    forwardedFrom: pp?.forwardedFrom || pp?._forwardedFrom || pp?.originalMessageId || null,
     // Reply: check column first, then payload fallback
     replyToMessageId: row.reply_to_message_id || pp?._replyToMessageId || null,
     replyPreviewText: row.reply_preview_text || pp?._replyPreviewText || null,
@@ -463,6 +466,9 @@ const _runInsert = async (db, msg, _retried = false) => {
     ...(msg.payload && typeof msg.payload === 'object' ? msg.payload : {}),
     // Preserve mediaMeta (location, contact data) in payload so it survives SQLite round-trip
     ...(msg.mediaMeta && typeof msg.mediaMeta === 'object' && !msg.payload?.mediaMeta ? { mediaMeta: msg.mediaMeta } : {}),
+    // Preserve forwarded flag in payload so it survives SQLite round-trip
+    ...(msg.isForwarded ? { isForwarded: true, _isForwarded: true } : {}),
+    ...(msg.forwardedFrom ? { forwardedFrom: msg.forwardedFrom, _forwardedFrom: msg.forwardedFrom } : {}),
     // Carry forward existing reply data from old payload
     ...(existingReplyInPayload ? {
       _replyToMessageId: existingReplyInPayload._replyToMessageId,

@@ -2158,7 +2158,8 @@ export default function ChatScreen({ navigation, route }) {
     }
     // Extract mentions before sending (text gets cleared after send)
     const mentions = isGroupChat ? getMentionsPayload(text) : undefined;
-    await handleSendText(mentions);
+    // Fire-and-forget: message appears instantly via optimistic UI, no need to await
+    handleSendText(mentions).catch(err => console.warn('[Send] error:', err?.message));
     if (isGroupChat) resetMentions();
   };
 
@@ -3844,6 +3845,24 @@ export default function ChatScreen({ navigation, route }) {
               </Text>
             )}
 
+            {/* Forwarded label — WhatsApp style */}
+            {!isDeletedMessage && (msg.isForwarded || msg.forwardedFrom || msg.forwarded || msg.payload?.isForwarded || msg.payload?.forwarded) && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
+                <Ionicons
+                  name="arrow-redo"
+                  size={14}
+                  color={isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0'}
+                  style={{ marginRight: 4 }}
+                />
+                <Text style={{
+                  fontFamily: 'Roboto-Regular',
+                  fontSize: 12,
+                  fontStyle: 'italic',
+                  color: isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0',
+                }}>Forwarded</Text>
+              </View>
+            )}
+
             {/* Reply quote bubble */}
             {msg.replyToMessageId && !isDeletedMessage && (
               <ReplyBubble
@@ -4302,6 +4321,35 @@ export default function ChatScreen({ navigation, route }) {
                     <Ionicons name="arrow-undo-outline" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
+                {/* Forward */}
+                {selectedMessage.length > 0 && (() => {
+                  const selectedMsgs = selectedMessage
+                    .map(id => messages.find(m => sameId(m.id, id) || sameId(m.serverMessageId, id) || sameId(m.tempId, id)))
+                    .filter(m => m && !m.isDeleted);
+                  // Server needs the MongoDB _id — use serverMessageId (which IS the _id)
+                  // Fallback: if id is not a temp ID, it was set by acknowledgeMessage to the server _id
+                  const forwardableIds = selectedMsgs.map(m => {
+                    if (m.serverMessageId) return m.serverMessageId;
+                    if (m.id && !String(m.id).startsWith('temp_')) return m.id;
+                    return null;
+                  }).filter(Boolean);
+                  if (forwardableIds.length === 0) return null;
+                  return (
+                    <TouchableOpacity
+                      onPress={() => {
+                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                        setReactionMsgId(null);
+                        clearSelectedMessages();
+                        navigation.navigate('ForwardMessage', {
+                          messageIds: forwardableIds,
+                          messages: selectedMsgs,
+                        });
+                      }}
+                      style={{ padding: 10 }}>
+                      <Ionicons name="arrow-redo-outline" size={22} color={theme.colors.primaryTextColor} />
+                    </TouchableOpacity>
+                  );
+                })()}
                 {/* Edit — only if NOT seen/read */}
                 {canEdit && (
                   <TouchableOpacity

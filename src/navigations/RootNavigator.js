@@ -30,6 +30,7 @@ import CreateGroup from "../screens/group/CreateGroup";
 import GroupInfo from "../screens/group/GroupInfo";
 import EditGroup from "../screens/group/EditGroup";
 import AddGroupMembers from "../screens/group/AddGroupMembers";
+import ForwardMessageScreen from "../screens/chats/ForwardMessageScreen";
 
 import BottomTabNavigator from "./BottomTabNavigator";
 
@@ -117,6 +118,7 @@ export default function RootNavigator() {
           <Stack.Screen name="GroupInfo" component={GroupInfo} />
           <Stack.Screen name="EditGroup" component={EditGroup} />
           <Stack.Screen name="AddGroupMembers" component={AddGroupMembers} />
+          <Stack.Screen name="ForwardMessage" component={ForwardMessageScreen} />
         </Stack.Navigator>
       </NavigationContainer>
     </SafeAreaView>

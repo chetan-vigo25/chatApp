@@ -14,6 +14,7 @@ import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../u
 import { useRealtimeChat } from "./RealtimeChatContext";
 import localStorageService from '../services/LocalStorageService';
 import ChatDatabase from '../services/ChatDatabase';
+import { isInForwardWindow, clearForwardTimestamp } from '../utils/forwardState';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
 import { apiCall } from '../Config/Https';
 import {
@@ -259,6 +260,8 @@ export default function useChatLogic({ navigation, route }) {
   const deletedTombstonesRef = useRef({});
   // Track tempIds of recently sent messages for dedup against sync responses
   const sentTempIdsRef = useRef(new Set());
+  // Track message IDs that were created by forwarding — persists across chat navigations
+  const forwardedMsgIdsRef = useRef(new Set());
   const pendingPreviewSyncRef = useRef(false);
   // Cache reply data by messageId — never lost even if SQLite row is overwritten
   const replyDataCacheRef = useRef({});
@@ -1203,6 +1206,14 @@ export default function useChatLogic({ navigation, route }) {
       }
       scheduleMarkVisibleUnreadAsRead();
 
+      // If opened from Forward screen, do an extra sync to pick up forwarded messages
+      // The server already processed the forward — we just need to fetch the result
+      if (route?.params?.openedFromForward) {
+        setTimeout(() => {
+          fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
+        }, 400);
+      }
+
       setIsLoadingInitial(false);
       setIsLoadingFromLocal(false);
       initialLoadDoneRef.current = true;
@@ -1447,6 +1458,8 @@ export default function useChatLogic({ navigation, route }) {
       reactions: apiMsg?.reactions || null,
       isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited),
       editedAt: apiMsg?.editedAt || apiMsg?.edited_at || null,
+      isForwarded: Boolean(apiMsg?.isForwarded || apiMsg?.is_forwarded || apiMsg?.forwarded || apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.forwardedMessage || apiMsg?.isForwardedMessage),
+      forwardedFrom: apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.originalMessageId || apiMsg?.forwardedMessageId || null,
       isDeleted: resolvedIsDeleted,
       deletedFor: resolvedDeletedFor,
       deletedBy: resolvedDeletedBy,
@@ -1792,7 +1805,46 @@ export default function useChatLogic({ navigation, route }) {
           };
         });
 
-        setAllMessages(enriched);
+        // MERGE strategy: keep optimistic messages that aren't in SQLite yet.
+        // This prevents the "message disappears then reappears" flicker.
+        // An optimistic message is one with a temp ID that hasn't been written to DB yet.
+        setAllMessages(prev => {
+          // Build a set of ALL IDs from DB messages
+          const dbIdSet = new Set();
+          for (const m of enriched) {
+            if (m.id) dbIdSet.add(m.id);
+            if (m.serverMessageId) dbIdSet.add(m.serverMessageId);
+            if (m.tempId) dbIdSet.add(m.tempId);
+          }
+
+          // Find optimistic messages in current state that are NOT in DB yet
+          const optimistic = prev.filter(m => {
+            const id = m.id || m.tempId;
+            if (!id) return false;
+            // Keep if: has temp ID, status is 'sending'/'uploaded', and not found in DB
+            const isTempMsg = String(id).startsWith('temp_');
+            if (!isTempMsg) return false;
+            const inDB = dbIdSet.has(m.id) || dbIdSet.has(m.tempId) || dbIdSet.has(m.serverMessageId);
+            return !inDB;
+          });
+
+          if (optimistic.length === 0) return enriched;
+
+          // Merge: optimistic messages first (newest), then DB messages
+          // Dedup by ID to prevent any doubles
+          const seenIds = new Set();
+          const merged = [];
+          for (const m of [...optimistic, ...enriched]) {
+            const ids = [m.id, m.serverMessageId, m.tempId].filter(Boolean);
+            if (ids.some(id => seenIds.has(id))) continue;
+            for (const id of ids) seenIds.add(id);
+            merged.push(m);
+          }
+
+          // Sort by timestamp descending (newest first)
+          merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+          return merged;
+        });
       } catch (err) {
         console.warn('[ChatDB] refreshMessagesFromDB error:', err);
       }
@@ -2848,6 +2900,21 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:quote:response', onQuoteResponse);
     registerSocketHandler('message:reply:response', onQuoteResponse);
 
+    // Track forwarded message IDs — when these arrive via message:new, mark as forwarded
+    const onForwardedMessage = (data) => {
+      const source = data?.data || data;
+      // Collect all forwarded message IDs so we can tag them when they arrive
+      const msgs = source?.forwardedMessages || [];
+      for (const fwd of msgs) {
+        const fwdId = fwd?.messageId || fwd?._id;
+        if (fwdId) forwardedMsgIdsRef.current.add(String(fwdId));
+      }
+      // Trigger a sync to pick up forwarded messages
+      setTimeout(() => refreshMessagesFromDB(), 500);
+    };
+    registerSocketHandler('message:forward:response', onForwardedMessage);
+    registerSocketHandler('message:forward:multiple:response', onForwardedMessage);
+
     const onMessageSent = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id;
@@ -2871,6 +2938,13 @@ export default function useChatLogic({ navigation, route }) {
       if (chatInPayload && !sameId(chatInPayload, currentChatId)) return;
       const msgId = source?.messageId || source?._id || source?.id;
       if (msgId) handledMsgIds.add(String(msgId));
+
+      // Check if this message was forwarded (tagged by forward response handler)
+      if (msgId && forwardedMsgIdsRef.current.has(String(msgId))) {
+        source.isForwarded = true;
+        forwardedMsgIdsRef.current.delete(String(msgId));
+      }
+
       handleReceivedMessage(source);
     };
     registerSocketHandler('message:new', onMessageNew);
@@ -3731,27 +3805,40 @@ export default function useChatLogic({ navigation, route }) {
 
   const updateMessageStatus = useCallback(async (tempId, status, serverData = null) => {
     const normalizedStatus = normalizeMessageStatus(status) || status;
-
-    // SQLite-first: update status in DB
     const serverMessageId = serverData?.messageId || serverData?._id;
 
-    // If server provided a messageId, do the ACK transition (tempId → serverMessageId)
+    // INSTANT UI: update status in state immediately (no flicker)
+    setAllMessages(prev => {
+      let changed = false;
+      const updated = prev.map(m => {
+        const isMatch = (tempId && (m.id === tempId || m.tempId === tempId)) ||
+                        (serverMessageId && (m.id === serverMessageId || m.serverMessageId === serverMessageId));
+        if (!isMatch) return m;
+        changed = true;
+        return {
+          ...m,
+          status: normalizedStatus,
+          ...(serverMessageId ? { serverMessageId, id: serverMessageId, synced: true } : {}),
+        };
+      });
+      return changed ? updated : prev;
+    });
+
+    // Background: persist to SQLite
     if (serverMessageId && tempId && serverMessageId !== tempId) {
-      await ChatDatabase.acknowledgeMessage(tempId, serverMessageId);
-      // Copy reply data to permanent table under serverId
+      ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
       const tempReply = await ChatDatabase.getReplyData(tempId);
       if (tempReply) {
         ChatDatabase.saveReplyData(serverMessageId, tempReply).catch(() => {});
       }
     }
 
-    // Update status in SQLite (only advances, never regresses)
     const targetId = serverMessageId || tempId;
     if (targetId) {
-      await ChatDatabase.updateMessageStatus(targetId, normalizedStatus);
+      ChatDatabase.updateMessageStatus(targetId, normalizedStatus).catch(() => {});
     }
 
-    // Refresh UI from SQLite
+    // Debounced DB refresh (merge strategy preserves optimistic messages)
     refreshMessagesFromDB();
 
     // Update chat list preview
@@ -3966,9 +4053,17 @@ export default function useChatLogic({ navigation, route }) {
       }).catch(() => {});
     }
 
-    // SQLite-first: write to DB immediately, then refresh UI from DB
-    await ChatDatabase.upsertMessage({ ...newMessage, chatId: chatIdRef.current });
-    refreshMessagesFromDB(true);
+    // INSTANT UI: Add message to state immediately (WhatsApp-style optimistic update)
+    // Don't wait for SQLite — show it NOW, persist in background
+    setAllMessages(prev => {
+      const updated = [newMessage, ...prev];
+      return updated;
+    });
+
+    // Write to SQLite in background (non-blocking)
+    ChatDatabase.upsertMessage({ ...newMessage, chatId: chatIdRef.current }).catch(err => {
+      console.warn('[handleSendText] SQLite write failed:', err?.message);
+    });
 
     const socket = socketRef.current || getSocket();
     try {
@@ -4029,31 +4124,32 @@ export default function useChatLogic({ navigation, route }) {
       } : null,
     });
 
-    setAllMessages((prev) => {
-      const localMsg = {
-        id: tempId,
-        tempId,
-        type: 'location',
-        mediaType: 'location',
-        text: payload.text,
-        mediaUrl: payload.mediaUrl,
-        previewUrl: payload.mediaUrl,
-        mediaMeta: payload.mediaMeta,
-        time: moment(timestamp).format('hh:mm A'),
-        date: moment(timestamp).format('YYYY-MM-DD'),
-        senderId: currentUserIdRef.current,
-        senderType: 'self',
-        receiverId: chatData.peerUser?._id || null,
-        status: 'sending',
-        createdAt: timestamp,
-        timestamp: new Date(timestamp).getTime(),
-        payload,
-        chatId: chatIdRef.current,
-      };
-      const next = deduplicateMessages([localMsg, ...prev]);
-      saveMessagesToLocal(next);
-      return next;
-    });
+    const localMsg = {
+      id: tempId,
+      tempId,
+      type: 'location',
+      mediaType: 'location',
+      text: payload.text,
+      mediaUrl: payload.mediaUrl,
+      previewUrl: payload.mediaUrl,
+      mediaMeta: payload.mediaMeta,
+      time: moment(timestamp).format('hh:mm A'),
+      date: moment(timestamp).format('YYYY-MM-DD'),
+      senderId: currentUserIdRef.current,
+      senderType: 'self',
+      receiverId: chatData.peerUser?._id || null,
+      status: 'sending',
+      createdAt: timestamp,
+      timestamp: new Date(timestamp).getTime(),
+      payload,
+      chatId: chatIdRef.current,
+    };
+
+    // INSTANT UI: show message immediately
+    setAllMessages((prev) => [localMsg, ...prev]);
+
+    // Write to SQLite in background (non-blocking)
+    ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
 
     await sendMessageViaSocket(payload, tempId);
     return { success: true, tempId };
@@ -4118,33 +4214,34 @@ export default function useChatLogic({ navigation, route }) {
       } : null,
     });
 
-    setAllMessages((prev) => {
-      const localMsg = {
-        id: tempId,
-        tempId,
-        serverMessageId: messageId,
-        type: 'contact',
-        mediaType: 'contact',
-        text: name,
-        mediaUrl: profileImage || '',
-        previewUrl: profileImage || '',
-        mediaMeta: contactData,
-        payload: { contact: contactData, isMediaDownloaded: false },
-        time: moment(timestamp).format('hh:mm A'),
-        date: moment(timestamp).format('YYYY-MM-DD'),
-        senderId: currentUserIdRef.current,
-        senderType: 'self',
-        receiverId: chatData.peerUser?._id || null,
-        status: 'sending',
-        createdAt: timestamp,
-        timestamp: new Date(timestamp).getTime(),
-        synced: false,
-        chatId: chatIdRef.current,
-      };
-      const next = deduplicateMessages([localMsg, ...prev]);
-      saveMessagesToLocal(next);
-      return next;
-    });
+    const localMsg = {
+      id: tempId,
+      tempId,
+      serverMessageId: messageId,
+      type: 'contact',
+      mediaType: 'contact',
+      text: name,
+      mediaUrl: profileImage || '',
+      previewUrl: profileImage || '',
+      mediaMeta: contactData,
+      payload: { contact: contactData, isMediaDownloaded: false },
+      time: moment(timestamp).format('hh:mm A'),
+      date: moment(timestamp).format('YYYY-MM-DD'),
+      senderId: currentUserIdRef.current,
+      senderType: 'self',
+      receiverId: chatData.peerUser?._id || null,
+      status: 'sending',
+      createdAt: timestamp,
+      timestamp: new Date(timestamp).getTime(),
+      synced: false,
+      chatId: chatIdRef.current,
+    };
+
+    // INSTANT UI: show message immediately
+    setAllMessages((prev) => [localMsg, ...prev]);
+
+    // Write to SQLite in background (non-blocking)
+    ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
 
     try {
       const socket = socketRef.current || getSocket();
@@ -4230,6 +4327,19 @@ export default function useChatLogic({ navigation, route }) {
   const handleReceivedMessage = useCallback(async (msg) => {
     resetIdleTimer();
 
+    // Debug: log forwarded message fields from server
+    if (msg?.isForwarded || msg?.forwarded || msg?.forwardedFrom || msg?.forwardedMessage) {
+      console.log('[FWD_DEBUG] Received forwarded message:', JSON.stringify({
+        messageId: msg?.messageId || msg?._id,
+        isForwarded: msg?.isForwarded,
+        forwarded: msg?.forwarded,
+        forwardedFrom: msg?.forwardedFrom,
+        forwardedMessage: msg?.forwardedMessage,
+        is_forwarded: msg?.is_forwarded,
+        text: msg?.text?.slice(0, 30),
+      }));
+    }
+
     const messageId = normalizeId(msg.messageId || msg._id);
     const incomingTempId = normalizeId(msg.tempId);
     const incomingSenderId = msg?.senderId;
@@ -4296,9 +4406,22 @@ export default function useChatLogic({ navigation, route }) {
       }
     }
 
+    // Detect forwarded messages:
+    // 1. Server explicitly marks it (isForwarded, forwarded, forwardedFrom, etc.)
+    // 2. Message ID is in our forwardedMsgIds set (from forward:response)
+    // 3. Message arrived within the forward time window (set by ForwardMessageScreen)
+    const isKnownForwarded = Boolean(msg.isForwarded || msg.forwarded || msg.forwardedFrom || msg.is_forwarded || msg.forwardedMessage);
+    const isTrackedForward = messageId && forwardedMsgIdsRef.current.has(String(messageId));
+    const isWindowForward = isInForwardWindow(15000) && isSelfMessage;
+    const shouldMarkForwarded = isKnownForwarded || isTrackedForward || isWindowForward;
+
+    if (isTrackedForward) forwardedMsgIdsRef.current.delete(String(messageId));
+    if (isWindowForward && shouldMarkForwarded) clearForwardTimestamp();
+
     // Normalize the incoming message
     const receivedMessage = normalizeIncomingMessage({
       ...msg,
+      ...(shouldMarkForwarded ? { isForwarded: true } : {}),
       messageId,
       chatId: msg?.chatId || chatIdRef.current,
     });
@@ -4871,12 +4994,11 @@ export default function useChatLogic({ navigation, route }) {
     };
 
     if (shouldInsertLocal) {
-      setAllMessages((prev) => {
-        const updated = [localMsg, ...prev];
-        const uniqueMessages = deduplicateMessages(updated);
-        saveMessagesToLocal(uniqueMessages);
-        return uniqueMessages;
-      });
+      // INSTANT UI: show message immediately with local preview
+      setAllMessages((prev) => [localMsg, ...prev]);
+
+      // Write to SQLite in background (non-blocking)
+      ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
     }
 
     if (!isConnected) {
