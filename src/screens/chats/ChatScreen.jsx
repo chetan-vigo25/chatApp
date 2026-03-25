@@ -4011,41 +4011,42 @@ export default function ChatScreen({ navigation, route }) {
               )}
             </View>
 
-            {/* Floating emoji reaction picker — WhatsApp style (over the message) */}
-            <ReactionPicker
-              visible={reactionMsgId === messageKey && !isDeletedMessage}
+          </View>
+
+          {/* Floating emoji reaction picker — WhatsApp style (over the message) */}
+          <ReactionPicker
+            visible={reactionMsgId === messageKey && !isDeletedMessage}
+            isMyMessage={isMyMessage}
+            isDarkMode={isDarkMode}
+            themeColor={theme.colors.themeColor}
+            currentReactions={msg?.reactions}
+            currentUserId={currentUserId}
+            onSelect={(emoji) => {
+              toggleReaction(messageKey, emoji);
+              setReactionMsgId(null);
+              clearSelectedMessages();
+            }}
+            onClose={() => {
+              setReactionMsgId(null);
+              clearSelectedMessages();
+            }}
+          />
+
+          {/* WhatsApp-style reaction pill — overlaps bottom edge of bubble */}
+          {!isDeletedMessage && (
+            <ReactionBar
+              reactions={msg?.reactions}
+              currentUserId={currentUserId}
               isMyMessage={isMyMessage}
               isDarkMode={isDarkMode}
               themeColor={theme.colors.themeColor}
-              currentReactions={msg?.reactions}
-              currentUserId={currentUserId}
-              onSelect={(emoji) => {
-                toggleReaction(messageKey, emoji);
-                setReactionMsgId(null);
-                clearSelectedMessages();
-              }}
-              onClose={() => {
-                setReactionMsgId(null);
-                clearSelectedMessages();
+              scaleAnims={reactionScaleAnims}
+              onToggleReaction={(emoji) => toggleReaction(messageKey, emoji)}
+              onShowDetail={(emoji) => {
+                setReactionDetailModal({ visible: true, reactions: msg.reactions, selectedEmoji: emoji, messageId: messageKey });
               }}
             />
-
-            {/* WhatsApp-style reaction pill — overlaps bottom of bubble */}
-            {!isDeletedMessage && (
-              <ReactionBar
-                reactions={msg?.reactions}
-                currentUserId={currentUserId}
-                isMyMessage={isMyMessage}
-                isDarkMode={isDarkMode}
-                themeColor={theme.colors.themeColor}
-                scaleAnims={reactionScaleAnims}
-                onToggleReaction={(emoji) => toggleReaction(messageKey, emoji)}
-                onShowDetail={(emoji) => {
-                  setReactionDetailModal({ visible: true, reactions: msg.reactions, selectedEmoji: emoji, messageId: messageKey });
-                }}
-              />
-            )}
-          </View>
+          )}
         </Pressable>
         </SwipeReplyRow>
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}

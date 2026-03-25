@@ -64,7 +64,6 @@ const ReactionBar = React.memo(({
           styles.pill,
           {
             backgroundColor: isDarkMode ? '#1B2B34' : '#FFFFFF',
-            borderColor: isDarkMode ? '#2A3A44' : '#E2E2E2',
           },
         ]}
         accessibilityLabel={`${entries.map(([e]) => e).join(' ')} reactions, ${totalCount} total`}
@@ -88,29 +87,29 @@ const ReactionBar = React.memo(({
 
 const styles = StyleSheet.create({
   wrapper: {
-    marginBottom: -15,
+    marginTop: -8,
+    marginBottom: 2,
     zIndex: 1,
   },
   pill: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 12,
+    borderRadius: 14,
     paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderWidth: 1,
-    elevation: 2,
+    paddingVertical: 3,
+    elevation: 3,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.1,
-    shadowRadius: 2,
+    shadowOpacity: 0.12,
+    shadowRadius: 3,
   },
   emoji: {
-    fontSize: 16,
-    marginHorizontal: 1,
+    fontSize: 17,
+    marginHorizontal: 0.5,
   },
   count: {
     fontSize: 12,
-    marginLeft: 2,
+    marginLeft: 3,
     fontFamily: 'Roboto-Medium',
   },
 });

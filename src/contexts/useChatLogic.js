@@ -3853,8 +3853,12 @@ export default function useChatLogic({ navigation, route }) {
           const isMatch = m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId;
           if (!isMatch) return m;
           changed = true;
-          const oldReactions = m.reactions || {};
-          const newReactions = updater({ ...oldReactions });
+          // Deep-copy each emoji entry so updater can mutate safely
+          const copy = {};
+          for (const [k, v] of Object.entries(m.reactions || {})) {
+            copy[k] = { count: v.count, users: [...(v.users || [])] };
+          }
+          const newReactions = updater(copy);
           // Persist to SQLite in background
           ChatDatabase.updateReactions(messageId, newReactions).catch(() => {});
           return { ...m, reactions: Object.keys(newReactions).length > 0 ? newReactions : undefined };
@@ -3885,10 +3889,22 @@ export default function useChatLogic({ navigation, route }) {
       if (!emoji || !reactionUserId) return;
 
       applyReactionUpdate(messageId, (reactions) => {
-        const existing = reactions[emoji] || { count: 0, users: [] };
-        if (action === 'add' && !existing.users.includes(reactionUserId)) {
-          reactions[emoji] = { count: existing.count + 1, users: [...existing.users, reactionUserId] };
+        if (action === 'add') {
+          // Remove user from ALL emojis first (one-reaction-per-user)
+          for (const [k, d] of Object.entries(reactions)) {
+            const idx = (d.users || []).indexOf(reactionUserId);
+            if (idx !== -1) {
+              d.users.splice(idx, 1);
+              d.count = Math.max(0, d.count - 1);
+              if (d.count === 0) delete reactions[k];
+            }
+          }
+          const entry = reactions[emoji] || { count: 0, users: [] };
+          entry.users.push(reactionUserId);
+          entry.count = entry.users.length;
+          reactions[emoji] = entry;
         } else if (action === 'remove') {
+          const existing = reactions[emoji] || { count: 0, users: [] };
           reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== reactionUserId) };
           if (reactions[emoji].count === 0) delete reactions[emoji];
         }
@@ -3921,10 +3937,20 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       applyReactionUpdate(messageId, (reactions) => {
-        const existing = reactions[emoji] || { count: 0, users: [] };
-        if (!existing.users.includes(reactionUserId)) {
-          reactions[emoji] = { count: existing.count + 1, users: [...existing.users, reactionUserId] };
+        // Remove user from ALL emojis first (one-reaction-per-user)
+        for (const [k, d] of Object.entries(reactions)) {
+          const idx = (d.users || []).indexOf(reactionUserId);
+          if (idx !== -1) {
+            d.users.splice(idx, 1);
+            d.count = Math.max(0, d.count - 1);
+            if (d.count === 0) delete reactions[k];
+          }
         }
+        // Add to the new emoji
+        const entry = reactions[emoji] || { count: 0, users: [] };
+        entry.users.push(reactionUserId);
+        entry.count = entry.users.length;
+        reactions[emoji] = entry;
         return reactions;
       });
     };
@@ -6263,22 +6289,32 @@ export default function useChatLogic({ navigation, route }) {
     const targetMsg = currentMsgs.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
     const oldReactions = targetMsg?.reactions || {};
 
-    const reactions = { ...oldReactions };
+    // Deep-copy each emoji entry so we don't mutate state
+    const reactions = {};
+    for (const [k, v] of Object.entries(oldReactions)) {
+      reactions[k] = { count: v.count, users: [...(v.users || [])] };
+    }
+
     const existing = reactions[emoji] || { count: 0, users: [] };
     const hasReacted = existing.users?.includes(uid);
     const action = hasReacted ? 'remove' : 'add';
 
-    if (hasReacted) {
-      reactions[emoji] = {
-        count: Math.max(0, existing.count - 1),
-        users: existing.users.filter((u) => u !== uid),
-      };
-      if (reactions[emoji].count === 0) delete reactions[emoji];
-    } else {
-      reactions[emoji] = {
-        count: existing.count + 1,
-        users: [...(existing.users || []), uid],
-      };
+    // STEP 1: Remove this user from ALL emojis (enforce one-reaction-per-user)
+    for (const [key, data] of Object.entries(reactions)) {
+      const idx = data.users.indexOf(uid);
+      if (idx !== -1) {
+        data.users.splice(idx, 1);
+        data.count = Math.max(0, data.count - 1);
+        if (data.count === 0) delete reactions[key];
+      }
+    }
+
+    // STEP 2: If it was a different emoji (not toggle-off), add to the new one
+    if (!hasReacted) {
+      const entry = reactions[emoji] || { count: 0, users: [] };
+      entry.users.push(uid);
+      entry.count = entry.users.length;
+      reactions[emoji] = entry;
     }
 
     // INSTANT UI update — no DB round-trip, no flicker
@@ -6325,15 +6361,24 @@ export default function useChatLogic({ navigation, route }) {
     const targetMsg = currentMsgs.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
     const oldReactions = targetMsg?.reactions || {};
 
-    const reactions = { ...oldReactions };
-    const existing = reactions[emoji] || { count: 0, users: [] };
-    if (!existing.users?.includes(uid)) return;
+    // Deep-copy
+    const reactions = {};
+    for (const [k, v] of Object.entries(oldReactions)) {
+      reactions[k] = { count: v.count, users: [...(v.users || [])] };
+    }
 
-    reactions[emoji] = {
-      count: Math.max(0, existing.count - 1),
-      users: existing.users.filter(u => u !== uid),
-    };
-    if (reactions[emoji].count === 0) delete reactions[emoji];
+    // Remove user from ALL emojis (cleans up any duplicates too)
+    let removed = false;
+    for (const [key, data] of Object.entries(reactions)) {
+      const idx = data.users.indexOf(uid);
+      if (idx !== -1) {
+        data.users.splice(idx, 1);
+        data.count = Math.max(0, data.count - 1);
+        if (data.count === 0) delete reactions[key];
+        removed = true;
+      }
+    }
+    if (!removed) return;
 
     // INSTANT UI update
     updateReactionsInState(msgId, reactions);
