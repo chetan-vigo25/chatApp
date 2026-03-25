@@ -51,6 +51,7 @@ import ReportBottomSheet from '../../components/ReportBottomSheet';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import MentionText from '../../components/MentionText';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
+import ScheduleTimePicker from '../../components/ScheduleTimePicker';
 import ReplyBubble from '../../components/ReplyBubble';
 import LocationBubble from '../../components/LocationBubble';
 
@@ -125,10 +126,12 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   onOpenAttachment,
   onRemovePendingMedia,
   onSubmit,
+  onSchedule,
   mentionSuggestionsNode,
 }, ref) {
   const hasContent = Boolean(text.trim() || pendingMedia);
   const showAttachment = !hasContent;
+  const [showSchedulePicker, setShowSchedulePicker] = useState(false);
   const iconColor = isDarkMode ? 'rgba(212,229,240,0.68)': '#111111';
   const inputTextColor = isDarkMode ? '#F2F8FC' : '#111111';
   const pendingTextColor = isDarkMode ? '#E8F2F8' : '#111111';
@@ -324,11 +327,13 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
       <Animated.View style={{ marginLeft: 8, transform: [{ scale: submitScale }] }}>
         <TouchableOpacity
           onPress={onSubmit}
+          onLongPress={hasContent ? () => setShowSchedulePicker(true) : undefined}
+          delayLongPress={400}
           onPressIn={handlePressInSubmit}
           onPressOut={handlePressOutSubmit}
           disabled={isSearching}
           accessibilityRole="button"
-          accessibilityLabel={hasContent ? 'Send message' : 'Voice message'}
+          accessibilityLabel={hasContent ? 'Send message (long press to schedule)' : 'Voice message'}
           activeOpacity={0.85}
           style={{
             width: 52,
@@ -370,6 +375,17 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           </Animated.View>
         </TouchableOpacity>
       </Animated.View>
+
+      {/* Schedule Time Picker */}
+      <ScheduleTimePicker
+        visible={showSchedulePicker}
+        onClose={() => setShowSchedulePicker(false)}
+        onSchedule={(isoTime) => {
+          setShowSchedulePicker(false);
+          if (onSchedule) onSchedule(isoTime);
+        }}
+        theme={theme}
+      />
     </View>
   );
 }));
@@ -1243,6 +1259,8 @@ export default function ChatScreen({ navigation, route }) {
     text,
     handleTextChange,
     handleSendText,
+    scheduleMessage,
+    cancelScheduledMessage,
     sendLocationMessage,
     sendContactMessage,
     pendingMedia,
@@ -3845,6 +3863,27 @@ export default function ChatScreen({ navigation, route }) {
               </Text>
             )}
 
+            {/* Scheduled message label */}
+            {!isDeletedMessage && isMyMessage && (msg.status === 'scheduled' || msg.isScheduled) && msg.scheduleTimeLabel && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
+                <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.65)" style={{ marginRight: 4 }} />
+                <Text style={{
+                  fontFamily: 'Roboto-Regular', fontSize: 11, fontStyle: 'italic',
+                  color: 'rgba(255,255,255,0.65)',
+                }}>Scheduled {msg.scheduleTimeLabel}</Text>
+              </View>
+            )}
+
+            {/* Cancelled message label */}
+            {!isDeletedMessage && msg.status === 'cancelled' && (
+              <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
+                <Ionicons name="close-circle" size={13} color="#FF8A80" style={{ marginRight: 4 }} />
+                <Text style={{
+                  fontFamily: 'Roboto-Regular', fontSize: 11, fontStyle: 'italic', color: '#FF8A80',
+                }}>Cancelled</Text>
+              </View>
+            )}
+
             {/* Forwarded label — WhatsApp style */}
             {!isDeletedMessage && (msg.isForwarded || msg.forwardedFrom || msg.forwarded || msg.payload?.isForwarded || msg.payload?.forwarded) && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
@@ -3949,6 +3988,12 @@ export default function ChatScreen({ navigation, route }) {
               
               {isMyMessage && !isDeletedMessage && !inlineMediaTime && (
                 <>
+                  {msg.status === "scheduled" && (
+                    <Ionicons name="time-outline" size={12} color="rgba(255,255,255,0.7)" style={{ marginLeft: 2 }} />
+                  )}
+                  {msg.status === "cancelled" && (
+                    <Ionicons name="close-circle" size={12} color="#FF8A80" style={{ marginLeft: 2 }} />
+                  )}
                   {msg.status === "sending" && (
                     <ActivityIndicator size={8} color="rgba(255,255,255,0.7)" style={{ marginLeft: 2 }} />
                   )}
@@ -4275,12 +4320,26 @@ export default function ChatScreen({ navigation, route }) {
             const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && !isSeen;
             const isTextMsg = selMsg?.type === 'text';
             const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
+            const canCancelSchedule = selectedMessage.length === 1 && selMsg?.status === 'scheduled' && isOwnMsg;
             return (
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                 {/* Count */}
                 <Text style={{ fontFamily: "Roboto-SemiBold", fontSize: 18, color: theme.colors.primaryTextColor, marginRight: 16, marginLeft: 4 }}>
                   {selectedMessage.length}
                 </Text>
+                {/* Cancel Scheduled */}
+                {canCancelSchedule && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      const msgId = selMsg.serverMessageId || selMsg.id;
+                      cancelScheduledMessage(msgId);
+                      clearSelectedMessages();
+                      setReactionMsgId(null);
+                    }}
+                    style={{ padding: 10 }}>
+                    <Ionicons name="time-outline" size={22} color="#FF5252" />
+                  </TouchableOpacity>
+                )}
                 {/* Delete */}
                 <TouchableOpacity
                   onPress={() => {
@@ -4833,6 +4892,7 @@ export default function ChatScreen({ navigation, route }) {
             onOpenAttachment={editingMessage ? undefined : handleToggleMediaOptions}
             onRemovePendingMedia={() => setPendingMedia(null)}
             onSubmit={handleSubmitInput}
+            onSchedule={scheduleMessage}
             mentionSuggestionsNode={isGroupChat ? (
               <MentionSuggestions
                 suggestions={mentionSuggestions}
@@ -5432,6 +5492,8 @@ export default function ChatScreen({ navigation, route }) {
         payload={reportPayload}
         analytics={reportAnalytics}
       />
+
+      {/* Schedule Time Picker is rendered inside ChatInputBar */}
       </Animated.View>
     </View>
   );

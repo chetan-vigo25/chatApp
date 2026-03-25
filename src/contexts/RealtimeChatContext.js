@@ -756,6 +756,8 @@ const reducer = (state, action) => {
 
     case 'INCOMING_MESSAGE': {
       const message = action.payload || {};
+      // Block pending scheduled messages from updating chat list (not yet delivered)
+      if (message.status === 'scheduled') return state;
       const chatId = normalizeId(message.chatId || message.roomId || message.chat);
       if (!chatId) return state;
 
@@ -1106,6 +1108,16 @@ const reducer = (state, action) => {
 
         switch (type) {
           case 'new_message': {
+            // Block pending scheduled messages from updating chat list (not yet delivered)
+            const lm = item?.lastMessage;
+            if (lm?.status === 'scheduled' || item?.status === 'scheduled') {
+              break; // Skip — still pending, not delivered yet
+            }
+            // Also block if scheduleTime is in the future (safety net)
+            const schedTime = lm?.scheduleTime || item?.scheduleTime;
+            if (schedTime && new Date(schedTime).getTime() > Date.now() + 30000) {
+              break;
+            }
             const lastMessage = buildLastMessageFromItem(existing, item, timestamp);
             const isActiveChat = state.activeChatId && String(state.activeChatId) === String(chatId);
             const currentUnread = Number(unreadByChat[chatId] || existing?.unreadCount || 0);
@@ -1810,6 +1822,15 @@ export function RealtimeChatProvider({ children }) {
     }
 
     const onMessage = (payload) => {
+      const source = unwrapPayload(payload);
+      // Block pending scheduled messages — not yet delivered
+      if (source?.status === 'scheduled' || source?.data?.status === 'scheduled') return;
+      // Block premature scheduled messages (scheduleTime in future)
+      const schedTime = source?.scheduleTime || source?.schedule_time || source?.data?.scheduleTime;
+      if (schedTime) {
+        const st = new Date(schedTime).getTime();
+        if (Number.isFinite(st) && st > Date.now() + 30000) return;
+      }
       const normalized = normalizeMessagePayload(payload);
       dispatch({ type: 'INCOMING_MESSAGE', payload: normalized });
     };
@@ -2179,6 +2200,8 @@ export function RealtimeChatProvider({ children }) {
 
     const onGroupMessageNew = (payload) => {
       const data = payload?.data || payload;
+      // Block pending scheduled messages from updating group chat list
+      if (data?.status === 'scheduled') return;
       const groupId = normalizeId(data?.groupId);
       const chatId = normalizeId(data?.chatId);
       if (!chatId && !groupId) return;

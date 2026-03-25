@@ -180,7 +180,7 @@ const formatDate = (ts, ca) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-const STATUS_PRIORITY = { sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
+const STATUS_PRIORITY = { scheduled: 0, cancelled: 0, sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
 
 const parseJSON = (val) => {
   if (!val) return null;
@@ -231,6 +231,10 @@ const rowToMsg = (row) => {
     // Restore forwarded flag from payload (not a column)
     isForwarded: Boolean(pp?.isForwarded || pp?._isForwarded || pp?.forwarded || pp?.forwardedMessage),
     forwardedFrom: pp?.forwardedFrom || pp?._forwardedFrom || pp?.originalMessageId || null,
+    // Restore scheduled message data from payload
+    isScheduled: Boolean(pp?.isScheduled),
+    scheduleTime: pp?.scheduleTime || null,
+    scheduleTimeLabel: pp?.scheduleTimeLabel || null,
     // Reply: check column first, then payload fallback
     replyToMessageId: row.reply_to_message_id || pp?._replyToMessageId || null,
     replyPreviewText: row.reply_preview_text || pp?._replyPreviewText || null,
@@ -469,6 +473,8 @@ const _runInsert = async (db, msg, _retried = false) => {
     // Preserve forwarded flag in payload so it survives SQLite round-trip
     ...(msg.isForwarded ? { isForwarded: true, _isForwarded: true } : {}),
     ...(msg.forwardedFrom ? { forwardedFrom: msg.forwardedFrom, _forwardedFrom: msg.forwardedFrom } : {}),
+    // Preserve scheduled message data in payload
+    ...(msg.isScheduled ? { isScheduled: true, scheduleTime: msg.scheduleTime, scheduleTimeLabel: msg.scheduleTimeLabel } : {}),
     // Carry forward existing reply data from old payload
     ...(existingReplyInPayload ? {
       _replyToMessageId: existingReplyInPayload._replyToMessageId,
@@ -690,7 +696,9 @@ const _preserveLocalState = async (db, msg) => {
   if (!merged) {
     const ip = STATUS_PRIORITY[msg.status] || 0;
     const ep = STATUS_PRIORITY[existing.status] || 0;
-    if (ep > ip) merged = { ...msg, status: existing.status };
+    // Don't override an explicitly-set 'scheduled' status with a higher-priority one
+    // The caller is intentionally keeping the message scheduled
+    if (ep > ip && msg.status !== 'scheduled') merged = { ...msg, status: existing.status };
   }
 
   // Preserve reactions
@@ -838,12 +846,17 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
   const db = await getDB();
 
   const serverRow = await db.getFirstAsync(`SELECT id, is_edited FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`, { $s: serverMessageId });
-  const tempRow = await db.getFirstAsync(`SELECT id, is_edited, reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id FROM messages WHERE id = $t OR temp_id = $t LIMIT 1`, { $t: tempId });
+  const tempRow = await db.getFirstAsync(`SELECT id, is_edited, status, payload, reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id FROM messages WHERE id = $t OR temp_id = $t LIMIT 1`, { $t: tempId });
+
+  // Preserve 'scheduled' status — don't overwrite it with 'sent' during acknowledge
+  const tempPayload = tempRow ? parseJSON(tempRow.payload) : null;
+  const isScheduledMsg = tempRow?.status === 'scheduled' || tempPayload?.isScheduled;
+  const ackStatus = isScheduledMsg ? 'scheduled' : 'sent';
 
   if (serverRow && tempRow && serverRow.id !== tempRow.id) {
     if (tempRow.is_edited && !serverRow.is_edited) {
       await db.runAsync(`DELETE FROM messages WHERE id = $s`, { $s: serverRow.id });
-      await db.runAsync(`UPDATE messages SET id = $s, server_message_id = $s, synced = 1, status = 'sent' WHERE id = $t`, { $s: serverMessageId, $t: tempRow.id });
+      await db.runAsync(`UPDATE messages SET id = $s, server_message_id = $s, synced = 1, status = $st WHERE id = $t`, { $s: serverMessageId, $t: tempRow.id, $st: ackStatus });
     } else {
       // Before deleting temp row, copy its reply data to the server row if server row lacks it
       if (_hasReplyColumns && tempRow.reply_to_message_id) {
@@ -870,7 +883,7 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
       await db.runAsync(`DELETE FROM messages WHERE id = $t`, { $t: tempRow.id });
     }
   } else if (tempRow && !serverRow) {
-    await db.runAsync(`UPDATE messages SET id = $s, server_message_id = $s, synced = 1, status = 'sent' WHERE temp_id = $t OR id = $t`, { $s: serverMessageId, $t: tempId });
+    await db.runAsync(`UPDATE messages SET id = $s, server_message_id = $s, synced = 1, status = $st WHERE temp_id = $t OR id = $t`, { $s: serverMessageId, $t: tempId, $st: ackStatus });
   }
 
   // Copy reply data to serverId in permanent table
