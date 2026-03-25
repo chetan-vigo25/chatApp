@@ -1477,7 +1477,7 @@ export default function useChatLogic({ navigation, route }) {
       downloadStatus: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri)
         ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
         : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
-      reactions: apiMsg?.reactions || null,
+      reactions: (apiMsg?.reactions && typeof apiMsg.reactions === 'object' && Object.keys(apiMsg.reactions).length > 0) ? apiMsg.reactions : null,
       isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited),
       editedAt: apiMsg?.editedAt || apiMsg?.edited_at || null,
       isForwarded: Boolean(apiMsg?.isForwarded || apiMsg?.is_forwarded || apiMsg?.forwarded || apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.forwardedMessage || apiMsg?.isForwardedMessage),
@@ -3845,7 +3845,25 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('group:message:read:update', onGroupMessageRead);
     registerSocketHandler('group:message:read', onGroupMessageRead);
 
-    const onGroupReactionUpdate = async (data) => {
+    // Helper: apply a reaction change to allMessages in-memory + persist to SQLite (no full reload)
+    const applyReactionUpdate = (messageId, updater) => {
+      setAllMessages(prev => {
+        let changed = false;
+        const updated = prev.map(m => {
+          const isMatch = m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId;
+          if (!isMatch) return m;
+          changed = true;
+          const oldReactions = m.reactions || {};
+          const newReactions = updater({ ...oldReactions });
+          // Persist to SQLite in background
+          ChatDatabase.updateReactions(messageId, newReactions).catch(() => {});
+          return { ...m, reactions: Object.keys(newReactions).length > 0 ? newReactions : undefined };
+        });
+        return changed ? updated : prev;
+      });
+    };
+
+    const onGroupReactionUpdate = (data) => {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
       const messageId = source?.messageId || source?.message || source?._id || source?.id;
@@ -3860,75 +3878,83 @@ export default function useChatLogic({ navigation, route }) {
 
       // If server sends full reactions map, use it directly
       if (source?.reactions && typeof source.reactions === 'object') {
-        await ChatDatabase.updateReactions(messageId, source.reactions);
-        refreshMessagesFromDB();
+        applyReactionUpdate(messageId, () => source.reactions);
         return;
       }
 
-      // Incremental update: apply to current message in SQLite
       if (!emoji || !reactionUserId) return;
 
-      const existingMsg = await ChatDatabase.getMessage(messageId);
-      if (!existingMsg) return;
-
-      const reactions = { ...(existingMsg.reactions || {}) };
-      const existing = reactions[emoji] || { count: 0, users: [] };
-      if (action === 'add' && !existing.users.includes(reactionUserId)) {
-        reactions[emoji] = { count: existing.count + 1, users: [...existing.users, reactionUserId] };
-      } else if (action === 'remove') {
-        reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== reactionUserId) };
-        if (reactions[emoji].count === 0) delete reactions[emoji];
-      }
-
-      await ChatDatabase.updateReactions(messageId, reactions);
-      refreshMessagesFromDB();
+      applyReactionUpdate(messageId, (reactions) => {
+        const existing = reactions[emoji] || { count: 0, users: [] };
+        if (action === 'add' && !existing.users.includes(reactionUserId)) {
+          reactions[emoji] = { count: existing.count + 1, users: [...existing.users, reactionUserId] };
+        } else if (action === 'remove') {
+          reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== reactionUserId) };
+          if (reactions[emoji].count === 0) delete reactions[emoji];
+        }
+        return reactions;
+      });
     };
     registerSocketHandler('group:message:reaction:update', onGroupReactionUpdate);
     registerSocketHandler('group:message:reaction', onGroupReactionUpdate);
     registerSocketHandler('group:message:reacted', onGroupReactionUpdate);
 
-    // 1-on-1 reaction updates
-    const onMessageReactionUpdate = async (data) => {
+    // 1-on-1 reaction broadcast: message:reaction:added
+    const onMessageReactionAdded = (data) => {
       const source = data?.data || data;
       const chatId = source?.chatId || source?.chat;
       if (!sameId(chatId, currentChatId)) return;
-      const messageId = source?.messageId || source?.message || source?._id || source?.id;
+      const messageId = source?.messageId;
       if (!messageId) return;
 
       const reactionUserId = source?.userId;
+      const emoji = source?.emoji;
 
       // Skip self-echo: we already applied our own reaction optimistically
       if (reactionUserId && sameId(reactionUserId, currentUserIdRef.current)) return;
+      if (!emoji || !reactionUserId) return;
 
       // If server sends full reactions map, use it directly
       if (source?.reactions && typeof source.reactions === 'object') {
-        await ChatDatabase.updateReactions(messageId, source.reactions);
-        refreshMessagesFromDB();
+        applyReactionUpdate(messageId, () => source.reactions);
         return;
       }
 
-      // Incremental update via SQLite
+      applyReactionUpdate(messageId, (reactions) => {
+        const existing = reactions[emoji] || { count: 0, users: [] };
+        if (!existing.users.includes(reactionUserId)) {
+          reactions[emoji] = { count: existing.count + 1, users: [...existing.users, reactionUserId] };
+        }
+        return reactions;
+      });
+    };
+    registerSocketHandler('message:reaction:added', onMessageReactionAdded);
+    registerSocketHandler('message:reaction', onMessageReactionAdded);
+    registerSocketHandler('message:reaction:update', onMessageReactionAdded);
+
+    // 1-on-1 reaction broadcast: message:reaction:removed
+    const onMessageReactionRemoved = (data) => {
+      const source = data?.data || data;
+      const chatId = source?.chatId || source?.chat;
+      if (!sameId(chatId, currentChatId)) return;
+      const messageId = source?.messageId;
+      if (!messageId) return;
+
+      const reactionUserId = source?.userId;
       const emoji = source?.emoji;
-      const action = source?.action;
+
+      // Skip self-echo
+      if (reactionUserId && sameId(reactionUserId, currentUserIdRef.current)) return;
       if (!emoji || !reactionUserId) return;
 
-      const existingMsg = await ChatDatabase.getMessage(messageId);
-      if (!existingMsg) return;
-
-      const reactions = { ...(existingMsg.reactions || {}) };
-      const existing = reactions[emoji] || { count: 0, users: [] };
-      if (action === 'add' && !existing.users.includes(reactionUserId)) {
-        reactions[emoji] = { count: existing.count + 1, users: [...existing.users, reactionUserId] };
-      } else if (action === 'remove') {
+      applyReactionUpdate(messageId, (reactions) => {
+        const existing = reactions[emoji] || { count: 0, users: [] };
         reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== reactionUserId) };
         if (reactions[emoji].count === 0) delete reactions[emoji];
-      }
-
-      await ChatDatabase.updateReactions(messageId, reactions);
-      refreshMessagesFromDB();
+        return reactions;
+      });
     };
-    registerSocketHandler('message:reaction', onMessageReactionUpdate);
-    registerSocketHandler('message:reaction:update', onMessageReactionUpdate);
+    registerSocketHandler('message:reaction:removed', onMessageReactionRemoved);
 
     const onMessageDeleteEveryone = (data) => {
       console.log('🧪 [B:SOCKET:DELETE:RECV]', {
@@ -6212,22 +6238,36 @@ export default function useChatLogic({ navigation, route }) {
   }, [route.params]);
 
   // ─── MESSAGE REACTIONS ───
-  const toggleReaction = useCallback(async (msgId, emoji) => {
+  // Helper: update reactions for a message directly in allMessages state (instant, no flicker)
+  const updateReactionsInState = useCallback((msgId, newReactions) => {
+    setAllMessages(prev => {
+      let changed = false;
+      const updated = prev.map(m => {
+        const isMatch = m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId;
+        if (!isMatch) return m;
+        changed = true;
+        return { ...m, reactions: Object.keys(newReactions).length > 0 ? newReactions : undefined };
+      });
+      return changed ? updated : prev;
+    });
+  }, []);
+
+  const toggleReaction = useCallback((msgId, emoji, skinTone) => {
     if (!msgId || !emoji || !currentUserIdRef.current) return;
 
     const uid = currentUserIdRef.current;
     const isGrpReact = chatData?.chatType === 'group' || chatData?.isGroup;
 
-    // Read current reactions from SQLite (source of truth)
-    const existingMsg = await ChatDatabase.getMessage(msgId);
-    if (!existingMsg) return;
+    // Get current reactions from in-memory state first (instant, no async wait)
+    const currentMsgs = allMessagesRef.current || [];
+    const targetMsg = currentMsgs.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
+    const oldReactions = targetMsg?.reactions || {};
 
-    const reactions = { ...(existingMsg.reactions || {}) };
+    const reactions = { ...oldReactions };
     const existing = reactions[emoji] || { count: 0, users: [] };
     const hasReacted = existing.users?.includes(uid);
     const action = hasReacted ? 'remove' : 'add';
 
-    // Update reactions
     if (hasReacted) {
       reactions[emoji] = {
         count: Math.max(0, existing.count - 1),
@@ -6241,9 +6281,11 @@ export default function useChatLogic({ navigation, route }) {
       };
     }
 
-    // SQLite-first: save to DB then refresh UI
-    await ChatDatabase.updateReactions(msgId, reactions);
-    refreshMessagesFromDB(true);
+    // INSTANT UI update — no DB round-trip, no flicker
+    updateReactionsInState(msgId, reactions);
+
+    // Background: persist to SQLite (fire-and-forget)
+    ChatDatabase.updateReactions(msgId, reactions).catch(() => {});
 
     // Emit to server
     const socket = socketRef.current || getSocket();
@@ -6254,19 +6296,84 @@ export default function useChatLogic({ navigation, route }) {
           messageId: msgId,
           emoji,
           action,
-          userId: uid,
+        });
+      } else if (action === 'add') {
+        socket.emit('message:reaction:add', {
+          messageId: msgId,
+          chatId: chatIdRef.current,
+          emoji,
+          ...(skinTone ? { skinTone } : {}),
         });
       } else {
-        socket.emit('message:reaction', {
-          chatId: chatIdRef.current,
+        socket.emit('message:reaction:remove', {
           messageId: msgId,
+          chatId: chatIdRef.current,
           emoji,
-          action,
-          userId: uid,
         });
       }
     }
-  }, [chatData, refreshMessagesFromDB]);
+  }, [chatData, updateReactionsInState]);
+
+  const removeReaction = useCallback((msgId, emoji) => {
+    if (!msgId || !emoji || !currentUserIdRef.current) return;
+
+    const uid = currentUserIdRef.current;
+    const isGrpReact = chatData?.chatType === 'group' || chatData?.isGroup;
+
+    // Get current reactions from in-memory state
+    const currentMsgs = allMessagesRef.current || [];
+    const targetMsg = currentMsgs.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
+    const oldReactions = targetMsg?.reactions || {};
+
+    const reactions = { ...oldReactions };
+    const existing = reactions[emoji] || { count: 0, users: [] };
+    if (!existing.users?.includes(uid)) return;
+
+    reactions[emoji] = {
+      count: Math.max(0, existing.count - 1),
+      users: existing.users.filter(u => u !== uid),
+    };
+    if (reactions[emoji].count === 0) delete reactions[emoji];
+
+    // INSTANT UI update
+    updateReactionsInState(msgId, reactions);
+
+    // Background: persist to SQLite
+    ChatDatabase.updateReactions(msgId, reactions).catch(() => {});
+
+    // Emit to server
+    const socket = socketRef.current || getSocket();
+    if (socket && isSocketConnected()) {
+      if (isGrpReact) {
+        socket.emit('group:message:reaction', {
+          groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
+          messageId: msgId,
+          emoji,
+          action: 'remove',
+        });
+      } else {
+        socket.emit('message:reaction:remove', {
+          chatId: chatIdRef.current,
+          messageId: msgId,
+          emoji,
+        });
+      }
+    }
+  }, [chatData, updateReactionsInState]);
+
+  const fetchReactionList = useCallback((msgId) => {
+    return new Promise((resolve, reject) => {
+      const socket = socketRef.current || getSocket();
+      if (!socket || !isSocketConnected()) return reject(new Error('Socket not connected'));
+      const timeout = setTimeout(() => reject(new Error('Timeout')), 10000);
+      socket.emit('message:reaction:list', { messageId: msgId }, (ack) => {
+        clearTimeout(timeout);
+        const res = ack?.data || ack;
+        if (ack?.status === false) return reject(new Error(res?.message || 'Failed'));
+        resolve(res);
+      });
+    });
+  }, []);
 
   return {
     fadeAnimRef, flatListRef,
@@ -6296,7 +6403,7 @@ export default function useChatLogic({ navigation, route }) {
     setMessages, saveMessagesToLocal, resendMessage,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
     replyTarget, startReply, cancelReply,
-    toggleReaction,
+    toggleReaction, removeReaction, fetchReactionList,
     clearSelectedMessages: () => setSelectedMessages([]),
   };
 }

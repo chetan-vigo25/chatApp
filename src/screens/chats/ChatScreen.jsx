@@ -54,6 +54,9 @@ import ReplyPreviewBox from '../../components/ReplyPreviewBox';
 import ScheduleTimePicker from '../../components/ScheduleTimePicker';
 import ReplyBubble from '../../components/ReplyBubble';
 import LocationBubble from '../../components/LocationBubble';
+import ReactionPicker from '../../components/ReactionPicker';
+import ReactionBar from '../../components/ReactionBar';
+import ReactionDetailSheet from '../../components/ReactionDetailSheet';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -1296,7 +1299,7 @@ export default function ChatScreen({ navigation, route }) {
     markVisibleIncomingAsRead,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
     replyTarget, startReply, cancelReply,
-    toggleReaction,
+    toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
 
   // ── Mentions ──
@@ -1328,27 +1331,8 @@ export default function ChatScreen({ navigation, route }) {
 
   // Reaction state
   const [reactionMsgId, setReactionMsgId] = useState(null);
-  const [reactionDetailModal, setReactionDetailModal] = useState({ visible: false, reactions: null, selectedEmoji: null });
+  const [reactionDetailModal, setReactionDetailModal] = useState({ visible: false, reactions: null, selectedEmoji: null, messageId: null });
   const reactionScaleAnims = useRef({}).current;
-
-  const QUICK_EMOJIS = ['❤️', '😂', '😮', '😢', '🙏', '👍'];
-
-  // Get or create a scale animation for a reaction badge
-  const getReactionScale = useCallback((key) => {
-    if (!reactionScaleAnims[key]) {
-      reactionScaleAnims[key] = new Animated.Value(1);
-    }
-    return reactionScaleAnims[key];
-  }, []);
-
-  // Animate a reaction badge (pop effect)
-  const animateReaction = useCallback((key) => {
-    const scale = getReactionScale(key);
-    Animated.sequence([
-      Animated.timing(scale, { toValue: 1.3, duration: 120, useNativeDriver: true }),
-      Animated.spring(scale, { toValue: 1, friction: 4, useNativeDriver: true }),
-    ]).start();
-  }, [getReactionScale]);
 
   // Resolve userId to display name
   const getReactionUserName = useCallback((userId) => {
@@ -3806,6 +3790,15 @@ export default function ChatScreen({ navigation, route }) {
             if (selectedMessage.length > 0) {
               handleToggleSelectMessages(messageKey);
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              return;
+            }
+            // Double-tap detection for quick heart react
+            const now = Date.now();
+            const lastTap = msg._lastTap || 0;
+            msg._lastTap = now;
+            if (now - lastTap < 350 && !isDeletedMessage) {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+              toggleReaction(messageKey, '❤️');
             }
           }}
           onLongPress={() => {
@@ -3818,7 +3811,7 @@ export default function ChatScreen({ navigation, route }) {
               }
             }
           }}
-          delayLongPress={300} 
+          delayLongPress={300}
           style={{ 
             alignItems: isMyMessage ? "flex-end" : "flex-start", 
             paddingVertical: 2, 
@@ -4018,123 +4011,47 @@ export default function ChatScreen({ navigation, route }) {
               )}
             </View>
 
-            {/* Floating emoji reaction bar — WhatsApp style (over the message) */}
-            {reactionMsgId === messageKey && !isDeletedMessage && (
-              <View style={{
-                flexDirection: 'row',
-                alignItems: 'center',
-                backgroundColor: isDarkMode ? '#1F2C34' : '#fff',
-                borderRadius: 28,
-                paddingHorizontal: 4,
-                paddingVertical: 2,
-                marginTop: 6,
-                elevation: 8,
-                shadowColor: '#000',
-                shadowOffset: { width: 0, height: 4 },
-                shadowOpacity: 0.25,
-                shadowRadius: 8,
-                alignSelf: isMyMessage ? 'flex-end' : 'flex-start',
-              }}>
-                {QUICK_EMOJIS.map((emoji) => {
-                  const hasReacted = msg?.reactions?.[emoji]?.users?.includes(currentUserId);
-                  return (
-                    <TouchableOpacity
-                      key={emoji}
-                      onPress={() => {
-                        toggleReaction(messageKey, emoji);
-                        setReactionMsgId(null);
-                        clearSelectedMessages();
-                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      }}
-                      style={{
-                        width: 40, height: 40, borderRadius: 20,
-                        alignItems: 'center', justifyContent: 'center',
-                        backgroundColor: hasReacted ? (theme.colors.themeColor + '20') : 'transparent',
-                      }}
-                      activeOpacity={0.6}
-                    >
-                      <Text style={{ fontSize: 24 }}>{emoji}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
-                {/* Plus button for more emojis */}
-                <TouchableOpacity
-                  onPress={() => { setReactionMsgId(null); }}
-                  style={{
-                    width: 36, height: 36, borderRadius: 18,
-                    alignItems: 'center', justifyContent: 'center',
-                    backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
-                    marginLeft: 2,
-                  }}
-                  activeOpacity={0.6}
-                >
-                  <Ionicons name="add" size={20} color={theme.colors.placeHolderTextColor} />
-                </TouchableOpacity>
-              </View>
+            {/* Floating emoji reaction picker — WhatsApp style (over the message) */}
+            <ReactionPicker
+              visible={reactionMsgId === messageKey && !isDeletedMessage}
+              isMyMessage={isMyMessage}
+              isDarkMode={isDarkMode}
+              themeColor={theme.colors.themeColor}
+              currentReactions={msg?.reactions}
+              currentUserId={currentUserId}
+              onSelect={(emoji) => {
+                toggleReaction(messageKey, emoji);
+                setReactionMsgId(null);
+                clearSelectedMessages();
+              }}
+              onClose={() => {
+                setReactionMsgId(null);
+                clearSelectedMessages();
+              }}
+            />
+
+            {/* WhatsApp-style reaction pill — overlaps bottom of bubble */}
+            {!isDeletedMessage && (
+              <ReactionBar
+                reactions={msg?.reactions}
+                currentUserId={currentUserId}
+                isMyMessage={isMyMessage}
+                isDarkMode={isDarkMode}
+                themeColor={theme.colors.themeColor}
+                scaleAnims={reactionScaleAnims}
+                onToggleReaction={(emoji) => toggleReaction(messageKey, emoji)}
+                onShowDetail={(emoji) => {
+                  setReactionDetailModal({ visible: true, reactions: msg.reactions, selectedEmoji: emoji, messageId: messageKey });
+                }}
+              />
             )}
           </View>
-
-          {/* Reaction bubbles under message */}
-          {msg?.reactions && Object.keys(msg.reactions).length > 0 && !isDeletedMessage && (
-            <View style={{
-              flexDirection: 'row',
-              flexWrap: 'wrap',
-              gap: 4,
-              marginTop: -4,
-              paddingHorizontal: 4,
-              alignSelf: isMyMessage ? 'flex-end' : 'flex-start',
-              marginRight: isMyMessage ? 12 : 0,
-              marginLeft: isMyMessage ? 0 : 12,
-            }}>
-              {Object.entries(msg.reactions).map(([emoji, data]) => {
-                if (!data?.count || data.count <= 0) return null;
-                const iReacted = data.users?.includes(currentUserId);
-                const badgeKey = `${messageKey}_${emoji}`;
-                return (
-                  <Animated.View key={emoji} style={{ transform: [{ scale: getReactionScale(badgeKey) }] }}>
-                    <TouchableOpacity
-                      onPress={() => {
-                        animateReaction(badgeKey);
-                        toggleReaction(messageKey, emoji);
-                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      }}
-                      onLongPress={() => {
-                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-                        setReactionDetailModal({ visible: true, reactions: msg.reactions, selectedEmoji: emoji });
-                      }}
-                      style={{
-                        flexDirection: 'row',
-                        alignItems: 'center',
-                        backgroundColor: iReacted
-                          ? (theme.colors.themeColor + '18')
-                          : (isDarkMode ? '#1E2C3A' : '#F0F0F0'),
-                        borderRadius: 12,
-                        paddingHorizontal: 7,
-                        paddingVertical: 3,
-                        borderWidth: iReacted ? 1 : 0,
-                        borderColor: theme.colors.themeColor + '40',
-                      }}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={{ fontSize: 14 }}>{emoji}</Text>
-                      <Text style={{
-                        fontSize: 11,
-                        marginLeft: 3,
-                        color: iReacted ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
-                        fontFamily: 'Roboto-Medium',
-                      }}>{data.count}</Text>
-                    </TouchableOpacity>
-                  </Animated.View>
-                );
-              })}
-            </View>
-          )}
         </Pressable>
         </SwipeReplyRow>
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, getReactionScale, animateReaction]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages]);
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -5372,117 +5289,29 @@ export default function ChatScreen({ navigation, route }) {
             }}
           />
         </Modal>
-      {/* Reaction Detail Modal — shows who reacted */}
-      <Modal
-        transparent
+      {/* Reaction Detail Sheet — shows who reacted */}
+      <ReactionDetailSheet
         visible={reactionDetailModal.visible}
-        animationType="fade"
-        onRequestClose={() => setReactionDetailModal({ visible: false, reactions: null, selectedEmoji: null })}
-      >
-        <TouchableOpacity
-          activeOpacity={1}
-          onPress={() => setReactionDetailModal({ visible: false, reactions: null, selectedEmoji: null })}
-          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' }}
-        >
-          <TouchableOpacity activeOpacity={1} onPress={() => {}} style={{
-            backgroundColor: isDarkMode ? '#1F2C34' : '#fff',
-            borderTopLeftRadius: 20,
-            borderTopRightRadius: 20,
-            maxHeight: Dimensions.get('window').height * 0.55,
-            paddingBottom: 24,
-          }}>
-            {/* Drag handle */}
-            <View style={{ alignItems: 'center', paddingTop: 10, paddingBottom: 6 }}>
-              <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? '#3A4A54' : '#D0D0D0' }} />
-            </View>
-
-            {/* Emoji tabs */}
-            {reactionDetailModal.reactions && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                style={{ borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: isDarkMode ? '#2A3A44' : '#E0E0E0' }}
-                contentContainerStyle={{ paddingHorizontal: 12, gap: 4 }}
-              >
-                {Object.entries(reactionDetailModal.reactions).map(([emoji, data]) => {
-                  if (!data?.count || data.count <= 0) return null;
-                  const isSelected = reactionDetailModal.selectedEmoji === emoji;
-                  return (
-                    <TouchableOpacity
-                      key={emoji}
-                      onPress={() => setReactionDetailModal(prev => ({ ...prev, selectedEmoji: emoji }))}
-                      style={{
-                        flexDirection: 'row',
-                        alignItems: 'center',
-                        paddingHorizontal: 14,
-                        paddingVertical: 8,
-                        borderBottomWidth: 2,
-                        borderBottomColor: isSelected ? theme.colors.themeColor : 'transparent',
-                      }}
-                    >
-                      <Text style={{ fontSize: 20 }}>{emoji}</Text>
-                      <Text style={{
-                        fontSize: 13,
-                        marginLeft: 4,
-                        color: isSelected ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
-                        fontFamily: 'Roboto-Medium',
-                      }}>{data.count}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </ScrollView>
-            )}
-
-            {/* User list for selected emoji */}
-            <ScrollView style={{ paddingHorizontal: 16, paddingTop: 8 }}>
-              {reactionDetailModal.reactions?.[reactionDetailModal.selectedEmoji]?.users?.map((userId) => {
-                const displayName = getReactionUserName(userId);
-                const member = groupMembersMap?.[userId];
-                const isMe = userId === currentUserId;
-                return (
-                  <View key={userId} style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    paddingVertical: 10,
-                    borderBottomWidth: StyleSheet.hairlineWidth,
-                    borderBottomColor: isDarkMode ? '#1A2A34' : '#F0F0F0',
-                  }}>
-                    {/* Avatar */}
-                    <View style={{
-                      width: 38, height: 38, borderRadius: 19,
-                      backgroundColor: isDarkMode ? '#2A3A44' : '#E8E8E8',
-                      alignItems: 'center', justifyContent: 'center',
-                      marginRight: 12,
-                      overflow: 'hidden',
-                    }}>
-                      {member?.profileImage ? (
-                        <Image source={{ uri: member.profileImage }} style={{ width: 38, height: 38, borderRadius: 19 }} />
-                      ) : (
-                        <Ionicons name="person" size={18} color={isDarkMode ? '#6A7A84' : '#ADADAD'} />
-                      )}
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{
-                        fontSize: 15,
-                        color: theme.colors.primaryTextColor,
-                        fontFamily: 'Roboto-Medium',
-                      }}>{displayName}</Text>
-                      {isMe && (
-                        <Text style={{
-                          fontSize: 12,
-                          color: theme.colors.placeHolderTextColor,
-                          marginTop: 1,
-                        }}>Tap to remove</Text>
-                      )}
-                    </View>
-                    <Text style={{ fontSize: 22 }}>{reactionDetailModal.selectedEmoji}</Text>
-                  </View>
-                );
-              })}
-            </ScrollView>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </Modal>
+        reactions={reactionDetailModal.reactions}
+        selectedEmoji={reactionDetailModal.selectedEmoji}
+        messageId={reactionDetailModal.messageId}
+        onClose={() => setReactionDetailModal({ visible: false, reactions: null, selectedEmoji: null, messageId: null })}
+        onRemoveReaction={(emoji) => {
+          if (reactionDetailModal.messageId) {
+            removeReaction(reactionDetailModal.messageId, emoji);
+            setReactionDetailModal({ visible: false, reactions: null, selectedEmoji: null, messageId: null });
+          }
+        }}
+        currentUserId={currentUserId}
+        isDarkMode={isDarkMode}
+        themeColor={theme.colors.themeColor}
+        primaryTextColor={theme.colors.primaryTextColor}
+        placeholderColor={theme.colors.placeHolderTextColor}
+        getReactionUserName={getReactionUserName}
+        groupMembersMap={groupMembersMap}
+        peerUser={chatData?.peerUser}
+        fetchReactionList={fetchReactionList}
+      />
 
       {/* Report Modal */}
       <ReportBottomSheet

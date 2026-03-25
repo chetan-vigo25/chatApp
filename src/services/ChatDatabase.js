@@ -520,7 +520,7 @@ const _runInsert = async (db, msg, _retried = false) => {
     $preview_url: msg.previewUrl || null,
     $local_uri: msg.localUri || null,
     $media_id: msg.mediaId || null,
-    $reactions: msg.reactions ? JSON.stringify(msg.reactions) : null,
+    $reactions: (msg.reactions && typeof msg.reactions === 'object' && Object.keys(msg.reactions).length > 0) ? JSON.stringify(msg.reactions) : null,
     $delivered_to: msg.deliveredTo ? JSON.stringify(msg.deliveredTo) : null,
     $read_by: msg.readBy ? JSON.stringify(msg.readBy) : null,
     $payload: JSON.stringify(payloadObj),
@@ -708,8 +708,9 @@ const _preserveLocalState = async (db, msg) => {
     }
   }
 
-  // Preserve reactions
-  if (existing.reactions && !msg.reactions) {
+  // Preserve reactions — don't let server sync overwrite local reactions with empty/null
+  const incomingHasReactions = msg.reactions && typeof msg.reactions === 'object' && Object.keys(msg.reactions).length > 0;
+  if (existing.reactions && !incomingHasReactions) {
     try {
       const r = JSON.parse(existing.reactions);
       if (r && Object.keys(r).length > 0) {
