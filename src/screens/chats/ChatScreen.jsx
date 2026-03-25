@@ -3863,8 +3863,8 @@ export default function ChatScreen({ navigation, route }) {
               </Text>
             )}
 
-            {/* Scheduled message label */}
-            {!isDeletedMessage && isMyMessage && (msg.status === 'scheduled' || msg.isScheduled) && msg.scheduleTimeLabel && (
+            {/* Scheduled message label — only show while still pending (status==='scheduled' or 'processing') */}
+            {!isDeletedMessage && isMyMessage && (msg.status === 'scheduled' || msg.status === 'processing') && msg.scheduleTimeLabel && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
                 <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.65)" style={{ marginRight: 4 }} />
                 <Text style={{
@@ -3988,7 +3988,7 @@ export default function ChatScreen({ navigation, route }) {
               
               {isMyMessage && !isDeletedMessage && !inlineMediaTime && (
                 <>
-                  {msg.status === "scheduled" && (
+                  {(msg.status === "scheduled" || msg.status === "processing") && (
                     <Ionicons name="time-outline" size={12} color="rgba(255,255,255,0.7)" style={{ marginLeft: 2 }} />
                   )}
                   {msg.status === "cancelled" && (
@@ -4320,7 +4320,7 @@ export default function ChatScreen({ navigation, route }) {
             const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && !isSeen;
             const isTextMsg = selMsg?.type === 'text';
             const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
-            const canCancelSchedule = selectedMessage.length === 1 && selMsg?.status === 'scheduled' && isOwnMsg;
+            const canCancelSchedule = selectedMessage.length === 1 && (selMsg?.status === 'scheduled' || selMsg?.status === 'processing') && isOwnMsg;
             return (
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                 {/* Count */}

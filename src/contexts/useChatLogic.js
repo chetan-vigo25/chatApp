@@ -262,6 +262,7 @@ export default function useChatLogic({ navigation, route }) {
   const sentTempIdsRef = useRef(new Set());
   // Track message IDs that were created by forwarding — persists across chat navigations
   const forwardedMsgIdsRef = useRef(new Set());
+  const cancelledMsgIdsRef = useRef(new Set());
   const pendingPreviewSyncRef = useRef(false);
   // Cache reply data by messageId — never lost even if SQLite row is overwritten
   const replyDataCacheRef = useRef({});
@@ -918,7 +919,12 @@ export default function useChatLogic({ navigation, route }) {
       );
     };
 
-    const filteredChat = allMessages.filter(matchesChat);
+    const filteredChat = allMessages.filter(msg => {
+      if (!matchesChat(msg)) return false;
+      // Cancelled/failed messages from OTHER users should never be shown to receiver
+      if ((msg.status === 'cancelled' || msg.status === 'failed') && !sameId(msg.senderId, myId)) return false;
+      return true;
+    });
     // Scheduled messages are sender-only — filter by same chat
     const filteredScheduled = scheduledMessages.filter(matchesChat);
 
@@ -1168,6 +1174,7 @@ export default function useChatLogic({ navigation, route }) {
       if (!isSameChat) {
         setMessages([]);
         setAllMessages([]);
+        setScheduledMessages([]);
       }
 
       // Fetch group members for sender name resolution
@@ -1280,6 +1287,7 @@ export default function useChatLogic({ navigation, route }) {
     if (s === 'sending') return 'sending';
     if (s === 'failed') return 'failed';
     if (s === 'scheduled') return 'scheduled';
+    if (s === 'processing') return 'processing';
     if (s === 'cancelled') return 'cancelled';
     return undefined;
   }, []);
@@ -1498,13 +1506,39 @@ export default function useChatLogic({ navigation, route }) {
     if (!Array.isArray(incomingMessages) || incomingMessages.length === 0) return;
 
     // Filter out pending scheduled messages — they belong in scheduledMessages state, not allMessages
-    // Only block status==='scheduled' (still pending). Delivered scheduled messages (status sent/delivered) are allowed.
+    // Also skip server versions of messages that are still pending in scheduledMessages
+    // (server may return them with status 'sent' which would overwrite local 'scheduled' in DB)
+    const pendingSchedIds = new Set();
+    for (const sm of (scheduledMessagesRef.current || [])) {
+      if (sm.status === 'scheduled' || sm.status === 'processing') {
+        if (sm.id) pendingSchedIds.add(String(sm.id));
+        if (sm.tempId) pendingSchedIds.add(String(sm.tempId));
+        if (sm.serverMessageId) pendingSchedIds.add(String(sm.serverMessageId));
+      }
+    }
+
     const filtered = incomingMessages.filter(raw => {
       if (raw?.status === 'scheduled') return false;
+      if (raw?.status === 'processing') return false;
+      if (raw?.status === 'cancelled') return false;
+      // Block isScheduled messages meant for receiver — only if scheduleTime is still in the future
+      // If scheduleTime has passed, it's a legitimate delivery from the server
+      const isSelf = raw?.senderId && sameId(raw.senderId, currentUserIdRef.current);
       const schedTime = raw?.scheduleTime || raw?.schedule_time;
-      if (!schedTime) return true;
-      const st = new Date(schedTime).getTime();
+      const st = schedTime ? new Date(schedTime).getTime() : 0;
       const isFuture = Number.isFinite(st) && st > Date.now() + 30000;
+      if (!isSelf && raw?.isScheduled && isFuture) return false;
+      // Strip schedule flags on receiver side for delivered scheduled messages
+      if (!isSelf && raw?.isScheduled && !isFuture) {
+        raw.isScheduled = false;
+        raw.scheduleTime = null;
+        raw.scheduleTimeLabel = null;
+        raw.schedule_time = null;
+      }
+      // Block server echoes of our pending scheduled messages
+      const rawId = raw?.messageId || raw?._id || raw?.id || raw?.serverMessageId;
+      if (rawId && pendingSchedIds.has(String(rawId))) return false;
+      // Block premature messages (scheduleTime in the future)
       return !isFuture;
     });
 
@@ -1526,14 +1560,43 @@ export default function useChatLogic({ navigation, route }) {
     const effectiveChatId = targetChatId || chatIdRef.current;
     if (!effectiveChatId) return;
 
-    const normalizedIncoming = Array.isArray(incomingMessages)
-      ? incomingMessages.map(raw => {
+    // Build set of pending scheduled message IDs to protect from overwrite
+    const pendingSchedIds = new Set();
+    for (const sm of (scheduledMessagesRef.current || [])) {
+      if (sm.status === 'scheduled' || sm.status === 'processing') {
+        if (sm.id) pendingSchedIds.add(String(sm.id));
+        if (sm.tempId) pendingSchedIds.add(String(sm.tempId));
+        if (sm.serverMessageId) pendingSchedIds.add(String(sm.serverMessageId));
+      }
+    }
+
+    const normalizedIncoming = (Array.isArray(incomingMessages) ? incomingMessages : [])
+      .filter(raw => {
+        // Don't let server overwrite pending scheduled messages
+        const rawId = raw?.messageId || raw?._id || raw?.id || raw?.serverMessageId;
+        if (rawId && pendingSchedIds.has(String(rawId))) return false;
+        if (raw?.status === 'scheduled') return false;
+        if (raw?.status === 'processing') return false;
+        if (raw?.status === 'cancelled') return false;
+        // Block isScheduled messages on receiver side only if scheduleTime is still in the future
+        const isSelf = raw?.senderId && sameId(raw.senderId, currentUserIdRef.current);
+        if (!isSelf && raw?.isScheduled) {
+          const schedTime = raw?.scheduleTime || raw?.schedule_time;
+          const st = schedTime ? new Date(schedTime).getTime() : 0;
+          if (Number.isFinite(st) && st > Date.now() + 30000) return false;
+          // scheduleTime passed — strip schedule flags, allow through
+          raw.isScheduled = false;
+          raw.scheduleTime = null;
+          raw.scheduleTimeLabel = null;
+        }
+        return true;
+      })
+      .map(raw => {
           const msg = normalizeIncomingMessage(raw);
           msg.chatId = msg.chatId || effectiveChatId;
           if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
           return msg;
-        })
-      : [];
+        });
 
     // SQLite-first: batch write then refresh
     await ChatDatabase.upsertMessages(normalizedIncoming);
@@ -1583,6 +1646,8 @@ export default function useChatLogic({ navigation, route }) {
           if (!id || !visibleMessageIds.includes(id)) return false;
           if (msg.chatId !== chatIdRef.current) return false;
           if (!msg.senderId || msg.senderId === currentUserIdRef.current) return false;
+          // Skip scheduled/processing/cancelled/failed — not real messages, don't emit read
+          if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return false;
           return msg.status !== 'seen' && msg.status !== 'read';
         })
         .map(msg => msg.serverMessageId || msg.id || msg.tempId)
@@ -1650,6 +1715,8 @@ export default function useChatLogic({ navigation, route }) {
           (msg.chatId === chatIdRef.current) &&
           msg.senderId &&
           msg.senderId !== currentUserIdRef.current &&
+          // Skip scheduled/processing/cancelled/failed — not real messages, don't emit read
+          msg.status !== 'scheduled' && msg.status !== 'processing' && msg.status !== 'cancelled' && msg.status !== 'failed' &&
           msg.status !== 'seen' && msg.status !== 'read'
         )
         .map(msg => msg.serverMessageId || msg.id || msg.tempId)
@@ -1802,9 +1869,21 @@ export default function useChatLogic({ navigation, route }) {
 
         // Separate still-pending scheduled messages from DB — they go to scheduledMessages state
         // Only status==='scheduled' means pending. Delivered messages (status sent/delivered) go to allMessages.
-        const isPendingScheduled = (m) => m.status === 'scheduled';
+        const isPendingScheduled = (m) => m.status === 'scheduled' || m.status === 'processing';
+        // Cancelled/failed messages from OTHER users should never be shown to receiver
+        const isOtherUserCancelledOrFailed = (m) =>
+          (m.status === 'cancelled' || m.status === 'failed') && !sameId(m.senderId, currentUser);
         const dbScheduled = dbMessages.filter(isPendingScheduled);
-        const dbRegular = dbMessages.filter(m => !isPendingScheduled(m));
+        const otherCancelled = dbMessages.filter(isOtherUserCancelledOrFailed);
+        const dbRegular = dbMessages.filter(m => !isPendingScheduled(m) && !isOtherUserCancelledOrFailed(m));
+
+        // Clean up: delete cancelled messages from other users from DB so they don't come back
+        if (otherCancelled.length > 0) {
+          for (const m of otherCancelled) {
+            const delId = m.serverMessageId || m.id || m.tempId;
+            if (delId) ChatDatabase.deleteMessageForMe(delId).catch(() => {});
+          }
+        }
 
         if (dbScheduled.length > 0) {
           const enrichedScheduled = dbScheduled
@@ -1896,6 +1975,13 @@ export default function useChatLogic({ navigation, route }) {
           // Sort by timestamp descending (newest first)
           merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
           return merged;
+        });
+
+        // Clean up: remove sent/delivered messages from scheduledMessages
+        // (they're now in allMessages via DB, no longer need the in-memory copy)
+        setScheduledMessages(prev => {
+          const cleaned = prev.filter(m => m.status === 'scheduled' || m.status === 'processing' || m.status === 'failed');
+          return cleaned.length !== prev.length ? cleaned : prev;
         });
       } catch (err) {
         console.warn('[ChatDB] refreshMessagesFromDB error:', err);
@@ -2414,13 +2500,42 @@ export default function useChatLogic({ navigation, route }) {
   }, [chatMessagesData, currentUserId, chatId, hasLoadedFromAPI, currentPage, isLoadingMore]);
 
   const processAPIResponse = useCallback(async (apiMessages) => {
-    // SQLite-first: normalize, batch write, refresh
-    const normalized = apiMessages.map(raw => {
-      const msg = normalizeIncomingMessage(raw);
-      msg.chatId = msg.chatId || chatIdRef.current;
-      if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
-      return msg;
-    });
+    // Build set of pending scheduled IDs to protect from server overwrite
+    const pendingSchedIds = new Set();
+    for (const sm of (scheduledMessagesRef.current || [])) {
+      if (sm.status === 'scheduled' || sm.status === 'processing') {
+        if (sm.id) pendingSchedIds.add(String(sm.id));
+        if (sm.tempId) pendingSchedIds.add(String(sm.tempId));
+        if (sm.serverMessageId) pendingSchedIds.add(String(sm.serverMessageId));
+      }
+    }
+
+    // SQLite-first: normalize, batch write, refresh — skip pending scheduled messages
+    const normalized = apiMessages
+      .filter(raw => {
+        if (raw?.status === 'scheduled') return false;
+        if (raw?.status === 'processing') return false;
+        if (raw?.status === 'cancelled') return false;
+        // Block isScheduled messages on receiver side only if scheduleTime is still in the future
+        const isSelf = raw?.senderId && sameId(raw.senderId, currentUserIdRef.current);
+        if (!isSelf && raw?.isScheduled) {
+          const schedTime = raw?.scheduleTime || raw?.schedule_time;
+          const st = schedTime ? new Date(schedTime).getTime() : 0;
+          if (Number.isFinite(st) && st > Date.now() + 30000) return false;
+          // scheduleTime passed — strip schedule flags, allow through
+          raw.isScheduled = false;
+          raw.scheduleTime = null;
+          raw.scheduleTimeLabel = null;
+        }
+        const rawId = raw?.messageId || raw?._id || raw?.id || raw?.serverMessageId;
+        return !(rawId && pendingSchedIds.has(String(rawId)));
+      })
+      .map(raw => {
+        const msg = normalizeIncomingMessage(raw);
+        msg.chatId = msg.chatId || chatIdRef.current;
+        if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+        return msg;
+      });
     await ChatDatabase.upsertMessages(normalized);
     refreshMessagesFromDB();
   }, [normalizeIncomingMessage, refreshMessagesFromDB]);
@@ -3031,50 +3146,89 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('message:schedule:response', onScheduleResponse);
 
-    // Server confirms cancel — remove from scheduledMessages
+    // Server confirms cancel — promote to allMessages as cancelled, remove from scheduled
     const onScheduleCancelResponse = (data) => {
       const source = data?.data || data;
       const msgId = source?.messageId;
       if (msgId && source?.cancelled) {
-        setScheduledMessages(prev => prev.filter(m =>
-          m.id !== msgId && m.serverMessageId !== msgId
-        ));
-        ChatDatabase.updateMessageStatus(msgId, 'cancelled').catch(() => {});
+        setScheduledMessages(prev => {
+          const match = prev.find(m => m.id === msgId || m.serverMessageId === msgId);
+          if (match) {
+            const cancelledMsg = {
+              ...match,
+              status: 'cancelled',
+              isScheduled: false,
+              scheduleTimeLabel: null,
+              scheduleTime: null,
+            };
+            setAllMessages(all => {
+              const exists = all.some(m => m.id === msgId || m.serverMessageId === msgId);
+              return exists ? all : [cancelledMsg, ...all];
+            });
+          }
+          return prev.filter(m => m.id !== msgId && m.serverMessageId !== msgId);
+        });
+        ChatDatabase.clearScheduleData(msgId, 'cancelled').then(() => {
+          refreshMessagesFromDB();
+        }).catch(() => {});
       }
     };
     registerSocketHandler('message:cancel:scheduled:response', onScheduleCancelResponse);
 
+    // Receiver-side: server notifies that a scheduled message was cancelled by the sender
+    // Remove the message from receiver's UI and DB if it somehow got through
+    const onScheduledCancelledReceiver = (data) => {
+      const source = data?.data || data;
+      const msgId = source?.messageId || source?._id || source?.id;
+      if (!msgId) return;
+      console.log('[Schedule] Receiver got cancel notification for:', msgId);
+      // Remove from allMessages immediately
+      setAllMessages(prev => {
+        const filtered = prev.filter(m =>
+          m.id !== msgId && m.serverMessageId !== msgId && m.tempId !== msgId
+        );
+        return filtered.length !== prev.length ? filtered : prev;
+      });
+      // Remove from DB, then refresh to ensure clean state
+      ChatDatabase.deleteMessageForMe(msgId).then(() => {
+        refreshMessagesFromDB(true);
+      }).catch(() => {});
+    };
+    registerSocketHandler('message:scheduled:cancelled', onScheduledCancelledReceiver);
+    registerSocketHandler('message:cancel:scheduled', onScheduledCancelledReceiver);
+
     // Server sent the scheduled message at the scheduled time → sender gets this
     // message:sent:ack with isScheduled: true
-    // Move from scheduledMessages → allMessages with status 'sent'
+    // Update in-place: clock → tick, no array swap to avoid UI revert
     const onScheduledSentAck = (data) => {
       const source = data?.data || data;
       if (!source?.isScheduled) return;
       const msgId = source?.messageId || source?._id;
       if (!msgId) return;
 
-      // Remove from scheduledMessages and promote to allMessages
+      // In-place update — just flip status, keep message in same position
       setScheduledMessages(prev => {
-        const match = prev.find(m => m.id === msgId || m.serverMessageId === msgId);
-        if (match) {
-          const sentMsg = { ...match, status: 'sent', isScheduled: false, scheduleTimeLabel: null };
-          setAllMessages(all => [sentMsg, ...all]);
-        } else {
-          // Fallback: message not in scheduledMessages (e.g., app restarted)
-          // Promote from server data directly
-          const fallbackMsg = {
-            id: msgId,
-            serverMessageId: msgId,
-            status: 'sent',
-            isScheduled: false,
-            scheduleTimeLabel: null,
-            ...source,
-          };
-          setAllMessages(all => [fallbackMsg, ...all]);
+        const hasMatch = prev.some(m => m.id === msgId || m.serverMessageId === msgId);
+        if (!hasMatch) {
+          // Fallback: not in scheduledMessages (e.g. app restarted) — add to allMessages
+          setAllMessages(all => [{
+            id: msgId, serverMessageId: msgId, status: 'sent',
+            isScheduled: false, scheduleTimeLabel: null, scheduleTime: null, ...source,
+          }, ...all]);
+          return prev;
         }
-        return prev.filter(m => m.id !== msgId && m.serverMessageId !== msgId);
+        return prev.map(m => {
+          if (m.id === msgId || m.serverMessageId === msgId) {
+            return { ...m, status: 'sent', isScheduled: false, scheduleTimeLabel: null, scheduleTime: null };
+          }
+          return m;
+        });
       });
-      ChatDatabase.updateMessageStatus(msgId, 'sent').catch(() => {});
+
+      // Update DB: status + clear schedule data from payload so reload is clean
+      ChatDatabase.clearScheduleData(msgId, 'sent').then(() => {
+        refreshMessagesFromDB();
+      }).catch(() => {});
     };
     registerSocketHandler('message:sent:ack', onScheduledSentAck);
 
@@ -3085,11 +3239,13 @@ export default function useChatLogic({ navigation, route }) {
       if (msgId) {
         setScheduledMessages(prev => prev.map(m => {
           if (m.id === msgId || m.serverMessageId === msgId) {
-            return { ...m, status: 'failed', isScheduled: false };
+            return { ...m, status: 'failed', isScheduled: false, scheduleTimeLabel: null, scheduleTime: null };
           }
           return m;
         }));
-        ChatDatabase.updateMessageStatus(msgId, 'failed').catch(() => {});
+        ChatDatabase.clearScheduleData(msgId, 'failed').then(() => {
+          refreshMessagesFromDB();
+        }).catch(() => {});
       }
     };
     registerSocketHandler('message:schedule:failed', onScheduleFailed);
@@ -3134,19 +3290,47 @@ export default function useChatLogic({ navigation, route }) {
       const chatInPayload = source?.chatId || source?.chat || source?.roomId;
       if (chatInPayload && !sameId(chatInPayload, currentChatId)) return;
 
-      // Block still-pending scheduled messages — handled via scheduledMessages state
-      if (source?.status === 'scheduled') {
+      // Block still-pending scheduled/processing messages — handled via scheduledMessages state
+      if (source?.status === 'scheduled' || source?.status === 'processing') {
         console.log('[Schedule] Blocked pending scheduled message:new:', source?.messageId || source?._id);
         return;
       }
 
-      // Block premature scheduled messages on receiver side
-      if (isScheduledAndPremature(source)) {
+      // Block cancelled/failed messages — they should never appear in chat
+      if (source?.status === 'cancelled' || source?.status === 'failed') {
+        console.log('[Schedule] Blocked cancelled/failed message:new:', source?.messageId || source?._id);
+        return;
+      }
+
+      // For receiver: if isScheduled but scheduleTime has passed → server is delivering now → allow it through
+      // Only block if scheduleTime is still in the future (premature)
+      const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+      if (!isSelfMsg && source?.isScheduled && isScheduledAndPremature(source)) {
+        console.log('[Schedule] Blocked premature scheduled message on receiver side:new:', source?.messageId || source?._id);
+        return;
+      }
+
+      // If it's a delivered scheduled message on receiver side, strip schedule flags so it appears as normal
+      if (!isSelfMsg && source?.isScheduled) {
+        source.isScheduled = false;
+        source.scheduleTime = null;
+        source.scheduleTimeLabel = null;
+        source.schedule_time = null;
+      }
+
+      // Block premature scheduled messages (sender side safety net)
+      if (isSelfMsg && isScheduledAndPremature(source)) {
         console.log('[Schedule] Blocked premature message:new:', source?.messageId || source?._id);
         return;
       }
 
       const msgId = source?.messageId || source?._id || source?.id;
+
+      // Block cancelled scheduled messages — server may still deliver after cancel
+      if (msgId && cancelledMsgIdsRef.current.has(String(msgId))) {
+        console.log('[Schedule] Blocked cancelled message:new:', msgId);
+        return;
+      }
 
       // Block if this message is already in scheduledMessages (server echo for sender)
       if (isInScheduledMessages(msgId)) {
@@ -3169,19 +3353,47 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageReceived = (data) => {
       const source = data?.data || data;
 
-      // Block still-pending scheduled messages — handled via scheduledMessages state
-      if (source?.status === 'scheduled') {
+      // Block still-pending scheduled/processing messages — handled via scheduledMessages state
+      if (source?.status === 'scheduled' || source?.status === 'processing') {
         console.log('[Schedule] Blocked pending scheduled message:received:', source?.messageId || source?._id);
         return;
       }
 
-      // Block premature scheduled messages on receiver side
-      if (isScheduledAndPremature(source)) {
+      // Block cancelled/failed messages — they should never appear in chat
+      if (source?.status === 'cancelled' || source?.status === 'failed') {
+        console.log('[Schedule] Blocked cancelled/failed message:received:', source?.messageId || source?._id);
+        return;
+      }
+
+      // For receiver: if isScheduled but scheduleTime has passed → server is delivering now → allow it
+      // Only block if scheduleTime is still in the future (premature)
+      const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+      if (!isSelfMsg && source?.isScheduled && isScheduledAndPremature(source)) {
+        console.log('[Schedule] Blocked premature scheduled message on receiver side:received:', source?.messageId || source?._id);
+        return;
+      }
+
+      // If it's a delivered scheduled message on receiver side, strip schedule flags so it appears as normal
+      if (!isSelfMsg && source?.isScheduled) {
+        source.isScheduled = false;
+        source.scheduleTime = null;
+        source.scheduleTimeLabel = null;
+        source.schedule_time = null;
+      }
+
+      // Block premature scheduled messages (sender side safety net)
+      if (isSelfMsg && isScheduledAndPremature(source)) {
         console.log('[Schedule] Blocked premature message:received:', source?.messageId || source?._id);
         return;
       }
 
       const msgId = source?.messageId || source?._id || source?.id;
+
+      // Block cancelled scheduled messages — server may still deliver after cancel
+      if (msgId && cancelledMsgIdsRef.current.has(String(msgId))) {
+        console.log('[Schedule] Blocked cancelled message:received:', msgId);
+        return;
+      }
 
       // Block if this message is already in scheduledMessages (server echo for sender)
       if (isInScheduledMessages(msgId)) {
@@ -3197,7 +3409,10 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageDelivered = (data) => {
       const source = data?.data || data;
       const messageId = source?.messageId || source?._id;
-      if (messageId) updateMessageStatus(messageId, 'delivered', source);
+      if (!messageId) return;
+      // Do NOT emit delivered for scheduled/processing/cancelled/failed messages
+      if (isInScheduledMessages(messageId)) return;
+      updateMessageStatus(messageId, 'delivered', source);
     };
     const onMessageRead = (data) => {
       const source = data?.data || data;
@@ -3224,6 +3439,8 @@ export default function useChatLogic({ navigation, route }) {
           const updated = prev.map(msg => {
             const isMine = msg.senderId === currentUserIdRef.current;
             if (!isMine) return msg;
+            // Skip scheduled/processing/cancelled/failed — not real messages yet
+            if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
             if (msg.status === 'sent' || msg.status === 'delivered') {
               changed = true;
               return { ...msg, status: 'seen' };
@@ -3256,6 +3473,8 @@ export default function useChatLogic({ navigation, route }) {
           const updated = prev.map(msg => {
             const id = String(msg.serverMessageId || msg.id || msg.tempId || '');
             if (!idSet.has(id)) return msg;
+            // Skip scheduled/processing/cancelled/failed — not real messages yet
+            if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
             if (msg.status === 'seen' || msg.status === 'read') return msg;
             changed = true;
             return { ...msg, status: 'seen' };
@@ -3276,6 +3495,8 @@ export default function useChatLogic({ navigation, route }) {
       const messageId = source?.messageId;
       const status = source?.status;
       if (!messageId || !status) return;
+      // Do NOT update status for messages that are in scheduledMessages
+      if (isInScheduledMessages(messageId)) return;
       updateMessageStatus(messageId, status, source);
     };
     registerSocketHandler('message:status', onMessageStatus);
@@ -3286,6 +3507,8 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       const messageId = source?.messageId;
       if (!messageId) return;
+      // Do NOT update delivery for scheduled/processing/cancelled/failed messages
+      if (isInScheduledMessages(messageId)) return;
       updateMessageStatus(messageId, 'delivered', source);
     };
     registerSocketHandler('message:delivered:response', onDeliveredResponse);
@@ -3297,6 +3520,8 @@ export default function useChatLogic({ navigation, route }) {
       // Only mark as 'seen' if the reader is the peer, not ourselves
       const readerId = source?.senderId || source?.readBy || source?.userId;
       if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
+      // Do NOT update read for scheduled/processing/cancelled/failed messages
+      if (isInScheduledMessages(messageId)) return;
       updateMessageStatus(messageId, 'seen', source);
     };
     registerSocketHandler('message:read:response', onReadResponse);
@@ -3318,6 +3543,8 @@ export default function useChatLogic({ navigation, route }) {
           if (!idSet.has(id)) return msg;
           // Only update incoming messages (from peer), not our own outgoing messages
           if (msg.senderId === currentUserIdRef.current) return msg;
+          // Skip scheduled/processing/cancelled/failed — not real messages yet
+          if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           if (msg.status === 'seen' || msg.status === 'read') return msg;
           changed = true;
           return { ...msg, status: 'seen' };
@@ -3346,6 +3573,8 @@ export default function useChatLogic({ navigation, route }) {
         const updated = prev.map(msg => {
           if (msg.chatId !== currentChatId) return msg;
           if (msg.senderId !== currentUserIdRef.current) return msg;
+          // Skip scheduled/processing/cancelled/failed — not real messages yet
+          if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           if (msg.status === 'seen' || msg.status === 'read') return msg;
           changed = true;
           return { ...msg, status: 'seen' };
@@ -3366,6 +3595,8 @@ export default function useChatLogic({ navigation, route }) {
       // Only mark as 'seen' if the reader is the peer, not ourselves
       const readerId = source?.senderId || source?.readBy || source?.userId;
       if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
+      // Do NOT update seen for scheduled/processing/cancelled/failed messages
+      if (isInScheduledMessages(messageId)) return;
       updateMessageStatus(messageId, 'seen', source);
     };
     registerSocketHandler('message:seen:response', onSeenResponse);
@@ -3552,6 +3783,8 @@ export default function useChatLogic({ navigation, route }) {
         const updated = prev.map((msg) => {
           const id = msg.serverMessageId || msg.id || msg.tempId;
           if (!messageIds.some(mid => sameId(mid, id))) return msg;
+          // Skip scheduled/processing/cancelled/failed — not real messages yet
+          if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           // Track per-user delivery
           const deliveredTo = { ...(msg.deliveredTo || {}) };
           if (userId && !deliveredTo[userId]) {
@@ -3588,6 +3821,8 @@ export default function useChatLogic({ navigation, route }) {
         const updated = prev.map((msg) => {
           const id = msg.serverMessageId || msg.id || msg.tempId;
           if (!messageIds.some(mid => sameId(mid, id))) return msg;
+          // Skip scheduled/processing/cancelled/failed — not real messages yet
+          if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           // Track per-user read
           const readBy = { ...(msg.readBy || {}) };
           if (userId && !readBy[userId]) {
@@ -4044,6 +4279,23 @@ export default function useChatLogic({ navigation, route }) {
     const normalizedStatus = normalizeMessageStatus(status) || status;
     const serverMessageId = serverData?.messageId || serverData?._id;
 
+    // Do NOT update status for messages that are scheduled/processing/cancelled/failed
+    // These statuses are managed by their own dedicated handlers
+    const PROTECTED_STATUSES = new Set(['scheduled', 'processing', 'cancelled', 'failed']);
+
+    // Check if this message is in scheduledMessages (protected from delivery/read updates)
+    const checkId = serverMessageId || tempId;
+    if (checkId) {
+      const scheduled = scheduledMessagesRef.current || [];
+      const isProtected = scheduled.some(m =>
+        PROTECTED_STATUSES.has(m.status) &&
+        (m.id === checkId || m.serverMessageId === checkId || m.tempId === checkId)
+      );
+      if (isProtected && (normalizedStatus === 'delivered' || normalizedStatus === 'seen' || normalizedStatus === 'read')) {
+        return; // Block delivery/read/seen for scheduled/processing/cancelled/failed messages
+      }
+    }
+
     // INSTANT UI: update status in state immediately (no flicker)
     setAllMessages(prev => {
       let changed = false;
@@ -4391,19 +4643,56 @@ export default function useChatLogic({ navigation, route }) {
   const cancelScheduledMessage = useCallback(async (messageId) => {
     if (!messageId) return;
 
-    // Instant UI: remove from scheduledMessages (cancelled = gone)
-    setScheduledMessages(prev => prev.filter(m => {
-      const isMatch = m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId;
-      return !isMatch;
-    }));
+    // Track cancelled ID — block this message from reaching receiver even if server delivers it
+    cancelledMsgIdsRef.current.add(String(messageId));
+    // Also track all ID variants from scheduledMessages
+    const scheduled = scheduledMessagesRef.current || [];
+    const match = scheduled.find(m =>
+      m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId
+    );
+    const allIds = match
+      ? [match.id, match.serverMessageId, match.tempId].filter(Boolean)
+      : [messageId];
+    allIds.forEach(id => cancelledMsgIdsRef.current.add(String(id)));
 
-    // Persist locally
-    ChatDatabase.updateMessageStatus(messageId, 'cancelled').catch(() => {});
+    // Determine the best server-side ID to send for cancel
+    const serverMsgId = match?.serverMessageId || match?.id || messageId;
 
-    // Tell server to cancel — server responds via message:cancel:scheduled:response
+    // Move from scheduledMessages → allMessages with status 'cancelled' (in-place, no flicker)
+    setScheduledMessages(prev => {
+      const found = prev.find(m =>
+        m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId
+      );
+      if (found) {
+        const cancelledMsg = {
+          ...found,
+          status: 'cancelled',
+          isScheduled: false,
+          scheduleTimeLabel: null,
+          scheduleTime: null,
+        };
+        setAllMessages(all => [cancelledMsg, ...all.filter(m =>
+          m.id !== messageId && m.serverMessageId !== messageId && m.tempId !== messageId
+        )]);
+      }
+      return prev.filter(m =>
+        m.id !== messageId && m.serverMessageId !== messageId && m.tempId !== messageId
+      );
+    });
+
+    // Persist: clear schedule data, set status cancelled — persist ALL known IDs
+    const clearPromises = [...new Set(allIds)].map(id =>
+      ChatDatabase.clearScheduleData(id, 'cancelled').catch(() => {})
+    );
+    Promise.all(clearPromises).then(() => refreshMessagesFromDB());
+
+    // Tell server to cancel — send all ID variants so server can reliably find the message
     const socket = socketRef.current || getSocket();
     if (socket && isSocketConnected()) {
-      socket.emit('message:cancel:scheduled', { messageId }, (ack) => {
+      socket.emit('message:cancel:scheduled', {
+        messageId: serverMsgId,
+        tempId: match?.tempId || null,
+      }, (ack) => {
         if (ack?.error) console.warn('[Schedule] cancel error:', ack.error);
       });
     }
@@ -4656,16 +4945,37 @@ export default function useChatLogic({ navigation, route }) {
   const handleReceivedMessage = useCallback(async (msg) => {
     resetIdleTimer();
 
-    // Block still-pending scheduled messages — they live in scheduledMessages state (sender-only)
+    // Block still-pending scheduled/processing messages — they live in scheduledMessages state (sender-only)
     // Delivered scheduled messages (status sent/delivered/seen) are allowed through
-    if (msg?.status === 'scheduled') {
+    if (msg?.status === 'scheduled' || msg?.status === 'processing') {
       console.log('[Schedule] Blocking pending scheduled message from handleReceivedMessage:', msg?.messageId || msg?._id);
       return;
     }
-    // Block messages with future scheduleTime (safety net — not yet time to deliver)
-    if (msg?.scheduleTime) {
+    // Block cancelled/failed messages
+    if (msg?.status === 'cancelled' || msg?.status === 'failed') {
+      console.log('[Schedule] Blocking cancelled/failed message from handleReceivedMessage:', msg?.messageId || msg?._id);
+      return;
+    }
+    // For receiver: if isScheduled but scheduleTime has passed → server is delivering now → allow it
+    // Only block if scheduleTime is still in the future (premature delivery)
+    const isSelfMsg = msg?.senderId && sameId(msg.senderId, currentUserIdRef.current);
+    if (!isSelfMsg && msg?.isScheduled) {
+      const schedTime = msg?.scheduleTime || msg?.schedule_time;
+      const st = schedTime ? new Date(schedTime).getTime() : 0;
+      if (Number.isFinite(st) && st > Date.now() + 30000) {
+        console.log('[Schedule] Blocking premature isScheduled message on receiver side:', msg?.messageId || msg?._id);
+        return;
+      }
+      // scheduleTime has passed — strip schedule flags so it appears as a normal message
+      msg.isScheduled = false;
+      msg.scheduleTime = null;
+      msg.scheduleTimeLabel = null;
+      msg.schedule_time = null;
+    }
+    // Block messages with future scheduleTime on sender side (safety net)
+    if (isSelfMsg && msg?.scheduleTime) {
       const schedTime = new Date(msg.scheduleTime).getTime();
-      if (Number.isFinite(schedTime) && schedTime > Date.now()) {
+      if (Number.isFinite(schedTime) && schedTime > Date.now() + 30000) {
         console.log('[Schedule] Ignoring premature scheduled message:', msg?.messageId || msg?._id);
         return;
       }
@@ -4817,8 +5127,11 @@ export default function useChatLogic({ navigation, route }) {
     refreshMessagesFromDB();
 
     // Emit delivery receipt for incoming messages from others
+    // Do NOT emit delivery for scheduled/processing/cancelled/failed messages
+    const msgStatus = (msg?.status || receivedMessage?.status || '').toLowerCase();
+    const isProtectedStatus = msgStatus === 'scheduled' || msgStatus === 'processing' || msgStatus === 'cancelled' || msgStatus === 'failed';
     const senderId = msg?.senderId;
-    if (senderId && !sameId(senderId, currentUserIdRef.current) && messageId) {
+    if (senderId && !sameId(senderId, currentUserIdRef.current) && messageId && !isProtectedStatus) {
       const socket = socketRef.current || getSocket();
       if (socket && isSocketConnected() && chatIdRef.current) {
         const isGrpDel = chatData?.chatType === 'group' || chatData?.isGroup;

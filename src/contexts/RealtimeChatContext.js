@@ -756,8 +756,15 @@ const reducer = (state, action) => {
 
     case 'INCOMING_MESSAGE': {
       const message = action.payload || {};
-      // Block pending scheduled messages from updating chat list (not yet delivered)
-      if (message.status === 'scheduled') return state;
+      // Block pending scheduled/processing/cancelled/failed messages from updating chat list
+      if (message.status === 'scheduled' || message.status === 'processing' || message.status === 'cancelled' || message.status === 'failed') return state;
+      // Block isScheduled on receiver side only if scheduleTime is still in the future
+      const isSelf = message.senderId && state.currentUserId && String(message.senderId) === String(state.currentUserId);
+      if (!isSelf && message.isScheduled) {
+        const st = message.scheduleTime || message.schedule_time;
+        const stMs = st ? new Date(st).getTime() : 0;
+        if (Number.isFinite(stMs) && stMs > Date.now() + 30000) return state;
+      }
       const chatId = normalizeId(message.chatId || message.roomId || message.chat);
       if (!chatId) return state;
 
@@ -987,6 +994,27 @@ const reducer = (state, action) => {
       };
     }
 
+    case 'REMOVE_CANCELLED_SCHEDULED': {
+      // When a scheduled message is cancelled, remove it from chat list if it was the last message
+      const cancelledMsgId = normalizeId(action.payload?.messageId);
+      if (!cancelledMsgId) return state;
+      const chatMap = { ...state.chatMap };
+      let changed = false;
+      for (const cid of Object.keys(chatMap)) {
+        const chat = chatMap[cid];
+        const lm = chat?.lastMessage;
+        const lmId = normalizeId(lm?.messageId || lm?.serverMessageId || lm?.id || lm?.tempId);
+        if (lmId === cancelledMsgId) {
+          // Clear last message so cancelled message doesn't show in chat list
+          chatMap[cid] = { ...chat, lastMessage: { ...lm, text: '', status: null }, lastMessageStatus: null };
+          changed = true;
+        }
+      }
+      if (!changed) return state;
+      const sections = buildOrderedSections(chatMap);
+      return { ...state, chatMap, sortedChatIds: sections.sortedChatIds, pinnedChatIds: sections.pinnedChatIds, regularChatIds: sections.regularChatIds, archivedChatIds: sections.archivedChatIds };
+    }
+
     case 'UPDATE_LAST_MESSAGE_STATUS': {
       const { chatId: rawChatId, status, messageId: rawMessageId } = action.payload || {};
       const chatId = normalizeId(rawChatId);
@@ -1108,10 +1136,11 @@ const reducer = (state, action) => {
 
         switch (type) {
           case 'new_message': {
-            // Block pending scheduled messages from updating chat list (not yet delivered)
+            // Block pending scheduled/processing/cancelled/failed messages from updating chat list
             const lm = item?.lastMessage;
-            if (lm?.status === 'scheduled' || item?.status === 'scheduled') {
-              break; // Skip — still pending, not delivered yet
+            const itemStatus = lm?.status || item?.status;
+            if (itemStatus === 'scheduled' || itemStatus === 'processing' || itemStatus === 'cancelled' || itemStatus === 'failed') {
+              break; // Skip — not a real delivered message
             }
             // Also block if scheduleTime is in the future (safety net)
             const schedTime = lm?.scheduleTime || item?.scheduleTime;
@@ -1823,13 +1852,23 @@ export function RealtimeChatProvider({ children }) {
 
     const onMessage = (payload) => {
       const source = unwrapPayload(payload);
-      // Block pending scheduled messages — not yet delivered
-      if (source?.status === 'scheduled' || source?.data?.status === 'scheduled') return;
+      // Block pending scheduled/processing/cancelled/failed messages — not yet delivered or not real
+      const msgStatus = source?.status || source?.data?.status;
+      if (msgStatus === 'scheduled' || msgStatus === 'processing' || msgStatus === 'cancelled' || msgStatus === 'failed') return;
       // Block premature scheduled messages (scheduleTime in future)
       const schedTime = source?.scheduleTime || source?.schedule_time || source?.data?.scheduleTime;
       if (schedTime) {
         const st = new Date(schedTime).getTime();
         if (Number.isFinite(st) && st > Date.now() + 30000) return;
+      }
+      // Block isScheduled on receiver side ONLY if scheduleTime is still in the future
+      // If scheduleTime has passed, server is delivering now — allow it through
+      const isSelf = source?.senderId && state.currentUserId && String(source.senderId) === String(state.currentUserId);
+      if (!isSelf && (source?.isScheduled || source?.data?.isScheduled)) {
+        // Already checked schedTime above — if we're here, scheduleTime has passed or is absent
+        // Strip schedule flags so chat list shows it as a normal message
+        if (source) { source.isScheduled = false; source.scheduleTime = null; source.scheduleTimeLabel = null; }
+        if (source?.data) { source.data.isScheduled = false; source.data.scheduleTime = null; source.data.scheduleTimeLabel = null; }
       }
       const normalized = normalizeMessagePayload(payload);
       dispatch({ type: 'INCOMING_MESSAGE', payload: normalized });
@@ -2160,6 +2199,18 @@ export function RealtimeChatProvider({ children }) {
       });
     };
 
+    // Receiver-side: scheduled message cancelled by sender — remove from chat list
+    const onScheduledCancelled = (payload) => {
+      const source = unwrapPayload(payload);
+      const msgId = normalizeId(source?.messageId || source?._id || source?.id);
+      if (msgId) {
+        dispatch({ type: 'REMOVE_CANCELLED_SCHEDULED', payload: { messageId: msgId } });
+      }
+    };
+    socket.on('message:scheduled:cancelled', onScheduledCancelled);
+    socket.on('message:cancel:scheduled', onScheduledCancelled);
+    socket.on('message:cancel:scheduled:response', onScheduledCancelled);
+
     socket.on('message:new', onMessage);
     socket.on('message:received', onMessage);
     socket.on('message:delivered', onMessageDelivered);
@@ -2200,8 +2251,19 @@ export function RealtimeChatProvider({ children }) {
 
     const onGroupMessageNew = (payload) => {
       const data = payload?.data || payload;
-      // Block pending scheduled messages from updating group chat list
-      if (data?.status === 'scheduled') return;
+      // Block pending scheduled/processing/cancelled/failed messages from updating group chat list
+      if (data?.status === 'scheduled' || data?.status === 'processing' || data?.status === 'cancelled' || data?.status === 'failed') return;
+      // Block isScheduled on receiver side only if scheduleTime is still in the future
+      const isSelf = data?.senderId && state.currentUserId && String(data.senderId) === String(state.currentUserId);
+      if (!isSelf && data?.isScheduled) {
+        const st = data?.scheduleTime || data?.schedule_time;
+        const stMs = st ? new Date(st).getTime() : 0;
+        if (Number.isFinite(stMs) && stMs > Date.now() + 30000) return;
+        // scheduleTime passed — strip flags, allow through
+        data.isScheduled = false;
+        data.scheduleTime = null;
+        data.scheduleTimeLabel = null;
+      }
       const groupId = normalizeId(data?.groupId);
       const chatId = normalizeId(data?.chatId);
       if (!chatId && !groupId) return;
@@ -2477,6 +2539,9 @@ export function RealtimeChatProvider({ children }) {
     socket.on('group:member:info:response', onGroupMemberInfoResponse);
 
     socketUnsubscribersRef.current = [
+      () => socket.off('message:scheduled:cancelled', onScheduledCancelled),
+      () => socket.off('message:cancel:scheduled', onScheduledCancelled),
+      () => socket.off('message:cancel:scheduled:response', onScheduledCancelled),
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
       () => socket.off('message:delivered', onMessageDelivered),

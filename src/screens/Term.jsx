@@ -5,7 +5,7 @@ import { WebView } from 'react-native-webview';
 import { WEB_URL } from '@env';
 import { FontAwesome6 } from '@expo/vector-icons'
 
-export default function Term() {
+export default function Term({ navigation }) {
   const { theme } = useTheme();
 
   return (

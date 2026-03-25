@@ -180,7 +180,7 @@ const formatDate = (ts, ca) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-const STATUS_PRIORITY = { scheduled: 0, cancelled: 0, sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
+const STATUS_PRIORITY = { scheduled: 0, cancelled: 0, processing: 0, sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
 
 const parseJSON = (val) => {
   if (!val) return null;
@@ -696,9 +696,16 @@ const _preserveLocalState = async (db, msg) => {
   if (!merged) {
     const ip = STATUS_PRIORITY[msg.status] || 0;
     const ep = STATUS_PRIORITY[existing.status] || 0;
-    // Don't override an explicitly-set 'scheduled' status with a higher-priority one
-    // The caller is intentionally keeping the message scheduled
-    if (ep > ip && msg.status !== 'scheduled') merged = { ...msg, status: existing.status };
+    // Don't override an explicitly-set 'scheduled'/'processing' status with a higher-priority one
+    if (ep > ip && msg.status !== 'scheduled' && msg.status !== 'processing') merged = { ...msg, status: existing.status };
+    // Protect existing 'scheduled'/'processing' status from being overwritten by server sync data
+    // Only clearScheduleData() or updateMessageStatus() should transition scheduled → sent
+    if ((existing.status === 'scheduled' || existing.status === 'processing') && msg.status !== 'scheduled' && msg.status !== 'processing') {
+      const existPayload = parseJSON(existing.payload);
+      if (existPayload?.isScheduled) {
+        merged = { ...msg, status: existing.status, isScheduled: true, scheduleTime: existPayload.scheduleTime, scheduleTimeLabel: existPayload.scheduleTimeLabel };
+      }
+    }
   }
 
   // Preserve reactions
@@ -848,10 +855,10 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
   const serverRow = await db.getFirstAsync(`SELECT id, is_edited FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`, { $s: serverMessageId });
   const tempRow = await db.getFirstAsync(`SELECT id, is_edited, status, payload, reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id FROM messages WHERE id = $t OR temp_id = $t LIMIT 1`, { $t: tempId });
 
-  // Preserve 'scheduled' status — don't overwrite it with 'sent' during acknowledge
+  // Preserve 'scheduled'/'processing' status — don't overwrite it with 'sent' during acknowledge
   const tempPayload = tempRow ? parseJSON(tempRow.payload) : null;
-  const isScheduledMsg = tempRow?.status === 'scheduled' || tempPayload?.isScheduled;
-  const ackStatus = isScheduledMsg ? 'scheduled' : 'sent';
+  const isScheduledMsg = tempRow?.status === 'scheduled' || tempRow?.status === 'processing' || tempPayload?.isScheduled;
+  const ackStatus = isScheduledMsg ? (tempRow?.status || 'scheduled') : 'sent';
 
   if (serverRow && tempRow && serverRow.id !== tempRow.id) {
     if (tempRow.is_edited && !serverRow.is_edited) {
@@ -910,9 +917,43 @@ const updateMessageStatus = async (messageId, newStatus) => {
   const np = STATUS_PRIORITY[newStatus] || 0;
   const cur = await db.getFirstAsync(`SELECT status FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`, { $id: messageId });
   if (!cur) return false;
+  // Protect scheduled/cancelled/failed from being overwritten by delivery/read/seen events
+  // Only clearScheduleData() should transition these statuses
+  const PROTECTED = new Set(['scheduled', 'processing', 'cancelled', 'failed']);
+  if (PROTECTED.has(cur.status) && !PROTECTED.has(newStatus)) return false;
   if (np <= (STATUS_PRIORITY[cur.status] || 0)) return false;
   await db.runAsync(`UPDATE messages SET status = $s WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $s: newStatus, $id: messageId });
   return true;
+};
+
+// Clear schedule data from payload when a scheduled message is delivered
+const clearScheduleData = async (messageId, newStatus = 'sent') => {
+  if (!messageId) return;
+  const db = await getDB();
+  try {
+    const row = await db.getFirstAsync(
+      `SELECT id, payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+      { $id: messageId }
+    );
+    if (!row) return;
+    const payload = parseJSON(row.payload);
+    if (payload) {
+      delete payload.isScheduled;
+      delete payload.scheduleTime;
+      delete payload.scheduleTimeLabel;
+      await db.runAsync(
+        `UPDATE messages SET status = $s, payload = $p WHERE id = $rid`,
+        { $s: newStatus, $p: JSON.stringify(payload), $rid: row.id }
+      );
+    } else {
+      await db.runAsync(
+        `UPDATE messages SET status = $s WHERE id = $rid`,
+        { $s: newStatus, $rid: row.id }
+      );
+    }
+  } catch (err) {
+    console.warn('[ChatDB] clearScheduleData error:', err);
+  }
 };
 
 const markMessageDeleted = async (messageId, deletedBy, placeholderText) => {
@@ -1033,7 +1074,7 @@ const saveMessages = upsertMessages;
 const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply data
 
 export default {
-  getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus,
+  getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
   loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getMessageCount, searchMessages, getClearedAt,
   markMessageDeleted, deleteMessageForMe, clearChat, deduplicateChat,
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
