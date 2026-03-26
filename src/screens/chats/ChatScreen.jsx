@@ -3856,14 +3856,18 @@ export default function ChatScreen({ navigation, route }) {
               </Text>
             )}
 
-            {/* Scheduled message label — only show while still pending (status==='scheduled' or 'processing') */}
-            {!isDeletedMessage && isMyMessage && (msg.status === 'scheduled' || msg.status === 'processing') && msg.scheduleTimeLabel && (
+            {/* Scheduled message label — same UI before and after delivery, both sender and receiver */}
+            {!isDeletedMessage && msg.status !== 'cancelled' && (msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel || msg.wasScheduled || msg.payload?.wasScheduled || ((msg.status === 'scheduled' || msg.status === 'processing') && msg.isScheduled)) && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
-                <Ionicons name="time-outline" size={13} color="rgba(255,255,255,0.65)" style={{ marginRight: 4 }} />
+                <Ionicons name="time-outline" size={13} color={isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0'} style={{ marginRight: 4 }} />
                 <Text style={{
                   fontFamily: 'Roboto-Regular', fontSize: 11, fontStyle: 'italic',
-                  color: 'rgba(255,255,255,0.65)',
-                }}>Scheduled {msg.scheduleTimeLabel}</Text>
+                  color: isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0',
+                }}>
+                  {msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel
+                    ? `Scheduled ${msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel}`
+                    : 'Scheduled message'}
+                </Text>
               </View>
             )}
 
@@ -4107,7 +4111,7 @@ export default function ChatScreen({ navigation, route }) {
         </View>
       );
     }
-    if (!hasMoreMessages && messages.length > 0 && !isSearching) {
+    if (!hasMoreMessages && !isSearching) {
       const isGrpFooter = chatData?.isGroup || chatData?.chatType === 'group';
       const creatorId = chatData?.group?.createdBy || chatData?.group?.ownerId;
       const creatorName = creatorId

@@ -4,22 +4,42 @@
  * Handles all group-specific real-time messaging via Socket.IO.
  *
  * Events emitted (client -> server):
- *   group:message:send        – Send a message to a group
- *   group:message:edit        – Edit a message you sent
- *   group:message:delete      – Delete a message (for self or everyone)
- *   group:message:read        – Mark messages as read
- *   group:message:delivered   – Acknowledge delivery
- *   group:message:sync        – Fetch missed messages (pagination)
- *   group:message:reaction    – Add or remove emoji reaction
+ *   group:message:send              – Send a message to a group
+ *   group:message:edit              – Edit a message you sent
+ *   group:message:delete            – Delete a message (for self or everyone)
+ *   group:message:read              – Mark messages as read
+ *   group:message:delivered         – Acknowledge delivery
+ *   group:message:sync              – Fetch missed messages (pagination)
+ *   group:message:reaction          – Add or remove emoji reaction
+ *   group:message:schedule          – Schedule a message for future delivery
+ *   group:message:cancel:scheduled  – Cancel a pending scheduled message
+ *   group:message:read:bulk         – Mark multiple messages as read (max 100)
+ *   group:message:read:all          – Mark all unread messages as read
+ *   group:message:seen              – Lightweight seen analytics
+ *   group:message:fetch             – Fetch messages with pagination
+ *   group:message:fetch:unread      – Fetch only unread messages
+ *   group:message:search            – Full-text search in group messages
+ *   group:message:search:media      – Filter messages by media type
+ *   group:message:forward           – Forward a single message
+ *   group:message:forward:multiple  – Forward multiple messages
+ *   group:message:reply             – Reply to a specific message
+ *   group:message:quote             – Quote a message with inline snapshot
+ *   group:message:clear:history     – Clear chat history for current user
+ *   group:message:media:update      – Update media download status
  *
  * Events listened (server -> client):
- *   group:message:new         – New message broadcast
- *   group:message:edited      – Message edited broadcast
- *   group:message:deleted     – Message deleted broadcast
- *   group:message:read:update – Read receipts update
- *   group:message:delivered:update – Delivery receipts update
- *   group:message:sync:response   – Sync response with missed messages
- *   group:message:reaction:update – Reaction added/removed broadcast
+ *   group:message:new               – New message broadcast
+ *   group:message:received          – New message broadcast (alternative)
+ *   group:message:edited            – Message edited broadcast
+ *   group:message:deleted           – Message deleted broadcast
+ *   group:message:read:update       – Read receipts update
+ *   group:message:delivered:update  – Delivery receipts update
+ *   group:message:delivered:receipt – Delivery receipt confirmation
+ *   group:message:sync:response     – Sync response with missed messages
+ *   group:message:reaction:update   – Reaction added/removed broadcast
+ *   group:message:reaction          – Reaction broadcast (alternative)
+ *   group:message:media:updated     – Media download status broadcast
+ *   group:message:schedule:failed   – Scheduled message delivery failed
  */
 
 import { getSocket, isSocketConnected, emitSocketEvent } from '../Redux/Services/Socket/socket';
@@ -206,6 +226,244 @@ export const reactToGroupMessage = (groupId, messageId, emoji, action = 'add', u
   });
 };
 
+// ─── EMIT: group:message:schedule ───────────────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId
+ * @param {string} params.text
+ * @param {string} params.scheduleTime  ISO date string (must be in the future)
+ * @param {string} [params.messageType='text']
+ * @param {string} [params.mediaUrl]
+ * @param {Object} [params.mediaMeta]
+ * @param {Function} [ack]
+ */
+export const scheduleGroupMessage = (params, ack) => {
+  const { groupId, text, scheduleTime, messageType = 'text', mediaUrl, mediaMeta } = params;
+  if (!groupId || !text?.trim() || !scheduleTime) return false;
+  const payload = { groupId, text: text.trim(), messageType, scheduleTime };
+  if (mediaUrl) payload.mediaUrl = mediaUrl;
+  if (mediaMeta) payload.mediaMeta = mediaMeta;
+  return emitSocketEvent('group:message:schedule', payload, ack);
+};
+
+// ─── EMIT: group:message:cancel:scheduled ───────────────
+/**
+ * @param {string} messageId
+ * @param {string} [groupId]
+ * @param {Function} [ack]
+ */
+export const cancelScheduledGroupMessage = (messageId, groupId, ack) => {
+  if (!messageId) return false;
+  const payload = { messageId };
+  if (groupId) payload.groupId = groupId;
+  return emitSocketEvent('group:message:cancel:scheduled', payload, ack);
+};
+
+// ─── EMIT: group:message:read:bulk ──────────────────────
+/**
+ * @param {string} groupId
+ * @param {string[]} messageIds  (max 100)
+ */
+export const bulkReadGroupMessages = (groupId, messageIds) => {
+  if (!groupId || !messageIds?.length) return false;
+  return emitSocketEvent('group:message:read:bulk', { groupId, messageIds: messageIds.slice(0, 100) });
+};
+
+// ─── EMIT: group:message:read:all ───────────────────────
+/**
+ * @param {string} groupId
+ */
+export const markAllGroupRead = (groupId) => {
+  if (!groupId) return false;
+  return emitSocketEvent('group:message:read:all', { groupId });
+};
+
+// ─── EMIT: group:message:seen ───────────────────────────
+/**
+ * @param {string} groupId
+ * @param {string} messageId
+ */
+export const markGroupMessageSeen = (groupId, messageId) => {
+  if (!groupId || !messageId) return false;
+  return emitSocketEvent('group:message:seen', { groupId, messageId });
+};
+
+// ─── EMIT: group:message:fetch ──────────────────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId
+ * @param {number} [params.offset=0]
+ * @param {number} [params.limit=50]
+ * @param {string} [params.before]   ISO date
+ * @param {string} [params.after]    ISO date
+ * @param {Function} [ack]
+ */
+export const fetchGroupMessages = (params, ack) => {
+  const { groupId, offset = 0, limit = 50, before, after } = params;
+  if (!groupId) return false;
+  const payload = { groupId, offset, limit };
+  if (before) payload.before = before;
+  if (after) payload.after = after;
+  return emitSocketEvent('group:message:fetch', payload, ack);
+};
+
+// ─── EMIT: group:message:fetch:unread ───────────────────
+/**
+ * @param {string} groupId
+ * @param {number} [limit=50]
+ * @param {Function} [ack]
+ */
+export const fetchGroupUnread = (groupId, limit = 50, ack) => {
+  if (!groupId) return false;
+  return emitSocketEvent('group:message:fetch:unread', { groupId, limit }, ack);
+};
+
+// ─── EMIT: group:message:search ─────────────────────────
+/**
+ * @param {string} groupId
+ * @param {string} query   1-200 chars
+ * @param {number} [limit=50]
+ * @param {Function} [ack]
+ */
+export const searchGroupMessages = (groupId, query, limit = 50, ack) => {
+  if (!groupId || !query?.trim()) return false;
+  return emitSocketEvent('group:message:search', { groupId, query: query.trim(), limit }, ack);
+};
+
+// ─── EMIT: group:message:search:media ───────────────────
+/**
+ * @param {string} groupId
+ * @param {string} mediaType  image|video|audio|file|location
+ * @param {number} [limit=50]
+ * @param {Function} [ack]
+ */
+export const searchGroupMedia = (groupId, mediaType, limit = 50, ack) => {
+  if (!groupId || !mediaType) return false;
+  return emitSocketEvent('group:message:search:media', { groupId, mediaType, limit }, ack);
+};
+
+// ─── EMIT: group:message:forward ────────────────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId          source group
+ * @param {string} params.messageId        message to forward
+ * @param {string[]} [params.targetGroupIds]  max 20
+ * @param {string[]} [params.targetUserIds]   max 20
+ * @param {Function} [ack]
+ */
+export const forwardGroupMessage = (params, ack) => {
+  const { groupId, messageId, targetGroupIds = [], targetUserIds = [] } = params;
+  if (!groupId || !messageId) return false;
+  if (targetGroupIds.length === 0 && targetUserIds.length === 0) return false;
+  return emitSocketEvent('group:message:forward', {
+    groupId, messageId,
+    targetGroupIds: targetGroupIds.slice(0, 20),
+    targetUserIds: targetUserIds.slice(0, 20),
+  }, ack);
+};
+
+// ─── EMIT: group:message:forward:multiple ───────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId
+ * @param {string[]} params.messageIds      max 10
+ * @param {string[]} [params.targetGroupIds]  max 10
+ * @param {string[]} [params.targetUserIds]   max 10
+ * @param {Function} [ack]
+ */
+export const forwardMultipleGroupMessages = (params, ack) => {
+  const { groupId, messageIds = [], targetGroupIds = [], targetUserIds = [] } = params;
+  if (!groupId || !messageIds.length) return false;
+  if (targetGroupIds.length === 0 && targetUserIds.length === 0) return false;
+  return emitSocketEvent('group:message:forward:multiple', {
+    groupId,
+    messageIds: messageIds.slice(0, 10),
+    targetGroupIds: targetGroupIds.slice(0, 10),
+    targetUserIds: targetUserIds.slice(0, 10),
+  }, ack);
+};
+
+// ─── EMIT: group:message:reply ──────────────────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId
+ * @param {string} params.text
+ * @param {string} params.replyToMessageId
+ * @param {string} [params.messageType='text']
+ * @param {string} [params.mediaUrl]
+ * @param {string} [params.mediaThumbnailUrl]
+ * @param {Object} [params.mediaMeta]
+ * @param {Object} [params.contact]
+ * @param {Function} [ack]
+ */
+export const replyToGroupMessage = (params, ack) => {
+  const { groupId, text, replyToMessageId, messageType = 'text', mediaUrl, mediaThumbnailUrl, mediaMeta, contact } = params;
+  if (!groupId || !replyToMessageId) return false;
+  const payload = { groupId, text: (text || '').trim(), messageType, replyToMessageId };
+  if (mediaUrl) payload.mediaUrl = mediaUrl;
+  if (mediaThumbnailUrl) payload.mediaThumbnailUrl = mediaThumbnailUrl;
+  if (mediaMeta) payload.mediaMeta = mediaMeta;
+  if (contact) payload.contact = contact;
+  return emitSocketEvent('group:message:reply', payload, ack);
+};
+
+// ─── EMIT: group:message:quote ──────────────────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId
+ * @param {string} params.text
+ * @param {string} params.quotedMessageId
+ * @param {string} params.quotedText
+ * @param {string} params.quotedSender
+ * @param {string} [params.messageType='text']
+ * @param {string} [params.mediaUrl]
+ * @param {string} [params.mediaThumbnailUrl]
+ * @param {Object} [params.mediaMeta]
+ * @param {Object} [params.contact]
+ * @param {Function} [ack]
+ */
+export const quoteGroupMessage = (params, ack) => {
+  const { groupId, text, quotedMessageId, quotedText, quotedSender, messageType = 'text', mediaUrl, mediaThumbnailUrl, mediaMeta, contact } = params;
+  if (!groupId || !quotedMessageId) return false;
+  const payload = { groupId, text: (text || '').trim(), messageType, quotedMessageId, quotedText, quotedSender };
+  if (mediaUrl) payload.mediaUrl = mediaUrl;
+  if (mediaThumbnailUrl) payload.mediaThumbnailUrl = mediaThumbnailUrl;
+  if (mediaMeta) payload.mediaMeta = mediaMeta;
+  if (contact) payload.contact = contact;
+  return emitSocketEvent('group:message:quote', payload, ack);
+};
+
+// ─── EMIT: group:message:clear:history ──────────────────
+/**
+ * @param {string} groupId
+ * @param {Function} [ack]
+ */
+export const clearGroupHistory = (groupId, ack) => {
+  if (!groupId) return false;
+  return emitSocketEvent('group:message:clear:history', { groupId }, ack);
+};
+
+// ─── EMIT: group:message:media:update ───────────────────
+/**
+ * @param {Object} params
+ * @param {string} params.groupId
+ * @param {string} params.messageId
+ * @param {boolean} params.isMediaDownloaded
+ * @param {string} [params.messageType]
+ * @param {string} [params.mediaId]
+ * @param {string} [params.deviceId]
+ * @param {Function} [ack]
+ */
+export const updateGroupMessageMedia = (params, ack) => {
+  const { groupId, messageId, isMediaDownloaded, messageType, mediaId, deviceId } = params;
+  if (!groupId || !messageId) return false;
+  const payload = { groupId, messageId, isMediaDownloaded: Boolean(isMediaDownloaded) };
+  if (messageType) payload.messageType = messageType;
+  if (mediaId) payload.mediaId = mediaId;
+  if (deviceId) payload.deviceId = deviceId;
+  return emitSocketEvent('group:message:media:update', payload, ack);
+};
+
 // ─── LISTENER MANAGER ───────────────────────────────────
 /**
  * Attaches all group message listeners to the socket.
@@ -219,6 +477,8 @@ export const reactToGroupMessage = (groupId, messageId, emoji, action = 'add', u
  * @param {Function} handlers.onDeliveredUpdate     ({ groupId, messageIds, userId, deliveredAt }) =>
  * @param {Function} handlers.onSyncResponse        ({ groupId, messages, hasMore, nextCursor }) =>
  * @param {Function} handlers.onReactionUpdate      ({ groupId, messageId, emoji, action, userId, reactions }) =>
+ * @param {Function} handlers.onMediaUpdated        ({ groupId, messageId, isMediaDownloaded, ... }) =>
+ * @param {Function} handlers.onScheduleFailed      ({ messageId, groupId }) =>
  * @returns {Function} unsubscribe
  */
 export const attachGroupMessageListeners = (handlers = {}) => {
@@ -236,6 +496,8 @@ export const attachGroupMessageListeners = (handlers = {}) => {
     onDeliveredUpdate,
     onSyncResponse,
     onReactionUpdate,
+    onMediaUpdated,
+    onScheduleFailed,
   } = handlers;
 
   // ── group:message:new ──
@@ -344,14 +606,42 @@ export const attachGroupMessageListeners = (handlers = {}) => {
     });
   };
 
+  // ── group:message:media:updated ──
+  const handleMediaUpdated = (payload) => {
+    const data = payload?.data || payload;
+    onMediaUpdated?.({
+      groupId: data?.groupId,
+      messageId: data?.messageId || data?._id,
+      messageType: data?.messageType,
+      isMediaDownloaded: data?.isMediaDownloaded,
+      updatedAt: data?.updatedAt,
+      updatedBy: data?.updatedBy,
+      deviceId: data?.deviceId,
+    });
+  };
+
+  // ── group:message:schedule:failed ──
+  const handleScheduleFailed = (payload) => {
+    const data = payload?.data || payload;
+    onScheduleFailed?.({
+      messageId: data?.messageId || data?._id,
+      groupId: data?.groupId,
+    });
+  };
+
   // Bind listeners
   socket.on('group:message:new', handleNewMessage);
+  socket.on('group:message:received', handleNewMessage);
   socket.on('group:message:edited', handleEdited);
   socket.on('group:message:deleted', handleDeleted);
   socket.on('group:message:read:update', handleReadUpdate);
   socket.on('group:message:delivered:update', handleDeliveredUpdate);
+  socket.on('group:message:delivered:receipt', handleDeliveredUpdate);
   socket.on('group:message:sync:response', handleSyncResponse);
   socket.on('group:message:reaction:update', handleReactionUpdate);
+  socket.on('group:message:reaction', handleReactionUpdate);
+  socket.on('group:message:media:updated', handleMediaUpdated);
+  socket.on('group:message:schedule:failed', handleScheduleFailed);
 
   // Also listen for generic message events that might be group messages
   const handleGenericNew = (payload) => {
@@ -365,12 +655,17 @@ export const attachGroupMessageListeners = (handlers = {}) => {
   // Cleanup function
   return () => {
     socket.off('group:message:new', handleNewMessage);
+    socket.off('group:message:received', handleNewMessage);
     socket.off('group:message:edited', handleEdited);
     socket.off('group:message:deleted', handleDeleted);
     socket.off('group:message:read:update', handleReadUpdate);
     socket.off('group:message:delivered:update', handleDeliveredUpdate);
+    socket.off('group:message:delivered:receipt', handleDeliveredUpdate);
     socket.off('group:message:sync:response', handleSyncResponse);
     socket.off('group:message:reaction:update', handleReactionUpdate);
+    socket.off('group:message:reaction', handleReactionUpdate);
+    socket.off('group:message:media:updated', handleMediaUpdated);
+    socket.off('group:message:schedule:failed', handleScheduleFailed);
     socket.off('message:new', handleGenericNew);
   };
 };
@@ -395,7 +690,7 @@ export const withAutoDelivery = (currentUserId, originalHandler) => {
 };
 
 export default {
-  // Emitters
+  // Emitters — core messaging
   sendGroupMessage,
   editGroupMessage,
   deleteGroupMessage,
@@ -403,6 +698,27 @@ export default {
   markGroupMessagesDelivered,
   syncGroupMessages,
   reactToGroupMessage,
+  // Emitters — scheduled messages
+  scheduleGroupMessage,
+  cancelScheduledGroupMessage,
+  // Emitters — read/seen
+  bulkReadGroupMessages,
+  markAllGroupRead,
+  markGroupMessageSeen,
+  // Emitters — fetch/search
+  fetchGroupMessages,
+  fetchGroupUnread,
+  searchGroupMessages,
+  searchGroupMedia,
+  // Emitters — forward
+  forwardGroupMessage,
+  forwardMultipleGroupMessages,
+  // Emitters — reply/quote
+  replyToGroupMessage,
+  quoteGroupMessage,
+  // Emitters — history/media
+  clearGroupHistory,
+  updateGroupMessageMedia,
   // Listeners
   attachGroupMessageListeners,
   // Utilities

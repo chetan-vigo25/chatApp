@@ -263,6 +263,7 @@ export default function useChatLogic({ navigation, route }) {
   // Track message IDs that were created by forwarding — persists across chat navigations
   const forwardedMsgIdsRef = useRef(new Set());
   const cancelledMsgIdsRef = useRef(new Set());
+  const groupScheduleTimersRef = useRef(new Map()); // tempId → timer for client-side group scheduling
   const pendingPreviewSyncRef = useRef(false);
   // Cache reply data by messageId — never lost even if SQLite row is overwritten
   const replyDataCacheRef = useRef({});
@@ -1068,7 +1069,13 @@ export default function useChatLogic({ navigation, route }) {
       if (socketRef.current) {
         removeSocketListeners(socketRef.current);
       }
-      
+
+      // Clear any group schedule timers
+      for (const timer of groupScheduleTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      groupScheduleTimersRef.current.clear();
+
       initialLoadDoneRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1526,7 +1533,7 @@ export default function useChatLogic({ navigation, route }) {
       const isSelf = raw?.senderId && sameId(raw.senderId, currentUserIdRef.current);
       const schedTime = raw?.scheduleTime || raw?.schedule_time;
       const st = schedTime ? new Date(schedTime).getTime() : 0;
-      const isFuture = Number.isFinite(st) && st > Date.now() + 30000;
+      const isFuture = Number.isFinite(st) && st > Date.now() + 5000;
       if (!isSelf && raw?.isScheduled && isFuture) return false;
       // Strip schedule flags on receiver side for delivered scheduled messages
       if (!isSelf && raw?.isScheduled && !isFuture) {
@@ -1583,7 +1590,7 @@ export default function useChatLogic({ navigation, route }) {
         if (!isSelf && raw?.isScheduled) {
           const schedTime = raw?.scheduleTime || raw?.schedule_time;
           const st = schedTime ? new Date(schedTime).getTime() : 0;
-          if (Number.isFinite(st) && st > Date.now() + 30000) return false;
+          if (Number.isFinite(st) && st > Date.now() + 5000) return false;
           // scheduleTime passed — strip schedule flags, allow through
           raw.isScheduled = false;
           raw.scheduleTime = null;
@@ -2521,7 +2528,7 @@ export default function useChatLogic({ navigation, route }) {
         if (!isSelf && raw?.isScheduled) {
           const schedTime = raw?.scheduleTime || raw?.schedule_time;
           const st = schedTime ? new Date(schedTime).getTime() : 0;
-          if (Number.isFinite(st) && st > Date.now() + 30000) return false;
+          if (Number.isFinite(st) && st > Date.now() + 5000) return false;
           // scheduleTime passed — strip schedule flags, allow through
           raw.isScheduled = false;
           raw.scheduleTime = null;
@@ -3063,6 +3070,14 @@ export default function useChatLogic({ navigation, route }) {
         if (tempId && serverMessageId && tempId !== serverMessageId) {
           ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
         }
+        // Update chat list preview with the reply text
+        updateLocalLastMessagePreview({
+          chatId: chatIdRef.current,
+          text: source?.text || '',
+          senderId: currentUserIdRef.current,
+          messageId: serverMessageId,
+          createdAt: source?.createdAt || new Date().toISOString(),
+        });
       }
     };
     registerSocketHandler('message:quote:response', onQuoteResponse);
@@ -3076,6 +3091,20 @@ export default function useChatLogic({ navigation, route }) {
       for (const fwd of msgs) {
         const fwdId = fwd?.messageId || fwd?._id;
         if (fwdId) forwardedMsgIdsRef.current.add(String(fwdId));
+      }
+      // Update chat list with the forwarded message preview
+      const firstFwd = msgs[0];
+      if (firstFwd) {
+        onLocalOutgoingMessage({
+          chatId: firstFwd?.chatId || chatIdRef.current,
+          senderId: currentUserIdRef.current,
+          text: firstFwd?.text || source?.text || 'Forwarded message',
+          messageId: firstFwd?.messageId || firstFwd?._id,
+          createdAt: firstFwd?.createdAt || new Date().toISOString(),
+          ...(chatData?.chatType === 'group' || chatData?.isGroup
+            ? { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }
+            : { peerUser: chatData?.peerUser ? { ...chatData.peerUser, _id: chatData.peerUser._id || chatData.peerUser.userId || null } : null }),
+        });
       }
       // Trigger a sync to pick up forwarded messages
       setTimeout(() => refreshMessagesFromDB(), 500);
@@ -3145,6 +3174,7 @@ export default function useChatLogic({ navigation, route }) {
       }, 100);
     };
     registerSocketHandler('message:schedule:response', onScheduleResponse);
+    registerSocketHandler('group:message:schedule:response', onScheduleResponse);
 
     // Server confirms cancel — promote to allMessages as cancelled, remove from scheduled
     const onScheduleCancelResponse = (data) => {
@@ -3174,6 +3204,7 @@ export default function useChatLogic({ navigation, route }) {
       }
     };
     registerSocketHandler('message:cancel:scheduled:response', onScheduleCancelResponse);
+    registerSocketHandler('group:message:cancel:scheduled:response', onScheduleCancelResponse);
 
     // Receiver-side: server notifies that a scheduled message was cancelled by the sender
     // Remove the message from receiver's UI and DB if it somehow got through
@@ -3196,6 +3227,8 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('message:scheduled:cancelled', onScheduledCancelledReceiver);
     registerSocketHandler('message:cancel:scheduled', onScheduledCancelledReceiver);
+    registerSocketHandler('group:message:scheduled:cancelled', onScheduledCancelledReceiver);
+    registerSocketHandler('group:message:cancel:scheduled', onScheduledCancelledReceiver);
 
     // Server sent the scheduled message at the scheduled time → sender gets this
     // message:sent:ack with isScheduled: true
@@ -3206,23 +3239,45 @@ export default function useChatLogic({ navigation, route }) {
       const msgId = source?.messageId || source?._id;
       if (!msgId) return;
 
-      // In-place update — just flip status, keep message in same position
+      // Move from scheduledMessages → allMessages with status 'sent'
       setScheduledMessages(prev => {
-        const hasMatch = prev.some(m => m.id === msgId || m.serverMessageId === msgId);
-        if (!hasMatch) {
+        const match = prev.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
+        if (!match) {
           // Fallback: not in scheduledMessages (e.g. app restarted) — add to allMessages
-          setAllMessages(all => [{
-            id: msgId, serverMessageId: msgId, status: 'sent',
-            isScheduled: false, scheduleTimeLabel: null, scheduleTime: null, ...source,
-          }, ...all]);
+          setAllMessages(all => {
+            const exists = all.some(m => m.id === msgId || m.serverMessageId === msgId);
+            if (exists) return all;
+            return [{
+              id: msgId, serverMessageId: msgId, status: 'sent',
+              isScheduled: false, scheduleTimeLabel: null, scheduleTime: null,
+              chatId: currentChatId, senderType: 'self', ...source,
+            }, ...all];
+          });
           return prev;
         }
-        return prev.map(m => {
-          if (m.id === msgId || m.serverMessageId === msgId) {
-            return { ...m, status: 'sent', isScheduled: false, scheduleTimeLabel: null, scheduleTime: null };
-          }
-          return m;
+        // Build the sent message and move to allMessages
+        const sentMsg = {
+          ...match,
+          ...source,
+          id: msgId,
+          serverMessageId: msgId,
+          status: 'sent',
+          isScheduled: false,
+          wasScheduled: true,
+          scheduleTimeLabel: match.scheduleTimeLabel || null,
+          scheduleTime: null,
+          chatId: match.chatId || currentChatId,
+          senderType: 'self',
+        };
+        setAllMessages(all => {
+          const filtered = all.filter(m =>
+            m.id !== msgId && m.serverMessageId !== msgId &&
+            m.tempId !== (match.tempId || '__none__')
+          );
+          return [sentMsg, ...filtered];
         });
+        // Remove from scheduledMessages
+        return prev.filter(m => m.id !== msgId && m.serverMessageId !== msgId && m.tempId !== msgId);
       });
 
       // Update DB: status + clear schedule data from payload so reload is clean
@@ -3231,6 +3286,9 @@ export default function useChatLogic({ navigation, route }) {
       }).catch(() => {});
     };
     registerSocketHandler('message:sent:ack', onScheduledSentAck);
+    registerSocketHandler('group:message:sent:ack', onScheduledSentAck);
+    registerSocketHandler('group:message:sent', onScheduledSentAck);
+    registerSocketHandler('group:message:send:response', onScheduledSentAck);
 
     // If server fails to deliver after 3 retries
     const onScheduleFailed = (data) => {
@@ -3249,6 +3307,7 @@ export default function useChatLogic({ navigation, route }) {
       }
     };
     registerSocketHandler('message:schedule:failed', onScheduleFailed);
+    registerSocketHandler('group:message:schedule:failed', onScheduleFailed);
 
     const onMessageSent = (data) => {
       const source = data?.data || data;
@@ -3272,8 +3331,8 @@ export default function useChatLogic({ navigation, route }) {
       const schedTime = source?.scheduleTime || source?.schedule_time;
       if (!schedTime) return false;
       const st = new Date(schedTime).getTime();
-      // If scheduleTime is in the future (more than 30s from now), block it
-      return Number.isFinite(st) && st > Date.now() + 30000;
+      // If scheduleTime is in the future (more than 5s from now), block it
+      return Number.isFinite(st) && st > Date.now() + 5000;
     };
 
     // Check if a message is already tracked in scheduledMessages (sender-only)
@@ -3290,8 +3349,13 @@ export default function useChatLogic({ navigation, route }) {
       const chatInPayload = source?.chatId || source?.chat || source?.roomId;
       if (chatInPayload && !sameId(chatInPayload, currentChatId)) return;
 
-      // Block still-pending scheduled/processing messages — handled via scheduledMessages state
-      if (source?.status === 'scheduled' || source?.status === 'processing') {
+      const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+
+      // Determine if this is a scheduled message being delivered now (scheduleTime has passed)
+      const isScheduledDelivery = source?.isScheduled && !isScheduledAndPremature(source);
+
+      // Block still-pending scheduled/processing messages — UNLESS it's a delivery (scheduleTime passed)
+      if ((source?.status === 'scheduled' || source?.status === 'processing') && !isScheduledDelivery) {
         console.log('[Schedule] Blocked pending scheduled message:new:', source?.messageId || source?._id);
         return;
       }
@@ -3302,20 +3366,22 @@ export default function useChatLogic({ navigation, route }) {
         return;
       }
 
-      // For receiver: if isScheduled but scheduleTime has passed → server is delivering now → allow it through
-      // Only block if scheduleTime is still in the future (premature)
-      const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+      // For receiver: if isScheduled but scheduleTime has NOT passed → block premature
       if (!isSelfMsg && source?.isScheduled && isScheduledAndPremature(source)) {
         console.log('[Schedule] Blocked premature scheduled message on receiver side:new:', source?.messageId || source?._id);
         return;
       }
 
-      // If it's a delivered scheduled message on receiver side, strip schedule flags so it appears as normal
+      // If it's a delivered scheduled message on receiver side, strip active schedule flags but mark as wasScheduled
       if (!isSelfMsg && source?.isScheduled) {
+        source.wasScheduled = true;
         source.isScheduled = false;
         source.scheduleTime = null;
-        source.scheduleTimeLabel = null;
         source.schedule_time = null;
+        // Keep scheduleTimeLabel for display — shows "Scheduled Mar 26, 11:55 AM" on receiver side
+        if (source?.status === 'scheduled' || source?.status === 'processing') {
+          source.status = 'sent';
+        }
       }
 
       // Block premature scheduled messages (sender side safety net)
@@ -3353,8 +3419,11 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageReceived = (data) => {
       const source = data?.data || data;
 
-      // Block still-pending scheduled/processing messages — handled via scheduledMessages state
-      if (source?.status === 'scheduled' || source?.status === 'processing') {
+      const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+      const isScheduledDelivery = source?.isScheduled && !isScheduledAndPremature(source);
+
+      // Block still-pending scheduled/processing messages — UNLESS it's a delivery (scheduleTime passed)
+      if ((source?.status === 'scheduled' || source?.status === 'processing') && !isScheduledDelivery) {
         console.log('[Schedule] Blocked pending scheduled message:received:', source?.messageId || source?._id);
         return;
       }
@@ -3365,20 +3434,21 @@ export default function useChatLogic({ navigation, route }) {
         return;
       }
 
-      // For receiver: if isScheduled but scheduleTime has passed → server is delivering now → allow it
-      // Only block if scheduleTime is still in the future (premature)
-      const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+      // For receiver: if isScheduled but scheduleTime has NOT passed → block premature
       if (!isSelfMsg && source?.isScheduled && isScheduledAndPremature(source)) {
         console.log('[Schedule] Blocked premature scheduled message on receiver side:received:', source?.messageId || source?._id);
         return;
       }
 
-      // If it's a delivered scheduled message on receiver side, strip schedule flags so it appears as normal
+      // If it's a delivered scheduled message on receiver side, mark as wasScheduled for visual indicator
       if (!isSelfMsg && source?.isScheduled) {
+        source.wasScheduled = true;
         source.isScheduled = false;
         source.scheduleTime = null;
-        source.scheduleTimeLabel = null;
         source.schedule_time = null;
+        if (source?.status === 'scheduled' || source?.status === 'processing') {
+          source.status = 'sent';
+        }
       }
 
       // Block premature scheduled messages (sender side safety net)
@@ -3696,6 +3766,9 @@ export default function useChatLogic({ navigation, route }) {
 
     const onMessageSyncResponse = (data) => {
       if (isHardReloadingRef.current) {
+        isHardReloadingRef.current = false;
+        setIsLoadingMore(false);
+        loadMoreInFlightRef.current = false;
         return;
       }
 
@@ -3711,6 +3784,19 @@ export default function useChatLogic({ navigation, route }) {
           lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
         }
       }
+
+      // Update hasMore from server response
+      if (typeof source?.hasMore === 'boolean') {
+        setHasMoreMessages(source.hasMore);
+      } else if (Array.isArray(rows) && rows.length === 0) {
+        // No messages returned — no more to load
+        setHasMoreMessages(false);
+      }
+
+      // Reset loading states — critical for stopping the spinner
+      setIsLoadingMore(false);
+      setIsRefreshing(false);
+      loadMoreInFlightRef.current = false;
     };
     registerSocketHandler('message:sync:response', onMessageSyncResponse);
     // Also handle group sync response with the same logic
@@ -3727,15 +3813,169 @@ export default function useChatLogic({ navigation, route }) {
     const onGroupMessageNew = (data) => {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
+
+      // Block cancelled/failed
+      if (source?.status === 'cancelled' || source?.status === 'failed') return;
+      // Block scheduled/processing ONLY if scheduleTime is still in the future
+      if (source?.status === 'scheduled' || source?.status === 'processing') {
+        const st = source?.scheduleTime || source?.schedule_time;
+        const stMs = st ? new Date(st).getTime() : 0;
+        const isDeliveryNow = source?.isScheduled === false || !st || !Number.isFinite(stMs) || stMs <= Date.now() + 5000;
+        if (!isDeliveryNow) return;
+      }
+
       const msgId = source?.messageId || source?._id || source?.id;
       if (msgId && handledMsgIds.has(String(msgId))) return;
       if (msgId) handledMsgIds.add(String(msgId));
+
+      // If this is our own scheduled message being delivered by the server,
+      // transition it from scheduledMessages → allMessages (same as onScheduledSentAck)
+      const isSelf = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
+      if (isSelf && msgId) {
+        const inScheduled = scheduledMessagesRef.current.some(m =>
+          m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId
+        );
+        if (inScheduled) {
+          // Transition: remove from scheduledMessages, add as sent
+          setScheduledMessages(prev => {
+            const match = prev.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
+            if (match) {
+              const sentMsg = {
+                ...match,
+                ...source,
+                id: msgId,
+                serverMessageId: msgId,
+                status: 'sent',
+                isScheduled: false,
+                wasScheduled: true,
+                scheduleTimeLabel: match.scheduleTimeLabel || null,
+                scheduleTime: null,
+                chatId: currentChatId,
+                senderType: 'self',
+              };
+              setAllMessages(all => [sentMsg, ...all.filter(m =>
+                m.id !== msgId && m.serverMessageId !== msgId && m.tempId !== (match.tempId || '__none__')
+              )]);
+            }
+            return prev.filter(m => m.id !== msgId && m.serverMessageId !== msgId && m.tempId !== msgId);
+          });
+          ChatDatabase.clearScheduleData(msgId, 'sent').catch(() => {});
+          return; // handled — don't pass to handleReceivedMessage
+        }
+      }
+
+      // For receiver side: strip isScheduled if scheduleTime has passed, mark wasScheduled
+      if (!isSelf && source?.isScheduled) {
+        const schedTime = source?.scheduleTime || source?.schedule_time;
+        const st = schedTime ? new Date(schedTime).getTime() : 0;
+        if (Number.isFinite(st) && st > Date.now() + 5000) return; // premature, block
+        source.wasScheduled = true;
+        source.isScheduled = false;
+        source.scheduleTime = null;
+      }
+
       handleReceivedMessage({
         ...source,
         chatId: currentChatId,
       });
     };
     registerSocketHandler('group:message:new', onGroupMessageNew);
+    registerSocketHandler('group:message:received', onGroupMessageNew);
+
+    // ── group:joined — insert "X created this group" system message into chat ──
+    const onGroupJoinedForChat = (data) => {
+      const source = data?.data || data;
+      const gid = source?.groupId || source?.group?._id;
+      if (!gid) return;
+      // Only handle if this group is the currently open chat
+      if (!sameId(gid, currentChatId) && !sameId(gid, groupOwnId)) return;
+
+      const creatorName = source?.createdByName || source?.creatorName || source?.username || source?.fullName || '';
+      const groupName = source?.groupName || source?.name || '';
+      const sysText = creatorName
+        ? `${creatorName} created group "${groupName || 'this group'}"`
+        : `Group "${groupName || ''}" created`;
+      const sysId = source?.messageId || `sys_created_${gid}_${Date.now()}`;
+
+      // Avoid duplicating if already in messages
+      const alreadyExists = allMessagesRef.current?.some(m =>
+        (m.id === sysId || m.text === sysText) && m.type === 'system'
+      );
+      if (alreadyExists) return;
+
+      const systemMsg = {
+        id: sysId,
+        tempId: sysId,
+        type: 'system',
+        messageType: 'system',
+        text: sysText,
+        senderId: null,
+        senderType: 'system',
+        status: 'sent',
+        chatId: currentChatId,
+        createdAt: source?.joinedAt ? new Date(source.joinedAt).toISOString() : new Date().toISOString(),
+        timestamp: source?.joinedAt || Date.now(),
+      };
+
+      setAllMessages(prev => [...prev, systemMsg]);
+      ChatDatabase.upsertMessage({ ...systemMsg, chatId: currentChatId }).catch(() => {});
+    };
+    registerSocketHandler('group:joined', onGroupJoinedForChat);
+    registerSocketHandler('group:member:joined', (data) => {
+      const source = data?.data || data;
+      const gid = source?.groupId || source?.group?._id;
+      if (!gid || (!sameId(gid, currentChatId) && !sameId(gid, groupOwnId))) return;
+      const memberName = source?.username || source?.fullName || source?.name || '';
+      const sysId = source?.messageId || `sys_joined_${source?.userId || ''}_${Date.now()}`;
+      const sysText = memberName ? `${memberName} joined` : 'A member joined';
+
+      const alreadyExists = allMessagesRef.current?.some(m =>
+        (m.id === sysId || m.text === sysText) && m.type === 'system'
+      );
+      if (alreadyExists) return;
+
+      const systemMsg = {
+        id: sysId,
+        tempId: sysId,
+        type: 'system',
+        messageType: 'system',
+        text: sysText,
+        senderId: null,
+        senderType: 'system',
+        status: 'sent',
+        chatId: currentChatId,
+        createdAt: source?.timestamp ? new Date(source.timestamp).toISOString() : new Date().toISOString(),
+        timestamp: source?.timestamp || Date.now(),
+      };
+
+      setAllMessages(prev => [...prev, systemMsg]);
+      ChatDatabase.upsertMessage({ ...systemMsg, chatId: currentChatId }).catch(() => {});
+    });
+    registerSocketHandler('group:member:left', (data) => {
+      const source = data?.data || data;
+      const gid = source?.groupId || source?.group?._id;
+      if (!gid || (!sameId(gid, currentChatId) && !sameId(gid, groupOwnId))) return;
+      const memberName = source?.username || source?.fullName || source?.name || '';
+      const sysId = source?.messageId || `sys_left_${source?.userId || ''}_${Date.now()}`;
+      const sysText = memberName ? `${memberName} left` : 'A member left';
+
+      const systemMsg = {
+        id: sysId,
+        tempId: sysId,
+        type: 'system',
+        messageType: 'system',
+        text: sysText,
+        senderId: null,
+        senderType: 'system',
+        status: 'sent',
+        chatId: currentChatId,
+        createdAt: source?.timestamp ? new Date(source.timestamp).toISOString() : new Date().toISOString(),
+        timestamp: source?.timestamp || Date.now(),
+      };
+
+      setAllMessages(prev => [...prev, systemMsg]);
+      ChatDatabase.upsertMessage({ ...systemMsg, chatId: currentChatId }).catch(() => {});
+    });
 
     const onGroupMessageEdited = async (data) => {
       const source = data?.data || data;
@@ -3807,6 +4047,7 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('group:message:delivered:update', onGroupMessageDelivered);
     registerSocketHandler('group:message:delivered', onGroupMessageDelivered);
+    registerSocketHandler('group:message:delivered:receipt', onGroupMessageDelivered);
 
     const onGroupMessageRead = (data) => {
       const source = data?.data || data;
@@ -3914,6 +4155,32 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('group:message:reaction:update', onGroupReactionUpdate);
     registerSocketHandler('group:message:reaction', onGroupReactionUpdate);
     registerSocketHandler('group:message:reacted', onGroupReactionUpdate);
+
+    // ── group:message:media:updated — media download status broadcast ──
+    const onGroupMessageMediaUpdated = (data) => {
+      const source = data?.data || data;
+      if (!isGroupEvent(source)) return;
+      const messageId = source?.messageId || source?._id;
+      if (!messageId) return;
+      setAllMessages(prev => {
+        const idx = prev.findIndex(m => m.id === messageId || m.serverMessageId === messageId);
+        if (idx === -1) return prev;
+        const updated = [...prev];
+        updated[idx] = {
+          ...updated[idx],
+          isMediaDownloaded: source?.isMediaDownloaded ?? updated[idx].isMediaDownloaded,
+          messageType: source?.messageType || updated[idx].messageType || updated[idx].type,
+        };
+        return updated;
+      });
+      // Also persist to SQLite
+      ChatDatabase.upsertMessage({
+        id: messageId,
+        chatId: currentChatId,
+        isMediaDownloaded: source?.isMediaDownloaded,
+      }).catch(() => {});
+    };
+    registerSocketHandler('group:message:media:updated', onGroupMessageMediaUpdated);
 
     // 1-on-1 reaction broadcast: message:reaction:added
     const onMessageReactionAdded = (data) => {
@@ -4559,7 +4826,7 @@ export default function useChatLogic({ navigation, route }) {
       senderType: 'self',
       receiverId: isGrpSend ? null : (chatData.peerUser?._id || null),
       chatType: chatData.chatType || 'private',
-      status: "sending",
+      status: "sent",
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
       payload,
@@ -4606,23 +4873,21 @@ export default function useChatLogic({ navigation, route }) {
       console.warn('[handleSendText] SQLite write failed:', err?.message);
     });
 
+    // Fire-and-forget socket send — message is already in UI via optimistic update
     const socket = socketRef.current || getSocket();
-    try {
-      if (!socket || !isSocketConnected()) {
-        updateMessageStatus(tempId, 'failed');
-        await checkAndReconnectSocket();
-        return;
-      }
+    if (!socket || !isSocketConnected()) {
+      updateMessageStatus(tempId, 'failed');
+      checkAndReconnectSocket();
+      return;
+    }
 
-      await sendMessageViaSocket(payload, tempId);
-    } catch (error) {
+    sendMessageViaSocket(payload, tempId).catch((error) => {
       console.error("Send message failed:", error);
       updateMessageStatus(tempId, 'failed');
-    }
+    });
   }, [text, replyTarget, chatData.peerUser, sendTypingStatus, updateMessageStatus, checkAndReconnectSocket, isLocalTyping, markUserOnline, onLocalOutgoingMessage, sendMessageViaSocket, refreshMessagesFromDB]);
 
   /* ========== Schedule message flow ========== */
-  /* ========== Schedule message — server-side scheduling ========== */
   const scheduleMessage = useCallback(async (scheduleTime) => {
     if (!text.trim() || !scheduleTime) return;
 
@@ -4636,6 +4901,7 @@ export default function useChatLogic({ navigation, route }) {
     const schedDateStr = scheduledDate.toLocaleDateString('en', { month: 'short', day: 'numeric' });
 
     const receiverId = isGrpSend ? null : (chatData.peerUser?._id || null);
+    const groupId = isGrpSend ? (chatData.groupId || chatData.group?._id || chatIdRef.current) : null;
 
     const newMessage = {
       id: tempId,
@@ -4657,7 +4923,7 @@ export default function useChatLogic({ navigation, route }) {
       isScheduled: true,
       scheduleTime: scheduleTime,
       scheduleTimeLabel: `${schedDateStr}, ${schedTimeStr}`,
-      ...(isGrpSend && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
+      ...(isGrpSend && { groupId }),
     };
 
     setText('');
@@ -4668,27 +4934,52 @@ export default function useChatLogic({ navigation, route }) {
     // Persist locally
     ChatDatabase.upsertMessage({ ...newMessage, chatId: chatIdRef.current }).catch(() => {});
 
-    // Send to server — server holds it until scheduleTime, then delivers to receiver
-    const socket = socketRef.current || getSocket();
-    if (socket && isSocketConnected()) {
-      socket.emit('message:schedule', {
-        receiverId,
-        text: msgText,
-        messageType: 'text',
-        scheduleTime: scheduleTime,
-      }, (ack) => {
-        if (ack?.error) {
-          console.warn('[Schedule] Server error:', ack.error);
-          setScheduledMessages(prev => prev.map(m =>
-            m.tempId === tempId ? { ...m, status: 'failed' } : m
-          ));
-        }
-        // Server response comes via message:schedule:response event (handled by listener)
-      });
+    if (isGrpSend) {
+      // ── GROUP: server-side scheduling ──
+      // Server supports group:message:schedule — same pattern as 1-on-1.
+      // Server holds the message and delivers at scheduleTime via group:message:sent + group:message:received.
+      const socket = socketRef.current || getSocket();
+      if (socket && isSocketConnected()) {
+        socket.emit('group:message:schedule', {
+          groupId,
+          text: msgText,
+          messageType: 'text',
+          scheduleTime: scheduleTime,
+        }, (ack) => {
+          if (ack?.error) {
+            console.warn('[Schedule] Group server error:', ack.error);
+            setScheduledMessages(prev => prev.map(m =>
+              m.tempId === tempId ? { ...m, status: 'failed' } : m
+            ));
+          }
+        });
+      } else {
+        setScheduledMessages(prev => prev.map(m =>
+          m.tempId === tempId ? { ...m, status: 'failed' } : m
+        ));
+      }
     } else {
-      setScheduledMessages(prev => prev.map(m =>
-        m.tempId === tempId ? { ...m, status: 'failed' } : m
-      ));
+      // ── 1-on-1: server-side scheduling ──
+      const socket = socketRef.current || getSocket();
+      if (socket && isSocketConnected()) {
+        socket.emit('message:schedule', {
+          receiverId,
+          text: msgText,
+          messageType: 'text',
+          scheduleTime: scheduleTime,
+        }, (ack) => {
+          if (ack?.error) {
+            console.warn('[Schedule] Server error:', ack.error);
+            setScheduledMessages(prev => prev.map(m =>
+              m.tempId === tempId ? { ...m, status: 'failed' } : m
+            ));
+          }
+        });
+      } else {
+        setScheduledMessages(prev => prev.map(m =>
+          m.tempId === tempId ? { ...m, status: 'failed' } : m
+        ));
+      }
     }
   }, [text, chatData, updateMessageStatus]);
 
@@ -4707,8 +4998,18 @@ export default function useChatLogic({ navigation, route }) {
       : [messageId];
     allIds.forEach(id => cancelledMsgIdsRef.current.add(String(id)));
 
+    // Clear group schedule timer if exists
+    for (const id of allIds) {
+      const timer = groupScheduleTimersRef.current.get(id);
+      if (timer) {
+        clearTimeout(timer);
+        groupScheduleTimersRef.current.delete(id);
+      }
+    }
+
     // Determine the best server-side ID to send for cancel
     const serverMsgId = match?.serverMessageId || match?.id || messageId;
+    const isGrpCancel = chatData?.chatType === 'group' || chatData?.isGroup;
 
     // Move from scheduledMessages → allMessages with status 'cancelled' (in-place, no flicker)
     setScheduledMessages(prev => {
@@ -4738,17 +5039,28 @@ export default function useChatLogic({ navigation, route }) {
     );
     Promise.all(clearPromises).then(() => refreshMessagesFromDB());
 
-    // Tell server to cancel — send all ID variants so server can reliably find the message
+    // Tell server to cancel
     const socket = socketRef.current || getSocket();
     if (socket && isSocketConnected()) {
-      socket.emit('message:cancel:scheduled', {
-        messageId: serverMsgId,
-        tempId: match?.tempId || null,
-      }, (ack) => {
-        if (ack?.error) console.warn('[Schedule] cancel error:', ack.error);
-      });
+      if (isGrpCancel) {
+        // Group: server-side cancel
+        socket.emit('group:message:cancel:scheduled', {
+          messageId: serverMsgId,
+          groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
+        }, (ack) => {
+          if (ack?.error) console.warn('[Schedule] group cancel error:', ack.error);
+        });
+      } else {
+        // 1-on-1: server-side cancel
+        socket.emit('message:cancel:scheduled', {
+          messageId: serverMsgId,
+          tempId: match?.tempId || null,
+        }, (ack) => {
+          if (ack?.error) console.warn('[Schedule] cancel error:', ack.error);
+        });
+      }
     }
-  }, []);
+  }, [chatData]);
 
   const sendLocationMessage = useCallback(async ({ latitude, longitude, address = '', mapPreviewUrl = '' } = {}) => {
     const lat = Number(latitude);
@@ -4808,7 +5120,7 @@ export default function useChatLogic({ navigation, route }) {
       senderId: currentUserIdRef.current,
       senderType: 'self',
       receiverId: chatData.peerUser?._id || null,
-      status: 'sending',
+      status: 'sent',
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
       payload,
@@ -4821,9 +5133,12 @@ export default function useChatLogic({ navigation, route }) {
     // Write to SQLite in background (non-blocking)
     ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
 
-    await sendMessageViaSocket(payload, tempId);
+    // Fire-and-forget socket send
+    sendMessageViaSocket(payload, tempId).catch(() => {
+      updateMessageStatus(tempId, 'failed');
+    });
     return { success: true, tempId };
-  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket]);
+  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, updateMessageStatus]);
 
   const sendContactMessage = useCallback(async ({
     fullName, countryCode = '', mobileNumber,
@@ -4900,7 +5215,7 @@ export default function useChatLogic({ navigation, route }) {
       senderId: currentUserIdRef.current,
       senderType: 'self',
       receiverId: chatData.peerUser?._id || null,
-      status: 'sending',
+      status: 'sent',
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
       synced: false,
@@ -4913,42 +5228,17 @@ export default function useChatLogic({ navigation, route }) {
     // Write to SQLite in background (non-blocking)
     ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
 
-    try {
-      const socket = socketRef.current || getSocket();
-      if (!socket || !isSocketConnected()) {
-        updateMessageStatus(tempId, 'failed');
-        await checkAndReconnectSocket();
-        return { success: false, tempId };
-      }
-
-      // Contact data is inline (no upload needed), so add a timeout fallback
-      // If server ack doesn't arrive within 4s, mark as sent anyway
-      let ackReceived = false;
-      const ackTimeout = setTimeout(() => {
-        if (!ackReceived) {
-          console.log('⏱️ [CONTACT:SEND] ack timeout, marking as sent');
-          updateMessageStatus(tempId, 'sent', { messageId });
-        }
-      }, 4000);
-
-      await sendMessageViaSocket(payload, tempId)
-        .then((res) => {
-          ackReceived = true;
-          clearTimeout(ackTimeout);
-          return res;
-        })
-        .catch((err) => {
-          ackReceived = true;
-          clearTimeout(ackTimeout);
-          // If socket emitted but ack format was unexpected, still mark as sent
-          // since contact data is inline and doesn't need upload
-          console.warn('⚠️ [CONTACT:SEND] ack issue, marking as sent:', err?.message);
-          updateMessageStatus(tempId, 'sent', { messageId });
-        });
-    } catch (error) {
-      console.error('❌ Send contact message failed:', error);
+    // Fire-and-forget socket send — message already shown via optimistic UI
+    const socket = socketRef.current || getSocket();
+    if (!socket || !isSocketConnected()) {
       updateMessageStatus(tempId, 'failed');
+      checkAndReconnectSocket();
+      return { success: false, tempId };
     }
+
+    sendMessageViaSocket(payload, tempId).catch(() => {
+      updateMessageStatus(tempId, 'sent', { messageId });
+    });
 
     return { success: true, tempId };
   }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, getOrCreateDeviceId, updateMessageStatus, checkAndReconnectSocket]);
@@ -4997,9 +5287,13 @@ export default function useChatLogic({ navigation, route }) {
   const handleReceivedMessage = useCallback(async (msg) => {
     resetIdleTimer();
 
-    // Block still-pending scheduled/processing messages — they live in scheduledMessages state (sender-only)
-    // Delivered scheduled messages (status sent/delivered/seen) are allowed through
-    if (msg?.status === 'scheduled' || msg?.status === 'processing') {
+    const isSelfMsg = msg?.senderId && sameId(msg.senderId, currentUserIdRef.current);
+    const schedTimeVal = msg?.scheduleTime || msg?.schedule_time;
+    const schedMs = schedTimeVal ? new Date(schedTimeVal).getTime() : 0;
+    const isScheduledDelivery = msg?.isScheduled && (!schedTimeVal || !Number.isFinite(schedMs) || schedMs <= Date.now() + 5000);
+
+    // Block still-pending scheduled/processing messages — UNLESS it's a delivery (scheduleTime passed)
+    if ((msg?.status === 'scheduled' || msg?.status === 'processing') && !isScheduledDelivery) {
       console.log('[Schedule] Blocking pending scheduled message from handleReceivedMessage:', msg?.messageId || msg?._id);
       return;
     }
@@ -5008,26 +5302,26 @@ export default function useChatLogic({ navigation, route }) {
       console.log('[Schedule] Blocking cancelled/failed message from handleReceivedMessage:', msg?.messageId || msg?._id);
       return;
     }
-    // For receiver: if isScheduled but scheduleTime has passed → server is delivering now → allow it
-    // Only block if scheduleTime is still in the future (premature delivery)
-    const isSelfMsg = msg?.senderId && sameId(msg.senderId, currentUserIdRef.current);
+    // For receiver: if isScheduled but scheduleTime has NOT passed → block premature
     if (!isSelfMsg && msg?.isScheduled) {
-      const schedTime = msg?.scheduleTime || msg?.schedule_time;
-      const st = schedTime ? new Date(schedTime).getTime() : 0;
-      if (Number.isFinite(st) && st > Date.now() + 30000) {
+      if (Number.isFinite(schedMs) && schedMs > Date.now() + 5000) {
         console.log('[Schedule] Blocking premature isScheduled message on receiver side:', msg?.messageId || msg?._id);
         return;
       }
-      // scheduleTime has passed — strip schedule flags so it appears as a normal message
+      // scheduleTime has passed — strip active schedule flags, keep label for display
+      msg.wasScheduled = true;
       msg.isScheduled = false;
       msg.scheduleTime = null;
-      msg.scheduleTimeLabel = null;
       msg.schedule_time = null;
+      // Keep scheduleTimeLabel for visual indicator
+      if (msg?.status === 'scheduled' || msg?.status === 'processing') {
+        msg.status = 'sent';
+      }
     }
     // Block messages with future scheduleTime on sender side (safety net)
     if (isSelfMsg && msg?.scheduleTime) {
       const schedTime = new Date(msg.scheduleTime).getTime();
-      if (Number.isFinite(schedTime) && schedTime > Date.now() + 30000) {
+      if (Number.isFinite(schedTime) && schedTime > Date.now() + 5000) {
         console.log('[Schedule] Ignoring premature scheduled message:', msg?.messageId || msg?._id);
         return;
       }

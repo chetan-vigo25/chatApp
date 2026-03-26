@@ -112,27 +112,42 @@ export default function ForwardMessageScreen({ navigation, route }) {
           const tempId = `temp_fwd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
           const timestamp = new Date().toISOString();
 
-          const sendPayload = {
-            receiverId,
-            messageType: msg.type || 'text',
-            chatType: isGroup ? 'group' : 'private',
-            text: msg.text || '',
-            mediaUrl: msg.mediaUrl || '',
-            mediaMeta: msg.mediaMeta || {},
-            forwardedFrom: msg.serverMessageId || msg.id || null,
-            isForwarded: true,
-            chatId: chat._id || chat.chatId || chatId,
-            senderId: currentUserId,
-            senderName: currentUserName,
-            tempId,
-            createdAt: timestamp,
-            ...(groupId && { groupId }),
-          };
-
           const sendEvent = isGroup ? 'group:message:send' : 'message:send';
 
+          const sendPayload = isGroup
+            ? {
+                groupId,
+                text: msg.text || '',
+                messageType: msg.type || 'text',
+                mediaUrl: msg.mediaUrl || '',
+                mediaMeta: msg.mediaMeta || {},
+                forwardedFrom: msg.serverMessageId || msg.id || null,
+                isForwarded: true,
+                tempId,
+                senderId: currentUserId,
+                senderName: currentUserName,
+                createdAt: timestamp,
+              }
+            : {
+                receiverId,
+                messageType: msg.type || 'text',
+                chatType: 'private',
+                text: msg.text || '',
+                mediaUrl: msg.mediaUrl || '',
+                mediaMeta: msg.mediaMeta || {},
+                forwardedFrom: msg.serverMessageId || msg.id || null,
+                isForwarded: true,
+                chatId: chat._id || chat.chatId || chatId,
+                senderId: currentUserId,
+                senderName: currentUserName,
+                tempId,
+                createdAt: timestamp,
+              };
+
           // Fire and don't wait — the existing message:new handler will pick it up
+          console.log('[Forward] Emitting:', sendEvent, JSON.stringify(sendPayload, null, 2));
           socket.emit(sendEvent, sendPayload, (ack) => {
+            console.log('[Forward] ACK received:', JSON.stringify(ack));
             if (ack?.error) console.warn('[Forward] send ack error:', ack.error);
           });
 

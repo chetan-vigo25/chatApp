@@ -135,8 +135,8 @@ export const emitGetSubscriptions = () =>
   emitWithAckOrResponse('presence:subscriptions', {}, 'presence:subscriptions:response');
 export const emitTypingStart = (chatId, receiverId, messageType) => emitWithAck('typing:start', { chatId, receiverId, messageType });
 export const emitTypingStop = (chatId, receiverId) => emitWithAck('typing:stop', { chatId, receiverId });
-export const emitGroupTypingStart = (groupId, messageType) => emitWithAck('typing:group:start', { groupId, messageType });
-export const emitGroupTypingStop = (groupId) => emitWithAck('typing:group:stop', { groupId });
+export const emitGroupTypingStart = (groupId, messageType) => emitWithAck('group:typing:start', { groupId, messageType });
+export const emitGroupTypingStop = (groupId) => emitWithAck('group:typing:stop', { groupId });
 export const emitTypingStatus = (chatId) => emitWithAck('typing:status', { chatId });
 export const emitListSessions = () => emitWithAck('session:list');
 export const emitSessionInfo = (socketId) => emitWithAck('session:info', { socketId });
@@ -170,8 +170,8 @@ export const onUnsubscribeResponse = (cb) => on('presence:unsubscribe:response',
 export const onSubscriptionsResponse = (cb) => on('presence:subscriptions:response', cb);
 export const onTypingStart = (cb) => on('typing:start', cb);
 export const onTypingStop = (cb) => on('typing:stop', cb);
-export const onGroupTypingStarted = (cb) => on('typing:group:started', cb);
-export const onGroupTypingStopped = (cb) => on('typing:group:stopped', cb);
+export const onGroupTypingStarted = (cb) => on('group:typing:started', cb);
+export const onGroupTypingStopped = (cb) => on('group:typing:stopped', cb);
 export const onTypingStatusResponse = (cb) => on('typing:status:response', cb);
 export const onSessionList = (cb) => on('session:list', cb);
 export const onSessionInfoResponse = (cb) => on('session:info:response', cb);

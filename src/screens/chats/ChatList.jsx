@@ -710,20 +710,24 @@ export default function ChatList({ navigation }) {
               <View style={[styles.sheetHandleBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)' }]} />
             </View>
 
-            {/* Selected user info */}
+            {/* Selected chat info — works for both 1-on-1 and group chats */}
             {selectedChatItem && (
               <View style={styles.sheetUserRow}>
-                {selectedChatItem?.peerUser?.profileImage ? (
-                  <Image source={{ uri: selectedChatItem.peerUser.profileImage }} style={styles.sheetUserAvatar} />
+                {previewImage ? (
+                  <Image source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
                 ) : (
-                  <View style={[styles.sheetUserAvatar, { backgroundColor: getUserColor(selectedChatItem?.peerUser?.fullName || '') }]}>
-                    <Text style={styles.sheetUserInitial}>
-                      {(selectedChatItem?.peerUser?.fullName || '?').charAt(0).toUpperCase()}
-                    </Text>
+                  <View style={[styles.sheetUserAvatar, { backgroundColor: previewAvatarColor || getUserColor(previewName) }]}>
+                    {isPreviewGroup ? (
+                      <Ionicons name="people" size={20} color="#fff" />
+                    ) : (
+                      <Text style={styles.sheetUserInitial}>
+                        {(previewName || '?').charAt(0).toUpperCase()}
+                      </Text>
+                    )}
                   </View>
                 )}
                 <Text style={[styles.sheetUserName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
-                  {selectedChatItem?.peerUser?.fullName || 'Unknown'}
+                  {previewName}
                 </Text>
               </View>
             )}

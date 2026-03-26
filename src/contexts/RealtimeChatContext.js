@@ -756,14 +756,21 @@ const reducer = (state, action) => {
 
     case 'INCOMING_MESSAGE': {
       const message = action.payload || {};
-      // Block pending scheduled/processing/cancelled/failed messages from updating chat list
-      if (message.status === 'scheduled' || message.status === 'processing' || message.status === 'cancelled' || message.status === 'failed') return state;
+      // Block cancelled/failed messages from updating chat list
+      if (message.status === 'cancelled' || message.status === 'failed') return state;
+      // Block scheduled/processing ONLY if scheduleTime is still in the future
+      if (message.status === 'scheduled' || message.status === 'processing') {
+        const st = message.scheduleTime || message.schedule_time;
+        const stMs = st ? new Date(st).getTime() : 0;
+        const isDeliveryNow = message.isScheduled === false || !st || !Number.isFinite(stMs) || stMs <= Date.now() + 5000;
+        if (!isDeliveryNow) return state;
+      }
       // Block isScheduled on receiver side only if scheduleTime is still in the future
       const isSelf = message.senderId && state.currentUserId && String(message.senderId) === String(state.currentUserId);
       if (!isSelf && message.isScheduled) {
         const st = message.scheduleTime || message.schedule_time;
         const stMs = st ? new Date(st).getTime() : 0;
-        if (Number.isFinite(stMs) && stMs > Date.now() + 30000) return state;
+        if (Number.isFinite(stMs) && stMs > Date.now() + 5000) return state;
       }
       const chatId = normalizeId(message.chatId || message.roomId || message.chat);
       if (!chatId) return state;
@@ -1144,7 +1151,7 @@ const reducer = (state, action) => {
             }
             // Also block if scheduleTime is in the future (safety net)
             const schedTime = lm?.scheduleTime || item?.scheduleTime;
-            if (schedTime && new Date(schedTime).getTime() > Date.now() + 30000) {
+            if (schedTime && new Date(schedTime).getTime() > Date.now() + 5000) {
               break;
             }
             const lastMessage = buildLastMessageFromItem(existing, item, timestamp);
@@ -1531,6 +1538,8 @@ const reducer = (state, action) => {
         ...existing,
         chatId: resolvedId,
         _id: existing._id || resolvedId,
+        chatType: existing.chatType || 'group',
+        isGroup: existing.isGroup !== undefined ? existing.isGroup : true,
         lastMessage: preserveGrpDelete
           ? existingGrpLastMsg
           : {
@@ -1777,6 +1786,9 @@ export function RealtimeChatProvider({ children }) {
   const storageSaveTimerRef = useRef(null);
   const socketUnsubscribersRef = useRef([]);
   const attachedSocketRef = useRef(null);
+  const handledGroupMsgIdsRef = useRef(new Set());
+  const currentUserIdRef = useRef(state.currentUserId);
+  currentUserIdRef.current = state.currentUserId;
 
   const clearTypingTimer = useCallback((chatId) => {
     const timer = typingTimersRef.current[chatId];
@@ -1852,22 +1864,31 @@ export function RealtimeChatProvider({ children }) {
 
     const onMessage = (payload) => {
       const source = unwrapPayload(payload);
-      // Block pending scheduled/processing/cancelled/failed messages — not yet delivered or not real
-      const msgStatus = source?.status || source?.data?.status;
-      if (msgStatus === 'scheduled' || msgStatus === 'processing' || msgStatus === 'cancelled' || msgStatus === 'failed') return;
-      // Block premature scheduled messages (scheduleTime in future)
+      // Skip group messages — they are handled by onGroupMessageNew via INCOMING_GROUP_MESSAGE
+      // Only skip if chatType is explicitly 'group' AND the message has a groupId target.
+      // Don't skip forwarded/replied 1-on-1 messages that merely reference a groupId from their origin.
+      const sourceIsGroup = (source?.chatType === 'group' || source?.data?.chatType === 'group') &&
+        (source?.groupId || source?.data?.groupId);
+      if (sourceIsGroup) return;
+
+      // Check if this is a scheduled message being delivered now (scheduleTime passed)
       const schedTime = source?.scheduleTime || source?.schedule_time || source?.data?.scheduleTime;
-      if (schedTime) {
-        const st = new Date(schedTime).getTime();
-        if (Number.isFinite(st) && st > Date.now() + 30000) return;
-      }
-      // Block isScheduled on receiver side ONLY if scheduleTime is still in the future
-      // If scheduleTime has passed, server is delivering now — allow it through
-      const isSelf = source?.senderId && state.currentUserId && String(source.senderId) === String(state.currentUserId);
+      const schedTimeMs = schedTime ? new Date(schedTime).getTime() : 0;
+      const isScheduledDelivery = (source?.isScheduled || source?.data?.isScheduled) &&
+        (!schedTime || !Number.isFinite(schedTimeMs) || schedTimeMs <= Date.now() + 5000);
+
+      // Block pending scheduled/processing messages — UNLESS it's a scheduled delivery
+      const msgStatus = source?.status || source?.data?.status;
+      if ((msgStatus === 'scheduled' || msgStatus === 'processing') && !isScheduledDelivery) return;
+      if (msgStatus === 'cancelled' || msgStatus === 'failed') return;
+
+      // Block premature scheduled messages (scheduleTime in future)
+      if (schedTime && Number.isFinite(schedTimeMs) && schedTimeMs > Date.now() + 5000) return;
+
+      // Strip schedule flags for delivered scheduled messages so chat list shows them as normal
+      const isSelf = source?.senderId && currentUserIdRef.current && String(source.senderId) === String(currentUserIdRef.current);
       if (!isSelf && (source?.isScheduled || source?.data?.isScheduled)) {
-        // Already checked schedTime above — if we're here, scheduleTime has passed or is absent
-        // Strip schedule flags so chat list shows it as a normal message
-        if (source) { source.isScheduled = false; source.scheduleTime = null; source.scheduleTimeLabel = null; }
+        if (source) { source.isScheduled = false; source.scheduleTime = null; source.scheduleTimeLabel = null; source.status = source.status === 'scheduled' ? 'sent' : source.status; }
         if (source?.data) { source.data.isScheduled = false; source.data.scheduleTime = null; source.data.scheduleTimeLabel = null; }
       }
       const normalized = normalizeMessagePayload(payload);
@@ -1892,12 +1913,12 @@ export function RealtimeChatProvider({ children }) {
       const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat || null);
       const readerId = source?.senderId || source?.readBy || source?.userId;
       // MARK_READ clears unread badge — always do this when we read incoming messages
-      if (chatId && readerId && String(readerId) === String(state.currentUserId)) {
+      if (chatId && readerId && String(readerId) === String(currentUserIdRef.current)) {
         dispatch({ type: 'MARK_READ', payload: chatId });
         return; // Don't update lastMessageStatus — this is OUR read, not the peer's
       }
       // Only update last message status to 'read' if a peer triggered it
-      if (readerId && String(readerId) !== String(state.currentUserId)) {
+      if (readerId && String(readerId) !== String(currentUserIdRef.current)) {
         dispatchLastMessageStatusUpdate(payload, 'read');
       }
     };
@@ -1905,25 +1926,25 @@ export function RealtimeChatProvider({ children }) {
     const onMessageReadBulk = (payload) => {
       const source = unwrapPayload(payload);
       const readerId = source?.senderId || source?.readBy || source?.userId;
-      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageReadBulkResponse = (payload) => {
       const source = unwrapPayload(payload);
       const readerId = source?.senderId || source?.readBy || source?.userId;
-      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageReadResponse = (payload) => {
       const source = unwrapPayload(payload);
       const readerId = source?.senderId || source?.readBy || source?.userId;
-      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageSeen = (payload) => {
       const source = unwrapPayload(payload);
       const readerId = source?.senderId || source?.readBy || source?.userId;
-      if (!readerId || String(readerId) === String(state.currentUserId)) return;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onPresence = (payload) => handlePresenceUpdate(payload);
@@ -2211,6 +2232,70 @@ export function RealtimeChatProvider({ children }) {
     socket.on('message:cancel:scheduled', onScheduledCancelled);
     socket.on('message:cancel:scheduled:response', onScheduledCancelled);
 
+    // Handle message sent ACK — update chat list for BOTH scheduled and normal messages
+    const onSentAckForChatList = (payload) => {
+      const source = unwrapPayload(payload);
+      const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat || source?.data?.chatId);
+      const groupId = normalizeId(source?.groupId || source?.data?.groupId);
+      const resolvedId = chatId || groupId;
+      if (!resolvedId) return;
+
+      // Dedup: if this message was already processed by onGroupMessageNew, skip
+      const dedupId = normalizeId(source?.messageId || source?._id || source?.data?.messageId);
+      if (dedupId && handledGroupMsgIdsRef.current.has(dedupId)) return;
+      if (dedupId) {
+        handledGroupMsgIdsRef.current.add(dedupId);
+        if (handledGroupMsgIdsRef.current.size > 2000) {
+          const first = handledGroupMsgIdsRef.current.values().next().value;
+          handledGroupMsgIdsRef.current.delete(first);
+        }
+      }
+      const text = source?.text || source?.data?.text || '';
+      const messageId = normalizeId(source?.messageId || source?._id || source?.data?.messageId);
+      const isGroup = !!(groupId || source?.chatType === 'group' || source?.data?.chatType === 'group');
+
+      // For scheduled messages: strip schedule flags
+      if (source?.isScheduled) {
+        if (source) { source.isScheduled = false; source.scheduleTime = null; source.status = 'sent'; }
+        if (source?.data) { source.data.isScheduled = false; source.data.scheduleTime = null; }
+      }
+
+      if (isGroup) {
+        const senderName = source?.senderName || source?.data?.senderName || '';
+        const messageType = source?.messageType || source?.data?.messageType || 'text';
+        // Build preview text — sent ACK is always our own message, so prefix with "You:"
+        let previewText = text;
+        if (messageType === 'image') previewText = 'Photo';
+        else if (messageType === 'video') previewText = 'Video';
+        else if (messageType === 'audio') previewText = 'Audio';
+        else if (messageType === 'file') previewText = 'Document';
+        else if (messageType === 'location') previewText = 'Location';
+        else if (messageType === 'contact') previewText = 'Contact';
+        dispatch({
+          type: 'INCOMING_GROUP_MESSAGE',
+          payload: {
+            chatId: resolvedId,
+            groupId: groupId || resolvedId,
+            senderId: normalizeId(source?.senderId || currentUserIdRef.current),
+            senderName,
+            text: `You: ${previewText}`,
+            messageType,
+            createdAt: source?.createdAt || source?.data?.createdAt || new Date().toISOString(),
+            messageId,
+            tempId: source?.tempId || source?.data?.tempId || source?.clientMessageId || source?.data?.clientMessageId,
+          },
+        });
+      } else {
+        if (source) source.status = source.status || 'sent';
+        const normalized = normalizeMessagePayload(payload);
+        dispatch({ type: 'INCOMING_MESSAGE', payload: normalized });
+      }
+    };
+    socket.on('message:sent:ack', onSentAckForChatList);
+    socket.on('group:message:sent', onSentAckForChatList);
+    socket.on('group:message:sent:ack', onSentAckForChatList);
+    socket.on('group:message:send:response', onSentAckForChatList);
+
     socket.on('message:new', onMessage);
     socket.on('message:received', onMessage);
     socket.on('message:delivered', onMessageDelivered);
@@ -2251,14 +2336,34 @@ export function RealtimeChatProvider({ children }) {
 
     const onGroupMessageNew = (payload) => {
       const data = payload?.data || payload;
-      // Block pending scheduled/processing/cancelled/failed messages from updating group chat list
-      if (data?.status === 'scheduled' || data?.status === 'processing' || data?.status === 'cancelled' || data?.status === 'failed') return;
+      // Block cancelled/failed messages from updating group chat list
+      if (data?.status === 'cancelled' || data?.status === 'failed') return;
+      // Block scheduled/processing ONLY if scheduleTime is still in the future
+      if (data?.status === 'scheduled' || data?.status === 'processing') {
+        const st = data?.scheduleTime || data?.schedule_time;
+        const stMs = st ? new Date(st).getTime() : 0;
+        const isDeliveryNow = data?.isScheduled === false || !st || !Number.isFinite(stMs) || stMs <= Date.now() + 5000;
+        if (!isDeliveryNow) return;
+      }
+
+      // Dedup: skip if already processed (prevents double unread count from new + received)
+      const dedupId = normalizeId(data?.messageId || data?._id || data?.id);
+      if (dedupId) {
+        if (handledGroupMsgIdsRef.current.has(dedupId)) return;
+        handledGroupMsgIdsRef.current.add(dedupId);
+        // Evict old entries to prevent memory leak
+        if (handledGroupMsgIdsRef.current.size > 2000) {
+          const first = handledGroupMsgIdsRef.current.values().next().value;
+          handledGroupMsgIdsRef.current.delete(first);
+        }
+      }
+
       // Block isScheduled on receiver side only if scheduleTime is still in the future
-      const isSelf = data?.senderId && state.currentUserId && String(data.senderId) === String(state.currentUserId);
+      const isSelf = data?.senderId && currentUserIdRef.current && String(data.senderId) === String(currentUserIdRef.current);
       if (!isSelf && data?.isScheduled) {
         const st = data?.scheduleTime || data?.schedule_time;
         const stMs = st ? new Date(st).getTime() : 0;
-        if (Number.isFinite(stMs) && stMs > Date.now() + 30000) return;
+        if (Number.isFinite(stMs) && stMs > Date.now() + 5000) return;
         // scheduleTime passed — strip flags, allow through
         data.isScheduled = false;
         data.scheduleTime = null;
@@ -2304,6 +2409,7 @@ export function RealtimeChatProvider({ children }) {
     };
 
     socket.on('group:message:new', onGroupMessageNew);
+    socket.on('group:message:received', onGroupMessageNew);
 
     // ─── GROUP SOCKET LISTENERS ───
 
@@ -2313,8 +2419,28 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       if (!groupId) return;
       console.log('📥 [GROUP] Joined group:', groupId);
-      // Refresh chat list to show the new group
-      // The chat list will pick it up on next hydrate/refresh
+
+      // Determine creator name for the system message
+      const creatorName = data?.createdByName || data?.creatorName || data?.username || data?.fullName || '';
+      const groupName = data?.groupName || data?.name || '';
+      const systemText = creatorName
+        ? `${creatorName} created group "${groupName || 'this group'}"`
+        : `Group "${groupName || ''}" created`;
+
+      // Show "X created this group" system message in chat list
+      dispatch({
+        type: 'INCOMING_GROUP_MESSAGE',
+        payload: {
+          chatId: groupId,
+          groupId,
+          senderId: null,
+          senderName: null,
+          text: systemText,
+          messageType: 'system',
+          createdAt: data?.joinedAt ? new Date(data.joinedAt).toISOString() : new Date().toISOString(),
+          messageId: data?.messageId || `sys_created_${groupId}`,
+        },
+      });
     };
 
     // Confirmation: you successfully left a group
@@ -2538,10 +2664,163 @@ export function RealtimeChatProvider({ children }) {
     socket.on('group:member:list:response', onGroupMemberListResponse);
     socket.on('group:member:info:response', onGroupMemberInfoResponse);
 
+    // ─── GROUP SETTINGS & METADATA LISTENERS ───
+
+    const onGroupSettingsUpdated = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, ...data }] });
+    };
+
+    const onGroupNameUpdated = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, groupName: data?.name, name: data?.name }] });
+    };
+
+    const onGroupDescriptionUpdated = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, description: data?.description }] });
+    };
+
+    const onGroupAvatarUpdated = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, avatar: data?.avatarUrl, profileImage: data?.avatarUrl }] });
+    };
+
+    socket.on('group:settings:updated', onGroupSettingsUpdated);
+    socket.on('group:settings:response', onGroupSettingsUpdated);
+    socket.on('group:settings:update:success', onGroupSettingsUpdated);
+    socket.on('group:name:updated', onGroupNameUpdated);
+    socket.on('group:name:update:success', onGroupNameUpdated);
+    socket.on('group:description:updated', onGroupDescriptionUpdated);
+    socket.on('group:description:update:success', onGroupDescriptionUpdated);
+    socket.on('group:avatar:updated', onGroupAvatarUpdated);
+    socket.on('group:avatar:update:success', onGroupAvatarUpdated);
+
+    // ─── GROUP NOTIFICATION/PREFERENCE LISTENERS ───
+
+    const onGroupMutedSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, isMuted: true, mutedTill: data?.mutedTill }] });
+    };
+    const onGroupUnmutedSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, isMuted: false, mutedTill: null }] });
+    };
+    const onGroupPinnedSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, isPinned: true }] });
+    };
+    const onGroupUnpinnedSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, isPinned: false }] });
+    };
+    const onGroupArchivedSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'ARCHIVE_CHAT', payload: groupId });
+    };
+    const onGroupUnarchivedSuccess = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'UNARCHIVE_CHAT', payload: groupId });
+    };
+
+    socket.on('group:muted:success', onGroupMutedSuccess);
+    socket.on('group:unmuted:success', onGroupUnmutedSuccess);
+    socket.on('group:pinned:success', onGroupPinnedSuccess);
+    socket.on('group:unpinned:success', onGroupUnpinnedSuccess);
+    socket.on('group:archived:success', onGroupArchivedSuccess);
+    socket.on('group:unarchived:success', onGroupUnarchivedSuccess);
+
+    // ─── GROUP ADMIN TRANSFER & DELETE LISTENERS ───
+
+    const onGroupAdminTransferred = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({
+        type: 'GROUP_ADMIN_TRANSFERRED',
+        payload: { groupId, previousAdmin: data?.previousAdmin, newAdmin: data?.newAdmin },
+      });
+    };
+    const onGroupDeleted = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      dispatch({ type: 'REMOVE_CHAT', payload: groupId });
+    };
+
+    socket.on('group:admin:transferred', onGroupAdminTransferred);
+    socket.on('group:admin:transfer:success', onGroupAdminTransferred);
+    socket.on('group:admin:received', onGroupAdminTransferred);
+    socket.on('group:deleted', onGroupDeleted);
+    socket.on('group:delete:success', onGroupDeleted);
+
+    // ─── GROUP INVITATION LISTENERS ───
+
+    const onGroupInvitationReceived = (payload) => {
+      const data = payload?.data || payload;
+      console.log('[GROUP] Invitation received:', data?.groupId, 'from:', data?.invitedBy);
+    };
+    const onGroupInviteListResponse = (payload) => {
+      console.log('[GROUP] Invite list response:', payload?.data?.invites?.length || 0, 'invites');
+    };
+
+    socket.on('group:invitation:received', onGroupInvitationReceived);
+    socket.on('group:invite:send:success', () => {});
+    socket.on('group:invite:accept:success', () => {});
+    socket.on('group:invite:reject:success', () => {});
+    socket.on('group:invite:list:response', onGroupInviteListResponse);
+
+    // ─── GROUP STATS & ACTIVITY LISTENERS ───
+
+    const onGroupStatsResponse = (payload) => {
+      console.log('[GROUP] Stats response:', payload?.data?.groupId);
+    };
+    const onGroupActivityResponse = (payload) => {
+      console.log('[GROUP] Activity response:', payload?.data?.activities?.length || 0, 'entries');
+    };
+
+    socket.on('group:stats:response', onGroupStatsResponse);
+    socket.on('group:activity:response', onGroupActivityResponse);
+
+    // ─── GROUP MEDIA UPDATED LISTENER ───
+
+    const onGroupMediaUpdated = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = normalizeId(data?.groupId);
+      if (!groupId) return;
+      // Dispatch for chat list update if last message media changed
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, ...data }] });
+    };
+    socket.on('group:message:media:updated', onGroupMediaUpdated);
+
     socketUnsubscribersRef.current = [
       () => socket.off('message:scheduled:cancelled', onScheduledCancelled),
       () => socket.off('message:cancel:scheduled', onScheduledCancelled),
       () => socket.off('message:cancel:scheduled:response', onScheduledCancelled),
+      () => socket.off('message:sent:ack', onSentAckForChatList),
+      () => socket.off('group:message:sent', onSentAckForChatList),
+      () => socket.off('group:message:sent:ack', onSentAckForChatList),
+      () => socket.off('group:message:send:response', onSentAckForChatList),
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
       () => socket.off('message:delivered', onMessageDelivered),
@@ -2576,6 +2855,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:cleared:me', onChatCleared),
       () => socket.off('chat:cleared:everyone', onChatCleared),
       () => socket.off('group:message:new', onGroupMessageNew),
+      () => socket.off('group:message:received', onGroupMessageNew),
       () => socket.off('group:joined', onGroupJoined),
       () => socket.off('group:left', onGroupLeft),
       () => socket.off('group:member:joined', onGroupMemberJoined),
@@ -2601,6 +2881,37 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('group:unmuted', onGroupMemberUnmuted),
       () => socket.off('group:member:list:response', onGroupMemberListResponse),
       () => socket.off('group:member:info:response', onGroupMemberInfoResponse),
+      // Settings & metadata
+      () => socket.off('group:settings:updated', onGroupSettingsUpdated),
+      () => socket.off('group:settings:response', onGroupSettingsUpdated),
+      () => socket.off('group:settings:update:success', onGroupSettingsUpdated),
+      () => socket.off('group:name:updated', onGroupNameUpdated),
+      () => socket.off('group:name:update:success', onGroupNameUpdated),
+      () => socket.off('group:description:updated', onGroupDescriptionUpdated),
+      () => socket.off('group:description:update:success', onGroupDescriptionUpdated),
+      () => socket.off('group:avatar:updated', onGroupAvatarUpdated),
+      () => socket.off('group:avatar:update:success', onGroupAvatarUpdated),
+      // Notification/preference
+      () => socket.off('group:muted:success', onGroupMutedSuccess),
+      () => socket.off('group:unmuted:success', onGroupUnmutedSuccess),
+      () => socket.off('group:pinned:success', onGroupPinnedSuccess),
+      () => socket.off('group:unpinned:success', onGroupUnpinnedSuccess),
+      () => socket.off('group:archived:success', onGroupArchivedSuccess),
+      () => socket.off('group:unarchived:success', onGroupUnarchivedSuccess),
+      // Admin transfer & delete
+      () => socket.off('group:admin:transferred', onGroupAdminTransferred),
+      () => socket.off('group:admin:transfer:success', onGroupAdminTransferred),
+      () => socket.off('group:admin:received', onGroupAdminTransferred),
+      () => socket.off('group:deleted', onGroupDeleted),
+      () => socket.off('group:delete:success', onGroupDeleted),
+      // Invitations
+      () => socket.off('group:invitation:received', onGroupInvitationReceived),
+      () => socket.off('group:invite:list:response', onGroupInviteListResponse),
+      // Stats & activity
+      () => socket.off('group:stats:response', onGroupStatsResponse),
+      () => socket.off('group:activity:response', onGroupActivityResponse),
+      // Media updated
+      () => socket.off('group:message:media:updated', onGroupMediaUpdated),
     ];
 
     attachedSocketRef.current = socket;
@@ -3032,6 +3343,131 @@ export function RealtimeChatProvider({ children }) {
     emitChatAction('group:member:info', { groupId: gid, userId: uid });
   }, [emitChatAction]);
 
+  // ─── GROUP SETTINGS & METADATA EMITTERS ───
+
+  const getGroupSettings = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:settings:get', { groupId: id });
+  }, [emitChatAction]);
+
+  const updateGroupSettings = useCallback((groupId, settings) => {
+    const id = normalizeId(groupId);
+    if (!id || !settings) return;
+    emitChatAction('group:settings:update', { groupId: id, settings });
+  }, [emitChatAction]);
+
+  const updateGroupName = useCallback((groupId, name) => {
+    const id = normalizeId(groupId);
+    if (!id || !name?.trim()) return;
+    emitChatAction('group:name:update', { groupId: id, name: name.trim() });
+  }, [emitChatAction]);
+
+  const updateGroupDescription = useCallback((groupId, description) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:description:update', { groupId: id, description: description || '' });
+  }, [emitChatAction]);
+
+  const updateGroupAvatar = useCallback((groupId, avatarUrl) => {
+    const id = normalizeId(groupId);
+    if (!id || !avatarUrl) return;
+    emitChatAction('group:avatar:update', { groupId: id, avatarUrl });
+  }, [emitChatAction]);
+
+  // ─── GROUP NOTIFICATION & PREFERENCE EMITTERS (user-level) ───
+
+  const muteGroup = useCallback((groupId, duration = 0) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:mute', { groupId: id, duration: Number(duration) || 0 });
+  }, [emitChatAction]);
+
+  const unmuteGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:unmute', { groupId: id });
+  }, [emitChatAction]);
+
+  const pinGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:pinned', { groupId: id });
+  }, [emitChatAction]);
+
+  const unpinGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:unpinned', { groupId: id });
+  }, [emitChatAction]);
+
+  const archiveGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:archive', { groupId: id });
+  }, [emitChatAction]);
+
+  const unarchiveGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:unarchive', { groupId: id });
+  }, [emitChatAction]);
+
+  // ─── GROUP ADMIN TRANSFER & DELETION EMITTERS ───
+
+  const transferGroupAdmin = useCallback((groupId, newAdminId) => {
+    const gid = normalizeId(groupId);
+    const uid = normalizeId(newAdminId);
+    if (!gid || !uid) return;
+    emitChatAction('group:admin:transfer', { groupId: gid, newAdminId: uid });
+  }, [emitChatAction]);
+
+  const deleteGroup = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:delete', { groupId: id });
+  }, [emitChatAction]);
+
+  // ─── GROUP INVITATION EMITTERS ───
+
+  const sendGroupInvite = useCallback((groupId, userIds) => {
+    const id = normalizeId(groupId);
+    if (!id || !Array.isArray(userIds) || userIds.length === 0) return;
+    emitChatAction('group:invite:send', { groupId: id, userIds });
+  }, [emitChatAction]);
+
+  const acceptGroupInvite = useCallback((groupId, inviteId) => {
+    const id = normalizeId(groupId);
+    if (!id || !inviteId) return;
+    emitChatAction('group:invite:accept', { groupId: id, inviteId });
+  }, [emitChatAction]);
+
+  const rejectGroupInvite = useCallback((groupId, inviteId) => {
+    const id = normalizeId(groupId);
+    if (!id || !inviteId) return;
+    emitChatAction('group:invite:reject', { groupId: id, inviteId });
+  }, [emitChatAction]);
+
+  const listGroupInvites = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:invite:list', { groupId: id });
+  }, [emitChatAction]);
+
+  // ─── GROUP STATS & ACTIVITY EMITTERS ───
+
+  const getGroupStats = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:stats', { groupId: id });
+  }, [emitChatAction]);
+
+  const getGroupActivity = useCallback((groupId, limit = 20, offset = 0) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    emitChatAction('group:activity', { groupId: id, limit, offset });
+  }, [emitChatAction]);
+
   const chatList = useMemo(() => {
     return state.sortedChatIds.map((chatId) => {
       const item = state.chatMap[chatId];
@@ -3134,6 +3570,30 @@ export function RealtimeChatProvider({ children }) {
     unmuteGroupMember,
     listGroupMembers,
     getGroupMemberInfo,
+    // Group settings & metadata
+    getGroupSettings,
+    updateGroupSettings,
+    updateGroupName,
+    updateGroupDescription,
+    updateGroupAvatar,
+    // Group notification preferences (user-level)
+    muteGroup,
+    unmuteGroup,
+    pinGroup,
+    unpinGroup,
+    archiveGroup,
+    unarchiveGroup,
+    // Group admin & deletion
+    transferGroupAdmin,
+    deleteGroup,
+    // Group invitations
+    sendGroupInvite,
+    acceptGroupInvite,
+    rejectGroupInvite,
+    listGroupInvites,
+    // Group stats & activity
+    getGroupStats,
+    getGroupActivity,
   }), [
     state,
     chatList,
@@ -3164,6 +3624,25 @@ export function RealtimeChatProvider({ children }) {
     unmuteGroupMember,
     listGroupMembers,
     getGroupMemberInfo,
+    getGroupSettings,
+    updateGroupSettings,
+    updateGroupName,
+    updateGroupDescription,
+    updateGroupAvatar,
+    muteGroup,
+    unmuteGroup,
+    pinGroup,
+    unpinGroup,
+    archiveGroup,
+    unarchiveGroup,
+    transferGroupAdmin,
+    deleteGroup,
+    sendGroupInvite,
+    acceptGroupInvite,
+    rejectGroupInvite,
+    listGroupInvites,
+    getGroupStats,
+    getGroupActivity,
   ]);
 
   return (

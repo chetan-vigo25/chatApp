@@ -941,7 +941,8 @@ const clearScheduleData = async (messageId, newStatus = 'sent') => {
     if (payload) {
       delete payload.isScheduled;
       delete payload.scheduleTime;
-      delete payload.scheduleTimeLabel;
+      // Keep scheduleTimeLabel for visual indicator on delivered scheduled messages
+      payload.wasScheduled = true;
       await db.runAsync(
         `UPDATE messages SET status = $s, payload = $p WHERE id = $rid`,
         { $s: newStatus, $p: JSON.stringify(payload), $rid: row.id }
