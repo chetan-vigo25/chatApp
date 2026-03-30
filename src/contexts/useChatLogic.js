@@ -1526,6 +1526,13 @@ export default function useChatLogic({ navigation, route }) {
     // Preserve the original tempId if present — it's the link to the optimistic message
     const originalTempId = normalizeId(apiMsg?.tempId || apiMsg?.payload?.tempId);
 
+    // Extract reply object from multiple possible locations
+    const replyObj = (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? apiMsg.replyTo : null)
+      || (apiMsg?.quotedMessage && typeof apiMsg.quotedMessage === 'object' ? apiMsg.quotedMessage : null)
+      || (apiMsg?.reply && typeof apiMsg.reply === 'object' ? apiMsg.reply : null)
+      || (normalizedPayload?.replyTo && typeof normalizedPayload.replyTo === 'object' ? normalizedPayload.replyTo : null)
+      || null;
+
     return {
       id: serverId,
       serverMessageId: serverId,
@@ -1569,17 +1576,28 @@ export default function useChatLogic({ navigation, route }) {
       placeholderText: resolvedIsDeleted ? resolvedPlaceholderText : null,
       // Reply/Quote fields — support both local field names and server field names
       // Handle replyTo being an object (server populates it) vs a plain ID string
-      replyToMessageId: apiMsg?.replyToMessageId || apiMsg?.quotedMessageId
-        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo._id || apiMsg.replyTo.id) : apiMsg?.replyTo)
-        || apiMsg?.reply_to_message_id || null,
+      // Check top-level, payload, and multiple server naming conventions
+      replyToMessageId: apiMsg?.replyToMessageId || apiMsg?.quotedMessageId || apiMsg?.reply_to_message_id
+        || normalizedPayload?.replyToMessageId || normalizedPayload?._replyToMessageId
+        || (replyObj ? (replyObj._id || replyObj.id || replyObj.messageId) : null)
+        || (typeof apiMsg?.replyTo === 'string' ? apiMsg.replyTo : null)
+        || null,
       replyPreviewText: apiMsg?.replyPreviewText || apiMsg?.quotedText || apiMsg?.reply_preview_text
-        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? apiMsg.replyTo.text : null) || null,
+        || normalizedPayload?.replyPreviewText || normalizedPayload?._replyPreviewText
+        || replyObj?.text || replyObj?.content || replyObj?.message
+        || null,
       replyPreviewType: apiMsg?.replyPreviewType || apiMsg?.reply_preview_type
-        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo.messageType || apiMsg.replyTo.type) : null) || null,
+        || normalizedPayload?.replyPreviewType || normalizedPayload?._replyPreviewType
+        || replyObj?.messageType || replyObj?.type
+        || null,
       replySenderName: apiMsg?.replySenderName || apiMsg?.quotedSender || apiMsg?.reply_sender_name
-        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo.senderName || apiMsg.replyTo.sender?.fullName || apiMsg.replyTo.sender?.name) : null) || null,
+        || normalizedPayload?.replySenderName || normalizedPayload?._replySenderName
+        || replyObj?.senderName || replyObj?.sender?.fullName || replyObj?.sender?.name
+        || null,
       replySenderId: apiMsg?.replySenderId || apiMsg?.reply_sender_id
-        || (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? (apiMsg.replyTo.senderId || apiMsg.replyTo.sender?._id || apiMsg.replyTo.sender) : null) || null,
+        || normalizedPayload?.replySenderId || normalizedPayload?._replySenderId
+        || replyObj?.senderId || replyObj?.sender?._id || (typeof replyObj?.sender === 'string' ? replyObj.sender : null)
+        || null,
     };
   }, [normalizeMessageStatus]);
 
@@ -2051,13 +2069,43 @@ export default function useChatLogic({ navigation, route }) {
           };
         });
 
-        // MERGE strategy: keep optimistic messages that aren't in SQLite yet.
-        // This prevents the "message disappears then reappears" flicker.
-        // An optimistic message is one with a temp ID that hasn't been written to DB yet.
+        // MERGE strategy: keep optimistic messages that aren't in SQLite yet,
+        // and preserve in-memory reply/sender data that SQLite may not have yet.
         setAllMessages(prev => {
+          // Build a lookup of previous in-memory messages by ID for data recovery
+          const prevById = new Map();
+          for (const m of prev) {
+            if (m.id) prevById.set(String(m.id), m);
+            if (m.serverMessageId) prevById.set(String(m.serverMessageId), m);
+            if (m.tempId) prevById.set(String(m.tempId), m);
+          }
+
+          // Preserve reply data and senderName from in-memory state onto enriched messages
+          // when SQLite didn't have them (race condition with async writes)
+          const patchedEnriched = enriched.map(m => {
+            const prevMsg = prevById.get(String(m.id)) || prevById.get(String(m.serverMessageId)) || prevById.get(String(m.tempId));
+            if (!prevMsg) return m;
+            let patch = null;
+            if (m.replyToMessageId && !m.replyPreviewText && prevMsg.replyPreviewText) {
+              patch = {
+                replyPreviewText: prevMsg.replyPreviewText,
+                replyPreviewType: prevMsg.replyPreviewType || m.replyPreviewType,
+                replySenderName: prevMsg.replySenderName || m.replySenderName,
+                replySenderId: prevMsg.replySenderId || m.replySenderId,
+              };
+            }
+            if (!m.senderName && prevMsg.senderName) {
+              patch = { ...(patch || {}), senderName: prevMsg.senderName };
+            }
+            if (!m.reactions && prevMsg.reactions) {
+              patch = { ...(patch || {}), reactions: prevMsg.reactions };
+            }
+            return patch ? { ...m, ...patch } : m;
+          });
+
           // Build a set of ALL IDs from DB messages
           const dbIdSet = new Set();
-          for (const m of enriched) {
+          for (const m of patchedEnriched) {
             if (m.id) dbIdSet.add(m.id);
             if (m.serverMessageId) dbIdSet.add(m.serverMessageId);
             if (m.tempId) dbIdSet.add(m.tempId);
@@ -2073,13 +2121,13 @@ export default function useChatLogic({ navigation, route }) {
             return false;
           });
 
-          if (optimistic.length === 0) return enriched;
+          if (optimistic.length === 0) return patchedEnriched;
 
           // Merge: optimistic messages first (newest), then DB messages
           // Dedup by ID to prevent any doubles
           const seenIds = new Set();
           const merged = [];
-          for (const m of [...optimistic, ...enriched]) {
+          for (const m of [...optimistic, ...patchedEnriched]) {
             const ids = [m.id, m.serverMessageId, m.tempId].filter(Boolean);
             if (ids.some(id => seenIds.has(id))) continue;
             for (const id of ids) seenIds.add(id);
@@ -5667,14 +5715,24 @@ export default function useChatLogic({ navigation, route }) {
         }
       }
 
-      // Source 3: Try to extract from the raw replyTo object in the payload
+      // Source 3: Try to extract from the raw replyTo / quotedMessage / payload in socket data
       if (!receivedMessage.replyPreviewText) {
-        const rawReplyTo = msg?.replyTo;
+        const rawReplyTo = msg?.replyTo || msg?.quotedMessage || msg?.reply || msg?.payload?.replyTo;
         if (rawReplyTo && typeof rawReplyTo === 'object') {
-          receivedMessage.replyPreviewText = rawReplyTo.text || null;
+          receivedMessage.replyPreviewText = rawReplyTo.text || rawReplyTo.content || rawReplyTo.message || null;
           receivedMessage.replyPreviewType = rawReplyTo.messageType || rawReplyTo.type || 'text';
-          receivedMessage.replySenderId = receivedMessage.replySenderId || rawReplyTo.senderId || rawReplyTo.sender?._id || null;
-          receivedMessage.replySenderName = receivedMessage.replySenderName || rawReplyTo.senderName || rawReplyTo.sender?.fullName || null;
+          receivedMessage.replySenderId = receivedMessage.replySenderId || rawReplyTo.senderId || rawReplyTo.sender?._id || (typeof rawReplyTo.sender === 'string' ? rawReplyTo.sender : null) || null;
+          receivedMessage.replySenderName = receivedMessage.replySenderName || rawReplyTo.senderName || rawReplyTo.sender?.fullName || rawReplyTo.sender?.name || null;
+        }
+        // Also check flat fields on the raw msg that normalizeIncomingMessage might have missed
+        if (!receivedMessage.replyPreviewText) {
+          receivedMessage.replyPreviewText = msg?.replyPreviewText || msg?.quotedText || msg?.payload?.replyPreviewText || msg?.payload?._replyPreviewText || null;
+        }
+        if (!receivedMessage.replySenderName) {
+          receivedMessage.replySenderName = msg?.replySenderName || msg?.quotedSender || msg?.payload?.replySenderName || msg?.payload?._replySenderName || null;
+        }
+        if (!receivedMessage.replySenderId) {
+          receivedMessage.replySenderId = msg?.replySenderId || msg?.payload?.replySenderId || msg?.payload?._replySenderId || null;
         }
       }
 
@@ -5695,10 +5753,11 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     // Save reply data to permanent reply table (never overwritten)
+    // MUST complete BEFORE delivery receipt can trigger refreshMessagesFromDB
     if (receivedMessage.replyToMessageId) {
       const rKey = receivedMessage.serverMessageId || receivedMessage.id || receivedMessage.tempId;
       if (rKey) {
-        ChatDatabase.saveReplyData(rKey, {
+        await ChatDatabase.saveReplyData(rKey, {
           replyToMessageId: receivedMessage.replyToMessageId,
           replyPreviewText: receivedMessage.replyPreviewText,
           replyPreviewType: receivedMessage.replyPreviewType,
@@ -5713,22 +5772,46 @@ export default function useChatLogic({ navigation, route }) {
       receivedMessage.senderName = groupMembersMapRef.current?.[receivedMessage.senderId]?.fullName || null;
     }
 
-    // INSTANT UI: merge into state immediately, then write to SQLite in background
+    // Write to SQLite BEFORE adding to state — so refreshMessagesFromDB won't lose data
+    await ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(() => {});
+
+    // INSTANT UI: merge into state — update existing if reply/sender data was missing
     setAllMessages(prev => {
-      // Dedup check — skip if already in the list
       const ids = [receivedMessage.serverMessageId, receivedMessage.id, receivedMessage.tempId].filter(Boolean);
-      const exists = prev.some(m =>
+      const existingIdx = prev.findIndex(m =>
         ids.some(id => sameId(id, m.serverMessageId) || sameId(id, m.id) || sameId(id, m.tempId))
       );
-      if (exists) return prev;
-      // Insert at the beginning (newest first) and resort
+
+      if (existingIdx !== -1) {
+        // Message already in state — patch it with reply/sender data if it was missing
+        const existing = prev[existingIdx];
+        let patch = null;
+        if (receivedMessage.replyToMessageId) {
+          if (!existing.replyPreviewText && receivedMessage.replyPreviewText) {
+            patch = {
+              ...(patch || {}),
+              replyPreviewText: receivedMessage.replyPreviewText,
+              replyPreviewType: receivedMessage.replyPreviewType,
+              replySenderName: receivedMessage.replySenderName,
+              replySenderId: receivedMessage.replySenderId,
+              replyToMessageId: receivedMessage.replyToMessageId,
+            };
+          }
+        }
+        if (!existing.senderName && receivedMessage.senderName) {
+          patch = { ...(patch || {}), senderName: receivedMessage.senderName };
+        }
+        if (!patch) return prev; // Nothing to patch
+        const updated = [...prev];
+        updated[existingIdx] = { ...existing, ...patch };
+        return updated;
+      }
+
+      // New message — insert
       const merged = [receivedMessage, ...prev];
       merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
       return merged;
     });
-
-    // Write to SQLite in background (non-blocking)
-    ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(() => {});
 
     // Emit delivery receipt for incoming messages from others
     // Do NOT emit delivery for scheduled/processing/cancelled/failed messages

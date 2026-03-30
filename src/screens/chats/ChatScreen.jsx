@@ -3925,43 +3925,75 @@ export default function ChatScreen({ navigation, route }) {
               </View>
             )}
 
-            {/* Reply quote bubble */}
-            {msg.replyToMessageId && !isDeletedMessage && (
-              <ReplyBubble
-                replyToMessageId={msg.replyToMessageId}
-                replyPreviewText={msg.replyPreviewText}
-                replyPreviewType={msg.replyPreviewType}
-                replySenderName={msg.replySenderName}
-                replySenderId={msg.replySenderId}
-                currentUserId={currentUserId}
-                isMyMessage={isMyMessage}
-                chatColor={chatColor}
-                theme={theme}
-                onPress={(originalMsgId) => {
-                  const idx = messages.findIndex(m =>
-                    sameId(m.serverMessageId, originalMsgId) ||
-                    sameId(m.id, originalMsgId) ||
-                    sameId(m.tempId, originalMsgId)
-                  );
-                  if (idx !== -1 && flatListRef?.current) {
-                    try {
-                      flatListRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0.5 });
-                    } catch {}
-                    // Highlight the target message for 3 seconds
-                    const targetMsg = messages[idx];
-                    const targetKey = targetMsg?.serverMessageId || targetMsg?.id || targetMsg?.tempId;
-                    if (targetKey) {
-                      if (replyHighlightTimer.current) clearTimeout(replyHighlightTimer.current);
-                      setReplyHighlightId(targetKey);
-                      replyHighlightTimer.current = setTimeout(() => {
-                        setReplyHighlightId(null);
-                        replyHighlightTimer.current = null;
-                      }, 3000);
-                    }
+            {/* Reply quote bubble — resolve missing data from messages array at render time */}
+            {msg.replyToMessageId && !isDeletedMessage && (() => {
+              let replyText = msg.replyPreviewText;
+              let replyType = msg.replyPreviewType;
+              let replySName = msg.replySenderName;
+              let replySId = msg.replySenderId;
+
+              // If reply preview data is missing, look up the original message
+              if (!replyText || !replySName) {
+                const originalMsg = messages.find(m =>
+                  sameId(m.serverMessageId, msg.replyToMessageId) ||
+                  sameId(m.id, msg.replyToMessageId) ||
+                  sameId(m.tempId, msg.replyToMessageId)
+                );
+                if (originalMsg) {
+                  if (!replyText) {
+                    replyText = originalMsg.isDeleted ? 'This message was deleted' : (originalMsg.text || originalMsg.content || null);
+                    replyType = replyType || originalMsg.type || 'text';
                   }
-                }}
-              />
-            )}
+                  if (!replySId) replySId = originalMsg.senderId;
+                  if (!replySName) {
+                    replySName = originalMsg.senderName
+                      || groupMembersMap?.[originalMsg.senderId]?.fullName
+                      || (sameId(originalMsg.senderId, currentUserId) ? 'You' : null);
+                  }
+                }
+                // Final fallback: resolve sender name from group members using replySenderId
+                if (!replySName && replySId) {
+                  replySName = groupMembersMap?.[replySId]?.fullName
+                    || (sameId(replySId, currentUserId) ? 'You' : null);
+                }
+              }
+
+              return (
+                <ReplyBubble
+                  replyToMessageId={msg.replyToMessageId}
+                  replyPreviewText={replyText}
+                  replyPreviewType={replyType}
+                  replySenderName={replySName}
+                  replySenderId={replySId}
+                  currentUserId={currentUserId}
+                  isMyMessage={isMyMessage}
+                  chatColor={chatColor}
+                  theme={theme}
+                  onPress={(originalMsgId) => {
+                    const idx = messages.findIndex(m =>
+                      sameId(m.serverMessageId, originalMsgId) ||
+                      sameId(m.id, originalMsgId) ||
+                      sameId(m.tempId, originalMsgId)
+                    );
+                    if (idx !== -1 && flatListRef?.current) {
+                      try {
+                        flatListRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0.5 });
+                      } catch {}
+                      const targetMsg = messages[idx];
+                      const targetKey = targetMsg?.serverMessageId || targetMsg?.id || targetMsg?.tempId;
+                      if (targetKey) {
+                        if (replyHighlightTimer.current) clearTimeout(replyHighlightTimer.current);
+                        setReplyHighlightId(targetKey);
+                        replyHighlightTimer.current = setTimeout(() => {
+                          setReplyHighlightId(null);
+                          replyHighlightTimer.current = null;
+                        }, 3000);
+                      }
+                    }
+                  }}
+                />
+              );
+            })()}
 
             {/* TEXT MESSAGES */}
             {msg.type === "text" && !isDeletedMessage && (
