@@ -135,10 +135,31 @@ export async function deactiveSession(deviceId) {
     }
 }
 
+export async function emailLoginService(payload) {
+    try {
+        const response = await apiCall("POST", "user/auth/login", payload);
+
+        if (response && response.message && typeof response.message === 'string') {
+            if (response.statusCode === 200) {
+                return response;
+            } else {
+                showToast(response.message);
+                return Promise.reject(response.message);
+            }
+        } else {
+            return Promise.reject("Invalid response from server");
+        }
+    } catch (error) {
+        console.error("Email login error:", error);
+        return Promise.reject(error.message || "Error during email login");
+    }
+}
+
 export const authServices = {
     generateOtp,
     verifyOtpService,
     resendOtpService,
+    emailLoginService,
     activeSession,
     deactiveSession,
 };

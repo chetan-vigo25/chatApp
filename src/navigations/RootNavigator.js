@@ -8,6 +8,7 @@ import { navigationRef, updateNavigationSnapshot } from "../Redux/Services/navig
 import Splash from "../screens/Splash";
 import UserAgree from "../screens/UserAgree";
 import Login from "../screens/Login";
+import LoginEmail from "../screens/LoginEmail";
 import Otp from "../screens/Otp";
 import ChatScreen from "../screens/chats/ChatScreen";
 import Test from "../screens/Test";
@@ -96,6 +97,7 @@ export default function RootNavigator() {
           <Stack.Screen name="Splash" component={Splash} />
           <Stack.Screen name="UserAgree" component={UserAgree} />
           <Stack.Screen name="Login" component={Login} />
+          <Stack.Screen name="LoginEmail" component={LoginEmail} />
           <Stack.Screen name="Otp" component={Otp} />
           <Stack.Screen name="ChatList" component={BottomTabNavigator} />
           <Stack.Screen name="ChatScreen" component={ChatScreen} />

@@ -54,7 +54,7 @@ export default function Setting({ navigation }) {
 
       navigation.reset({
         index: 0,
-        routes: [{ name: "Login" }],
+        routes: [{ name: "LoginEmail" }],
       });
 
       console.log("Logged out from current device.");

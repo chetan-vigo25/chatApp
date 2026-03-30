@@ -42,6 +42,18 @@ export const resendOtp = createAsyncThunk(
   }
 );
 
+export const emailLogin = createAsyncThunk(
+  'auth/emailLogin',
+  async (payload, { rejectWithValue }) => {
+    try {
+      const response = await authServices.emailLoginService(payload);
+      return response;
+    } catch (error) {
+      return rejectWithValue(error.message || error);
+    }
+  }
+);
+
 export const linkedDevice = createAsyncThunk(
   'auth/activeSession',
   async (_, { rejectWithValue }) => {
@@ -135,6 +147,20 @@ const authSlice = createSlice({
       .addCase(linkedDevice.rejected, (state, action) => {
         state.isLoading = false;
         state.error = action.payload; // Store error message
+      })
+
+      .addCase(emailLogin.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(emailLogin.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload.data || null;
+        state.error = null;
+      })
+      .addCase(emailLogin.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload;
       })
 
       .addCase(resendOtp.pending, (state) => {

@@ -20,7 +20,7 @@ function showToast(message) {
 }
 
 export default function EditProfile({ navigation, route }) {
-    const { selectedCountry, phoneNumber } = route.params;
+    const { selectedCountry, phoneNumber, email } = route.params || {};
     const { theme, isDarkMode, toggleTheme } = useTheme();
     const fadeAnim = useRef(new Animated.Value(0)).current;
     const [focusedInput, setFocusedInput] = useState(null);
@@ -30,7 +30,7 @@ export default function EditProfile({ navigation, route }) {
     const dispatch = useDispatch();
     const { profileData, updateProfileData, isLoading, error } = useSelector(state => state.profile);
     const fullNumber = selectedCountry?.code + phoneNumber;
-
+// console.log("Profile Data in EditProfile:", email);
     const [form, setForm] = useState({
       fullName: '',
       email: '',
@@ -103,7 +103,7 @@ export default function EditProfile({ navigation, route }) {
       //   if (!emailRegex.test(form.email)) newErrors.email = 'Please enter a valid email address';
       // }
       // if (!form.about?.trim()) newErrors.about = 'About is required';
-      if (!phoneNumber?.trim()) newErrors.phoneNumber = 'Phone number is required';
+      if (phoneNumber !== undefined && !phoneNumber?.trim()) newErrors.phoneNumber = 'Phone number is required';
   
       setFormErrors(newErrors);
       return Object.keys(newErrors).length === 0; // returns true if no errors
@@ -276,15 +276,17 @@ export default function EditProfile({ navigation, route }) {
       
       const payload = {
         fullName: form.fullName,
-        email: form.email,
+        email: form.email || email || '',
         about: form.about,
         profileImage: finalProfileImage,
-        mobile: {
+        ...(phoneNumber ? {
+          mobile: {
             code: selectedCountry?.code || '',
-            number: phoneNumber || ''
-        },
+            number: phoneNumber || '',
+          },
+        } : {}),
       };
-      // console.log("Updating profile with payload:", payload);
+      console.log("Updating profile with payload:", payload);
   
       try {
         const response = await dispatch(editProfile(payload)).unwrap();
@@ -381,7 +383,9 @@ export default function EditProfile({ navigation, route }) {
                                  placeholder="Email" 
                                  placeholderTextColor={theme.colors.placeHolderTextColor} 
                                  style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
-                                 value={form.email}
+                                //  value={form.email}
+                                editable={false}
+                                 value={form.email || email || ''}
                                  keyboardType="email-address"
                                  autoCapitalize="none"
                                  onChangeText={(value) => handleChange('email', value)}
