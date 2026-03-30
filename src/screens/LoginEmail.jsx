@@ -283,7 +283,7 @@ export default function LoginEmail({ navigation }) {
             </View>
 
             {/* Remember Me & Forgot Password */}
-            <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 28, }} >
+            {/* <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 28, }} >
               <TouchableOpacity
                 style={{ flexDirection: "row", alignItems: "center" }}
                 onPress={() => setRememberMe((prev) => !prev)}
@@ -318,7 +318,7 @@ export default function LoginEmail({ navigation }) {
                   Forgot Password?
                 </Text>
               </TouchableOpacity>
-            </View>
+            </View> */}
 
             {/* Submit Button */}
             <TouchableOpacity

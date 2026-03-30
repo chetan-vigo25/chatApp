@@ -3866,13 +3866,16 @@ export default function ChatScreen({ navigation, route }) {
           }}>
             
             {/* Sender name for group chats */}
-            {!isMyMessage && chatData?.isGroup && (
-              <Text style={{
-                fontSize: 11,
-                color: getUserColor?.(msg.senderId) || theme.colors.themeColor,
-                fontFamily: "Roboto-Medium",
-                marginBottom: 2,
-              }}>
+            {!isMyMessage && (chatData?.chatType === 'group' || chatData?.isGroup) && (
+              <Text
+                numberOfLines={1}
+                style={{
+                  fontSize: 12,
+                  color: getUserColor?.(msg.senderId) || theme.colors.themeColor,
+                  fontFamily: "Roboto-SemiBold",
+                  marginBottom: 2,
+                  paddingRight: 8,
+                }}>
                 {msg.senderName
                   || groupMembersMap?.[msg.senderId]?.fullName
                   || 'Member'}

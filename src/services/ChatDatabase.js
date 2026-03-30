@@ -363,6 +363,26 @@ const cleanBeforeUpsert = async (db, msg) => {
   const tempId = msg.tempId;
   const serverId = msg.serverMessageId;
 
+  // Rescue reactions from any row that's about to be deleted so the incoming msg preserves them
+  if (!msg.reactions || (typeof msg.reactions === 'object' && Object.keys(msg.reactions).length === 0)) {
+    try {
+      const lookupIds = [tempId, serverId, id].filter(Boolean);
+      for (const lid of lookupIds) {
+        const existing = await db.getFirstAsync(
+          `SELECT reactions FROM messages WHERE (id = $lid OR server_message_id = $lid OR temp_id = $lid) AND reactions IS NOT NULL AND reactions != 'null' AND reactions != '{}' LIMIT 1`,
+          { $lid: lid }
+        );
+        if (existing?.reactions) {
+          const parsed = parseJSON(existing.reactions);
+          if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+            msg.reactions = parsed;
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
+
   // 1. If we know the tempId→serverId link, remove the temp row
   if (serverId && tempId && serverId !== tempId) {
     await db.runAsync(`DELETE FROM messages WHERE (id = $t OR temp_id = $t) AND id != $s`, { $t: tempId, $s: serverId });
@@ -924,11 +944,18 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
   const ackStatus = isScheduledMsg ? (tempRow?.status || 'scheduled') : 'sent';
 
   if (serverRow && tempRow && serverRow.id !== tempRow.id) {
+    // Rescue reactions from temp row before it gets deleted
+    let tempReactions = null;
+    try {
+      const tempFull = await db.getFirstAsync(`SELECT reactions FROM messages WHERE id = $t LIMIT 1`, { $t: tempRow.id });
+      if (tempFull?.reactions) tempReactions = tempFull.reactions;
+    } catch {}
+
     if (tempRow.is_edited && !serverRow.is_edited) {
       await db.runAsync(`DELETE FROM messages WHERE id = $s`, { $s: serverRow.id });
       await db.runAsync(`UPDATE messages SET id = $s, server_message_id = $s, synced = 1, status = $st WHERE id = $t`, { $s: serverMessageId, $t: tempRow.id, $st: ackStatus });
     } else {
-      // Before deleting temp row, copy its reply data to the server row if server row lacks it
+      // Before deleting temp row, copy its reply data and reactions to the server row
       if (_hasReplyColumns && tempRow.reply_to_message_id) {
         await db.runAsync(
           `UPDATE messages SET
@@ -948,6 +975,13 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
             $rsid: tempRow.reply_sender_id || null,
             $tempId: tempId,
           }
+        );
+      }
+      // Copy reactions from temp row to server row if server row has none
+      if (tempReactions) {
+        await db.runAsync(
+          `UPDATE messages SET reactions = COALESCE(reactions, $r), temp_id = COALESCE(temp_id, $tempId) WHERE id = $s`,
+          { $s: serverRow.id, $r: tempReactions, $tempId: tempId }
         );
       }
       await db.runAsync(`DELETE FROM messages WHERE id = $t`, { $t: tempRow.id });

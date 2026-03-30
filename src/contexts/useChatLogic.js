@@ -5,7 +5,8 @@ import * as FileSystem from 'expo-file-system/legacy';
 import moment from "moment";
 import { useDispatch, useSelector } from "react-redux";
 import { chatMessage, chatListData, mediaUpload } from "../Redux/Reducer/Chat/Chat.reducer";
-import { getSocket, isSocketConnected, reconnectSocket } from "../Redux/Services/Socket/socket";
+import { viewGroup } from "../Redux/Reducer/Group/Group.reducer";
+import { getSocket, isSocketConnected, reconnectSocket, emitSocketEvent } from "../Redux/Services/Socket/socket";
 import { useNetwork } from "../contexts/NetworkContext";
 import { useImage } from "../contexts/ImageProvider";
 import { useFocusEffect } from "@react-navigation/native";
@@ -92,6 +93,37 @@ const isDeletedForUser = (deletedFor, userId) => {
 const computeSenderType = (senderId, currentUserId) => (
   sameId(senderId, currentUserId) ? 'self' : 'other'
 );
+
+// Sanitize reactions from any source (API, SQLite, socket) into { emoji: { count, users } }
+const sanitizeReactions = (raw) => {
+  if (!raw || typeof raw !== 'object') return null;
+  // Handle array format: [ { emoji, userId }, ... ]
+  if (Array.isArray(raw)) {
+    const result = {};
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const emoji = item.emoji || item.key || item.type;
+      if (!emoji || typeof emoji !== 'string') continue;
+      if (!result[emoji]) result[emoji] = { count: 0, users: [] };
+      const uid = item.userId || item.user || item.reactedBy;
+      if (uid && !result[emoji].users.includes(String(uid))) result[emoji].users.push(String(uid));
+      if (Array.isArray(item.users)) {
+        for (const u of item.users) { const s = String(u); if (!result[emoji].users.includes(s)) result[emoji].users.push(s); }
+      }
+      result[emoji].count = result[emoji].users.length;
+    }
+    return Object.keys(result).length > 0 ? result : null;
+  }
+  // Handle object map — filter out invalid keys
+  const result = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (/^\d+$/.test(k) || !k || k === 'undefined' || k === 'null') continue;
+    if (v && typeof v === 'object' && Array.isArray(v.users) && v.users.length > 0) {
+      result[k] = { count: v.users.length, users: [...v.users] };
+    }
+  }
+  return Object.keys(result).length > 0 ? result : null;
+};
 
 const buildDeletePlaceholderText = (isDeletedBySelf) => (
   isDeletedBySelf ? 'You deleted this message' : 'This message was deleted'
@@ -702,7 +734,10 @@ export default function useChatLogic({ navigation, route }) {
   // Build group members name lookup map from route item members or Redux currentGroup
   useEffect(() => {
     if (!isGroupChat) return;
-    const membersList = chatData.members || currentGroup?.members;
+    // Prefer currentGroup.members (from viewGroup API - has populated user objects with fullName)
+    // over chatData.members (from chat list - may have unpopulated userId strings)
+    const membersList = (currentGroup?.members?.length > 0 ? currentGroup.members : null)
+      || chatData.members;
     if (!membersList || !Array.isArray(membersList) || membersList.length === 0) return;
     const map = {};
     membersList.forEach((m) => {
@@ -719,15 +754,35 @@ export default function useChatLogic({ navigation, route }) {
     if (Object.keys(map).length === 0) return;
     groupMembersMapRef.current = map;
 
-    // Patch existing messages with resolved sender names
+    // Patch existing messages with resolved sender names and reply sender names
     setAllMessages((prev) => {
       let changed = false;
       const patched = prev.map((msg) => {
-        if (msg.senderName || !msg.senderId) return msg;
-        const resolved = map[String(msg.senderId)]?.fullName;
-        if (resolved) {
+        let updates = null;
+
+        // Resolve missing senderName
+        if (!msg.senderName && msg.senderId) {
+          const resolved = map[String(msg.senderId)]?.fullName;
+          if (resolved) {
+            updates = { ...updates, senderName: resolved };
+          }
+        }
+
+        // Resolve missing replySenderName
+        if (msg.replyToMessageId && !msg.replySenderName && msg.replySenderId) {
+          if (sameId(msg.replySenderId, currentUserIdRef.current)) {
+            updates = { ...updates, replySenderName: currentUserNameRef.current || 'You' };
+          } else {
+            const resolvedReply = map[String(msg.replySenderId)]?.fullName;
+            if (resolvedReply) {
+              updates = { ...updates, replySenderName: resolvedReply };
+            }
+          }
+        }
+
+        if (updates) {
           changed = true;
-          return { ...msg, senderName: resolved };
+          return { ...msg, ...updates };
         }
         return msg;
       });
@@ -1201,6 +1256,14 @@ export default function useChatLogic({ navigation, route }) {
         groupMembersMapRef.current = map;
       }
 
+      // Fetch full group details to get populated member data with names
+      if (isGrpInit) {
+        const grpId = chatData.groupId || chatData.group?._id;
+        if (grpId) {
+          dispatch(viewGroup({ groupId: grpId })).catch(() => {});
+        }
+      }
+
       await loadQueuedManualPresence();
       await loadQueuedMediaStatusUpdates();
       await loadQueuedMediaUploads();
@@ -1495,7 +1558,7 @@ export default function useChatLogic({ navigation, route }) {
       downloadStatus: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri)
         ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
         : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
-      reactions: (apiMsg?.reactions && typeof apiMsg.reactions === 'object' && Object.keys(apiMsg.reactions).length > 0) ? apiMsg.reactions : null,
+      reactions: sanitizeReactions(apiMsg?.reactions),
       isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited),
       editedAt: apiMsg?.editedAt || apiMsg?.edited_at || null,
       isForwarded: Boolean(apiMsg?.isForwarded || apiMsg?.is_forwarded || apiMsg?.forwarded || apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.forwardedMessage || apiMsg?.isForwardedMessage),
@@ -4148,22 +4211,47 @@ export default function useChatLogic({ navigation, route }) {
 
     // Helper: apply a reaction change to allMessages in-memory + persist to SQLite (no full reload)
     const applyReactionUpdate = (messageId, updater) => {
+      if (!messageId) return;
+      const mid = String(messageId);
       setAllMessages(prev => {
         let changed = false;
         const updated = prev.map(m => {
-          const isMatch = m.id === messageId || m.serverMessageId === messageId || m.tempId === messageId;
+          const isMatch =
+            String(m.id || '') === mid ||
+            String(m.serverMessageId || '') === mid ||
+            String(m.tempId || '') === mid;
           if (!isMatch) return m;
           changed = true;
-          // Deep-copy each emoji entry so updater can mutate safely
+          // Deep-copy each emoji entry, skip invalid keys (numeric "0","1", etc.)
           const copy = {};
-          for (const [k, v] of Object.entries(m.reactions || {})) {
-            copy[k] = { count: v.count, users: [...(v.users || [])] };
+          if (m.reactions && typeof m.reactions === 'object' && !Array.isArray(m.reactions)) {
+            for (const [k, v] of Object.entries(m.reactions)) {
+              if (/^\d+$/.test(k) || !k || k === 'undefined' || k === 'null') continue;
+              if (v && Array.isArray(v.users)) {
+                copy[k] = { count: v.users.length, users: [...v.users] };
+              }
+            }
           }
           const newReactions = updater(copy);
+          // Sanitize output — only keep valid emoji keys with valid users
+          const sanitized = {};
+          if (newReactions && typeof newReactions === 'object') {
+            for (const [k, v] of Object.entries(newReactions)) {
+              if (/^\d+$/.test(k) || !k || k === 'undefined' || k === 'null') continue;
+              if (v && Array.isArray(v.users) && v.users.length > 0) {
+                sanitized[k] = { count: v.users.length, users: v.users };
+              }
+            }
+          }
+          const finalReactions = Object.keys(sanitized).length > 0 ? sanitized : undefined;
+          console.log('[Reaction] state updated for', mid, JSON.stringify(finalReactions));
           // Persist to SQLite in background
-          ChatDatabase.updateReactions(messageId, newReactions).catch(() => {});
-          return { ...m, reactions: Object.keys(newReactions).length > 0 ? newReactions : undefined };
+          ChatDatabase.updateReactions(mid, finalReactions || null).catch(() => {});
+          return { ...m, reactions: finalReactions };
         });
+        if (!changed) {
+          console.log('[Reaction] ⚠️ NO message found for id:', mid, '| total msgs:', prev.length, '| sample ids:', prev.slice(0, 3).map(m => ({ id: m.id, sid: m.serverMessageId, tid: m.tempId })));
+        }
         return changed ? updated : prev;
       });
     };
@@ -4174,9 +4262,9 @@ export default function useChatLogic({ navigation, route }) {
       const messageId = source?.messageId || source?.message || source?._id || source?.id;
       if (!messageId) return;
 
-      const reactionUserId = source?.userId;
+      const reactionUserId = source?.userId || source?.user || source?.reactedBy || source?.senderId;
       const emoji = source?.emoji;
-      const action = source?.action;
+      const action = source?.action || (emoji ? 'add' : null);
 
       // Skip self-echo: we already applied our own reaction optimistically
       if (reactionUserId && sameId(reactionUserId, currentUserIdRef.current)) return;
@@ -4242,72 +4330,137 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('group:message:media:updated', onGroupMessageMediaUpdated);
 
-    // 1-on-1 reaction broadcast: message:reaction:added
-    const onMessageReactionAdded = (data) => {
-      const source = data?.data || data;
+    // ── 1-on-1 reaction: apply server's authoritative reaction state ──
+    const applyServerReactions = (source) => {
+      const messageId = source?.messageId || source?.message || source?._id || source?.id;
+      if (!messageId) {
+        console.log('[Reaction] ⚠️ No messageId in source:', source);
+        return;
+      }
       const chatId = source?.chatId || source?.chat;
-      if (!sameId(chatId, currentChatId)) return;
-      const messageId = source?.messageId;
-      if (!messageId) return;
+      if (chatId && !sameId(chatId, currentChatId)) return;
 
-      const reactionUserId = source?.userId;
+      // If server sends full reactions (object map OR array), normalize and apply
+      const rawReactions = source?.reactions || source?.reaction;
+      if (rawReactions && typeof rawReactions === 'object') {
+        const normalized = sanitizeReactions(rawReactions);
+        if (normalized) {
+          console.log('[Reaction] Applying server reactions for', messageId, JSON.stringify(normalized));
+          applyReactionUpdate(messageId, () => normalized);
+          return;
+        }
+      }
+
+      // Otherwise apply incremental update from individual fields
+      const reactionUserId = source?.userId || source?.user || source?.reactedBy || source?.senderId;
       const emoji = source?.emoji;
+      const action = source?.action;
 
-      // Skip self-echo: we already applied our own reaction optimistically
-      if (reactionUserId && sameId(reactionUserId, currentUserIdRef.current)) return;
-      if (!emoji || !reactionUserId) return;
-
-      // If server sends full reactions map, use it directly
-      if (source?.reactions && typeof source.reactions === 'object') {
-        applyReactionUpdate(messageId, () => source.reactions);
+      if (!emoji || !reactionUserId) {
+        console.log('[Reaction] ⚠️ Missing emoji or userId for incremental update:', { emoji, reactionUserId });
         return;
       }
 
-      applyReactionUpdate(messageId, (reactions) => {
-        // Remove user from ALL emojis first (one-reaction-per-user)
-        for (const [k, d] of Object.entries(reactions)) {
-          const idx = (d.users || []).indexOf(reactionUserId);
-          if (idx !== -1) {
-            d.users.splice(idx, 1);
-            d.count = Math.max(0, d.count - 1);
-            if (d.count === 0) delete reactions[k];
+      console.log('[Reaction] Applying incremental:', action, emoji, 'by', reactionUserId, 'on', messageId);
+
+      if (action === 'remove') {
+        applyReactionUpdate(messageId, (reactions) => {
+          const existing = reactions[emoji] || { count: 0, users: [] };
+          reactions[emoji] = {
+            count: Math.max(0, existing.count - 1),
+            users: existing.users.filter(u => String(u) !== String(reactionUserId)),
+          };
+          if (reactions[emoji].count === 0) delete reactions[emoji];
+          return reactions;
+        });
+      } else {
+        applyReactionUpdate(messageId, (reactions) => {
+          // Remove user from ALL emojis first (one-reaction-per-user)
+          for (const [k, d] of Object.entries(reactions)) {
+            const idx = d.users.findIndex(u => String(u) === String(reactionUserId));
+            if (idx !== -1) {
+              d.users.splice(idx, 1);
+              d.count = Math.max(0, d.count - 1);
+              if (d.count === 0) delete reactions[k];
+            }
           }
-        }
-        // Add to the new emoji
-        const entry = reactions[emoji] || { count: 0, users: [] };
-        entry.users.push(reactionUserId);
-        entry.count = entry.users.length;
-        reactions[emoji] = entry;
-        return reactions;
-      });
+          const entry = reactions[emoji] || { count: 0, users: [] };
+          if (!entry.users.some(u => String(u) === String(reactionUserId))) {
+            entry.users.push(String(reactionUserId));
+          }
+          entry.count = entry.users.length;
+          reactions[emoji] = entry;
+          return reactions;
+        });
+      }
+    };
+
+    // Dedup guard — broadcast and :response fire for the same reaction, only process once
+    const reactionDedup = new Map();
+    const isReactionDuplicate = (messageId, emoji, userId) => {
+      const key = `${messageId}|${emoji}|${userId}`;
+      const now = Date.now();
+      if (reactionDedup.has(key) && now - reactionDedup.get(key) < 2000) return true;
+      reactionDedup.set(key, now);
+      // Cleanup old entries
+      if (reactionDedup.size > 100) {
+        for (const [k, t] of reactionDedup) { if (now - t > 5000) reactionDedup.delete(k); }
+      }
+      return false;
+    };
+
+    // ── Broadcast: message:reaction:added (server sends to ALL users in chat) ──
+    const onMessageReactionAdded = (data) => {
+      console.log('[Reaction] broadcast added received:', JSON.stringify(data));
+      const source = data?.data || data;
+      const chatId = source?.chatId || source?.chat;
+      if (chatId && !sameId(chatId, currentChatId)) return;
+      const mid = source?.messageId || source?.message || source?._id || source?.id;
+      const emoji = source?.emoji;
+      const uid = source?.userId || source?.user || source?.reactedBy || source?.senderId;
+      if (mid && emoji && uid && isReactionDuplicate(mid, emoji, uid)) return;
+      applyServerReactions({ ...source, action: 'add' });
     };
     registerSocketHandler('message:reaction:added', onMessageReactionAdded);
     registerSocketHandler('message:reaction', onMessageReactionAdded);
     registerSocketHandler('message:reaction:update', onMessageReactionAdded);
 
-    // 1-on-1 reaction broadcast: message:reaction:removed
+    // ── Broadcast: message:reaction:removed (server sends to ALL users in chat) ──
     const onMessageReactionRemoved = (data) => {
+      console.log('[Reaction] broadcast removed received:', JSON.stringify(data));
       const source = data?.data || data;
       const chatId = source?.chatId || source?.chat;
-      if (!sameId(chatId, currentChatId)) return;
-      const messageId = source?.messageId;
-      if (!messageId) return;
-
-      const reactionUserId = source?.userId;
+      if (chatId && !sameId(chatId, currentChatId)) return;
+      const mid = source?.messageId || source?.message || source?._id || source?.id;
       const emoji = source?.emoji;
-
-      // Skip self-echo
-      if (reactionUserId && sameId(reactionUserId, currentUserIdRef.current)) return;
-      if (!emoji || !reactionUserId) return;
-
-      applyReactionUpdate(messageId, (reactions) => {
-        const existing = reactions[emoji] || { count: 0, users: [] };
-        reactions[emoji] = { count: Math.max(0, existing.count - 1), users: existing.users.filter(u => u !== reactionUserId) };
-        if (reactions[emoji].count === 0) delete reactions[emoji];
-        return reactions;
-      });
+      const uid = source?.userId || source?.user || source?.reactedBy || source?.senderId;
+      if (mid && emoji && uid && isReactionDuplicate(mid, emoji, uid)) return;
+      applyServerReactions({ ...source, action: 'remove' });
     };
     registerSocketHandler('message:reaction:removed', onMessageReactionRemoved);
+
+    // ── :response events — also handled with dedup guard ──
+    const onReactionAddResponse = (data) => {
+      console.log('[Reaction] add:response received:', JSON.stringify(data));
+      const source = data?.data || data;
+      const mid = source?.messageId || source?._id || source?.id;
+      const emoji = source?.emoji;
+      const uid = source?.userId || source?.user || source?.senderId;
+      if (mid && emoji && uid && isReactionDuplicate(mid, emoji, uid)) return;
+      applyServerReactions({ ...source, action: 'add' });
+    };
+    registerSocketHandler('message:reaction:add:response', onReactionAddResponse);
+
+    const onReactionRemoveResponse = (data) => {
+      console.log('[Reaction] remove:response received:', JSON.stringify(data));
+      const source = data?.data || data;
+      const mid = source?.messageId || source?._id || source?.id;
+      const emoji = source?.emoji;
+      const uid = source?.userId || source?.user || source?.senderId;
+      if (mid && emoji && uid && isReactionDuplicate(mid, emoji, uid)) return;
+      applyServerReactions({ ...source, action: 'remove' });
+    };
+    registerSocketHandler('message:reaction:remove:response', onReactionRemoveResponse);
 
     const onMessageDeleteEveryone = (data) => {
       console.log('🧪 [B:SOCKET:DELETE:RECV]', {
@@ -6764,13 +6917,21 @@ export default function useChatLogic({ navigation, route }) {
   // ─── MESSAGE REACTIONS ───
   // Helper: update reactions for a message directly in allMessages state (instant, no flicker)
   const updateReactionsInState = useCallback((msgId, newReactions) => {
+    if (!msgId) return;
+    const mid = String(msgId);
     setAllMessages(prev => {
       let changed = false;
       const updated = prev.map(m => {
-        const isMatch = m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId;
+        const isMatch =
+          String(m.id || '') === mid ||
+          String(m.serverMessageId || '') === mid ||
+          String(m.tempId || '') === mid;
         if (!isMatch) return m;
         changed = true;
-        return { ...m, reactions: Object.keys(newReactions).length > 0 ? newReactions : undefined };
+        const finalReactions = (newReactions && typeof newReactions === 'object' && Object.keys(newReactions).length > 0)
+          ? newReactions
+          : undefined;
+        return { ...m, reactions: finalReactions };
       });
       return changed ? updated : prev;
     });
@@ -6825,27 +6986,40 @@ export default function useChatLogic({ navigation, route }) {
     const socket = socketRef.current || getSocket();
     if (socket && isSocketConnected()) {
       if (isGrpReact) {
-        socket.emit('group:message:reaction', {
+        // Group chat — fire-and-forget (group system handles its own broadcast)
+        const reactionPayload = {
           groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
+          chatId: chatIdRef.current,
           messageId: msgId,
           emoji,
           action,
-        });
-      } else if (action === 'add') {
-        socket.emit('message:reaction:add', {
-          messageId: msgId,
-          chatId: chatIdRef.current,
-          emoji,
-          ...(skinTone ? { skinTone } : {}),
-        });
+          userId: uid,
+        };
+        socket.emit('group:message:reaction', reactionPayload);
       } else {
-        socket.emit('message:reaction:remove', {
+        // 1-on-1 chat — emit with ack callback to capture server response
+        const event = action === 'add' ? 'message:reaction:add' : 'message:reaction:remove';
+        const reactionPayload = {
           messageId: msgId,
           chatId: chatIdRef.current,
           emoji,
+          userId: uid,
+          ...(action === 'add' && skinTone ? { skinTone } : {}),
+        };
+        console.log(`[Reaction] emit ${event}:`, reactionPayload);
+        socket.emit(event, reactionPayload, (ack) => {
+          console.log(`[Reaction] ${event} ack:`, JSON.stringify(ack));
+          if (!ack) return;
+          const source = ack?.data || ack;
+          // If server returns authoritative reactions map, apply it
+          if (source?.reactions && typeof source.reactions === 'object') {
+            updateReactionsInState(msgId, source.reactions);
+            ChatDatabase.updateReactions(msgId, source.reactions).catch(() => {});
+          }
         });
       }
     }
+
   }, [chatData, updateReactionsInState]);
 
   const removeReaction = useCallback((msgId, emoji) => {
@@ -6890,15 +7064,28 @@ export default function useChatLogic({ navigation, route }) {
       if (isGrpReact) {
         socket.emit('group:message:reaction', {
           groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
-          messageId: msgId,
-          emoji,
-          action: 'remove',
-        });
-      } else {
-        socket.emit('message:reaction:remove', {
           chatId: chatIdRef.current,
           messageId: msgId,
           emoji,
+          action: 'remove',
+          userId: uid,
+        });
+      } else {
+        const reactionPayload = {
+          chatId: chatIdRef.current,
+          messageId: msgId,
+          emoji,
+          userId: uid,
+        };
+        console.log('[Reaction] emit message:reaction:remove:', reactionPayload);
+        socket.emit('message:reaction:remove', reactionPayload, (ack) => {
+          console.log('[Reaction] message:reaction:remove ack:', JSON.stringify(ack));
+          if (!ack) return;
+          const source = ack?.data || ack;
+          if (source?.reactions && typeof source.reactions === 'object') {
+            updateReactionsInState(msgId, source.reactions);
+            ChatDatabase.updateReactions(msgId, source.reactions).catch(() => {});
+          }
         });
       }
     }
@@ -6908,11 +7095,47 @@ export default function useChatLogic({ navigation, route }) {
     return new Promise((resolve, reject) => {
       const socket = socketRef.current || getSocket();
       if (!socket || !isSocketConnected()) return reject(new Error('Socket not connected'));
-      const timeout = setTimeout(() => reject(new Error('Timeout')), 10000);
-      socket.emit('message:reaction:list', { messageId: msgId }, (ack) => {
+      let finished = false;
+      const timeout = setTimeout(() => {
+        if (finished) return;
+        finished = true;
+        socket.off('message:reaction:list:response', onResponse);
+        reject(new Error('Timeout'));
+      }, 10000);
+
+      const onResponse = (data) => {
+        if (finished) return;
+        const source = data?.data || data;
+        // Only handle response for our message
+        if (source?.messageId && String(source.messageId) !== String(msgId)) return;
+        finished = true;
         clearTimeout(timeout);
+        socket.off('message:reaction:list:response', onResponse);
+        console.log('[Reaction] list:response received:', JSON.stringify(data));
+
+        if (data?.status === false) return reject(new Error(source?.message || 'Failed'));
+
+        // Apply the full reactions map to state if available
+        if (source?.reactions && typeof source.reactions === 'object') {
+          applyReactionUpdate(msgId, () => source.reactions);
+        }
+        resolve(source);
+      };
+
+      socket.on('message:reaction:list:response', onResponse);
+      console.log('[Reaction] emit message:reaction:list:', { messageId: msgId });
+      socket.emit('message:reaction:list', { messageId: msgId }, (ack) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        socket.off('message:reaction:list:response', onResponse);
+        console.log('[Reaction] list ack received:', JSON.stringify(ack));
         const res = ack?.data || ack;
         if (ack?.status === false) return reject(new Error(res?.message || 'Failed'));
+
+        if (res?.reactions && typeof res.reactions === 'object') {
+          applyReactionUpdate(msgId, () => res.reactions);
+        }
         resolve(res);
       });
     });

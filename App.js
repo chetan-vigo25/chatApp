@@ -11,6 +11,7 @@ import { Provider as PaperProvider } from 'react-native-paper';
 import { NetworkProvider, useNetwork } from './src/contexts/NetworkContext';
 import { DeviceLocationProvider } from './src/contexts/DeviceLoc';
 import { ImageProvider } from './src/contexts/ImageProvider';
+import { AuthProvider } from './src/contexts/AuthContext';
 import { PresenceProvider } from './src/presence/store/PresenceContext';
 import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
@@ -53,6 +54,7 @@ export default function App() {
       <NetworkProvider>
        <PaperProvider>
          <DeviceInfoProvider>
+         <AuthProvider>
            <ContactProvider>
             <ImageProvider>
              <DeviceLocationProvider>
@@ -64,6 +66,7 @@ export default function App() {
               </DeviceLocationProvider>
             </ImageProvider>
            </ContactProvider>
+         </AuthProvider>
          </DeviceInfoProvider>
        </PaperProvider>
       </NetworkProvider>
