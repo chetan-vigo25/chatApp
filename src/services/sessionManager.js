@@ -5,6 +5,7 @@ import store from '../Redux/Store';
 import { resetAppState } from '../Redux/RootReducers';
 import { resetToLogin } from '../Redux/Services/navigationService';
 import { emitSessionReset, emitUserChanged } from './sessionEvents';
+import ChatDatabase from './ChatDatabase';
 
 export const AUTH_KEYS = {
   accessToken: 'accessToken',
@@ -193,6 +194,13 @@ export const performSessionReset = async ({
   clearAllStorage = true,
 } = {}) => {
   await clearAllSessionData({ clearAllStorage });
+
+  // Clear SQLite database (messages, chats, sync_meta)
+  try {
+    await ChatDatabase.clearSyncData();
+    await ChatDatabase.closeDB();
+  } catch {}
+
   resetRuntimeState();
 
   if (resetNavigation) {

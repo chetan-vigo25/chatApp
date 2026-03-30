@@ -159,7 +159,7 @@ export const authServices = {
     generateOtp,
     verifyOtpService,
     resendOtpService,
-    emailLoginService,
     activeSession,
     deactiveSession,
+    emailLoginService,
 };

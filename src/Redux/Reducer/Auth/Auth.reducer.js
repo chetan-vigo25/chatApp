@@ -42,18 +42,6 @@ export const resendOtp = createAsyncThunk(
   }
 );
 
-export const emailLogin = createAsyncThunk(
-  'auth/emailLogin',
-  async (payload, { rejectWithValue }) => {
-    try {
-      const response = await authServices.emailLoginService(payload);
-      return response;
-    } catch (error) {
-      return rejectWithValue(error.message || error);
-    }
-  }
-);
-
 export const linkedDevice = createAsyncThunk(
   'auth/activeSession',
   async (_, { rejectWithValue }) => {
@@ -66,6 +54,19 @@ export const linkedDevice = createAsyncThunk(
     }
   }
 );
+
+export const emailLogin = createAsyncThunk(
+  'auth/emailLogin',
+  async (payload, { rejectWithValue }) => {
+    try {
+      const response = await authServices.emailLoginService(payload);
+      return response;
+    } catch (error) {
+      return rejectWithValue(error.message || error);
+    }
+  }
+);
+
 
 export const removeDevice = createAsyncThunk(
   'auth/deactiveSession',

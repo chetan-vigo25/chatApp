@@ -9,9 +9,7 @@ import {
   Animated,
   TextInput,
   Image,
-  LayoutAnimation,
   Platform,
-  UIManager,
   Alert,
   StyleSheet,
   Dimensions,
@@ -104,11 +102,7 @@ export default function ChatList({ navigation }) {
     ? realtimeArchivedChatList
     : (Array.isArray(chatsData) ? chatsData.filter((chat) => Boolean(chat?.isArchived)) : []);
 
-  useEffect(() => {
-    if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
-      UIManager.setLayoutAnimationEnabledExperimental(true);
-    }
-  }, []);
+  // LayoutAnimation disabled — causes frame drops on low-end Android devices
 
   useEffect(() => {
     if (effectiveChatList.length > 0) {
@@ -133,14 +127,7 @@ export default function ChatList({ navigation }) {
     }
   }, [searchQuery, effectiveChatList]);
 
-  const listOrderSignature = useMemo(
-    () => (filteredChats || []).map((item) => item?.chatId || item?._id).filter(Boolean).join('|'),
-    [filteredChats]
-  );
-
-  useEffect(() => {
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-  }, [listOrderSignature]);
+  // listOrderSignature + LayoutAnimation removed — causes jank on low-end devices
 
   useEffect(() => {
     const id = setInterval(() => setTimeTick((prev) => prev + 1), 30000);
@@ -150,17 +137,26 @@ export default function ChatList({ navigation }) {
   useEffect(() => {
     Animated.timing(fadeAnim, {
       toValue: 1,
-      duration: 350,
+      duration: 120,
       useNativeDriver: true,
     }).start();
   }, [fadeAnim]);
 
+  // Initial sync: only call API if SQLite has no chatlist data (first login)
+  // After first sync, chatlist is driven entirely by SQLite + socket updates
+  const initialSyncDone = useRef(false);
   useFocusEffect(
     useCallback(() => {
-      dispatch(chatListData(''));
-    }, [dispatch])
+      if (initialSyncDone.current) return;
+      initialSyncDone.current = true;
+      // Only fetch from API if realtime chatlist is empty (no SQLite data loaded yet)
+      if (!realtimeChatList || realtimeChatList.length === 0) {
+        dispatch(chatListData(''));
+      }
+    }, [dispatch, realtimeChatList])
   );
 
+  // Pull-to-refresh: the ONLY time API is called after initial sync
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
@@ -250,15 +246,14 @@ export default function ChatList({ navigation }) {
     sheetSlideAnim.setValue(300);
     sheetBgAnim.setValue(0);
     Animated.parallel([
-      Animated.spring(sheetSlideAnim, {
+      Animated.timing(sheetSlideAnim, {
         toValue: 0,
-        tension: 65,
-        friction: 11,
+        duration: 150,
         useNativeDriver: true,
       }),
       Animated.timing(sheetBgAnim, {
         toValue: 1,
-        duration: 250,
+        duration: 150,
         useNativeDriver: true,
       }),
     ]).start();
@@ -268,12 +263,12 @@ export default function ChatList({ navigation }) {
     Animated.parallel([
       Animated.timing(sheetSlideAnim, {
         toValue: 300,
-        duration: 200,
+        duration: 120,
         useNativeDriver: true,
       }),
       Animated.timing(sheetBgAnim, {
         toValue: 0,
-        duration: 200,
+        duration: 120,
         useNativeDriver: true,
       }),
     ]).start(() => {
@@ -329,7 +324,7 @@ export default function ChatList({ navigation }) {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
     const ct = selectedChatItem?.chatType || 'private';
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+
     if (selectedChatItem?.isPinned) unpinChat(chatId, ct);
     else pinChat(chatId, ct);
     closeActionMenu();
@@ -359,7 +354,7 @@ export default function ChatList({ navigation }) {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
     const ct = selectedChatItem?.chatType || 'private';
-    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+
     if (selectedChatItem?.isArchived) unarchiveChat(chatId, ct);
     else archiveChat(chatId, ct);
     closeActionMenu();
@@ -620,6 +615,12 @@ export default function ChatList({ navigation }) {
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
+            <Menu.Item
+              onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
+              title="Linked Devices"
+              titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
+              leadingIcon={() => <Ionicons name="qr-code-outline" size={18} color={theme.colors.placeHolderTextColor} />}
+            />
           </Menu>
         </View>
       </View>
@@ -675,16 +676,12 @@ export default function ChatList({ navigation }) {
             ListEmptyComponent={renderEmptyComponent}
             style={{ width: '100%' }}
             contentContainerStyle={styles.listContent}
-            removeClippedSubviews
-            windowSize={8}
-            initialNumToRender={12}
-            maxToRenderPerBatch={12}
-            updateCellsBatchingPeriod={40}
-            ItemSeparatorComponent={() => (
-              <View style={{ marginLeft: 82, marginRight: 16 }}>
-                <View style={{ height: StyleSheet.hairlineWidth, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)' }} />
-              </View>
-            )}
+            removeClippedSubviews={Platform.OS === 'android'}
+            windowSize={7}
+            initialNumToRender={10}
+            maxToRenderPerBatch={8}
+            updateCellsBatchingPeriod={50}
+            getItemLayout={(_, index) => ({ length: 76, offset: 76 * index, index })}
           />
         )}
       </View>
@@ -876,7 +873,7 @@ export default function ChatList({ navigation }) {
                 <Text style={styles.profileNameText} numberOfLines={1}>{previewName}</Text>
               </View>
 
-              {/* Action buttons */}
+              {/* Action buttons — top right corner */}
               <View style={styles.profileActions}>
                 <TouchableOpacity
                   onPress={() => {
@@ -886,7 +883,7 @@ export default function ChatList({ navigation }) {
                   activeOpacity={0.8}
                   style={styles.profileActionBtn}
                 >
-                  <MaterialCommunityIcons name="message-reply-text-outline" size={22} color="#fff" />
+                  <MaterialCommunityIcons name="message-reply-text-outline" size={20} color="#fff" />
                 </TouchableOpacity>
                 <TouchableOpacity
                   onPress={() => {
@@ -905,7 +902,7 @@ export default function ChatList({ navigation }) {
                   activeOpacity={0.8}
                   style={styles.profileActionBtn}
                 >
-                  <Ionicons name="information-circle-outline" size={22} color="#fff" />
+                  <Ionicons name="information-circle-outline" size={20} color="#fff" />
                 </TouchableOpacity>
               </View>
             </View>
@@ -1405,16 +1402,16 @@ const styles = StyleSheet.create({
   },
   profileActions: {
     position: 'absolute',
-    bottom: 52,
-    right: 10,
+    top: 8,
+    right: 8,
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
   },
   profileActionBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(0,0,0,0.45)',
     alignItems: 'center',
     justifyContent: 'center',
   },

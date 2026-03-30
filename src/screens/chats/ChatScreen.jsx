@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   View,
@@ -83,24 +84,25 @@ const MEDIA_PANEL_OPTIONS = [
 const CHAT_WALLPAPER_TEXTURE = require('../../../assets/images/chat-background.jpg');
 
 const ChatWallpaperLayer = React.memo(function ChatWallpaperLayer({ isDarkMode }) {
+  // WhatsApp-style: no overlay — background color shows through, image as subtle doodle pattern
   return (
-    <View pointerEvents="none" style={wpStyles.container}>
+    <View pointerEvents="none" style={[wpStyles.container, {
+      backgroundColor: isDarkMode ? '#0B141A' : '#E4DDD6',
+    }]}>
       <Image
         source={CHAT_WALLPAPER_TEXTURE}
         resizeMode="cover"
-        style={wpStyles.image}
+        style={[wpStyles.image, {
+          opacity: isDarkMode ? 0.04 : 0.35,
+        }]}
       />
-      <View style={[wpStyles.overlay, {
-        backgroundColor: isDarkMode ? 'rgba(0,0,0,0.45)' : 'rgba(192, 192, 192, 0.15)',
-      }]} />
     </View>
   );
 });
 
 const wpStyles = StyleSheet.create({
-  container: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: '#0B141A' },
+  container: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 },
   image: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, width: '100%', height: '100%' },
-  overlay: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 },
 });
 
 const EMOJI_SECTIONS = {
@@ -148,7 +150,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   useEffect(() => {
     Animated.timing(sendAnim, {
       toValue: hasContent ? 1 : 0,
-      duration: 170,
+      duration: 100,
       useNativeDriver: true,
     }).start();
   }, [sendAnim, hasContent]);
@@ -156,7 +158,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   useEffect(() => {
     Animated.timing(attachAnim, {
       toValue: showAttachment ? 1 : 0,
-      duration: 180,
+      duration: 100,
       useNativeDriver: false,
     }).start();
   }, [attachAnim, showAttachment]);
@@ -164,7 +166,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   useEffect(() => {
     Animated.timing(inputAnimHeight, {
       toValue: Math.max(36, Number(inputHeight || 36)),
-      duration: 180,
+      duration: 80,
       useNativeDriver: false,
     }).start();
   }, [inputAnimHeight, inputHeight]);
@@ -172,7 +174,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   const handlePressInSubmit = () => {
     Animated.timing(submitScale, {
       toValue: 0.94,
-      duration: 120,
+      duration: 60,
       useNativeDriver: true,
     }).start();
   };
@@ -180,7 +182,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   const handlePressOutSubmit = () => {
     Animated.timing(submitScale, {
       toValue: 1,
-      duration: 120,
+      duration: 60,
       useNativeDriver: true,
     }).start();
   };
@@ -416,10 +418,10 @@ const SwipeReplyRow = React.memo(function SwipeReplyRow({ isMyMessage, disabled,
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
         onReply();
       }
-      Animated.spring(translateX, { toValue: 0, useNativeDriver: true, friction: 8 }).start();
+      Animated.timing(translateX, { toValue: 0, duration: 120, useNativeDriver: true }).start();
     },
     onPanResponderTerminate: () => {
-      Animated.spring(translateX, { toValue: 0, useNativeDriver: true, friction: 8 }).start();
+      Animated.timing(translateX, { toValue: 0, duration: 120, useNativeDriver: true }).start();
     },
   })).current;
 
@@ -620,7 +622,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
   const displayPhone = countryCode ? `${countryCode} ${phone}` : phone;
   const fullPhone = countryCode ? `${countryCode}${phone}` : phone;
 
-  const bgColor = isDarkMode ? '#0f1b27' : '#f5f5f5';
+  const bgColor = isDarkMode ? '#0b141a' : '#f5f5f5';
   const cardBg = isDarkMode ? '#1a2b3c' : '#fff';
   const textColor = isDarkMode ? '#EDF6FC' : '#111';
   const subColor = isDarkMode ? 'rgba(200,216,228,0.6)' : '#666';
@@ -754,6 +756,8 @@ export default function ChatScreen({ navigation, route }) {
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
   const [reportPayload, setReportPayload] = useState({});
+  const [replyHighlightId, setReplyHighlightId] = useState(null);
+  const replyHighlightTimer = useRef(null);
   const [reportAnalytics, setReportAnalytics] = useState({
     report_opened: () => {/* analytics event */},
     report_submitted: () => {/* analytics event */},
@@ -2479,16 +2483,14 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
       Animated.parallel([
-        Animated.spring(mediaSheetAnim, {
+        Animated.timing(mediaSheetAnim, {
           toValue: 0,
-          damping: 18,
-          stiffness: 220,
-          mass: 0.9,
+          duration: 150,
           useNativeDriver: true,
         }),
         Animated.timing(mediaBackdropAnim, {
           toValue: 1,
-          duration: 140,
+          duration: 120,
           useNativeDriver: true,
         }),
       ]).start();
@@ -3219,6 +3221,11 @@ export default function ChatScreen({ navigation, route }) {
       ? (msg.localUri || resolveCachedThumbnailUrl(msg) || msg.mediaUrl)
       : (downloadedUri || resolveCachedThumbnailUrl(msg));
     const shouldRenderThumbnail = Boolean(imageSource);
+    const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
+    // Blur: full (20) before download, reduces progressively during download, 0 when done
+    const blurAmount = (!isMyMessage && !downloaded && shouldRenderThumbnail)
+      ? (isDownloading ? Math.round(20 * (1 - Math.min(1, progress))) : 20)
+      : 0;
 
     const animationStyle = getMediaAnimationStyle(messageKey, !isMyMessage && shouldRenderThumbnail);
 
@@ -3263,7 +3270,12 @@ export default function ChatScreen({ navigation, route }) {
       >
         <Animated.View style={animationStyle}>
           {shouldRenderThumbnail ? (
-            <Image source={{ uri: imageSource }} style={imageStyle} resizeMode="cover" />
+            <Image
+              source={{ uri: imageSource }}
+              style={imageStyle}
+              resizeMode="cover"
+              blurRadius={blurAmount}
+            />
           ) : (
             <View style={[imageStyle, { backgroundColor: theme.colors.menuBackground, alignItems: 'center', justifyContent: 'center' }]}>
               <Ionicons name="image-outline" size={30} color={theme.colors.placeHolderTextColor} />
@@ -3292,6 +3304,10 @@ export default function ChatScreen({ navigation, route }) {
     const sendingProgress = resolveUploadProgress(msg);
     const thumbnailSource = resolveCachedThumbnailUrl(msg);
     const shouldRenderThumbnail = Boolean(thumbnailSource || downloaded);
+    const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
+    const videoBlurAmount = (!isMyMessage && !downloaded && Boolean(thumbnailSource))
+      ? (isDownloading ? Math.round(20 * (1 - Math.min(1, progress))) : 20)
+      : 0;
     const animationStyle = getMediaAnimationStyle(`${messageKey}_video`, !isMyMessage && shouldRenderThumbnail);
 
     return (
@@ -3318,7 +3334,12 @@ export default function ChatScreen({ navigation, route }) {
       >
         <Animated.View style={animationStyle}>
           {thumbnailSource && shouldRenderThumbnail ? (
-            <Image source={{ uri: thumbnailSource }} style={videoStyle} resizeMode="cover" />
+            <Image
+              source={{ uri: thumbnailSource }}
+              style={videoStyle}
+              resizeMode="cover"
+              blurRadius={videoBlurAmount}
+            />
           ) : (
             <View style={[videoStyle, { alignItems: 'center', justifyContent: 'center', backgroundColor: theme.colors.menuBackground }]}>
               <Ionicons name="videocam-outline" size={34} color={theme.colors.placeHolderTextColor} />
@@ -3721,7 +3742,9 @@ export default function ChatScreen({ navigation, route }) {
       ? msg.senderType === 'self'
       : sameId(msg.senderId, currentUserId);
     const highlightedId = searchResults[currentSearchIndex]?.serverMessageId || searchResults[currentSearchIndex]?.id || searchResults[currentSearchIndex]?.tempId;
-    const isHighlighted = isSearching && searchResults.length > 0 && currentSearchIndex >= 0 && sameId(highlightedId, messageKey);
+    const isSearchHighlighted = isSearching && searchResults.length > 0 && currentSearchIndex >= 0 && sameId(highlightedId, messageKey);
+    const isReplyHighlighted = replyHighlightId && sameId(replyHighlightId, messageKey);
+    const isHighlighted = isSearchHighlighted || isReplyHighlighted;
     
     const progress = resolveMediaProgress(msg);
     const downloadState = resolveMediaState(msg);
@@ -3921,6 +3944,17 @@ export default function ChatScreen({ navigation, route }) {
                     try {
                       flatListRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0.5 });
                     } catch {}
+                    // Highlight the target message for 3 seconds
+                    const targetMsg = messages[idx];
+                    const targetKey = targetMsg?.serverMessageId || targetMsg?.id || targetMsg?.tempId;
+                    if (targetKey) {
+                      if (replyHighlightTimer.current) clearTimeout(replyHighlightTimer.current);
+                      setReplyHighlightId(targetKey);
+                      replyHighlightTimer.current = setTimeout(() => {
+                        setReplyHighlightId(null);
+                        replyHighlightTimer.current = null;
+                      }, 3000);
+                    }
                   }
                 }}
               />
@@ -3933,14 +3967,17 @@ export default function ChatScreen({ navigation, route }) {
             
             {/* DELETED MESSAGES */}
             {isDeletedMessage && (
-              <Text style={{ 
-                fontSize: 13, 
-                color: theme.colors.placeHolderTextColor,
-                fontFamily: "Roboto-Regular", 
-                fontStyle: 'italic',
-              }}>
-                {deletedText}
-              </Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                <Ionicons name="ban-outline" size={14} color={theme.colors.placeHolderTextColor} />
+                <Text style={{
+                  fontSize: 13,
+                  color: theme.colors.placeHolderTextColor,
+                  fontFamily: "Roboto-Regular",
+                  fontStyle: 'italic',
+                }}>
+                  {deletedText}
+                </Text>
+              </View>
             )}
   
             {/* MEDIA MESSAGES */}
@@ -4056,7 +4093,7 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -4214,8 +4251,8 @@ export default function ChatScreen({ navigation, route }) {
     : 'Only admins can send messages';
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
-      <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+    <View style={{ flex: 1, backgroundColor: isDarkMode ? '#0b141a' : theme.colors.background }}>
+      <StatusBar backgroundColor={isDarkMode ? '#101D25' : theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
       <Animated.View style={{ flex: 1, paddingBottom: Platform.OS === 'android' ? keyboardAnim : 0 }}>
         <ChatWallpaperLayer isDarkMode={isDarkMode} />
         
@@ -4513,10 +4550,10 @@ export default function ChatScreen({ navigation, route }) {
             onViewableItemsChanged={onViewableItemsChanged}
             viewabilityConfig={viewabilityConfig}
 
-            removeClippedSubviews={Platform.OS !== 'web'}
-            maxToRenderPerBatch={20}
-            updateCellsBatchingPeriod={100}
-            windowSize={17}
+            removeClippedSubviews={Platform.OS === 'android'}
+            maxToRenderPerBatch={10}
+            updateCellsBatchingPeriod={50}
+            windowSize={11}
             ListFooterComponent={!isSearching ? renderFooter : null}
             ListEmptyComponent={!isSearching ? renderChatEmptyState : null}
             maintainVisibleContentPosition={{
@@ -4524,7 +4561,14 @@ export default function ChatScreen({ navigation, route }) {
               autoscrollToTopThreshold: 5,
             }}
             onScrollToIndexFailed={(info) => {
-              console.warn("Scroll to index failed:", info);
+              // Scroll to approximate offset, then retry scrollToIndex after layout
+              const offset = info.averageItemLength * info.index;
+              flatListRef.current?.scrollToOffset({ offset, animated: true });
+              setTimeout(() => {
+                try {
+                  flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 });
+                } catch {}
+              }, 300);
             }}
           />
         )}

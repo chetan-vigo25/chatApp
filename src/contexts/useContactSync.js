@@ -356,6 +356,14 @@ export const useContactSync = () => {
         await ContactDatabase.removeContacts(parsed.changes.removed);
       }
 
+      // Remove stale contacts no longer on device / SIM
+      const currentDeviceHashes = new Set(hashed.map((c) => c.hash).filter(Boolean));
+      if (currentDeviceHashes.size > 0) {
+        await ContactDatabase.removeStaleContacts(currentDeviceHashes).catch((err) =>
+          console.warn('[useContactSync] removeStaleContacts error:', err?.message)
+        );
+      }
+
       // Save sync metadata
       const refreshedAt = clampNumber(parsed.refreshedAt, Date.now());
       const expiresMs = parseExpiresInToMs(parsed.expiresIn);

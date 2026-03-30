@@ -29,12 +29,10 @@ export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode,
   const activeIndex = TABS.findIndex((t) => t.key === activeTab);
 
   useEffect(() => {
-    // Slide indicator
-    Animated.spring(indicatorAnim, {
+    // Slide indicator — fast timing instead of heavy spring
+    Animated.timing(indicatorAnim, {
       toValue: activeIndex * TAB_WIDTH,
-      damping: 18,
-      stiffness: 200,
-      mass: 0.8,
+      duration: 150,
       useNativeDriver: true,
     }).start();
 
@@ -42,24 +40,23 @@ export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode,
     TABS.forEach((_, i) => {
       Animated.timing(iconColorAnims[i], {
         toValue: i === activeIndex ? 1 : 0,
-        duration: 200,
+        duration: 120,
         useNativeDriver: false,
       }).start();
     });
   }, [activeIndex]);
 
   const handlePress = (tab, index) => {
-    // Scale bounce animation
+    // Quick scale tap feedback
     Animated.sequence([
       Animated.timing(scaleAnims[index], {
-        toValue: 0.85,
-        duration: 80,
+        toValue: 0.9,
+        duration: 50,
         useNativeDriver: true,
       }),
-      Animated.spring(scaleAnims[index], {
+      Animated.timing(scaleAnims[index], {
         toValue: 1,
-        damping: 12,
-        stiffness: 300,
+        duration: 80,
         useNativeDriver: true,
       }),
     ]).start();

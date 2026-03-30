@@ -12,7 +12,9 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Audio } from 'expo-av';
 import { useTheme } from '../contexts/ThemeContext';
+import { useRealtimeChat } from '../contexts/RealtimeChatContext';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import {
   getActiveChatFromRoute,
@@ -21,6 +23,9 @@ import {
   subscribeNavigationSnapshot,
 } from '../Redux/Services/navigationService';
 import { subscribeSessionReset } from '../services/sessionEvents';
+
+// Preload the notification sound once at module level
+const MESSAGE_SOUND = require('../../assets/sounds/message-sound-01.mp3');
 
 let OptionalBlurView = null;
 try {
@@ -60,7 +65,10 @@ const formatClock = (timestamp) => {
 const buildBannerModel = (payload = {}) => {
   const notification = payload?.notificationData?.notification || {};
   const data = payload?.notificationData?.data || {};
-  const avtar = data?.profileImage || payload?.profileImage || null
+  const avtar = data?.profileImage || payload?.profileImage || null;
+
+  const isGroup = String(data?.isGroup || payload?.isGroup || data?.chatType === 'group' || payload?.chatType === 'group' || 'false').toLowerCase() === 'true'
+    || data?.chatType === 'group' || payload?.chatType === 'group';
 
   const senderName =
     data?.senderName ||
@@ -68,18 +76,35 @@ const buildBannerModel = (payload = {}) => {
     payload?.senderName ||
     'New Message';
 
+  // For group chats: extract group metadata
+  const groupId = normalizeId(data?.groupId || payload?.groupId);
+  const groupName = data?.groupName || payload?.groupName || data?.chatName || payload?.chatName || notification?.title || '';
+  const groupAvatar = data?.groupAvatar || payload?.groupAvatar || data?.chatAvatar || payload?.chatAvatar || null;
+
+  // For group banners: title = group name, body = "SenderName: message"
+  const title = isGroup
+    ? (groupName || notification?.title || senderName)
+    : (notification?.title || senderName);
+  const body = isGroup
+    ? (notification?.body || (senderName !== 'New Message' ? `${senderName}: ${data?.text || payload?.text || ''}` : (data?.text || payload?.text || '')))
+    : (notification?.body || '');
+
   return {
     id: String(payload?.notificationId || payload?.messageId || `${payload?.chatId || 'chat'}_${payload?.timestamp || Date.now()}`),
     notificationId: payload?.notificationId || null,
     messageId: payload?.messageId || null,
-    chatId: normalizeId(payload?.chatId),
+    chatId: normalizeId(payload?.chatId) || groupId,
+    groupId,
     senderId: normalizeId(payload?.senderId),
     senderName,
-    title: notification?.title || senderName,
-    body: notification?.body || '',
-    avatarUrl: avtar,
-    timestamp: Number(payload?.timestamp || Date.now()),
-    isGroup: String(data?.isGroup || 'false').toLowerCase() === 'true',
+    groupName,
+    groupAvatar,
+    title,
+    body,
+    avatarUrl: isGroup ? (groupAvatar || avtar) : avtar,
+    timestamp: Number(payload?.timestamp || payload?.sentAt || Date.now()),
+    isGroup,
+    chatType: isGroup ? 'group' : 'private',
     metadata: payload?.metadata || {},
     raw: payload,
   };
@@ -87,6 +112,7 @@ const buildBannerModel = (payload = {}) => {
 
 export default function WhatsAppBannerHost() {
   const { theme } = useTheme();
+  const { state: realtimeState } = useRealtimeChat();
   const insets = useSafeAreaInsets();
   const [banner, setBanner] = useState(null);
   const [screenWidth, setScreenWidth] = useState(Dimensions.get('window').width);
@@ -100,6 +126,50 @@ export default function WhatsAppBannerHost() {
   const listenerSocketRef = useRef(null);
   const seenRef = useRef(new Set());
   const appStateRef = useRef(AppState.currentState);
+
+  // Keep a ref to realtime state so socket handlers can read latest chatMap/currentUserId
+  const realtimeStateRef = useRef(realtimeState);
+  realtimeStateRef.current = realtimeState;
+
+  // Notification sound — preload once, reuse on every banner
+  const soundRef = useRef(null);
+
+  const playNotificationSound = useCallback(async () => {
+    try {
+      // Unload previous instance to avoid memory leak
+      if (soundRef.current) {
+        try { await soundRef.current.unloadAsync(); } catch {}
+        soundRef.current = null;
+      }
+      await Audio.setAudioModeAsync({
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        staysActiveInBackground: false,
+      });
+      const { sound } = await Audio.Sound.createAsync(MESSAGE_SOUND, {
+        shouldPlay: true,
+        volume: 1.0,
+      });
+      soundRef.current = sound;
+      // Auto-unload when playback finishes
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.didJustFinish) {
+          sound.unloadAsync().catch(() => {});
+          if (soundRef.current === sound) soundRef.current = null;
+        }
+      });
+    } catch {}
+  }, []);
+
+  // Cleanup sound on unmount
+  useEffect(() => {
+    return () => {
+      if (soundRef.current) {
+        soundRef.current.unloadAsync().catch(() => {});
+        soundRef.current = null;
+      }
+    };
+  }, []);
 
   const clearAutoDismiss = useCallback(() => {
     if (autoDismissRef.current) {
@@ -135,6 +205,11 @@ export default function WhatsAppBannerHost() {
     }
 
     if (active.chatId && item.chatId && active.chatId === item.chatId) {
+      return true;
+    }
+
+    // For group chats, also check if active chat matches the groupId
+    if (active.chatId && item.groupId && active.chatId === item.groupId) {
       return true;
     }
 
@@ -210,6 +285,9 @@ export default function WhatsAppBannerHost() {
       return;
     }
 
+    // Play notification sound for every new banner
+    playNotificationSound();
+
     if (currentRef.current?.chatId && currentRef.current.chatId === item.chatId) {
       currentRef.current = item;
       setBanner(item);
@@ -225,23 +303,44 @@ export default function WhatsAppBannerHost() {
     }
 
     showNext();
-  }, [shouldRespectDnd, shouldSuppressForActiveRoute, showNext, startAutoDismiss]);
+  }, [shouldRespectDnd, shouldSuppressForActiveRoute, showNext, startAutoDismiss, playNotificationSound]);
 
   const handleBannerPress = useCallback(() => {
     const current = currentRef.current;
-    console.log("current ================ ", current)
     if (!current) return;
 
     dismissCurrent('navigate', () => {
       if (!navigationRef.isReady()) return;
-      navigationRef.navigate('ChatScreen', {
-        chatId: current.chatId,
-        user: {
-          _id: current.senderId,
-          fullName: current.senderName,
-          profileImage: current.avatarUrl || null,
-        },
-      });
+
+      if (current.isGroup) {
+        // Navigate as group chat — pass item with group metadata so ChatScreen/useChatLogic recognizes it
+        navigationRef.navigate('ChatScreen', {
+          item: {
+            chatId: current.chatId,
+            _id: current.chatId,
+            chatType: 'group',
+            isGroup: true,
+            groupId: current.groupId || current.chatId,
+            chatName: current.groupName || current.title || 'Group',
+            chatAvatar: current.groupAvatar || null,
+            group: {
+              _id: current.groupId || current.chatId,
+              name: current.groupName || current.title || 'Group',
+              avatar: current.groupAvatar || null,
+            },
+          },
+        });
+      } else {
+        // Navigate as 1-on-1 chat
+        navigationRef.navigate('ChatScreen', {
+          chatId: current.chatId,
+          user: {
+            _id: current.senderId,
+            fullName: current.senderName,
+            profileImage: current.avatarUrl || null,
+          },
+        });
+      }
     });
   }, [dismissCurrent]);
 
@@ -330,6 +429,74 @@ export default function WhatsAppBannerHost() {
       enqueueBanner(payload);
     };
 
+    // Handler for group:message:received / group:message:new — look up names from chatMap
+    const groupMessageHandler = (payload) => {
+      const data = payload?.data || payload;
+      const groupId = data?.groupId;
+      if (!groupId) return;
+
+      // Skip own messages
+      const currentUserId = realtimeStateRef.current?.currentUserId;
+      if (currentUserId && data?.senderId && String(data.senderId) === String(currentUserId)) return;
+
+      // Look up group name and sender name from chatMap
+      const chatMap = realtimeStateRef.current?.chatMap || {};
+      const groupEntry = chatMap[groupId] || chatMap[data?.chatId] || {};
+      const groupName = groupEntry?.chatName || groupEntry?.group?.name || groupEntry?.groupName || data?.groupName || '';
+      const groupAvatar = groupEntry?.chatAvatar || groupEntry?.group?.avatar || groupEntry?.groupAvatar || data?.groupAvatar || null;
+
+      // Look up sender name from group members/participants
+      let senderName = data?.senderName || '';
+      if (!senderName && data?.senderId) {
+        const members = Array.isArray(groupEntry?.members) ? groupEntry.members : (Array.isArray(groupEntry?.participants) ? groupEntry.participants : []);
+        const member = members.find((m) => {
+          const mId = normalizeId(m?.userId || m?._id || m?.id);
+          return mId && String(mId) === String(data.senderId);
+        });
+        senderName = member?.fullName || member?.username || member?.name || '';
+      }
+
+      // Build preview text based on message type
+      const messageType = data?.messageType || 'text';
+      let bodyText = data?.text || '';
+      if (messageType === 'image') bodyText = 'Photo';
+      else if (messageType === 'video') bodyText = 'Video';
+      else if (messageType === 'audio') bodyText = 'Audio';
+      else if (messageType === 'file') bodyText = 'Document';
+      else if (messageType === 'location') bodyText = 'Location';
+      else if (messageType === 'contact') bodyText = 'Contact';
+
+      const senderPrefix = senderName ? `${senderName}: ` : '';
+
+      enqueueBanner({
+        messageId: data?.messageId || data?._id,
+        chatId: data?.chatId || groupId,
+        groupId,
+        senderId: data?.senderId,
+        senderName: senderName || 'New Message',
+        chatType: 'group',
+        isGroup: true,
+        groupName,
+        groupAvatar,
+        text: bodyText,
+        timestamp: data?.timestamp || data?.sentAt || Date.now(),
+        notificationData: {
+          notification: {
+            title: groupName || 'Group',
+            body: `${senderPrefix}${bodyText}`,
+          },
+          data: {
+            ...data,
+            isGroup: 'true',
+            chatType: 'group',
+            senderName,
+            groupName,
+            groupAvatar,
+          },
+        },
+      });
+    };
+
     const attach = () => {
       const socket = getSocket();
       if (!socket || !isSocketConnected()) {
@@ -342,9 +509,13 @@ export default function WhatsAppBannerHost() {
 
       if (listenerSocketRef.current) {
         listenerSocketRef.current.off('notification:message:new', handler);
+        listenerSocketRef.current.off('group:message:received', groupMessageHandler);
+        listenerSocketRef.current.off('group:message:new', groupMessageHandler);
       }
 
       socket.on('notification:message:new', handler);
+      socket.on('group:message:received', groupMessageHandler);
+      socket.on('group:message:new', groupMessageHandler);
       listenerSocketRef.current = socket;
       return true;
     };
@@ -360,6 +531,8 @@ export default function WhatsAppBannerHost() {
       }
       if (listenerSocketRef.current) {
         listenerSocketRef.current.off('notification:message:new', handler);
+        listenerSocketRef.current.off('group:message:received', groupMessageHandler);
+        listenerSocketRef.current.off('group:message:new', groupMessageHandler);
         listenerSocketRef.current = null;
       }
     };
@@ -403,7 +576,7 @@ export default function WhatsAppBannerHost() {
         <View style={{ flex: 1, paddingRight: 10 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
             <Text numberOfLines={1} style={{ flexShrink: 1, color: theme.colors.primaryTextColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
-              {banner.senderName}
+              {banner.title || banner.senderName}
             </Text>
             {banner.isGroup ? (
               <View style={{ marginLeft: 6, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 8, backgroundColor: theme.colors.menuBackground }}>

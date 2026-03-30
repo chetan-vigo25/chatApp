@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, View, Text, Animated, Dimensions, AppState, Image } from 'react-native';
-import LottieView from 'lottie-react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { APP_TAG_NAME } from '@env';
 import { initSocket, getSocket, isSocketConnected, reconnectSocket } from '../Redux/Services/Socket/socket';
 import { useDeviceInfo } from '../contexts/DeviceInfoContext';
 import { bootstrapSession, getStoredSession } from '../services/sessionManager';
+import ChatDatabase from '../services/ChatDatabase';
  
 const { width } = Dimensions.get('window');
  
@@ -80,19 +80,31 @@ export default function Splash({ navigation }) {
             // Wait for animation to complete
             setTimeout(async () => {
                 if (isLoggedIn) {
-                    console.log('✅ User logged in - going to ChatList');
-                   
+                    console.log('✅ User logged in');
+
                     // Initialize socket if not already connected
                     if (!isSocketConnected() && deviceInfo) {
                         console.log('🔌 Initializing socket.....');
                         await initSocket(deviceInfo, navigation);
                     }
-                   
-                    // Navigate to ChatList with reset (clears history)
-                    navigation.reset({
-                        index: 0,
-                        routes: [{ name: 'ChatList' }],
-                    });
+
+                    // Check if initial sync is done — if not, route through SyncScreen
+                    const userId = sessionCheck?.session?.userInfo?._id || sessionCheck?.session?.userInfo?.id;
+                    const syncDone = userId ? await ChatDatabase.isInitialSyncDone(userId) : false;
+
+                    if (syncDone) {
+                        // Already synced — go straight to ChatList
+                        navigation.reset({
+                            index: 0,
+                            routes: [{ name: 'ChatList' }],
+                        });
+                    } else {
+                        // First time on this device — sync chats + messages from API
+                        navigation.reset({
+                            index: 0,
+                            routes: [{ name: 'SyncScreen', params: { navigateTarget: 'ChatList' } }],
+                        });
+                    }
                 } else {
                     console.log('📝 No user found - going to UserAgree');
                    

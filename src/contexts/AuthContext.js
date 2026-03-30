@@ -30,14 +30,16 @@ export const AuthProvider = ({ children }) => {
 
   const checkLoginStatus = async () => {
     try {
-      const [userData, accessToken, deviceId] = await Promise.all([
+      const [userData, userInfo, accessToken, deviceId] = await Promise.all([
         AsyncStorage.getItem('userData'),
+        AsyncStorage.getItem('userInfo'),
         AsyncStorage.getItem('accessToken'),
         AsyncStorage.getItem('deviceId'),
       ]);
 
-      if (userData && accessToken && deviceId) {
-        const parsedUser = JSON.parse(userData);
+      const rawUser = userInfo || userData;
+      if (rawUser && accessToken && deviceId) {
+        const parsedUser = JSON.parse(rawUser);
         setUser(parsedUser);
         setIsAuthenticated(true);
 
@@ -60,6 +62,7 @@ export const AuthProvider = ({ children }) => {
   const login = async (userData, tokens = {}) => {
     try {
       await AsyncStorage.setItem('userData', JSON.stringify(userData));
+      await AsyncStorage.setItem('userInfo', JSON.stringify(userData));
       if (tokens.accessToken) await AsyncStorage.setItem('accessToken', tokens.accessToken);
       if (tokens.refreshToken) await AsyncStorage.setItem('refreshToken', tokens.refreshToken);
       if (tokens.deviceId) await AsyncStorage.setItem('deviceId', tokens.deviceId);

@@ -5,7 +5,6 @@ import * as FileSystem from 'expo-file-system/legacy';
 import moment from "moment";
 import { useDispatch, useSelector } from "react-redux";
 import { chatMessage, chatListData, mediaUpload } from "../Redux/Reducer/Chat/Chat.reducer";
-import { viewGroup } from "../Redux/Reducer/Group/Group.reducer";
 import { getSocket, isSocketConnected, reconnectSocket } from "../Redux/Services/Socket/socket";
 import { useNetwork } from "../contexts/NetworkContext";
 import { useImage } from "../contexts/ImageProvider";
@@ -95,7 +94,7 @@ const computeSenderType = (senderId, currentUserId) => (
 );
 
 const buildDeletePlaceholderText = (isDeletedBySelf) => (
-  isDeletedBySelf ? '🗑 You deleted this message' : '🗑 This message was deleted'
+  isDeletedBySelf ? 'You deleted this message' : 'This message was deleted'
 );
 
 const generateClientMessageId = () => (
@@ -700,40 +699,41 @@ export default function useChatLogic({ navigation, route }) {
     scheduledMessagesRef.current = scheduledMessages;
   }, [scheduledMessages]);
 
-  // Build group members name lookup map from Redux currentGroup
+  // Build group members name lookup map from route item members or Redux currentGroup
   useEffect(() => {
-    if (!isGroupChat || !currentGroup?.members) return;
+    if (!isGroupChat) return;
+    const membersList = chatData.members || currentGroup?.members;
+    if (!membersList || !Array.isArray(membersList) || membersList.length === 0) return;
     const map = {};
-    (currentGroup.members || []).forEach((m) => {
+    membersList.forEach((m) => {
       const u = (typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
-      const id = u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id;
+      const id = u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id || m.id;
       if (id) {
         map[String(id)] = {
-          fullName: u.fullName || m.fullName || m.name || '',
+          fullName: u.fullName || m.fullName || m.name || m.username || '',
           profileImage: u.profileImage || m.profileImage || null,
           role: m.role || 'member',
         };
       }
     });
+    if (Object.keys(map).length === 0) return;
     groupMembersMapRef.current = map;
 
     // Patch existing messages with resolved sender names
-    if (Object.keys(map).length > 0) {
-      setAllMessages((prev) => {
-        let changed = false;
-        const patched = prev.map((msg) => {
-          if (msg.senderName || !msg.senderId) return msg;
-          const resolved = map[String(msg.senderId)]?.fullName;
-          if (resolved) {
-            changed = true;
-            return { ...msg, senderName: resolved };
-          }
-          return msg;
-        });
-        return changed ? patched : prev;
+    setAllMessages((prev) => {
+      let changed = false;
+      const patched = prev.map((msg) => {
+        if (msg.senderName || !msg.senderId) return msg;
+        const resolved = map[String(msg.senderId)]?.fullName;
+        if (resolved) {
+          changed = true;
+          return { ...msg, senderName: resolved };
+        }
+        return msg;
       });
-    }
-  }, [isGroupChat, currentGroup?.members]);
+      return changed ? patched : prev;
+    });
+  }, [isGroupChat, chatData.members, currentGroup?.members]);
 
   // Keyboard listeners
   useEffect(() => {
@@ -1184,10 +1184,21 @@ export default function useChatLogic({ navigation, route }) {
         setScheduledMessages([]);
       }
 
-      // Fetch group members for sender name resolution
-      if (isGrpInit) {
-        const grpId = chatData.groupId || chatData.group?._id || generatedChatId;
-        dispatch(viewGroup({ groupId: grpId }));
+      // Build group members map from route item data (no API call needed)
+      if (isGrpInit && Array.isArray(chatData.members) && chatData.members.length > 0) {
+        const map = {};
+        chatData.members.forEach((m) => {
+          const u = (typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
+          const id = u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id || m.id;
+          if (id) {
+            map[String(id)] = {
+              fullName: u.fullName || m.fullName || m.name || m.username || '',
+              profileImage: u.profileImage || m.profileImage || null,
+              role: m.role || 'member',
+            };
+          }
+        });
+        groupMembersMapRef.current = map;
       }
 
       await loadQueuedManualPresence();
@@ -1869,8 +1880,9 @@ export default function useChatLogic({ navigation, route }) {
         const cid = chatIdRef.current;
         if (!cid) return;
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
-        // loadMessagesWithReplies already handles dedup (SQL cleanup + JS fingerprint filter)
-        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, { limit: 500, afterTimestamp: clearedAt });
+        // skipCleanup on subsequent refreshes — cleanup only runs on initial load
+        const isSubsequent = initialLoadDoneRef.current;
+        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, { limit: 500, afterTimestamp: clearedAt, skipCleanup: isSubsequent });
 
         const currentUser = currentUserIdRef.current;
 
@@ -1914,21 +1926,50 @@ export default function useChatLogic({ navigation, route }) {
           }
         }
 
+        // Batch-load reply data for messages that have replyToMessageId but missing preview
+        const replyDataCache = {};
+        const replyMsgKeys = dbRegular
+          .filter(m => m.replyToMessageId && !m.replyPreviewText)
+          .map(m => m.serverMessageId || m.id || m.tempId)
+          .filter(Boolean);
+        if (replyMsgKeys.length > 0) {
+          for (const key of replyMsgKeys) {
+            try {
+              const rd = await ChatDatabase.getReplyData(key);
+              if (rd) replyDataCache[key] = rd;
+            } catch {}
+          }
+        }
+
         const enriched = dbRegular.map(msg => {
           let status = msg.status;
           if ((status === 'sending' || status === 'uploaded') && msg.serverMessageId && msg.synced) {
             status = 'sent';
           }
 
-          // Resolve missing replySenderName from available context
-          let replySenderName = msg.replySenderName;
-          if (msg.replyToMessageId && !replySenderName && msg.replySenderId) {
-            if (sameId(msg.replySenderId, currentUser)) {
-              replySenderName = currentUserNameRef.current || 'You';
-            } else if (chatData?.peerUser?.fullName) {
-              replySenderName = chatData.peerUser.fullName;
-            } else if (groupMembersMapRef.current?.[msg.replySenderId]?.fullName) {
-              replySenderName = groupMembersMapRef.current[msg.replySenderId].fullName;
+          // Resolve missing reply data from permanent reply table or group members
+          let { replySenderName, replyPreviewText, replyPreviewType, replySenderId } = msg;
+          if (msg.replyToMessageId) {
+            // If reply preview text is missing, try the permanent reply table
+            if (!replyPreviewText) {
+              const msgKey = msg.serverMessageId || msg.id || msg.tempId;
+              if (msgKey && replyDataCache[msgKey]) {
+                const rd = replyDataCache[msgKey];
+                replyPreviewText = rd.replyPreviewText || replyPreviewText;
+                replyPreviewType = rd.replyPreviewType || replyPreviewType;
+                replySenderId = rd.replySenderId || replySenderId;
+                replySenderName = rd.replySenderName || replySenderName;
+              }
+            }
+            // Resolve sender name from context
+            if (!replySenderName && replySenderId) {
+              if (sameId(replySenderId, currentUser)) {
+                replySenderName = currentUserNameRef.current || 'You';
+              } else if (chatData?.peerUser?.fullName && !isGroupChat) {
+                replySenderName = chatData.peerUser.fullName;
+              } else if (groupMembersMapRef.current?.[replySenderId]?.fullName) {
+                replySenderName = groupMembersMapRef.current[replySenderId].fullName;
+              }
             }
           }
 
@@ -1936,6 +1977,9 @@ export default function useChatLogic({ navigation, route }) {
             ...msg,
             status,
             senderType: computeSenderType(msg.senderId, currentUser),
+            ...(replyPreviewText && !msg.replyPreviewText ? { replyPreviewText } : {}),
+            ...(replyPreviewType && !msg.replyPreviewType ? { replyPreviewType } : {}),
+            ...(replySenderId && !msg.replySenderId ? { replySenderId } : {}),
             ...(replySenderName && !msg.replySenderName ? { replySenderName } : {}),
             ...(msg.localUri && msg.type !== 'text' ? {
               previewUrl: msg.previewUrl || msg.localUri,
@@ -3011,13 +3055,13 @@ export default function useChatLogic({ navigation, route }) {
       ...(isGroupChat && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
     };
 
-    // Emit appropriate event based on typing state
-    if (isTypingNow) {
-      socket.emit('typing:start', payload);
+    // Emit appropriate event based on typing state and chat type
+    if (isGroupChat) {
+      socket.emit(isTypingNow ? 'group:typing:start' : 'group:typing:stop', payload);
     } else {
-      socket.emit('typing:stop', payload);
+      socket.emit(isTypingNow ? 'typing:start' : 'typing:stop', payload);
     }
-  }, [chatData.peerUser]);
+  }, [chatData.peerUser, chatData.chatType, chatData.isGroup, chatData.groupId, chatData.group]);
 
   /* ========== Socket listeners setup ========== */
   const removeSocketListeners = useCallback((socket) => {
@@ -3988,29 +4032,45 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('group:message:edited', onGroupMessageEdited);
 
+    // ─── GROUP MESSAGE DELETE HANDLERS ───
+
+    // group:message:deleted — broadcast to ALL group members (including sender).
+    // This is the ONLY event that should trigger UI/DB updates.
     const onGroupMessageDeleted = (data) => {
       const source = data?.data || data;
-      console.log('[DELETE:GROUP:RAW]', JSON.stringify(source));
-      if (!isGroupEvent(source)) {
-        console.log('[DELETE:GROUP:SKIP] isGroupEvent false', { groupId: source?.groupId, group: source?.group, chatId: source?.chatId, currentChatId, groupOwnId });
-        return;
-      }
-      const messageId = source?.messageId || source?.message || source?._id || source?.id;
+      console.log('[DELETE:GROUP:BROADCAST]', JSON.stringify(source));
+
+      if (!isGroupEvent(source)) return;
+
+      const messageId = normalizeId(source?.messageId || source?._id || source?.id);
       if (!messageId) return;
-      const deleteFor = source?.deleteFor || source?.delete_type || (source?.isDeletedForEveryone ? 'everyone' : null) || 'everyone';
-      const deletedBy = source?.deletedBy || source?.senderId || source?.userId;
-      if (deleteFor === 'everyone') {
+
+      const isEveryoneDel = Boolean(source?.deleteForEveryone);
+      const deletedBy = normalizeId(source?.deletedBy || source?.senderId || source?.userId);
+
+      if (isEveryoneDel) {
+        // Delete for everyone — update for all members
         handleDeleteMessage(messageId, true, { deletedBy });
       } else {
-        // Delete for me — only apply if current user is the one who deleted
-        if (!deletedBy || sameId(deletedBy, currentUserIdRef.current)) {
-          handleDeleteMessage(messageId, false);
+        // Delete for me — only the user who deleted sees the removal.
+        // If we are the one who deleted, it was already handled optimistically.
+        // If another user deleted for themselves, we should NOT see any change.
+        if (sameId(deletedBy, currentUserIdRef.current)) {
+          refreshMessagesFromDB();
         }
       }
     };
     registerSocketHandler('group:message:deleted', onGroupMessageDeleted);
-    registerSocketHandler('group:message:delete', onGroupMessageDeleted);
-    registerSocketHandler('group:message:delete:everyone', onGroupMessageDeleted);
+
+    // group:message:delete:success — confirmation to the SENDER only.
+    // Used only for logging / hiding pending indicator.
+    // Do NOT re-trigger UI update here — optimistic update already handled it.
+    const onGroupMessageDeleteSuccess = (data) => {
+      const source = data?.data || data;
+      console.log('[DELETE:GROUP:SUCCESS]', source?.messageId);
+      // No-op: optimistic update + broadcast handler already cover everything.
+    };
+    registerSocketHandler('group:message:delete:success', onGroupMessageDeleteSuccess);
 
     const onGroupMessageDelivered = (data) => {
       const source = data?.data || data;
@@ -4430,94 +4490,76 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('user:offline', onUserOffline);
 
-    // FIXED: Typing event handlers
-    const onTypingStart = (data) => {
-      console.log('📨 [TYPING] Received typing:start:', data);
-      
-      const senderId = data.userId || data.senderId || data.from;
-      const chatIdInPayload = data.chatId || data.roomId;
-      
-      // Only show typing indicator if it's from the peer user and for this chat
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
-        
-        console.log('👤 [TYPING] Peer is typing');
-        setIsPeerTyping(true);
-        
-        // Clear any existing timeout
-        if (peerTypingTimeoutRef.current) {
-          clearTimeout(peerTypingTimeoutRef.current);
-        }
-        
-        // Set timeout to hide typing indicator after TYPING_TIMEOUT
-        peerTypingTimeoutRef.current = setTimeout(() => {
-          console.log('⏰ [TYPING] Peer typing timeout');
-          setIsPeerTyping(false);
-          peerTypingTimeoutRef.current = null;
-        }, TYPING_TIMEOUT);
+    // Typing event handlers — support both 1:1 and group chats
+    const isGroupChat = chatData.chatType === 'group' || chatData.isGroup;
+    const matchesTypingSender = (senderId, chatIdInPayload) => {
+      if (!senderId || String(senderId) === String(currentUserIdRef.current)) return false;
+      const chatIdMatch = chatIdInPayload && (
+        chatIdInPayload === currentChatId ||
+        chatIdInPayload === chatData.groupId ||
+        chatIdInPayload === chatData.group?._id
+      );
+      if (isGroupChat) {
+        // For groups: any other member typing in this group chat
+        return chatIdMatch;
+      }
+      // For 1:1: match peer user
+      return chatData.peerUser?._id && senderId === chatData.peerUser._id &&
+        (!chatIdInPayload || chatIdInPayload === currentChatId);
+    };
+
+    const startPeerTyping = () => {
+      setIsPeerTyping(true);
+      if (peerTypingTimeoutRef.current) clearTimeout(peerTypingTimeoutRef.current);
+      peerTypingTimeoutRef.current = setTimeout(() => {
+        setIsPeerTyping(false);
+        peerTypingTimeoutRef.current = null;
+      }, TYPING_TIMEOUT);
+    };
+
+    const stopPeerTyping = () => {
+      setIsPeerTyping(false);
+      if (peerTypingTimeoutRef.current) {
+        clearTimeout(peerTypingTimeoutRef.current);
+        peerTypingTimeoutRef.current = null;
       }
     };
+
+    const onTypingStart = (data) => {
+      const senderId = data.userId || data.senderId || data.from;
+      const chatIdInPayload = data.chatId || data.groupId || data.roomId;
+      if (matchesTypingSender(senderId, chatIdInPayload)) startPeerTyping();
+    };
     registerSocketHandler('typing:start', onTypingStart);
+    if (isGroupChat) {
+      registerSocketHandler('group:typing:started', onTypingStart);
+      registerSocketHandler('group:typing:start', onTypingStart);
+    }
 
     const onTypingStop = (data) => {
-      console.log('📨 [TYPING] Received typing:stop:', data);
-      
-      const senderId = data.userId || data.senderId || data.from;
-      const chatIdInPayload = data.chatId || data.roomId;
-      
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
-        
-        console.log('👤 [TYPING] Peer stopped typing');
-        setIsPeerTyping(false);
-        
-        // Clear timeout
-        if (peerTypingTimeoutRef.current) {
-          clearTimeout(peerTypingTimeoutRef.current);
-          peerTypingTimeoutRef.current = null;
-        }
+      const chatIdInPayload = data.chatId || data.groupId || data.roomId;
+      if (chatIdInPayload && (chatIdInPayload === currentChatId || chatIdInPayload === chatData.groupId || chatIdInPayload === chatData.group?._id)) {
+        stopPeerTyping();
       }
     };
     registerSocketHandler('typing:stop', onTypingStop);
+    if (isGroupChat) {
+      registerSocketHandler('group:typing:stopped', onTypingStop);
+      registerSocketHandler('group:typing:stop', onTypingStop);
+    }
 
     // Handle recording as typing
     const onTypingRecording = (data) => {
       const senderId = data.userId || data.senderId || data.from;
-      const chatIdInPayload = data.chatId || data.roomId;
-      
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
-        setIsPeerTyping(true);
-        
-        if (peerTypingTimeoutRef.current) {
-          clearTimeout(peerTypingTimeoutRef.current);
-        }
-        
-        peerTypingTimeoutRef.current = setTimeout(() => {
-          setIsPeerTyping(false);
-          peerTypingTimeoutRef.current = null;
-        }, TYPING_TIMEOUT);
-      }
+      const chatIdInPayload = data.chatId || data.groupId || data.roomId;
+      if (matchesTypingSender(senderId, chatIdInPayload)) startPeerTyping();
     };
     registerSocketHandler('typing:recording', onTypingRecording);
 
     const onTypingRecordingUpdate = (data) => {
       const senderId = data.userId || data.senderId || data.from;
-      const chatIdInPayload = data.chatId || data.roomId;
-      
-      if (senderId === chatData.peerUser._id && 
-          (!chatIdInPayload || chatIdInPayload === currentChatId)) {
-        setIsPeerTyping(true);
-        
-        if (peerTypingTimeoutRef.current) {
-          clearTimeout(peerTypingTimeoutRef.current);
-        }
-        
-        peerTypingTimeoutRef.current = setTimeout(() => {
-          setIsPeerTyping(false);
-          peerTypingTimeoutRef.current = null;
-        }, TYPING_TIMEOUT);
-      }
+      const chatIdInPayload = data.chatId || data.groupId || data.roomId;
+      if (matchesTypingSender(senderId, chatIdInPayload)) startPeerTyping();
     };
     registerSocketHandler('typing:recording:update', onTypingRecordingUpdate);
 
@@ -4790,10 +4832,20 @@ export default function useChatLogic({ navigation, route }) {
       createdAt: timestamp,
       ...(isGrpSend && { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }),
       ...(mentionsArray && { mentions: mentionsArray }),
-      // Reply field for message:reply event (swipe-to-reply in 1-on-1)
-      // For groups, replyToMessageId is embedded in the group:message:send payload
+      // Reply data — include full preview so receivers can display it without lookup
       ...(replyToMsgId && {
         replyToMessageId: replyToMsgId,
+        replyTo: {
+          _id: replyToMsgId,
+          text: quotedText || '',
+          messageType: currentReply?.type || 'text',
+          senderId: currentReply?.senderId || null,
+          senderName: resolvedReplySenderName || null,
+        },
+        replyPreviewText: quotedText || '',
+        replyPreviewType: currentReply?.type || 'text',
+        replySenderName: resolvedReplySenderName || null,
+        replySenderId: currentReply?.senderId || null,
       }),
     };
 
@@ -5429,28 +5481,63 @@ export default function useChatLogic({ navigation, route }) {
       receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
     }
 
-    // If this message is a reply but missing preview data, look up the original from SQLite
+    // If this message is a reply but missing preview data, try multiple sources
     if (receivedMessage.replyToMessageId && !receivedMessage.replyPreviewText) {
-      const originalMsg = await ChatDatabase.getMessage(receivedMessage.replyToMessageId);
-      if (originalMsg) {
-        receivedMessage.replyPreviewText = originalMsg.isDeleted ? 'This message was deleted' : (originalMsg.text || '');
-        receivedMessage.replyPreviewType = originalMsg.type || 'text';
-        receivedMessage.replySenderId = originalMsg.senderId || null;
-        // Resolve sender name for the reply preview
-        let rSenderName = originalMsg.senderName || null;
-        if (!rSenderName && originalMsg.senderId) {
-          if (sameId(originalMsg.senderId, currentUserIdRef.current)) {
-            rSenderName = currentUserNameRef.current || 'You';
-          } else if (chatData?.peerUser?.fullName) {
-            rSenderName = chatData.peerUser.fullName;
-          } else if (groupMembersMapRef.current?.[originalMsg.senderId]?.fullName) {
-            rSenderName = groupMembersMapRef.current[originalMsg.senderId].fullName;
+      // Source 1: Check permanent reply table first (fastest)
+      const savedReply = await ChatDatabase.getReplyData(receivedMessage.serverMessageId || receivedMessage.id);
+      if (savedReply?.replyPreviewText) {
+        receivedMessage.replyPreviewText = savedReply.replyPreviewText;
+        receivedMessage.replyPreviewType = savedReply.replyPreviewType || receivedMessage.replyPreviewType;
+        receivedMessage.replySenderId = savedReply.replySenderId || receivedMessage.replySenderId;
+        receivedMessage.replySenderName = savedReply.replySenderName || receivedMessage.replySenderName;
+      }
+
+      // Source 2: Look up the original message from SQLite
+      if (!receivedMessage.replyPreviewText) {
+        const originalMsg = await ChatDatabase.getMessage(receivedMessage.replyToMessageId);
+        if (originalMsg) {
+          receivedMessage.replyPreviewText = originalMsg.isDeleted ? 'This message was deleted' : (originalMsg.text || '');
+          receivedMessage.replyPreviewType = originalMsg.type || 'text';
+          receivedMessage.replySenderId = receivedMessage.replySenderId || originalMsg.senderId || null;
+          // Resolve sender name
+          let rSenderName = originalMsg.senderName || null;
+          if (!rSenderName && originalMsg.senderId) {
+            if (sameId(originalMsg.senderId, currentUserIdRef.current)) {
+              rSenderName = currentUserNameRef.current || 'You';
+            } else if (chatData?.peerUser?.fullName) {
+              rSenderName = chatData.peerUser.fullName;
+            } else if (groupMembersMapRef.current?.[originalMsg.senderId]?.fullName) {
+              rSenderName = groupMembersMapRef.current[originalMsg.senderId].fullName;
+            }
           }
+          receivedMessage.replySenderName = receivedMessage.replySenderName || rSenderName;
         }
-        receivedMessage.replySenderName = rSenderName;
-      } else {
+      }
+
+      // Source 3: Try to extract from the raw replyTo object in the payload
+      if (!receivedMessage.replyPreviewText) {
+        const rawReplyTo = msg?.replyTo;
+        if (rawReplyTo && typeof rawReplyTo === 'object') {
+          receivedMessage.replyPreviewText = rawReplyTo.text || null;
+          receivedMessage.replyPreviewType = rawReplyTo.messageType || rawReplyTo.type || 'text';
+          receivedMessage.replySenderId = receivedMessage.replySenderId || rawReplyTo.senderId || rawReplyTo.sender?._id || null;
+          receivedMessage.replySenderName = receivedMessage.replySenderName || rawReplyTo.senderName || rawReplyTo.sender?.fullName || null;
+        }
+      }
+
+      // Final fallback
+      if (!receivedMessage.replyPreviewText) {
         receivedMessage.replyPreviewText = 'Message';
         receivedMessage.replyPreviewType = 'text';
+      }
+
+      // Resolve sender name from group members if still missing
+      if (!receivedMessage.replySenderName && receivedMessage.replySenderId) {
+        if (sameId(receivedMessage.replySenderId, currentUserIdRef.current)) {
+          receivedMessage.replySenderName = currentUserNameRef.current || 'You';
+        } else if (groupMembersMapRef.current?.[receivedMessage.replySenderId]?.fullName) {
+          receivedMessage.replySenderName = groupMembersMapRef.current[receivedMessage.replySenderId].fullName;
+        }
       }
     }
 
@@ -5468,9 +5555,27 @@ export default function useChatLogic({ navigation, route }) {
       }
     }
 
-    // SQLite-first: write to DB, then refresh UI
-    await ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current });
-    refreshMessagesFromDB();
+    // Resolve senderName from group members if missing
+    if (!receivedMessage.senderName && receivedMessage.senderId && !sameId(receivedMessage.senderId, currentUserIdRef.current)) {
+      receivedMessage.senderName = groupMembersMapRef.current?.[receivedMessage.senderId]?.fullName || null;
+    }
+
+    // INSTANT UI: merge into state immediately, then write to SQLite in background
+    setAllMessages(prev => {
+      // Dedup check — skip if already in the list
+      const ids = [receivedMessage.serverMessageId, receivedMessage.id, receivedMessage.tempId].filter(Boolean);
+      const exists = prev.some(m =>
+        ids.some(id => sameId(id, m.serverMessageId) || sameId(id, m.id) || sameId(id, m.tempId))
+      );
+      if (exists) return prev;
+      // Insert at the beginning (newest first) and resort
+      const merged = [receivedMessage, ...prev];
+      merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      return merged;
+    });
+
+    // Write to SQLite in background (non-blocking)
+    ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(() => {});
 
     // Emit delivery receipt for incoming messages from others
     // Do NOT emit delivery for scheduled/processing/cancelled/failed messages
@@ -5504,25 +5609,64 @@ export default function useChatLogic({ navigation, route }) {
   }, [refreshMessagesFromDB, resetIdleTimer]);
 
   const handleDeleteMessage = useCallback(async (messageId, isDeletedForEveryone, options = {}) => {
+    const normalizedMsgId = normalizeId(messageId);
+    if (!normalizedMsgId) return;
+
     const deletedBy = normalizeId(options?.deletedBy) || null;
     const isDeletedBySelf = deletedBy
       ? sameId(deletedBy, currentUserIdRef.current)
       : Boolean(options?._initiatedLocally);
 
-    // SQLite-first: write to DB then refresh UI
+    // Check SQLite first — if already deleted, only refresh UI (no duplicate write)
+    const existing = await ChatDatabase.getMessage(normalizedMsgId);
+    if (!existing) {
+      // Message not in DB at all — nothing to delete
+      return;
+    }
+    if (existing.isDeleted && isDeletedForEveryone) {
+      // Already marked deleted — just make sure UI reflects it
+      refreshMessagesFromDB(true);
+      return;
+    }
+
+    // 1. Update in-memory state immediately (optimistic — instant UI update)
+    setAllMessages(prev => prev.map(msg => {
+      const msgId = msg.serverMessageId || msg.id || msg.tempId;
+      if (!sameId(msgId, normalizedMsgId)) return msg;
+
+      if (!isDeletedForEveryone) {
+        // Delete for me: filter out in the next step
+        return { ...msg, _removedForMe: true };
+      }
+
+      // Delete for everyone: mark as deleted in-place
+      return {
+        ...msg,
+        isDeleted: true,
+        deletedFor: 'everyone',
+        deletedBy,
+        placeholderText: buildDeletePlaceholderText(isDeletedBySelf),
+        text: buildDeletePlaceholderText(isDeletedBySelf),
+        mediaUrl: null,
+        mediaThumbnailUrl: null,
+        previewUrl: null,
+        localUri: null,
+      };
+    }).filter(msg => !msg._removedForMe));
+
+    // 2. Persist to SQLite (source of truth for next load)
     if (isDeletedForEveryone) {
-      registerDeletedTombstone(messageId, {
+      registerDeletedTombstone(normalizedMsgId, {
         deletedBy,
         placeholderText: buildDeletePlaceholderText(isDeletedBySelf),
       });
-      await ChatDatabase.markMessageDeleted(messageId, deletedBy, buildDeletePlaceholderText(isDeletedBySelf));
+      await ChatDatabase.markMessageDeleted(normalizedMsgId, deletedBy, buildDeletePlaceholderText(isDeletedBySelf));
     } else {
-      removeDeletedTombstone(messageId);
-      await ChatDatabase.deleteMessageForMe(messageId);
+      removeDeletedTombstone(normalizedMsgId);
+      await ChatDatabase.deleteMessageForMe(normalizedMsgId);
     }
 
-    // Refresh UI from SQLite — single source of truth
-    refreshMessagesFromDB(true);
+    // 3. Sync chat list preview
     pendingPreviewSyncRef.current = true;
   }, [
     refreshMessagesFromDB,
@@ -5545,48 +5689,59 @@ export default function useChatLogic({ navigation, route }) {
   const deleteSelectedMessages = useCallback(async (deleteForEveryone) => {
     try {
       const socket = getSocket();
-
-      // Read latest allMessages via ref to avoid stale closure
       const latestMessages = allMessagesRef.current || [];
+      const isGroupDel = chatData?.chatType === 'group' || chatData?.isGroup;
+      const groupId = isGroupDel ? (chatData?.groupId || chatData?.group?._id || chatIdRef.current) : null;
 
       const selectedResolved = selectedMessage
         .map((messageId) => {
-          // Search in latest allMessages (not stale `messages` closure)
           const found = latestMessages.find(m =>
             sameId(m.id, messageId) ||
             sameId(m.serverMessageId, messageId) ||
             sameId(m.tempId, messageId)
           );
-          // Always prefer serverMessageId for the emit — server doesn't know temp IDs
           const resolvedId = found?.serverMessageId || found?.id || found?.tempId || messageId;
           return { found, resolvedId };
         })
-        .filter(entry => Boolean(entry.resolvedId));
+        .filter(entry => {
+          if (!entry.resolvedId) return false;
+          // Skip messages already marked as deleted locally
+          if (entry.found?.isDeleted) return false;
+          return true;
+        });
 
-      selectedResolved.forEach(({ resolvedId }) => {
-        handleDeleteMessage(resolvedId, deleteForEveryone, {
+      if (selectedResolved.length === 0) {
+        setSelectedMessages([]);
+        return;
+      }
+
+      // 1. Optimistic local update — instant UI change
+      for (const { resolvedId } of selectedResolved) {
+        await handleDeleteMessage(resolvedId, deleteForEveryone, {
           deletedBy: currentUserIdRef.current,
           _initiatedLocally: true,
         });
-      });
+      }
 
+      // 2. Emit to server
       if (socket && isSocketConnected()) {
         for (const { resolvedId, found } of selectedResolved) {
-          const isGroupDel = chatData?.chatType === 'group' || chatData?.isGroup;
-          const groupId = isGroupDel ? (chatData?.groupId || chatData?.group?._id || chatIdRef.current) : null;
-          if (deleteForEveryone && found && sameId(found.senderId, currentUserIdRef.current)) {
-            if (isGroupDel) {
-              const payload = { messageId: resolvedId, chatId: chatIdRef.current, groupId, deleteFor: 'everyone', senderId: currentUserIdRef.current };
-              socket.emit('group:message:delete', payload);
-              console.log('[DELETE:GROUP:EMIT]', payload);
-            } else {
+          if (isGroupDel) {
+            // Group: emit { groupId, messageId, deleteForEveryone }
+            // "Delete for everyone" only allowed for own messages
+            const canDeleteForEveryone = deleteForEveryone && found && sameId(found.senderId, currentUserIdRef.current);
+            const payload = {
+              groupId,
+              messageId: resolvedId,
+              deleteForEveryone: Boolean(canDeleteForEveryone),
+            };
+            socket.emit('group:message:delete', payload);
+            console.log('[DELETE:GROUP:EMIT]', payload);
+          } else {
+            // Private chat
+            if (deleteForEveryone && found && sameId(found.senderId, currentUserIdRef.current)) {
               socket.emit('message:delete', { messageId: resolvedId, chatId: chatIdRef.current, deleteFor: 'everyone', senderId: currentUserIdRef.current });
               socket.emit('message:delete:everyone', { messageId: resolvedId, chatId: chatIdRef.current, senderId: currentUserIdRef.current });
-              console.log('[DELETE:1on1:EMIT]', { messageId: resolvedId, chatId: chatIdRef.current });
-            }
-          } else {
-            if (isGroupDel) {
-              socket.emit('group:message:delete', { messageId: resolvedId, chatId: chatIdRef.current, groupId, deleteFor: 'me', senderId: currentUserIdRef.current });
             } else {
               socket.emit('message:delete', { messageId: resolvedId, chatId: chatIdRef.current, deleteFor: 'me' });
               socket.emit('message:delete:me', { messageId: resolvedId, chatId: chatIdRef.current });
@@ -5594,6 +5749,7 @@ export default function useChatLogic({ navigation, route }) {
           }
         }
       }
+
       setSelectedMessages([]);
     } catch (error) {
       Alert.alert("Error", "Failed to delete messages");
@@ -5780,12 +5936,20 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       const resolvedIdentity = resolveMediaIdentity(msg);
-      const messageId = String(resolvedIdentity?.mediaId || msg?.mediaId || msg?.serverMessageId || msg?.id || msg?.messageId || '');
+      const mediaId = String(resolvedIdentity?.mediaId || msg?.mediaId || msg?.serverMessageId || msg?.id || msg?.messageId || '');
+      const serverMsgId = String(resolvedIdentity?.messageId || msg?.serverMessageId || msg?.id || msg?.messageId || '');
+
+      // Resolve groupId: explicit field, or from chat data, or from chatIdRef for group chats
+      const isGroup = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+      const resolvedGroupId = normalizeId(
+        msg?.groupId || resolvedIdentity?.groupId || chatData?.groupId || chatData?.group?._id || (isGroup ? chatIdRef.current : null)
+      );
+
       console.log('=== DOWNLOAD MSG DATA ===', JSON.stringify({
-        messageId,
-        mediaId: msg?.mediaId,
-        serverMessageId: msg?.serverMessageId,
-        id: msg?.id,
+        mediaId,
+        serverMsgId,
+        isGroup,
+        resolvedGroupId,
         mediaUrl: msg?.mediaUrl,
         previewUrl: msg?.previewUrl,
         chatId: msg?.chatId,
@@ -5794,7 +5958,7 @@ export default function useChatLogic({ navigation, route }) {
         resolvedMediaId: resolvedIdentity?.mediaId,
         resolvedMediaUrl: resolvedIdentity?.mediaUrl,
       }));
-      if (!messageId) {
+      if (!mediaId) {
         Alert.alert('Download failed', 'Media identifier missing for this message');
         return;
       }
@@ -5805,12 +5969,12 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       const effectiveChatId = normalizeId(msg?.chatId || msg?.groupId || chatIdRef.current);
-      const eventKey = buildMediaStatusEventKey(effectiveChatId, messageId);
+      const eventKey = buildMediaStatusEventKey(effectiveChatId, mediaId);
 
       setMediaDownloadStates((prev) => ({
         ...prev,
-        [messageId]: {
-          ...(prev[messageId] || { mediaId: messageId }),
+        [mediaId]: {
+          ...(prev[mediaId] || { mediaId }),
           status: MEDIA_DOWNLOAD_STATUS.DOWNLOADING,
           progress: 0,
           error: null,
@@ -5820,30 +5984,30 @@ export default function useChatLogic({ navigation, route }) {
 
       setDownloadProgress(prev => ({
         ...prev,
-        [messageId]: 0
+        [mediaId]: 0
       }));
 
       const localUri = await mediaDownloadManager.download(
         {
           ...msg,
-          mediaId: messageId,
-          messageId: msg?.serverMessageId || msg?.id || msg?.messageId || messageId,
+          mediaId,
+          messageId: serverMsgId || mediaId,
           mediaUrl: resolvedIdentity?.mediaUrl || msg?.mediaUrl || msg?.previewUrl || msg?.url,
           mediaThumbnailUrl: resolvedIdentity?.mediaThumbnailUrl || msg?.mediaThumbnailUrl || msg?.thumbnailUrl || msg?.previewUrl,
           mediaMeta: resolvedIdentity?.mediaMeta || msg?.mediaMeta || msg?.payload?.mediaMeta || {},
           messageType: messageType,
           fileCategory: msg?.fileCategory || resolvedIdentity?.messageType || messageType,
           chatId: effectiveChatId || chatIdRef.current,
-          groupId: msg?.groupId || chatData?.groupId || chatData?.group?._id || null,
+          groupId: resolvedGroupId,
         },
         {
           chatId: effectiveChatId || chatIdRef.current,
-          filename: msg.text || msg.fileName || `${messageId}`,
+          filename: msg.text || msg.fileName || `${mediaId}`,
           onProgress: (progressPct) => {
             const normalized = Math.max(0, Math.min(100, Number(progressPct || 0)));
             setDownloadProgress(prev => ({
               ...prev,
-              [messageId]: normalized / 100,
+              [mediaId]: normalized / 100,
             }));
           },
         }
@@ -5852,9 +6016,9 @@ export default function useChatLogic({ navigation, route }) {
       if (!localUri) throw new Error("Download failed");
 
       await localStorageService.upsertMediaFile({
-        mediaId: messageId,
-        id: messageId,
-        serverMessageId: msg.serverMessageId || msg.id || messageId,
+        mediaId,
+        id: mediaId,
+        serverMessageId: serverMsgId || mediaId,
         chatId: msg.chatId || chatIdRef.current,
         localPath: localUri,
         messageType: resolvedIdentity?.messageType || msg.type || msg.mediaType || 'file',
@@ -5868,11 +6032,11 @@ export default function useChatLogic({ navigation, route }) {
         createdAtTs: Number(msg?.timestamp || Date.now()),
       });
 
-      setDownloadedMedia((prev) => ({ ...prev, [messageId]: localUri }));
+      setDownloadedMedia((prev) => ({ ...prev, [mediaId]: localUri }));
       setMediaDownloadStates((prev) => ({
         ...prev,
-        [messageId]: {
-          ...(prev[messageId] || { mediaId: messageId }),
+        [mediaId]: {
+          ...(prev[mediaId] || { mediaId }),
           status: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
           progress: 100,
           localPath: localUri,
@@ -5882,7 +6046,7 @@ export default function useChatLogic({ navigation, route }) {
       }));
 
       await applyMediaDownloadedStateLocally({
-        messageId,
+        messageId: serverMsgId || mediaId,
         chatId: effectiveChatId,
         isMediaDownloaded: true,
         localUri,
@@ -5891,16 +6055,16 @@ export default function useChatLogic({ navigation, route }) {
       if (eventKey && !mediaStatusProcessedRef.current.has(eventKey)) {
         const deviceId = await getOrCreateDeviceId();
         await queueMediaStatusUpdate({
-          messageId,
+          messageId: serverMsgId || mediaId,
           chatId: effectiveChatId,
           deviceId,
           isMediaDownloaded: true,
         });
       }
-  
+
       setDownloadProgress(prev => {
         const copy = { ...prev };
-        delete copy[messageId];
+        delete copy[mediaId];
         return copy;
       });
 
@@ -6476,11 +6640,10 @@ export default function useChatLogic({ navigation, route }) {
     setMuteUntil(nextMuteUntil);
   }, [isChatMuted, muteUntil]);
 
-  const loadMoreMessages = useCallback(() => {
+  const loadMoreMessages = useCallback(async () => {
     if (isLoadingMore || loadMoreInFlightRef.current) return;
     if (!hasMoreMessages) return;
 
-    const nextPage = currentPage + 1;
     const oldest = messages.length > 0
       ? messages.reduce((acc, msg) => {
           const ts = Number(msg?.timestamp || 0);
@@ -6489,21 +6652,62 @@ export default function useChatLogic({ navigation, route }) {
         }, 0)
       : null;
 
-    if (!oldest || fetchOlderCursorRef.current === oldest) {
-      return;
-    }
+    if (!oldest || fetchOlderCursorRef.current === oldest) return;
 
     loadMoreInFlightRef.current = true;
     fetchOlderCursorRef.current = oldest;
     setIsLoadingMore(true);
-    setCurrentPage(nextPage);
 
-    fetchAndSyncMessagesViaSocket(chatIdRef.current, {
-      before: oldest || undefined,
-      limit: SOCKET_FETCH_LIMIT,
-    });
+    try {
+      // SQLite-first: try loading older messages from local DB
+      const cid = chatIdRef.current;
+      const olderLocal = await ChatDatabase.loadMessages(cid, {
+        limit: SOCKET_FETCH_LIMIT,
+        offset: messages.length,
+        skipCleanup: true,
+      });
 
-    dispatch(chatMessage({ chatId: chatIdRef.current, search: '', page: nextPage, limit: 50 }));
+      if (olderLocal.length > 0) {
+        // Found older messages in SQLite — merge into state
+        setAllMessages(prev => {
+          const seenIds = new Set();
+          for (const m of prev) {
+            if (m.id) seenIds.add(m.id);
+            if (m.serverMessageId) seenIds.add(m.serverMessageId);
+            if (m.tempId) seenIds.add(m.tempId);
+          }
+          const newOnes = olderLocal.filter(m => {
+            const ids = [m.id, m.serverMessageId, m.tempId].filter(Boolean);
+            return !ids.some(id => seenIds.has(id));
+          }).map(m => ({
+            ...m,
+            senderType: m.senderId && sameId(m.senderId, currentUserIdRef.current) ? 'self' : 'other',
+          }));
+          if (newOnes.length === 0) return prev;
+          const merged = [...prev, ...newOnes];
+          merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+          return merged;
+        });
+
+        if (olderLocal.length < SOCKET_FETCH_LIMIT) {
+          setHasMoreMessages(false);
+        }
+      } else {
+        // No more local messages — fallback to API/socket for older history
+        const nextPage = currentPage + 1;
+        setCurrentPage(nextPage);
+        fetchAndSyncMessagesViaSocket(cid, {
+          before: oldest,
+          limit: SOCKET_FETCH_LIMIT,
+        });
+        dispatch(chatMessage({ chatId: cid, search: '', page: nextPage, limit: 50 }));
+      }
+    } catch (err) {
+      console.warn('[loadMoreMessages] error:', err);
+    } finally {
+      setIsLoadingMore(false);
+      loadMoreInFlightRef.current = false;
+    }
   }, [isLoadingMore, hasMoreMessages, currentPage, dispatch, messages, fetchAndSyncMessagesViaSocket]);
 
   /* ========== FIXED: Render status helper ========== */

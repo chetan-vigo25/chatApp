@@ -153,6 +153,9 @@ export default function AddUser({ navigation }) {
   // Search input ref for auto-focus
   const searchInputRef = useRef(null);
 
+  // Cancel flag: set to true when user scrolls down during a refresh
+  const refreshCancelledRef = useRef(false);
+
   const {
     matchedContacts = [],
     matchedCount,
@@ -200,14 +203,9 @@ export default function AddUser({ navigation }) {
   }, []);
 
   useEffect(() => {
-    const initializeContacts = async () => {
-      try {
-        await syncContacts();
-      } catch (err) {
-        console.error('Failed to sync contacts:', err);
-      }
-    };
-    initializeContacts();
+    // Only load cached contacts from SQLite on mount — no server sync.
+    // Server sync only happens when the user taps the refresh button.
+    loadContacts().catch((err) => console.warn('Failed to load contacts:', err));
   }, []);
 
   useEffect(() => {
@@ -312,9 +310,13 @@ export default function AddUser({ navigation }) {
 
   const handleRefresh = useCallback(async () => {
     if (refreshing || isSyncing) return;
+    refreshCancelledRef.current = false;
     setRefreshing(true);
-    try { await refreshContacts({ fallbackToSync: true }); }
-    catch (err) {
+    try {
+      await refreshContacts({ fallbackToSync: true });
+      if (refreshCancelledRef.current) return;
+    } catch (err) {
+      if (refreshCancelledRef.current) return;
       console.warn('Refresh failed:', err);
       try { await syncContacts(); } catch (_) { showMessage('Failed to refresh contacts'); }
     } finally { setRefreshing(false); }
@@ -511,6 +513,12 @@ export default function AddUser({ navigation }) {
     const currentY = event.nativeEvent.contentOffset.y;
     const diff = currentY - lastScrollY.current;
 
+    // Cancel ongoing refresh when user scrolls down
+    if (diff > 10 && (refreshing || isSyncing)) {
+      refreshCancelledRef.current = true;
+      setRefreshing(false);
+    }
+
     if (diff > 15 && !isCollapsed.current && currentY > 40) {
       collapseCollapsible();
     } else if (diff < -15 && isCollapsed.current) {
@@ -518,7 +526,7 @@ export default function AddUser({ navigation }) {
     }
 
     lastScrollY.current = currentY;
-  }, [collapseCollapsible, expandCollapsible]);
+  }, [collapseCollapsible, expandCollapsible, refreshing, isSyncing]);
 
   // ─── BUILD FLATLIST DATA (MEMOIZED) ───
 

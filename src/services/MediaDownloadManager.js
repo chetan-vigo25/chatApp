@@ -45,18 +45,32 @@ const normalizeMessageType = (message = {}, mediaMeta = {}) => {
 
 const resolveMediaIdentity = (message = {}) => {
   const mediaMeta = message?.mediaMeta || message?.payload?.mediaMeta || {};
-  const mediaId =
+  const payloadFile = message?.payload?.file || {};
+
+  // Prefer the real media ID from upload; fall back to message ID only as last resort
+  const realMediaId =
     normalizeId(message?.mediaId) ||
     normalizeId(mediaMeta?.mediaId) ||
+    normalizeId(message?.payload?.mediaId) ||
+    normalizeId(payloadFile?.mediaId);
+
+  const messageId =
     normalizeId(message?.serverMessageId) ||
     normalizeId(message?.id) ||
+    normalizeId(message?.messageId) ||
     normalizeId(message?.tempId);
+
+  const mediaId = realMediaId || messageId;
 
   const mediaUrl =
     message?.mediaUrl ||
     message?.previewUrl ||
     message?.serverMediaUrl ||
     message?.url ||
+    message?.payload?.mediaUrl ||
+    message?.payload?.previewUrl ||
+    payloadFile?.url ||
+    payloadFile?.uri ||
     null;
 
   const mediaThumbnailUrl =
@@ -64,12 +78,16 @@ const resolveMediaIdentity = (message = {}) => {
     message?.thumbnailUrl ||
     message?.serverPreviewUrl ||
     message?.previewUrl ||
+    message?.payload?.mediaThumbnailUrl ||
+    message?.payload?.thumbnailUrl ||
     mediaUrl ||
     null;
 
   return {
     mediaId,
+    messageId,
     chatId: normalizeId(message?.chatId),
+    groupId: normalizeId(message?.groupId),
     messageType: normalizeMessageType(message, mediaMeta),
     mediaUrl,
     mediaThumbnailUrl,
@@ -255,8 +273,9 @@ class MediaDownloadManager {
             messageType: identity.messageType,
             filename: options?.filename || message?.text || message?.fileName || key,
             force,
-            messageId: message?.messageId || message?.serverMessageId || message?.id || null,
-            groupId: message?.groupId || null,
+            messageId: identity.messageId || message?.messageId || message?.serverMessageId || message?.id || null,
+            groupId: identity.groupId || message?.groupId || null,
+            mediaUrl: identity.mediaUrl || message?.mediaUrl || message?.previewUrl || message?.url || null,
             onProgress: (progressPct) => {
               const normalized = Math.max(0, Math.min(100, Number(progressPct || 0)));
               this.setState(key, {

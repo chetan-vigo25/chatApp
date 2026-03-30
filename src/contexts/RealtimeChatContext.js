@@ -199,14 +199,18 @@ const getMessageTypeDisplayText = (messageType, text, metadata = {}) => {
   return normalizedText || 'No messages yet';
 };
 
-const buildLastMessageDisplay = ({ chat, currentUserId, isTyping }) => {
+const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName }) => {
   if (isTyping) {
+    const isGroup = chat?.chatType === 'group' || chat?.isGroup;
+    const typingText = isGroup && typingUserName
+      ? `${typingUserName} is typing...`
+      : 'Typing...';
     return {
-      text: 'Typing...',
+      text: typingText,
       icon: null,
       prefix: '',
       isEdited: false,
-      fullText: 'Typing...',
+      fullText: typingText,
     };
   }
 
@@ -227,7 +231,7 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping }) => {
   }
 
   const messageText = typeof rawLastMessage === 'string' ? rawLastMessage : (rawLastMessage?.text || '');
-  const messageType = (chat?.lastMessageType || rawLastMessage?.type || 'text').toString().toLowerCase();
+  const messageType = (chat?.lastMessageType || rawLastMessage?.type || rawLastMessage?.messageType || 'text').toString().toLowerCase();
   const messageSender = chat?.lastMessageSender || rawLastMessage?.senderId || null;
   const isEdited = Boolean(rawLastMessage?.isEdited || chat?.lastMessageEdited || rawLastMessage?.editedAt);
   const icon = MESSAGE_TYPE_ICON_MAP[messageType] || null;
@@ -457,8 +461,12 @@ const normalizeCachedEntry = (entry = {}) => {
 const buildStorageChatList = (state) => {
   return Object.keys(state?.chatMap || {}).map((chatId) => {
     const chat = state.chatMap[chatId] || {};
+    const isGroup = chat?.chatType === 'group' || chat?.isGroup;
     return {
       chatId,
+      _id: chat?._id || chatId,
+      chatType: chat?.chatType || (isGroup ? 'group' : 'private'),
+      isGroup: Boolean(isGroup),
       participants: Array.isArray(chat?.participants) ? chat.participants : [],
       otherUser: chat?.otherUser || chat?.peerUser || {},
       peerUser: chat?.peerUser || chat?.otherUser || {},
@@ -471,6 +479,17 @@ const buildStorageChatList = (state) => {
       lastMessageAt: chat?.lastMessageAt || getChatTimestampIso(chat),
       pinnedAt: chat?.pinnedAt || null,
       muteUntil: chat?.muteUntil || null,
+      // Group-specific fields
+      ...(isGroup ? {
+        groupId: chat?.groupId || chat?.group?._id || null,
+        chatName: chat?.chatName || chat?.group?.name || chat?.groupName || null,
+        chatAvatar: chat?.chatAvatar || chat?.group?.avatar || chat?.groupAvatar || null,
+        groupName: chat?.chatName || chat?.group?.name || chat?.groupName || null,
+        groupAvatar: chat?.chatAvatar || chat?.group?.avatar || chat?.groupAvatar || null,
+        group: chat?.group || null,
+        members: Array.isArray(chat?.members) ? chat.members : [],
+        memberCount: chat?.memberCount || chat?.members?.length || 0,
+      } : {}),
     };
   });
 };
@@ -512,7 +531,7 @@ const normalizePresencePayload = (payload = {}) => {
 const normalizeTypingPayload = (payload = {}) => {
   const source = unwrapPayload(payload);
   return {
-    chatId: normalizeId(source?.chatId || source?.roomId || source?.chat || null),
+    chatId: normalizeId(source?.chatId || source?.roomId || source?.chat || source?.groupId || null),
     userId: normalizeId(source?.senderId || source?.userId || source?.from || null),
     messageType: source?.messageType || null,
   };
@@ -536,7 +555,39 @@ const reducer = (state, action) => {
       const nextMap = { ...state.chatMap };
       const migratedUnreadPairs = [];
 
-      incoming.forEach((chat) => {
+      incoming.forEach((rawChat) => {
+        // Normalize flat API response into the shape the app expects
+        const isGroupChat = rawChat?.chatType === 'group' || rawChat?.isGroup;
+        const chat = { ...rawChat };
+
+        // Build peerUser object from flat fields if not already present (new API format)
+        if (!isGroupChat && !chat.peerUser && chat.peerUserId) {
+          chat.peerUser = {
+            _id: chat.peerUserId,
+            fullName: chat.chatName || '',
+            profileImage: chat.chatAvatar || null,
+          };
+        }
+
+        // Build group object from flat fields if not already present (new API format)
+        if (isGroupChat && !chat.group && (chat.groupId || chat.chatId)) {
+          chat.isGroup = true;
+          chat.groupId = chat.groupId || chat.chatId;
+          chat.group = {
+            _id: chat.groupId || chat.chatId,
+            name: chat.chatName || '',
+            avatar: chat.chatAvatar || null,
+          };
+          chat.groupName = chat.chatName || '';
+          chat.groupAvatar = chat.chatAvatar || null;
+          chat.memberCount = chat.groupMembersCount || chat.memberCount || 0;
+        }
+
+        // Map archived field
+        if (chat.archived !== undefined && chat.isArchived === undefined) {
+          chat.isArchived = Boolean(chat.archived);
+        }
+
         const normalizedChatId = normalizeId(chat?.chatId || chat?._id);
         const normalizedGroupId = normalizeId(chat?.groupId || chat?.group?._id);
         const peerUserId = getPeerUserId(chat);
@@ -560,7 +611,6 @@ const reducer = (state, action) => {
 
         const prevUnread = state.unreadByChat[chatId];
         const unreadCount = typeof prevUnread === 'number' ? prevUnread : Number(chat?.unreadCount || 0);
-        const isGroupChat = chat?.chatType === 'group' || chat?.isGroup;
         const normalizedPeerUser = isGroupChat
           ? null
           : {
@@ -581,6 +631,13 @@ const reducer = (state, action) => {
         // Preserve local edit if server hasn't acknowledged the edit yet
         const preserveEdit = (prevLastMsg?.isEdited || prev?.lastMessageEdited) && !incomingLastMsg?.isEdited && !chat?.lastMessageEdited;
 
+        // Preserve local lastMessage if it's newer than what the API returned
+        // This prevents pull-to-refresh from reverting socket-updated messages
+        const prevLastMsgTs = toTimestamp(prev?.lastMessageAt || prevLastMsg?.createdAt);
+        const incomingLastMsgTs = toTimestamp(chat?.lastMessageAt || incomingLastMsg?.createdAt);
+        const localIsNewer = prevLastMsgTs > 0 && incomingLastMsgTs > 0 && prevLastMsgTs > incomingLastMsgTs;
+        const preserveLocal = preserveEdit || localIsNewer;
+
         nextMap[chatId] = {
           ...prev,
           ...chat,
@@ -588,9 +645,11 @@ const reducer = (state, action) => {
           chatId,
           peerUser: normalizedPeerUser,
           unreadCount,
-          lastMessage: preserveEdit ? prevLastMsg : (incomingLastMsg || prevLastMsg),
+          lastMessage: preserveLocal ? prevLastMsg : (incomingLastMsg || prevLastMsg),
           lastMessageEdited: preserveEdit ? true : (chat?.lastMessageEdited || prev?.lastMessageEdited || false),
-          lastMessageAt: chat?.lastMessageAt || prev?.lastMessageAt || chat?.lastMessage?.createdAt || prev?.lastMessage?.createdAt,
+          lastMessageAt: preserveLocal
+            ? (prev?.lastMessageAt || prevLastMsg?.createdAt || chat?.lastMessageAt)
+            : (chat?.lastMessageAt || prev?.lastMessageAt || chat?.lastMessage?.createdAt || prev?.lastMessage?.createdAt),
         };
       });
 
@@ -1056,6 +1115,32 @@ const reducer = (state, action) => {
       return { ...state, chatMap };
     }
 
+    case 'UPDATE_LAST_MESSAGE_DELETED': {
+      const { chatId: rawDelChatId, messageId: rawDelMsgId, placeholderText } = action.payload || {};
+      const delChatId = normalizeId(rawDelChatId);
+      const delMsgId = normalizeId(rawDelMsgId);
+      if (!delChatId || !state.chatMap[delChatId]) return state;
+
+      const chatMap = { ...state.chatMap };
+      const existing = chatMap[delChatId];
+      const lastMsg = existing?.lastMessage;
+      const lastMsgId = getMessageIdentifier(lastMsg);
+
+      // Only update if the deleted message is the last message in the chat list
+      if (lastMsg && delMsgId && lastMsgId === delMsgId) {
+        chatMap[delChatId] = {
+          ...existing,
+          lastMessage: {
+            ...lastMsg,
+            text: placeholderText || 'This message was deleted',
+            isDeleted: true,
+          },
+        };
+        return { ...state, chatMap };
+      }
+      return state;
+    }
+
     case 'CLEAR_CHAT_HIGHLIGHT': {
       const chatId = action.payload;
       if (!chatId || !state.highlightByChat[chatId]) return state;
@@ -1156,8 +1241,11 @@ const reducer = (state, action) => {
             }
             const lastMessage = buildLastMessageFromItem(existing, item, timestamp);
             const isActiveChat = state.activeChatId && String(state.activeChatId) === String(chatId);
-            const currentUnread = Number(unreadByChat[chatId] || existing?.unreadCount || 0);
-            unreadByChat[chatId] = isActiveChat ? 0 : currentUnread + (typeof item?.unreadCount === 'number' ? 0 : 1);
+            // Use the higher of local count and server count as base, then increment by 1
+            const localUnread = Number(unreadByChat[chatId] || existing?.unreadCount || 0);
+            const serverUnread = typeof item?.unreadCount === 'number' ? Number(item.unreadCount) : 0;
+            const baseUnread = Math.max(localUnread, serverUnread);
+            unreadByChat[chatId] = isActiveChat ? 0 : baseUnread + 1;
 
             const nextLastMessageAt = isActiveChat
               ? (existing?.lastMessageAt || item?.lastMessageAt || lastMessage?.createdAt || timestamp)
@@ -1480,6 +1568,21 @@ const reducer = (state, action) => {
     case 'TYPING_START': {
       const { chatId, userId, messageType } = action.payload || {};
       if (!chatId || !userId) return state;
+      // Skip own typing
+      if (state.currentUserId && String(userId) === String(state.currentUserId)) return state;
+
+      // Look up sender name from group members for group typing display
+      const chatEntry = state.chatMap[chatId];
+      let typingUserName = null;
+      if (chatEntry?.chatType === 'group' || chatEntry?.isGroup) {
+        const members = Array.isArray(chatEntry?.members) ? chatEntry.members : (Array.isArray(chatEntry?.participants) ? chatEntry.participants : []);
+        const member = members.find((m) => {
+          const mId = normalizeId(m?.userId || m?._id || m?.id);
+          return mId && String(mId) === String(userId);
+        });
+        typingUserName = member?.fullName || member?.username || member?.name || null;
+      }
+
       return {
         ...state,
         typingStates: {
@@ -1487,6 +1590,7 @@ const reducer = (state, action) => {
           [chatId]: {
             isTyping: true,
             userId,
+            userName: typingUserName,
             messageType: messageType || null,
             startedAt: Date.now(),
           },
@@ -1553,13 +1657,15 @@ const reducer = (state, action) => {
           createdAt: lastMessageAt,
         },
         lastMessageAt: preserveGrpDelete ? (existing.lastMessageAt || lastMessageAt) : lastMessageAt,
+        timestamp: preserveGrpDelete ? (existing.timestamp || existing.lastMessageAt || lastMessageAt) : lastMessageAt,
         lastMessageType: preserveGrpDelete ? existing.lastMessageType : (messageType || 'text'),
         lastMessageSender: preserveGrpDelete ? existing.lastMessageSender : (senderId || null),
       };
 
       // Increment unread if not the active chat — skip if preserving a delete
       const unreadByChat = { ...state.unreadByChat };
-      if (!preserveGrpDelete && senderId && state.currentUserId && String(senderId) !== String(state.currentUserId) && state.activeChatId !== resolvedId) {
+      const isOwnMessage = senderId && state.currentUserId && String(senderId) === String(state.currentUserId);
+      if (!preserveGrpDelete && senderId && state.currentUserId && !isOwnMessage && state.activeChatId !== resolvedId) {
         unreadByChat[resolvedId] = Number(unreadByChat[resolvedId] || existing?.unreadCount || 0) + 1;
         nextMap[resolvedId].unreadCount = unreadByChat[resolvedId];
       }
@@ -1789,6 +1895,8 @@ export function RealtimeChatProvider({ children }) {
   const handledGroupMsgIdsRef = useRef(new Set());
   const currentUserIdRef = useRef(state.currentUserId);
   currentUserIdRef.current = state.currentUserId;
+  const stateRef = useRef(state);
+  stateRef.current = state;
 
   const clearTypingTimer = useCallback((chatId) => {
     const timer = typingTimersRef.current[chatId];
@@ -1864,12 +1972,82 @@ export function RealtimeChatProvider({ children }) {
 
     const onMessage = (payload) => {
       const source = unwrapPayload(payload);
-      // Skip group messages — they are handled by onGroupMessageNew via INCOMING_GROUP_MESSAGE
-      // Only skip if chatType is explicitly 'group' AND the message has a groupId target.
-      // Don't skip forwarded/replied 1-on-1 messages that merely reference a groupId from their origin.
+      // Handle group messages — forward to INCOMING_GROUP_MESSAGE for proper unread count tracking.
+      // Only treat as group if chatType is explicitly 'group' AND the message has a groupId target.
+      // Don't treat forwarded/replied 1-on-1 messages that merely reference a groupId from their origin.
       const sourceIsGroup = (source?.chatType === 'group' || source?.data?.chatType === 'group') &&
         (source?.groupId || source?.data?.groupId);
-      if (sourceIsGroup) return;
+      if (sourceIsGroup) {
+        // Dedup: skip if already processed by onGroupMessageNew
+        const grpMsgId = normalizeId(source?.messageId || source?._id || source?.data?.messageId || source?.data?._id);
+        if (grpMsgId && handledGroupMsgIdsRef.current.has(grpMsgId)) return;
+        if (grpMsgId) {
+          handledGroupMsgIdsRef.current.add(grpMsgId);
+          if (handledGroupMsgIdsRef.current.size > 2000) {
+            const first = handledGroupMsgIdsRef.current.values().next().value;
+            handledGroupMsgIdsRef.current.delete(first);
+          }
+        }
+
+        const grpGroupId = normalizeId(source?.groupId || source?.data?.groupId);
+        const grpChatId = normalizeId(source?.chatId || source?.data?.chatId) || grpGroupId;
+        const grpSenderId = normalizeId(source?.senderId || source?.data?.senderId);
+
+        // Resolve senderName — look up from group members if not in payload
+        let grpSenderName = source?.senderName || source?.data?.senderName || source?.sender?.fullName || source?.data?.sender?.fullName || '';
+        if (!grpSenderName && grpSenderId) {
+          const currentState = stateRef.current;
+          const resolvedKey = (grpChatId && currentState.chatMap[grpChatId])
+            ? grpChatId
+            : (grpGroupId && currentState.chatMap[grpGroupId])
+              ? grpGroupId
+              : findChatIdByGroupId(currentState.chatMap, grpGroupId || grpChatId);
+          const groupEntry = resolvedKey ? currentState.chatMap[resolvedKey] : null;
+          if (groupEntry) {
+            const members = Array.isArray(groupEntry.members) ? groupEntry.members : (Array.isArray(groupEntry.participants) ? groupEntry.participants : []);
+            const member = members.find((m) => {
+              const mId = normalizeId(m?.userId || m?._id || m?.id);
+              return mId && mId === String(grpSenderId);
+            });
+            grpSenderName = member?.fullName || member?.username || member?.name || '';
+          }
+        }
+
+        const grpText = source?.text || source?.data?.text || '';
+        const grpMessageType = source?.messageType || source?.data?.messageType || source?.type || 'text';
+        // Handle both ISO string (createdAt) and epoch ms (sentAt) timestamps
+        const grpRawTs = source?.createdAt || source?.data?.createdAt || source?.sentAt || source?.data?.sentAt || source?.timestamp || source?.data?.timestamp;
+        const grpCreatedAt = grpRawTs
+          ? (typeof grpRawTs === 'number' ? new Date(grpRawTs).toISOString() : grpRawTs)
+          : new Date().toISOString();
+
+        // Build preview text for chat list
+        const isSystem = grpMessageType === 'system';
+        let previewText = grpText;
+        if (grpMessageType === 'image') previewText = 'Photo';
+        else if (grpMessageType === 'video') previewText = 'Video';
+        else if (grpMessageType === 'audio') previewText = 'Audio';
+        else if (grpMessageType === 'file') previewText = 'Document';
+        else if (grpMessageType === 'location') previewText = 'Location';
+        else if (grpMessageType === 'contact') previewText = 'Contact';
+
+        const fullPreview = isSystem ? previewText : (grpSenderName ? `${grpSenderName}: ${previewText}` : previewText);
+
+        dispatch({
+          type: 'INCOMING_GROUP_MESSAGE',
+          payload: {
+            chatId: grpChatId,
+            groupId: grpGroupId,
+            senderId: grpSenderId,
+            senderName: grpSenderName,
+            text: fullPreview,
+            messageType: grpMessageType,
+            createdAt: grpCreatedAt,
+            messageId: grpMsgId,
+          },
+        });
+        return;
+      }
 
       // Check if this is a scheduled message being delivered now (scheduleTime passed)
       const schedTime = source?.scheduleTime || source?.schedule_time || source?.data?.scheduleTime;
@@ -1893,6 +2071,70 @@ export function RealtimeChatProvider({ children }) {
       }
       const normalized = normalizeMessagePayload(payload);
       dispatch({ type: 'INCOMING_MESSAGE', payload: normalized });
+
+      // Persist to SQLite so messages are available when ChatScreen opens later
+      const msgId = normalized.serverMessageId || normalized.messageId || normalized.id;
+      if (msgId && !isSelf) {
+        const ts = normalized.createdAt ? new Date(normalized.createdAt).getTime() : Date.now();
+
+        // Extract reply data — server may send replyTo as object or string
+        const srcReplyTo = source?.replyTo;
+        const srcReplyIsObj = srcReplyTo && typeof srcReplyTo === 'object';
+        const replyToMsgId = source?.replyToMessageId || source?.quotedMessageId
+          || (srcReplyIsObj ? (srcReplyTo._id || srcReplyTo.id) : srcReplyTo)
+          || source?.reply_to_message_id || null;
+        const replyPreviewText = source?.replyPreviewText || source?.quotedText
+          || (srcReplyIsObj ? srcReplyTo.text : null) || null;
+        const replyPreviewType = source?.replyPreviewType
+          || (srcReplyIsObj ? (srcReplyTo.messageType || srcReplyTo.type) : null) || null;
+        const replySenderId = source?.replySenderId
+          || (srcReplyIsObj ? (srcReplyTo.senderId || srcReplyTo.sender?._id) : null) || null;
+        const replySenderName = source?.replySenderName || source?.quotedSender
+          || (srcReplyIsObj ? (srcReplyTo.senderName || srcReplyTo.sender?.fullName) : null) || null;
+
+        ChatDatabase.upsertMessage({
+          id: msgId,
+          serverMessageId: msgId,
+          tempId: normalized.tempId || null,
+          chatId: normalized.chatId,
+          senderId: normalized.senderId,
+          text: normalized.text || '',
+          type: source?.messageType || source?.type || 'text',
+          status: normalized.status || 'sent',
+          timestamp: Number.isFinite(ts) ? ts : Date.now(),
+          createdAt: normalized.createdAt,
+          synced: 1,
+          mediaUrl: source?.mediaUrl || null,
+          mediaType: source?.mediaType || null,
+          replyToMessageId: replyToMsgId,
+          replyPreviewText,
+          replyPreviewType,
+          replySenderName,
+          replySenderId,
+        }).catch(() => {});
+
+        // Save reply data to permanent reply table
+        if (replyToMsgId) {
+          ChatDatabase.saveReplyData(msgId, {
+            replyToMessageId: replyToMsgId,
+            replyPreviewText,
+            replyPreviewType,
+            replySenderName,
+            replySenderId,
+          }).catch(() => {});
+        }
+
+        // Update chatlist in SQLite — last message + unread count
+        ChatDatabase.updateChatLastMessage(normalized.chatId, {
+          text: normalized.text || '',
+          type: source?.messageType || source?.type || 'text',
+          senderId: normalized.senderId,
+          status: normalized.status || 'sent',
+          createdAt: normalized.createdAt,
+          serverMessageId: msgId,
+        }).catch(() => {});
+        ChatDatabase.incrementChatUnread(normalized.chatId).catch(() => {});
+      }
     };
 
     const dispatchLastMessageStatusUpdate = (payload, fallbackStatus) => {
@@ -1952,6 +2194,23 @@ export function RealtimeChatProvider({ children }) {
     const onOffline = (payload) => handlePresenceUpdate({ ...payload, status: 'offline' });
     const onTypingStartSocket = (payload) => handleTypingStart(payload);
     const onTypingStopSocket = (payload) => handleTypingStop(payload);
+
+    // Group typing handlers — server broadcasts group:typing:started / group:typing:stopped
+    const onGroupTypingStarted = (payload) => {
+      const source = unwrapPayload(payload);
+      const groupId = normalizeId(source?.groupId);
+      const senderId = normalizeId(source?.senderId || source?.userId);
+      if (!groupId || !senderId) return;
+      // Skip own typing
+      if (currentUserIdRef.current && String(senderId) === String(currentUserIdRef.current)) return;
+      handleTypingStart({ chatId: groupId, senderId, userId: senderId, messageType: source?.messageType });
+    };
+    const onGroupTypingStopped = (payload) => {
+      const source = unwrapPayload(payload);
+      const groupId = normalizeId(source?.groupId);
+      if (!groupId) return;
+      handleTypingStop({ chatId: groupId });
+    };
     const onPresenceFetchResponse = (payload) => {
       const source = unwrapPayload(payload);
       const rows = source?.users || source?.presence || source || [];
@@ -1960,18 +2219,21 @@ export function RealtimeChatProvider({ children }) {
     };
     const onTypingIndicator = (payload) => {
       const source = unwrapPayload(payload);
-      if (!source?.chatId) return;
+      const chatId = source?.chatId || source?.groupId;
+      if (!chatId) return;
+
+      // Skip own typing events
+      const senderId = normalizeId(source?.senderId || source?.userId);
+      if (senderId && currentUserIdRef.current && String(senderId) === String(currentUserIdRef.current)) return;
 
       if (source?.isTyping) {
         handleTypingStart({
-          chatId: source.chatId,
-          userId: source.userId,
+          chatId,
+          userId: source.userId || source.senderId,
           messageType: source.messageType,
         });
       } else {
-        handleTypingStop({
-          chatId: source.chatId,
-        });
+        handleTypingStop({ chatId });
       }
     };
     const flushChatListUpdates = () => {
@@ -2319,6 +2581,10 @@ export function RealtimeChatProvider({ children }) {
     socket.on('typing:start', onTypingStartSocket);
     socket.on('typing:stop', onTypingStopSocket);
     socket.on('typing:indicator', onTypingIndicator);
+    socket.on('group:typing:started', onGroupTypingStarted);
+    socket.on('group:typing:stopped', onGroupTypingStopped);
+    socket.on('group:typing:start', onGroupTypingStarted);
+    socket.on('group:typing:stop', onGroupTypingStopped);
     socket.on('chat:list:update', onChatListUpdate);
     socket.on('message:edit:response', onMessageEditedForChatList);
     socket.on('message:edited', onMessageEditedForChatList);
@@ -2370,14 +2636,38 @@ export function RealtimeChatProvider({ children }) {
         data.scheduleTimeLabel = null;
       }
       const groupId = normalizeId(data?.groupId);
-      const chatId = normalizeId(data?.chatId);
+      const chatId = normalizeId(data?.chatId) || groupId; // fallback chatId to groupId
       if (!chatId && !groupId) return;
 
       const senderId = normalizeId(data?.senderId);
-      const senderName = data?.senderName || data?.sender?.fullName || '';
+
+      // Resolve senderName: payload may not include it, so look up from group members in chatMap
+      let senderName = data?.senderName || data?.sender?.fullName || '';
+      if (!senderName && senderId) {
+        const currentState = stateRef.current;
+        const resolvedKey = (chatId && currentState.chatMap[chatId])
+          ? chatId
+          : (groupId && currentState.chatMap[groupId])
+            ? groupId
+            : findChatIdByGroupId(currentState.chatMap, groupId || chatId);
+        const groupEntry = resolvedKey ? currentState.chatMap[resolvedKey] : null;
+        if (groupEntry) {
+          const members = Array.isArray(groupEntry.members) ? groupEntry.members : (Array.isArray(groupEntry.participants) ? groupEntry.participants : []);
+          const member = members.find((m) => {
+            const mId = normalizeId(m?.userId || m?._id || m?.id);
+            return mId && mId === String(senderId);
+          });
+          senderName = member?.fullName || member?.username || member?.name || '';
+        }
+      }
+
       const text = data?.text || '';
       const messageType = data?.messageType || data?.type || 'text';
-      const createdAt = data?.createdAt || new Date().toISOString();
+      // Handle both ISO string (createdAt) and epoch ms (sentAt) timestamps
+      const rawTimestamp = data?.createdAt || data?.sentAt || data?.timestamp;
+      const createdAt = rawTimestamp
+        ? (typeof rawTimestamp === 'number' ? new Date(rawTimestamp).toISOString() : rawTimestamp)
+        : new Date().toISOString();
 
       // Build preview text for chat list
       const isSystemMsg = messageType === 'system';
@@ -2392,6 +2682,8 @@ export function RealtimeChatProvider({ children }) {
       // System messages show as-is (no sender prefix)
       const fullPreview = isSystemMsg ? previewText : (senderName ? `${senderName}: ${previewText}` : previewText);
 
+      const resolvedMessageId = normalizeId(data?.messageId || data?._id);
+
       dispatch({
         type: 'INCOMING_GROUP_MESSAGE',
         payload: {
@@ -2402,14 +2694,138 @@ export function RealtimeChatProvider({ children }) {
           text: fullPreview,
           messageType,
           createdAt,
-          messageId: normalizeId(data?.messageId || data?._id),
+          messageId: resolvedMessageId,
           tempId: data?.tempId,
         },
       });
+
+      // Persist to SQLite so messages are available when ChatScreen opens later
+      if (resolvedMessageId && !isSelf) {
+        const ts = rawTimestamp
+          ? (typeof rawTimestamp === 'number' ? rawTimestamp : new Date(rawTimestamp).getTime())
+          : Date.now();
+        // Extract reply data from the payload — server may send replyTo as object or string
+        const rawReplyTo = data?.replyTo;
+        const replyIsObject = rawReplyTo && typeof rawReplyTo === 'object';
+        const replyToMessageId = data?.replyToMessageId || data?.quotedMessageId
+          || (replyIsObject ? (rawReplyTo._id || rawReplyTo.id) : rawReplyTo)
+          || data?.reply_to_message_id || null;
+        const replyPreviewText = data?.replyPreviewText || data?.quotedText || data?.reply_preview_text
+          || (replyIsObject ? rawReplyTo.text : null) || null;
+        const replyPreviewType = data?.replyPreviewType || data?.reply_preview_type
+          || (replyIsObject ? (rawReplyTo.messageType || rawReplyTo.type) : null) || null;
+
+        // Resolve reply sender name — try payload, then replyTo object, then group members
+        let replySenderId = data?.replySenderId || data?.reply_sender_id
+          || (replyIsObject ? (rawReplyTo.senderId || rawReplyTo.sender?._id) : null) || null;
+        let replySenderName = data?.replySenderName || data?.quotedSender || data?.reply_sender_name
+          || (replyIsObject ? (rawReplyTo.senderName || rawReplyTo.sender?.fullName || rawReplyTo.sender?.name) : null) || null;
+        if (!replySenderName && replySenderId) {
+          const currentState = stateRef.current;
+          if (currentState.currentUserId && String(replySenderId) === String(currentState.currentUserId)) {
+            replySenderName = 'You';
+          } else if (groupEntry) {
+            const mbrs = Array.isArray(groupEntry.members) ? groupEntry.members : (Array.isArray(groupEntry.participants) ? groupEntry.participants : []);
+            const rm = mbrs.find((m) => {
+              const mId = normalizeId(m?.userId || m?._id || m?.id);
+              return mId && String(mId) === String(replySenderId);
+            });
+            replySenderName = rm?.fullName || rm?.username || rm?.name || null;
+          }
+        }
+
+        ChatDatabase.upsertMessage({
+          id: resolvedMessageId,
+          serverMessageId: resolvedMessageId,
+          tempId: data?.tempId || null,
+          chatId: chatId || groupId,
+          groupId: groupId || chatId,
+          senderId,
+          senderName: senderName || null,
+          text: text || '',
+          type: messageType || 'text',
+          status: data?.status || 'sent',
+          timestamp: ts,
+          createdAt,
+          synced: 1,
+          mediaUrl: data?.mediaUrl || null,
+          mediaType: data?.mediaType || null,
+          replyToMessageId: replyToMessageId || null,
+          replyPreviewText: replyPreviewText || null,
+          replyPreviewType: replyPreviewType || null,
+          replySenderName: replySenderName || null,
+          replySenderId: replySenderId || null,
+          contact: data?.contact ? JSON.stringify(data.contact) : null,
+          forwardedFrom: data?.forwardedFrom || null,
+        }).catch(() => {});
+
+        // Save reply data to permanent reply table
+        if (replyToMessageId && resolvedMessageId) {
+          ChatDatabase.saveReplyData(resolvedMessageId, {
+            replyToMessageId,
+            replyPreviewText,
+            replyPreviewType,
+            replySenderName,
+            replySenderId,
+          }).catch(() => {});
+        }
+
+        // Update chatlist in SQLite — last message + unread count
+        const chatKey = chatId || groupId;
+        ChatDatabase.updateChatLastMessage(chatKey, {
+          text: fullPreview,
+          type: messageType,
+          senderId,
+          senderName,
+          status: data?.status || 'sent',
+          createdAt,
+          serverMessageId: resolvedMessageId,
+        }).catch(() => {});
+        ChatDatabase.incrementChatUnread(chatKey).catch(() => {});
+      }
     };
 
     socket.on('group:message:new', onGroupMessageNew);
     socket.on('group:message:received', onGroupMessageNew);
+
+    // ─── GROUP MESSAGE DELETE (chat list update) ───
+    // Only listen to the broadcast event (group:message:deleted).
+    // group:message:delete:success is sender-only confirmation — not needed here
+    // because the sender's chat screen already updated optimistically.
+    const onGroupMessageDeleteForChatList = (payload) => {
+      const source = payload?.data || payload;
+      if (source?.status === false) return;
+
+      const messageId = normalizeId(source?.messageId || source?._id || source?.id);
+      const groupId = normalizeId(source?.groupId || source?.group?._id);
+      const chatId = normalizeId(source?.chatId) || groupId;
+      if (!messageId || !chatId) return;
+
+      const isEveryoneDel = Boolean(source?.deleteForEveryone);
+      if (!isEveryoneDel) return;
+
+      const deletedBy = normalizeId(source?.deletedBy || source?.senderId || source?.userId);
+      const placeholderText = deletedBy && deletedBy === state.currentUserId
+        ? 'You deleted this message'
+        : 'This message was deleted';
+
+      // Update chat list preview if this was the last message
+      dispatch({
+        type: 'UPDATE_LAST_MESSAGE_DELETED',
+        payload: { chatId, messageId, placeholderText },
+      });
+
+      // Persist message deletion to SQLite
+      ChatDatabase.markMessageDeleted(messageId, deletedBy, placeholderText).catch(() => {});
+
+      // Update SQLite chats row if this was the last message
+      ChatDatabase.updateChatLastMessage(chatId, {
+        text: placeholderText,
+        type: 'system',
+        isDeleted: true,
+      }).catch(() => {});
+    };
+    socket.on('group:message:deleted', onGroupMessageDeleteForChatList);
 
     // ─── GROUP SOCKET LISTENERS ───
 
@@ -2842,6 +3258,10 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('typing:start', onTypingStartSocket),
       () => socket.off('typing:stop', onTypingStopSocket),
       () => socket.off('typing:indicator', onTypingIndicator),
+      () => socket.off('group:typing:started', onGroupTypingStarted),
+      () => socket.off('group:typing:stopped', onGroupTypingStopped),
+      () => socket.off('group:typing:start', onGroupTypingStarted),
+      () => socket.off('group:typing:stop', onGroupTypingStopped),
       () => socket.off('chat:list:update', onChatListUpdate),
       () => socket.off('message:edit:response', onMessageEditedForChatList),
       () => socket.off('message:edited', onMessageEditedForChatList),
@@ -2856,6 +3276,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:cleared:everyone', onChatCleared),
       () => socket.off('group:message:new', onGroupMessageNew),
       () => socket.off('group:message:received', onGroupMessageNew),
+      () => socket.off('group:message:deleted', onGroupMessageDeleteForChatList),
       () => socket.off('group:joined', onGroupJoined),
       () => socket.off('group:left', onGroupLeft),
       () => socket.off('group:member:joined', onGroupMemberJoined),
@@ -2955,21 +3376,19 @@ export function RealtimeChatProvider({ children }) {
     };
   }, [attachSocketListeners, clearTypingTimer, detachSocketListeners]);
 
+  // ─── SQLite-first chatlist loading ───
+  // Load chatlist from SQLite on mount. No API call needed if data exists.
   useEffect(() => {
     let cancelled = false;
 
-    const loadCachedChatList = async () => {
+    const loadChatListFromSQLite = async () => {
       try {
-        const raw = await AsyncStorage.getItem(CHAT_LIST_CACHE_KEY);
-        if (!raw || cancelled) {
+        const chats = await ChatDatabase.loadChatList({ includeArchived: true });
+        if (cancelled) return;
+        if (chats.length > 0) {
+          dispatch({ type: 'HYDRATE_CHAT_CACHE', payload: chats });
+        } else {
           dispatch({ type: 'HYDRATE_CHAT_CACHE', payload: [] });
-          return;
-        }
-
-        const parsed = JSON.parse(raw);
-        const list = Array.isArray(parsed) ? parsed : [];
-        if (!cancelled) {
-          dispatch({ type: 'HYDRATE_CHAT_CACHE', payload: list });
         }
       } catch {
         if (!cancelled) {
@@ -2978,12 +3397,12 @@ export function RealtimeChatProvider({ children }) {
       }
     };
 
-    loadCachedChatList();
-    return () => {
-      cancelled = true;
-    };
+    loadChatListFromSQLite();
+    return () => { cancelled = true; };
   }, []);
 
+  // ─── Debounced SQLite chatlist save ───
+  // Persist chatMap changes to SQLite chats table (replaces AsyncStorage cache)
   useEffect(() => {
     if (!state.hasHydratedCache) return;
 
@@ -2993,8 +3412,8 @@ export function RealtimeChatProvider({ children }) {
 
     storageSaveTimerRef.current = setTimeout(async () => {
       try {
-        const payload = buildStorageChatList(state);
-        await AsyncStorage.setItem(CHAT_LIST_CACHE_KEY, JSON.stringify(payload));
+        const chatList = buildStorageChatList(state);
+        await ChatDatabase.upsertChats(chatList);
       } catch {
         // noop
       }
@@ -3042,7 +3461,7 @@ export function RealtimeChatProvider({ children }) {
     dispatch({ type: 'RESET_STATE', payload: { currentUserId: state.currentUserId || null } });
   }, [state.currentUserId]);
 
-  const hydrateChats = useCallback(async (chats) => {
+  const hydrateChats = useCallback(async (chats, opts = {}) => {
     dispatch({ type: 'HYDRATE_CHATS', payload: chats || [] });
     const tempMap = {};
     (chats || []).forEach((chat) => {
@@ -3050,6 +3469,11 @@ export function RealtimeChatProvider({ children }) {
       if (chatId) tempMap[chatId] = chat;
     });
     subscribePresenceForChats(tempMap);
+
+    // Persist chatlist to SQLite (write-through on API sync / initial load)
+    if (!opts.skipSQLiteWrite) {
+      ChatDatabase.upsertChats(chats || []).catch(() => {});
+    }
 
     // Sync lastMessage from SQLite — SQLite is the source of truth for message content.
     // The API/cache may have stale lastMessage (before edit/delete).
@@ -3144,6 +3568,8 @@ export function RealtimeChatProvider({ children }) {
 
   const markChatRead = useCallback((chatId) => {
     deferDispatch({ type: 'MARK_READ', payload: chatId });
+    // Reset unread in SQLite
+    if (chatId) ChatDatabase.updateChatUnread(chatId, 0).catch(() => {});
   }, [deferDispatch]);
 
   const onLocalOutgoingMessage = useCallback((message) => {
@@ -3485,6 +3911,7 @@ export function RealtimeChatProvider({ children }) {
         chat: item,
         currentUserId: state.currentUserId,
         isTyping: Boolean(typing?.isTyping),
+        typingUserName: typing?.userName || null,
       });
 
       return {
@@ -3517,6 +3944,7 @@ export function RealtimeChatProvider({ children }) {
         chat: item,
         currentUserId: state.currentUserId,
         isTyping: Boolean(typing?.isTyping),
+        typingUserName: typing?.userName || null,
       });
 
       return {

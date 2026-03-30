@@ -144,10 +144,10 @@ export default function LinkDevice({ navigation }) {
                <View style={{ width: '100%', height: 250, }} >
                 <Image source={require('../../../assets/images/devicelink.png')} style={{ width:'100%', height:'100%', resizeMode:'contain' }} />
                </View>
-               {/* <TouchableOpacity activeOpacity={0.9} style={{ width:'100%', height:45, flexDirection:'row', gap:5, backgroundColor:theme.colors.themeColor, alignItems:'center', justifyContent:'center', borderRadius:40, marginVertical:10 }} >
+               <TouchableOpacity onPress={() => navigation.navigate('QRScanner')} activeOpacity={0.9} style={{ width:'100%', height:45, flexDirection:'row', gap:5, backgroundColor:theme.colors.themeColor, alignItems:'center', justifyContent:'center', borderRadius:40, marginVertical:10 }} >
                  <Entypo name="plus" size={20} color={theme.colors.textWhite} />
                  <Text style={{ color:theme.colors.textWhite, fontFamily:'Roboto-Medium', fontSize:16, }} >Link a device</Text>
-               </TouchableOpacity> */}
+               </TouchableOpacity>
                  <View>
                     <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Roboto-Medium', fontSize:14, }} >Linked Devices</Text>
                     <Text style={{ color:theme.colors.placeHolderTextColor, fontFamily:'Roboto-Regular', fontSize:12, }} >Tap a device to logout</Text>

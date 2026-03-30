@@ -2,8 +2,10 @@ import React from 'react';
 import { View, StyleSheet, TouchableOpacity, Text } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
 import { WebView } from 'react-native-webview';
-import { WEB_URL } from '@env';
-import { FontAwesome6 } from '@expo/vector-icons'
+import { WEB_URL, BACKEND_URL } from '@env';
+import { FontAwesome6 } from '@expo/vector-icons';
+
+const BASE_URL = WEB_URL || (BACKEND_URL ? BACKEND_URL.replace('/api/v2/', '') : '');
 
 export default function Term({ navigation }) {
   const { theme } = useTheme();
@@ -17,7 +19,7 @@ export default function Term({ navigation }) {
         <Text style={{ color: theme.colors.primaryTextColor, fontSize:16, fontFamily:'Roboto-Regular' }} >Term and Conditions</Text>
       </View>
       <WebView
-        source={{ uri: `${WEB_URL}/webview/terms-and-conditions` }}
+        source={{ uri: `${BASE_URL}/webview/terms-and-conditions` }}
         style={{ flex:1 }}
         startInLoadingState={true}
       />

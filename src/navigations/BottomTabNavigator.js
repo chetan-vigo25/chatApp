@@ -56,7 +56,9 @@ export default function BottomTabNavigator() {
       screenOptions={{
         headerShown: false,
         lazy: true,
+        animationEnabled: false,
       }}
+      detachInactiveScreens
       initialRouteName="ChatListTab"
     >
       <Tab.Screen name="ChatListTab" component={ChatList} />

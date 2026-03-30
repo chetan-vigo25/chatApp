@@ -1,32 +1,52 @@
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'vibeconnect_chat.db';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 let _db = null;
 let _hasReplyColumns = false;
 
 // ─── DATABASE INIT ──────────────────────────────────────
+let _dbInitPromise = null;
+
 const getDB = async () => {
-  if (_db) return _db;
+  if (_db) {
+    // Verify connection is still alive
+    try {
+      await _db.getFirstAsync('SELECT 1');
+      return _db;
+    } catch {
+      _db = null;
+      _dbInitPromise = null;
+    }
+  }
+  // Prevent concurrent init attempts
+  if (_dbInitPromise) return _dbInitPromise;
+  _dbInitPromise = _initDB();
   try {
-    _db = await SQLite.openDatabaseAsync(DB_NAME);
-    await _db.execAsync('PRAGMA journal_mode = WAL;');
-    await _db.execAsync('PRAGMA synchronous = NORMAL;');
-    await _db.execAsync('PRAGMA foreign_keys = ON;');
-    await runMigrations(_db);
-  } catch (err) {
-    console.error('[ChatDB] getDB error:', err);
-    _db = null;
+    return await _dbInitPromise;
+  } finally {
+    _dbInitPromise = null;
+  }
+};
+
+const _initDB = async () => {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       _db = await SQLite.openDatabaseAsync(DB_NAME);
       await _db.execAsync('PRAGMA journal_mode = WAL;');
+      await _db.execAsync('PRAGMA synchronous = NORMAL;');
+      await _db.execAsync('PRAGMA foreign_keys = ON;');
       await runMigrations(_db);
-    } catch (e) {
-      console.error('[ChatDB] getDB retry failed:', e);
+      return _db;
+    } catch (err) {
+      console.error(`[ChatDB] getDB attempt ${attempt + 1} failed:`, err?.message);
+      _db = null;
+      if (attempt < 2) await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
     }
   }
-  return _db;
+  console.error('[ChatDB] All DB init attempts failed');
+  return null;
 };
 
 const runMigrations = async (db) => {
@@ -136,6 +156,56 @@ const runMigrations = async (db) => {
         `);
       } catch (e) {
         console.warn('[ChatDB] V5 migration warning:', e?.message);
+      }
+    }
+
+    // V6: Add chats table (chatlist in SQLite) + sync_meta table
+    if (currentVersion < 6) {
+      try {
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS chats (
+            chat_id TEXT PRIMARY KEY NOT NULL,
+            chat_type TEXT DEFAULT 'private',
+            is_group INTEGER DEFAULT 0,
+            peer_user TEXT,
+            group_data TEXT,
+            group_id TEXT,
+            chat_name TEXT,
+            chat_avatar TEXT,
+            last_message_text TEXT,
+            last_message_type TEXT DEFAULT 'text',
+            last_message_sender_id TEXT,
+            last_message_sender_name TEXT,
+            last_message_status TEXT,
+            last_message_at TEXT,
+            last_message_id TEXT,
+            last_message_is_edited INTEGER DEFAULT 0,
+            last_message_is_deleted INTEGER DEFAULT 0,
+            unread_count INTEGER DEFAULT 0,
+            is_pinned INTEGER DEFAULT 0,
+            pinned_at TEXT,
+            is_muted INTEGER DEFAULT 0,
+            mute_until TEXT,
+            is_archived INTEGER DEFAULT 0,
+            members TEXT,
+            member_count INTEGER DEFAULT 0,
+            created_at TEXT,
+            updated_at INTEGER DEFAULT 0,
+            raw_data TEXT
+          );
+          CREATE INDEX IF NOT EXISTS idx_chats_last_message_at ON chats(last_message_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_chats_pinned ON chats(is_pinned);
+          CREATE INDEX IF NOT EXISTS idx_chats_archived ON chats(is_archived);
+          CREATE INDEX IF NOT EXISTS idx_chats_group_id ON chats(group_id);
+
+          CREATE TABLE IF NOT EXISTS sync_meta (
+            key TEXT PRIMARY KEY NOT NULL,
+            value TEXT,
+            updated_at INTEGER DEFAULT 0
+          );
+        `);
+      } catch (e) {
+        console.warn('[ChatDB] V6 migration warning:', e?.message);
       }
     }
 
@@ -727,28 +797,32 @@ const _preserveLocalState = async (db, msg) => {
 const loadMessages = async (chatId, opts = {}) => {
   if (!chatId) return [];
   const db = await getDB();
-  const { limit = 50, offset = 0, afterTimestamp = 0 } = opts;
+  const { limit = 50, offset = 0, afterTimestamp = 0, skipCleanup = false } = opts;
 
-  // ── STEP 1: Nuclear SQL cleanup — delete ALL orphan temp rows in this chat ──
-  // A temp row is orphan if ANY non-temp row exists with same sender+text within 30s
-  try {
-    await db.runAsync(
-      `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND EXISTS (
-         SELECT 1 FROM messages s WHERE s.chat_id = $cid AND s.id != messages.id
-           AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id
-           AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000
-       )`,
-      { $cid: chatId }
-    );
-  } catch (e) { console.warn('[ChatDB:loadMessages] cleanup error:', e?.message); }
+  // ── STEP 1: Lightweight cleanup — only run on first load (not every refresh) ──
+  if (!skipCleanup) {
+    try {
+      await db.runAsync(
+        `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND server_message_id IS NOT NULL`,
+        { $cid: chatId }
+      );
+    } catch {}
+  }
 
-  // ── STEP 2: Load raw rows ──
-  const rows = await db.getAllAsync(
-    `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
-    { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
-  );
+  // ── STEP 2: Load raw rows using indexed query ──
+  const rows = afterTimestamp > 0
+    ? await db.getAllAsync(
+        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+        { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
+      )
+    : await db.getAllAsync(
+        `SELECT * FROM messages WHERE chat_id = $cid ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+        { $cid: chatId, $lim: limit, $off: offset }
+      );
 
-  // ── STEP 3: Batch-lookup reply data from message_replies table ──
+  if (rows.length === 0) return [];
+
+  // ── STEP 3: Batch-lookup reply data ──
   let replyMap = {};
   try {
     const allIds = [];
@@ -758,64 +832,52 @@ const loadMessages = async (chatId, opts = {}) => {
       if (row.temp_id && row.temp_id !== row.id) allIds.push(row.temp_id);
     }
     if (allIds.length > 0) {
-      const ph = allIds.map(() => '?').join(',');
-      const replyRows = await db.getAllAsync(`SELECT * FROM message_replies WHERE message_id IN (${ph})`, allIds);
-      for (const r of replyRows) {
-        replyMap[r.message_id] = {
-          replyToMessageId: r.reply_to_message_id,
-          replyPreviewText: r.reply_preview_text,
-          replyPreviewType: r.reply_preview_type,
-          replySenderName: r.reply_sender_name,
-          replySenderId: r.reply_sender_id,
-        };
+      const BATCH = 200;
+      for (let i = 0; i < allIds.length; i += BATCH) {
+        const batch = allIds.slice(i, i + BATCH);
+        const ph = batch.map(() => '?').join(',');
+        const replyRows = await db.getAllAsync(`SELECT * FROM message_replies WHERE message_id IN (${ph})`, batch);
+        for (const r of replyRows) {
+          replyMap[r.message_id] = {
+            replyToMessageId: r.reply_to_message_id,
+            replyPreviewText: r.reply_preview_text,
+            replyPreviewType: r.reply_preview_type,
+            replySenderName: r.reply_sender_name,
+            replySenderId: r.reply_sender_id,
+          };
+        }
       }
     }
   } catch {}
 
-  // ── STEP 4: Convert rows to message objects, enrich with reply data ──
-  const allMsgs = rows.map(row => {
+  // ── STEP 4: Convert rows + enrich with reply data ──
+  const allMsgs = [];
+  for (const row of rows) {
     const msg = rowToMsg(row);
-    if (msg && !msg.replyToMessageId) {
+    if (!msg) continue;
+    if (!msg.replyToMessageId) {
       const rd = replyMap[msg.id] || replyMap[msg.serverMessageId] || replyMap[msg.tempId];
       if (rd) Object.assign(msg, rd);
     }
-    return msg;
-  }).filter(Boolean);
+    allMsgs.push(msg);
+  }
 
-  // ── STEP 5: BULLETPROOF JS DEDUP — zero duplicates guaranteed ──
-  // Uses a fingerprint map: for each message, generate a fingerprint from sender+text+rounded_timestamp.
-  // If two messages share ANY ID or have the same fingerprint, keep only one (prefer server-confirmed).
+  // ── STEP 5: Fast ID-based dedup (fingerprint only needed for temp rows) ──
   const seenIds = new Set();
-  const fingerprintMap = new Map(); // fingerprint → first msg that claimed it
   const result = [];
 
   for (const msg of allMsgs) {
-    // Check ALL IDs
     const ids = [msg.serverMessageId, msg.id, msg.tempId].filter(Boolean);
-    if (ids.some(id => seenIds.has(id))) continue; // already seen by ID
+    if (ids.some(id => seenIds.has(id))) continue;
 
-    // Fingerprint: sender + text + 30s rounded timestamp
-    // 30s window is wide enough to catch any client/server clock difference
-    let dominated = false;
-    if (msg.senderId && msg.text != null) {
+    // Only fingerprint-check temp rows — server-confirmed rows are unique by ID
+    if (msg.id && String(msg.id).startsWith('temp_') && msg.senderId && msg.text != null) {
       const roundedTs = Math.round((msg.timestamp || 0) / 30000);
       const fp = `${msg.senderId}|${msg.text}|${roundedTs}`;
-      // Also check ±1 bucket to handle boundary cases
-      const fpPrev = `${msg.senderId}|${msg.text}|${roundedTs - 1}`;
-      const fpNext = `${msg.senderId}|${msg.text}|${roundedTs + 1}`;
-
-      const existing = fingerprintMap.get(fp) || fingerprintMap.get(fpPrev) || fingerprintMap.get(fpNext);
-      if (existing) {
-        // Duplicate found! Skip this one.
-        dominated = true;
-      } else {
-        fingerprintMap.set(fp, msg);
-      }
+      if (seenIds.has(fp) || seenIds.has(`${msg.senderId}|${msg.text}|${roundedTs - 1}`) || seenIds.has(`${msg.senderId}|${msg.text}|${roundedTs + 1}`)) continue;
+      seenIds.add(fp);
     }
 
-    if (dominated) continue;
-
-    // Register all IDs
     for (const id of ids) seenIds.add(id);
     result.push(msg);
   }
@@ -962,8 +1024,8 @@ const markMessageDeleted = async (messageId, deletedBy, placeholderText) => {
   if (!messageId) return;
   const db = await getDB();
   await db.runAsync(
-    `UPDATE messages SET is_deleted = 1, deleted_for = 'everyone', deleted_by = $by, placeholder_text = $ph, text = 'This message was deleted', media_url = NULL, preview_url = NULL, local_uri = NULL WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
-    { $id: messageId, $by: deletedBy || null, $ph: placeholderText || null }
+    `UPDATE messages SET is_deleted = 1, deleted_for = 'everyone', deleted_by = $by, placeholder_text = $ph, text = $ph, type = 'system', media_url = NULL, media_type = NULL, preview_url = NULL, local_uri = NULL WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+    { $id: messageId, $by: deletedBy || null, $ph: placeholderText || 'This message was deleted' }
   );
 };
 
@@ -1067,7 +1129,276 @@ const bulkUpdateStatus = async (chatId, newStatus, opts = {}) => {
 };
 
 const closeDB = async () => {
-  if (_db) { await _db.closeAsync(); _db = null; }
+  _dbInitPromise = null;
+  if (_db) {
+    try { await _db.closeAsync(); } catch {}
+    _db = null;
+  }
+};
+
+// ─── CHATLIST (chats table) ──────────────────────────────
+
+const _chatToRow = (chat) => {
+  if (!chat) return null;
+  const chatId = chat.chatId || chat._id;
+  if (!chatId) return null;
+  const isGroup = chat.chatType === 'group' || Boolean(chat.isGroup);
+  const lm = chat.lastMessage || {};
+  // Handle peerUser from flat API format (peerUserId + chatName + chatAvatar)
+  const peerUserObj = isGroup ? null : (chat.peerUser || chat.otherUser || (chat.peerUserId ? { _id: chat.peerUserId, fullName: chat.chatName, profileImage: chat.chatAvatar } : null));
+  return {
+    $chatId: String(chatId),
+    $chatType: chat.chatType || (isGroup ? 'group' : 'private'),
+    $isGroup: isGroup ? 1 : 0,
+    $peerUser: isGroup ? null : JSON.stringify(peerUserObj),
+    $groupData: isGroup ? JSON.stringify(chat.group || (chat.groupId ? { _id: chat.groupId, name: chat.chatName, avatar: chat.chatAvatar } : null)) : null,
+    $groupId: chat.groupId || chat.group?._id || (isGroup ? chatId : null),
+    $chatName: chat.chatName || chat.groupName || chat.group?.name || peerUserObj?.fullName || null,
+    $chatAvatar: chat.chatAvatar || chat.groupAvatar || chat.group?.avatar || peerUserObj?.profileImage || null,
+    $lmText: lm.text || null,
+    $lmType: lm.type || lm.messageType || 'text',
+    $lmSenderId: lm.senderId || null,
+    $lmSenderName: lm.senderName || null,
+    $lmStatus: lm.status || null,
+    $lmAt: chat.lastMessageAt || lm.createdAt || null,
+    $lmId: lm.serverMessageId || lm.messageId || lm.id || null,
+    $lmEdited: lm.isEdited ? 1 : 0,
+    $lmDeleted: lm.isDeleted ? 1 : 0,
+    $unread: Number(chat.unreadCount || 0),
+    $pinned: chat.isPinned ? 1 : 0,
+    $pinnedAt: chat.pinnedAt || null,
+    $muted: chat.isMuted ? 1 : 0,
+    $muteUntil: chat.muteUntil || null,
+    $archived: (chat.isArchived || chat.archived) ? 1 : 0,
+    $members: isGroup && Array.isArray(chat.members) ? JSON.stringify(chat.members) : null,
+    $memberCount: chat.memberCount || chat.members?.length || 0,
+    $createdAt: chat.createdAt || null,
+    $updatedAt: Date.now(),
+    $rawData: JSON.stringify(chat),
+  };
+};
+
+const _rowToChat = (row) => {
+  if (!row) return null;
+  const peerUser = parseJSON(row.peer_user);
+  const group = parseJSON(row.group_data);
+  const members = parseJSON(row.members);
+  const raw = parseJSON(row.raw_data) || {};
+  const isGroup = Boolean(row.is_group);
+  return {
+    ...raw,
+    chatId: row.chat_id,
+    _id: row.chat_id,
+    chatType: row.chat_type || 'private',
+    isGroup,
+    peerUser: isGroup ? null : (peerUser || null),
+    otherUser: isGroup ? null : (peerUser || null),
+    group: group || null,
+    groupId: row.group_id || null,
+    chatName: row.chat_name || null,
+    chatAvatar: row.chat_avatar || null,
+    groupName: row.chat_name || null,
+    groupAvatar: row.chat_avatar || null,
+    lastMessage: {
+      text: row.last_message_text || '',
+      type: row.last_message_type || 'text',
+      senderId: row.last_message_sender_id || null,
+      senderName: row.last_message_sender_name || null,
+      status: row.last_message_status || null,
+      createdAt: row.last_message_at || null,
+      serverMessageId: row.last_message_id || null,
+      messageId: row.last_message_id || null,
+      isEdited: Boolean(row.last_message_is_edited),
+      isDeleted: Boolean(row.last_message_is_deleted),
+    },
+    lastMessageAt: row.last_message_at || null,
+    unreadCount: Number(row.unread_count || 0),
+    isPinned: Boolean(row.is_pinned),
+    pinnedAt: row.pinned_at || null,
+    isMuted: Boolean(row.is_muted),
+    muteUntil: row.mute_until || null,
+    isArchived: Boolean(row.is_archived),
+    members: Array.isArray(members) ? members : [],
+    memberCount: Number(row.member_count || 0),
+    createdAt: row.created_at || null,
+  };
+};
+
+const UPSERT_CHAT_SQL = `INSERT INTO chats (
+  chat_id, chat_type, is_group, peer_user, group_data, group_id,
+  chat_name, chat_avatar,
+  last_message_text, last_message_type, last_message_sender_id, last_message_sender_name,
+  last_message_status, last_message_at, last_message_id,
+  last_message_is_edited, last_message_is_deleted,
+  unread_count, is_pinned, pinned_at, is_muted, mute_until, is_archived,
+  members, member_count, created_at, updated_at, raw_data
+) VALUES (
+  $chatId, $chatType, $isGroup, $peerUser, $groupData, $groupId,
+  $chatName, $chatAvatar,
+  $lmText, $lmType, $lmSenderId, $lmSenderName,
+  $lmStatus, $lmAt, $lmId,
+  $lmEdited, $lmDeleted,
+  $unread, $pinned, $pinnedAt, $muted, $muteUntil, $archived,
+  $members, $memberCount, $createdAt, $updatedAt, $rawData
+) ON CONFLICT(chat_id) DO UPDATE SET
+  chat_type = $chatType, is_group = $isGroup,
+  peer_user = COALESCE($peerUser, peer_user),
+  group_data = COALESCE($groupData, group_data),
+  group_id = COALESCE($groupId, group_id),
+  chat_name = COALESCE($chatName, chat_name),
+  chat_avatar = COALESCE($chatAvatar, chat_avatar),
+  last_message_text = $lmText, last_message_type = $lmType,
+  last_message_sender_id = $lmSenderId, last_message_sender_name = $lmSenderName,
+  last_message_status = $lmStatus, last_message_at = $lmAt, last_message_id = $lmId,
+  last_message_is_edited = $lmEdited, last_message_is_deleted = $lmDeleted,
+  unread_count = $unread, is_pinned = $pinned, pinned_at = $pinnedAt,
+  is_muted = $muted, mute_until = $muteUntil, is_archived = $archived,
+  members = COALESCE($members, members),
+  member_count = CASE WHEN $memberCount > 0 THEN $memberCount ELSE member_count END,
+  updated_at = $updatedAt, raw_data = $rawData`;
+
+const upsertChat = async (chat) => {
+  const params = _chatToRow(chat);
+  if (!params) return;
+  const db = await getDB();
+  await db.runAsync(UPSERT_CHAT_SQL, params);
+};
+
+const upsertChats = async (chats) => {
+  if (!Array.isArray(chats) || chats.length === 0) return;
+  const db = await getDB();
+  for (const chat of chats) {
+    const params = _chatToRow(chat);
+    if (!params) continue;
+    try { await db.runAsync(UPSERT_CHAT_SQL, params); } catch {}
+  }
+};
+
+const loadChatList = async (opts = {}) => {
+  const db = await getDB();
+  const { includeArchived = false } = opts;
+  const sql = includeArchived
+    ? `SELECT * FROM chats ORDER BY is_pinned DESC, last_message_at DESC`
+    : `SELECT * FROM chats WHERE is_archived = 0 ORDER BY is_pinned DESC, last_message_at DESC`;
+  const rows = await db.getAllAsync(sql);
+  return rows.map(_rowToChat).filter(Boolean);
+};
+
+const loadArchivedChats = async () => {
+  const db = await getDB();
+  const rows = await db.getAllAsync(`SELECT * FROM chats WHERE is_archived = 1 ORDER BY last_message_at DESC`);
+  return rows.map(_rowToChat).filter(Boolean);
+};
+
+const getChatById = async (chatId) => {
+  if (!chatId) return null;
+  const db = await getDB();
+  const row = await db.getFirstAsync(`SELECT * FROM chats WHERE chat_id = $id OR group_id = $id LIMIT 1`, { $id: chatId });
+  return _rowToChat(row);
+};
+
+const updateChatLastMessage = async (chatId, lm) => {
+  if (!chatId || !lm) return;
+  const db = await getDB();
+  await db.runAsync(
+    `UPDATE chats SET
+      last_message_text = $text, last_message_type = $type,
+      last_message_sender_id = $senderId, last_message_sender_name = $senderName,
+      last_message_status = $status, last_message_at = $at, last_message_id = $id,
+      last_message_is_edited = $edited, last_message_is_deleted = $deleted,
+      updated_at = $now
+    WHERE chat_id = $chatId`,
+    {
+      $chatId: chatId,
+      $text: lm.text || null,
+      $type: lm.type || 'text',
+      $senderId: lm.senderId || null,
+      $senderName: lm.senderName || null,
+      $status: lm.status || null,
+      $at: lm.createdAt || lm.lastMessageAt || null,
+      $id: lm.serverMessageId || lm.messageId || null,
+      $edited: lm.isEdited ? 1 : 0,
+      $deleted: lm.isDeleted ? 1 : 0,
+      $now: Date.now(),
+    }
+  );
+};
+
+const updateChatUnread = async (chatId, count) => {
+  if (!chatId) return;
+  const db = await getDB();
+  await db.runAsync(`UPDATE chats SET unread_count = $c, updated_at = $n WHERE chat_id = $id`, { $c: count, $n: Date.now(), $id: chatId });
+};
+
+const incrementChatUnread = async (chatId) => {
+  if (!chatId) return;
+  const db = await getDB();
+  await db.runAsync(`UPDATE chats SET unread_count = unread_count + 1, updated_at = $n WHERE chat_id = $id`, { $n: Date.now(), $id: chatId });
+};
+
+const updateChatPin = async (chatId, isPinned, pinnedAt) => {
+  if (!chatId) return;
+  const db = await getDB();
+  await db.runAsync(`UPDATE chats SET is_pinned = $p, pinned_at = $at, updated_at = $n WHERE chat_id = $id`, { $p: isPinned ? 1 : 0, $at: pinnedAt || null, $n: Date.now(), $id: chatId });
+};
+
+const updateChatMute = async (chatId, isMuted, muteUntil) => {
+  if (!chatId) return;
+  const db = await getDB();
+  await db.runAsync(`UPDATE chats SET is_muted = $m, mute_until = $u, updated_at = $n WHERE chat_id = $id`, { $m: isMuted ? 1 : 0, $u: muteUntil || null, $n: Date.now(), $id: chatId });
+};
+
+const updateChatArchive = async (chatId, isArchived) => {
+  if (!chatId) return;
+  const db = await getDB();
+  await db.runAsync(`UPDATE chats SET is_archived = $a, updated_at = $n WHERE chat_id = $id`, { $a: isArchived ? 1 : 0, $n: Date.now(), $id: chatId });
+};
+
+const deleteChatRow = async (chatId) => {
+  if (!chatId) return;
+  const db = await getDB();
+  await db.runAsync(`DELETE FROM chats WHERE chat_id = $id`, { $id: chatId });
+};
+
+const getChatCount = async () => {
+  const db = await getDB();
+  const r = await db.getFirstAsync(`SELECT COUNT(*) as cnt FROM chats`);
+  return r?.cnt || 0;
+};
+
+// ─── SYNC META ──────────────────────────────────────────
+
+const getSyncMeta = async (key) => {
+  if (!key) return null;
+  const db = await getDB();
+  const r = await db.getFirstAsync(`SELECT value FROM sync_meta WHERE key = $k`, { $k: key });
+  return r?.value || null;
+};
+
+const setSyncMeta = async (key, value) => {
+  if (!key) return;
+  const db = await getDB();
+  await db.runAsync(
+    `INSERT INTO sync_meta (key, value, updated_at) VALUES ($k, $v, $n) ON CONFLICT(key) DO UPDATE SET value = $v, updated_at = $n`,
+    { $k: key, $v: String(value), $n: Date.now() }
+  );
+};
+
+const isInitialSyncDone = async (userId) => {
+  if (!userId) return false;
+  const val = await getSyncMeta('INITIAL_SYNC_COMPLETE');
+  return val === String(userId);
+};
+
+const clearSyncData = async () => {
+  const db = await getDB();
+  await db.runAsync(`DELETE FROM chats`);
+  await db.runAsync(`DELETE FROM messages`);
+  await db.runAsync(`DELETE FROM message_status`);
+  await db.runAsync(`DELETE FROM reactions`);
+  await db.runAsync(`DELETE FROM chat_meta`);
+  await db.runAsync(`DELETE FROM message_replies`);
+  await db.runAsync(`DELETE FROM sync_meta`);
 };
 
 // Legacy aliases
@@ -1082,4 +1413,10 @@ export default {
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
   closeDB, saveMessageSync, saveMessages,
+  // Chatlist
+  upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
+  updateChatLastMessage, updateChatUnread, incrementChatUnread,
+  updateChatPin, updateChatMute, updateChatArchive, deleteChatRow, getChatCount,
+  // Sync meta
+  getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData,
 };

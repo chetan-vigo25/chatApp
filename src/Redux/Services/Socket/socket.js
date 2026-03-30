@@ -13,7 +13,8 @@ const STORAGE_KEYS = {
 };
 
 const TOKEN_ERROR_REGEX = /(token expired|invalid token|jwt expired|authentication failed|unauthorized|not authorized|invalid credentials)/i;
-const REAUTH_TIMEOUT_MS = 5000;
+const REAUTH_TIMEOUT_MS = 15000;
+const REAUTH_CONNECT_TIMEOUT_MS = 8000;
 const REAUTH_MAX_ATTEMPTS = 3;
 const REAUTH_RETRY_BASE_DELAY_MS = 800;
 
@@ -332,13 +333,17 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
       try {
         await new Promise((resolve, reject) => {
           let settled = false;
-          let connectForReauth = false;
           let timeoutHandle = null;
+          let connectTimeoutHandle = null;
 
           const cleanup = () => {
             if (timeoutHandle) {
               clearTimeout(timeoutHandle);
               timeoutHandle = null;
+            }
+            if (connectTimeoutHandle) {
+              clearTimeout(connectTimeoutHandle);
+              connectTimeoutHandle = null;
             }
             socketRef.off('reauthenticated', onReauthenticated);
             socketRef.off('connect', onConnect);
@@ -353,7 +358,7 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
             else resolve();
           };
 
-          const onReauthenticated = async (response) => {
+          const onReauthenticated = (response) => {
             console.log('📥 reauthenticated response received', {
               status: response?.status,
               message: response?.message,
@@ -365,12 +370,9 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
               return;
             }
 
-            try {
-              await completeReauthentication(response);
-              finalize();
-            } catch (error) {
-              finalize(error);
-            }
+            completeReauthentication(response)
+              .then(() => finalize())
+              .catch((err) => finalize(err));
           };
 
           const onConnectError = (error) => {
@@ -388,18 +390,22 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
           };
 
           const onConnect = () => {
-            if (!connectForReauth) return;
+            if (connectTimeoutHandle) {
+              clearTimeout(connectTimeoutHandle);
+              connectTimeoutHandle = null;
+            }
             emitReauth();
           };
 
-          // Register listeners before emit/connect to avoid missing fast responses.
-          socketRef.on('reauthenticated', onReauthenticated);
-          socketRef.on('connect_error', onConnectError);
+          // Use .once() to avoid listener leaks across retry attempts.
+          socketRef.once('reauthenticated', onReauthenticated);
+          socketRef.once('connect_error', onConnectError);
 
           timeoutHandle = setTimeout(() => {
             console.error('⏱️ reauthentication timeout occurred', {
               timeoutMs: REAUTH_TIMEOUT_MS,
               attempt,
+              socketConnected: socketRef.connected,
             });
             finalize(new Error('reauthentication timeout'));
           }, REAUTH_TIMEOUT_MS);
@@ -409,8 +415,16 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
             return;
           }
 
-          connectForReauth = true;
-          socketRef.on('connect', onConnect);
+          // Separate timeout for the connection phase
+          connectTimeoutHandle = setTimeout(() => {
+            console.error('⏱️ reauthentication connect timeout', {
+              timeoutMs: REAUTH_CONNECT_TIMEOUT_MS,
+              attempt,
+            });
+            finalize(new Error('reauthentication timeout'));
+          }, REAUTH_CONNECT_TIMEOUT_MS);
+
+          socketRef.once('connect', onConnect);
           socketRef.connect();
         });
 
@@ -785,7 +799,42 @@ export const reconnectSocket = async (navigation) => {
     return socket;
   }
 
-  return requestSocketReauthentication('manual_reconnect', navigation);
+  // Try simple reconnect first before full reauthentication
+  try {
+    updateSocketState({ status: 'reconnecting', connected: false });
+    socket.connect();
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          socket.off('connect', onOk);
+          socket.off('connect_error', onErr);
+          reject(new Error('reconnect timeout'));
+        }
+      }, 8000);
+      const onOk = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.off('connect_error', onErr);
+        resolve();
+      };
+      const onErr = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.off('connect', onOk);
+        reject(err);
+      };
+      socket.once('connect', onOk);
+      socket.once('connect_error', onErr);
+    });
+    return socket;
+  } catch (_err) {
+    // Simple reconnect failed, try full reauthentication
+    return requestSocketReauthentication('manual_reconnect', navigation);
+  }
 };
 
 export const reauthenticateSocket = async (navigation) => {

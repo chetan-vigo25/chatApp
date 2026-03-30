@@ -197,13 +197,12 @@ export default function Otp({ navigation, route }) {
                 index: 0,
                 routes: [{ name: "EditProfile", params:{ selectedCountry, phoneNumber }}],
               });
-              // navigation.navigate("Profile");
             } else {
+              // Route through SyncScreen to fetch chatlist + messages from API
               navigation.reset({
-                index: 0, 
-                routes: [{ name: "ChatList" }], 
+                index: 0,
+                routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }],
               });
-              // navigation.navigate("ChatList");
             }
             otpInputRef.current?.clear();
             setOtp("");
@@ -494,4 +493,3 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
   },
 });
-

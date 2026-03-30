@@ -123,13 +123,29 @@ class MediaService {
     if (chatId) payload.chatId = chatId;
     if (extra.messageId) payload.messageId = extra.messageId;
     if (extra.groupId) payload.groupId = extra.groupId;
+    if (!extra.messageId && mediaId) {
+      payload.messageId = payload.messageId || mediaId;
+    }
     console.log('=== MEDIA DOWNLOAD REQUEST ===', JSON.stringify(payload));
     const result = await apiCall('POST', `${API_PREFIX}/download`, payload);
     console.log('=== MEDIA DOWNLOAD RESPONSE ===', JSON.stringify(result));
     return result;
   }
 
-  async downloadToLocal({ mediaId, chatId, messageType, filename, onProgress, force = false, messageId = null, groupId = null }) {
+  /**
+   * Silent version — returns null instead of throwing on failure.
+   * Used during download to avoid toast flashing when the API fails
+   * but a direct URL fallback is available.
+   */
+  async getDownloadUrlSilent(mediaId, chatId = null, extra = {}) {
+    try {
+      return await this.getDownloadUrl(mediaId, chatId, extra);
+    } catch {
+      return null;
+    }
+  }
+
+  async downloadToLocal({ mediaId, chatId, messageType, filename, onProgress, force = false, messageId = null, groupId = null, mediaUrl = null }) {
     if (!mediaId) throw new Error('mediaId is required');
 
     const existing = await localStorageService.getMediaFile(mediaId);
@@ -142,8 +158,20 @@ class MediaService {
     }
 
     console.log('[MEDIA:CACHE:MISS]', mediaId);
-    const signed = await this.getDownloadUrl(mediaId, chatId, { messageId, groupId });
-    const downloadUrl = signed?.data?.downloadUrl || signed?.downloadUrl || null;
+
+    let downloadUrl = null;
+
+    // Try the download API first — uses silent version to avoid error toasts
+    // when it fails for group media (where mediaId is actually a messageId).
+    const signed = await this.getDownloadUrlSilent(mediaId, chatId, { messageId, groupId });
+    downloadUrl = signed?.data?.downloadUrl || signed?.downloadUrl || null;
+
+    // Fallback: use the direct media URL from the message (common for group media)
+    if (!downloadUrl && mediaUrl) {
+      downloadUrl = buildAbsoluteUrl(mediaUrl);
+      console.log('[MEDIA:DOWNLOAD:DIRECT_URL]', downloadUrl);
+    }
+
     if (!downloadUrl) {
       throw new Error('Download URL not available');
     }
@@ -163,10 +191,17 @@ class MediaService {
     });
     await localStorageService.updateDownloadQueue(mediaId, { status: 'downloading', progress: 0 });
 
+    // Build download headers — include auth token for direct media URLs
+    const downloadHeaders = {};
+    try {
+      const token = await AsyncStorage.getItem('accessToken');
+      if (token) downloadHeaders.Authorization = `Bearer ${token}`;
+    } catch {}
+
     const task = FileSystem.createDownloadResumable(
       downloadUrl,
       destination,
-      {},
+      { headers: downloadHeaders },
       (event) => {
         const total = Number(event?.totalBytesExpectedToWrite || 0);
         const written = Number(event?.totalBytesWritten || 0);

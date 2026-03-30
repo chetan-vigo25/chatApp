@@ -402,6 +402,33 @@ const clearAllContacts = async () => {
   });
 };
 
+/**
+ * Remove contacts from SQLite whose hashes are NOT in the given set of current hashes.
+ * This cleans up old contacts that were deleted from the device or SIM.
+ * Returns the number of rows removed.
+ */
+const removeStaleContacts = async (currentHashes) => {
+  if (!currentHashes || currentHashes.size === 0) return 0;
+  return withDB(async (db) => {
+    const allRows = await db.getAllAsync('SELECT hash FROM contacts');
+    const staleHashes = allRows
+      .map((r) => r.hash)
+      .filter((h) => !currentHashes.has(h));
+    if (staleHashes.length === 0) return 0;
+
+    const BATCH = 100;
+    let removed = 0;
+    for (let i = 0; i < staleHashes.length; i += BATCH) {
+      const chunk = staleHashes.slice(i, i + BATCH);
+      const ph = chunk.map(() => '?').join(',');
+      const result = await db.runAsync(`DELETE FROM contacts WHERE hash IN (${ph})`, chunk);
+      removed += result?.changes || chunk.length;
+    }
+    console.log(`[ContactDB] removeStaleContacts: removed ${removed} stale records`);
+    return removed;
+  });
+};
+
 const searchContacts = async (query, limit = 50) => {
   if (!query) return [];
   return withDB(async (db) => {
@@ -457,6 +484,7 @@ export default {
   removeContacts,
   getExistingHashes,
   clearAllContacts,
+  removeStaleContacts,
   searchContacts,
   // Helpers
   findNewContacts,

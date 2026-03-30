@@ -203,7 +203,9 @@ const ChatCard = ({
                     },
                   ]}
                 >
-                  {isTyping ? 'Typing...' : getPreviewText(getLastMessageText(item), 38)}
+                  {isTyping
+                    ? (item?.lastMessageDisplay?.text || 'Typing...')
+                    : getPreviewText(getLastMessageText(item), 38)}
                 </Text>
               </View>
 
