@@ -159,19 +159,26 @@ const buildUrl = (endpoint) => {
 };
 
 // Generic API call for JSON
+// Pass { silent: true } in config to suppress error toasts (e.g., expected 404s)
 export const apiCall = async (method, endpoint, data = {}, config = {}) => {
+  const { silent, ...restConfig } = config;
   try {
     const url = buildUrl(endpoint);
     if (!url) {
       const msg = 'BACKEND_URL is not configured. Set BACKEND_URL in your .env';
       console.error(msg);
-      showToast(msg);
+      if (!silent) showToast(msg);
       return Promise.reject(new Error(msg));
     }
 
-    const response = await api({ method, url, data, ...config });
+    const response = await api({ method, url, data, ...restConfig });
     return response.data;
   } catch (error) {
+    if (silent) {
+      // Log but don't toast — caller handles the error
+      console.log('[API:silent]', error?.response?.status, endpoint);
+      return Promise.reject(error?.response?.data || error);
+    }
     return handleApiError(error);
   }
 };

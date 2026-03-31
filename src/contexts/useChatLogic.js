@@ -1233,13 +1233,6 @@ export default function useChatLogic({ navigation, route }) {
       });
       lastInitializedChatRef.current = generatedChatId;
 
-      // Only clear messages if switching to a DIFFERENT chat — preserve state for same chat
-      if (!isSameChat) {
-        setMessages([]);
-        setAllMessages([]);
-        setScheduledMessages([]);
-      }
-
       // Build group members map from route item data (no API call needed)
       if (isGrpInit && Array.isArray(chatData.members) && chatData.members.length > 0) {
         const map = {};
@@ -1257,58 +1250,94 @@ export default function useChatLogic({ navigation, route }) {
         groupMembersMapRef.current = map;
       }
 
-      // Fetch full group details to get populated member data with names
+      // ═══════════════════════════════════════════════════════════
+      // STEP 1: INSTANT RENDER — Load messages from cache/SQLite FIRST
+      // This MUST happen before any awaits so the screen renders immediately
+      // ═══════════════════════════════════════════════════════════
+      if (!isSameChat) {
+        // Try memory cache first (synchronous — zero delay)
+        const cached = ChatCache.hasMessages(generatedChatId)
+          ? ChatCache.getMessages(generatedChatId)
+          : [];
+
+        if (cached.length > 0) {
+          setAllMessages(cached);
+          setIsLoadingInitial(false);
+          setIsLoadingFromLocal(false);
+        } else {
+          // Cache miss — clear old messages and let SQLite load below
+          setMessages([]);
+          setAllMessages([]);
+        }
+        setScheduledMessages([]);
+      } else {
+        // Same chat — already have messages, just clear loading
+        setIsLoadingInitial(false);
+        setIsLoadingFromLocal(false);
+      }
+
+      // ═══════════════════════════════════════════════════════════
+      // STEP 2: BACKGROUND — Load from SQLite for full data (non-blocking)
+      // This enriches the cache data with reply previews, sender names, etc.
+      // ═══════════════════════════════════════════════════════════
+      const localLoadPromise = isSameChat
+        ? Promise.resolve(allMessages.length)
+        : loadMessagesFromLocal(generatedChatId);
+
+      // ═══════════════════════════════════════════════════════════
+      // STEP 3: BACKGROUND — Socket setup + queued tasks (parallel with step 2)
+      // ═══════════════════════════════════════════════════════════
+      // Fetch full group details (fire-and-forget, updates members map when done)
       if (isGrpInit) {
         const grpId = chatData.groupId || chatData.group?._id;
-        if (grpId) {
-          dispatch(viewGroup({ groupId: grpId })).catch(() => {});
-        }
+        if (grpId) dispatch(viewGroup({ groupId: grpId })).catch(() => {});
       }
 
-      await loadQueuedManualPresence();
-      await loadQueuedMediaStatusUpdates();
-      await loadQueuedMediaUploads();
-      await loadDeletedTombstones(generatedChatId);
+      // Run all queued tasks + socket setup in parallel with SQLite load
+      const [localCount] = await Promise.all([
+        localLoadPromise,
+        (async () => {
+          await Promise.all([
+            loadQueuedManualPresence(),
+            loadQueuedMediaStatusUpdates(),
+            loadQueuedMediaUploads(),
+            loadDeletedTombstones(generatedChatId),
+          ]);
+          await checkAndReconnectSocket();
+          const socket = getSocket();
+          if (socket && isSocketConnected()) {
+            socketRef.current = socket;
+            setupSocketListeners(socket, generatedChatId);
+            requestUserPresence();
+            socket.emit('user:status', { userId, status: 'online', chatId: generatedChatId });
+            socket.emit('chat:join', { chatId: generatedChatId, userId }, (response) => {});
+            socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
+            markUserOnline("chat-init");
+            startHeartbeat();
+            resetIdleTimer();
+            flushQueuedManualPresence();
+            flushQueuedMediaStatusUpdates();
+            flushQueuedMediaUploadsRef.current();
+            presenceCheckInterval.current = setInterval(() => {
+              if (isSocketConnected()) requestUserPresence();
+              else checkAndReconnectSocket();
+            }, PRESENCE_POLL_INTERVAL);
+          } else {
+            setUserStatus("offline");
+          }
+        })(),
+      ]);
 
-      // Step 1: Setup socket FIRST so no real-time messages are missed
-      await checkAndReconnectSocket();
-      const socket = getSocket();
-      if (socket && isSocketConnected()) {
-        socketRef.current = socket;
-        setupSocketListeners(socket, generatedChatId);
-        requestUserPresence();
-        socket.emit('user:status', { userId, status: 'online', chatId: generatedChatId });
-        socket.emit('chat:join', { chatId: generatedChatId, userId }, (response) => {});
-        socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
-        markUserOnline("chat-init");
-        startHeartbeat();
-        resetIdleTimer();
-        flushQueuedManualPresence();
-        flushQueuedMediaStatusUpdates();
-        flushQueuedMediaUploadsRef.current();
-        presenceCheckInterval.current = setInterval(() => {
-          if (isSocketConnected()) requestUserPresence();
-          else checkAndReconnectSocket();
-        }, PRESENCE_POLL_INTERVAL);
-      } else {
-        setUserStatus("offline");
-      }
-
-      // Step 2: Load from SQLite (instant display — WhatsApp pattern)
-      const localCount = isSameChat ? allMessages.length : await loadMessagesFromLocal(generatedChatId);
-
-      // Step 3: Single sync — fetch delta only, never triple-fetch
+      // ═══════════════════════════════════════════════════════════
+      // STEP 4: BACKGROUND SYNC — fetch only new messages from server
+      // ═══════════════════════════════════════════════════════════
       if (localCount === 0) {
-        // No local messages — full fetch from server (single path)
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
       } else {
-        // Has local messages — only sync new messages since last known
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
       }
       scheduleMarkVisibleUnreadAsRead();
 
-      // If opened from Forward screen, do an extra sync to pick up forwarded messages
-      // The server already processed the forward — we just need to fetch the result
       if (route?.params?.openedFromForward) {
         setTimeout(() => {
           fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });

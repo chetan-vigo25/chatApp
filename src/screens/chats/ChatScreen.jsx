@@ -4224,23 +4224,17 @@ export default function ChatScreen({ navigation, route }) {
     return null;
   };
 
-  if (isLoadingInitial) {
+  // Only show loading if no messages at all (no cache, no SQLite data yet)
+  // If we have ANY messages, render them immediately while loading more in background
+  if (isLoadingInitial && messages.length === 0) {
     return (
-      <View style={{ 
-        flex: 1, 
-        backgroundColor: theme.colors.background, 
-        justifyContent: "center", 
-        alignItems: "center" 
+      <View style={{
+        flex: 1,
+        backgroundColor: theme.colors.background,
+        justifyContent: "center",
+        alignItems: "center"
       }}>
-        <ActivityIndicator size="large" color={theme.colors.themeColor} />
-        <Text style={{ 
-          marginTop: 16, 
-          fontSize: 14, 
-          color: theme.colors.primaryTextColor,
-          fontFamily: "Roboto-Regular",
-        }}>
-          Loading chat...
-        </Text>
+        <ActivityIndicator size="small" color={theme.colors.themeColor} />
       </View>
     );
   }

@@ -474,47 +474,55 @@ const upsertMessages = async (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) return;
   const db = await getDB();
 
-  for (const msg of messages) {
-    try {
-      // Same 5-step flow as upsertMessage
-      let replyData = null;
-      const needsRecovery = !msg.replyToMessageId || (msg.replyToMessageId && !msg.replyPreviewText);
-      if (needsRecovery) {
-        const msgId = msg.serverMessageId || msg.id || msg.tempId;
-        if (msgId) {
-          replyData = await getReplyData(msgId);
-          if (!replyData) {
-            try {
-              const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`, { $id: msgId });
-              if (ex?.payload) {
-                const p = JSON.parse(ex.payload);
-                if (p?._replyToMessageId) replyData = { replyToMessageId: p._replyToMessageId, replyPreviewText: p._replyPreviewText, replyPreviewType: p._replyPreviewType, replySenderName: p._replySenderName, replySenderId: p._replySenderId };
-              }
-            } catch {}
+  // Wrap in transaction for atomic batch writes — 10-50x faster for bulk inserts
+  await db.execAsync('BEGIN TRANSACTION');
+  try {
+    for (const msg of messages) {
+      try {
+        // Same 5-step flow as upsertMessage
+        let replyData = null;
+        const needsRecovery = !msg.replyToMessageId || (msg.replyToMessageId && !msg.replyPreviewText);
+        if (needsRecovery) {
+          const msgId = msg.serverMessageId || msg.id || msg.tempId;
+          if (msgId) {
+            replyData = await getReplyData(msgId);
+            if (!replyData) {
+              try {
+                const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`, { $id: msgId });
+                if (ex?.payload) {
+                  const p = JSON.parse(ex.payload);
+                  if (p?._replyToMessageId) replyData = { replyToMessageId: p._replyToMessageId, replyPreviewText: p._replyPreviewText, replyPreviewType: p._replyPreviewType, replySenderName: p._replySenderName, replySenderId: p._replySenderId };
+                }
+              } catch {}
+            }
           }
         }
+        const finalMsg = replyData
+          ? {
+              ...msg,
+              replyToMessageId: msg.replyToMessageId || replyData.replyToMessageId,
+              replyPreviewText: msg.replyPreviewText || replyData.replyPreviewText,
+              replyPreviewType: msg.replyPreviewType || replyData.replyPreviewType,
+              replySenderName: msg.replySenderName || replyData.replySenderName,
+              replySenderId: msg.replySenderId || replyData.replySenderId,
+            }
+          : msg;
+        await cleanBeforeUpsert(db, finalMsg);
+        const merged = await _preserveLocalState(db, finalMsg);
+        const writeMsg = merged || finalMsg;
+        await _runInsert(db, writeMsg);
+        if (writeMsg.replyToMessageId) {
+          const ids = [writeMsg.serverMessageId, writeMsg.id, writeMsg.tempId].filter(Boolean);
+          for (const rid of ids) saveReplyData(rid, writeMsg).catch(() => {});
+        }
+      } catch (err) {
+        console.warn('[ChatDB] upsertMessages row error:', err?.message);
       }
-      const finalMsg = replyData
-        ? {
-            ...msg,
-            replyToMessageId: msg.replyToMessageId || replyData.replyToMessageId,
-            replyPreviewText: msg.replyPreviewText || replyData.replyPreviewText,
-            replyPreviewType: msg.replyPreviewType || replyData.replyPreviewType,
-            replySenderName: msg.replySenderName || replyData.replySenderName,
-            replySenderId: msg.replySenderId || replyData.replySenderId,
-          }
-        : msg;
-      await cleanBeforeUpsert(db, finalMsg);
-      const merged = await _preserveLocalState(db, finalMsg);
-      const writeMsg = merged || finalMsg;
-      await _runInsert(db, writeMsg);
-      if (writeMsg.replyToMessageId) {
-        const ids = [writeMsg.serverMessageId, writeMsg.id, writeMsg.tempId].filter(Boolean);
-        for (const rid of ids) saveReplyData(rid, writeMsg).catch(() => {});
-      }
-    } catch (err) {
-      console.warn('[ChatDB] upsertMessages error:', err?.message);
     }
+    await db.execAsync('COMMIT');
+  } catch (err) {
+    await db.execAsync('ROLLBACK').catch(() => {});
+    console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
   }
 };
 

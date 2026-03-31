@@ -102,16 +102,34 @@ export const initializeAppDirectories = async () => {
 // Alias for backward compatibility
 export const ensureAppFoldersExist = initializeAppDirectories;
 
-// Request permissions
+// Request permissions — checks existing permission first, only prompts if undetermined
+let _mediaPermissionGranted = false;
 export const requestStoragePermission = async () => {
-  if (Platform.OS === 'android') {
+  // Skip system call entirely if we already know permission is granted (session cache)
+  if (_mediaPermissionGranted) return true;
+
+  try {
+    // Check existing permission first — no dialog shown
+    const existing = await MediaLibrary.getPermissionsAsync();
+    if (existing.status === 'granted' || existing.status === 'limited') {
+      _mediaPermissionGranted = true;
+      return true;
+    }
+
+    // Only prompt if permission hasn't been decided yet (undetermined)
+    // If user previously denied, don't keep asking — return false
+    if (existing.status === 'denied' && !existing.canAskAgain) {
+      return false;
+    }
+
+    // First-time ask or user can be asked again
     const { status } = await MediaLibrary.requestPermissionsAsync();
-    return status === 'granted';
-  } else if (Platform.OS === 'ios') {
-    const { status } = await MediaLibrary.requestPermissionsAsync();
-    return status === 'granted' || status === 'limited';
+    const granted = status === 'granted' || status === 'limited';
+    if (granted) _mediaPermissionGranted = true;
+    return granted;
+  } catch {
+    return false;
   }
-  return true;
 };
 
 // Ensure a specific directory exists

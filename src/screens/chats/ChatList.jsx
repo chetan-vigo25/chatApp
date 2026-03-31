@@ -23,6 +23,8 @@ import { useFocusEffect } from '@react-navigation/native';
 import { FontAwesome6, AntDesign, MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
+import ChatCache from '../../services/ChatCache';
+import ChatDatabase from '../../services/ChatDatabase';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
@@ -70,6 +72,29 @@ export default function ChatList({ navigation }) {
   const [profilePreviewVisible, setProfilePreviewVisible] = useState(false);
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
+
+  // Preload messages into cache before navigating — makes chat screen open instantly
+  const openChat = useCallback(async (item) => {
+    const chatId = item?.chatId || item?._id;
+    if (!chatId) { navigation.navigate('ChatScreen', { item }); return; }
+
+    // If cache already has messages, navigate immediately
+    if (ChatCache.hasMessages(chatId)) {
+      navigation.navigate('ChatScreen', { item });
+      return;
+    }
+
+    // Preload from SQLite (fast — indexed query, LIMIT 30)
+    try {
+      const msgs = await ChatDatabase.loadMessages(chatId, { limit: 30 });
+      if (msgs && msgs.length > 0) {
+        ChatCache.setMessages(chatId, msgs);
+      }
+    } catch {}
+
+    // Navigate regardless — never block on DB failure
+    navigation.navigate('ChatScreen', { item });
+  }, [navigation]);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
   const [imageViewerVisible, setImageViewerVisible] = useState(false);
   // Profile modal animations
@@ -643,7 +668,7 @@ export default function ChatList({ navigation }) {
                 item={item}
                 theme={theme}
                 openSwipeableRef={openSwipeableRef}
-                onPress={() => navigation.navigate('ChatScreen', { item })}
+                onPress={() => openChat(item)}
                 onLongPress={() => openActionMenu(item)}
                 onAvatarPress={() => openProfilePreview(item)}
                 onSwipePin={() => {
@@ -877,7 +902,7 @@ export default function ChatList({ navigation }) {
               <View style={styles.profileActions}>
                 <TouchableOpacity
                   onPress={() => {
-                    if (selectedChatItem) navigation.navigate('ChatScreen', { item: selectedChatItem });
+                    if (selectedChatItem) openChat(selectedChatItem);
                     closeProfilePreview();
                   }}
                   activeOpacity={0.8}

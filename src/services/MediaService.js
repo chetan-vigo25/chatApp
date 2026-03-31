@@ -127,7 +127,8 @@ class MediaService {
       payload.messageId = payload.messageId || mediaId;
     }
     console.log('=== MEDIA DOWNLOAD REQUEST ===', JSON.stringify(payload));
-    const result = await apiCall('POST', `${API_PREFIX}/download`, payload);
+    // Silent mode — don't show toast on 404, direct URL fallback handles it
+    const result = await apiCall('POST', `${API_PREFIX}/download`, payload, { silent: true });
     console.log('=== MEDIA DOWNLOAD RESPONSE ===', JSON.stringify(result));
     return result;
   }
@@ -285,8 +286,9 @@ class MediaService {
 
       if (!isMediaType) return null; // only save images/videos to gallery
 
-      // Request media library permission
-      const { status } = await MediaLibrary.requestPermissionsAsync();
+      // Check existing permission — only proceed if already granted
+      // Do NOT prompt during auto-download; user can save to gallery manually
+      const { status } = await MediaLibrary.getPermissionsAsync();
       if (status !== 'granted') return null;
 
       // Save to media library — this creates the file in:
