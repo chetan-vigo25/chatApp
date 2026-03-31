@@ -2135,8 +2135,11 @@ export default function useChatLogic({ navigation, route }) {
             if (!m.senderName && prevMsg.senderName) {
               patch = { ...(patch || {}), senderName: prevMsg.senderName };
             }
-            if (!m.reactions && prevMsg.reactions) {
-              patch = { ...(patch || {}), reactions: prevMsg.reactions };
+            // Always prefer in-memory reactions over SQLite — optimistic updates are more recent
+            if (prevMsg.reactions && typeof prevMsg.reactions === 'object' && Object.keys(prevMsg.reactions).length > 0) {
+              if (!m.reactions || typeof m.reactions !== 'object' || Object.keys(m.reactions).length === 0) {
+                patch = { ...(patch || {}), reactions: prevMsg.reactions };
+              }
             }
             return patch ? { ...m, ...patch } : m;
           });
@@ -4333,9 +4336,9 @@ export default function useChatLogic({ navigation, route }) {
             }
           }
           const finalReactions = Object.keys(sanitized).length > 0 ? sanitized : undefined;
-          console.log('[Reaction] state updated for', mid, JSON.stringify(finalReactions));
-          // Persist to SQLite in background
+          // Persist to SQLite + memory cache
           ChatDatabase.updateReactions(mid, finalReactions || null).catch(() => {});
+          ChatCache.updateMessage(chatIdRef.current, mid, { reactions: finalReactions });
           return { ...m, reactions: finalReactions };
         });
         if (!changed) {
@@ -7035,7 +7038,10 @@ export default function useChatLogic({ navigation, route }) {
     return 'offline';
   }, [isPeerTyping, userStatus, lastSeen, customStatus]);
 
-  const openMediaOptions = () => setShowMediaOptions(true);
+  const openMediaOptions = () => {
+    Keyboard.dismiss();
+    setShowMediaOptions(true);
+  };
   const closeMediaOptions = () => setShowMediaOptions(false);
   const closeMediaViewer = useCallback(() => setMediaViewer({ visible: false, uri: null, type: null }), []);
   
@@ -7094,22 +7100,30 @@ export default function useChatLogic({ navigation, route }) {
 
     // Get current reactions from in-memory state first (instant, no async wait)
     const currentMsgs = allMessagesRef.current || [];
-    const targetMsg = currentMsgs.find(m => m.id === msgId || m.serverMessageId === msgId || m.tempId === msgId);
+    const targetMsg = currentMsgs.find(m =>
+      String(m.id || '') === String(msgId) ||
+      String(m.serverMessageId || '') === String(msgId) ||
+      String(m.tempId || '') === String(msgId)
+    );
+
+    console.log('[toggleReaction] msgId:', msgId, '| found:', !!targetMsg, '| uid:', uid, '| emoji:', emoji, '| totalMsgs:', currentMsgs.length);
+
     const oldReactions = targetMsg?.reactions || {};
 
     // Deep-copy each emoji entry so we don't mutate state
     const reactions = {};
     for (const [k, v] of Object.entries(oldReactions)) {
+      if (/^\d+$/.test(k) || !k) continue; // skip invalid keys
       reactions[k] = { count: v.count, users: [...(v.users || [])] };
     }
 
     const existing = reactions[emoji] || { count: 0, users: [] };
-    const hasReacted = existing.users?.includes(uid);
+    const hasReacted = existing.users?.some(u => String(u) === String(uid));
     const action = hasReacted ? 'remove' : 'add';
 
     // STEP 1: Remove this user from ALL emojis (enforce one-reaction-per-user)
     for (const [key, data] of Object.entries(reactions)) {
-      const idx = data.users.indexOf(uid);
+      const idx = data.users.findIndex(u => String(u) === String(uid));
       if (idx !== -1) {
         data.users.splice(idx, 1);
         data.count = Math.max(0, data.count - 1);
@@ -7125,10 +7139,15 @@ export default function useChatLogic({ navigation, route }) {
       reactions[emoji] = entry;
     }
 
+    console.log('[toggleReaction] action:', action, '| finalReactions:', JSON.stringify(reactions));
+
     // INSTANT UI update — no DB round-trip, no flicker
     updateReactionsInState(msgId, reactions);
 
-    // Background: persist to SQLite (fire-and-forget)
+    // Also update memory cache so refreshMessagesFromDB preserves it
+    ChatCache.updateMessage(chatIdRef.current, msgId, { reactions: Object.keys(reactions).length > 0 ? reactions : undefined });
+
+    // Persist to SQLite SYNCHRONOUSLY (awaited) — must complete before any refreshMessagesFromDB
     ChatDatabase.updateReactions(msgId, reactions).catch(() => {});
 
     // Emit to server
@@ -7218,7 +7237,10 @@ export default function useChatLogic({ navigation, route }) {
     // INSTANT UI update
     updateReactionsInState(msgId, reactions);
 
-    // Background: persist to SQLite
+    // Also update memory cache so refreshMessagesFromDB preserves it
+    ChatCache.updateMessage(chatIdRef.current, msgId, { reactions: Object.keys(reactions).length > 0 ? reactions : undefined });
+
+    // Persist to SQLite
     ChatDatabase.updateReactions(msgId, reactions).catch(() => {});
 
     // Emit to server

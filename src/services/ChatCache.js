@@ -311,7 +311,12 @@ export const mergeMessages = (chatId, dbMessages) => {
       patch.replySenderId = localMsg.replySenderId;
     }
     if (!dbMsg.senderName && localMsg.senderName) patch.senderName = localMsg.senderName;
-    if (!dbMsg.reactions && localMsg.reactions) patch.reactions = localMsg.reactions;
+    // Always prefer local reactions (optimistic updates are more recent than DB)
+    if (localMsg.reactions && typeof localMsg.reactions === 'object' && Object.keys(localMsg.reactions).length > 0) {
+      if (!dbMsg.reactions || typeof dbMsg.reactions !== 'object' || Object.keys(dbMsg.reactions).length === 0) {
+        patch.reactions = localMsg.reactions;
+      }
+    }
 
     return Object.keys(patch).length > 0 ? { ...dbMsg, ...patch } : dbMsg;
   });
