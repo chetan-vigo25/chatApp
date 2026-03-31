@@ -339,7 +339,7 @@ export default function ChatList({ navigation }) {
       }),
     ]).start(() => {
       setProfilePreviewVisible(false);
-      setSelectedChatItem(null);
+      // Don't clear selectedChatItem here — image viewer may need it
     });
   }, [profileScaleAnim, profileOpacityAnim]);
 
@@ -389,7 +389,15 @@ export default function ChatList({ navigation }) {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
     requestChatInfo(chatId);
-    navigation.navigate('UserB', { item: selectedChatItem });
+    const isGroup = selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup;
+    if (isGroup) {
+      navigation.navigate('GroupInfo', {
+        groupId: selectedChatItem?.groupId || selectedChatItem?.group?._id || chatId,
+        item: selectedChatItem,
+      });
+    } else {
+      navigation.navigate('UserB', { item: selectedChatItem });
+    }
     closeActionMenu();
   }, [selectedChatItem, requestChatInfo, navigation, closeActionMenu]);
 
@@ -880,7 +888,16 @@ export default function ChatList({ navigation }) {
           ]}>
             <View style={[styles.profileImageWrap, { backgroundColor: theme.colors.menuBackground }]}>
               {previewImage ? (
-                <Image resizeMode="cover" source={{ uri: previewImage }} style={{ width: '100%', height: '100%' }} fadeDuration={0} />
+                <TouchableOpacity
+                  activeOpacity={0.9}
+                  style={{ width: '100%', height: '100%' }}
+                  onPress={() => {
+                    closeProfilePreview();
+                    setTimeout(() => setImageViewerVisible(true), 250);
+                  }}
+                >
+                  <Image resizeMode="cover" source={{ uri: previewImage }} style={{ width: '100%', height: '100%' }} fadeDuration={0} />
+                </TouchableOpacity>
               ) : (
                 <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
                   {isPreviewGroup ? (
@@ -941,13 +958,13 @@ export default function ChatList({ navigation }) {
         transparent
         animationType="fade"
         statusBarTranslucent
-        onRequestClose={() => setImageViewerVisible(false)}
+        onRequestClose={() => { setImageViewerVisible(false); setSelectedChatItem(null); }}
       >
         <View style={styles.imageViewerContainer}>
           {/* Top bar with back button and name */}
           <View style={styles.imageViewerTopBar}>
             <TouchableOpacity
-              onPress={() => setImageViewerVisible(false)}
+              onPress={() => { setImageViewerVisible(false); setSelectedChatItem(null); }}
               style={styles.imageViewerBackBtn}
               activeOpacity={0.7}
             >

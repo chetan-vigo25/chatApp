@@ -2498,10 +2498,13 @@ export default function ChatScreen({ navigation, route }) {
   }), [closeMediaPanelAnimated, mediaBackdropAnim, mediaSheetAnim]);
 
   // Keyboard handling — smooth animated transitions like WhatsApp
+  // iOS: keyboardWillShow fires BEFORE keyboard animates — we match its duration
+  // Android: keyboardDidShow fires AFTER keyboard is visible — set padding instantly
   const kbHideTimerRef = useRef(null);
   useEffect(() => {
-    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
-    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const isIOS = Platform.OS === 'ios';
+    const showEvent = isIOS ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = isIOS ? 'keyboardWillHide' : 'keyboardDidHide';
 
     const showSub = Keyboard.addListener(showEvent, (event) => {
       if (kbHideTimerRef.current) {
@@ -2509,30 +2512,39 @@ export default function ChatScreen({ navigation, route }) {
         kbHideTimerRef.current = null;
       }
       const nextHeight = event?.endCoordinates?.height || 0;
-      const duration = Platform.OS === 'ios' ? (event?.duration || 250) : 220;
       setKeyboardHeight(nextHeight);
       setIsInputFocused(true);
       setShowEmojiPanel(false);
-      Animated.timing(keyboardAnim, {
-        toValue: nextHeight,
-        duration,
-        useNativeDriver: false,
-      }).start();
+
+      if (isIOS) {
+        Animated.timing(keyboardAnim, {
+          toValue: nextHeight,
+          duration: event?.duration || 250,
+          useNativeDriver: false,
+        }).start();
+      } else {
+        // Android: keyboard already visible, snap padding instantly
+        keyboardAnim.setValue(nextHeight);
+      }
     });
 
     const hideSub = Keyboard.addListener(hideEvent, (event) => {
-      kbHideTimerRef.current = setTimeout(() => {
-        kbHideTimerRef.current = null;
-        const duration = Platform.OS === 'ios' ? (event?.duration || 250) : 200;
-        // Don't reset keyboard height if emoji panel is opening (keeps panel same height)
-        setKeyboardHeight((prev) => prev);
+      if (isIOS) {
+        kbHideTimerRef.current = setTimeout(() => {
+          kbHideTimerRef.current = null;
+          setKeyboardHeight((prev) => prev);
+          setIsInputFocused(false);
+          Animated.timing(keyboardAnim, {
+            toValue: 0,
+            duration: event?.duration || 250,
+            useNativeDriver: false,
+          }).start();
+        }, 80);
+      } else {
+        // Android: keyboard already hidden, snap padding instantly
         setIsInputFocused(false);
-        Animated.timing(keyboardAnim, {
-          toValue: 0,
-          duration,
-          useNativeDriver: false,
-        }).start();
-      }, 80);
+        keyboardAnim.setValue(0);
+      }
     });
 
     return () => {
@@ -3713,12 +3725,12 @@ export default function ChatScreen({ navigation, route }) {
         <View style={{ flexDirection: 'row' }}>
           {isRegistered && contactUserId && (
             <>
-              <Pressable
+              {/* <Pressable
                 onPress={handleMessageContact}
                 style={{ flex: 1, paddingVertical: 10, alignItems: 'center', justifyContent: 'center' }}
               >
                 <Text style={{ color: btnColor, fontFamily: 'Roboto-Medium', fontSize: 13 }}>Message</Text>
-              </Pressable>
+              </Pressable> */}
               <View style={{ width: 0.5, backgroundColor: dividerColor }} />
             </>
           )}
@@ -4282,7 +4294,7 @@ export default function ChatScreen({ navigation, route }) {
   return (
     <View style={{ flex: 1, backgroundColor: isDarkMode ? '#0b141a' : theme.colors.background }}>
       <StatusBar backgroundColor={isDarkMode ? '#101D25' : theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <Animated.View style={{ flex: 1, paddingBottom: Platform.OS === 'android' ? keyboardAnim : 0 }}>
+      <Animated.View style={{ flex: 1, paddingBottom: keyboardAnim }}>
         <ChatWallpaperLayer isDarkMode={isDarkMode} />
         
         {/* Header */}

@@ -53,21 +53,21 @@ export default function App() {
     <ThemeProvider>
       <NetworkProvider>
        <PaperProvider>
-         <DeviceInfoProvider>
+        <DeviceInfoProvider>
          <AuthProvider>
            <ContactProvider>
             <ImageProvider>
              <DeviceLocationProvider>
-                <PresenceProvider>
-                  <RealtimeChatProvider>
-                    <AppContent />
-                  </RealtimeChatProvider>
-                </PresenceProvider>
-              </DeviceLocationProvider>
+              <PresenceProvider>
+               <RealtimeChatProvider>
+                 <AppContent />
+               </RealtimeChatProvider>
+              </PresenceProvider>
+             </DeviceLocationProvider>
             </ImageProvider>
            </ContactProvider>
          </AuthProvider>
-         </DeviceInfoProvider>
+        </DeviceInfoProvider>
        </PaperProvider>
       </NetworkProvider>
     </ThemeProvider>

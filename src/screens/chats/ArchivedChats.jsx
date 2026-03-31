@@ -314,8 +314,13 @@ export default function ArchivedChats({ navigation }) {
 
   // ─── PREVIEW DATA ───
 
-  const previewName = selectedChatItem?.peerUser?.fullName || 'Unknown User';
-  const previewImage = selectedChatItem?.peerUser?.profileImage;
+  const isGroupItem = selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup;
+  const previewName = isGroupItem
+    ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
+    : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
+  const previewImage = isGroupItem
+    ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
+    : selectedChatItem?.peerUser?.profileImage;
   const previewAvatarColor = getUserColor(previewName);
 
   return (
@@ -386,17 +391,21 @@ export default function ArchivedChats({ navigation }) {
 
             {selectedChatItem && (
               <View style={styles.sheetUserRow}>
-                {selectedChatItem?.peerUser?.profileImage ? (
-                  <Image source={{ uri: selectedChatItem.peerUser.profileImage }} style={styles.sheetUserAvatar} />
+                {previewImage ? (
+                  <Image source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
                 ) : (
-                  <View style={[styles.sheetUserAvatar, { backgroundColor: getUserColor(selectedChatItem?.peerUser?.fullName || '') }]}>
-                    <Text style={styles.sheetUserInitial}>
-                      {(selectedChatItem?.peerUser?.fullName || '?').charAt(0).toUpperCase()}
-                    </Text>
+                  <View style={[styles.sheetUserAvatar, { backgroundColor: previewAvatarColor }]}>
+                    {isGroupItem ? (
+                      <Ionicons name="people" size={20} color="#fff" />
+                    ) : (
+                      <Text style={styles.sheetUserInitial}>
+                        {(previewName || '?').charAt(0).toUpperCase()}
+                      </Text>
+                    )}
                   </View>
                 )}
                 <Text style={[styles.sheetUserName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
-                  {selectedChatItem?.peerUser?.fullName || 'Unknown'}
+                  {previewName}
                 </Text>
               </View>
             )}

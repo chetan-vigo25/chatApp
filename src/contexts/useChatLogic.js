@@ -957,8 +957,13 @@ export default function useChatLogic({ navigation, route }) {
 
   // Filter messages by current chat ID — always immediate for real-time feel
   // Merges scheduledMessages (sender-only) with chatMessages for display
+  // Uses shallow comparison to skip setMessages when nothing actually changed
+  const lastMessagesFingerprintRef = useRef('');
   useEffect(() => {
-    if (!chatId || (allMessages.length === 0 && scheduledMessages.length === 0)) return;
+    if (!chatId || (allMessages.length === 0 && scheduledMessages.length === 0)) {
+      if (messages.length > 0) setMessages([]);
+      return;
+    }
 
     const isGrpFilter = chatData.chatType === 'group' || chatData.isGroup;
     const peerId = normalizeId(chatData.peerUser?._id);
@@ -978,28 +983,19 @@ export default function useChatLogic({ navigation, route }) {
 
     const filteredChat = allMessages.filter(msg => {
       if (!matchesChat(msg)) return false;
-      // Cancelled/failed messages from OTHER users should never be shown to receiver
       if ((msg.status === 'cancelled' || msg.status === 'failed') && !sameId(msg.senderId, myId)) return false;
       return true;
     });
-    // Scheduled messages are sender-only — filter by same chat
     const filteredScheduled = scheduledMessages.filter(matchesChat);
-
-    // Combine: scheduled messages + chat messages
     const combined = [...filteredScheduled, ...filteredChat];
+    const sorted = combined.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-    const sorted = combined.sort((a, b) =>
-      (b.timestamp || 0) - (a.timestamp || 0)
-    );
-
-    // Dedup using same fingerprint approach as loadMessages
+    // Dedup using ID + content fingerprint
     const seenIds = new Set();
     const fpMap = new Map();
     const deduped = sorted.filter(msg => {
       const ids = [normalizeId(msg.serverMessageId), normalizeId(msg.id), normalizeId(msg.tempId)].filter(Boolean);
       if (ids.some(id => seenIds.has(id))) return false;
-
-      // Fingerprint: sender + text + 30s rounded timestamp
       if (msg.senderId && msg.text != null) {
         const roundedTs = Math.round((msg.timestamp || 0) / 30000);
         const fp = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs}`;
@@ -1008,10 +1004,16 @@ export default function useChatLogic({ navigation, route }) {
         if (fpMap.has(fp) || fpMap.has(fpPrev) || fpMap.has(fpNext)) return false;
         fpMap.set(fp, true);
       }
-
       for (const id of ids) seenIds.add(id);
       return true;
     });
+
+    // Skip setMessages if content hasn't actually changed — prevents unnecessary FlatList reconciliation
+    const fingerprint = deduped.map(m =>
+      `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}`
+    ).join('|');
+    if (fingerprint === lastMessagesFingerprintRef.current) return;
+    lastMessagesFingerprintRef.current = fingerprint;
 
     setMessages(deduped);
   }, [chatId, allMessages, scheduledMessages, chatData.peerUser?._id, currentUserId]);
@@ -2001,7 +2003,7 @@ export default function useChatLogic({ navigation, route }) {
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
         // skipCleanup on subsequent refreshes — cleanup only runs on initial load
         const isSubsequent = initialLoadDoneRef.current;
-        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, { limit: 500, afterTimestamp: clearedAt, skipCleanup: isSubsequent });
+        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, { limit: 100, afterTimestamp: clearedAt, skipCleanup: isSubsequent });
 
         const currentUser = currentUserIdRef.current;
 
