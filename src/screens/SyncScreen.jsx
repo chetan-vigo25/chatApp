@@ -10,6 +10,7 @@ import {
 import { useTheme } from '../contexts/ThemeContext';
 import { APP_TAG_NAME } from '@env';
 import ChatDatabase from '../services/ChatDatabase';
+import ChatCache from '../services/ChatCache';
 import { chatServices } from '../Redux/Services/Chat/Chat.Services';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -125,6 +126,7 @@ export default function SyncScreen({ navigation, route }) {
       });
 
       await ChatDatabase.upsertChats(normalizedChats);
+      ChatCache.setChats(normalizedChats);
 
       if (!mountedRef.current) return;
 

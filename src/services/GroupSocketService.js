@@ -640,6 +640,7 @@ export const attachGroupMessageListeners = (handlers = {}) => {
   socket.on('group:message:sync:response', handleSyncResponse);
   socket.on('group:message:reaction:update', handleReactionUpdate);
   socket.on('group:message:reaction', handleReactionUpdate);
+  socket.on('group:message:reaction:success', handleReactionUpdate);
   socket.on('group:message:media:updated', handleMediaUpdated);
   socket.on('group:message:schedule:failed', handleScheduleFailed);
 
@@ -664,6 +665,7 @@ export const attachGroupMessageListeners = (handlers = {}) => {
     socket.off('group:message:sync:response', handleSyncResponse);
     socket.off('group:message:reaction:update', handleReactionUpdate);
     socket.off('group:message:reaction', handleReactionUpdate);
+    socket.off('group:message:reaction:success', handleReactionUpdate);
     socket.off('group:message:media:updated', handleMediaUpdated);
     socket.off('group:message:schedule:failed', handleScheduleFailed);
     socket.off('message:new', handleGenericNew);

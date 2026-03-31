@@ -332,7 +332,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
       <Animated.View style={{ marginLeft: 8, transform: [{ scale: submitScale }] }}>
         <TouchableOpacity
           onPress={onSubmit}
-          onLongPress={hasContent ? () => setShowSchedulePicker(true) : undefined}
+          // onLongPress={hasContent ? () => setShowSchedulePicker(true) : undefined}
           delayLongPress={400}
           onPressIn={handlePressInSubmit}
           onPressOut={handlePressOutSubmit}

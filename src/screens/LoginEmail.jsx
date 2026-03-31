@@ -144,7 +144,7 @@ export default function LoginEmail({ navigation }) {
       } else {
         navigation.reset({
           index: 0,
-          routes: [{ name: "ChatList" }],
+          routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }],
         });
       }
     } catch (error) {
