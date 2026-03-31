@@ -10,6 +10,7 @@ import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setForwardTimestamp } from '../../utils/forwardState';
+import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
@@ -32,6 +33,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
   const { messageIds = [], messages = [] } = route.params || {};
   const { theme, isDarkMode } = useTheme();
   const { chatsData = [] } = useSelector(state => state.chat || {});
+  const { chatList: realtimeChatList } = useRealtimeChat();
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedReceivers, setSelectedReceivers] = useState([]);
   const [isSending, setIsSending] = useState(false);
@@ -41,20 +43,45 @@ export default function ForwardMessageScreen({ navigation, route }) {
     Animated.timing(fadeAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
   }, []);
 
-  // Build list of chats to forward to
+  // Merge both sources — RealtimeChatContext (SQLite + socket) is primary, Redux is fallback
+  const allChats = useMemo(() => {
+    const realtimeList = Array.isArray(realtimeChatList) ? realtimeChatList : [];
+    const reduxList = Array.isArray(chatsData) ? chatsData : [];
+
+    // Deduplicate: use a Map keyed by chatId, prefer realtime version
+    const chatMap = new Map();
+    for (const chat of reduxList) {
+      const id = chat?._id || chat?.chatId || chat?.peerUser?._id;
+      if (id) chatMap.set(String(id), chat);
+    }
+    for (const chat of realtimeList) {
+      const id = chat?._id || chat?.chatId || chat?.peerUser?._id;
+      if (id) chatMap.set(String(id), chat);
+    }
+    return [...chatMap.values()];
+  }, [realtimeChatList, chatsData]);
+
+  // Build list of chats to forward to — includes both groups AND private chats
   const chatList = useMemo(() => {
-    return (chatsData || [])
+    return allChats
       .filter(chat => {
         if (!chat) return false;
-        const name = chat.chatType === 'group'
+        // Skip archived chats
+        if (chat.isArchived || chat.archived) return false;
+        const isGroup = chat.chatType === 'group' || chat.isGroup;
+        const name = isGroup
           ? (chat.chatName || chat.group?.name || chat.groupName || '')
-          : (chat.peerUser?.fullName || '');
+          : (chat.peerUser?.fullName || chat.chatName || '');
         if (!name) return false;
         if (searchQuery) return name.toLowerCase().includes(searchQuery.toLowerCase());
         return true;
       })
-      .sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0));
-  }, [chatsData, searchQuery]);
+      .sort((a, b) => {
+        const timeA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : (a.timestamp ? new Date(a.timestamp).getTime() : 0);
+        const timeB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : (b.timestamp ? new Date(b.timestamp).getTime() : 0);
+        return timeB - timeA;
+      });
+  }, [allChats, searchQuery]);
 
   const toggleReceiver = useCallback((chatId) => {
     setSelectedReceivers(prev =>
@@ -64,8 +91,8 @@ export default function ForwardMessageScreen({ navigation, route }) {
 
   const getChatId = (chat) => chat?._id || chat?.chatId || chat?.peerUser?._id;
   const getChatName = (chat) => {
-    if (chat?.chatType === 'group') return chat.chatName || chat.group?.name || chat.groupName || 'Group';
-    return chat?.peerUser?.fullName || 'Unknown';
+    if (chat?.chatType === 'group' || chat?.isGroup) return chat.chatName || chat.group?.name || chat.groupName || 'Group';
+    return chat?.peerUser?.fullName || chat?.chatName || 'Unknown';
   };
   const getChatAvatar = (chat) => {
     if (chat?.chatType === 'group') return chat.chatAvatar || chat.group?.avatar || chat.groupAvatar;
@@ -101,7 +128,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
       // Send each message to each selected chat as a NEW message
       let sentCount = 0;
       for (const chatId of selectedReceivers) {
-        const chat = chatsData.find(c => getChatId(c) === chatId);
+        const chat = allChats.find(c => getChatId(c) === chatId);
         if (!chat) continue;
 
         const isGroup = chat?.chatType === 'group';
@@ -163,7 +190,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
       // ─── WHATSAPP BEHAVIOR ───
       if (chatCount === 1) {
         const targetChatId = selectedReceivers[0];
-        const targetChat = chatsData.find(c => getChatId(c) === targetChatId);
+        const targetChat = allChats.find(c => getChatId(c) === targetChatId);
 
         if (targetChat) {
           showToast(`Message${msgCount > 1 ? 's' : ''} forwarded`);
@@ -189,7 +216,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
     } finally {
       setIsSending(false);
     }
-  }, [selectedReceivers, messages, chatsData, navigation]);
+  }, [selectedReceivers, messages, allChats, navigation]);
 
   // ─── RENDER ───
   const renderChatItem = useCallback(({ item }) => {
@@ -197,7 +224,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
     const name = getChatName(item);
     const avatar = getChatAvatar(item);
     const isSelected = selectedReceivers.includes(chatId);
-    const isGroup = item?.chatType === 'group';
+    const isGroup = item?.chatType === 'group' || item?.isGroup;
     const initials = (name || '?').charAt(0).toUpperCase();
     const avatarBg = getAvatarColor(name);
 
@@ -243,10 +270,10 @@ export default function ForwardMessageScreen({ navigation, route }) {
   // Selected chips at top
   const selectedChats = useMemo(() => {
     return selectedReceivers.map(id => {
-      const chat = chatsData.find(c => getChatId(c) === id);
+      const chat = allChats.find(c => getChatId(c) === id);
       return chat ? { id, name: getChatName(chat), avatar: getChatAvatar(chat) } : null;
     }).filter(Boolean);
-  }, [selectedReceivers, chatsData]);
+  }, [selectedReceivers, allChats]);
 
   return (
     <Animated.View style={[styles.container, { backgroundColor: theme.colors.background, opacity: fadeAnim }]}>
