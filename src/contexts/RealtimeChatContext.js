@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import ChatDatabase from '../services/ChatDatabase';
+import ChatCache from '../services/ChatCache';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -3383,8 +3384,10 @@ export function RealtimeChatProvider({ children }) {
 
     const loadChatListFromSQLite = async () => {
       try {
+        // Populate in-memory cache FIRST for instant reads
         const chats = await ChatDatabase.loadChatList({ includeArchived: true });
         if (cancelled) return;
+        ChatCache.setChats(chats);
         if (chats.length > 0) {
           dispatch({ type: 'HYDRATE_CHAT_CACHE', payload: chats });
         } else {
@@ -3444,10 +3447,12 @@ export function RealtimeChatProvider({ children }) {
 
   useEffect(() => {
     const unsubscribeReset = subscribeSessionReset(() => {
+      ChatCache.clearAll();
       dispatch({ type: 'RESET_STATE', payload: { currentUserId: null } });
     });
 
     const unsubscribeUserChanged = subscribeUserChanged(({ userId }) => {
+      ChatCache.clearAll();
       dispatch({ type: 'RESET_STATE', payload: { currentUserId: userId || null } });
     });
 
@@ -3462,6 +3467,7 @@ export function RealtimeChatProvider({ children }) {
   }, [state.currentUserId]);
 
   const hydrateChats = useCallback(async (chats, opts = {}) => {
+    ChatCache.setChats(chats || []);
     dispatch({ type: 'HYDRATE_CHATS', payload: chats || [] });
     const tempMap = {};
     (chats || []).forEach((chat) => {

@@ -14,6 +14,7 @@ import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../u
 import { useRealtimeChat } from "./RealtimeChatContext";
 import localStorageService from '../services/LocalStorageService';
 import ChatDatabase from '../services/ChatDatabase';
+import ChatCache from '../services/ChatCache';
 import { isInForwardWindow, clearForwardTimestamp } from '../utils/forwardState';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
 import { apiCall } from '../Config/Https';
@@ -1329,6 +1330,14 @@ export default function useChatLogic({ navigation, route }) {
     try {
       if (!chatIdParam) return 0;
 
+      // INSTANT: If memory cache has messages, render immediately
+      if (ChatCache.hasMessages(chatIdParam)) {
+        const cached = ChatCache.getMessages(chatIdParam);
+        if (cached.length > 0) {
+          setAllMessages(cached);
+        }
+      }
+
       // Clean up any duplicate rows on first load
       await ChatDatabase.deduplicateChat(chatIdParam).catch(() => {});
 
@@ -1347,7 +1356,7 @@ export default function useChatLogic({ navigation, route }) {
         }
       }
 
-      // Load from SQLite → set UI state directly (single source of truth)
+      // Load from SQLite → set UI state, also syncs memory cache
       refreshMessagesFromDB(true);
 
       const finalCount = await ChatDatabase.getMessageCount(chatIdParam);
@@ -2138,6 +2147,9 @@ export default function useChatLogic({ navigation, route }) {
           merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
           return merged;
         });
+
+        // Sync memory cache with the latest enriched messages from SQLite
+        if (cid) ChatCache.mergeMessages(cid, enriched);
 
         // Clean up: remove sent/delivered messages from scheduledMessages
         // (they're now in allMessages via DB, no longer need the in-memory copy)
@@ -5116,6 +5128,7 @@ export default function useChatLogic({ navigation, route }) {
 
     // INSTANT UI: Add message to state immediately (WhatsApp-style optimistic update)
     // Don't wait for SQLite — show it NOW, persist in background
+    ChatCache.addMessage(chatIdRef.current, newMessage);
     setAllMessages(prev => {
       const updated = [newMessage, ...prev];
       return updated;
@@ -5774,6 +5787,9 @@ export default function useChatLogic({ navigation, route }) {
 
     // Write to SQLite BEFORE adding to state — so refreshMessagesFromDB won't lose data
     await ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(() => {});
+
+    // Update memory cache instantly
+    ChatCache.addMessage(receivedMessage.chatId || chatIdRef.current, receivedMessage);
 
     // INSTANT UI: merge into state — update existing if reply/sender data was missing
     setAllMessages(prev => {
