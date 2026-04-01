@@ -3873,23 +3873,32 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:seen:response', onSeenResponse);
     registerSocketHandler('message:seen', onSeenResponse);
 
-    // ─── MESSAGE EDIT RESPONSE ───
+    // ─── MESSAGE EDIT (sender confirmation + receiver broadcast) ───
     const onEditResponse = async (data) => {
+      console.log('[Edit] received:', JSON.stringify(data));
       const source = data?.data || data || {};
       if (source?.status === false || data?.status === false) return;
 
-      const messageId = source?.messageId || source?.id;
-      const newText = source?.text || source?.newText;
-      const editedChatId = source?.chatId;
+      const messageId = source?.messageId || source?.id || source?._id;
+      const newText = source?.text || source?.newText || source?.message;
+      const editedChatId = source?.chatId || source?.chat;
+      const editedAt = source?.editedAt || source?.updatedAt || new Date().toISOString();
       if (!messageId) return;
 
       if (editedChatId && !sameId(editedChatId, currentChatId)) return;
 
-      // SQLite-first: update in DB then refresh UI
-      await ChatDatabase.updateMessageEdit(messageId, newText, source?.editedAt || new Date().toISOString());
+      console.log('[Edit] applying:', { messageId, newText, editedAt });
+
+      // Update in DB then refresh UI
+      if (newText) {
+        await ChatDatabase.updateMessageEdit(messageId, newText, editedAt);
+      }
       refreshMessagesFromDB();
     };
+    // Sender gets: message:edit:response
     registerSocketHandler('message:edit:response', onEditResponse);
+    // Receiver gets: message:edited (broadcast from server)
+    registerSocketHandler('message:edited', onEditResponse);
 
     const handleMediaDownloadedUpdate = (data) => {
       const source = data?.data || data || {};
@@ -6069,8 +6078,10 @@ export default function useChatLogic({ navigation, route }) {
     if (!msg) return;
     const isMine = sameId(msg.senderId, currentUserIdRef.current);
     if (!isMine) return;
-    // Only allow editing messages not yet seen
-    if (msg.status === 'seen' || msg.status === 'read') return;
+    if (msg.type !== 'text' && msg.type !== undefined) return;
+    if (msg.isDeleted) return;
+    // Must have server ID — temp messages can't be edited on server
+    if (!msg.serverMessageId || String(msg.serverMessageId).startsWith('temp_')) return;
     setEditingMessage(msg);
     setSelectedMessages([]);
   }, []);
@@ -6107,9 +6118,18 @@ export default function useChatLogic({ navigation, route }) {
   const submitEditMessage = useCallback(async (newText) => {
     if (!editingMessage || !newText?.trim()) return;
 
-    const messageId = editingMessage.serverMessageId || editingMessage.id || editingMessage.tempId;
+    // MUST use the server message ID — temp IDs are not known to the server
+    const serverMsgId = editingMessage.serverMessageId;
+    const localId = editingMessage.id || editingMessage.tempId;
+    const messageId = serverMsgId || localId;
     const cId = chatIdRef.current;
     if (!messageId || !cId) return;
+
+    // Block editing if the message hasn't been acknowledged by the server yet
+    if (!serverMsgId || String(serverMsgId).startsWith('temp_')) {
+      Alert.alert('Cannot edit', 'Message is still sending. Please wait.');
+      return;
+    }
 
     try {
       const socket = socketRef.current || getSocket();
@@ -6121,11 +6141,17 @@ export default function useChatLogic({ navigation, route }) {
       const trimmedText = newText.trim();
       const editedAt = new Date().toISOString();
 
-      // SQLite-first: update in DB then refresh UI
-      await ChatDatabase.updateMessageEdit(messageId, trimmedText, editedAt);
-      refreshMessagesFromDB(true);
+      // Optimistic UI: update state immediately
+      setAllMessages(prev => prev.map(m => {
+        const isMatch = sameId(m.serverMessageId, serverMsgId) || sameId(m.id, serverMsgId);
+        if (!isMatch) return m;
+        return { ...m, text: trimmedText, isEdited: true, editedAt };
+      }));
 
-      // Update chat list preview with edited text
+      // Persist to SQLite
+      await ChatDatabase.updateMessageEdit(serverMsgId, trimmedText, editedAt);
+
+      // Update chat list preview
       updateLocalLastMessagePreview({
         chatId: cId,
         lastMessage: {
@@ -6136,8 +6162,8 @@ export default function useChatLogic({ navigation, route }) {
           createdAt: editingMessage.createdAt || editedAt,
           isEdited: true,
           editedAt,
-          serverMessageId: editingMessage.serverMessageId || messageId,
-          messageId: editingMessage.serverMessageId || messageId,
+          serverMessageId: serverMsgId,
+          messageId: serverMsgId,
         },
         lastMessageAt: editingMessage.createdAt || editedAt,
         lastMessageType: editingMessage.type || 'text',
@@ -6145,21 +6171,28 @@ export default function useChatLogic({ navigation, route }) {
         lastMessageEdited: true,
       });
 
-      // Emit socket event
+      // Emit to server with the SERVER message ID
       const isGroupEdit = chatData?.chatType === 'group' || chatData?.isGroup;
       const editEvent = isGroupEdit ? 'group:message:edit' : 'message:edit';
-      socket.emit(editEvent, {
-        messageId,
+      const editPayload = {
+        messageId: serverMsgId,
         chatId: cId,
         ...(isGroupEdit && { groupId: chatData?.groupId || chatData?.group?._id || cId }),
         text: trimmedText,
+      };
+      console.log('[Edit] emit', editEvent, ':', editPayload);
+      socket.emit(editEvent, editPayload, (ack) => {
+        console.log('[Edit] ack:', JSON.stringify(ack));
+        if (ack?.status === false) {
+          console.warn('[Edit] server rejected:', ack);
+        }
       });
     } catch (err) {
       console.warn('[EDIT] submitEditMessage error:', err);
     } finally {
       setEditingMessage(null);
     }
-  }, [editingMessage, refreshMessagesFromDB, updateLocalLastMessagePreview]);
+  }, [editingMessage, updateLocalLastMessagePreview]);
 
   const handleDeleteSelected = useCallback(() => {
     if (selectedMessage.length === 0) return;

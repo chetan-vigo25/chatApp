@@ -4317,7 +4317,7 @@ export default function ChatScreen({ navigation, route }) {
             const isOwnMsg = selMsg && sameId(selMsg?.senderId, currentUserId);
             const msgStatus = (selMsg?.status || '').toLowerCase();
             const isSeen = msgStatus === 'seen' || msgStatus === 'read';
-            const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && !isSeen;
+            const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted;
             const isTextMsg = selMsg?.type === 'text';
             const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
             const canCancelSchedule = selectedMessage.length === 1 && (selMsg?.status === 'scheduled' || selMsg?.status === 'processing') && isOwnMsg;
@@ -4410,7 +4410,7 @@ export default function ChatScreen({ navigation, route }) {
                   );
                 })()}
                 {/* Edit — only if NOT seen/read */}
-                {canEdit && (
+                {/* {canEdit && (
                   <TouchableOpacity
                     onPress={() => {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -4420,7 +4420,7 @@ export default function ChatScreen({ navigation, route }) {
                     style={{ padding: 10 }}>
                     <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
-                )}
+                )} */}
                 {/* Report Message — only for other's messages */}
                 {canReport && (
                   <TouchableOpacity
