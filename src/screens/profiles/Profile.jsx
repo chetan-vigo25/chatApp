@@ -10,6 +10,7 @@ import { editProfile, profileDetail, editImage } from "../../Redux/Reducer/Profi
 import { BACKEND_URL } from '@env';
 
 import { FontAwesome6, Ionicons, FontAwesome5, AntDesign, MaterialIcons } from '@expo/vector-icons';
+import { useFocusEffect } from '@react-navigation/native';
 
 function showToast(message) {
   if (Platform.OS === 'android') {
@@ -27,17 +28,19 @@ export default function Profile({ navigation }) {
     const { profileData, isLoading, error } = useSelector(state => state.profile);
     const [loader, setLoader] = useState(false);
 
-    useEffect(() => {
-      dispatch(profileDetail()); 
-      const timer = setTimeout(() => {
-        Animated.timing(fadeAnim, {
-          toValue: 1,
-          duration: 400,
-          useNativeDriver: true,
-        }).start();
-      }, 400);
-      return () => clearTimeout(timer);
-    }, []);
+    useFocusEffect(
+      React.useCallback(() => {
+        dispatch(profileDetail()); 
+        const timer = setTimeout(() => {
+          Animated.timing(fadeAnim, {
+            toValue: 1,
+            duration: 400,
+            useNativeDriver: true,
+          }).start();
+        }, 400);
+        return () => clearTimeout(timer);
+      }, [])
+    );
 
     const requestPermission = async () => {
       if (Platform.OS !== 'web') {
