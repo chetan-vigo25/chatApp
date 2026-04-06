@@ -4989,11 +4989,8 @@ export default function useChatLogic({ navigation, route }) {
           return reject(new Error('socket not connected'));
         }
 
-        // Only set 'sending' if not already uploaded (media messages set 'uploaded' after upload completes)
-        const isMediaPayload = payload?.mediaUrl || payload?.messageType === 'image' || payload?.messageType === 'video' || payload?.messageType === 'audio' || payload?.messageType === 'file';
-        if (!isMediaPayload) {
-          updateMessageStatus(tempId, 'sending');
-        }
+        // Immediately mark as sent for instant UI feedback (WhatsApp behavior)
+        updateMessageStatus(tempId, 'sent');
 
         const isGroupPayload = payload?.chatType === 'group' || payload?.groupId;
         const isReplyPayload = Boolean(payload?.replyToMessageId);
@@ -5013,27 +5010,18 @@ export default function useChatLogic({ navigation, route }) {
           pendingReplyTempIdRef.current = tempId;
         }
 
-        // Timeout: if server doesn't ack within 8s, treat as sent (optimistic)
-        let ackReceived = false;
-        const ackTimeout = setTimeout(() => {
-          if (!ackReceived) {
-            ackReceived = true;
-            updateMessageStatus(tempId, 'sent');
-            resolve({ status: true, timeout: true });
-          }
-        }, 8000);
-
+        // Emit the message
         socket.emit(sendEvent, payload, (response) => {
-          if (ackReceived) return; // timeout already resolved
-          ackReceived = true;
-          clearTimeout(ackTimeout);
-
           if (response && (response.status === true || response.success === true || response.data)) {
             const serverMessageId = response.data?.messageId || response.data?._id || response.messageId || response._id;
-            updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response.data });
-            if (serverMessageId && tempId) ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
+            // Update with server message ID if available
+            if (serverMessageId && tempId) {
+              updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response.data });
+              ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
+            }
             return resolve(response);
           } else if (response && response.status === false) {
+            // Only mark as failed if server explicitly rejects
             updateMessageStatus(tempId, 'failed');
             return reject(new Error(response.message || 'send failed'));
           } else {
@@ -5043,11 +5031,13 @@ export default function useChatLogic({ navigation, route }) {
               if (tempId) ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
               return resolve(response);
             }
-            // No ack data but also no error — treat as sent optimistically
-            updateMessageStatus(tempId, 'sent');
+            // No response data but no error — message was sent successfully
             return resolve({ status: true, noAck: true });
           }
         });
+
+        // Resolve immediately since we marked as sent above
+        resolve({ status: true, optimistic: true });
       } catch (err) {
         console.error("❌ sendMessageViaSocket error:", err);
         updateMessageStatus(tempId, 'failed');

@@ -64,8 +64,6 @@ export default function ChatList({ navigation }) {
   const [refreshing, setRefreshing] = useState(false);
   const [, setTimeTick] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
-  const [filteredChats, setFilteredChats] = useState([]);
-  const [isSearching, setIsSearching] = useState(false);
   const [actionSheetVisible, setActionSheetVisible] = useState(false);
   const [muteSheetVisible, setMuteSheetVisible] = useState(false);
   const [selectedChatItem, setSelectedChatItem] = useState(null);
@@ -129,28 +127,21 @@ export default function ChatList({ navigation }) {
 
   // LayoutAnimation disabled — causes frame drops on low-end Android devices
 
-  useEffect(() => {
-    if (effectiveChatList.length > 0) {
-      if (searchQuery.trim() === '') {
-        setFilteredChats(effectiveChatList);
-        setIsSearching(false);
-      } else {
-        const query = searchQuery.toLowerCase().trim();
-        const filtered = effectiveChatList.filter((item) => {
-          const isGroupItem = item?.chatType === 'group' || item?.isGroup;
-          const chatDisplayName = isGroupItem
-            ? (item?.chatName || item?.group?.name || '').toLowerCase()
-            : (item?.peerUser?.fullName || '').toLowerCase();
-          const lastMessage = getLastMessageText(item).toLowerCase();
-          return chatDisplayName.includes(query) || lastMessage.includes(query);
-        });
-        setFilteredChats(filtered);
-        setIsSearching(true);
-      }
-    } else {
-      setFilteredChats([]);
-    }
+  const filteredChats = useMemo(() => {
+    if (effectiveChatList.length === 0) return [];
+    if (searchQuery.trim() === '') return effectiveChatList;
+    const query = searchQuery.toLowerCase().trim();
+    return effectiveChatList.filter((item) => {
+      const isGroupItem = item?.chatType === 'group' || item?.isGroup;
+      const chatDisplayName = isGroupItem
+        ? (item?.chatName || item?.group?.name || '').toLowerCase()
+        : (item?.peerUser?.fullName || '').toLowerCase();
+      const lastMessage = getLastMessageText(item).toLowerCase();
+      return chatDisplayName.includes(query) || lastMessage.includes(query);
+    });
   }, [searchQuery, effectiveChatList]);
+
+  const isSearching = searchQuery.trim() !== '';
 
   // listOrderSignature + LayoutAnimation removed — causes jank on low-end devices
 
@@ -160,12 +151,16 @@ export default function ChatList({ navigation }) {
   }, []);
 
   useEffect(() => {
-    Animated.timing(fadeAnim, {
-      toValue: 1,
-      duration: 120,
-      useNativeDriver: true,
-    }).start();
-  }, [fadeAnim]);
+    if (effectiveChatList.length > 0) {
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 120,
+        useNativeDriver: true,
+      }).start();
+    } else {
+      fadeAnim.setValue(1); // No animation if no chats
+    }
+  }, [fadeAnim, effectiveChatList]);
 
   // Initial sync: only call API if SQLite has no chatlist data (first login)
   // After first sync, chatlist is driven entirely by SQLite + socket updates

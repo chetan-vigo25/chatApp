@@ -11,7 +11,7 @@ import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setForwardTimestamp } from '../../utils/forwardState';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
-
+import ChatCache from '../../services/ChatCache';
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
   '#E84393', '#00CEC9', '#FDCB6E', '#D63031',
@@ -135,6 +135,11 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const receiverId = isGroup ? null : (chat?.peerUser?._id || chatId);
         const groupId = isGroup ? (chat.groupId || chat.group?._id || chatId) : null;
 
+        // Generate the correct chatId for cache (same logic as useChatLogic)
+        const chatIdForCache = isGroup 
+          ? (chat.groupId || chat.group?._id || chat._id || chat.chatId)
+          : `u_${currentUserId}_${chat?.peerUser?._id || 'unknown'}`;
+
         for (const msg of messages) {
           const tempId = `temp_fwd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
           const timestamp = new Date().toISOString();
@@ -164,7 +169,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 mediaMeta: msg.mediaMeta || {},
                 forwardedFrom: currentUserId,
                 isForwarded: true,
-                chatId: chat._id || chat.chatId || chatId,
+                chatId: chatIdForCache,
                 senderId: currentUserId,
                 senderName: currentUserName,
                 tempId,
@@ -177,6 +182,26 @@ export default function ForwardMessageScreen({ navigation, route }) {
             console.log('[Forward] ACK received:', JSON.stringify(ack));
             if (ack?.error) console.warn('[Forward] send ack error:', ack.error);
           });
+
+          // Optimistically add to cache for instant UI update
+          const optimisticMessage = {
+            id: tempId,
+            tempId,
+            text: msg.text || '',
+            type: msg.type || 'text',
+            mediaUrl: msg.mediaUrl || '',
+            mediaMeta: msg.mediaMeta || {},
+            senderId: currentUserId,
+            senderName: currentUserName,
+            chatId: chatIdForCache,
+            timestamp: new Date(timestamp).getTime(),
+            createdAt: timestamp,
+            status: 'sent', // Mark as sent immediately for instant feedback
+            isForwarded: true,
+            forwardedFrom: currentUserId,
+            senderType: 'self',
+          };
+          ChatCache.addMessage(chatIdForCache, optimisticMessage);
 
           sentCount++;
           // Small delay between messages to avoid flooding
@@ -193,11 +218,16 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const targetChat = allChats.find(c => getChatId(c) === targetChatId);
 
         if (targetChat) {
+          const isGroup = targetChat?.chatType === 'group';
+          const navChatId = isGroup 
+            ? (targetChat.groupId || targetChat.group?._id || targetChat._id || targetChat.chatId)
+            : `u_${currentUserId}_${targetChat?.peerUser?._id || 'unknown'}`;
+
           showToast(`Message${msgCount > 1 ? 's' : ''} forwarded`);
 
           navigation.replace('ChatScreen', {
             item: targetChat,
-            chatId: targetChat._id || targetChat.chatId,
+            chatId: navChatId,
             user: targetChat.peerUser || null,
             hasExistingChat: true,
             openedFromForward: true,
