@@ -639,6 +639,11 @@ const reducer = (state, action) => {
         const localIsNewer = prevLastMsgTs > 0 && incomingLastMsgTs > 0 && prevLastMsgTs > incomingLastMsgTs;
         const preserveLocal = preserveEdit || localIsNewer;
 
+        // Preserve local isArchived/isPinned/isMuted if set optimistically but API hasn't caught up
+        const preserveArchived = Boolean(prev?.isArchived) && !Boolean(chat?.isArchived);
+        const preservePinned = Boolean(prev?.isPinned) && !Boolean(chat?.isPinned);
+        const preserveMuted = Boolean(prev?.isMuted) && !Boolean(chat?.isMuted);
+
         nextMap[chatId] = {
           ...prev,
           ...chat,
@@ -651,6 +656,9 @@ const reducer = (state, action) => {
           lastMessageAt: preserveLocal
             ? (prev?.lastMessageAt || prevLastMsg?.createdAt || chat?.lastMessageAt)
             : (chat?.lastMessageAt || prev?.lastMessageAt || chat?.lastMessage?.createdAt || prev?.lastMessage?.createdAt),
+          ...(preserveArchived ? { isArchived: true } : {}),
+          ...(preservePinned ? { isPinned: true, pinnedAt: prev?.pinnedAt } : {}),
+          ...(preserveMuted ? { isMuted: true, mutedUntil: prev?.mutedUntil } : {}),
         };
       });
 

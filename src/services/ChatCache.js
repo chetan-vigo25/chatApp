@@ -203,16 +203,16 @@ export const addMessage = (chatId, message) => {
  */
 export const updateMessage = (chatId, messageId, updates) => {
   if (!chatId || !messageId) return false;
-  const id = String(chatId);
-  const mid = String(messageId);
+  const id = String(chatId).trim();
+  const mid = String(messageId).trim();
 
   const entry = messageStore.get(id);
   if (!entry) return false;
 
   const idx = entry.messages.findIndex(m =>
-    String(m.id || '') === mid ||
-    String(m.serverMessageId || '') === mid ||
-    String(m.tempId || '') === mid
+    String(m.id || '').trim() === mid ||
+    String(m.serverMessageId || '').trim() === mid ||
+    String(m.tempId || '').trim() === mid
   );
 
   if (idx === -1) return false;
@@ -225,14 +225,14 @@ export const updateMessage = (chatId, messageId, updates) => {
  */
 export const removeMessage = (chatId, messageId) => {
   if (!chatId || !messageId) return;
-  const id = String(chatId);
-  const mid = String(messageId);
+  const id = String(chatId).trim();
+  const mid = String(messageId).trim();
   const entry = messageStore.get(id);
   if (!entry) return;
   entry.messages = entry.messages.filter(m =>
-    String(m.id || '') !== mid &&
-    String(m.serverMessageId || '') !== mid &&
-    String(m.tempId || '') !== mid
+    String(m.id || '').trim() !== mid &&
+    String(m.serverMessageId || '').trim() !== mid &&
+    String(m.tempId || '').trim() !== mid
   );
 };
 
@@ -290,16 +290,16 @@ export const mergeMessages = (chatId, dbMessages) => {
   // Build lookup of existing messages by ID for preserving local-only state
   const localById = new Map();
   for (const m of entry.messages) {
-    if (m.id) localById.set(String(m.id), m);
-    if (m.serverMessageId) localById.set(String(m.serverMessageId), m);
-    if (m.tempId) localById.set(String(m.tempId), m);
+    if (m.id) localById.set(String(m.id).trim(), m);
+    if (m.serverMessageId) localById.set(String(m.serverMessageId).trim(), m);
+    if (m.tempId) localById.set(String(m.tempId).trim(), m);
   }
 
   // Merge: prefer DB data but preserve local-only fields (reactions, reply preview)
   const merged = dbMessages.map(dbMsg => {
-    const localMsg = localById.get(String(dbMsg.id))
-      || localById.get(String(dbMsg.serverMessageId))
-      || localById.get(String(dbMsg.tempId));
+    const localMsg = localById.get(String(dbMsg.id).trim())
+      || localById.get(String(dbMsg.serverMessageId).trim())
+      || localById.get(String(dbMsg.tempId).trim());
     if (!localMsg) return dbMsg;
 
     // Preserve local data that DB might not have yet
@@ -311,11 +311,10 @@ export const mergeMessages = (chatId, dbMessages) => {
       patch.replySenderId = localMsg.replySenderId;
     }
     if (!dbMsg.senderName && localMsg.senderName) patch.senderName = localMsg.senderName;
-    // Always prefer local reactions (optimistic updates are more recent than DB)
+    // ALWAYS prefer local reactions (optimistic updates are more fresh than DB)
+    // This prevents flickering where reactions briefly disappear
     if (localMsg.reactions && typeof localMsg.reactions === 'object' && Object.keys(localMsg.reactions).length > 0) {
-      if (!dbMsg.reactions || typeof dbMsg.reactions !== 'object' || Object.keys(dbMsg.reactions).length === 0) {
-        patch.reactions = localMsg.reactions;
-      }
+      patch.reactions = localMsg.reactions;
     }
 
     return Object.keys(patch).length > 0 ? { ...dbMsg, ...patch } : dbMsg;

@@ -363,7 +363,7 @@ export default function LoginEmail({ navigation }) {
               accessibilityLabel="Sign in with phone number"
               style={{ height: 50, borderRadius: 12, borderWidth: 1.5, borderColor: colors.inputBorder, alignItems: "center", justifyContent: "center", flexDirection: "row", }}  >
               <Ionicons  name="call-outline" size={18} color={colors.linkColor} style={{ marginRight: 8 }} />
-              <Text style={{ fontFamily: "Roboto-Medium", fontSize: 14,}}>
+              <Text style={{ fontFamily: "Roboto-Medium", fontSize: 14, color: colors.linkColor, }} >
                 Sign in with Phone Number
               </Text>
             </TouchableOpacity>

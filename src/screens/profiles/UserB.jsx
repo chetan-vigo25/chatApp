@@ -15,8 +15,7 @@ import {
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useRealtimeChat } from "../../contexts/RealtimeChatContext";
-import { useDispatch, useSelector } from "react-redux";
-import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
+import { profileServices } from "../../Redux/Services/Profile/Profile.Services";
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 
 const { width } = Dimensions.get('window');
@@ -33,8 +32,8 @@ const MUTE_OPTIONS = [
 export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
   const { theme, isDarkMode } = useTheme();
-  const dispatch = useDispatch();
-  const { profileData, isLoading } = useSelector(state => state.profile);
+  const [peerProfile, setPeerProfile] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
   const [muteSheetVisible, setMuteSheetVisible] = useState(false);
   const [scrolledPastHeader, setScrolledPastHeader] = useState(false);
 
@@ -60,26 +59,33 @@ export default function UserB({ navigation, route }) {
   const chatItem = (chatList || []).find(c => (c?.chatId || c?._id) === chatId) || routeItem || {};
   const isMuted = chatItem?.isMuted || false;
 
+  // Fetch peer profile into local state (not Redux) to avoid polluting shared profileData
   useEffect(() => {
     if (peerId) {
-      dispatch(profileDetail(peerId));
+      setIsLoading(true);
+      profileServices.profileDetails(peerId)
+        .then((response) => {
+          setPeerProfile(response?.data || null);
+        })
+        .catch(() => {})
+        .finally(() => setIsLoading(false));
     }
-  }, [peerId, dispatch]);
+  }, [peerId]);
 
-  // Display info
-  const displayName = profileData?.fullName || peer?.fullName || peer?.name || peer?.username || "User";
+  // Display info — use local peerProfile instead of Redux profileData
+  const displayName = peerProfile?.fullName || peer?.fullName || peer?.name || peer?.username || "User";
   const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
-  const lastSeen = profileData?.lastSeen || peer?.lastSeen || '';
-  const about = profileData?.about || peer?.about || '';
-  const phoneNumber = profileData?.mobile?.number || peer?.mobile?.number || '';
-  const countryCode = profileData?.mobile?.countryCode || peer?.mobile?.countryCode || '';
+  const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
+  const about = peerProfile?.about || peer?.about || '';
+  const phoneNumber = peerProfile?.mobile?.number || peer?.mobile?.number || '';
+  const countryCode = peerProfile?.mobile?.countryCode || peer?.mobile?.countryCode || '';
   const displayPhone = countryCode ? `${countryCode} ${phoneNumber}` : phoneNumber;
 
   // Image source
-  const reduxImage = profileData?.profileImage;
+  const peerProfileImage = peerProfile?.profileImage;
   const peerImage = peer?.profileImage || peer?.profilePicture || peer?.profilePictureUri;
-  const imageSource = reduxImage
-    ? (typeof reduxImage === 'string' ? { uri: reduxImage } : reduxImage)
+  const imageSource = peerProfileImage
+    ? (typeof peerProfileImage === 'string' ? { uri: peerProfileImage } : peerProfileImage)
     : (peerImage ? { uri: peerImage } : null);
 
   const pastelColors = ["#6C5CE7", "#00B894", "#E17055", "#0984E3", "#D63031", "#E84393", "#00CEC9"];
@@ -267,11 +273,11 @@ export default function UserB({ navigation, route }) {
         ) : null}
 
         {/* Email Section */}
-        {(profileData?.email || peer?.email) ? (
+        {(peerProfile?.email || peer?.email) ? (
           <View style={[styles.infoSection, { borderBottomColor: borderClr }]}>
             <View style={styles.infoRow}>
               <Text style={[styles.infoTitle, { color: theme.colors.primaryTextColor }]}>
-                {profileData?.email || peer?.email}
+                {peerProfile?.email || peer?.email}
               </Text>
               <Text style={[styles.infoSub, { color: theme.colors.placeHolderTextColor }]}>Email</Text>
             </View>

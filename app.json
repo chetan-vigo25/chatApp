@@ -4,7 +4,7 @@
     "slug": "baatCheet",
     "version": "1.0.0",
     "orientation": "portrait",
-    "scheme": "VibeConnect",
+    "scheme": "vibeconnect",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "icon": "./assets/icon.png",
@@ -15,8 +15,7 @@
     },
     "notification": {
       "icon": "./assets/ic_notification.png",
-      "color": "#ffffff",
-      "iosDisplayInForeground": true
+      "color": "#ffffff"
     },
     "ios": {
       "supportsTablet": true,
@@ -49,10 +48,6 @@
         "android.permission.READ_MEDIA_VIDEO",
         "android.permission.READ_MEDIA_AUDIO"
       ],
-      "notification": {
-        "icon": "./assets/ic_notification.png",
-        "color": "#ffffff"
-      },
       "adaptiveIcon": {
         "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"

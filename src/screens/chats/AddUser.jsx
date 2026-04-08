@@ -138,6 +138,13 @@ export default function AddUser({ navigation }) {
   const [searchQuery, setSearchQuery] = useState('');
   const { chatsData } = useSelector(state => state.chat || {});
 
+  // Clear search when navigating away from this tab
+  useFocusEffect(
+    useCallback(() => {
+      return () => setSearchQuery('');
+    }, [])
+  );
+
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedChatItem, setSelectedChatItem] = useState(null);
   const [refreshing, setRefreshing] = useState(false);

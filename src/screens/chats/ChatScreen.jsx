@@ -2523,7 +2523,8 @@ export default function ChatScreen({ navigation, route }) {
           useNativeDriver: false,
         }).start();
       } else {
-        // Android: keyboard already visible, snap padding instantly
+        // Android with edge-to-edge: adjustResize keeps header visible,
+        // but we still need manual padding to push input above keyboard
         keyboardAnim.setValue(nextHeight);
       }
     });
@@ -2541,7 +2542,7 @@ export default function ChatScreen({ navigation, route }) {
           }).start();
         }, 80);
       } else {
-        // Android: keyboard already hidden, snap padding instantly
+        // Android: snap padding to 0
         setIsInputFocused(false);
         keyboardAnim.setValue(0);
       }
