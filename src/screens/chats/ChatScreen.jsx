@@ -764,26 +764,29 @@ export default function ChatScreen({ navigation, route }) {
     report_failed: () => {/* analytics event */},
   });
 
-  // Open report modal for message
+  // Open report modal for message (uses chatDataRef to avoid TDZ on web)
+  const chatDataRef = useRef(null);
   const handleReportMessage = useCallback((msg) => {
+    const cd = chatDataRef.current;
     setReportPayload({
       reportType: 'message',
-      chatId: chatData.chatId || chatData?._id || route?.params?.chatId,
+      chatId: cd?.chatId || cd?._id || route?.params?.chatId,
       messageId: msg.id || msg.serverMessageId || msg.tempId,
       reportedUserId: msg.senderId,
     });
     setReportModalVisible(true);
-  }, [chatData, route]);
+  }, [route]);
 
   // Open report modal for chat
   const handleReportChat = useCallback(() => {
+    const cd = chatDataRef.current;
     setReportPayload({
       reportType: 'chat',
-      chatId: chatData.chatId || chatData?._id || route?.params?.chatId,
-      reportedUserId: chatData.peerUser?._id || chatData.peerUser?.userId,
+      chatId: cd?.chatId || cd?._id || route?.params?.chatId,
+      reportedUserId: cd?.peerUser?._id || cd?.peerUser?.userId,
     });
     setReportModalVisible(true);
-  }, [chatData, route]);
+  }, [route]);
 
   // Add report chat option to menu
   const handleMenuReportChat = () => {
@@ -1305,6 +1308,9 @@ export default function ChatScreen({ navigation, route }) {
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
+
+  // Sync chatData to ref for callbacks declared before destructuring (web TDZ fix)
+  useEffect(() => { chatDataRef.current = chatData; }, [chatData]);
 
   // ── Mentions ──
   const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);

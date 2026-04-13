@@ -51,6 +51,13 @@ export default function SyncScreen({ navigation, route }) {
 
   const runInitialSync = useCallback(async () => {
     try {
+      // On web, skip SQLite-dependent sync and go directly to chat
+      if (require('react-native').Platform.OS === 'web') {
+        updateProgress(100, 'Ready!');
+        setTimeout(navigateAway, 300);
+        return;
+      }
+
       // Get current user ID
       let userId = null;
       try {

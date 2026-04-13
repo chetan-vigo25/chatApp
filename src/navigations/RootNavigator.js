@@ -35,6 +35,9 @@ import EditGroup from "../screens/group/EditGroup";
 import AddGroupMembers from "../screens/group/AddGroupMembers";
 import ForwardMessageScreen from "../screens/chats/ForwardMessageScreen";
 import SyncScreen from "../screens/SyncScreen";
+import StatusListScreen from "../screens/status/StatusList";
+import StatusCreateScreen from "../screens/status/StatusCreate";
+import StatusViewerScreen from "../screens/status/StatusViewer";
 
 import BottomTabNavigator from "./BottomTabNavigator";
 
@@ -111,6 +114,9 @@ export default function RootNavigator() {
           <Stack.Screen name="EditGroup" component={EditGroup} />
           <Stack.Screen name="AddGroupMembers" component={AddGroupMembers} />
           <Stack.Screen name="ForwardMessage" component={ForwardMessageScreen} />
+          <Stack.Screen name="StatusListScreen" component={StatusListScreen} />
+          <Stack.Screen name="StatusCreate" component={StatusCreateScreen} />
+          <Stack.Screen name="StatusViewer" component={StatusViewerScreen} options={{ gestureEnabled: false }} />
         </Stack.Navigator>
       </NavigationContainer>
     </SafeAreaView>

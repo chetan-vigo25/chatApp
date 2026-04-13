@@ -602,17 +602,20 @@ export default function ChatList({ navigation }) {
       {/* ─── HEADER ─── */}
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>
+          <View style={{ width:50, height:50, }} >
+            <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={{ width:50, height:50 }} />
+          </View>
+          {/* <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>
             <Text style={{ color: theme.colors.themeColor, fontSize: 22, fontFamily: 'Roboto-SemiBold' }}>{name.slice(0,4)}</Text>
             <Text style={{ color: theme.colors.themeColor, fontSize: 22, fontFamily: 'Roboto-Regular' }}>{name.slice(4)}</Text>
-          </Text>
-          {Number(realtimeState?.totalUnread || 0) > 0 && (
+          </Text> */}
+          {/* {Number(realtimeState?.totalUnread || 0) > 0 && (
             <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Text style={styles.unreadBadgeText}>
                 {Number(realtimeState.totalUnread) > 99 ? '99+' : Number(realtimeState.totalUnread)}
               </Text>
             </View>
-          )}
+          )} */}
         </View>
 
         <View style={styles.headerRight}>

@@ -159,22 +159,22 @@ export default function Otp({ navigation, route }) {
               appVersion: deviceInfo.appVersion,
               fcmToken: fcmToken || '',
               "location": {
-              "lat": location.coords.latitude,
-              "lng": location.coords.longitude,
-              "street": address[0].street,
-              "city": address[0].city,
-              "state": address[0].state,
-              "country": address[0].country,
-              "zipCode": address[0].postalCode,
-              "timezone": address[0].timezone
+              "lat": location?.coords?.latitude || 0,
+              "lng": location?.coords?.longitude || 0,
+              "street": address?.[0]?.street || "",
+              "city": address?.[0]?.city || "",
+              "state": address?.[0]?.state || "",
+              "country": address?.[0]?.country || "",
+              "zipCode": address?.[0]?.postalCode || "",
+              "timezone": address?.[0]?.timezone || ""
              }
             },
           };
         
           try {
             const loginData = await dispatch(otpVerify(payload)).unwrap();
-        
-            // console.log("OTP Verified with login data:", loginData);
+
+            console.log("OTP Verified successfully, saving session...");
             await performSessionReset({
               reason: 'user_switch_login',
               resetNavigation: false,
@@ -187,28 +187,35 @@ export default function Otp({ navigation, route }) {
               refreshToken: loginData?.token?.refreshToken,
               deviceId: loginData?.data?.deviceId,
             });
+            console.log("Session saved, navigating...");
 
             showToast(loginData.message);
-            if (deviceInfo) {
-              initSocket(deviceInfo, navigation);
+            try {
+              if (deviceInfo) {
+                initSocket(deviceInfo, navigation);
+              }
+            } catch (socketErr) {
+              console.warn("Socket init failed (non-fatal):", socketErr.message);
             }
+
             if (loginData?.data?.isNewUser) {
+              console.log("New user, going to EditProfile");
               navigation.reset({
                 index: 0,
                 routes: [{ name: "EditProfile", params:{ selectedCountry, phoneNumber }}],
               });
             } else {
-              // Route through SyncScreen to fetch chatlist + messages from API
+              console.log("Existing user, going to ChatList");
               navigation.reset({
                 index: 0,
-                routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }],
+                routes: [{ name: "ChatList" }],
               });
             }
             otpInputRef.current?.clear();
             setOtp("");
           } catch (error) {
             console.error("OTP Verification Failed:", error);
-            showToast(error);
+            showToast(typeof error === 'string' ? error : error?.message || 'Verification failed');
             otpInputRef.current?.clear();
             setOtp("");
           }

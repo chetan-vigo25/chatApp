@@ -59,7 +59,8 @@ export default function ChatHeaderPresence({
   const statusText = isGroup ? groupStatusText : peerStatusText;
   const displayName = isGroup ? (groupName || 'Group') : (user?.fullName || 'Unknown User');
 
-  const borderColor = isGroup ? '#ececec' : (normalizedStatus === 'online' ? '#2CC84D' : '#ececec');
+  const isPeerOnline = !isGroup && normalizedStatus === 'online';
+  const borderColor = isGroup ? '#ececec' : (isPeerOnline ? '#2CC84D' : '#ececec');
 
   return (
     <View style={{ width: '100%', flexDirection: 'row', alignItems: 'center', padding: 10, gap: 10, backgroundColor: theme.colors.background,
@@ -95,7 +96,9 @@ export default function ChatHeaderPresence({
         <Text
           numberOfLines={1}
           style={{
-            color: (isPeerTyping || isRealtimeTyping) ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
+            color: (isPeerTyping || isRealtimeTyping)
+              ? theme.colors.themeColor
+              : (isPeerOnline ? '#2CC84D' : theme.colors.placeHolderTextColor),
             fontFamily: 'Roboto-Medium',
             fontSize: 12,
             fontStyle: (isPeerTyping || isRealtimeTyping) ? 'italic' : 'normal',

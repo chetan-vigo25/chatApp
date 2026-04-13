@@ -90,7 +90,11 @@ export default function Splash({ navigation }) {
 
                     // Check if initial sync is done — if not, route through SyncScreen
                     const userId = sessionCheck?.session?.userInfo?._id || sessionCheck?.session?.userInfo?.id;
-                    const syncDone = userId ? await ChatDatabase.isInitialSyncDone(userId) : false;
+                    let syncDone = false;
+                    try {
+                        const { Platform } = require('react-native');
+                        syncDone = Platform.OS === 'web' ? true : (userId ? await ChatDatabase.isInitialSyncDone(userId) : false);
+                    } catch { syncDone = false; }
 
                     if (syncDone) {
                         // Already synced — go straight to ChatList

@@ -11,15 +11,15 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const TAB_COUNT = 4;
-const TAB_WIDTH = SCREEN_WIDTH / TAB_COUNT;
-
 const TABS = [
   { key: 'chats', label: 'Chats', icon: 'chatbubbles', iconOutline: 'chatbubbles-outline' },
+  { key: 'status', label: 'Status', icon: 'ellipse', iconOutline: 'ellipse-outline' },
   { key: 'contacts', label: 'Contacts', icon: 'people', iconOutline: 'people-outline' },
   { key: 'profile', label: 'Profile', icon: 'person', iconOutline: 'person-outline' },
   { key: 'settings', label: 'Settings', icon: 'settings', iconOutline: 'settings-outline' },
 ];
+const TAB_COUNT = TABS.length;
+const TAB_WIDTH = SCREEN_WIDTH / TAB_COUNT;
 
 export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode, unreadCount }) {
   const indicatorAnim = useRef(new Animated.Value(0)).current;

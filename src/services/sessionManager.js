@@ -195,10 +195,13 @@ export const performSessionReset = async ({
 } = {}) => {
   await clearAllSessionData({ clearAllStorage });
 
-  // Clear SQLite database (messages, chats, sync_meta)
+  // Clear SQLite database (messages, chats, sync_meta) — skip on web
   try {
-    await ChatDatabase.clearSyncData();
-    await ChatDatabase.closeDB();
+    const { Platform } = require('react-native');
+    if (Platform.OS !== 'web') {
+      await ChatDatabase.clearSyncData();
+      await ChatDatabase.closeDB();
+    }
   } catch {}
 
   resetRuntimeState();

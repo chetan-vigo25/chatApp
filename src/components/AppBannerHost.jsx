@@ -1,15 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Animated,
-  AppState,
-  Dimensions,
-  Image,
-  PanResponder,
-  Platform,
-  Text,
-  TouchableOpacity,
-  View,
-} from 'react-native';
+import { Animated, AppState, Dimensions, Image, PanResponder, Platform, Text, TouchableOpacity, View,} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio } from 'expo-av';
@@ -25,7 +15,7 @@ import {
 import { subscribeSessionReset } from '../services/sessionEvents';
 
 // Preload the notification sound once at module level
-const MESSAGE_SOUND = require('../../assets/sounds/message-sound-01.mp3');
+const MESSAGE_SOUND = require('../../assets/sounds/message-sound-001.mp3');
 
 let OptionalBlurView = null;
 try {

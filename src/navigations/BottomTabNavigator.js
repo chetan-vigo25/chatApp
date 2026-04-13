@@ -4,6 +4,7 @@ import ChatList from '../screens/chats/ChatList';
 import Profile from '../screens/profiles/Profile';
 import AddUser from '../screens/chats/AddUser';
 import Setting from '../screens/profiles/Setting';
+import StatusList from '../screens/status/StatusList';
 import BottomTabBar from '../components/BottomTabBar';
 import { useTheme } from '../contexts/ThemeContext';
 import { useRealtimeChat } from '../contexts/RealtimeChatContext';
@@ -14,12 +15,13 @@ function CustomTabBar({ state, navigation }) {
   const { theme, isDarkMode } = useTheme();
   const { state: realtimeState } = useRealtimeChat();
 
-  const tabKeys = ['chats', 'contacts', 'profile', 'settings'];
+  const tabKeys = ['chats', 'status', 'contacts', 'profile', 'settings'];
   const activeTab = tabKeys[state.index] || 'chats';
 
   const handleTabPress = (tabKey) => {
     const routeMap = {
       chats: 'ChatListTab',
+      status: 'StatusTab',
       contacts: 'ContactsTab',
       profile: 'ProfileTab',
       settings: 'SettingsTab',
@@ -62,6 +64,7 @@ export default function BottomTabNavigator() {
       initialRouteName="ChatListTab"
     >
       <Tab.Screen name="ChatListTab" component={ChatList} />
+      <Tab.Screen name="StatusTab" component={StatusList} />
       <Tab.Screen name="ContactsTab" component={AddUser} />
       <Tab.Screen name="ProfileTab" component={Profile} />
       <Tab.Screen name="SettingsTab" component={Setting} />
