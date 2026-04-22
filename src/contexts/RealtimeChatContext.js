@@ -2162,7 +2162,8 @@ export function RealtimeChatProvider({ children }) {
     const onMessageRead = (payload) => {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat || null);
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      // Backend sends field as `readerId`; also check legacy aliases
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       // MARK_READ clears unread badge — always do this when we read incoming messages
       if (chatId && readerId && String(readerId) === String(currentUserIdRef.current)) {
         dispatch({ type: 'MARK_READ', payload: chatId });
@@ -2176,25 +2177,25 @@ export function RealtimeChatProvider({ children }) {
     const onMessageDelivered = (payload) => dispatchLastMessageStatusUpdate(payload, 'delivered');
     const onMessageReadBulk = (payload) => {
       const source = unwrapPayload(payload);
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageReadBulkResponse = (payload) => {
       const source = unwrapPayload(payload);
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageReadResponse = (payload) => {
       const source = unwrapPayload(payload);
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageSeen = (payload) => {
       const source = unwrapPayload(payload);
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
@@ -2449,10 +2450,18 @@ export function RealtimeChatProvider({ children }) {
     const onMessageReadAllResponse = (payload) => {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat);
-      if (chatId) {
+      // readerId = the person who read (peer). If it's us, clear our unread badge.
+      // If it's the peer, update our outgoing last-message tick to 'read'.
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
+      const isOwnRead = readerId && String(readerId) === String(currentUserIdRef.current);
+      if (chatId && isOwnRead) {
         dispatch({ type: 'MARK_READ', payload: chatId });
+        return;
       }
-      dispatchLastMessageStatusUpdate(payload, 'read');
+      // Peer read all our messages in this chat → update last message tick
+      if (!readerId || !isOwnRead) {
+        dispatchLastMessageStatusUpdate(payload, 'read');
+      }
     };
 
     // Handle message:seen:response — update last message seen status
@@ -2570,15 +2579,18 @@ export function RealtimeChatProvider({ children }) {
     socket.on('message:new', onMessage);
     socket.on('message:received', onMessage);
     socket.on('message:delivered', onMessageDelivered);
+    socket.on('message:delivered:response', onMessageDeliveredResponse);
     socket.on('message:seen', onMessageSeen);
+    socket.on('message:seen:response', onMessageSeenResponse);
     socket.on('message:read', onMessageRead);
     socket.on('message:read:response', onMessageReadResponse);
     socket.on('message:read:bulk', onMessageReadBulk);
     socket.on('message:read:bulk:response', onMessageReadBulkResponse);
+    // ack events sent by server to the ORIGINAL MESSAGE SENDER when peer reads messages
+    socket.on('message:read:bulk:ack', onMessageReadBulk);
     socket.on('message:read:all', onMessageReadAllResponse);
-    socket.on('message:delivered:response', onMessageDeliveredResponse);
     socket.on('message:read:all:response', onMessageReadAllResponse);
-    socket.on('message:seen:response', onMessageSeenResponse);
+    socket.on('message:read:all:ack', onMessageReadAllResponse);
 
     socket.on('presence:update', onPresence);
     socket.on('presence:subscribed:update', onPresence);

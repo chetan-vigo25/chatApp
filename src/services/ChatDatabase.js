@@ -1031,6 +1031,41 @@ const updateMessageStatus = async (messageId, newStatus) => {
   return true;
 };
 
+// Bulk-mark all outgoing (sent/delivered) messages in a chat as 'seen' (blue tick)
+// Called when the peer reads everything — e.g. message:read:all:ack arrives.
+const updateAllSentMessagesInChatToSeen = async (chatId, myUserId) => {
+  if (!chatId || !myUserId) return 0;
+  const db = await getDB();
+  try {
+    const result = await db.runAsync(
+      `UPDATE messages SET status = 'seen'
+       WHERE chat_id = $cid
+         AND sender_id = $uid
+         AND status IN ('sent', 'delivered')
+         AND (is_deleted = 0 OR is_deleted IS NULL)`,
+      { $cid: chatId, $uid: myUserId }
+    );
+    return result?.changes || 0;
+  } catch (err) {
+    console.warn('[ChatDB] updateAllSentMessagesInChatToSeen error:', err?.message);
+    return 0;
+  }
+};
+
+// Update the last_message_status column in the chats table (chat list tick)
+const updateChatLastMessageStatus = async (chatId, newStatus) => {
+  if (!chatId || !newStatus) return;
+  const db = await getDB();
+  try {
+    await db.runAsync(
+      `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $id`,
+      { $s: newStatus, $n: Date.now(), $id: chatId }
+    );
+  } catch (err) {
+    console.warn('[ChatDB] updateChatLastMessageStatus error:', err?.message);
+  }
+};
+
 // Clear schedule data from payload when a scheduled message is delivered
 const clearScheduleData = async (messageId, newStatus = 'sent') => {
   if (!messageId) return;
@@ -1458,6 +1493,7 @@ export default {
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
   updateChatLastMessage, updateChatUnread, incrementChatUnread,
+  updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
   updateChatPin, updateChatMute, updateChatArchive, deleteChatRow, getChatCount,
   // Sync meta
   getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData,

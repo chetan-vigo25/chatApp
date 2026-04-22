@@ -14,7 +14,7 @@ const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const TABS = [
   { key: 'chats', label: 'Chats', icon: 'chatbubbles', iconOutline: 'chatbubbles-outline' },
   { key: 'status', label: 'Status', icon: 'ellipse', iconOutline: 'ellipse-outline' },
-  { key: 'contacts', label: 'Contacts', icon: 'people', iconOutline: 'people-outline' },
+  // { key: 'contacts', label: 'Contacts', icon: 'people', iconOutline: 'people-outline' },
   { key: 'profile', label: 'Profile', icon: 'person', iconOutline: 'person-outline' },
   { key: 'settings', label: 'Settings', icon: 'settings', iconOutline: 'settings-outline' },
 ];

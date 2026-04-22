@@ -3688,7 +3688,8 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageRead = (data) => {
       const source = data?.data || data;
       // Determine WHO triggered the read — must be the PEER, not ourselves
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      // Backend sends field as `readerId`; also check legacy aliases
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
 
       // If readerId is us, ignore (we triggered this via message:read:all on chat open)
       if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
@@ -3734,7 +3735,7 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageReadBulk = (data) => {
       const source = data?.data || data;
       // Must have a readerId that is NOT us — only peer reads should turn ticks blue
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       const messageIds = Array.isArray(source?.messageIds) ? source.messageIds : [];
       if (messageIds.length > 0) {
@@ -3760,6 +3761,49 @@ export default function useChatLogic({ navigation, route }) {
       }
     };
     registerSocketHandler('message:read:bulk', onMessageReadBulk);
+
+    // message:read:bulk:ack → sent by server to the ORIGINAL MESSAGE SENDER when the
+    // peer calls message:read:bulk. This is what turns OUR outgoing ticks blue.
+    const onMessageReadBulkAck = (data) => {
+      const source = data?.data || data;
+      // readerId = the person who read (the peer) — must NOT be us
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+
+      const messageIds = Array.isArray(source?.messageIds) ? source.messageIds : [];
+      const bulkChatId = source?.chatId;
+      if (messageIds.length === 0 && !bulkChatId) return;
+
+      setAllMessages(prev => {
+        const idSet = new Set(messageIds.map(id => String(id)));
+        let changed = false;
+        const updated = prev.map(msg => {
+          // Match by messageId list OR by chatId (bulk-all case)
+          const msgId = String(msg.serverMessageId || msg.id || msg.tempId || '');
+          const matchById = idSet.size > 0 && idSet.has(msgId);
+          const matchByChat = !matchById && bulkChatId && sameId(msg.chatId, bulkChatId) && sameId(msg.senderId, currentUserIdRef.current);
+          if (!matchById && !matchByChat) return msg;
+          if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
+          if (msg.status === 'seen' || msg.status === 'read') return msg;
+          changed = true;
+          return { ...msg, status: 'seen' };
+        });
+        if (changed) {
+          saveMessagesToLocal(updated);
+          updateChatListLastMessagePreview(updated);
+          // Persist 'seen' to SQLite for each matched message
+          messageIds.forEach(msgId => {
+            ChatDatabase.updateMessageStatus(String(msgId), 'seen').catch(() => {});
+          });
+          // Update chats table last_message_status
+          if (bulkChatId) {
+            ChatDatabase.updateChatLastMessageStatus(bulkChatId, 'seen').catch(() => {});
+          }
+        }
+        return changed ? updated : prev;
+      });
+    };
+    registerSocketHandler('message:read:bulk:ack', onMessageReadBulkAck);
 
     const onMessageStatus = (data) => {
       const source = data?.data || data;
@@ -3789,7 +3833,7 @@ export default function useChatLogic({ navigation, route }) {
       const messageId = source?.messageId;
       if (!messageId) return;
       // Only mark as 'seen' if the reader is the peer, not ourselves
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
       // Do NOT update read for scheduled/processing/cancelled/failed messages
       if (isInScheduledMessages(messageId)) return;
@@ -3829,21 +3873,30 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('message:read:bulk:response', onReadBulkResponse);
 
+    // onReadAllResponse: fires on the SENDER when the peer calls message:read:all
+    // (i.e. the peer opened our chat → all our messages are now read → turn ticks blue)
     const onReadAllResponse = (data) => {
       const source = data?.data || data;
       const responseChatId = source?.chatId;
-      if (!responseChatId || !sameId(responseChatId, currentChatId)) return;
+      if (!responseChatId) return;
 
-      // This is the response to OUR message:read:all emission (we told the server we read incoming messages).
-      // Only mark our outgoing messages as seen if the server indicates the PEER triggered this read.
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      // readerId = the person who READ (the peer), must NOT be ourselves
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+
+      // Always update SQLite (even when this chat is not currently open)
+      ChatDatabase.updateAllSentMessagesInChatToSeen(responseChatId, currentUserIdRef.current)
+        .catch(() => {});
+      ChatDatabase.updateChatLastMessageStatus(responseChatId, 'seen').catch(() => {});
+
+      // Update in-memory state only for the currently open chat
+      if (!sameId(responseChatId, currentChatId)) return;
 
       setAllMessages(prev => {
         let changed = false;
         const updated = prev.map(msg => {
-          if (msg.chatId !== currentChatId) return msg;
-          if (msg.senderId !== currentUserIdRef.current) return msg;
+          // Only update OUR outgoing messages — not messages from the peer
+          if (!sameId(msg.senderId, currentUserIdRef.current)) return msg;
           // Skip scheduled/processing/cancelled/failed — not real messages yet
           if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           if (msg.status === 'seen' || msg.status === 'read') return msg;
@@ -3857,6 +3910,9 @@ export default function useChatLogic({ navigation, route }) {
         return changed ? updated : prev;
       });
     };
+    // Backend sends this event name to the SENDER when the peer bulk-reads all messages
+    registerSocketHandler('message:read:all:ack', onReadAllResponse);
+    // Also listen on legacy response event for backwards-compat
     registerSocketHandler('message:read:all:response', onReadAllResponse);
 
     const onSeenResponse = (data) => {
@@ -3864,7 +3920,7 @@ export default function useChatLogic({ navigation, route }) {
       const messageId = source?.messageId;
       if (!messageId) return;
       // Only mark as 'seen' if the reader is the peer, not ourselves
-      const readerId = source?.senderId || source?.readBy || source?.userId;
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (readerId && String(readerId) === String(currentUserIdRef.current)) return;
       // Do NOT update seen for scheduled/processing/cancelled/failed messages
       if (isInScheduledMessages(messageId)) return;

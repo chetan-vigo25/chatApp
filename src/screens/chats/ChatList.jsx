@@ -30,7 +30,6 @@ import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chat
 import { APP_TAG_NAME } from '@env';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 const MUTE_OPTIONS = [
@@ -64,6 +63,7 @@ export default function ChatList({ navigation }) {
   const [refreshing, setRefreshing] = useState(false);
   const [, setTimeTick] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeFilter, setActiveFilter] = useState('all');
   const [actionSheetVisible, setActionSheetVisible] = useState(false);
   const [muteSheetVisible, setMuteSheetVisible] = useState(false);
   const [selectedChatItem, setSelectedChatItem] = useState(null);
@@ -129,9 +129,15 @@ export default function ChatList({ navigation }) {
 
   const filteredChats = useMemo(() => {
     if (effectiveChatList.length === 0) return [];
-    if (searchQuery.trim() === '') return effectiveChatList;
+    let chats = effectiveChatList;
+    if (activeFilter === 'groups') {
+      chats = chats.filter((item) => item?.chatType === 'group' || item?.isGroup);
+    } else if (activeFilter === 'chats') {
+      chats = chats.filter((item) => item?.chatType !== 'group' && !item?.isGroup);
+    }
+    if (searchQuery.trim() === '') return chats;
     const query = searchQuery.toLowerCase().trim();
-    return effectiveChatList.filter((item) => {
+    return chats.filter((item) => {
       const isGroupItem = item?.chatType === 'group' || item?.isGroup;
       const chatDisplayName = isGroupItem
         ? (item?.chatName || item?.group?.name || '').toLowerCase()
@@ -139,7 +145,7 @@ export default function ChatList({ navigation }) {
       const lastMessage = getLastMessageText(item).toLowerCase();
       return chatDisplayName.includes(query) || lastMessage.includes(query);
     });
-  }, [searchQuery, effectiveChatList]);
+  }, [searchQuery, effectiveChatList, activeFilter]);
 
   const isSearching = searchQuery.trim() !== '';
 
@@ -592,6 +598,39 @@ export default function ChatList({ navigation }) {
         )}
       </View>
 
+      {/* Filter Pills */}
+      <View style={styles.filterRow}>
+        {[
+          { key: 'all', label: 'All' },
+          { key: 'chats', label: 'Chats' },
+          { key: 'groups', label: 'Groups' },
+        ].map((f) => {
+          const isActive = activeFilter === f.key;
+          return (
+            <TouchableOpacity
+              key={f.key}
+              onPress={() => setActiveFilter(f.key)}
+              activeOpacity={0.7}
+              style={[
+                styles.filterPill,
+                isActive
+                  ? { backgroundColor: theme.colors.themeColor }
+                  : { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)' },
+              ]}
+            >
+              <Text
+                style={[
+                  styles.filterPillText,
+                  { color: isActive ? '#fff' : theme.colors.placeHolderTextColor },
+                ]}
+              >
+                {f.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
       {renderArchivedRow()}
     </View>
   );
@@ -646,12 +685,12 @@ export default function ChatList({ navigation }) {
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
-            {/* <Menu.Item
+            <Menu.Item
               onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
               title="Linked Devices"
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="qr-code-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            /> */}
+            />
           </Menu>
         </View>
       </View>
@@ -1113,6 +1152,24 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+
+  // ─── FILTER PILLS ───
+  filterRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingTop: 6,
+    paddingBottom: 4,
+  },
+  filterPill: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 20,
+  },
+  filterPillText: {
+    fontSize: 13,
+    fontFamily: 'Roboto-Medium',
   },
 
   // ─── ARCHIVE ROW ───

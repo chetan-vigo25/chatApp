@@ -1,12 +1,57 @@
-import React, { useCallback, useState, useEffect } from 'react';
-import { View, Text, FlatList, TouchableOpacity, Image, StyleSheet, RefreshControl, ActivityIndicator } from 'react-native';
+import { useCallback, useState, useEffect, useRef } from 'react';
+import { View, Text, FlatList, TouchableOpacity, Image, StyleSheet, RefreshControl } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
-import { fetchMyStatuses, fetchContactStatuses } from '../../Redux/Reducer/Status/Status.reducer';
+import { fetchMyStatuses, fetchStatusFeed, addNewStatusFromSocket, removeStatusFromSocket } from '../../Redux/Reducer/Status/Status.reducer';
+import { getSocket } from '../../Redux/Services/Socket/socket';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import SegmentedRing from '../../components/SegmentedRing';
 
-const STATUS_COLORS = ['#075e54', '#128C7E', '#25D366', '#DCF8C6', '#34B7F1', '#FF6B6B', '#C44569', '#F8B500', '#6C5CE7', '#00B894'];
+/**
+ * Shows the first status's content as a small square thumbnail.
+ * - image / video  → shows mediaUrl / thumbnailUrl
+ * - text           → bgColor background + truncated text
+ * - link           → OG image if available, else link icon bg
+ * Falls back to a neutral dark tile when there's nothing to show.
+ */
+function StatusThumb({ status, style }) {
+  if (!status) return <View style={[style, { backgroundColor: '#2A3942' }]} />;
+
+  const firstItem  = status.mediaItems?.[0];
+  const statusType = firstItem?.mediaType ?? (status.textContent ? 'text' : null);
+
+  if (statusType === 'image' || statusType === 'video') {
+    const uri = firstItem?.thumbnailUrl || firstItem?.mediaUrl;
+    if (uri) {
+      return (
+        <Image source={{ uri }} style={[style, { resizeMode: 'cover' }]} />
+      );
+    }
+  }
+
+  if (statusType === 'text') {
+    return (
+      <View style={[style, { backgroundColor: status.bgColor || '#075e54', justifyContent: 'center', alignItems: 'center', overflow: 'hidden', padding: 3 }]}>
+        <Text style={{ color: '#fff', fontSize: 8, textAlign: 'center', lineHeight: 10 }} numberOfLines={3}>
+          {status.textContent}
+        </Text>
+      </View>
+    );
+  }
+
+  if (statusType === 'link') {
+    const ogImage = status.ogMetadata?.image;
+    if (ogImage) return <Image source={{ uri: ogImage }} style={[style, { resizeMode: 'cover' }]} />;
+    return (
+      <View style={[style, { backgroundColor: '#1a3a5c', justifyContent: 'center', alignItems: 'center' }]}>
+        <Text style={{ fontSize: 16 }}>🔗</Text>
+      </View>
+    );
+  }
+
+  return <View style={[style, { backgroundColor: '#2A3942' }]} />;
+}
 
 const timeAgo = (date) => {
   if (!date) return '';
@@ -18,24 +63,64 @@ const timeAgo = (date) => {
 };
 
 export default function StatusList({ navigation }) {
-  const { theme, isDarkMode } = useTheme();
+  const { theme } = useTheme();
   const dispatch = useDispatch();
-  const { myStatuses, contactStatuses, isLoading } = useSelector(state => state.status);
+  const { myStatuses, contactStatuses, viewedStatusIds, isLoading } = useSelector(state => state.status);
   const { user } = useSelector(state => state.authentication);
   const [refreshing, setRefreshing] = useState(false);
+  const socketListenerRef = useRef(null);
 
   const loadData = useCallback(() => {
     dispatch(fetchMyStatuses());
-    dispatch(fetchContactStatuses());
+    dispatch(fetchStatusFeed());
   }, [dispatch]);
 
   useFocusEffect(useCallback(() => { loadData(); }, [loadData]));
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([dispatch(fetchMyStatuses()), dispatch(fetchContactStatuses())]);
+    await Promise.all([dispatch(fetchMyStatuses()), dispatch(fetchStatusFeed())]);
     setRefreshing(false);
   }, [dispatch]);
+
+  // ── Socket: real-time status:new / status:deleted ──────────────────────────
+  useEffect(() => {
+    const attachListeners = () => {
+      const socket = getSocket?.();
+      if (!socket || socketListenerRef.current === socket) return;
+
+      const onStatusNew = (payload) => {
+        dispatch(addNewStatusFromSocket(payload));
+      };
+      const onStatusDeleted = (payload) => {
+        dispatch(removeStatusFromSocket(payload));
+      };
+
+      socket.on('status:new', onStatusNew);
+      socket.on('status:deleted', onStatusDeleted);
+
+      socketListenerRef.current = socket;
+
+      return () => {
+        socket.off('status:new', onStatusNew);
+        socket.off('status:deleted', onStatusDeleted);
+      };
+    };
+
+    const cleanup = attachListeners();
+
+    // Retry attachment every 2s until socket is available
+    const interval = setInterval(() => {
+      if (!socketListenerRef.current) attachListeners();
+    }, 2000);
+
+    return () => {
+      clearInterval(interval);
+      if (cleanup) cleanup();
+      socketListenerRef.current = null;
+    };
+  }, [dispatch]);
+  // ──────────────────────────────────────────────────────────────────────────
 
   const hasMyStatus = myStatuses && myStatuses.length > 0;
 
@@ -48,31 +133,38 @@ export default function StatusList({ navigation }) {
       }
     >
       <View style={styles.avatarContainer}>
-        <Image
-          source={user?.profileImage ? { uri: user.profileImage } : require('../../../assets/icon.png')}
-          style={styles.avatar}
-        />
         {hasMyStatus ? (
-          <View style={[styles.statusRing, { borderColor: '#25D366' }]}>
-            <Text style={styles.statusCount}>{myStatuses.length}</Text>
+          <View style={styles.ringWrap}>
+            <SegmentedRing
+              count={myStatuses.length}
+              viewedCount={0}
+              size={58}
+              strokeWidth={2.5}
+            />
+            <StatusThumb status={myStatuses[0]} style={[styles.avatar, styles.avatarAbsolute]} />
           </View>
         ) : (
-          <View style={[styles.addButton, { backgroundColor: theme.colors.themeColor }]}>
-            <Ionicons name="add" size={16} color="#fff" />
+          <View style={styles.ringWrap}>
+            <Image
+              source={user?.profileImage ? { uri: user.profileImage } : require('../../../assets/icon.png')}
+              style={styles.avatar}
+            />
+            <View style={[styles.addButton, { backgroundColor: theme.colors.themeColor }]}>
+              <Ionicons name="add" size={16} color="#fff" />
+            </View>
           </View>
         )}
       </View>
       <View style={styles.textContainer}>
         <Text style={[styles.name, { color: theme.colors.primaryTextColor }]}>My Status</Text>
         <Text style={[styles.time, { color: theme.colors.placeHolderTextColor }]}>
-          {hasMyStatus ? `${myStatuses.length} status${myStatuses.length > 1 ? 'es' : ''} • ${timeAgo(myStatuses[0]?.createdAt)}` : 'Tap to add status update'}
+          {hasMyStatus
+            ? `${myStatuses.length} status${myStatuses.length > 1 ? 'es' : ''} • ${timeAgo(myStatuses[0]?.createdAt)}`
+            : 'Tap to add status update'}
         </Text>
       </View>
       {hasMyStatus && (
-        <TouchableOpacity
-          style={styles.cameraBtn}
-          onPress={() => navigation.navigate('StatusCreate')}
-        >
+        <TouchableOpacity style={styles.cameraBtn} onPress={() => navigation.navigate('StatusCreate')}>
           <Ionicons name="camera" size={22} color={theme.colors.themeColor} />
         </TouchableOpacity>
       )}
@@ -80,32 +172,38 @@ export default function StatusList({ navigation }) {
   );
 
   const renderContactStatus = ({ item }) => {
-    const statusCount = item.count || item.statuses?.length || 0;
-    const viewed = false; // TODO: track viewed statuses locally
+    const statusCount  = item.count || item.statuses?.length || 0;
+    // Backend returns `name` and `avatar`; fall back to legacy aliases just in case
+    const displayName  = item.name || item.fullName || 'Unknown';
+    const displayImage = item.avatar || item.profileImage;
 
     return (
       <TouchableOpacity
         style={[styles.statusItem, { backgroundColor: theme.colors.cardBackground }]}
         onPress={() => navigation.navigate('StatusViewer', {
-          statuses: item.statuses || [],
+          statuses:  item.statuses || [],
           startIndex: 0,
-          isMine: false,
-          userName: item.fullName,
-          userImage: item.profileImage,
+          isMine:    false,
+          userName:  displayName,
+          userImage: displayImage,
+          userId:    item.userId,
         })}
       >
         <View style={styles.avatarContainer}>
-          <View style={[styles.statusRingOuter, { borderColor: viewed ? '#94a3b8' : '#25D366' }]}>
-            <Image
-              source={item.profileImage ? { uri: item.profileImage } : require('../../../assets/icon.png')}
-              style={styles.avatar}
+          <View style={styles.ringWrap}>
+            <SegmentedRing
+              count={statusCount}
+              viewedCount={(item.statuses || []).filter(s => viewedStatusIds.includes(String(s._id))).length}
+              size={58}
+              strokeWidth={2.5}
             />
+            <StatusThumb status={(item.statuses || [])[0]} style={[styles.avatar, styles.avatarAbsolute]} />
           </View>
         </View>
         <View style={styles.textContainer}>
-          <Text style={[styles.name, { color: theme.colors.primaryTextColor }]}>{item.fullName || 'Unknown'}</Text>
+          <Text style={[styles.name, { color: theme.colors.primaryTextColor }]}>{displayName}</Text>
           <Text style={[styles.time, { color: theme.colors.placeHolderTextColor }]}>
-            {statusCount} status{statusCount > 1 ? 'es' : ''} • {timeAgo(item.latestAt)}
+            {timeAgo(item.latestAt)}
           </Text>
         </View>
       </TouchableOpacity>
@@ -115,20 +213,17 @@ export default function StatusList({ navigation }) {
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
       {/* Header */}
-      <View style={[styles.header, {  }]}>
-        <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>Status</Text>
-        <View style={styles.headerActions}>
-          <TouchableOpacity onPress={() => navigation.navigate('StatusCreate')} style={styles.headerBtn}>
-            <Ionicons name="camera" size={22} color={ theme.colors.themeColor } />
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => navigation.navigate('StatusCreate', { type: 'text' })} style={styles.headerBtn}>
-            <MaterialCommunityIcons name="pencil" size={22} color={theme.colors.themeColor} />
-          </TouchableOpacity>
-        </View>
+      <View style={styles.header}>
+        <Text style={[styles.headerTitle, { color: '#fff' }]}>Status</Text>
       </View>
 
       <FlatList
-        data={contactStatuses || []}
+        data={(contactStatuses || []).slice().sort((a, b) => {
+          const aViewed = a.allViewed || (a.statuses || []).every(s => viewedStatusIds.includes(String(s._id)));
+          const bViewed = b.allViewed || (b.statuses || []).every(s => viewedStatusIds.includes(String(s._id)));
+          if (aViewed !== bViewed) return aViewed ? 1 : -1;
+          return new Date(b.latestAt) - new Date(a.latestAt);
+        })}
         keyExtractor={(item) => String(item.userId || item._id)}
         ListHeaderComponent={() => (
           <View>
@@ -170,22 +265,25 @@ export default function StatusList({ navigation }) {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   header: { paddingTop: 0, paddingBottom: 16, paddingHorizontal: 20, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  headerTitle: { fontSize: 20, fontWeight: '700', color: '#fff' },
+  headerTitle: { fontSize: 20, fontWeight: '700' },
   headerActions: { flexDirection: 'row', gap: 16 },
   headerBtn: { padding: 4 },
-  listContent: { paddingBottom: 100 },
-  statusItem: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12 },
-  avatarContainer: { position: 'relative', marginRight: 14 },
+  listContent: { paddingBottom: 80 },
+  statusItem: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8, minHeight: 72 },
+  avatarContainer: { marginRight: 16 },
   avatar: { width: 50, height: 50, borderRadius: 25 },
+  ringWrap: { width: 58, height: 58, alignItems: 'center', justifyContent: 'center', position: 'relative' },
+  avatarAbsolute: { position: 'absolute', width: 50, height: 50, borderRadius: 25 },
   statusRingOuter: { width: 56, height: 56, borderRadius: 28, borderWidth: 2.5, padding: 2, alignItems: 'center', justifyContent: 'center' },
   statusRing: { position: 'absolute', bottom: -2, right: -2, width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#fff' },
   statusCount: { fontSize: 10, fontWeight: '700', color: '#fff' },
   addButton: { position: 'absolute', bottom: -2, right: -2, width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#fff' },
   textContainer: { flex: 1 },
-  name: { fontSize: 16, fontWeight: '600', marginBottom: 2 },
+  name: { fontSize: 15, fontWeight: '600', marginBottom: 3 },
   time: { fontSize: 13 },
+  rowTimestamp: { fontSize: 12, alignSelf: 'flex-start', paddingTop: 2 },
   cameraBtn: { padding: 8 },
-  sectionTitle: { fontSize: 13, fontWeight: '600', paddingHorizontal: 16, paddingTop: 16, paddingBottom: 8, textTransform: 'uppercase', letterSpacing: 0.5 },
+  sectionTitle: { fontSize: 13, fontWeight: '600', paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 },
   emptyContainer: { alignItems: 'center', paddingTop: 80, paddingHorizontal: 40 },
   emptyText: { fontSize: 16, fontWeight: '600', marginTop: 16 },
   emptySubText: { fontSize: 13, marginTop: 6, textAlign: 'center' },

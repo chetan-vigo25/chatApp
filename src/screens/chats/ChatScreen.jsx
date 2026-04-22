@@ -3182,20 +3182,24 @@ export default function ChatScreen({ navigation, route }) {
     const renderTick = () => {
       if (!isMyMessage) return null;
 
+      // pending = message not yet sent (e.g. queued offline)
+      if (msg?.status === 'pending') {
+        return <Ionicons name="time-outline" size={11} color="rgba(255,255,255,0.75)" style={{ marginLeft: 3 }} />;
+      }
       if (msg?.status === 'sending') {
         return <ActivityIndicator size={8} color="rgba(255,255,255,0.85)" style={{ marginLeft: 3 }} />;
       }
-      if (msg?.status === 'uploaded') {
-        return <Ionicons name="checkmark" size={11} color="rgba(255,255,255,0.9)" style={{ marginLeft: 3 }} />;
-      }
-      if (msg?.status === 'sent') {
-        return <Ionicons name="checkmark" size={11} color="rgba(255,255,255,0.9)" style={{ marginLeft: 3 }} />;
+      if (msg?.status === 'uploaded' || msg?.status === 'sent') {
+        // single gray tick — sent but not yet delivered
+        return <Ionicons name="checkmark" size={11} color="rgba(255,255,255,0.75)" style={{ marginLeft: 3 }} />;
       }
       if (msg?.status === 'delivered') {
-        return <Ionicons name="checkmark-done" size={11} color="rgba(255,255,255,0.92)" style={{ marginLeft: 3 }} />;
+        // double gray tick
+        return <Ionicons name="checkmark-done" size={11} color="rgba(255,255,255,0.75)" style={{ marginLeft: 3 }} />;
       }
       if (msg?.status === 'seen' || msg?.status === 'read') {
-        return <Ionicons name="checkmark-done" size={11} color="#67B7FF" style={{ marginLeft: 3 }} />;
+        // double blue tick — WhatsApp blue #53BDEB
+        return <Ionicons name="checkmark-done" size={11} color="#53BDEB" style={{ marginLeft: 3 }} />;
       }
       if (msg?.status === 'failed') {
         return <Ionicons name="alert-circle" size={11} color="#FF8A80" style={{ marginLeft: 3 }} />;
@@ -4076,26 +4080,31 @@ export default function ChatScreen({ navigation, route }) {
               
               {isMyMessage && !isDeletedMessage && !inlineMediaTime && (
                 <>
+                  {/* scheduled / processing → clock */}
                   {(msg.status === "scheduled" || msg.status === "processing") && (
-                    <Ionicons name="time-outline" size={12} color="rgba(255,255,255,0.7)" style={{ marginLeft: 2 }} />
+                    <Ionicons name="time-outline" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
+                  )}
+                  {/* pending → clock (queued offline, not yet emitted to server) */}
+                  {msg.status === "pending" && (
+                    <Ionicons name="time-outline" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
                   )}
                   {msg.status === "cancelled" && (
                     <Ionicons name="close-circle" size={12} color="#FF8A80" style={{ marginLeft: 2 }} />
                   )}
                   {msg.status === "sending" && (
-                    <ActivityIndicator size={8} color="rgba(255,255,255,0.7)" style={{ marginLeft: 2 }} />
+                    <ActivityIndicator size={8} color="#8696A0" style={{ marginLeft: 2 }} />
                   )}
-                  {msg.status === "uploaded" && (
-                    <Ionicons name="checkmark" size={12} color="rgba(255,255,255,0.7)" />
+                  {/* uploaded / sent → single gray tick */}
+                  {(msg.status === "uploaded" || msg.status === "sent") && (
+                    <Ionicons name="checkmark" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
                   )}
-                  {msg.status === "sent" && (
-                    <Ionicons name="checkmark" size={12} color="rgba(255,255,255,0.7)" />
-                  )}
+                  {/* delivered → double gray tick */}
                   {msg.status === "delivered" && (
-                    <Ionicons name="checkmark-done" size={12} color="rgba(255,255,255,0.7)" />
+                    <Ionicons name="checkmark-done" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
                   )}
+                  {/* seen / read → double blue tick — WhatsApp blue #53BDEB */}
                   {(msg.status === "seen" || msg.status === "read") && (
-                    <Ionicons name="checkmark-done" size={12} color="#4FC3F7"/>
+                    <Ionicons name="checkmark-done" size={12} color="#53BDEB" style={{ marginLeft: 2 }} />
                   )}
                   {msg.status === "failed" && (
                     <TouchableOpacity onPress={() => resendMessage(msg)}>
