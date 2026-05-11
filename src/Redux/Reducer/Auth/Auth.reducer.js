@@ -8,7 +8,7 @@ export const generateOtpAction = createAsyncThunk(
     try {
       const response = await authServices.generateOtp(mobile);
       // console.log("msg test", response)
-      return response.otpMessage;
+      return { otpMessage: response.otpMessage, otpData: response.otpData };
     } catch (error) {
       return rejectWithValue(error.message || "OTP generation failed");
     }
@@ -55,6 +55,19 @@ export const linkedDevice = createAsyncThunk(
   }
 );
 
+export const emailLogin = createAsyncThunk(
+  'auth/emailLogin',
+  async (payload, { rejectWithValue }) => {
+    try {
+      const response = await authServices.emailLoginService(payload);
+      return response;
+    } catch (error) {
+      return rejectWithValue(error.message || error);
+    }
+  }
+);
+
+
 export const removeDevice = createAsyncThunk(
   'auth/deactiveSession',
   async ( deviceId, { rejectWithValue }) => {
@@ -77,6 +90,7 @@ const authSlice = createSlice({
     isLoading: false,
     error: null,
     otpMessage: '', // State for storing OTP message
+    otpData: null, // State for storing OTP data (dev)
   },
   reducers: {
     logout: (state) => {
@@ -95,7 +109,8 @@ const authSlice = createSlice({
       })
       .addCase(generateOtpAction.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.otpMessage = action.payload; // Store OTP message
+        state.otpMessage = action.payload?.otpMessage || action.payload;
+        state.otpData = action.payload?.otpData || null;
         state.error = null;
       })
       .addCase(generateOtpAction.rejected, (state, action) => {
@@ -133,6 +148,20 @@ const authSlice = createSlice({
       .addCase(linkedDevice.rejected, (state, action) => {
         state.isLoading = false;
         state.error = action.payload; // Store error message
+      })
+
+      .addCase(emailLogin.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(emailLogin.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.user = action.payload.data || null;
+        state.error = null;
+      })
+      .addCase(emailLogin.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload;
       })
 
       .addCase(resendOtp.pending, (state) => {

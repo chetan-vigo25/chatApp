@@ -1,4 +1,4 @@
-import React, { createContext, useState, useEffect, useContext } from 'react';
+import React, { createContext, useState, useEffect, useContext, useRef } from 'react';
 import NetInfo from '@react-native-community/netinfo';
 import { Alert } from 'react-native';
 
@@ -6,27 +6,35 @@ export const NetworkContext = createContext();
 
 export const NetworkProvider = ({ children }) => {
   const [isConnected, setIsConnected] = useState(true);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [isInternetReachable, setIsInternetReachable] = useState(true);
+  const [networkType, setNetworkType] = useState('unknown');
+  const previousConnectedRef = useRef(true);
 
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener(state => {
-      if (!state.isConnected && isConnected) {
+      const currentlyConnected = Boolean(state.isConnected);
+      const internetReachable = state.isInternetReachable == null ? currentlyConnected : Boolean(state.isInternetReachable);
+
+      setIsConnected(currentlyConnected);
+      setIsInternetReachable(internetReachable);
+      setNetworkType(state.type || 'unknown');
+
+      if (!currentlyConnected && previousConnectedRef.current) {
         Alert.alert('No Internet', 'You have lost connection.');
-        setIsConnected(false);
       }
 
-      if (state.isConnected && !isConnected) {
+      if (currentlyConnected && !previousConnectedRef.current) {
         Alert.alert('Connected', 'Internet connection restored.');
-        setIsConnected(true);
-        setRefreshKey(prev => prev + 1); // 🔁 Trigger refresh
       }
+
+      previousConnectedRef.current = currentlyConnected;
     });
 
     return () => unsubscribe();
-  }, [isConnected]);
+  }, []);
 
   return (
-    <NetworkContext.Provider value={{ isConnected }}>
+    <NetworkContext.Provider value={{ isConnected, isInternetReachable, networkType }}>
       {children}
     </NetworkContext.Provider>
   );

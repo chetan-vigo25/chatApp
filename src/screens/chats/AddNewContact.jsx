@@ -28,6 +28,10 @@ export default function AddNewContact({ navigation }) {
     const searchTimeoutRef = useRef(null);
     const isSocketListenerActive = useRef(false);
     const pendingUserDataRef = useRef(null); // Add this to store user data persistently
+    const socketHandlersRef = useRef({
+      onSearchResponse: null,
+      onChatCreateResponse: null,
+    });
 
     useEffect(() => {
       const timer = setTimeout(() => {
@@ -42,6 +46,15 @@ export default function AddNewContact({ navigation }) {
 
     const handleCountrySelect = (country) => {
       setSelectedCountry(country);
+    };
+
+    const handleBack = () => {
+      if (navigation?.canGoBack?.()) {
+        navigation.goBack();
+        return;
+      }
+
+      navigation?.navigate?.('ChatList');
     };
 
     const handleClearPhoneNumber = () => {
@@ -98,12 +111,12 @@ export default function AddNewContact({ navigation }) {
 
         console.log('🎧 Setting up socket listeners for contact search');
         
-        socket.on('searchuserbymobile:response', (response) => {
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          console.log("📥 SEARCH USER BY MOBILE RESPONSE");
-          console.log("   Status:", response.status);
-          console.log("   Data:", JSON.stringify(response.data, null, 2));
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        const onSearchResponse = (response) => {
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("📥 SEARCH USER BY MOBILE RESPONSE");
+          // console.log("   Status:", response.status);
+          // console.log("   Data:", JSON.stringify(response.data, null, 2));
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           
           setIsSearching(false);
           
@@ -134,13 +147,15 @@ export default function AddNewContact({ navigation }) {
               message: response?.message || 'User not found'
             });
           }
-        });
+        };
+        socketHandlersRef.current.onSearchResponse = onSearchResponse;
+        socket.on('user:search:mobile:response', onSearchResponse);
 
-        socket.on('createchat:response', (response) => {
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          console.log("📥 CREATE CHAT RESPONSE");
-          console.log("   Response:", JSON.stringify(response, null, 2));
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        const onChatCreateResponse = (response) => {
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("📥 CREATE CHAT RESPONSE");
+          // console.log("   Response:", JSON.stringify(response, null, 2));
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           
           if (response.status && response.data) {
             console.log("✅ Chat created successfully, navigating to ChatScreen");
@@ -185,7 +200,9 @@ export default function AddNewContact({ navigation }) {
             console.error("❌ Failed to create chat:", response.message);
             Alert.alert('Error', response.message || 'Failed to create chat');
           }
-        });
+        };
+        socketHandlersRef.current.onChatCreateResponse = onChatCreateResponse;
+        socket.on('chat:create:response', onChatCreateResponse);
 
         isSocketListenerActive.current = true;
     }
@@ -213,8 +230,14 @@ export default function AddNewContact({ navigation }) {
         }
         
         console.log("🔇 Removing socket listeners for contact search");
-        socket.off('searchuserbymobile:response');
-        socket.off('createchat:response');
+        if (socketHandlersRef.current.onSearchResponse) {
+          socket.off('user:search:mobile:response', socketHandlersRef.current.onSearchResponse);
+        }
+        if (socketHandlersRef.current.onChatCreateResponse) {
+          socket.off('chat:create:response', socketHandlersRef.current.onChatCreateResponse);
+        }
+        socketHandlersRef.current.onSearchResponse = null;
+        socketHandlersRef.current.onChatCreateResponse = null;
         isSocketListenerActive.current = false;
     }; 
 
@@ -284,10 +307,10 @@ export default function AddNewContact({ navigation }) {
 
     const handleCreateChat = async (userId) => {
       try {
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-          console.log("💬 CREATING CHAT");
-          console.log("   User ID:", userId);
-          console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+          // console.log("💬 CREATING CHAT");
+          // console.log("   User ID:", userId);
+          // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
           
           // Use the stored user data from ref instead of searchResult
           const userData = pendingUserDataRef.current;
@@ -363,14 +386,14 @@ export default function AddNewContact({ navigation }) {
       // Store user data in ref for persistence
       pendingUserDataRef.current = searchResult.user;
       
-      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      console.log("📱 ADDING CONTACT");
-      console.log("   User:", searchResult.user?.fullName || searchResult.user?.name);
-      console.log("   User ID:", searchResult.user?._id);
-      console.log("   Chat ID:", searchResult.chatId);
-      console.log("   Has Existing Chat:", searchResult.hasExistingChat);
-      console.log("   Is Contact:", searchResult.isContact);
-      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      // console.log("📱 ADDING CONTACT");
+      // console.log("   User:", searchResult.user?.fullName || searchResult.user?.name);
+      // console.log("   User ID:", searchResult.user?._id);
+      // console.log("   Chat ID:", searchResult.chatId);
+      // console.log("   Has Existing Chat:", searchResult.hasExistingChat);
+      // console.log("   Is Contact:", searchResult.isContact);
+      // console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
       
       // If chat already exists, navigate directly
       if (searchResult.hasExistingChat && searchResult.chatId) {
@@ -461,11 +484,11 @@ export default function AddNewContact({ navigation }) {
     return(
        <Animated.View style={{ flex: 1, opacity: fadeAnim, backgroundColor: theme.colors.background }} >
          <View style={{ width:'100%', flexDirection:'row', gap:10, alignItems:'center', padding:10, borderBottomWidth:1, borderBottomColor:theme.colors.borderColor }} >
-           <TouchableOpacity onPress={() => navigation.goBack()} style={{ width:40, height:40, alignItems:'center', justifyContent:'center', }} >
+            <TouchableOpacity onPress={handleBack} style={{ width:40, height:40, alignItems:'center', justifyContent:'center', }} >
               <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
            </TouchableOpacity>
            <View style={{ flex:1 }} >
-               <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Poppins-Medium', fontSize:16, textTransform:'capitalize' }} >New Contact</Text>
+               <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, textTransform:'capitalize' }} >New Contact</Text>
            </View>
          </View>
          <ScrollView style={{ flex:1, padding:20 }} >
@@ -489,6 +512,9 @@ export default function AddNewContact({ navigation }) {
                 onChangeText={handlePhoneNumberChange}
                 activeOutlineColor={ theme.colors.themeColor }
                 outlineColor={ theme.colors.themeColor }
+                textColor={ theme.colors.primaryTextColor }
+                style={{ backgroundColor: 'transparent' }}
+                theme={{ colors: { background: theme.colors.background, surfaceVariant: 'transparent', onSurfaceVariant: theme.colors.placeHolderTextColor } }}
                 right={
                     isSearching ? (
                       <TextInput.Icon
@@ -522,12 +548,12 @@ export default function AddNewContact({ navigation }) {
          {searchResult && searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching && (
            <View style={{ marginTop: 20 }}>
              <View style={{ flex: 1 }}>
-               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Medium', fontSize: 14, marginTop: 2 }}>
+               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium', fontSize: 14, marginTop: 2 }}>
                  This phone number is on {APP_TAG_NAME}.
                </Text>
              </View>
              <View style={{ alignSelf:'flex-start', marginTop: 8 }}>
-               <Text style={{ color: theme.colors.themeColor, fontFamily: 'Poppins-SemiBold', fontSize: 14 }}>
+               <Text style={{ color: theme.colors.themeColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
                  View Contact →
                </Text>
              </View>
@@ -556,16 +582,16 @@ export default function AddNewContact({ navigation }) {
                      justifyContent: 'center',
                      alignItems: 'center'
                    }}>
-                     <Text style={{ color: '#fff', fontSize: 18, fontFamily: 'Poppins-Medium' }}>
+                     <Text style={{ color: '#fff', fontSize: 18, fontFamily: 'Roboto-Medium' }}>
                        {(searchResult.user?.fullName || searchResult.user?.name || 'U').charAt(0).toUpperCase()}
                      </Text>
                    </View>
                  )}
                  <View style={{ marginLeft: 12 }}>
-                   <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium', fontSize: 16 }}>
+                   <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16 }}>
                      {searchResult.user?.fullName || searchResult.user?.name || 'User'}
                    </Text>
-                   <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Regular', fontSize: 12 }}>
+                   <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', fontSize: 12 }}>
                      {selectedCountry.code} {phoneNumber}
                    </Text>
                  </View>
@@ -578,7 +604,7 @@ export default function AddNewContact({ navigation }) {
          {searchResult && !searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching && (
            <View style={{ marginTop: 20 }}>
              <View style={{ flex: 1 }}>
-               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Poppins-Medium', fontSize: 14, marginTop: 2 }}>
+               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium', fontSize: 14, marginTop: 2 }}>
                  This phone number is not on {APP_TAG_NAME}.
                </Text>
              </View>

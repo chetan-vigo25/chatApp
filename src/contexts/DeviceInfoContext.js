@@ -3,7 +3,8 @@ import * as Device from 'expo-device';
 import Constants from 'expo-constants';
 
 
-export const DeviceInfoContext = createContext();
+const DEVICE_INFO_SENTINEL = Symbol('DeviceInfoContext');
+export const DeviceInfoContext = createContext(DEVICE_INFO_SENTINEL);
 
 export const DeviceInfoProvider = ({ children }) => {
   const [deviceInfo, setDeviceInfo] = useState(null);
@@ -54,7 +55,7 @@ export const DeviceInfoProvider = ({ children }) => {
 
 export const useDeviceInfo = () => {
   const context = React.useContext(DeviceInfoContext);
-  if (!context) {
+  if (context === DEVICE_INFO_SENTINEL) {
     throw new Error('useDeviceInfo must be used within a DeviceInfoProvider');
   }
   return context;

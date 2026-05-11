@@ -1,4 +1,5 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { chatServices } from '../../Services/Chat/Chat.Services';
 
 // ============================================
@@ -11,11 +12,17 @@ export const chatListData = createAsyncThunk(
   async (searchValue, { rejectWithValue }) => {
     try {
       const response = await chatServices.chatListData(searchValue);
+      const rawUser = await AsyncStorage.getItem('userInfo');
+      const parsedUser = rawUser ? JSON.parse(rawUser) : null;
+      const ownerUserId = parsedUser?._id || parsedUser?.id || null;
       if (!response?.data) {
-        return [];
+        return { docs: [], ownerUserId };
       }
       const docs = response.data.docs;
-      return Array.isArray(docs) ? docs : [];
+      return {
+        docs: Array.isArray(docs) ? docs : [],
+        ownerUserId,
+      };
 
     } catch (error) {
       return rejectWithValue(error.message);
@@ -96,6 +103,39 @@ export const downloadMedia = createAsyncThunk(
   }
 );
 
+export const mediaAllFiles = createAsyncThunk(
+  'chat/mediaAllFiles',
+  async (payload, { rejectWithValue }) => {
+    try {
+      return await chatServices.mediaAllFiles(payload || {});
+    } catch (error) {
+      return rejectWithValue(error.message || 'Unable to fetch media files');
+    }
+  }
+);
+
+export const mediaView = createAsyncThunk(
+  'chat/mediaView',
+  async (payload, { rejectWithValue }) => {
+    try {
+      return await chatServices.mediaView(payload || {});
+    } catch (error) {
+      return rejectWithValue(error.message || 'Unable to view media');
+    }
+  }
+);
+
+export const mediaDelete = createAsyncThunk(
+  'chat/mediaDelete',
+  async (payload, { rejectWithValue }) => {
+    try {
+      return await chatServices.mediaDelete(payload || {});
+    } catch (error) {
+      return rejectWithValue(error.message || 'Unable to delete media');
+    }
+  }
+);
+
 // ============================================
 // 🔧 CHAT SLICE
 // ============================================
@@ -110,6 +150,7 @@ const chatSlice = createSlice({
     isLoading: false,
     error: null,
     otpMessage: '',
+    ownerUserId: null,
     
     // Pagination state
     currentPage: 1,
@@ -130,6 +171,18 @@ const chatSlice = createSlice({
       state.currentPage = 1;
       state.totalPages = 1;
       state.hasMoreMessages = true;
+    },
+
+    // Insert a new group chat at the top of chatsData
+    addGroupChat: (state, action) => {
+      const groupChat = action.payload;
+      if (!groupChat) return;
+      const existing = (state.chatsData || []).find(
+        (c) => (c?.chatId || c?._id) === (groupChat?.chatId || groupChat?._id)
+      );
+      if (!existing) {
+        state.chatsData = [groupChat, ...(state.chatsData || [])];
+      }
     },
 
     // Logout
@@ -157,7 +210,8 @@ const chatSlice = createSlice({
       })
       .addCase(chatListData.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.chatsData = action.payload || null;
+        state.chatsData = action.payload?.docs || [];
+        state.ownerUserId = action.payload?.ownerUserId || null;
         state.error = null;
       })
       .addCase(chatListData.rejected, (state, action) => {
@@ -208,5 +262,5 @@ const chatSlice = createSlice({
   },
 });
 
-export const { logout, clearChatMessages, resetPagination } = chatSlice.actions;
+export const { logout, clearChatMessages, resetPagination, addGroupChat } = chatSlice.actions;
 export default chatSlice.reducer;

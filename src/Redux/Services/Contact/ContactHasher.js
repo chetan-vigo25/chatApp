@@ -5,11 +5,30 @@ class ContactHasher {
   constructor() {
     this.algorithm = 'sha256';
     this.saltLength = 32;
+    this.cipherVersion = 'v2';
+  }
+
+  generatePseudoRandomBytes(byteLength) {
+    const words = [];
+    for (let i = 0; i < byteLength; i += 4) {
+      const randomWord = ((Math.random() * 0x100000000) | 0);
+      words.push(randomWord);
+    }
+    return CryptoJS.lib.WordArray.create(words, byteLength);
+  }
+
+  getRandomWordArray(byteLength) {
+    try {
+      return CryptoJS.lib.WordArray.random(byteLength);
+    } catch (error) {
+      console.warn('Secure random unavailable, using fallback RNG:', error?.message || error);
+      return this.generatePseudoRandomBytes(byteLength);
+    }
   }
  
   generateSalt() {
     try {
-      return CryptoJS.lib.WordArray.random(this.saltLength).toString();
+      return this.getRandomWordArray(this.saltLength).toString();
     } catch (error) {
       console.error('Error generating salt:', error);
       return Array.from({length: this.saltLength}, () =>
@@ -46,13 +65,17 @@ class ContactHasher {
     }
   }
 
-  // Simple encryption without complex EVP (more reliable)
+  getEncryptionKey() {
+    const secret = String(CONTACT_SALT || 'default_salt_123');
+    return CryptoJS.SHA256(secret);
+  }
+
+  // Versioned AES-CBC encryption with IV prefix for stable cross-screen decrypt
   encryptContent(plainText) {
     if (!plainText) return "";
     try {
-      // Use simple AES encryption with the CONTACT_SALT as key
-      const key = CryptoJS.enc.Utf8.parse(String(CONTACT_SALT || 'default_salt_123').padEnd(32, '0').substring(0, 32));
-      const iv = CryptoJS.lib.WordArray.random(16);
+      const key = this.getEncryptionKey();
+      const iv = this.getRandomWordArray(16);
       
       const encrypted = CryptoJS.AES.encrypt(plainText, key, {
         iv: iv,
@@ -60,39 +83,81 @@ class ContactHasher {
         padding: CryptoJS.pad.Pkcs7
       });
 
-      // Combine IV and ciphertext
-      const combined = iv.concat(encrypted.ciphertext);
-      return CryptoJS.enc.Base64.stringify(combined);
+      const ivHex = CryptoJS.enc.Hex.stringify(iv);
+      const cipherHex = CryptoJS.enc.Hex.stringify(encrypted.ciphertext);
+      return `${this.cipherVersion}:${ivHex}:${cipherHex}`;
     } catch (err) {
       console.error('Error encrypting content:', err);
       return "";
     }
   }
 
-  // Simple decryption
+  decryptLegacyCombinedBase64(cipherText) {
+    const key = this.getEncryptionKey();
+
+    const combined = CryptoJS.enc.Base64.parse(cipherText);
+    const iv = CryptoJS.lib.WordArray.create(combined.words.slice(0, 4), 16);
+    const cipherSigBytes = Math.max((combined.sigBytes || 0) - 16, 0);
+    const ciphertext = CryptoJS.lib.WordArray.create(combined.words.slice(4), cipherSigBytes);
+
+    const decrypted = CryptoJS.AES.decrypt(
+      { ciphertext },
+      key,
+      { iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
+    );
+
+    return decrypted.toString(CryptoJS.enc.Utf8);
+  }
+
+  decryptVersioned(cipherText) {
+    const parts = String(cipherText).split(':');
+    if (parts.length !== 3) return "";
+
+    const [version, ivHex, cipherHex] = parts;
+    if (version !== this.cipherVersion) return "";
+
+    const key = this.getEncryptionKey();
+    const iv = CryptoJS.enc.Hex.parse(ivHex);
+    const ciphertext = CryptoJS.enc.Hex.parse(cipherHex);
+
+    const decrypted = CryptoJS.AES.decrypt(
+      { ciphertext },
+      key,
+      { iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
+    );
+
+    return decrypted.toString(CryptoJS.enc.Utf8);
+  }
+
+  // Decrypts v2 format and supports old payloads for backward compatibility
   decryptContent(cipherText) {
     if (!cipherText) return "";
     try {
-      const key = CryptoJS.enc.Utf8.parse(String(CONTACT_SALT || 'default_salt_123').padEnd(32, '0').substring(0, 32));
-      
-      // Parse the combined IV and ciphertext
-      const combined = CryptoJS.enc.Base64.parse(cipherText);
-      
-      // Extract IV (first 16 bytes) and ciphertext
-      const iv = CryptoJS.lib.WordArray.create(combined.words.slice(0, 4), 16);
-      const ciphertext = CryptoJS.lib.WordArray.create(combined.words.slice(4));
-      
-      const decrypted = CryptoJS.AES.decrypt(
-        { ciphertext: ciphertext },
-        key,
-        { iv: iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
-      );
-      
-      return decrypted.toString(CryptoJS.enc.Utf8);
+      const text = String(cipherText).trim();
+
+      if (text.startsWith(`${this.cipherVersion}:`)) {
+        return this.decryptVersioned(text);
+      }
+
+      const legacyCombined = this.decryptLegacyCombinedBase64(text);
+      if (legacyCombined) return legacyCombined;
+
+      const passphraseFallback = CryptoJS.AES.decrypt(text, String(CONTACT_SALT || 'default_salt_123'));
+      return passphraseFallback.toString(CryptoJS.enc.Utf8);
     } catch (err) {
       console.error('Error decrypting content:', err);
       return "";
     }
+  }
+
+  decryptPhoneNumber(encryptNumber, salt = SALT_SECRET) {
+    const decrypted = this.decryptContent(encryptNumber);
+    if (!decrypted) return '';
+    const suffix = String(salt || '');
+    if (suffix && decrypted.endsWith(suffix)) {
+      return decrypted.slice(0, decrypted.length - suffix.length);
+    }
+    return decrypted;
   }
  
   hashPhoneNumber(phoneNumber, salt = null) {

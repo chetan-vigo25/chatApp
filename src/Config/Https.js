@@ -2,6 +2,7 @@ import axios from "axios";
 import { ToastAndroid, Alert, Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { BACKEND_URL } from "@env";
+import { performSessionReset, refreshAccessToken } from "../services/sessionManager";
 
 function showToast(message) {
   if (!message) return;
@@ -16,6 +17,20 @@ const api = axios.create({
   baseURL: BACKEND_URL,
   timeout: 15000,
 });
+
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach(({ resolve, reject }) => {
+    if (error) {
+      reject(error);
+      return;
+    }
+    resolve(token);
+  });
+  failedQueue = [];
+};
 
 // Helper to detect FormData in different environments (expo/react-native)
 const isFormData = (data) => {
@@ -50,6 +65,60 @@ api.interceptors.request.use(
     }
   },
   (error) => Promise.reject(error)
+);
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error?.config;
+    const status = error?.response?.status;
+
+    if (!originalRequest || status !== 401 || originalRequest._retry) {
+      return Promise.reject(error);
+    }
+
+    if ((originalRequest.url || '').includes('/refresh')) {
+      return Promise.reject(error);
+    }
+
+    if (isRefreshing) {
+      return new Promise((resolve, reject) => {
+        failedQueue.push({ resolve, reject });
+      }).then((newAccessToken) => {
+        originalRequest.headers = originalRequest.headers || {};
+        originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+        return api(originalRequest);
+      });
+    }
+
+    originalRequest._retry = true;
+    isRefreshing = true;
+
+    try {
+      const refreshed = await refreshAccessToken({ force: true });
+      console.log("Token refreshed successfully ------------------", { refreshed });
+      const newAccessToken = refreshed?.accessToken;
+
+      if (!newAccessToken) {
+        throw new Error('Token refresh response missing access token');
+      }
+
+      processQueue(null, newAccessToken);
+      originalRequest.headers = originalRequest.headers || {};
+      originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+      return api(originalRequest);
+    } catch (refreshError) {
+      processQueue(refreshError, null);
+      await performSessionReset({
+        reason: 'session_expired',
+        resetNavigation: true,
+        clearAllStorage: true,
+      });
+      return Promise.reject(refreshError);
+    } finally {
+      isRefreshing = false;
+    }
+  }
 );
 
 // Centralized error handling
@@ -90,19 +159,26 @@ const buildUrl = (endpoint) => {
 };
 
 // Generic API call for JSON
+// Pass { silent: true } in config to suppress error toasts (e.g., expected 404s)
 export const apiCall = async (method, endpoint, data = {}, config = {}) => {
+  const { silent, ...restConfig } = config;
   try {
     const url = buildUrl(endpoint);
     if (!url) {
       const msg = 'BACKEND_URL is not configured. Set BACKEND_URL in your .env';
       console.error(msg);
-      showToast(msg);
+      if (!silent) showToast(msg);
       return Promise.reject(new Error(msg));
     }
 
-    const response = await api({ method, url, data, ...config });
+    const response = await api({ method, url, data, ...restConfig });
     return response.data;
   } catch (error) {
+    if (silent) {
+      // Log but don't toast — caller handles the error
+      console.log('[API:silent]', error?.response?.status, endpoint);
+      return Promise.reject(error?.response?.data || error);
+    }
     return handleApiError(error);
   }
 };
@@ -120,7 +196,7 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
     }
 
     // Prepare headers and token
-    const token = await AsyncStorage.getItem('accessToken');
+    let token = await AsyncStorage.getItem('accessToken');
     const headers = { ...(config.headers || {}) };
     if (token) headers.Authorization = `Bearer ${token}`;
     // Do NOT set Content-Type for FormData; fetch will handle it.
@@ -143,6 +219,33 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
     const text = await response.text();
     let data = null;
     try { data = text ? JSON.parse(text) : {}; } catch (e) { data = text; }
+
+    if (response.status === 401 && !config._retry) {
+      try {
+        const refreshed = await refreshAccessToken({ force: true });
+        token = refreshed?.accessToken;
+
+        if (!token) {
+          throw new Error('Session expired');
+        }
+
+        return apiCallForm(method, endpoint, formData, {
+          ...config,
+          _retry: true,
+          headers: {
+            ...(config.headers || {}),
+            Authorization: `Bearer ${token}`,
+          },
+        });
+      } catch (refreshError) {
+        await performSessionReset({
+          reason: 'session_expired_upload',
+          resetNavigation: true,
+          clearAllStorage: true,
+        });
+        throw refreshError;
+      }
+    }
 
     if (!response.ok) {
       const msg = data?.message || response.statusText || 'Upload failed';

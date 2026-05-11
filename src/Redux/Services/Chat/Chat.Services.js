@@ -142,6 +142,7 @@ export async function downloadMedia(formData) {
     console.log("user/media/downloadMedia services-----",formData)
     try {
       const response = await apiCall("POST","user/media/download", formData);
+      console.log("api response of the download ", response)
   
       if (response?.statusCode === 200) {
         return response;
@@ -156,6 +157,64 @@ export async function downloadMedia(formData) {
     }
   }
 
+export async function mediaAllFiles(payload = {}) {
+  try {
+    const response = await apiCall('POST', 'user/media/all/files', {
+      category: payload?.category ?? null,
+      chatId: payload?.chatId ?? null,
+      page: payload?.page ?? 1,
+      limit: payload?.limit ?? 20,
+      groupByCategory: payload?.groupByCategory ?? false,
+    });
+
+    if (response?.statusCode === 200) {
+      return response;
+    }
+
+    showToast(response?.message || 'Unable to fetch media files');
+    return Promise.reject(response?.message || 'Unable to fetch media files');
+  } catch (error) {
+    console.error('user/media/all/files error:', error);
+    return Promise.reject(error);
+  }
+}
+
+export async function mediaView(payload = {}) {
+  try {
+    const response = await apiCall('POST', 'user/media/view', {
+      id: payload?.id,
+    });
+
+    if (response?.statusCode === 200) {
+      return response;
+    }
+
+    showToast(response?.message || 'Unable to view media');
+    return Promise.reject(response?.message || 'Unable to view media');
+  } catch (error) {
+    console.error('user/media/view error:', error);
+    return Promise.reject(error);
+  }
+}
+
+export async function mediaDelete(payload = {}) {
+  try {
+    const response = await apiCall('POST', 'user/media/delete', {
+      id: payload?.id,
+    });
+
+    if (response?.statusCode === 200) {
+      return response;
+    }
+
+    showToast(response?.message || 'Unable to delete media');
+    return Promise.reject(response?.message || 'Unable to delete media');
+  } catch (error) {
+    console.error('user/media/delete error:', error);
+    return Promise.reject(error);
+  }
+}
+
 // Export as chatServices object
 export const chatServices = {
   chatListData,
@@ -163,6 +222,9 @@ export const chatServices = {
   chatMessageList,
   mediaUpload,
   downloadMedia,
+  mediaAllFiles,
+  mediaView,
+  mediaDelete,
 };
 
 export default chatServices;

@@ -1,5 +1,10 @@
-import { initializeApp } from '@react-native-firebase/app';
+let firebaseApp = null;
 
-// No extra config needed if using google-services.json
-// Firebase will auto-initialize from Android/iOS config
-export const firebaseApp = initializeApp({});
+try {
+  const { initializeApp } = require('@react-native-firebase/app');
+  firebaseApp = initializeApp({});
+} catch (error) {
+  console.warn('[Firebase] Init failed — google-services.json may be missing:', error?.message);
+}
+
+export { firebaseApp };

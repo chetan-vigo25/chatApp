@@ -90,7 +90,7 @@ export default function PersonalInfoEdit({ navigation, route }) {
           <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
         </TouchableOpacity>
         <View style={{ flex: 1, alignItems: 'flex-start', justifyContent: 'center' }} >
-          <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 16, color: theme.colors.primaryTextColor }} >
+          <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 16, color: theme.colors.primaryTextColor }} >
             Edit {field === 'fullName' ? 'Name' : field === 'about' ? 'About' : ''}
           </Text>
         </View>
@@ -100,10 +100,10 @@ export default function PersonalInfoEdit({ navigation, route }) {
           width: '100%', height: 50, backgroundColor: theme.colors.background, justifyContent: 'center', borderRadius: 6, borderWidth: 1, borderColor: focusedInput === field ? theme.colors.themeColor : theme.colors.borderColor,
         }} >
           <Text style={{
-            color: focusedInput === field ? theme.colors.themeColor : theme.colors.primaryTextColor, alignSelf: "flex-start", fontSize: 12, fontFamily: 'Poppins-SemiBold', paddingHorizontal: 5, position: 'absolute', top: -10, left: 15, backgroundColor: theme.colors.background
+            color: focusedInput === field ? theme.colors.themeColor : theme.colors.primaryTextColor, alignSelf: "flex-start", fontSize: 12, fontFamily: 'Roboto-SemiBold', paddingHorizontal: 5, position: 'absolute', top: -10, left: 15, backgroundColor: theme.colors.background
           }} >{field === 'fullName' ? 'Name' : field === 'about' ? 'About' : ''}</Text>
           <TextInput placeholder="" placeholderTextColor={theme.colors.placeHolderTextColor} style={{
-            flex: 1, paddingLeft: 15, color: theme.colors.primaryTextColor, fontFamily: 'Poppins-Medium', fontSize: 16,
+            flex: 1, paddingLeft: 15, color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16,
           }}
             value={inputValue}
             onChangeText={handleInputChange}
@@ -112,13 +112,13 @@ export default function PersonalInfoEdit({ navigation, route }) {
             maxLength={maxLength}
           />
         </View>
-        <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 12, color: theme.colors.placeHolderTextColor, alignSelf: 'flex-end', marginTop: 5 }} >{charCount}/{maxLength}</Text>
+        <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 12, color: theme.colors.placeHolderTextColor, alignSelf: 'flex-end', marginTop: 5 }} >{charCount}/{maxLength}</Text>
         <TouchableOpacity onPress={handleSave} disabled={isLoading} style={{ opacity: isLoading ? 0.5 : 1, width: '100%', height: 50, alignSelf: "center", backgroundColor: theme.colors.themeColor, justifyContent: 'center', alignItems: 'center', borderRadius: 40, marginTop: 20, position: 'absolute', bottom: 40 }} >
           {
             isLoading ? (
               <ActivityIndicator size="small" color={theme.colors.textWhite} />
             ) : (
-              <Text style={{ fontFamily: 'Poppins-SemiBold', fontSize: 16, color: '#fff' }} >Save</Text>
+              <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 16, color: '#fff' }} >Save</Text>
             )
           }
         </TouchableOpacity>

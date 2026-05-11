@@ -10,7 +10,7 @@ const lightTheme = {
     background: '#ffffff',
     primaryTextColor: '#000000',
     textWhite: '#ffffff',
-    themeColor: '#34B7F1',
+    themeColor: '#03b0a2',
     placeHolderTextColor: '#a9a9a9',
     borderColor: '#e0e0e0',
     menuBackground: '#f5f5f5',
@@ -28,7 +28,7 @@ const darkTheme = {
     background: '#101D25',
     primaryTextColor: '#ffffff',
     textWhite: '#ffffff',
-    themeColor: '#34B7F1',
+    themeColor: '#03b0a2',
     placeHolderTextColor: '#a9a9a9',
     borderColor: '#e0e0e0',
     menuBackground: '#232D36',
@@ -46,7 +46,7 @@ export const defaultTheme = lightTheme;
 export const ThemeProvider = ({ children }) => {
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [chatColor, setChatColor] = useState('#34B7F1');
+  const [chatColor, setChatColor] = useState('#128C7E');
   const [hasManualTheme, setHasManualTheme] = useState(false);
 
   // 1️⃣ Load saved theme and chat color on mount
