@@ -2,17 +2,43 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TouchableOpacity, Image, ScrollView,
   ActivityIndicator, Animated, StyleSheet, Alert, Modal,
-  Platform, ToastAndroid,
+  Platform, ToastAndroid, Dimensions, StatusBar,
 } from 'react-native';
+
+const { width: SCREEN_W } = Dimensions.get('window');
+const HERO_H = Math.min(SCREEN_W, 380);
+const STATUS_H = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons, MaterialCommunityIcons, FontAwesome6 } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { viewGroup, deleteGroup, transferOwnership } from '../../Redux/Reducer/Group/Group.reducer';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
+
+// Smooth dark bottom gradient (14 stacked bands, quadratic easing)
+const GRADIENT_BANDS = 14;
+const GRADIENT_HEIGHT = 220;
+function HeroGradient() {
+  const bandH = GRADIENT_HEIGHT / GRADIENT_BANDS;
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, bottom: 0, justifyContent: 'flex-end' }}>
+      {Array.from({ length: GRADIENT_BANDS }).map((_, i) => {
+        const t = (i + 1) / GRADIENT_BANDS;
+        const alpha = Math.min(0.62, t * t * 0.7);
+        return (
+          <View
+            key={i}
+            style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }}
+          />
+        );
+      })}
+    </View>
+  );
+}
 
 const getMemberUser = (m) => {
   if (!m) return {};
@@ -219,36 +245,47 @@ export default function GroupInfo({ navigation, route }) {
   const cardBg = isDarkMode ? 'rgba(255,255,255,0.035)' : 'rgba(0,0,0,0.018)';
   const dividerBg = isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)';
 
+  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+
   return (
-    <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: theme.colors.background }]}>
-      {/* ─── HEADER ─── */}
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={styles.headerBtn}>
-          <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
-        </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>Group Info</Text>
-        {canEditGroup && (
-          <TouchableOpacity onPress={() => navigation.navigate('EditGroup', { groupId })} activeOpacity={0.6} style={styles.headerBtn}>
-            <Ionicons name="create-outline" size={20} color={theme.colors.themeColor} />
+    <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
+      <StatusBar translucent backgroundColor="transparent" barStyle="light-content" />
+
+      {/* ─── Floating header over hero — SafeAreaView handles the top inset ─── */}
+      <SafeAreaView edges={['top']} style={styles.floatingHeaderSafe}>
+        <View style={styles.floatingHeaderRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.7} style={styles.floatingBtn}>
+            <FontAwesome6 name="arrow-left" size={18} color="#fff" />
           </TouchableOpacity>
-        )}
-      </View>
+          <View style={{ flex: 1 }} />
+          {canEditGroup && (
+            <TouchableOpacity onPress={() => navigation.navigate('EditGroup', { groupId })} activeOpacity={0.7} style={styles.floatingBtn}>
+              <Ionicons name="create-outline" size={18} color="#fff" />
+            </TouchableOpacity>
+          )}
+        </View>
+      </SafeAreaView>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 100 }}>
 
-        {/* ═══ GROUP PROFILE HERO ═══ */}
-        <View style={styles.heroSection}>
-          <View style={[styles.heroAvatar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}>
-            {groupAvatarUrl ? (
-              <Image source={{ uri: groupAvatarUrl }} style={styles.heroAvatarImg} />
-            ) : (
-              <Ionicons name="people" size={48} color={theme.colors.placeHolderTextColor} />
-            )}
+        {/* ═══ TELEGRAM-STYLE GROUP HERO ═══ */}
+        <View style={[styles.tgHero, { backgroundColor: groupAvatarUrl ? '#000' : getAvatarColor(groupName) }]}>
+          {groupAvatarUrl ? (
+            <Image source={{ uri: groupAvatarUrl }} style={styles.tgHeroImg} resizeMode="cover" />
+          ) : (
+            <View style={styles.tgHeroFallback}>
+              <Ionicons name="people" size={92} color="rgba(255,255,255,0.85)" />
+            </View>
+          )}
+          {/* Smooth bottom gradient (many thin bands) */}
+          <HeroGradient />
+
+          <View style={styles.tgHeroOverlay} pointerEvents="none">
+            <Text style={styles.tgHeroName} numberOfLines={2}>{groupName}</Text>
+            <Text style={styles.tgHeroSub} numberOfLines={1}>
+              {memberCount} {memberCount === 1 ? 'participant' : 'participants'}
+            </Text>
           </View>
-          <Text style={[styles.heroName, { color: theme.colors.primaryTextColor }]}>{groupName}</Text>
-          <Text style={[styles.heroSub, { color: theme.colors.placeHolderTextColor }]}>
-            Group · {memberCount} {memberCount === 1 ? 'participant' : 'participants'}
-          </Text>
         </View>
 
         {/* ═══ QUICK ACTIONS ROW ═══ */}
@@ -504,17 +541,43 @@ export default function GroupInfo({ navigation, route }) {
 const styles = StyleSheet.create({
   container: { flex: 1 },
 
-  // Header
-  header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 6, paddingVertical: 10, gap: 2 },
-  headerBtn: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 21 },
-  headerTitle: { flex: 1, fontFamily: 'Roboto-SemiBold', fontSize: 18, marginLeft: 4 },
+  // Floating header (over hero)
+  floatingHeaderSafe: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 100,
+  },
+  floatingHeaderRow: {
+    height: 44,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingTop: 4,
+  },
+  floatingBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 
-  // Hero
-  heroSection: { alignItems: 'center', paddingTop: 8, paddingBottom: 16 },
-  heroAvatar: { width: 100, height: 100, borderRadius: 50, alignItems: 'center', justifyContent: 'center', overflow: 'hidden', marginBottom: 14 },
-  heroAvatarImg: { width: '100%', height: '100%' },
-  heroName: { fontFamily: 'Roboto-SemiBold', fontSize: 22, textTransform: 'capitalize' },
-  heroSub: { fontFamily: 'Roboto-Regular', fontSize: 14, marginTop: 4 },
+  // Telegram-style hero
+  tgHero: { width: '100%', height: HERO_H, position: 'relative', overflow: 'hidden' },
+  tgHeroImg: { width: '100%', height: '100%' },
+  tgHeroFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  tgHeroOverlay: { position: 'absolute', left: 20, right: 20, bottom: 18 },
+  tgHeroName: {
+    color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 26, textTransform: 'capitalize',
+    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4,
+  },
+  tgHeroSub: {
+    color: 'rgba(255,255,255,0.88)', fontFamily: 'Roboto-Regular', fontSize: 13, marginTop: 4,
+    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
 
   // Quick Actions
   quickActions: { flexDirection: 'row', justifyContent: 'center', paddingHorizontal: 20, gap: 12, paddingBottom: 12 },

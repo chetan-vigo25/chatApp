@@ -23,10 +23,13 @@
       "bundleIdentifier": "com.chat.baatCheet",
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
         "NSCameraUsageDescription": "This app needs access to your camera to take photos and videos.",
         "NSMicrophoneUsageDescription": "This app needs access to your microphone to record audio.",
         "NSPhotoLibraryUsageDescription": "This app needs access to your photo library to select media.",
-        "NSPhotoLibraryAddUsageDescription": "This app needs permission to save photos to your library."
+        "NSPhotoLibraryAddUsageDescription": "This app needs permission to save photos to your library.",
+        "NSContactsUsageDescription": "Allow VibeConnect to access your contacts to find friends already using the app.",
+        "NSLocationWhenInUseUsageDescription": "Allow VibeConnect to access your location when sharing a location in chat."
       }
     },
     "android": {
@@ -63,6 +66,15 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
+      [
+        "expo-build-properties",
+        {
+          "ios": {
+            "useFrameworks": "static",
+            "buildReactNativeFromSource": true
+          }
+        }
+      ],
       "expo-font",
       "expo-secure-store",
       [

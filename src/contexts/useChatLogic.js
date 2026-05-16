@@ -70,6 +70,22 @@ const sameId = (a, b) => {
   return Boolean(left && right && left === right);
 };
 
+// Private chat ids are minted as `u_<userA>_<userB>` and the two participants may
+// have opposite orderings locally. Compare by the participant set so a message
+// arriving as `u_A_B` is not dropped on a receiver whose local id is `u_B_A`.
+const sameChatId = (a, b) => {
+  const left = normalizeId(a);
+  const right = normalizeId(b);
+  if (!left || !right) return false;
+  if (left === right) return true;
+  if (left.startsWith('u_') && right.startsWith('u_')) {
+    const lp = left.slice(2).split('_').filter(Boolean).sort().join('_');
+    const rp = right.slice(2).split('_').filter(Boolean).sort().join('_');
+    return lp === rp;
+  }
+  return false;
+};
+
 const isDeletedForUser = (deletedFor, userId) => {
   const normalizedUserId = normalizeId(userId);
   if (!deletedFor) return false;
@@ -3548,7 +3564,14 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageNew = (data) => {
       const source = data?.data || data;
       const chatInPayload = source?.chatId || source?.chat || source?.roomId;
-      if (chatInPayload && !sameId(chatInPayload, currentChatId)) return;
+      // Use sameChatId (set-equality on participants) so a private chatId in the
+      // payload doesn't drop the message when ordering differs from the local key.
+      if (chatInPayload && !sameChatId(chatInPayload, currentChatId) && !sameChatId(chatInPayload, chatIdRef.current)) return;
+      // Normalize chatId on the payload to whatever this client uses, so the message
+      // is stored under the same chat row both sides see.
+      if (chatInPayload && (currentChatId || chatIdRef.current)) {
+        source.chatId = currentChatId || chatIdRef.current;
+      }
 
       const isSelfMsg = source?.senderId && sameId(source.senderId, currentUserIdRef.current);
 
@@ -4371,14 +4394,21 @@ export default function useChatLogic({ navigation, route }) {
     // Helper: apply a reaction change to allMessages in-memory + persist to SQLite (no full reload)
     const applyReactionUpdate = (messageId, updater) => {
       if (!messageId) return;
-      const mid = String(messageId);
+      // Accept either a single id or an array of candidate ids
+      // (canonical messageId, Mongo _id, clientMessageId) — match any.
+      const candidates = (Array.isArray(messageId) ? messageId : [messageId])
+        .filter(Boolean)
+        .map(String);
+      if (candidates.length === 0) return;
+      const mid = candidates[0];
+      const idSet = new Set(candidates);
       setAllMessages(prev => {
         let changed = false;
         const updated = prev.map(m => {
           const isMatch =
-            String(m.id || '') === mid ||
-            String(m.serverMessageId || '') === mid ||
-            String(m.tempId || '') === mid;
+            idSet.has(String(m.id || '')) ||
+            idSet.has(String(m.serverMessageId || '')) ||
+            idSet.has(String(m.tempId || ''));
           if (!isMatch) return m;
           changed = true;
           // Deep-copy each emoji entry, skip invalid keys (numeric "0","1", etc.)
@@ -4512,8 +4542,18 @@ export default function useChatLogic({ navigation, route }) {
 
     // ── 1-on-1 reaction: apply server's authoritative reaction state ──
     const applyServerReactions = (source) => {
-      const messageId = source?.messageId || source?.message || source?._id || source?.id;
-      if (!messageId) {
+      // Server now emits canonical messageId + _id (and echoes clientMessageId).
+      // Try each in turn so we still match when the local copy was keyed by
+      // a temp id or only the Mongo _id.
+      const candidateIds = [
+        source?.messageId,
+        source?.message,
+        source?._id,
+        source?.id,
+        source?.clientMessageId,
+      ].filter(Boolean);
+      const messageId = candidateIds;
+      if (!messageId.length) {
         console.log('[Reaction] ⚠️ No messageId in source:', source);
         return;
       }
@@ -7142,6 +7182,7 @@ export default function useChatLogic({ navigation, route }) {
 
   useEffect(() => {
     console.log("📱 ChatScreen received params:", {
+      params: route.params,
       chatId: route.params?.chatId,
       user: route.params?.user,
       isNewContact: route.params?.isNewContact,
@@ -7371,6 +7412,25 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, [chatData, updateReactionsInState]);
 
+  // Server returns reactions as an ARRAY of { userId, emoji, ... } documents.
+  // Local state uses a MAP { emoji: { count, users:[userId,...] } }. Convert
+  // before merging — otherwise the reducer wipes reactions instead of refining.
+  const reactionsArrayToMap = (arr) => {
+    if (!Array.isArray(arr)) return null;
+    const map = {};
+    for (const r of arr) {
+      const emoji = r?.emoji;
+      if (!emoji) continue;
+      const uid = String(r?.userId?._id || r?.userId || '');
+      if (!uid) continue;
+      const entry = map[emoji] || { count: 0, users: [] };
+      if (!entry.users.includes(uid)) entry.users.push(uid);
+      entry.count = entry.users.length;
+      map[emoji] = entry;
+    }
+    return map;
+  };
+
   const fetchReactionList = useCallback((msgId) => {
     return new Promise((resolve, reject) => {
       const socket = socketRef.current || getSocket();
@@ -7381,41 +7441,40 @@ export default function useChatLogic({ navigation, route }) {
         finished = true;
         socket.off('message:reaction:list:response', onResponse);
         reject(new Error('Timeout'));
-      }, 10000);
+      }, 5000);
+
+      const applyFromPayload = (payload) => {
+        const arr = payload?.reactions;
+        if (Array.isArray(arr)) {
+          const map = reactionsArrayToMap(arr);
+          if (map) applyReactionUpdate(msgId, () => map);
+        } else if (arr && typeof arr === 'object') {
+          applyReactionUpdate(msgId, () => arr);
+        }
+      };
 
       const onResponse = (data) => {
         if (finished) return;
         const source = data?.data || data;
-        // Only handle response for our message
         if (source?.messageId && String(source.messageId) !== String(msgId)) return;
         finished = true;
         clearTimeout(timeout);
         socket.off('message:reaction:list:response', onResponse);
-        console.log('[Reaction] list:response received:', JSON.stringify(data));
 
         if (data?.status === false) return reject(new Error(source?.message || 'Failed'));
-
-        // Apply the full reactions map to state if available
-        if (source?.reactions && typeof source.reactions === 'object') {
-          applyReactionUpdate(msgId, () => source.reactions);
-        }
+        applyFromPayload(source);
         resolve(source);
       };
 
       socket.on('message:reaction:list:response', onResponse);
-      console.log('[Reaction] emit message:reaction:list:', { messageId: msgId });
       socket.emit('message:reaction:list', { messageId: msgId }, (ack) => {
         if (finished) return;
         finished = true;
         clearTimeout(timeout);
         socket.off('message:reaction:list:response', onResponse);
-        console.log('[Reaction] list ack received:', JSON.stringify(ack));
         const res = ack?.data || ack;
         if (ack?.status === false) return reject(new Error(res?.message || 'Failed'));
-
-        if (res?.reactions && typeof res.reactions === 'object') {
-          applyReactionUpdate(msgId, () => res.reactions);
-        }
+        applyFromPayload(res);
         resolve(res);
       });
     });

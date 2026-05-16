@@ -73,6 +73,20 @@ api.interceptors.response.use(
     const originalRequest = error?.config;
     const status = error?.response?.status;
 
+    // One-shot retry for transient iOS network drops on idempotent GETs.
+    // ERR_NETWORK on RN/iOS often means the underlying request was aborted
+    // (component unmount, app backgrounding, brief connectivity blip).
+    if (
+      originalRequest &&
+      !originalRequest._netRetry &&
+      error?.code === 'ERR_NETWORK' &&
+      (originalRequest.method || 'get').toLowerCase() === 'get'
+    ) {
+      originalRequest._netRetry = true;
+      await new Promise(r => setTimeout(r, 400));
+      return api(originalRequest);
+    }
+
     if (!originalRequest || status !== 401 || originalRequest._retry) {
       return Promise.reject(error);
     }
@@ -124,11 +138,18 @@ api.interceptors.response.use(
 // Centralized error handling
 async function handleApiError(error) {
   console.log("API Error in HTTPS Config:", {
+    platform: Platform.OS,
     status: error?.response?.status,
     data: error?.response?.data,
     url: error?.config?.url,
     method: error?.config?.method,
-    message: error.message,
+    timeout: error?.config?.timeout,
+    code: error?.code,
+    name: error?.name,
+    message: error?.message,
+    isAxiosTimeout: error?.code === 'ECONNABORTED',
+    hasRequest: !!error?.request,
+    hasResponse: !!error?.response,
   });
 
   // If response exists, use its message
@@ -138,10 +159,15 @@ async function handleApiError(error) {
     return Promise.reject(error.response.data || error);
   }
 
-  // If request was sent but no response
+  // Request was sent but no response — distinguish timeout from network failure
   if (error.request) {
-    showToast("No response received from server");
-    return Promise.reject(new Error("No response received from server"));
+    const isTimeout = error?.code === 'ECONNABORTED' || /timeout/i.test(error?.message || '');
+    const msg = isTimeout ? 'Request timed out' : 'No response received from server';
+    showToast(msg);
+    const wrapped = new Error(msg);
+    wrapped.code = error?.code || (isTimeout ? 'ECONNABORTED' : 'ERR_NETWORK');
+    wrapped.url = error?.config?.url;
+    return Promise.reject(wrapped);
   }
 
   // Other errors

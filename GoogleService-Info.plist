@@ -26,5 +26,21 @@
 	<true></true>
 	<key>GOOGLE_APP_ID</key>
 	<string>1:777897911960:ios:e18b7b21f02caab75092ed</string>
+	<!-- ATC Config -->
+	<key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>api.whatback.com</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+                <key>NSIncludesSubdomains</key>
+                <true/>
+                <key>NSTemporaryExceptionMinimumTLSVersion</key>
+                <string>TLSv1.2</string>
+            </dict>
+        </dict>
+    </dict>
 </dict>
 </plist>

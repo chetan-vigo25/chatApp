@@ -22,7 +22,14 @@ const REASON_TYPE_MAP = {
   'kafka.message.deleted': 'message_deleted',
   'message.deleted': 'message_deleted',
   'message.read': 'message_read',
+  'message.read.all': 'message_read',
+  'message.seen': 'message_read',
   'message.delivered': 'message_delivered',
+  'group.message.read': 'message_read',
+  'group.message.read.all': 'message_read',
+  'group.message.seen': 'message_read',
+  'group.message.delivered': 'message_delivered',
+  'group.message.deleted': 'message_deleted',
   'chat.created': 'chat_created',
   'chat.archived': 'chat_archived',
   'chat.unarchived': 'chat_unarchived',
@@ -386,10 +393,11 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
     ? (baseLastMessage.placeholderText || baseLastMessage.text)
     : (keepLocalEdit ? baseLastMessage.text : (incomingText || baseLastMessage?.text || ''));
 
-  const status = pickHighestMessageStatus(
-    baseLastMessage?.status,
-    item?.lastMessageStatus || item?.status || item?.lastMessage?.status || null
-  );
+  // Same message? Preserve highest status. Different message? Reset to incoming status only.
+  const incomingStatusRaw = item?.lastMessageStatus || item?.status || item?.lastMessage?.status || null;
+  const status = isSameMessage
+    ? pickHighestMessageStatus(baseLastMessage?.status, incomingStatusRaw)
+    : (normalizeMessageDeliveryStatus(incomingStatusRaw) || 'sent');
 
   return {
     ...baseLastMessage,
@@ -868,10 +876,17 @@ const reducer = (state, action) => {
 
       const incomingType = message.type || message.messageType || existingLastMsg?.type || 'text';
 
+      // Same message? Preserve highest status. Different message? Use the incoming status only —
+      // a fresh message must not inherit the previous message's 'delivered'/'read' state.
+      const isSameLastMessage = incomingMsgId && existingMsgId && String(incomingMsgId) === String(existingMsgId);
+      const resolvedStatus = isSameLastMessage
+        ? pickHighestMessageStatus(existingLastMsg?.status, message.status)
+        : (normalizeMessageDeliveryStatus(message.status) || 'sent');
+
       const lastMessage = preserveDelete
         ? {
             ...existingLastMsg,
-            status: pickHighestMessageStatus(existingLastMsg?.status, message.status),
+            status: resolvedStatus,
           }
         : {
             ...existingLastMsg,
@@ -883,7 +898,7 @@ const reducer = (state, action) => {
             type: incomingType,
             createdAt: lastMessageAt,
             senderId: message.senderId,
-            status: pickHighestMessageStatus(existingLastMsg?.status, message.status),
+            status: resolvedStatus,
           };
 
       const isIncoming = Boolean(
@@ -965,6 +980,15 @@ const reducer = (state, action) => {
         ? `You: ${message.text || ''}`
         : (message.text || existing?.lastMessage?.text || '');
 
+      // A new outgoing message must NOT inherit the previous last-message's status.
+      // Only preserve highest when we're updating the same message id (status progression).
+      const outgoingMsgId = normalizeId(message.messageId || message.id || message.serverMessageId || message.tempId);
+      const existingLastMsgId = getMessageIdentifier(existing?.lastMessage);
+      const isSameOutgoing = outgoingMsgId && existingLastMsgId && String(outgoingMsgId) === String(existingLastMsgId);
+      const outgoingStatus = isSameOutgoing
+        ? pickHighestMessageStatus(existing?.lastMessage?.status, message.status || 'sent')
+        : (normalizeMessageDeliveryStatus(message.status) || 'sent');
+
       const lastMessage = {
         ...(existing.lastMessage || {}),
         id: message.id || message.messageId || existing?.lastMessage?.id || null,
@@ -974,7 +998,7 @@ const reducer = (state, action) => {
         text: outgoingText,
         createdAt: lastMessageAt,
         senderId: message.senderId,
-        status: pickHighestMessageStatus(existing?.lastMessage?.status, message.status || 'sent'),
+        status: outgoingStatus,
       };
 
       const nextMap = {
@@ -1219,6 +1243,30 @@ const reducer = (state, action) => {
         const incomingAcksDelete = incomingLastMsg?.isDeleted === true || incomingLastMsg?.deletedFor === 'everyone';
         const shouldPreserveDelete = existingWasDeleted && !incomingAcksDelete && type !== 'message_deleted';
 
+        // Backend's buildChatListItem emits `lastMessage` as a plain STRING (the
+        // preview text), but the local chatMap stores it as an OBJECT
+        // {text, status, senderId, messageId, ...}. If we let a string override
+        // the object, the chat row loses senderId (→ ticks vanish) and `.text`
+        // (→ "No messages yet"). Coerce to an object that preserves the existing
+        // structure and only updates the text.
+        const incomingLm = item?.lastMessage;
+        const existingLm = existing?.lastMessage;
+        if (typeof incomingLm === 'string') {
+          item.lastMessage = {
+            ...(existingLm && typeof existingLm === 'object' ? existingLm : {}),
+            text: incomingLm,
+            // Backend ships these as siblings on the item, not inside lastMessage
+            senderId: item?.lastMessageSender || existingLm?.senderId || null,
+            messageType: item?.lastMessageType || existingLm?.messageType || 'text',
+          };
+        } else if (incomingLm && typeof incomingLm === 'object') {
+          // Object form: still merge with existing so missing fields don't drop
+          item.lastMessage = {
+            ...(existingLm && typeof existingLm === 'object' ? existingLm : {}),
+            ...incomingLm,
+          };
+        }
+
         const mergedBase = {
           ...existing,
           ...item,
@@ -1271,7 +1319,9 @@ const reducer = (state, action) => {
               lastMessage,
               lastMessageAt: nextLastMessageAt,
               timestamp: nextLastMessageAt,
-              lastMessageStatus: pickHighestMessageStatus(mergedBase?.lastMessageStatus, lastMessage?.status) || 'sent',
+              // For a brand-new message, use the incoming status directly — don't carry the
+              // previous lastMessageStatus (e.g. 'read') forward onto a fresh send.
+              lastMessageStatus: normalizeMessageDeliveryStatus(lastMessage?.status) || 'sent',
               unreadCount: unreadByChat[chatId],
             };
 
@@ -1282,21 +1332,40 @@ const reducer = (state, action) => {
           }
 
           case 'message_read': {
-            unreadByChat[chatId] = 0;
+            // A 'message.read' chat:list:update is fanned out to ALL chat
+            // participants (sender so the tick goes blue, reader so their own
+            // unread clears). Previously this case always zeroed unreadCount —
+            // which incorrectly wiped the OTHER participant's badge whenever
+            // the local user wasn't the reader.
+            //
+            // The backend's per-user `item.unreadCount` is authoritative when
+            // present. If it's missing (e.g. group status emits use a minimal
+            // patch), keep the existing unread count — never blindly zero.
             const nextStatus = pickHighestMessageStatus(existing?.lastMessage?.status, 'read') || 'read';
             const lastMessage = {
               ...(existing?.lastMessage || {}),
               status: nextStatus,
             };
 
+            const backendUnread = typeof item?.unreadCount === 'number'
+              ? Number(item.unreadCount)
+              : null;
+            const preservedUnread = Number(unreadByChat[chatId] ?? existing?.unreadCount ?? 0);
+            const resolvedUnread = backendUnread !== null ? backendUnread : preservedUnread;
+            unreadByChat[chatId] = resolvedUnread;
+
             nextMap[chatId] = {
               ...mergedBase,
               lastMessage,
               lastMessageStatus: nextStatus,
-              unreadCount: 0,
+              unreadCount: resolvedUnread,
             };
 
-            delete highlightByChat[chatId];
+            // Only drop the new-message highlight if our unread actually went to 0
+            // (i.e. we're the reader). Otherwise keep it for the other side.
+            if (resolvedUnread === 0) {
+              delete highlightByChat[chatId];
+            }
             break;
           }
 
@@ -2162,6 +2231,13 @@ export function RealtimeChatProvider({ children }) {
         type: 'UPDATE_LAST_MESSAGE_STATUS',
         payload: { chatId, status, messageId },
       });
+
+      // Persist the bump to SQLite chat list so the tick survives reload.
+      // Only updates when the row's last_message_id matches — prevents an ack
+      // for an older message from overwriting a newer last-message.
+      if (messageId) {
+        ChatDatabase.updateChatLastMessageStatusById(chatId, messageId, status).catch(() => {});
+      }
     };
 
     const onMessageRead = (payload) => {
@@ -3605,6 +3681,28 @@ export function RealtimeChatProvider({ children }) {
 
   const onLocalOutgoingMessage = useCallback((message) => {
     deferDispatch({ type: 'OUTGOING_MESSAGE', payload: message });
+
+    // Mirror the new last-message to SQLite so the chat list survives app
+    // restart with the freshest preview + 'sent' status for the sender side.
+    const chatKey = normalizeId(message?.chatId || message?.groupId);
+    if (chatKey) {
+      const previewText =
+        (message?.groupId || message?.chatType === 'group')
+          ? `You: ${message?.text || ''}`
+          : (message?.text || '');
+      ChatDatabase.updateChatLastMessage(chatKey, {
+        text: previewText,
+        type: message?.messageType || message?.type || 'text',
+        senderId: message?.senderId || null,
+        status: normalizeMessageDeliveryStatus(message?.status) || 'sent',
+        createdAt: message?.createdAt || new Date().toISOString(),
+        serverMessageId: message?.serverMessageId || message?.messageId || message?.id || null,
+        messageId: message?.serverMessageId || message?.messageId || message?.id || null,
+        isEdited: false,
+        isDeleted: false,
+      }).catch(() => {});
+      ChatDatabase.updateChatUnread(chatKey, 0).catch(() => {});
+    }
   }, [deferDispatch]);
 
   const updateLocalLastMessagePreview = useCallback((payload) => {

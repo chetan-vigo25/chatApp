@@ -28,31 +28,60 @@ const getDB = async () => {
     return _dbInitPromise;
   }
 
-  _dbInitPromise = (async () => {
-    try {
-      _db = await SQLite.openDatabaseAsync(DB_NAME);
-      await _db.execAsync('PRAGMA journal_mode = WAL;');
-      await _db.execAsync('PRAGMA synchronous = NORMAL;');
-      await runMigrations(_db);
-      return _db;
-    } catch (err) {
-      console.error('[ContactDB] getDB error:', err);
-      _db = null;
-      // Retry once
-      try {
-        _db = await SQLite.openDatabaseAsync(DB_NAME);
-        await _db.execAsync('PRAGMA journal_mode = WAL;');
-        await runMigrations(_db);
-        return _db;
-      } catch (retryErr) {
-        console.error('[ContactDB] getDB retry failed:', retryErr);
-        _db = null;
-        throw retryErr;
-      }
-    } finally {
-      _dbInitPromise = null;
+  // Try to open the DB and run init queries with up to `attempts` retries.
+  // Native expo-sqlite on Android occasionally rejects the first execAsync after
+  // a fresh openDatabaseAsync (NullPointerException) — usually clears on a retry
+  // with a small back-off plus a fresh handle. We also tolerate PRAGMA failures
+  // since journal_mode/synchronous are optimizations, not correctness.
+  const tryOpen = async () => {
+    const db = await SQLite.openDatabaseAsync(DB_NAME);
+    // Settle tick: avoids the Android NullPointerException race between
+    // openDatabaseAsync resolving and the native handle being fully ready.
+    await new Promise((r) => setTimeout(r, 50));
+    try { await db.execAsync('PRAGMA journal_mode = WAL;'); } catch (e) {
+      console.warn('[ContactDB] PRAGMA journal_mode failed (non-fatal):', e?.message);
     }
-  })();
+    try { await db.execAsync('PRAGMA synchronous = NORMAL;'); } catch (e) {
+      console.warn('[ContactDB] PRAGMA synchronous failed (non-fatal):', e?.message);
+    }
+    await runMigrations(db);
+    return db;
+  };
+
+  const safeClose = async () => {
+    if (!_db) return;
+    try { await _db.closeAsync(); } catch {}
+    _db = null;
+  };
+
+  _dbInitPromise = (async () => {
+    const MAX_ATTEMPTS = 3;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        _db = await tryOpen();
+        return _db;
+      } catch (err) {
+        lastErr = err;
+        const msg = String(err?.message || '').toLowerCase();
+        const isNative = msg.includes('nullpointerexception')
+          || msg.includes('nativedatabase')
+          || msg.includes('has been rejected')
+          || msg.includes('database is closed');
+        if (attempt < MAX_ATTEMPTS) {
+          console.warn(`[ContactDB] getDB attempt ${attempt} failed${isNative ? ' (native)' : ''}: ${err?.message}; retrying...`);
+          await safeClose();
+          // Small back-off — gives Android time to release the native handle
+          await new Promise((res) => setTimeout(res, 150 * attempt));
+        }
+      }
+    }
+    console.error('[ContactDB] getDB error (all retries exhausted):', lastErr);
+    _db = null;
+    throw lastErr;
+  })().finally(() => {
+    _dbInitPromise = null;
+  });
 
   return _dbInitPromise;
 };

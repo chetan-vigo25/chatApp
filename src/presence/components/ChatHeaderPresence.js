@@ -1,9 +1,10 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Image, Text, TouchableOpacity, View } from 'react-native';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import ContactDatabase from '../../services/ContactDatabase';
 
 export default function ChatHeaderPresence({
   user,
@@ -22,6 +23,18 @@ export default function ChatHeaderPresence({
   const { theme } = useTheme();
   const { presence, lastSeenFormatted } = useUserPresence(isGroup ? null : user?._id);
   const { state } = useRealtimeChat();
+
+  // Look up the device-saved (SQLite) contact by userId. If present, use the
+  // locally-saved name/image so the header always matches the user's phonebook.
+  const [localContact, setLocalContact] = useState(null);
+  useEffect(() => {
+    if (isGroup || !user?._id) { setLocalContact(null); return; }
+    let cancelled = false;
+    ContactDatabase.getContactByUserId(String(user._id))
+      .then((row) => { if (!cancelled) setLocalContact(row); })
+      .catch(() => { if (!cancelled) setLocalContact(null); });
+    return () => { cancelled = true; };
+  }, [isGroup, user?._id]);
 
   const realtimePresence = (!isGroup && user?._id) ? state?.presenceByUser?.[user._id] : null;
   const realtimeTyping = chatId ? state?.typingStates?.[chatId] : null;
@@ -57,7 +70,21 @@ export default function ChatHeaderPresence({
     : (memberCount ? `${memberCount} members` : 'tap here for group info');
 
   const statusText = isGroup ? groupStatusText : peerStatusText;
-  const displayName = isGroup ? (groupName || 'Group') : (user?.fullName || 'Unknown User');
+  // Display name priority for 1:1 chats:
+  //   1. Local device contact name (SQLite)
+  //   2. peerUser fullName passed via route
+  //   3. Fallback
+  const peerDisplayName =
+    localContact?.fullName ||
+    user?.fullName ||
+    user?.name ||
+    'Unknown User';
+  const peerAvatar =
+    localContact?.profileImage ||
+    user?.profileImage ||
+    user?.profilePicture ||
+    null;
+  const displayName = isGroup ? (groupName || 'Group') : peerDisplayName;
 
   const isPeerOnline = !isGroup && normalizedStatus === 'online';
   const borderColor = isGroup ? '#ececec' : (isPeerOnline ? '#2CC84D' : '#ececec');
@@ -78,12 +105,12 @@ export default function ChatHeaderPresence({
               <Ionicons name="people" size={20} color="#fff" />
             </View>
           )
-        ) : user?.profileImage ? (
-          <Image source={{ uri: user.profileImage }} style={{ width: '100%', height: '100%', borderRadius: 24 }} />
+        ) : peerAvatar ? (
+          <Image source={{ uri: peerAvatar }} style={{ width: '100%', height: '100%', borderRadius: 24 }} />
         ) : (
           <View style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: getUserColor?.(user?._id || '') || '#888' }}>
             <Text style={{ color: theme.colors.textWhite, fontFamily: 'Roboto-Medium', fontSize: 18 }}>
-              {user?.fullName?.charAt(0).toUpperCase() || '?'}
+              {peerDisplayName?.charAt(0).toUpperCase() || '?'}
             </Text>
           </View>
         )}

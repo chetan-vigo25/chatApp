@@ -43,7 +43,7 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
@@ -58,6 +58,8 @@ import LocationBubble from '../../components/LocationBubble';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
+import SaveContactBanner from '../../components/SaveContactBanner';
+import useSaveContact from '../../hooks/useSaveContact';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -1314,6 +1316,16 @@ export default function ChatScreen({ navigation, route }) {
 
   // ── Mentions ──
   const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+
+  // ── Save Contact ──
+  const {
+    isUnknown: isPeerUnknownContact,
+    isSaving: isContactSaving,
+    isSyncing: isContactSyncing,
+    savedSuccessfully: contactSavedSuccessfully,
+    saveError: contactSaveError,
+    saveContact,
+  } = useSaveContact(!isGroupChat ? chatData?.peerUser : null);
   const {
     showSuggestions: showMentionSuggestions,
     suggestions: mentionSuggestions,
@@ -2765,7 +2777,11 @@ export default function ChatScreen({ navigation, route }) {
   ), [theme.colors.placeHolderTextColor, isDarkMode]);
 
   useEffect(() => {
-    if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+    // setLayoutAnimationEnabledExperimental is a no-op under the New Architecture
+    // (Fabric). LayoutAnimation works natively now, so we don't need to opt in.
+    if (Platform.OS === 'android'
+        && UIManager?.setLayoutAnimationEnabledExperimental
+        && !global?.nativeFabricUIManager) {
       UIManager.setLayoutAnimationEnabledExperimental(true);
     }
   }, []);
@@ -4437,6 +4453,28 @@ export default function ChatScreen({ navigation, route }) {
                     <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )} */}
+                {/* Message Info — only for own, non-deleted messages */}
+                {selectedMessage.length === 1 && isOwnMsg && selMsg && !selMsg?.isDeleted && (
+                  <TouchableOpacity
+                    onPress={() => {
+                      const mid = selMsg.serverMessageId || selMsg.id;
+                      const cid = selMsg.chatId || chatData?.chatId || chatData?._id;
+                      clearSelectedMessages();
+                      setReactionMsgId(null);
+                      navigation.navigate('MessageInfo', {
+                        messageId: mid,
+                        chatId: cid,
+                        message: {
+                          text: selMsg.text,
+                          mediaUrl: selMsg.mediaUrl,
+                          type: selMsg.type,
+                        },
+                      });
+                    }}
+                    style={{ padding: 10 }}>
+                    <Ionicons name="information-circle-outline" size={22} color={theme.colors.primaryTextColor} />
+                  </TouchableOpacity>
+                )}
                 {/* Report Message — only for other's messages */}
                 {canReport && (
                   <TouchableOpacity
@@ -4560,6 +4598,18 @@ export default function ChatScreen({ navigation, route }) {
               <Ionicons name="close" size={20} color={theme.colors.primaryTextColor} />
             </TouchableOpacity>
           </View>
+        )}
+
+        {/* Save Contact Banner — shown for unknown Vibe Connect users in 1:1 chats */}
+        {!isGroupChat && (isPeerUnknownContact || contactSavedSuccessfully) && (
+          <SaveContactBanner
+            peerName={chatData?.peerUser?.fullName || chatData?.peerUser?.name || ''}
+            isSaving={isContactSaving}
+            isSyncing={isContactSyncing}
+            savedSuccessfully={contactSavedSuccessfully}
+            saveError={contactSaveError}
+            onSave={saveContact}
+          />
         )}
 
         {/* Messages List */}
@@ -5336,7 +5386,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                <ImageZoom
+                {/* <ImageZoom
                   uri={localMediaViewer.uri}
                   minScale={1}
                   maxScale={5}
@@ -5346,7 +5396,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                />
+                /> */}
               </GestureHandlerRootView>
             )}
 

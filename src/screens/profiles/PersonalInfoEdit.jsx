@@ -1,128 +1,255 @@
-import React, { useState, useEffect, useRef } from "react";
-import { View, Text, Image, Animated, TouchableOpacity, ScrollView, Alert, Platform, ToastAndroid, ActivityIndicator, TextInput } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { SafeAreaView } from "react-native-safe-area-context";
+import React, { useState, useEffect, useRef, useMemo } from "react";
+import {
+  View, Text, Animated, TouchableOpacity, Alert, Platform, ToastAndroid,
+  ActivityIndicator, TextInput, StyleSheet,
+} from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
-import * as SMS from 'expo-sms';
-
-import { FontAwesome6 } from '@expo/vector-icons';
+import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 
 function showToast(message) {
-  if (Platform.OS === 'android') {
-    ToastAndroid.show(message, ToastAndroid.SHORT);
-  } else {
-    Alert.alert('', message);
-  }
+  if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
+  else Alert.alert('', message);
 }
 
+const FIELD_META = {
+  fullName: {
+    title: 'Name',
+    placeholder: 'Your name',
+    icon: 'person-outline',
+    keyboard: 'default',
+    maxLength: 60,
+    helper: 'This name will be visible to your contacts.',
+  },
+  about: {
+    title: 'About',
+    placeholder: 'Hey there! I am using the app.',
+    icon: 'information-circle-outline',
+    keyboard: 'default',
+    maxLength: 140,
+    helper: 'Tell others a bit about yourself.',
+  },
+  email: {
+    title: 'Email',
+    placeholder: 'name@example.com',
+    icon: 'mail-outline',
+    keyboard: 'email-address',
+    maxLength: 80,
+    helper: 'We use email for account recovery and security alerts.',
+  },
+  mobile: {
+    title: 'Mobile number',
+    placeholder: 'Mobile number',
+    icon: 'call-outline',
+    keyboard: 'phone-pad',
+    maxLength: 15,
+    helper: 'Changing your number will require verification.',
+  },
+};
+
+const validateEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v).trim());
+const validateMobile = (v) => /^[0-9]{6,15}$/.test(String(v).replace(/[^\d]/g, ''));
+
 export default function PersonalInfoEdit({ navigation, route }) {
-  const { field, value } = route.params;
-  const { theme, isDarkMode, toggleTheme } = useTheme();
+  const { field, value, extra } = route.params || {};
+  const meta = FIELD_META[field] || FIELD_META.fullName;
+  const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const dispatch = useDispatch();
-  const { profileData, isLoading, error } = useSelector(state => state.profile);
-  const [inputValue, setInputValue] = useState(value || "");  // Default to an empty string if value is null
-  const [focusedInput, setFocusedInput] = useState(null);
-  const [charCount, setCharCount] = useState((value || "").length);  // Ensure length is computed for a string
-  const maxLength = 30;
+  const { profileData, isLoading } = useSelector(state => state.profile);
+
+  const [inputValue, setInputValue] = useState(value || "");
+  const [focused, setFocused] = useState(false);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const charCount = inputValue.length;
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      Animated.timing(fadeAnim, {
-        toValue: 1,
-        duration: 400,
-        useNativeDriver: true,
-      }).start();
-    }, 400);
-    return () => clearTimeout(timer);
+    Animated.timing(fadeAnim, { toValue: 1, duration: 250, useNativeDriver: true }).start();
   }, []);
 
-  useEffect(() => {
-    // Set initial value to input field
-    setInputValue(value || "");  // Ensure value is a string
-    setCharCount((value || "").length);  // Ensure length is computed for a string
-  }, [value]);
+  useEffect(() => { setInputValue(value || ""); }, [value]);
+
+  const isValid = useMemo(() => {
+    const trimmed = inputValue.trim();
+    if (!trimmed) return false;
+    if (field === 'email') return validateEmail(trimmed);
+    if (field === 'mobile') return validateMobile(trimmed);
+    return true;
+  }, [inputValue, field]);
 
   const handleSave = async () => {
-    const updatedData = {
-      ...profileData,
-      [field]: inputValue,
-    };
+    const trimmed = inputValue.trim();
+    if (!trimmed) { setErrorMsg(`${meta.title} cannot be empty.`); return; }
+    if (field === 'email' && !validateEmail(trimmed)) {
+      setErrorMsg('Enter a valid email address.');
+      return;
+    }
+    if (field === 'mobile' && !validateMobile(trimmed)) {
+      setErrorMsg('Enter a valid mobile number.');
+      return;
+    }
+
+    let updatedData;
+    if (field === 'mobile') {
+      updatedData = {
+        ...profileData,
+        mobile: {
+          ...(profileData?.mobile || {}),
+          code: extra?.code || profileData?.mobile?.code || '+91',
+          number: trimmed.replace(/[^\d]/g, ''),
+        },
+      };
+    } else {
+      updatedData = { ...profileData, [field]: trimmed };
+    }
+
     try {
       await dispatch(editProfile(updatedData));
       await dispatch(profileDetail());
+      showToast(`${meta.title} updated`);
       navigation.goBack();
-    } catch (error) {
-      console.error("Error updating profile:", error);
-      Alert.alert("Error", "Failed to update profile. Please try again.");
+    } catch (err) {
+      console.error('Error updating profile:', err);
+      setErrorMsg('Failed to update. Try again.');
     }
   };
 
-  const handleInputChange = (text) => {
-    if (text.length <= maxLength) {
-      setInputValue(text);
-      setCharCount(text.length);
-    }
+  const handleChange = (text) => {
+    if (errorMsg) setErrorMsg(null);
+    const allowed = field === 'mobile' ? text.replace(/[^\d]/g, '') : text;
+    if (allowed.length <= meta.maxLength) setInputValue(allowed);
   };
 
-  const sendInvitation = async (receiverPhoneNumber) => {
-    const message = "Hey! I'm inviting you to join our app. Please check it out!";
-
-    // Use Expo's SMS API to send message
-    const { result } = await SMS.sendSMSAsync(
-      receiverPhoneNumber, // Receiver's phone number
-      message // Your message
-    );
-
-    if (result === 'sent') {
-      Alert.alert('Message Sent', 'The invitation message has been sent!');
-    } else {
-      Alert.alert('Error', 'Message could not be sent');
-    }
-  };
+  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+  const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
+  const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
+  const primaryText = theme.colors.primaryTextColor;
+  const subText = theme.colors.placeHolderTextColor;
+  const themeColor = theme.colors.themeColor || '#1DA1F2';
+  const showCharCount = field !== 'email' && field !== 'mobile';
 
   return (
-    <Animated.View style={{ flex: 1, opacity: fadeAnim }}>
-      <View style={{ width: '100%', flexDirection: 'row', gap: 20, borderBottomWidth: .5, borderBottomColor: theme.colors.borderColor, padding: 10 }}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={{ width: 30, height: 30, justifyContent: 'center', alignItems: 'flex-end' }} >
-          <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
+    <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
+      {/* Header */}
+      <View style={[styles.header, { backgroundColor: pageBg, borderBottomColor: borderClr }]}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconBtn} activeOpacity={0.6}>
+          <FontAwesome6 name="arrow-left" size={18} color={primaryText} />
         </TouchableOpacity>
-        <View style={{ flex: 1, alignItems: 'flex-start', justifyContent: 'center' }} >
-          <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 16, color: theme.colors.primaryTextColor }} >
-            Edit {field === 'fullName' ? 'Name' : field === 'about' ? 'About' : ''}
-          </Text>
-        </View>
+        <Text style={[styles.headerTitle, { color: primaryText }]}>
+          Edit {meta.title}
+        </Text>
+        <TouchableOpacity
+          onPress={handleSave}
+          disabled={!isValid || isLoading}
+          activeOpacity={0.7}
+          style={styles.saveBtn}
+        >
+          {isLoading ? (
+            <ActivityIndicator size="small" color={themeColor} />
+          ) : (
+            <Text style={[styles.saveBtnText, { color: isValid ? themeColor : subText }]}>
+              Save
+            </Text>
+          )}
+        </TouchableOpacity>
       </View>
-      <View style={{ flex: 1, backgroundColor: theme.colors.background, padding: 20 }} >
-        <View style={{
-          width: '100%', height: 50, backgroundColor: theme.colors.background, justifyContent: 'center', borderRadius: 6, borderWidth: 1, borderColor: focusedInput === field ? theme.colors.themeColor : theme.colors.borderColor,
-        }} >
-          <Text style={{
-            color: focusedInput === field ? theme.colors.themeColor : theme.colors.primaryTextColor, alignSelf: "flex-start", fontSize: 12, fontFamily: 'Roboto-SemiBold', paddingHorizontal: 5, position: 'absolute', top: -10, left: 15, backgroundColor: theme.colors.background
-          }} >{field === 'fullName' ? 'Name' : field === 'about' ? 'About' : ''}</Text>
-          <TextInput placeholder="" placeholderTextColor={theme.colors.placeHolderTextColor} style={{
-            flex: 1, paddingLeft: 15, color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16,
-          }}
-            value={inputValue}
-            onChangeText={handleInputChange}
-            onFocus={() => setFocusedInput(field)}
-            onBlur={() => setFocusedInput(null)}
-            maxLength={maxLength}
-          />
-        </View>
-        <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 12, color: theme.colors.placeHolderTextColor, alignSelf: 'flex-end', marginTop: 5 }} >{charCount}/{maxLength}</Text>
-        <TouchableOpacity onPress={handleSave} disabled={isLoading} style={{ opacity: isLoading ? 0.5 : 1, width: '100%', height: 50, alignSelf: "center", backgroundColor: theme.colors.themeColor, justifyContent: 'center', alignItems: 'center', borderRadius: 40, marginTop: 20, position: 'absolute', bottom: 40 }} >
-          {
-            isLoading ? (
-              <ActivityIndicator size="small" color={theme.colors.textWhite} />
+
+      {/* Body */}
+      <View style={{ flex: 1, paddingTop: 18 }}>
+        <View style={[styles.inputCard, { backgroundColor: cardBg }]}>
+          <View style={[styles.iconBubble, { backgroundColor: themeColor + '18' }]}>
+            <Ionicons name={meta.icon} size={20} color={themeColor} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={[styles.fieldLabel, { color: focused ? themeColor : subText }]}>
+              {meta.title}
+            </Text>
+            {field === 'mobile' && extra?.code ? (
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                <Text style={[styles.codePrefix, { color: primaryText }]}>{extra.code}</Text>
+                <TextInput
+                  value={inputValue}
+                  onChangeText={handleChange}
+                  onFocus={() => setFocused(true)}
+                  onBlur={() => setFocused(false)}
+                  placeholder={meta.placeholder}
+                  placeholderTextColor={subText}
+                  keyboardType={meta.keyboard}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  style={[styles.input, { color: primaryText, flex: 1 }]}
+                />
+              </View>
             ) : (
-              <Text style={{ fontFamily: 'Roboto-SemiBold', fontSize: 16, color: '#fff' }} >Save</Text>
-            )
-          }
-        </TouchableOpacity>
+              <TextInput
+                value={inputValue}
+                onChangeText={handleChange}
+                onFocus={() => setFocused(true)}
+                onBlur={() => setFocused(false)}
+                placeholder={meta.placeholder}
+                placeholderTextColor={subText}
+                keyboardType={meta.keyboard}
+                autoCapitalize={field === 'email' ? 'none' : 'sentences'}
+                autoCorrect={field !== 'email'}
+                style={[styles.input, { color: primaryText }]}
+                autoFocus
+              />
+            )}
+          </View>
+        </View>
+
+        {showCharCount && (
+          <Text style={[styles.charCount, { color: subText }]}>
+            {charCount}/{meta.maxLength}
+          </Text>
+        )}
+
+        {errorMsg ? (
+          <Text style={styles.errorText}>{errorMsg}</Text>
+        ) : (
+          <Text style={[styles.helperText, { color: subText }]}>{meta.helper}</Text>
+        )}
       </View>
     </Animated.View>
   );
 }
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  header: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 8, paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  iconBtn: {
+    width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 20,
+  },
+  headerTitle: { flex: 1, fontFamily: 'Roboto-SemiBold', fontSize: 17, marginLeft: 4 },
+  saveBtn: { paddingHorizontal: 14, paddingVertical: 8 },
+  saveBtnText: { fontFamily: 'Roboto-SemiBold', fontSize: 15 },
+
+  inputCard: {
+    flexDirection: 'row', alignItems: 'center',
+    marginHorizontal: 12, padding: 14, borderRadius: 14, gap: 12,
+  },
+  iconBubble: {
+    width: 40, height: 40, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  fieldLabel: { fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.4, marginBottom: 2 },
+  input: { fontFamily: 'Roboto-Medium', fontSize: 16, padding: 0, paddingVertical: 4 },
+  codePrefix: { fontFamily: 'Roboto-Medium', fontSize: 16, marginRight: 6 },
+  charCount: {
+    alignSelf: 'flex-end', marginTop: 8, marginRight: 18,
+    fontFamily: 'Roboto-Regular', fontSize: 12,
+  },
+  helperText: {
+    fontFamily: 'Roboto-Regular', fontSize: 12,
+    marginTop: 10, marginHorizontal: 22,
+  },
+  errorText: {
+    color: '#FF3B30', fontFamily: 'Roboto-Regular', fontSize: 12,
+    marginTop: 10, marginHorizontal: 22,
+  },
+});

@@ -119,6 +119,20 @@ export async function chatMessageList({ chatId, search = '', page = 1, limit = 5
   }
 }
 
+// Message info — returns who delivered/read the message + timestamps.
+// chatId is optional but recommended for index hit.
+export async function getMessageInfo({ messageId, chatId }) {
+  try {
+    const response = await apiCall('POST', `user/chat/message/${messageId}/info`, { chatId });
+    if (response?.statusCode === 200) return response;
+    showToast(response?.message || 'Failed to load message info');
+    return Promise.reject(response?.message || 'Failed to load message info');
+  } catch (error) {
+    console.error('getMessageInfo error:', error);
+    return Promise.reject(new Error(error.message || 'Error getMessageInfo api'));
+  }
+}
+
 export async function mediaUpload(formData) {
     console.log("user/media/upload services",formData)
     try {

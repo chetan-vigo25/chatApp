@@ -1,6 +1,12 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import { statusServices } from '../../Services/Status/Status.Services';
 
+const toSerializableError = (error) => {
+  if (!error) return 'Unknown error';
+  if (typeof error === 'string') return error;
+  return error?.message || error?.code || String(error);
+};
+
 // ── Thunks ────────────────────────────────────────────────────────────────────
 
 export const createStatus = createAsyncThunk(
@@ -9,7 +15,7 @@ export const createStatus = createAsyncThunk(
     try {
       return await statusServices.createStatus(data);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -20,7 +26,7 @@ export const fetchMyStatuses = createAsyncThunk(
     try {
       return await statusServices.getMyStatuses();
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -32,7 +38,7 @@ export const fetchStatusFeed = createAsyncThunk(
     try {
       return await statusServices.getStatusFeed();
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -47,7 +53,7 @@ export const viewStatusAction = createAsyncThunk(
       const response = await statusServices.viewStatus(statusId);
       return { ...response, statusId };
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -59,7 +65,7 @@ export const reactToStatusAction = createAsyncThunk(
       const response = await statusServices.reactToStatus(statusId, reactionType);
       return { ...response, statusId, reactionType };
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -70,7 +76,7 @@ export const replyToStatusAction = createAsyncThunk(
     try {
       return await statusServices.replyToStatus(statusId, message);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -81,7 +87,7 @@ export const reportStatusAction = createAsyncThunk(
     try {
       return await statusServices.reportStatus(statusId, reason, details);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -93,7 +99,7 @@ export const hideStatusAction = createAsyncThunk(
       await statusServices.hideStatus(statusId);
       return { statusId };
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -104,7 +110,7 @@ export const shareStatusAction = createAsyncThunk(
     try {
       return await statusServices.shareStatus(statusId, targetChatIds);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -115,7 +121,7 @@ export const fetchStatusViewers = createAsyncThunk(
     try {
       return await statusServices.getStatusViewers(statusId);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -126,7 +132,7 @@ export const fetchStatusLikers = createAsyncThunk(
     try {
       return await statusServices.getStatusLikers(statusId);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );
@@ -137,7 +143,7 @@ export const deleteStatusAction = createAsyncThunk(
     try {
       return await statusServices.deleteStatus(statusId);
     } catch (error) {
-      return rejectWithValue(error);
+      return rejectWithValue(toSerializableError(error));
     }
   }
 );

@@ -12,8 +12,9 @@ import { registerRootComponent } from 'expo';
 import { Provider } from 'react-redux';
 import App from './App';
 import store from './src/Redux/Store';
+import { registerBackgroundHandler } from './src/firebase/fcmService';
 
-
+registerBackgroundHandler();
 
 const RootApp = () => (
   <Provider store={store}>

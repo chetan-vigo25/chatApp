@@ -20,11 +20,17 @@ export const statusServices = {
     return { data: [] };
   },
 
-  /** Feed — contacts, grouped, Redis-cached 60 s */
+  /** Feed — contacts, grouped, Redis-cached 60 s.
+   * Silent on error: background fetch, no user-facing alert on transient network failures. */
   async getStatusFeed() {
-    const response = await apiCall('GET', `${BASE}/feed`);
-    if (response?.statusCode === 200) return response;
-    return { data: [] };
+    try {
+      const response = await apiCall('GET', `${BASE}/feed`, {}, { timeout: 30000, silent: true });
+      if (response?.statusCode === 200) return response;
+      return { data: [] };
+    } catch (err) {
+      console.log('[getStatusFeed] silent failure:', err?.code || err?.message);
+      return { data: [] };
+    }
   },
 
   async getContactStatuses() {

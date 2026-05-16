@@ -1,455 +1,446 @@
 import React, { useState, useEffect, useRef } from "react";
-import { View, Text, Image, Animated, TouchableOpacity, ScrollView, Alert, Platform, ToastAndroid, ActivityIndicator, TextInput } from "react-native";
+import {
+  View, Text, Image, Animated, TouchableOpacity, ScrollView,
+  Alert, Platform, ToastAndroid, ActivityIndicator, TextInput,
+  StatusBar, Dimensions, StyleSheet, KeyboardAvoidingView,
+} from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import * as ImagePicker from 'expo-image-picker';
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
-
 import { BACKEND_URL } from '@env';
+import { Feather, FontAwesome5, Ionicons, FontAwesome6 } from '@expo/vector-icons';
 
-import { Feather, FontAwesome5, Ionicons } from '@expo/vector-icons';
+const { width: SCREEN_W } = Dimensions.get('window');
+const HERO_H = Math.min(SCREEN_W * 0.7, 320);
 
 function showToast(message) {
-  if (Platform.OS === 'android') {
-    ToastAndroid.show(message, ToastAndroid.SHORT);
-  } else {
-    Alert.alert('', message);
-  }
+  if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
+  else Alert.alert('', message);
+}
+
+function HeroGradient() {
+  const BANDS = 14;
+  const TOTAL = 180;
+  const bandH = TOTAL / BANDS;
+  return (
+    <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, bottom: 0, justifyContent: 'flex-end' }}>
+      {Array.from({ length: BANDS }).map((_, i) => {
+        const t = (i + 1) / BANDS;
+        const alpha = Math.min(0.6, t * t * 0.7);
+        return <View key={i} style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
+      })}
+    </View>
+  );
 }
 
 export default function EditProfile({ navigation, route }) {
-    const { selectedCountry, phoneNumber, email } = route.params || {};
-    const { theme, isDarkMode, toggleTheme } = useTheme();
-    const fadeAnim = useRef(new Animated.Value(0)).current;
-    const [focusedInput, setFocusedInput] = useState(null);
-    const [formErrors, setFormErrors] = useState({}); 
-    const [selectedImage, setSelectedImage] = useState(null);
-    const [imageUploadLoader, setImageUploadLoader] = useState(false);
-    const dispatch = useDispatch();
-    const { profileData, updateProfileData, isLoading, error } = useSelector(state => state.profile);
-    const fullNumber = selectedCountry?.code + phoneNumber;
-// console.log("Profile Data in EditProfile:", email);
-    const [form, setForm] = useState({
-      fullName: '',
-      email: '',
-      about: '',
-      profileImage: '',
-    });
+  const { selectedCountry, phoneNumber, email } = route.params || {};
+  const { theme, isDarkMode } = useTheme();
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const [focusedInput, setFocusedInput] = useState(null);
+  const [formErrors, setFormErrors] = useState({});
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [imageUploadLoader, setImageUploadLoader] = useState(false);
+  const dispatch = useDispatch();
+  const { profileData, isLoading } = useSelector(state => state.profile);
 
-    // useEffect(() => {
-    //   // Pre-fill form with existing profile data if available
-    //   if (profileData) {
-    //     setForm({
-    //       fullName: profileData.fullName || '',
-    //       email: profileData.email || '',
-    //       about: profileData.about || '',
-    //       profileImage: profileData.profileImage || '',
-    //     });
-    //   }
-    // }, [profileData]);
+  const [form, setForm] = useState({
+    fullName: '',
+    email: '',
+    about: '',
+    profileImage: '',
+  });
 
-    const getUploadedImageUrl = (result = {}) => {
-      return (
-        result?.data?.profileImageUrl ||
-        result?.data?.profileImage ||
-        result?.data?.url ||
-        result?.profileImageUrl ||
-        result?.profileImage ||
-        ''
-      );
-    };
+  const getUploadedImageUrl = (result = {}) => (
+    result?.data?.profileImageUrl ||
+    result?.data?.profileImage ||
+    result?.data?.url ||
+    result?.profileImageUrl ||
+    result?.profileImage ||
+    ''
+  );
 
-    useEffect(() => {
-      // Fetch profile data if not available
-      if (!profileData) {
-        dispatch(profileDetail());
+  useEffect(() => {
+    if (!profileData) dispatch(profileDetail());
+  }, []);
+
+  useEffect(() => {
+    Animated.timing(fadeAnim, { toValue: 1, duration: 350, useNativeDriver: true }).start();
+  }, []);
+
+  const handleChange = (name, value) => {
+    setForm(prev => ({ ...prev, [name]: value }));
+    if (formErrors[name]) setFormErrors(prev => ({ ...prev, [name]: null }));
+  };
+
+  const validateForm = () => {
+    const newErrors = {};
+    if (!form.fullName?.trim()) newErrors.fullName = 'Full Name is required';
+    if (phoneNumber !== undefined && !phoneNumber?.trim()) newErrors.phoneNumber = 'Phone number is required';
+    setFormErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const requestPermission = async () => {
+    if (Platform.OS === 'web') return true;
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') {
+      Alert.alert('Permission needed', 'Camera roll permission is required.');
+      return false;
+    }
+    return true;
+  };
+
+  const pickImage = async () => {
+    if (!(await requestPermission())) return;
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.8,
+      });
+      if (!result.canceled && result.assets?.[0]?.uri) {
+        setSelectedImage(result.assets[0].uri);
       }
-    }, []);
+    } catch (e) {
+      console.error('pickImage', e);
+      showToast('Failed to pick image');
+    }
+  };
 
-    const handleChange = (name, value) => {
-      setForm(prev => ({
-        ...prev,
-        [name]: value,
-      }));
-      // Clear error for this field when user starts typing
-      if (formErrors[name]) {
-        setFormErrors(prev => ({
-          ...prev,
-          [name]: null
-        }));
-      }
-    };
+  const showImagePickerOptions = () => {
+    Alert.alert('Profile Picture', 'Choose an option', [
+      { text: 'Choose from Gallery', onPress: pickImage },
+      { text: 'Cancel', style: 'cancel' },
+    ], { cancelable: true });
+  };
 
-     useEffect(() => {
-       const timer = setTimeout(() => {
-         Animated.timing(fadeAnim, {
-           toValue: 1,
-           duration: 400,
-           useNativeDriver: true,
-         }).start();
-       }, 400);
-       return () => clearTimeout(timer);
-     }, []);
-
-    const validateForm = () => {
-      let newErrors = {};
-  
-      if (!form.fullName?.trim()) newErrors.fullName = 'Full Name is required';
-      // if (!form.email?.trim()) newErrors.email = 'Email is required';
-      // else {
-      //   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      //   if (!emailRegex.test(form.email)) newErrors.email = 'Please enter a valid email address';
-      // }
-      // if (!form.about?.trim()) newErrors.about = 'About is required';
-      if (phoneNumber !== undefined && !phoneNumber?.trim()) newErrors.phoneNumber = 'Phone number is required';
-  
-      setFormErrors(newErrors);
-      return Object.keys(newErrors).length === 0; // returns true if no errors
-    };
-
-    const requestPermission = async () => {
-      if (Platform.OS !== 'web') {
-        const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-        if (status !== 'granted') {
-          Alert.alert('Permission needed', 'Sorry, we need camera roll permissions to make this work!');
-          return false;
-        }
-        return true;
-      }
-      return true;
-    };
-
-    const pickImage = async () => {
-      const hasPermission = await requestPermission();
-      if (!hasPermission) return;
-
-      try {
-        const result = await ImagePicker.launchImageLibraryAsync({
-          mediaTypes: ImagePicker.MediaTypeOptions.Images,
-          allowsEditing: true,
-          aspect: [1, 1],
-          quality: 0.8,
-          base64: false,
-        });
-
-        if (!result.canceled && result.assets && result.assets.length > 0) {
-          setSelectedImage(result.assets[0].uri);
-        }
-      } catch (error) {
-        console.error('Error picking image:', error);
-        showToast('Failed to pick image');
-      }
-    };
-
-    const takePhoto = async () => {
-      const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission needed', 'Sorry, we need camera permissions to make this work!');
-        return;
-      }
-
-      try {
-        const result = await ImagePicker.launchCameraAsync({
-          allowsEditing: true,
-          aspect: [1, 1],
-          quality: 0.8,
-        });
-
-        if (!result.canceled && result.assets && result.assets.length > 0) {
-          setSelectedImage(result.assets[0].uri);
-        }
-      } catch (error) {
-        console.error('Error taking photo:', error);
-        showToast('Failed to take photo');
-      }
-    };
-
-    const showImagePickerOptions = () => {
-      Alert.alert(
-        'Select Profile Picture',
-        'Choose an option',
-        [
-          // {
-          //   text: 'Take Photo',
-          //   onPress: takePhoto,
-          // },
-          {
-            text: 'Choose from Gallery',
-            onPress: pickImage,
-          },
-          {
-            text: 'Cancel',
-            style: 'cancel',
-          },
-        ],
-        { cancelable: true }
-      );
-    };
-
-    const imageEdit = async ({ silent = false } = {}) => {
-      if (!selectedImage) {
-        if (!silent) showToast('No image selected');
-        return;
-      }
-
-      setImageUploadLoader(true);
-      try {
-        let token = await AsyncStorage.getItem("accessToken");
-        const myHeaders = new Headers();
-        myHeaders.append("Authorization", "Bearer " + token);
-
-        const formData = new FormData();
-        
-        // Get file extension and mime type
-        const uriParts = selectedImage.split('.');
-        const fileType = uriParts[uriParts.length - 1];
-        const mimeType = fileType === 'jpg' || fileType === 'jpeg' ? 'image/jpeg' : 'image/png';
-
-        formData.append("file", {
-          uri: selectedImage,
-          name: `profile.${fileType}`,
-          type: mimeType,
-        });
-
-        const requestOptions = {
-          method: "POST",
-          headers: myHeaders,
-          body: formData,
-        };
-
-        const response = await fetch(`${BACKEND_URL}user/profile/picture`, requestOptions);
-        const result = await response.json();
-        console.log("Image upload response:", result);
-
-        if (result?.statusCode === 200) {
-          const uploadedImageUrl = getUploadedImageUrl(result);
-
-          if (!uploadedImageUrl) {
-            throw new Error('Uploaded image URL not found in response');
-          }
-
-          if (!silent) showToast("Profile image updated");
-          setImageUploadLoader(false);
-          dispatch(profileDetail());
-          setSelectedImage(null);
-          setForm(prev => ({ ...prev, profileImage: uploadedImageUrl }));
-          return uploadedImageUrl;
-        } else {
-          console.error("Image upload failed with response:", result);
-          const msg = result?.message || "Image upload failed";
-          if (!silent) showToast(msg);
-          setImageUploadLoader(false);
-          return null;
-        }
-      } catch (error) {
-        console.error("Network request failed:", error);
-        if (!silent) showToast(error?.message || "Network request failed");
-        setImageUploadLoader(false);
-        return null;
-      }
-    };
-
-    const getImageSource = () => {
-      if (selectedImage) {
-        return { uri: selectedImage };
-      } else if (profileData?.profileImage) {
-        return { uri: profileData.profileImage };
-      }
+  const imageEdit = async ({ silent = false } = {}) => {
+    if (!selectedImage) {
+      if (!silent) showToast('No image selected');
       return null;
-    };
+    }
+    setImageUploadLoader(true);
+    try {
+      const token = await AsyncStorage.getItem("accessToken");
+      const ext = selectedImage.split('.').pop();
+      const mime = (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg' : 'image/png';
+      const formData = new FormData();
+      formData.append("file", { uri: selectedImage, name: `profile.${ext}`, type: mime });
 
-    const handleUpdateProfile = async () => {
-      if (!validateForm()) return;
+      const response = await fetch(`${BACKEND_URL}user/profile/picture`, {
+        method: "POST",
+        headers: { Authorization: "Bearer " + token },
+        body: formData,
+      });
+      const result = await response.json();
 
-      let finalProfileImage = form.profileImage || profileData?.profileImage || '';
-
-      if (selectedImage) {
-        const uploadedImageUrl = await imageEdit({ silent: true });
-        if (!uploadedImageUrl) {
-          showToast('Please upload profile image again');
-          return;
-        }
-        finalProfileImage = uploadedImageUrl;
-      }
-      
-      const payload = {
-        fullName: form.fullName,
-        email: form.email || email || '',
-        about: form.about,
-        profileImage: finalProfileImage,
-        ...(phoneNumber ? {
-          mobile: {
-            code: selectedCountry?.code || '',
-            number: phoneNumber || '',
-          },
-        } : {}),
-      };
-      console.log("Updating profile with payload:", payload);
-  
-      try {
-        const response = await dispatch(editProfile(payload)).unwrap();
-        showToast("Profile updated successfully");
+      if (result?.statusCode === 200) {
+        const uploadedImageUrl = getUploadedImageUrl(result);
+        if (!uploadedImageUrl) throw new Error('Uploaded image URL not found');
+        if (!silent) showToast("Profile image updated");
         dispatch(profileDetail());
-        setForm(prev => ({
-          ...prev,
-          fullName: form.fullName,
-          email: form.email,
-          about: form.about,
-          profileImage: finalProfileImage,
-        }));
-        navigation.reset({
-          index: 0,
-          routes: [{ name: "ChatList"}],
-        });
-        // navigation.navigate('ChatList')
-      } catch (error) {
-        console.error("Profile update failed", error);
-        showToast(error?.message || "Profile update failed");
+        setSelectedImage(null);
+        setForm(prev => ({ ...prev, profileImage: uploadedImageUrl }));
+        return uploadedImageUrl;
       }
+      if (!silent) showToast(result?.message || "Image upload failed");
+      return null;
+    } catch (e) {
+      console.error(e);
+      if (!silent) showToast(e?.message || "Network request failed");
+      return null;
+    } finally {
+      setImageUploadLoader(false);
+    }
+  };
+
+  const getImageSource = () => {
+    if (selectedImage) return { uri: selectedImage };
+    if (profileData?.profileImage) return { uri: profileData.profileImage };
+    return null;
+  };
+
+  const handleUpdateProfile = async () => {
+    if (!validateForm()) return;
+    let finalProfileImage = form.profileImage || profileData?.profileImage || '';
+
+    if (selectedImage) {
+      const uploadedImageUrl = await imageEdit({ silent: true });
+      if (!uploadedImageUrl) {
+        showToast('Please upload profile image again');
+        return;
+      }
+      finalProfileImage = uploadedImageUrl;
+    }
+
+    const payload = {
+      fullName: form.fullName,
+      email: form.email || email || '',
+      about: form.about,
+      profileImage: finalProfileImage,
+      ...(phoneNumber ? { mobile: { code: selectedCountry?.code || '', number: phoneNumber || '' } } : {}),
     };
 
-    return (
-        <Animated.View style={{ flex: 1, opacity: fadeAnim }}>
-            <View style={{ flex:1, backgroundColor: theme.colors.background }} >
-                <View style={{ width:'100%', flexDirection:'row', borderBottomWidth:.5, borderBottomColor:theme.colors.borderColor, padding:10,}} >
-                    <View style={{ flex:1, alignItems:'center', justifyContent:'center' }} >
-                        <Text style={{ fontFamily:'Roboto-SemiBold', fontSize:16, color:theme.colors.primaryTextColor }} >Edit Profile</Text>
-                    </View>
-                    <View style={{ width:40 }} />
-                </View>
-                
-                <ScrollView style={{ flex:1, padding:20 }} showsVerticalScrollIndicator={false}>
-                    <View style={{ alignItems:'center' }} >
-                        <View style={{ width:150, height:150, alignItems:'center', justifyContent:'center', borderRadius:75, overflow: 'hidden', marginBottom:10 }} >
-                            <View style={{ width:150, height:150, backgroundColor:'#ccc', borderRadius:100, overflow: 'hidden', justifyContent: 'center', alignItems:"center" }} >
-                              {imageUploadLoader ? (
-                                <ActivityIndicator size="large" color={theme.colors.themeColor} />
-                              ) : (
-                                <>
-                                  {getImageSource() ? (
-                                    <Image
-                                      resizeMode="cover"
-                                      source={getImageSource()}
-                                      style={{ width: '100%', height: '100%' }}
-                                    />
-                                  ) : (
-                                    <FontAwesome5 name="user-alt" size={80} color="#fff" />
-                                  )}
-                                </>
-                              )}
-                            </View>
-                            <TouchableOpacity 
-                              onPress={showImagePickerOptions} 
-                              disabled={imageUploadLoader}
-                              style={{ width:150, height:35, justifyContent:'center', alignItems:'center', backgroundColor:'#00000080', position:'absolute', bottom:0, borderBottomLeftRadius:100, borderBottomRightRadius:100 }} 
-                            >
-                              <Ionicons name="camera-reverse" size={24} color="#fff" />
-                            </TouchableOpacity>
-                        </View>
-                        
-                        {selectedImage && (
-                          <TouchableOpacity 
-                            onPress={imageEdit} 
-                            disabled={imageUploadLoader}
-                            style={{ marginBottom: 20 }}
-                          >
-                            {/* <Text style={{ color: theme.colors.themeColor, fontFamily: 'Roboto-Medium', fontSize: 14 }}>
-                              {imageUploadLoader ? 'Uploading...' : 'Upload Image'}
-                            </Text> */}
-                          </TouchableOpacity>
-                        )}
-                        
-                        <View style={{ width:'100%', marginTop:20 }} >
-                          <View style={{ width:'100%', marginBottom:20 }} >
-                            <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, borderWidth:1, borderColor:focusedInput === 'fullName' ? theme.colors.themeColor : theme.colors.borderColor, }} >
-                                <TextInput 
-                                  placeholder="Full Name" 
-                                  placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                  style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
-                                  value={form.fullName}
-                                  onChangeText={(value) => handleChange('fullName', value)}
-                                  onFocus={() => setFocusedInput('fullName')}
-                                  onBlur={() => setFocusedInput(null)}
-                                />
-                            </View>
-                            {formErrors.fullName && <Text style={{ fontSize: 12, fontFamily:"Roboto-Medium", color: 'red', marginTop: 5 }}>{formErrors.fullName}</Text>}
-                          </View>
-                          
-                          <View style={{ width:'100%', marginBottom:20 }} >
-                           <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, borderWidth:1, borderColor:focusedInput === 'email' ? theme.colors.themeColor : theme.colors.borderColor, }} >
-                               <TextInput 
-                                 placeholder="Email" 
-                                 placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                 style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
-                                //  value={form.email}
-                                editable={false}
-                                 value={form.email || email || ''}
-                                 keyboardType="email-address"
-                                 autoCapitalize="none"
-                                 onChangeText={(value) => handleChange('email', value)}
-                                 onFocus={() => setFocusedInput('email')}
-                                 onBlur={() => setFocusedInput(null)}
-                               />
-                           </View>
-                           {formErrors.email && <Text style={{ fontSize: 12, fontFamily:"Roboto-Medium", color: 'red', marginTop: 5 }}>{formErrors.email}</Text>}
-                          </View>
-                          
-                          <View style={{ width:'100%', marginBottom:20 }} >
-                          <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, borderWidth:1, borderColor:focusedInput === 'about' ? theme.colors.themeColor : theme.colors.borderColor, }} >
-                              <TextInput 
-                                placeholder="About" 
-                                placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
-                                value={form.about}
-                                onChangeText={(value) => handleChange('about', value)}
-                                onFocus={() => setFocusedInput('about')}
-                                onBlur={() => setFocusedInput(null)}
-                                multiline={false}
-                              />
-                          </View>
-                          {formErrors.about && <Text style={{ fontSize: 12, fontFamily:"Roboto-Medium", color: 'red', marginTop: 5 }}>{formErrors.about}</Text>}
-                          </View>
-                          
-                          {/* <View style={{ width:'100%', height:50, backgroundColor:theme.colors.menuBackground, justifyContent:'center', borderRadius:6, marginBottom:10, borderWidth:1, borderColor:theme.colors.borderColor }} >
-                              <TextInput 
-                                editable={false}
-                                placeholderTextColor={theme.colors.placeHolderTextColor} 
-                                style={{ flex:1, paddingLeft:15, color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, }} 
-                                value={fullNumber}
-                              />
-                          </View>
-                          <Text style={{ fontFamily:'Roboto-Medium', fontSize:12, color:theme.colors.placeHolderTextColor, textAlign:'center', marginTop:5 }}>
-                            Phone number cannot be changed
-                          </Text> */}
-                        </View>
-                    </View>
-                </ScrollView>
-               
-                <TouchableOpacity 
-                  onPress={handleUpdateProfile} 
-                  disabled={isLoading || imageUploadLoader}
-                  style={{ 
-                    width:55, 
-                    height:55, 
-                    backgroundColor: theme.colors.themeColor, 
-                    position:'absolute', 
-                    bottom:20, 
-                    right:20, 
-                    borderRadius:15, 
-                    alignItems:'center', 
-                    justifyContent:'center',
-                    opacity: (isLoading || imageUploadLoader) ? 0.5 : 1
-                  }} 
-                >
-                  {isLoading ? (
-                    <ActivityIndicator size="small" color={theme.colors.textWhite} />
-                  ) : (
-                    <Feather name="check" size={24} color={theme.colors.textWhite} />
-                  )}
-                </TouchableOpacity>
+    try {
+      await dispatch(editProfile(payload)).unwrap();
+      showToast("Profile updated successfully");
+      dispatch(profileDetail());
+      navigation.reset({ index: 0, routes: [{ name: "ChatList" }] });
+    } catch (e) {
+      console.error(e);
+      showToast(e?.message || "Profile update failed");
+    }
+  };
+
+  // ─── Theme helpers ─────────────────────────
+  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+  const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
+  const borderClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
+  const primaryText = theme.colors.primaryTextColor;
+  const subText = theme.colors.placeHolderTextColor;
+  const themeColor = theme.colors.themeColor || '#1DA1F2';
+  const inputBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+
+  const imgSrc = getImageSource();
+
+  return (
+    <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
+      <StatusBar translucent backgroundColor="transparent" barStyle="light-content" />
+
+      {/* Floating back button */}
+      <SafeAreaView edges={['top']} style={styles.topBarSafe}>
+        <View style={styles.topBarRow}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.floatingBtn} activeOpacity={0.7}>
+            <FontAwesome6 name="arrow-left" size={18} color="#fff" />
+          </TouchableOpacity>
+          <Text style={styles.topBarTitle}>Edit Profile</Text>
+          <View style={{ width: 40 }} />
+        </View>
+      </SafeAreaView>
+
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={{ flex: 1 }}
+      >
+        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 120 }}>
+          {/* ─── Hero ─── */}
+          <View style={[styles.hero, { backgroundColor: imgSrc ? '#000' : themeColor }]}>
+            {imgSrc ? (
+              <Image source={imgSrc} style={styles.heroImage} resizeMode="cover" />
+            ) : (
+              <View style={styles.heroFallback}>
+                <FontAwesome5 name="user-alt" size={88} color="rgba(255,255,255,0.85)" />
+              </View>
+            )}
+            <HeroGradient />
+
+            <TouchableOpacity
+              onPress={showImagePickerOptions}
+              disabled={imageUploadLoader}
+              activeOpacity={0.85}
+              style={[styles.cameraFab, { backgroundColor: themeColor }]}
+            >
+              {imageUploadLoader ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Ionicons name="camera" size={20} color="#fff" />
+              )}
+            </TouchableOpacity>
+
+            <View style={styles.heroOverlay} pointerEvents="none">
+              <Text style={styles.heroName} numberOfLines={1}>
+                {form.fullName || profileData?.fullName || 'Welcome'}
+              </Text>
+              <Text style={styles.heroStatus} numberOfLines={1}>
+                Set up your profile
+              </Text>
             </View>
-        </Animated.View>
-    );
+          </View>
+
+          {/* ─── PROFILE section ─── */}
+          <Text style={[styles.sectionLabel, { color: subText }]}>PROFILE</Text>
+          <View style={[styles.card, { backgroundColor: cardBg }]}>
+            <FieldRow
+              icon="person-outline"
+              themeColor={themeColor}
+              label="Full Name"
+              value={form.fullName}
+              onChangeText={(v) => handleChange('fullName', v)}
+              focused={focusedInput === 'fullName'}
+              onFocus={() => setFocusedInput('fullName')}
+              onBlur={() => setFocusedInput(null)}
+              primaryText={primaryText}
+              subText={subText}
+              inputBg={inputBg}
+              borderClr={borderClr}
+              error={formErrors.fullName}
+            />
+
+            <View style={[styles.divider, { backgroundColor: borderClr }]} />
+
+            <FieldRow
+              icon="information-circle-outline"
+              themeColor={themeColor}
+              label="About"
+              value={form.about}
+              onChangeText={(v) => handleChange('about', v)}
+              focused={focusedInput === 'about'}
+              onFocus={() => setFocusedInput('about')}
+              onBlur={() => setFocusedInput(null)}
+              primaryText={primaryText}
+              subText={subText}
+              inputBg={inputBg}
+              borderClr={borderClr}
+              error={formErrors.about}
+            />
+          </View>
+
+          <Text style={[styles.helperText, { color: subText }]}>
+            Your profile is visible to people you chat with on baatcheet.
+          </Text>
+        </ScrollView>
+      </KeyboardAvoidingView>
+
+      {/* Save FAB */}
+      <TouchableOpacity
+        onPress={handleUpdateProfile}
+        disabled={isLoading || imageUploadLoader}
+        activeOpacity={0.85}
+        style={[
+          styles.saveFab,
+          {
+            backgroundColor: themeColor,
+            opacity: (isLoading || imageUploadLoader) ? 0.6 : 1,
+          },
+        ]}
+      >
+        {isLoading ? (
+          <ActivityIndicator size="small" color="#fff" />
+        ) : (
+          <Feather name="check" size={26} color="#fff" />
+        )}
+      </TouchableOpacity>
+    </Animated.View>
+  );
 }
+
+// ─── Field row ───
+function FieldRow({
+  icon, themeColor, label, value, onChangeText, focused, onFocus, onBlur,
+  primaryText, subText, inputBg, borderClr, editable = true, keyboardType, error,
+}) {
+  return (
+    <View style={styles.fieldWrap}>
+      <View style={styles.fieldRow}>
+        <View style={[styles.rowIcon, { backgroundColor: themeColor + '18' }]}>
+          <Ionicons name={icon} size={18} color={themeColor} />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={[styles.fieldLabel, { color: subText }]}>{label}</Text>
+          <TextInput
+            value={value}
+            onChangeText={onChangeText}
+            onFocus={onFocus}
+            onBlur={onBlur}
+            editable={editable}
+            keyboardType={keyboardType}
+            placeholder={`Enter ${label.toLowerCase()}`}
+            placeholderTextColor={subText}
+            style={[
+              styles.fieldInput,
+              {
+                color: editable ? primaryText : subText,
+                borderColor: focused ? themeColor : 'transparent',
+                backgroundColor: focused ? inputBg : 'transparent',
+              },
+            ]}
+          />
+          {error ? <Text style={styles.errorText}>{error}</Text> : null}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+
+  topBarSafe: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100 },
+  topBarRow: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 10, paddingTop: 4, paddingBottom: 6,
+  },
+  floatingBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  topBarTitle: {
+    flex: 1, textAlign: 'center', color: '#fff',
+    fontFamily: 'Roboto-SemiBold', fontSize: 16,
+    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
+
+  hero: { width: '100%', height: HERO_H, position: 'relative', overflow: 'hidden' },
+  heroImage: { width: '100%', height: '100%' },
+  heroFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  heroOverlay: { position: 'absolute', left: 20, right: 80, bottom: 18 },
+  heroName: {
+    color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 24,
+    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4,
+  },
+  heroStatus: {
+    color: 'rgba(255,255,255,0.85)', fontFamily: 'Roboto-Regular', fontSize: 13, marginTop: 4,
+    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
+  cameraFab: {
+    position: 'absolute', right: 18, bottom: 18,
+    width: 50, height: 50, borderRadius: 25,
+    alignItems: 'center', justifyContent: 'center',
+    elevation: 5,
+    shadowColor: '#000', shadowOpacity: 0.3, shadowOffset: { width: 0, height: 2 }, shadowRadius: 4,
+  },
+
+  sectionLabel: {
+    fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.8,
+    marginTop: 18, marginBottom: 6, paddingHorizontal: 24,
+  },
+  card: { marginHorizontal: 12, borderRadius: 14, overflow: 'hidden' },
+  divider: { height: StyleSheet.hairlineWidth, marginLeft: 64 },
+
+  fieldWrap: { paddingVertical: 8 },
+  fieldRow: {
+    flexDirection: 'row', alignItems: 'flex-start',
+    paddingVertical: 8, paddingHorizontal: 14, gap: 14,
+  },
+  rowIcon: {
+    width: 36, height: 36, borderRadius: 18,
+    alignItems: 'center', justifyContent: 'center',
+    marginTop: 6,
+  },
+  fieldLabel: { fontFamily: 'Roboto-Regular', fontSize: 12 },
+  fieldInput: {
+    marginTop: 2, paddingVertical: 8, paddingHorizontal: 8,
+    fontFamily: 'Roboto-Medium', fontSize: 15,
+    borderRadius: 8, borderWidth: 1,
+  },
+  errorText: { color: '#E53935', fontFamily: 'Roboto-Medium', fontSize: 12, marginTop: 4 },
+
+  helperText: {
+    fontFamily: 'Roboto-Regular', fontSize: 12,
+    paddingHorizontal: 24, marginTop: 14, textAlign: 'center',
+  },
+
+  saveFab: {
+    position: 'absolute', bottom: 24, right: 20,
+    width: 58, height: 58, borderRadius: 29,
+    alignItems: 'center', justifyContent: 'center',
+    elevation: 6,
+    shadowColor: '#000', shadowOpacity: 0.3, shadowOffset: { width: 0, height: 2 }, shadowRadius: 5,
+  },
+});

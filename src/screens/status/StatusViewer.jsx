@@ -144,6 +144,10 @@ export default function StatusViewer({ navigation, route }) {
   }, [navigation]);
 
   // ── Navigate ──────────────────────────────────────────────────────────────
+  // Note: navigation calls must NEVER happen inside a setState updater —
+  // React may invoke the updater during render, which triggers
+  // "Cannot update a component while rendering a different component"
+  // and can also abort in-flight network requests (iOS surfaces this as ERR_NETWORK).
   const goNext = useCallback(() => {
     setCurrentIndex(i => {
       if (i < statuses.length - 1) {
@@ -151,7 +155,7 @@ export default function StatusViewer({ navigation, route }) {
         setVideoDuration(STORY_DURATION);
         return i + 1;
       }
-      safeGoBack();
+      setTimeout(() => safeGoBack(), 0);
       return i;
     });
   }, [statuses.length, safeGoBack]);
@@ -160,7 +164,7 @@ export default function StatusViewer({ navigation, route }) {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setCurrentIndex(i => {
       if (i > 0) { setVideoDuration(STORY_DURATION); return i - 1; }
-      safeGoBack();
+      setTimeout(() => safeGoBack(), 0);
       return i;
     });
   }, [safeGoBack]);
@@ -208,11 +212,9 @@ export default function StatusViewer({ navigation, route }) {
 
       const onExpired = ({ statusId }) => {
         dispatch(removeStatusFromSocket({ statusId }));
-        setStatuses(prev => {
-          const updated = prev.filter(s => String(s._id) !== String(statusId));
-          if (updated.length === 0) safeGoBack();
-          return updated;
-        });
+        // Don't call safeGoBack here — useEffect on `!currentStatus` handles
+        // navigating back once the list becomes empty.
+        setStatuses(prev => prev.filter(s => String(s._id) !== String(statusId)));
       };
       const onReactionUpdate = (payload) => dispatch(handleReactionUpdateFromSocket(payload));
       const onLikeAnim = ({ statusId }) => {
@@ -271,11 +273,7 @@ export default function StatusViewer({ navigation, route }) {
           onPress: () => {
             dispatch(deleteStatusAction(currentStatus._id));
             dispatch(removeLocalStatus(currentStatus._id));
-            setStatuses(prev => {
-              const updated = prev.filter(s => s._id !== currentStatus._id);
-              if (updated.length === 0) safeGoBack();
-              return updated;
-            });
+            setStatuses(prev => prev.filter(s => s._id !== currentStatus._id));
           },
         },
       ],
@@ -304,12 +302,8 @@ export default function StatusViewer({ navigation, route }) {
 
   const handleHide = useCallback(() => {
     dispatch(hideStatusAction(currentStatus._id));
-    setStatuses(prev => {
-      const updated = prev.filter(s => s._id !== currentStatus._id);
-      if (updated.length === 0) safeGoBack();
-      return updated;
-    });
-  }, [currentStatus?._id, dispatch, navigation]);
+    setStatuses(prev => prev.filter(s => s._id !== currentStatus._id));
+  }, [currentStatus?._id, dispatch]);
 
   const openOptions = useCallback(() => {
     pause();

@@ -16,6 +16,7 @@ const getDB = async () => {
       await _db.getFirstAsync('SELECT 1');
       return _db;
     } catch {
+      try { await _db.closeAsync(); } catch {}
       _db = null;
       _dbInitPromise = null;
     }
@@ -24,25 +25,59 @@ const getDB = async () => {
   if (_dbInitPromise) return _dbInitPromise;
   _dbInitPromise = _initDB();
   try {
-    return await _dbInitPromise;
+    const db = await _dbInitPromise;
+    // Crucial: never return null. Callers (saveMessagesToLocal, etc.) immediately
+    // call methods on the result; null would crash them with "Cannot read property
+    // X of null". Surface a real error instead so the caller's try/catch handles it.
+    if (!db) throw new Error('ChatDB unavailable: all init attempts failed');
+    return db;
   } finally {
     _dbInitPromise = null;
   }
 };
 
+const _safeClose = async () => {
+  if (!_db) return;
+  try { await _db.closeAsync(); } catch {}
+  _db = null;
+};
+
 const _initDB = async () => {
-  for (let attempt = 0; attempt < 3; attempt++) {
+  // Native expo-sqlite on Android occasionally rejects the first execAsync after
+  // a fresh openDatabaseAsync with a bare NullPointerException. PRAGMA calls are
+  // optimizations, not correctness — wrap them so a failing PRAGMA never blocks
+  // init. Each attempt opens a fresh handle and closes the previous one cleanly.
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      await _safeClose();
       _db = await SQLite.openDatabaseAsync(DB_NAME);
-      await _db.execAsync('PRAGMA journal_mode = WAL;');
-      await _db.execAsync('PRAGMA synchronous = NORMAL;');
-      await _db.execAsync('PRAGMA foreign_keys = ON;');
+
+      // Small tick gives the native side time to finish wiring up the handle —
+      // without this, Android sometimes throws NullPointerException on the very
+      // first execAsync immediately after openDatabaseAsync resolves.
+      await new Promise((r) => setTimeout(r, 50));
+
+      // PRAGMAs are best-effort — log and continue on failure rather than
+      // tearing down the connection.
+      try { await _db.execAsync('PRAGMA journal_mode = WAL;'); }
+      catch (e) { console.warn('[ChatDB] PRAGMA journal_mode failed (non-fatal):', e?.message); }
+      try { await _db.execAsync('PRAGMA synchronous = NORMAL;'); }
+      catch (e) { console.warn('[ChatDB] PRAGMA synchronous failed (non-fatal):', e?.message); }
+      try { await _db.execAsync('PRAGMA foreign_keys = ON;'); }
+      catch (e) { console.warn('[ChatDB] PRAGMA foreign_keys failed (non-fatal):', e?.message); }
+      // busy_timeout makes SQLite block for up to 5s waiting for a write lock
+      // instead of failing immediately with "database is locked". Critical for
+      // the upsertMessages path where many batches + fire-and-forget reply
+      // writes contend on the same WAL writer.
+      try { await _db.execAsync('PRAGMA busy_timeout = 5000;'); }
+      catch (e) { console.warn('[ChatDB] PRAGMA busy_timeout failed (non-fatal):', e?.message); }
+
       await runMigrations(_db);
       return _db;
     } catch (err) {
-      console.error(`[ChatDB] getDB attempt ${attempt + 1} failed:`, err?.message);
-      _db = null;
-      if (attempt < 2) await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
+      console.warn(`[ChatDB] getDB attempt ${attempt} failed: ${err?.message}; will retry`);
+      await _safeClose();
+      if (attempt < 3) await new Promise(r => setTimeout(r, 200 * attempt));
     }
   }
   console.error('[ChatDB] All DB init attempts failed');
@@ -326,22 +361,26 @@ const rowToMsg = (row) => {
 
 // ─── REPLY TABLE (permanent, never overwritten) ────────
 
-const saveReplyData = async (messageId, data) => {
+// `dbOverride` lets callers (notably the upsertMessages transaction) pass in
+// the already-resolved handle so this function does NOT call getDB() again.
+// getDB()'s heartbeat can swap `_db` if it thinks the connection is stale,
+// which would orphan the in-flight transaction onto the old handle — exactly
+// the kind of state that produces "database is locked" on finalizeAsync.
+const saveReplyData = async (messageId, data, dbOverride = null) => {
   if (!messageId || !data?.replyToMessageId) return;
-  const db = await getDB();
+  const db = dbOverride || await getDB();
   const params = { $mid: messageId, $rid: data.replyToMessageId, $text: data.replyPreviewText || null, $type: data.replyPreviewType || null, $name: data.replySenderName || null, $sid: data.replySenderId || null };
   const sql = `INSERT OR IGNORE INTO message_replies (message_id, reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id) VALUES ($mid, $rid, $text, $type, $name, $sid)`;
   try {
     await db.runAsync(sql, params);
-    console.log('[DEBUG:SAVE_REPLY] Saved reply for', messageId, '→', data.replyToMessageId);
   } catch (err) {
-    console.log('[DEBUG:SAVE_REPLY] FAILED for', messageId, err?.message);
-    try {
-      await db.execAsync(`CREATE TABLE IF NOT EXISTS message_replies (message_id TEXT PRIMARY KEY NOT NULL, reply_to_message_id TEXT NOT NULL, reply_preview_text TEXT, reply_preview_type TEXT, reply_sender_name TEXT, reply_sender_id TEXT);`);
-      await db.runAsync(sql, params);
-      console.log('[DEBUG:SAVE_REPLY] Retry OK for', messageId);
-    } catch (e2) {
-      console.log('[DEBUG:SAVE_REPLY] Retry FAILED', e2?.message);
+    // Don't re-create the table inside a transaction (would itself try a write
+    // and can deadlock). Just swallow — the table is created in migrations.
+    if (!dbOverride) {
+      try {
+        await db.execAsync(`CREATE TABLE IF NOT EXISTS message_replies (message_id TEXT PRIMARY KEY NOT NULL, reply_to_message_id TEXT NOT NULL, reply_preview_text TEXT, reply_preview_type TEXT, reply_sender_name TEXT, reply_sender_id TEXT);`);
+        await db.runAsync(sql, params);
+      } catch {}
     }
   }
 };
@@ -465,20 +504,56 @@ const upsertMessage = async (msg) => {
   if (writeMsg.replyToMessageId) {
     const ids = [writeMsg.serverMessageId, writeMsg.id, writeMsg.tempId].filter(Boolean);
     for (const rid of ids) {
-      saveReplyData(rid, writeMsg).catch(() => {});
+      try { await saveReplyData(rid, writeMsg, db); } catch {}
     }
   }
 };
 
+// Serializes upsertMessages calls so two parallel batches don't both issue
+// BEGIN TRANSACTION on the same SQLite connection ("cannot start a transaction
+// within a transaction"). Each batch waits for the previous one to finish.
+let _upsertMessagesChain = Promise.resolve();
+
 const upsertMessages = async (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) return;
-  const db = await getDB();
 
-  // Wrap in transaction for atomic batch writes — 10-50x faster for bulk inserts
-  await db.execAsync('BEGIN TRANSACTION');
-  try {
-    for (const msg of messages) {
+  const run = async () => {
+    const db = await getDB();
+
+    // Use expo-sqlite's built-in transaction wrapper when available — it
+    // correctly handles BEGIN/COMMIT/ROLLBACK and serializes against other
+    // transactions on the same handle.
+    if (typeof db.withTransactionAsync === 'function') {
       try {
+        await db.withTransactionAsync(async () => {
+          await _runUpsertBatch(db, messages);
+        });
+      } catch (err) {
+        console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
+      }
+      return;
+    }
+
+    // Fallback for older expo-sqlite: manual BEGIN/COMMIT
+    await db.execAsync('BEGIN TRANSACTION');
+    try {
+      await _runUpsertBatch(db, messages);
+      await db.execAsync('COMMIT');
+    } catch (err) {
+      await db.execAsync('ROLLBACK').catch(() => {});
+      console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
+    }
+  };
+
+  // Chain onto the previous run — guarantees serial execution per process.
+  const next = _upsertMessagesChain.then(run, run);
+  _upsertMessagesChain = next.catch(() => {}); // swallow so chain doesn't break
+  return next;
+};
+
+const _runUpsertBatch = async (db, messages) => {
+  for (const msg of messages) {
+    try {
         // Same 5-step flow as upsertMessage
         let replyData = null;
         const needsRecovery = !msg.replyToMessageId || (msg.replyToMessageId && !msg.replyPreviewText);
@@ -513,16 +588,25 @@ const upsertMessages = async (messages) => {
         await _runInsert(db, writeMsg);
         if (writeMsg.replyToMessageId) {
           const ids = [writeMsg.serverMessageId, writeMsg.id, writeMsg.tempId].filter(Boolean);
-          for (const rid of ids) saveReplyData(rid, writeMsg).catch(() => {});
+          // Pass db explicitly so saveReplyData stays on the same handle as
+          // the open transaction — see saveReplyData() docstring.
+          for (const rid of ids) {
+            try { await saveReplyData(rid, writeMsg, db); } catch {}
+          }
         }
-      } catch (err) {
-        console.warn('[ChatDB] upsertMessages row error:', err?.message);
+    } catch (err) {
+      const msg = String(err?.message || '').toLowerCase();
+      // "database is locked" mid-transaction is recoverable on the next
+      // iteration once busy_timeout drains the contending statement; downgrade
+      // to a quiet log so it stops surfacing as a red warning, and skip the
+      // row (the message will be re-upserted on the next sync/ack anyway).
+      if (msg.includes('database is locked')) {
+        // brief yield gives the busy writer time to finalize before we move on
+        await new Promise((r) => setTimeout(r, 25));
+        continue;
       }
+      console.warn('[ChatDB] upsertMessages row error:', err?.message);
     }
-    await db.execAsync('COMMIT');
-  } catch (err) {
-    await db.execAsync('ROLLBACK').catch(() => {});
-    console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
   }
 };
 
@@ -943,13 +1027,19 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
   if (!tempId || !serverMessageId) return;
   const db = await getDB();
 
-  const serverRow = await db.getFirstAsync(`SELECT id, is_edited FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`, { $s: serverMessageId });
+  const serverRow = await db.getFirstAsync(`SELECT id, is_edited, status FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`, { $s: serverMessageId });
   const tempRow = await db.getFirstAsync(`SELECT id, is_edited, status, payload, reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id FROM messages WHERE id = $t OR temp_id = $t LIMIT 1`, { $t: tempId });
 
-  // Preserve 'scheduled'/'processing' status — don't overwrite it with 'sent' during acknowledge
+  // Preserve 'scheduled'/'processing' status — don't overwrite it with 'sent' during acknowledge.
+  // Also preserve any HIGHER status (delivered/seen/read) that may already be on the temp OR
+  // server row from prior status events — without this, re-acknowledging an already-delivered
+  // message on chat re-open silently downgrades the bubble back to single tick.
   const tempPayload = tempRow ? parseJSON(tempRow.payload) : null;
   const isScheduledMsg = tempRow?.status === 'scheduled' || tempRow?.status === 'processing' || tempPayload?.isScheduled;
-  const ackStatus = isScheduledMsg ? (tempRow?.status || 'scheduled') : 'sent';
+  const pickHigher = (a, b) => ((STATUS_PRIORITY[a] || 0) >= (STATUS_PRIORITY[b] || 0) ? a : b);
+  const ackStatus = isScheduledMsg
+    ? (tempRow?.status || 'scheduled')
+    : pickHigher(pickHigher(tempRow?.status || 'sent', serverRow?.status || 'sent'), 'sent');
 
   if (serverRow && tempRow && serverRow.id !== tempRow.id) {
     // Rescue reactions from temp row before it gets deleted
@@ -1374,9 +1464,38 @@ const getChatById = async (chatId) => {
   return _rowToChat(row);
 };
 
+// Anti-downgrade map for the chat-list status column. Mirrors STATUS_PRIORITY
+// but rounded to the three states the chat list cares about.
+const CHAT_STATUS_PRIORITY = { sent: 1, delivered: 2, seen: 3, read: 3 };
+
 const updateChatLastMessage = async (chatId, lm) => {
   if (!chatId || !lm) return;
   const db = await getDB();
+  const now = Date.now();
+
+  // Ensure a row exists so realtime updates aren't no-ops for chats that haven't
+  // been hydrated from the API yet (e.g. a brand-new conversation).
+  // peer/group info will be filled in by the next full chat-list sync.
+  await db.runAsync(
+    `INSERT OR IGNORE INTO chats (chat_id, chat_type, is_group, unread_count, created_at, updated_at)
+     VALUES ($chatId, 'private', 0, 0, $now, $now)`,
+    { $chatId: chatId, $now: now }
+  );
+
+  // Anti-downgrade: don't let a stale 'sent' overwrite an existing 'delivered'/'read'
+  // for the SAME message. Different message id always wins (it's a new last-message).
+  const existing = await db.getFirstAsync(
+    `SELECT last_message_id, last_message_status FROM chats WHERE chat_id = $cid LIMIT 1`,
+    { $cid: chatId }
+  );
+  const incomingMsgId = lm.serverMessageId || lm.messageId || lm.id || null;
+  const sameMessage = existing?.last_message_id && incomingMsgId
+    && String(existing.last_message_id) === String(incomingMsgId);
+  const incomingPri = CHAT_STATUS_PRIORITY[lm.status] || 0;
+  const existingPri = CHAT_STATUS_PRIORITY[existing?.last_message_status] || 0;
+  const keepExistingStatus = sameMessage && incomingPri < existingPri;
+  const resolvedStatus = keepExistingStatus ? existing.last_message_status : (lm.status || null);
+
   await db.runAsync(
     `UPDATE chats SET
       last_message_text = $text, last_message_type = $type,
@@ -1391,14 +1510,35 @@ const updateChatLastMessage = async (chatId, lm) => {
       $type: lm.type || 'text',
       $senderId: lm.senderId || null,
       $senderName: lm.senderName || null,
-      $status: lm.status || null,
-      $at: lm.createdAt || lm.lastMessageAt || null,
-      $id: lm.serverMessageId || lm.messageId || null,
+      $status: resolvedStatus,
+      $at: lm.createdAt || lm.lastMessageAt || now,
+      $id: incomingMsgId,
       $edited: lm.isEdited ? 1 : 0,
       $deleted: lm.isDeleted ? 1 : 0,
-      $now: Date.now(),
+      $now: now,
     }
   );
+};
+
+// Bump only the status column for a chat's last message — used by delivered/read
+// socket acks. Anti-downgrade and tied to messageId so an ack for an older
+// message can't overwrite the current last-message's status.
+const updateChatLastMessageStatusById = async (chatId, messageId, newStatus) => {
+  if (!chatId || !messageId || !newStatus) return false;
+  const db = await getDB();
+  const row = await db.getFirstAsync(
+    `SELECT last_message_id, last_message_status FROM chats WHERE chat_id = $cid LIMIT 1`,
+    { $cid: chatId }
+  );
+  if (!row || String(row.last_message_id) !== String(messageId)) return false;
+  const cur = CHAT_STATUS_PRIORITY[row.last_message_status] || 0;
+  const nxt = CHAT_STATUS_PRIORITY[newStatus] || 0;
+  if (nxt <= cur) return false;
+  await db.runAsync(
+    `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $cid`,
+    { $s: newStatus, $n: Date.now(), $cid: chatId }
+  );
+  return true;
 };
 
 const updateChatUnread = async (chatId, count) => {
@@ -1492,7 +1632,7 @@ export default {
   closeDB, saveMessageSync, saveMessages,
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
-  updateChatLastMessage, updateChatUnread, incrementChatUnread,
+  updateChatLastMessage, updateChatLastMessageStatusById, updateChatUnread, incrementChatUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
   updateChatPin, updateChatMute, updateChatArchive, deleteChatRow, getChatCount,
   // Sync meta

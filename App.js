@@ -34,7 +34,7 @@ export default function App() {
           const token = await getFCMToken();
           if (token) {
             await AsyncStorage.setItem('fcmToken', token);
-            console.log('FCM token stored');
+            console.log('FCM token stored', token);
           }
 
           // Setup foreground listeners (background handler is in index.js)
@@ -50,26 +50,29 @@ export default function App() {
     }, []);
 
   return (
-    <ThemeProvider>
-      <NetworkProvider>
-       <PaperProvider>
-        <DeviceInfoProvider>
-         <AuthProvider>
-           <ContactProvider>
-            <ImageProvider>
-             <DeviceLocationProvider>
-              <PresenceProvider>
-               <RealtimeChatProvider>
-                 <AppContent />
-               </RealtimeChatProvider>
-              </PresenceProvider>
-             </DeviceLocationProvider>
-            </ImageProvider>
-           </ContactProvider>
-         </AuthProvider>
-        </DeviceInfoProvider>
-       </PaperProvider>
-      </NetworkProvider>
-    </ThemeProvider>
+    <SafeAreaProvider>
+       <ThemeProvider>
+         <NetworkProvider>
+          <PaperProvider>
+           <DeviceInfoProvider>
+            <AuthProvider>
+              <ContactProvider>
+               <ImageProvider>
+                <DeviceLocationProvider>
+                 <PresenceProvider>
+                  <RealtimeChatProvider>
+                    <AppContent />
+                  </RealtimeChatProvider>
+                 </PresenceProvider>
+                </DeviceLocationProvider>
+               </ImageProvider>
+              </ContactProvider>
+            </AuthProvider>
+           </DeviceInfoProvider>
+          </PaperProvider>
+         </NetworkProvider>
+       </ThemeProvider>
+    </SafeAreaProvider>
+   
   );
 }

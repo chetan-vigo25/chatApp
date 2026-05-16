@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
+import ChatDB from '../services/ChatDatabase';
 import moment from 'moment';
 import {
   clearChatLocalArtifacts,
@@ -320,6 +321,128 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       }
     };
 
+    // Helper: update single message status in local storage, with anti-downgrade.
+    const STATUS_RANK = { sent: 1, delivered: 2, seen: 3, read: 4 };
+    const advanceLocalStatus = async (chatId, messageId, newStatus, extras = {}) => {
+      if (!chatId || !messageId || !newStatus) return;
+      const localKey = getChatMessagesKey(chatId);
+      if (!localKey) return;
+      try {
+        const raw = await AsyncStorage.getItem(localKey);
+        if (!raw) return;
+        const messages = JSON.parse(raw);
+        if (!Array.isArray(messages)) return;
+
+        let changed = false;
+        const updated = messages.map((msg) => {
+          const id = msg?.serverMessageId || msg?.id || msg?.tempId;
+          if (String(id) !== String(messageId)) return msg;
+          const currentRank = STATUS_RANK[msg.status] || 0;
+          const newRank = STATUS_RANK[newStatus] || 0;
+          if (newRank <= currentRank && !extras.forceMerge) return msg;
+
+          const merged = { ...msg, ...extras };
+          if (newRank > currentRank) merged.status = newStatus;
+          // Per-recipient timeline for group message info (local cache for UI)
+          if (extras._appendReader) {
+            const list = Array.isArray(msg.readBy) ? [...msg.readBy] : [];
+            if (!list.some((r) => String(r.userId) === String(extras._appendReader.userId))) {
+              list.push(extras._appendReader);
+            }
+            merged.readBy = list;
+            delete merged._appendReader;
+          }
+          if (extras._appendDelivered) {
+            const list = Array.isArray(msg.deliveredTo) ? [...msg.deliveredTo] : [];
+            if (!list.some((r) => String(r.userId) === String(extras._appendDelivered.userId))) {
+              list.push(extras._appendDelivered);
+            }
+            merged.deliveredTo = list;
+            delete merged._appendDelivered;
+          }
+          changed = true;
+          return merged;
+        });
+
+        if (changed) await AsyncStorage.setItem(localKey, JSON.stringify(updated));
+
+        // Mirror to SQLite (anti-downgrade handled inside updateMessageStatus)
+        try {
+          await ChatDB.updateMessageStatus(messageId, newStatus);
+          if (extras._appendReader || extras._appendDelivered) {
+            const target = updated.find((m) => String(m?.serverMessageId || m?.id || m?.tempId) === String(messageId));
+            if (target) {
+              await ChatDB.updateGroupMessageTracking(messageId, {
+                deliveredTo: target.deliveredTo,
+                readBy: target.readBy,
+              });
+            }
+          }
+        } catch (e) {
+          // SQLite mirror is best-effort; AsyncStorage path remains the source for UI
+        }
+      } catch (err) {
+        console.error('ChatSocketProvider: advanceLocalStatus failed', err);
+      }
+    };
+
+    // 1-1: peer read a single message of mine
+    const onMessageRead = async (payload) => {
+      const source = payload?.data || payload || {};
+      const { messageId, chatId, readerId } = source;
+      if (!messageId || !chatId) return;
+      await advanceLocalStatus(chatId, messageId, 'read', {
+        _appendReader: readerId ? { userId: readerId, readAt: new Date().toISOString() } : undefined,
+        forceMerge: !!readerId,
+      });
+    };
+
+    // 1-1: peer marked a single message delivered
+    const onMessageDelivered = async (payload) => {
+      const source = payload?.data || payload || {};
+      const { messageId, chatId, receiverId } = source;
+      if (!messageId || !chatId) return;
+      await advanceLocalStatus(chatId, messageId, 'delivered', {
+        _appendDelivered: receiverId ? { userId: receiverId, deliveredAt: new Date().toISOString() } : undefined,
+        forceMerge: !!receiverId,
+      });
+    };
+
+    // 1-1: peer bulk-read messages of mine
+    const onReadBulkAck = async (payload) => {
+      const source = payload?.data || payload || {};
+      const { messageIds, chatId, readerId } = source;
+      if (!chatId || !Array.isArray(messageIds)) return;
+      for (const mid of messageIds) {
+        await advanceLocalStatus(chatId, mid, 'read', {
+          _appendReader: readerId ? { userId: readerId, readAt: new Date().toISOString() } : undefined,
+          forceMerge: !!readerId,
+        });
+      }
+    };
+
+    // Group: a member delivered a message
+    const onGroupDeliveredReceipt = async (payload) => {
+      const source = payload?.data || payload || {};
+      const { groupId, messageId, deliveredTo } = source;
+      if (!groupId || !messageId) return;
+      await advanceLocalStatus(String(groupId), messageId, 'delivered', {
+        _appendDelivered: deliveredTo ? { userId: deliveredTo, deliveredAt: new Date().toISOString() } : undefined,
+        forceMerge: !!deliveredTo,
+      });
+    };
+
+    // Group: a member read a message
+    const onGroupRead = async (payload) => {
+      const source = payload?.data || payload || {};
+      const { groupId, messageId, readBy, readAt } = source;
+      if (!groupId || !messageId) return;
+      await advanceLocalStatus(String(groupId), messageId, 'read', {
+        _appendReader: readBy ? { userId: readBy, readAt: readAt || new Date().toISOString() } : undefined,
+        forceMerge: !!readBy,
+      });
+    };
+
     // Handle message:read:all:response — mark all messages as read in local storage
     const onReadAllResponse = async (payload) => {
       const source = payload?.data || payload || {};
@@ -488,6 +611,11 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:edit:response', onEditResponse);
       socket.off('message:edited', onEditResponse);
       socket.off('chat:list:update', onChatListUpdateForEdit);
+      socket.off('message:read', onMessageRead);
+      socket.off('message:delivered', onMessageDelivered);
+      socket.off('message:read:bulk:ack', onReadBulkAck);
+      socket.off('group:message:delivered:receipt', onGroupDeliveredReceipt);
+      socket.off('group:message:read', onGroupRead);
 
       socket.on('message:new', handleNewMessage);
       socket.on('message:delete:everyone:response', onDeleteEveryoneResponse);
@@ -502,6 +630,11 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.on('message:edit:response', onEditResponse);
       socket.on('message:edited', onEditResponse);
       socket.on('chat:list:update', onChatListUpdateForEdit);
+      socket.on('message:read', onMessageRead);
+      socket.on('message:delivered', onMessageDelivered);
+      socket.on('message:read:bulk:ack', onReadBulkAck);
+      socket.on('group:message:delivered:receipt', onGroupDeliveredReceipt);
+      socket.on('group:message:read', onGroupRead);
     };
 
     const detachMessageListeners = () => {
@@ -519,6 +652,11 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:edit:response', onEditResponse);
       socket.off('message:edited', onEditResponse);
       socket.off('chat:list:update', onChatListUpdateForEdit);
+      socket.off('message:read', onMessageRead);
+      socket.off('message:delivered', onMessageDelivered);
+      socket.off('message:read:bulk:ack', onReadBulkAck);
+      socket.off('group:message:delivered:receipt', onGroupDeliveredReceipt);
+      socket.off('group:message:read', onGroupRead);
     };
 
     const onSocketConnect = () => attachMessageListeners();

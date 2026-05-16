@@ -10,31 +10,28 @@ import {
   StatusBar,
   Platform,
   Linking,
-  Modal,
   ScrollView,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useRealtimeChat } from "../../contexts/RealtimeChatContext";
 import { profileServices } from "../../Redux/Services/Profile/Profile.Services";
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import ContactDatabase from "../../services/ContactDatabase";
+import useSaveContact from "../../hooks/useSaveContact";
+import { findInDeviceContacts } from "../../services/SaveContactService";
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 const { width } = Dimensions.get('window');
 const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
 const TOP_BAR_HEIGHT = 56 + STATUS_BAR_HEIGHT;
 const AVATAR_SIZE = 120;
-
-const MUTE_OPTIONS = [
-  { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
-  { key: '1w', label: '1 week', icon: 'calendar-week', duration: 7 * 24 * 60 * 60 * 1000 },
-  { key: 'always', label: 'Always', icon: 'bell-off-outline', duration: 0 },
-];
+const HERO_HEIGHT = Math.min(width, 420);
 
 export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
   const { theme, isDarkMode } = useTheme();
   const [peerProfile, setPeerProfile] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [muteSheetVisible, setMuteSheetVisible] = useState(false);
   const [scrolledPastHeader, setScrolledPastHeader] = useState(false);
 
   // Safe access to realtime context
@@ -59,6 +56,11 @@ export default function UserB({ navigation, route }) {
   const chatItem = (chatList || []).find(c => (c?.chatId || c?._id) === chatId) || routeItem || {};
   const isMuted = chatItem?.isMuted || false;
 
+  // Local device-saved contact (from SQLite). When present, its name/phone wins.
+  const [localContact, setLocalContact] = useState(null);
+  const [isInDeviceBook, setIsInDeviceBook] = useState(false);
+  const [reloadVersion, setReloadVersion] = useState(0);
+
   // Fetch peer profile into local state (not Redux) to avoid polluting shared profileData
   useEffect(() => {
     if (peerId) {
@@ -70,23 +72,85 @@ export default function UserB({ navigation, route }) {
         .catch(() => {})
         .finally(() => setIsLoading(false));
     }
-  }, [peerId]);
+  }, [peerId, reloadVersion]);
 
-  // Display info — use local peerProfile instead of Redux profileData
-  const displayName = peerProfile?.fullName || peer?.fullName || peer?.name || peer?.username || "User";
+  // Look up the contact in our local SQLite store
+  useEffect(() => {
+    if (!peerId) { setLocalContact(null); return; }
+    let cancelled = false;
+    ContactDatabase.getContactByUserId(String(peerId))
+      .then((row) => { if (!cancelled) setLocalContact(row || null); })
+      .catch(() => { if (!cancelled) setLocalContact(null); });
+    return () => { cancelled = true; };
+  }, [peerId, reloadVersion]);
+
+  // Defensive device-book check (covers contacts saved outside the app)
+  useEffect(() => {
+    let cancelled = false;
+    const phoneForCheck =
+      localContact?.normalizedPhone ||
+      (peerProfile?.mobile?.code && peerProfile?.mobile?.number
+        ? `${peerProfile.mobile.code}${peerProfile.mobile.number}`
+        : null);
+    if (!phoneForCheck) { setIsInDeviceBook(Boolean(localContact?.originalId)); return; }
+    findInDeviceContacts(phoneForCheck)
+      .then((match) => { if (!cancelled) setIsInDeviceBook(Boolean(match) || Boolean(localContact?.originalId)); })
+      .catch(() => { if (!cancelled) setIsInDeviceBook(Boolean(localContact?.originalId)); });
+    return () => { cancelled = true; };
+  }, [peerProfile?.mobile?.code, peerProfile?.mobile?.number, localContact?.originalId, localContact?.normalizedPhone]);
+
+  // Display info — LOCAL contact (device-saved) takes priority over server
+  const displayName =
+    localContact?.fullName ||
+    peerProfile?.fullName ||
+    peer?.fullName ||
+    peer?.name ||
+    peer?.username ||
+    "User";
   const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
   const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
   const about = peerProfile?.about || peer?.about || '';
-  const phoneNumber = peerProfile?.mobile?.number || peer?.mobile?.number || '';
-  const countryCode = peerProfile?.mobile?.countryCode || peer?.mobile?.countryCode || '';
-  const displayPhone = countryCode ? `${countryCode} ${phoneNumber}` : phoneNumber;
+  // Phone: prefer device-saved number, then server's mobile
+  const serverNumber = peerProfile?.mobile?.number || peer?.mobile?.number || '';
+  const serverCode = peerProfile?.mobile?.code || peerProfile?.mobile?.countryCode || peer?.mobile?.code || peer?.mobile?.countryCode || '';
+  const phoneNumber = localContact?.mobile?.number || localContact?.normalizedPhone || serverNumber;
+  const countryCode = localContact?.mobile?.code || (localContact?.normalizedPhone ? '' : serverCode);
+  const displayPhone = localContact?.normalizedPhone
+    ? localContact.normalizedPhone
+    : (countryCode ? `${countryCode} ${phoneNumber}` : phoneNumber);
 
-  // Image source
+  // Image source — local profile image wins
   const peerProfileImage = peerProfile?.profileImage;
   const peerImage = peer?.profileImage || peer?.profilePicture || peer?.profilePictureUri;
-  const imageSource = peerProfileImage
-    ? (typeof peerProfileImage === 'string' ? { uri: peerProfileImage } : peerProfileImage)
-    : (peerImage ? { uri: peerImage } : null);
+  const localImage = localContact?.profileImage;
+  const imageSource = localImage
+    ? { uri: localImage }
+    : (peerProfileImage
+        ? (typeof peerProfileImage === 'string' ? { uri: peerProfileImage } : peerProfileImage)
+        : (peerImage ? { uri: peerImage } : null));
+
+  // Save Contact flow — only show button when not already in device
+  const peerForSave = {
+    _id: peerId,
+    fullName: peerProfile?.fullName || peer?.fullName || peer?.name || displayName,
+    mobileNumber: serverNumber || phoneNumber,
+    mobile: { code: serverCode || '', number: serverNumber || phoneNumber },
+    profileImage: peerProfileImage || peerImage || '',
+  };
+  const {
+    isSaving: isSavingContact,
+    saveError: saveContactError,
+    savedSuccessfully: contactJustSaved,
+    saveContact,
+  } = useSaveContact(peerForSave);
+
+  // After save succeeds, re-pull local contact + profile so UI reflects new state
+  useEffect(() => {
+    if (contactJustSaved) {
+      const t = setTimeout(() => setReloadVersion((v) => v + 1), 600);
+      return () => clearTimeout(t);
+    }
+  }, [contactJustSaved]);
 
   const pastelColors = ["#6C5CE7", "#00B894", "#E17055", "#0984E3", "#D63031", "#E84393", "#00CEC9"];
   function getUserColor(str) {
@@ -108,18 +172,16 @@ export default function UserB({ navigation, route }) {
     });
   }, [navigation, routeItem, peer, chatId]);
 
+  // Single-tap mute toggle — no duration prompt.
+  // Mutes "Always" by default; tap again to unmute.
   const handleMutePress = useCallback(() => {
+    if (!chatId) return;
     if (isMuted) {
-      if (chatId) unmuteChat(chatId);
+      unmuteChat(chatId);
     } else {
-      setMuteSheetVisible(true);
+      muteChat(chatId, 0); // 0 = Always
     }
-  }, [isMuted, chatId, unmuteChat]);
-
-  const onSelectMuteDuration = useCallback((duration) => {
-    if (chatId) muteChat(chatId, duration);
-    setMuteSheetVisible(false);
-  }, [chatId, muteChat]);
+  }, [isMuted, chatId, muteChat, unmuteChat]);
 
   const handleCall = useCallback(() => {
     const fullPhone = countryCode ? `${countryCode}${phoneNumber}` : phoneNumber;
@@ -128,7 +190,7 @@ export default function UserB({ navigation, route }) {
 
   const onScroll = useCallback((e) => {
     const y = e.nativeEvent.contentOffset.y;
-    setScrolledPastHeader(y > 140);
+    setScrolledPastHeader(y > HERO_HEIGHT - 110);
   }, []);
 
   if (isLoading) {
@@ -139,322 +201,444 @@ export default function UserB({ navigation, route }) {
     );
   }
 
-  const cardBg = isDarkMode ? '#0e1621' : theme.colors.cardBackground || '#fff';
-  const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
-  const iconBtnBg = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)';
+  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+  const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
+  const borderClr = isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+  const primaryText = theme.colors.primaryTextColor;
+  const subText = theme.colors.placeHolderTextColor;
+  const themeColor = theme.colors.themeColor || '#1DA1F2';
+  const isOnline = Boolean(peerProfile?.isOnline || peer?.isOnline);
 
   return (
-    <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
-      <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? "light-content" : "dark-content"} />
+    <View style={[styles.container, { backgroundColor: pageBg }]}>
+      <StatusBar translucent backgroundColor="transparent" barStyle={scrolledPastHeader && !isDarkMode ? "dark-content" : "light-content"} />
 
-      {/* Fixed Top Bar */}
-      <View style={[styles.topBar, { backgroundColor: scrolledPastHeader ? cardBg : 'transparent', borderBottomColor: scrolledPastHeader ? borderClr : 'transparent', borderBottomWidth: scrolledPastHeader ? 0.5 : 0 }]}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.topBarBtn} activeOpacity={0.7}>
-          <Ionicons name="arrow-back" size={24} color={theme.colors.primaryTextColor} />
-        </TouchableOpacity>
+      {/* Floating top bar — SafeAreaView auto-applies the correct top inset */}
+      <SafeAreaView
+        edges={['top']}
+        style={[
+          styles.topBarSafe,
+          {
+            backgroundColor: scrolledPastHeader ? cardBg : 'transparent',
+            borderBottomColor: scrolledPastHeader ? borderClr : 'transparent',
+            borderBottomWidth: scrolledPastHeader ? StyleSheet.hairlineWidth : 0,
+          },
+        ]}
+      >
+        <View style={styles.topBarRow}>
+          <TouchableOpacity
+            onPress={() => navigation.goBack()}
+            style={[styles.topBarBtn, !scrolledPastHeader && styles.topBarBtnFloating]}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="arrow-back" size={22} color={scrolledPastHeader ? primaryText : '#fff'} />
+          </TouchableOpacity>
 
-        {/* Collapsed title - visible when scrolled */}
-        {scrolledPastHeader && (
-          <View style={styles.collapsedInfo}>
-            <Text style={[styles.collapsedName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
-              {displayName}
-            </Text>
-            <Text style={[styles.collapsedSub, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
-              {/* {lastSeen ? `last seen ${lastSeen}` : 'last seen recently'} */}
-            </Text>
-          </View>
-        )}
+          {scrolledPastHeader && (
+            <View style={styles.collapsedInfo}>
+              <Text style={[styles.collapsedName, { color: primaryText }]} numberOfLines={1}>
+                {displayName}
+              </Text>
+              <Text style={[styles.collapsedSub, { color: subText }]} numberOfLines={1}>
+                {isOnline ? 'online' : (lastSeen ? `last seen ${lastSeen}` : '')}
+              </Text>
+            </View>
+          )}
 
-        <TouchableOpacity style={styles.topBarBtn} activeOpacity={0.7}>
-          <MaterialCommunityIcons name="dots-vertical" size={24} color={theme.colors.primaryTextColor} />
-        </TouchableOpacity>
-      </View>
+          <TouchableOpacity
+            style={[styles.topBarBtn, !scrolledPastHeader && styles.topBarBtnFloating]}
+            activeOpacity={0.7}
+          >
+            <MaterialCommunityIcons name="dots-vertical" size={22} color={scrolledPastHeader ? primaryText : '#fff'} />
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
 
-      {/* Scrollable Content */}
       <ScrollView
         onScroll={onScroll}
         scrollEventThrottle={16}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: 40 }}
+        contentContainerStyle={{ paddingBottom: 32 }}
       >
-        {/* Profile Header */}
-        <View style={[styles.profileHeader, { backgroundColor: cardBg, borderBottomColor: borderClr }]}>
-          {/* Avatar */}
-          <View style={styles.avatarWrap}>
-            {imageSource ? (
-              <Image source={imageSource} style={styles.avatarImg} resizeMode="cover" />
-            ) : (
-              <View style={[styles.avatarImg, { backgroundColor: avatarBgColor, justifyContent: 'center', alignItems: 'center' }]}>
-                <Text style={styles.avatarInitial}>{initial}</Text>
-              </View>
-            )}
-          </View>
+        {/* ─── Telegram-style Hero ─── */}
+        <View style={[styles.hero, { backgroundColor: imageSource ? '#000' : avatarBgColor }]}>
+          {imageSource ? (
+            <Image source={imageSource} style={styles.heroImage} resizeMode="cover" />
+          ) : (
+            <View style={styles.heroFallback}>
+              <Text style={styles.heroInitial}>{initial}</Text>
+            </View>
+          )}
 
-          {/* Name */}
-          <Text style={[styles.profileName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
-            {displayName}
-          </Text>
-          <Text style={[styles.profileSub, { color: theme.colors.placeHolderTextColor }]}>
-            {/* {lastSeen ? `last seen ${lastSeen}` : 'last seen recently'} */}
-          </Text>
+          {/* Smooth dark gradient at bottom of hero — many thin bands fake a gradient */}
+          <HeroGradient />
 
-          {/* Action Buttons Row */}
-          <View style={styles.actionsRow}>
-            {/* Message */}
-            <TouchableOpacity style={styles.actionBtn} onPress={handleMessage} activeOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: iconBtnBg }]}>
-                <Ionicons name="chatbubble" size={20} color={theme.colors.themeColor} />
-              </View>
-              <Text style={[styles.actionLabel, { color: theme.colors.primaryTextColor }]}>Message</Text>
-            </TouchableOpacity>
-
-            {/* Mute */}
-            <TouchableOpacity style={styles.actionBtn} onPress={handleMutePress} activeOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: iconBtnBg }]}>
-                <Ionicons
-                  name={isMuted ? "volume-mute" : "notifications"}
-                  size={20}
-                  color={isMuted ? '#F0A030' : theme.colors.themeColor}
-                />
-              </View>
-              <Text style={[styles.actionLabel, { color: isMuted ? '#F0A030' : theme.colors.primaryTextColor }]}>
-                {isMuted ? 'Unmute' : 'Mute'}
-              </Text>
-            </TouchableOpacity>
-
-            {/* Call */}
-            <TouchableOpacity style={styles.actionBtn} onPress={handleCall} activeOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: iconBtnBg }]}>
-                <Ionicons name="call" size={20} color={theme.colors.themeColor} />
-              </View>
-              <Text style={[styles.actionLabel, { color: theme.colors.primaryTextColor }]}>Call</Text>
-            </TouchableOpacity>
-
-            {/* Video */}
-            <TouchableOpacity style={styles.actionBtn} onPress={() => {}} activeOpacity={0.7}>
-              <View style={[styles.actionIconWrap, { backgroundColor: iconBtnBg }]}>
-                <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
-              </View>
-              <Text style={[styles.actionLabel, { color: theme.colors.primaryTextColor }]}>Video</Text>
-            </TouchableOpacity>
+          {/* Name + status overlay */}
+          <View style={styles.heroOverlay} pointerEvents="none">
+            <View style={styles.heroNameRow}>
+              <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
+              {isOnline && <View style={styles.heroOnlineDot} />}
+            </View>
+            <Text style={styles.heroStatus} numberOfLines={1}>
+              {isOnline ? 'online' : (lastSeen ? `last seen ${lastSeen}` : 'tap for info')}
+            </Text>
           </View>
         </View>
 
-        {/* Phone Section */}
-        <View style={[styles.infoSection, { borderBottomColor: borderClr }]}>
-          <View style={styles.infoRow}>
-            <Text style={[styles.infoTitle, { color: theme.colors.primaryTextColor }]}>
-              {displayPhone || 'Unknown'}
-            </Text>
-            <Text style={[styles.infoSub, { color: theme.colors.placeHolderTextColor }]}>Mobile</Text>
-          </View>
+        {/* ─── Action Pills Row ─── */}
+        <View style={[styles.actionsCard, { backgroundColor: cardBg }]}>
+          <ActionPill icon="chatbubble" label="Message" color={themeColor} onPress={handleMessage} textColor={primaryText} />
+          <ActionPill
+            icon={isMuted ? 'volume-mute' : 'notifications-outline'}
+            label={isMuted ? 'Unmute' : 'Mute'}
+            color={isMuted ? '#F0A030' : themeColor}
+            onPress={handleMutePress}
+            textColor={primaryText}
+          />
+          <ActionPill icon="call" label="Call" color={themeColor} onPress={handleCall} textColor={primaryText} />
+          <ActionPill icon="videocam" label="Video" color={themeColor} onPress={() => {}} textColor={primaryText} />
+        </View>
 
-          <TouchableOpacity
-            style={[styles.addContactRow, { borderTopColor: borderClr }]}
-            activeOpacity={0.6}
+        {/* ─── Info / Bio Card ─── */}
+        <Text style={[styles.sectionLabel, { color: subText }]}>INFO</Text>
+        <View style={[styles.card, { backgroundColor: cardBg }]}>
+          {/* Phone row */}
+          <InfoRow
+            icon="call-outline"
+            iconColor={themeColor}
+            value={displayPhone || 'Unknown'}
+            label="mobile"
+            primary={primaryText}
+            sub={subText}
             onPress={() => {
               const fullPhone = countryCode ? `${countryCode}${phoneNumber}` : phoneNumber;
               if (fullPhone) Linking.openURL(`tel:${fullPhone}`).catch(() => {});
             }}
-          >
-            <Ionicons name="person-add-outline" size={20} color={theme.colors.themeColor} />
-            <Text style={[styles.addContactText, { color: theme.colors.themeColor }]}>Add to contacts</Text>
-          </TouchableOpacity>
+          />
+
+          {about ? (
+            <>
+              <View style={[styles.divider, { backgroundColor: borderClr }]} />
+              <InfoRow
+                icon="information-circle-outline"
+                iconColor={themeColor}
+                value={about}
+                label="bio"
+                primary={primaryText}
+                sub={subText}
+                multiline
+              />
+            </>
+          ) : null}
+
+          {(peerProfile?.email || peer?.email) ? (
+            <>
+              <View style={[styles.divider, { backgroundColor: borderClr }]} />
+              <InfoRow
+                icon="mail-outline"
+                iconColor={themeColor}
+                value={peerProfile?.email || peer?.email}
+                label="email"
+                primary={primaryText}
+                sub={subText}
+              />
+            </>
+          ) : null}
+
+          {(peer?.userName || peerProfile?.userName) ? (
+            <>
+              <View style={[styles.divider, { backgroundColor: borderClr }]} />
+              <InfoRow
+                icon="at-outline"
+                iconColor={themeColor}
+                value={`@${peer?.userName || peerProfile?.userName}`}
+                label="username"
+                primary={primaryText}
+                sub={subText}
+              />
+            </>
+          ) : null}
         </View>
 
-        {/* About Section */}
-        {about ? (
-          <View style={[styles.infoSection, { borderBottomColor: borderClr }]}>
-            <View style={styles.infoRow}>
-              <Text style={[styles.infoTitle, { color: theme.colors.primaryTextColor }]}>{about}</Text>
-              <Text style={[styles.infoSub, { color: theme.colors.placeHolderTextColor }]}>About</Text>
-            </View>
-          </View>
-        ) : null}
-
-        {/* Email Section */}
-        {(peerProfile?.email || peer?.email) ? (
-          <View style={[styles.infoSection, { borderBottomColor: borderClr }]}>
-            <View style={styles.infoRow}>
-              <Text style={[styles.infoTitle, { color: theme.colors.primaryTextColor }]}>
-                {peerProfile?.email || peer?.email}
+        {/* ─── Save Contact Card ─── */}
+        {!isInDeviceBook && !contactJustSaved && (
+          <View style={[styles.card, { backgroundColor: cardBg, marginTop: 14 }]}>
+            <TouchableOpacity
+              style={[styles.card_row, { opacity: isSavingContact ? 0.6 : 1 }]}
+              activeOpacity={0.6}
+              disabled={isSavingContact}
+              onPress={saveContact}
+            >
+              <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
+                {isSavingContact ? (
+                  <ActivityIndicator size="small" color={themeColor} />
+                ) : (
+                  <Ionicons name="person-add-outline" size={20} color={themeColor} />
+                )}
+              </View>
+              <Text style={[styles.rowAction, { color: themeColor }]}>
+                {isSavingContact ? 'Saving…' : 'Save Contact'}
               </Text>
-              <Text style={[styles.infoSub, { color: theme.colors.placeHolderTextColor }]}>Email</Text>
+            </TouchableOpacity>
+            {saveContactError && !isSavingContact && (
+              <Text style={styles.errorText}>
+                {saveContactError === 'permission_denied'
+                  ? 'Contacts permission denied. Enable it from Settings.'
+                  : saveContactError}
+              </Text>
+            )}
+          </View>
+        )}
+
+        {contactJustSaved && (
+          <View style={[styles.card, { backgroundColor: cardBg, marginTop: 14 }]}>
+            <View style={styles.card_row}>
+              <View style={[styles.rowIconWrap, { backgroundColor: '#22C55E18' }]}>
+                <Ionicons name="checkmark-circle" size={20} color="#22C55E" />
+              </View>
+              <Text style={[styles.rowAction, { color: '#22C55E' }]}>Contact saved</Text>
             </View>
           </View>
-        ) : null}
+        )}
       </ScrollView>
-
-      {/* Mute Duration Modal */}
-      <Modal animationType="fade" transparent visible={muteSheetVisible} onRequestClose={() => setMuteSheetVisible(false)}>
-        <TouchableOpacity activeOpacity={1} onPress={() => setMuteSheetVisible(false)} style={styles.muteOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.muteCard, { backgroundColor: isDarkMode ? '#1a2b3c' : '#fff' }]}>
-            <View style={[styles.muteIconWrapModal, { backgroundColor: '#F0A03015' }]}>
-              <Ionicons name="volume-mute" size={28} color="#F0A030" />
-            </View>
-            <Text style={[styles.muteTitle, { color: theme.colors.primaryTextColor }]}>
-              Mute notifications
-            </Text>
-            <Text style={[styles.muteSubtitle, { color: theme.colors.placeHolderTextColor }]}>
-              Choose how long to mute this chat
-            </Text>
-            <View style={styles.muteOptionsWrap}>
-              {MUTE_OPTIONS.map((option) => (
-                <TouchableOpacity
-                  key={option.key}
-                  onPress={() => onSelectMuteDuration(option.duration)}
-                  activeOpacity={0.7}
-                  style={[styles.muteOptionBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.03)' }]}
-                >
-                  <MaterialCommunityIcons name={option.icon} size={18} color={theme.colors.themeColor} />
-                  <Text style={[styles.muteOptionText, { color: theme.colors.primaryTextColor }]}>{option.label}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-            <TouchableOpacity onPress={() => setMuteSheetVisible(false)} activeOpacity={0.6} style={styles.muteCancelBtn}>
-              <Text style={[styles.muteCancelText, { color: theme.colors.placeHolderTextColor }]}>Cancel</Text>
-            </TouchableOpacity>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </Modal>
     </View>
   );
 }
 
+// ─────────────────────────────────────────────
+// Reusable bits
+// ─────────────────────────────────────────────
+
+// Smooth bottom gradient (faked via 14 thin stacked bands, ~14px each).
+// Each band has a slightly higher alpha than the previous → no hard edges,
+// no "double shade" effect from stacking just 2 overlays.
+const GRADIENT_BANDS = 14;
+const GRADIENT_HEIGHT = 220; // total fade height in px
+function HeroGradient() {
+  const bandHeight = GRADIENT_HEIGHT / GRADIENT_BANDS;
+  return (
+    <View pointerEvents="none" style={styles.gradientWrap}>
+      {Array.from({ length: GRADIENT_BANDS }).map((_, i) => {
+        // Quadratic easing → softer top, deeper bottom
+        const t = (i + 1) / GRADIENT_BANDS;
+        const alpha = Math.min(0.62, t * t * 0.7);
+        return (
+          <View
+            key={i}
+            style={{
+              height: bandHeight,
+              backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})`,
+            }}
+          />
+        );
+      })}
+    </View>
+  );
+}
+
+function ActionPill({ icon, label, color, onPress, textColor }) {
+  return (
+    <TouchableOpacity style={styles.actionPill} onPress={onPress} activeOpacity={0.7}>
+      <View style={[styles.actionPillIcon, { backgroundColor: color + '15' }]}>
+        <Ionicons name={icon} size={22} color={color} />
+      </View>
+      <Text style={[styles.actionPillLabel, { color: textColor }]} numberOfLines={1}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function InfoRow({ icon, iconColor, value, label, primary, sub, onPress, multiline }) {
+  const Wrapper = onPress ? TouchableOpacity : View;
+  return (
+    <Wrapper style={styles.card_row} onPress={onPress} activeOpacity={0.6}>
+      <View style={[styles.rowIconWrap, { backgroundColor: iconColor + '15' }]}>
+        <Ionicons name={icon} size={18} color={iconColor} />
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text
+          style={[styles.rowValue, { color: primary }]}
+          numberOfLines={multiline ? 0 : 1}
+          selectable
+        >
+          {value}
+        </Text>
+        <Text style={[styles.rowLabel, { color: sub }]}>{label}</Text>
+      </View>
+    </Wrapper>
+  );
+}
+
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  // Top Bar
-  topBar: {
+  container: { flex: 1 },
+  loadingContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+
+  // ── Top bar (transparent over hero, solid when scrolled) ──
+  topBarSafe: {
     position: 'absolute',
     top: 0,
     left: 0,
     right: 0,
     zIndex: 100,
+  },
+  topBarRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 4,
-    // paddingTop: STATUS_BAR_HEIGHT,
-    // height: TOP_BAR_HEIGHT,
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 6,
   },
   topBarBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  collapsedInfo: {
-    flex: 1,
-    marginHorizontal: 4,
-    justifyContent: 'center',
+  topBarBtnFloating: {
+    backgroundColor: 'rgba(0,0,0,0.32)',
   },
-  collapsedName: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 16,
-    lineHeight: 20,
-  },
-  collapsedSub: {
-    fontFamily: 'Roboto-Regular',
-    fontSize: 11,
-    lineHeight: 14,
-  },
-  // Profile Header
-  profileHeader: {
-    alignItems: 'center',
-    paddingTop: TOP_BAR_HEIGHT + 0,
-    paddingBottom: 20,
-    borderBottomWidth: 0.5,
-  },
-  avatarWrap: {
-    width: AVATAR_SIZE,
-    height: AVATAR_SIZE,
-    borderRadius: AVATAR_SIZE / 2,
-    overflow: 'hidden',
-    marginBottom: 14,
-  },
-  avatarImg: {
+  collapsedInfo: { flex: 1, paddingHorizontal: 8, justifyContent: 'center' },
+  collapsedName: { fontFamily: 'Roboto-SemiBold', fontSize: 16, lineHeight: 20 },
+  collapsedSub: { fontFamily: 'Roboto-Regular', fontSize: 11, lineHeight: 14, marginTop: 1 },
+
+  // ── Hero ──
+  hero: {
     width: '100%',
-    height: '100%',
-    borderRadius: AVATAR_SIZE / 2,
+    height: HERO_HEIGHT,
+    position: 'relative',
+    overflow: 'hidden',
   },
-  avatarInitial: {
+  heroImage: { width: '100%', height: '100%' },
+  heroFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  heroInitial: {
     color: '#fff',
+    fontSize: 110,
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 46,
-    textTransform: 'uppercase',
     includeFontPadding: false,
   },
-  profileName: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 22,
-    textAlign: 'center',
-    paddingHorizontal: 20,
+  // Wrapper for the smooth gradient (bands rendered by <HeroGradient />)
+  gradientWrap: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'flex-end',
   },
-  profileSub: {
+  heroOverlay: {
+    position: 'absolute',
+    left: 20,
+    right: 20,
+    bottom: 18,
+  },
+  heroNameRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  heroName: {
+    color: '#fff',
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 26,
+    flexShrink: 1,
+    textShadowColor: 'rgba(0,0,0,0.4)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  heroOnlineDot: {
+    width: 11,
+    height: 11,
+    borderRadius: 6,
+    backgroundColor: '#25D366',
+    borderWidth: 2,
+    borderColor: 'rgba(255,255,255,0.85)',
+  },
+  heroStatus: {
+    color: 'rgba(255,255,255,0.88)',
     fontFamily: 'Roboto-Regular',
     fontSize: 13,
-    textAlign: 'center',
-    marginTop: 2,
-    marginBottom: 18,
+    marginTop: 4,
+    textShadowColor: 'rgba(0,0,0,0.4)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
   },
-  // Actions
-  actionsRow: {
+
+  // ── Action pills (right under hero) ──
+  actionsCard: {
     flexDirection: 'row',
-    justifyContent: 'space-evenly',
-    width: '100%',
-    paddingHorizontal: 10,
+    justifyContent: 'space-around',
+    paddingVertical: 14,
+    paddingHorizontal: 6,
+    marginTop: 0,
   },
-  actionBtn: {
+  actionPill: {
     alignItems: 'center',
-    width: 72,
+    flex: 1,
+    paddingVertical: 4,
   },
-  actionIconWrap: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+  actionPillIcon: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: 6,
   },
-  actionLabel: {
+  actionPillLabel: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 11.5,
+  },
+
+  // ── Section label (small, above each card) ──
+  sectionLabel: {
     fontFamily: 'Roboto-Medium',
     fontSize: 11,
+    letterSpacing: 0.8,
+    marginTop: 14,
+    marginBottom: 6,
+    paddingHorizontal: 24,
   },
-  // Info Sections
-  infoSection: {
-    paddingHorizontal: 20,
-    borderBottomWidth: 0.5,
+
+  // ── Card (rounded container with rows) ──
+  card: {
+    marginHorizontal: 12,
+    borderRadius: 14,
+    paddingHorizontal: 4,
+    overflow: 'hidden',
   },
-  infoRow: {
-    paddingVertical: 14,
+  card_row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    gap: 14,
   },
-  infoTitle: {
-    fontFamily: 'Roboto-Regular',
+  rowIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rowValue: {
+    fontFamily: 'Roboto-Medium',
     fontSize: 15,
   },
-  infoSub: {
+  rowLabel: {
     fontFamily: 'Roboto-Regular',
     fontSize: 12,
     marginTop: 2,
   },
-  addContactRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 14,
-    gap: 12,
-    borderTopWidth: 0.5,
-  },
-  addContactText: {
-    fontFamily: 'Roboto-Medium',
+  rowAction: {
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 14,
+    flex: 1,
+  },
+  divider: {
+    height: StyleSheet.hairlineWidth,
+    marginLeft: 64,
+  },
+  errorText: {
+    color: '#FF3B30',
+    fontSize: 12,
+    paddingHorizontal: 18,
+    paddingBottom: 10,
   },
   // Mute Modal
   muteOverlay: {

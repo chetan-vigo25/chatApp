@@ -59,22 +59,19 @@ const ReactionDetailSheet = React.memo(({
 }) => {
   const [selectedEmoji, setSelectedEmoji] = useState(initialEmoji || 'all');
   const [serverReactors, setServerReactors] = useState(null);
-  const [loading, setLoading] = useState(false);
 
-  // Reset tab when modal opens
+  // Reset tab when modal opens — render local reactions instantly, refine
+  // with server data in the background (no spinner blocking the list).
   useEffect(() => {
     if (visible) {
       setSelectedEmoji(initialEmoji || 'all');
       setServerReactors(null);
-      // Try to fetch detailed reactor info from server
       if (fetchReactionList && messageId) {
-        setLoading(true);
         fetchReactionList(messageId)
           .then((res) => {
-            if (res?.reactions) setServerReactors(res.reactions);
+            if (Array.isArray(res?.reactions)) setServerReactors(res.reactions);
           })
-          .catch(() => {}) // fallback to local data
-          .finally(() => setLoading(false));
+          .catch(() => {});
       }
     }
   }, [visible, messageId]);
@@ -216,21 +213,19 @@ const ReactionDetailSheet = React.memo(({
             })}
           </ScrollView>
 
-          {/* Reactor list */}
-          {loading ? (
-            <View style={styles.loadingWrap}>
-              <ActivityIndicator size="small" color={themeColor || '#03b0a2'} />
-            </View>
-          ) : (
-            <FlatList
-              data={reactorList}
-              renderItem={renderReactor}
-              keyExtractor={keyExtractor}
-              style={styles.list}
-              contentContainerStyle={styles.listContent}
-              showsVerticalScrollIndicator={false}
-            />
-          )}
+          {/* Reactor list — render from local data immediately, server data refines it */}
+          <FlatList
+            data={reactorList}
+            renderItem={renderReactor}
+            keyExtractor={keyExtractor}
+            style={styles.list}
+            contentContainerStyle={styles.listContent}
+            showsVerticalScrollIndicator={false}
+            initialNumToRender={12}
+            maxToRenderPerBatch={12}
+            windowSize={5}
+            removeClippedSubviews
+          />
         </TouchableOpacity>
       </TouchableOpacity>
     </Modal>

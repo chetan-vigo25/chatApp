@@ -28,7 +28,7 @@ import ChatDatabase from '../../services/ChatDatabase';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -70,6 +70,19 @@ export default function ChatList({ navigation }) {
   const [profilePreviewVisible, setProfilePreviewVisible] = useState(false);
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
+  const [currentUserId, setCurrentUserId] = useState(null);
+
+  // Load current user id once — used to gate tick rendering to outgoing last-messages only
+  useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem('userInfo');
+        const u = raw ? JSON.parse(raw) : null;
+        const id = u?._id || u?.id || null;
+        if (id) setCurrentUserId(String(id));
+      } catch {}
+    })();
+  }, []);
 
   // Preload messages into cache before navigating — makes chat screen open instantly
   const openChat = useCallback(async (item) => {
@@ -115,6 +128,7 @@ export default function ChatList({ navigation }) {
     archiveChat,
     unarchiveChat,
     applyChatClearedPreview,
+    removeChat,
   } = useRealtimeChat();
 
   const effectiveChatList = Array.isArray(realtimeChatList)
@@ -184,6 +198,41 @@ export default function ChatList({ navigation }) {
     }, [dispatch, realtimeChatList])
   );
 
+  // When a brand-new chat appears (someone messages us for the first time),
+  // refetch the chat list from the server so the new peer is fully hydrated
+  // (name / number / avatar) instead of showing "Unknown".
+  const knownChatIdsRef = useRef(new Set());
+  const newChatRefetchTimerRef = useRef(null);
+  useEffect(() => {
+    if (!Array.isArray(realtimeChatList) || realtimeChatList.length === 0) return;
+
+    const currentIds = realtimeChatList
+      .map((c) => String(c?.chatId || c?._id || ''))
+      .filter(Boolean);
+
+    // First population — seed the known set, don't refetch
+    if (knownChatIdsRef.current.size === 0) {
+      currentIds.forEach((id) => knownChatIdsRef.current.add(id));
+      return;
+    }
+
+    const newIds = currentIds.filter((id) => !knownChatIdsRef.current.has(id));
+    if (newIds.length === 0) return;
+
+    newIds.forEach((id) => knownChatIdsRef.current.add(id));
+
+    // Debounce: bursts of incoming events should trigger a single refetch
+    if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
+    newChatRefetchTimerRef.current = setTimeout(() => {
+      dispatch(chatListData(''));
+      newChatRefetchTimerRef.current = null;
+    }, 400);
+  }, [realtimeChatList, dispatch]);
+
+  useEffect(() => () => {
+    if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
+  }, []);
+
   // Pull-to-refresh: the ONLY time API is called after initial sync
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -229,27 +278,35 @@ export default function ChatList({ navigation }) {
     item?.lastMessageStatus || item?.lastMessage?.status || item?.status || null
   );
 
+  // Last message is "mine" only when current user sent it. Receiver side: hide ticks.
+  const isLastMessageMine = (item) => {
+    if (!currentUserId) return false;
+    const senderId = item?.lastMessage?.senderId
+      || item?.lastMessageSender         // backend ships this as a sibling field
+      || item?.lastMessageSenderId
+      || item?.lastMessage?.createdBy
+      || item?.lastSenderId;
+    if (!senderId) return false;
+    return String(senderId) === currentUserId;
+  };
+
   const renderMessageStatus = (item) => {
+    // Hide ticks on chat summary when the last message is incoming (receiver side).
+    if (!isLastMessageMine(item)) return null;
     const status = (getLastMessageStatus(item) || '').toLowerCase();
     if (!status) return null;
+    const grayColor = theme.colors.placeHolderTextColor;
     if (status === 'read' || status === 'seen') {
-      return (
-        <View style={{ flexDirection: 'row', marginRight: 4 }}>
-          <FontAwesome6 name="check" size={10} color="#34B7F1" style={{ marginRight: -2 }} />
-          <FontAwesome6 name="check" size={10} color="#34B7F1" />
-        </View>
-      );
+      return <Ionicons name="checkmark-done" size={14} color="#53BDEB" style={{ marginRight: 4 }} />;
     }
     if (status === 'delivered') {
-      return (
-        <View style={{ flexDirection: 'row', marginRight: 4 }}>
-          <FontAwesome6 name="check" size={10} color={theme.colors.placeHolderTextColor} style={{ marginRight: -2 }} />
-          <FontAwesome6 name="check" size={10} color={theme.colors.placeHolderTextColor} />
-        </View>
-      );
+      return <Ionicons name="checkmark-done" size={14} color={grayColor} style={{ marginRight: 4 }} />;
     }
-    if (status === 'sent') {
-      return <FontAwesome6 name="check" size={10} color={theme.colors.placeHolderTextColor} style={{ marginRight: 4 }} />;
+    if (status === 'sent' || status === 'sending' || status === 'pending' || status === 'uploaded') {
+      return <Ionicons name="checkmark" size={14} color={grayColor} style={{ marginRight: 4 }} />;
+    }
+    if (status === 'failed') {
+      return <Ionicons name="alert-circle" size={14} color="#FF8A80" style={{ marginRight: 4 }} />;
     }
     return null;
   };
@@ -436,6 +493,9 @@ export default function ChatList({ navigation }) {
       }
       await removeMessagesByChatId(chatId);
       applyChatClearedPreview(chatId, scope);
+      // Remove the chat row from the list on the user's own side.
+      try { await ChatDatabase.deleteChatRow(chatId); } catch (e) { console.warn('deleteChatRow failed', e); }
+      removeChat?.(chatId);
       setDeleteModalVisible(false);
       setDeleteForEveryone(false);
       setSelectedChatItem(null);
@@ -445,7 +505,7 @@ export default function ChatList({ navigation }) {
     } finally {
       setIsDeletingChat(false);
     }
-  }, [selectedChatItem, isDeletingChat, deleteForEveryone, applyChatClearedPreview]);
+  }, [selectedChatItem, isDeletingChat, deleteForEveryone, applyChatClearedPreview, removeChat]);
 
   useEffect(() => {
     if (Array.isArray(chatsData)) {
@@ -498,13 +558,13 @@ export default function ChatList({ navigation }) {
       onPress: onViewInfo,
     });
 
-    // opts.push({
-    //   icon: 'delete-outline',
-    //   label: 'Delete Chat',
-    //   iconColor: '#E06A6A',
-    //   onPress: onDeleteChat,
-    //   isDanger: true,
-    // });
+    opts.push({
+      icon: 'delete-outline',
+      label: 'Delete Chat',
+      iconColor: '#E06A6A',
+      onPress: onDeleteChat,
+      isDanger: true,
+    });
 
     return opts;
   }, [selectedChatItem, onTogglePin, onPressMute, onToggleArchive, onViewInfo, onDeleteChat]);
@@ -577,9 +637,9 @@ export default function ChatList({ navigation }) {
     );
   };
 
-  const listHeader = (
-    <View style={styles.listHeaderWrap}>
-      {/* Search Bar */}
+  // Pinned (non-scrolling) section: ONLY the search bar.
+  const pinnedSearchAndFilters = (
+    <View style={[styles.pinnedHeaderWrap, { backgroundColor: theme.colors.background }]}>
       <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
         <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
         <TextInput
@@ -597,8 +657,12 @@ export default function ChatList({ navigation }) {
           </TouchableOpacity>
         )}
       </View>
+    </View>
+  );
 
-      {/* Filter Pills */}
+  // Filter pills + archived row scroll with the list.
+  const listHeader = (
+    <View style={styles.listHeaderWrap}>
       <View style={styles.filterRow}>
         {[
           { key: 'all', label: 'All' },
@@ -685,15 +749,18 @@ export default function ChatList({ navigation }) {
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
-            <Menu.Item
+            {/* <Menu.Item
               onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
               title="Linked Devices"
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="qr-code-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            />
+            /> */}
           </Menu>
         </View>
       </View>
+
+      {/* ─── PINNED: Search bar + filter pills (do NOT scroll with the list) ─── */}
+      {pinnedSearchAndFilters}
 
       {/* ─── CHAT LIST ─── */}
       <View style={styles.listWrap}>
@@ -1012,14 +1079,14 @@ export default function ChatList({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              <ImageZoom
+              {/* <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              />
+              /> */}
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>
@@ -1109,6 +1176,11 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   listHeaderWrap: {
+    paddingHorizontal: 16,
+    paddingTop: 4,
+    paddingBottom: 4,
+  },
+  pinnedHeaderWrap: {
     paddingHorizontal: 16,
     paddingTop: 4,
     paddingBottom: 4,

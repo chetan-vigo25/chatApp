@@ -14,7 +14,6 @@ import {
   Alert,
   Modal,
   Linking,
-  RefreshControl,
   StyleSheet,
   Dimensions,
   InteractionManager,
@@ -23,6 +22,7 @@ import {
 import { useTheme } from "../../contexts/ThemeContext";
 import { APP_TAG_NAME } from '@env';
 import useContactSync from "../../contexts/useContactSync";
+import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
 import { FontAwesome6, FontAwesome5, AntDesign, MaterialCommunityIcons, FontAwesome, Ionicons } from '@expo/vector-icons';
 import { useSelector } from "react-redux";
 import { useFocusEffect } from '@react-navigation/native';
@@ -242,15 +242,23 @@ export default function AddUser({ navigation }) {
       hash: discoveredData.hash
     };
 
-    const existingChat = chatsData?.find((chat) => (
-      sameId(chat?.peerUser?._id, discovered?.userId) ||
-      sameId(chat?.peerUser?._id, discovered?.id)
-    ));
+    const existingChat = chatsData?.find((chat) => {
+      if (!chat || chat.chatType === 'group' || chat.isGroup) return false;
+      const peerIds = [
+        chat?.peerUser?._id, chat?.peerUser?.userId,
+        chat?.otherUser?._id, chat?.otherUser?.userId,
+      ];
+      const candidates = [discovered?.userId, discovered?._id, discovered?.id].filter(Boolean);
+      return peerIds.some((pid) => candidates.some((c) => sameId(pid, c)));
+    });
 
     if (existingChat) {
-      navigation.navigate('ChatScreen', { item: existingChat, chatId: existingChat._id || existingChat.chatId, user: discovered, hasExistingChat: true });
+      navigation.navigate('ChatScreen', { item: existingChat });
+    } else if (discovered?._id || discovered?.userId) {
+      // Create the chat first so we don't end up with a duplicate later
+      createChatThenNavigate(discovered).catch(() => {});
     } else {
-      navigation.navigate('ChatScreen', { user: discovered, chatId: null, hasExistingChat: false });
+      navigation.navigate('ChatScreen', { user: discovered });
     }
 
     clearDiscoverResponse();
@@ -274,46 +282,169 @@ export default function AddUser({ navigation }) {
   const normalizeChatUser = useCallback((contact) => {
     if (!contact) return null;
     const resolvedId = contact._id || contact.userId || contact.id || null;
+    // Prefer the locally-saved name (device contact / SQLite) so the chat
+    // header matches what the user has in their phonebook.
+    const localName =
+      contact.fullName || contact.name || contact.displayName || contact.username || 'Unknown';
+    const image = contact.profileImage || contact.profilePicture || contact.avatar || '';
     return {
       ...contact,
       _id: resolvedId,
       id: contact.id || resolvedId,
       userId: contact.userId || resolvedId,
-      name: contact.name || contact.fullName || 'Unknown',
-      fullName: contact.fullName || contact.name || 'Unknown',
-      profilePicture: contact.profilePicture || contact.profileImage || '',
+      name: localName,
+      fullName: localName,
+      // Both keys — different consumers read different fields
+      profileImage: image,
+      profilePicture: image,
     };
   }, []);
 
+  // Guards against double-tap creating multiple chats
+  const openChatInFlightRef = useRef(false);
+
+  // Find an existing chat for a given user across every shape the chat list
+  // might use (peerUser._id, peerUser.userId, otherUser, members[]).
+  const findExistingChat = useCallback((normalizedUser) => {
+    if (!normalizedUser || !Array.isArray(chatsData)) return null;
+    const candidates = [normalizedUser._id, normalizedUser.userId, normalizedUser.id]
+      .filter(Boolean);
+    if (candidates.length === 0) return null;
+
+    return chatsData.find((chat) => {
+      if (!chat || chat.chatType === 'group' || chat.isGroup) return false;
+      const peerIds = [
+        chat?.peerUser?._id,
+        chat?.peerUser?.userId,
+        chat?.otherUser?._id,
+        chat?.otherUser?.userId,
+        chat?.user?._id,
+        chat?.user?.userId,
+      ];
+      return peerIds.some((pid) => candidates.some((c) => sameId(pid, c)));
+    }) || null;
+  }, [chatsData]);
+
+  // Open an existing chat — pass the SAME `item` shape the chat list uses,
+  // but override peerUser fields with the local (device/SQLite) name & image
+  // so the header matches what the user has saved in their phonebook.
+  const navigateToExistingChat = useCallback((existingChat, normalizedUser) => {
+    const mergedPeer = {
+      ...(existingChat?.peerUser || {}),
+      // Local fields win — these come from the device contact / SQLite row
+      ...(normalizedUser?.fullName ? { fullName: normalizedUser.fullName, name: normalizedUser.fullName } : {}),
+      ...(normalizedUser?.profileImage
+        ? { profileImage: normalizedUser.profileImage, profilePicture: normalizedUser.profileImage }
+        : {}),
+      _id: existingChat?.peerUser?._id || normalizedUser?._id || normalizedUser?.userId,
+    };
+    navigation.navigate('ChatScreen', { item: { ...existingChat, peerUser: mergedPeer } });
+  }, [navigation]);
+
+  // Create a chat on the backend, then navigate with the resulting chat object.
+  // Without this step the screen opens with chatId=null and the backend can
+  // create a second chat doc when the first message is sent → "duplicate chat".
+  const createChatThenNavigate = useCallback(async (normalizedUser) => {
+    return new Promise(async (resolve) => {
+      try {
+        if (!isSocketConnected()) {
+          await reconnectSocket(navigation);
+          await new Promise(r => setTimeout(r, 500));
+        }
+        const socket = getSocket();
+        if (!socket) {
+          // Last-resort fallback: open with user only
+          navigation.navigate('ChatScreen', { user: normalizedUser });
+          return resolve();
+        }
+
+        let settled = false;
+        const cleanup = () => {
+          socket.off('chat:create:response', onResponse);
+          clearTimeout(timer);
+        };
+        const onResponse = (response) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const chatPayload = response?.data;
+          if (response?.status && chatPayload) {
+            // Merge server peerUser with the local contact name/image so the
+            // header reflects the user's saved phonebook entry, not the
+            // sign-up name from the server.
+            const serverPeer = chatPayload.peerUser || {};
+            const mergedPeer = {
+              ...serverPeer,
+              fullName: normalizedUser?.fullName || serverPeer.fullName || 'Unknown',
+              name: normalizedUser?.fullName || serverPeer.fullName || 'Unknown',
+              profileImage: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
+              profilePicture: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
+              _id: serverPeer._id || normalizedUser?._id || normalizedUser?.userId,
+            };
+            navigation.navigate('ChatScreen', {
+              item: { ...chatPayload, peerUser: mergedPeer },
+            });
+          } else {
+            navigation.navigate('ChatScreen', { user: normalizedUser });
+          }
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          // Timeout — open chat with user-only payload as fallback
+          navigation.navigate('ChatScreen', { user: normalizedUser });
+          resolve();
+        }, 8000);
+
+        socket.on('chat:create:response', onResponse);
+        socket.emit('chat:create', { userId: normalizedUser._id || normalizedUser.userId });
+      } catch (err) {
+        console.warn('[AddUser] createChat error:', err?.message);
+        navigation.navigate('ChatScreen', { user: normalizedUser });
+        resolve();
+      }
+    });
+  }, [navigation]);
+
   const handleContactPress = useCallback(async (contact) => {
     if (!contact) return;
+    if (openChatInFlightRef.current) return; // prevent double-tap duplicates
+    openChatInFlightRef.current = true;
 
-    const normalizedUser = normalizeChatUser(contact);
+    try {
+      const normalizedUser = normalizeChatUser(contact);
 
-    const existingChat = chatsData?.find((chat) => (
-      sameId(chat?.peerUser?._id, normalizedUser?.userId) ||
-      sameId(chat?.peerUser?._id, normalizedUser?.id)
-    ));
+      // 1. Already have a chat? → open it (same nav pattern as ChatList → no duplicate screen)
+      const existingChat = findExistingChat(normalizedUser);
+      if (existingChat) {
+        navigateToExistingChat(existingChat, normalizedUser);
+        return;
+      }
 
-    if (existingChat) {
-      navigation.navigate('ChatScreen', { item: existingChat, chatId: existingChat._id || existingChat.chatId, user: normalizedUser, hasExistingChat: true });
-      return;
+      const isRegistered = normalizedUser?.type === 'registered' || !!normalizedUser?.userId;
+
+      // 2. Registered user, no existing chat → create chat first, then navigate
+      if (isRegistered && (normalizedUser?._id || normalizedUser?.userId)) {
+        await createChatThenNavigate(normalizedUser);
+        return;
+      }
+
+      // 3. Unregistered (only hash known) → discover then handle in discoverResponse effect
+      if (normalizedUser?.hash && discoverContact) {
+        try { await discoverContact(normalizedUser.hash); }
+        catch (err) { showMessage(err?.message || 'Failed to discover contact.'); }
+        return;
+      }
+
+      // 4. Last resort
+      navigation.navigate('ChatScreen', { user: normalizedUser });
+    } finally {
+      // Allow next press shortly after — covers fast-back-and-tap-again
+      setTimeout(() => { openChatInFlightRef.current = false; }, 600);
     }
-
-    const isRegistered = normalizedUser?.type === 'registered' || !!normalizedUser?.userId;
-    if (isRegistered && normalizedUser?._id) {
-      navigation.navigate('ChatScreen', { user: normalizedUser, chatId: null, hasExistingChat: false });
-      return;
-    }
-
-    if (normalizedUser?.hash && discoverContact) {
-      try { await discoverContact(normalizedUser.hash); }
-      catch (err) { showMessage(err?.message || 'Failed to discover contact.'); }
-      return;
-    }
-
-    navigation.navigate('ChatScreen', { user: normalizedUser, chatId: null, hasExistingChat: false });
-  }, [chatsData, normalizeChatUser, discoverContact, navigation]);
+  }, [normalizeChatUser, findExistingChat, navigateToExistingChat, createChatThenNavigate, discoverContact, navigation]);
 
   const handleRefresh = useCallback(async () => {
     if (refreshing || isSyncing) return;
@@ -461,8 +592,14 @@ export default function AddUser({ navigation }) {
 
   const collapseAnimating = useRef(false);
 
-  const expandCollapsible = useCallback(() => {
-    if (!isCollapsed.current) return;
+  // `focus` defaults to false — scroll-triggered expansions must NEVER pop the
+  // keyboard. Only the explicit search-icon press passes `{ focus: true }`.
+  const expandCollapsible = useCallback((opts) => {
+    const focus = opts && opts.focus === true;
+    if (!isCollapsed.current) {
+      if (focus) searchInputRef.current?.focus();
+      return;
+    }
     isCollapsed.current = false;
     collapseAnimating.current = true;
 
@@ -480,10 +617,11 @@ export default function AddUser({ navigation }) {
         useNativeDriver: false,
       }).start(() => {
         collapseAnimating.current = false;
-        // Auto-focus search input after expanding
-        InteractionManager.runAfterInteractions(() => {
-          searchInputRef.current?.focus();
-        });
+        if (focus) {
+          InteractionManager.runAfterInteractions(() => {
+            searchInputRef.current?.focus();
+          });
+        }
       });
     });
   }, [collapseAnim, headerSearchAnim]);
@@ -514,26 +652,31 @@ export default function AddUser({ navigation }) {
     });
   }, [collapseAnim, headerSearchAnim]);
 
+  // Pure UI handler — never calls APIs/events. Only toggles the collapsible
+  // header (search + New Contact + New Group buttons) based on scroll direction:
+  //   • scroll DOWN  → hide  (collapse)
+  //   • scroll UP    → show  (expand)
   const handleScroll = useCallback((event) => {
     if (collapseAnimating.current) return;
 
     const currentY = event.nativeEvent.contentOffset.y;
     const diff = currentY - lastScrollY.current;
 
-    // Cancel ongoing refresh when user scrolls down
-    if (diff > 10 && (refreshing || isSyncing)) {
-      refreshCancelledRef.current = true;
-      setRefreshing(false);
+    // Show again immediately when user reaches the very top
+    if (currentY <= 4 && isCollapsed.current) {
+      expandCollapsible();
+      lastScrollY.current = currentY;
+      return;
     }
 
-    if (diff > 15 && !isCollapsed.current && currentY > 40) {
+    if (diff > 12 && !isCollapsed.current && currentY > 40) {
       collapseCollapsible();
-    } else if (diff < -15 && isCollapsed.current) {
+    } else if (diff < -12 && isCollapsed.current) {
       expandCollapsible();
     }
 
     lastScrollY.current = currentY;
-  }, [collapseCollapsible, expandCollapsible, refreshing, isSyncing]);
+  }, [collapseCollapsible, expandCollapsible]);
 
   // ─── BUILD FLATLIST DATA (MEMOIZED) ───
 
@@ -597,7 +740,7 @@ export default function AddUser({ navigation }) {
           {headerSearchVisible && (
             <Animated.View style={{ opacity: headerSearchAnim, transform: [{ scale: headerSearchAnim }] }}>
               <TouchableOpacity
-                onPress={expandCollapsible}
+                onPress={() => expandCollapsible({ focus: true })}
                 activeOpacity={0.6}
                 style={styles.headerActionBtn}
               >
@@ -838,7 +981,8 @@ export default function AddUser({ navigation }) {
           renderItem={renderItem}
           keyExtractor={keyExtractor}
           onScroll={handleScroll}
-          scrollEventThrottle={16}
+          scrollEventThrottle={32}
+          keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
           // ─── PERFORMANCE OPTIMIZATIONS ───
@@ -847,17 +991,9 @@ export default function AddUser({ navigation }) {
           updateCellsBatchingPeriod={30}
           windowSize={7}
           removeClippedSubviews={Platform.OS === 'android'}
-          // No getItemLayout — mixed item types have different heights.
-          // Wrong offsets cause scroll jumping which feels worse than no layout hint.
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing || isSyncing}
-              onRefresh={handleRefresh}
-              colors={[theme.colors.themeColor]}
-              tintColor={theme.colors.themeColor}
-              progressBackgroundColor={theme.colors.menuBackground}
-            />
-          }
+          keyboardShouldPersistTaps="handled"
+          // Pull-to-refresh disabled — scrolling must NOT trigger any API/event.
+          // Use the explicit Refresh button in the header to re-sync.
         />
       )}
 

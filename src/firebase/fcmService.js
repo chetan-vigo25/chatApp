@@ -1,12 +1,6 @@
-import firebase from '@react-native-firebase/app';
 import messaging from '@react-native-firebase/messaging';
 import * as Notifications from 'expo-notifications';
 import { Platform, PermissionsAndroid } from 'react-native';
-
-// Ensure Firebase App exists
-if (!firebase.apps.length) {
-  firebase.initializeApp();
-}
 
 // ─── NOTIFICATION SOUND CONFIG ───
 // Android: file must be at android/app/src/main/res/raw/notification_sound.wav
@@ -61,9 +55,11 @@ const setupNotificationChannel = async () => {
 setupNotificationChannel();
 
 // Configure foreground notifications — tells expo-notifications to show alerts in foreground
+// SDK 54+ deprecated `shouldShowAlert`; iOS requires shouldShowBanner + shouldShowList to display.
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
     shouldPlaySound: true,
     shouldSetBadge: true,
   }),
@@ -89,52 +85,66 @@ export const setupNotificationCategory = async () => {
 // Request permission for notifications
 export const requestNotificationPermission = async () => {
   try {
+    console.log('[FCM] requestNotificationPermission start, platform:', Platform.OS, 'version:', Platform.Version);
+
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       const granted = await PermissionsAndroid.request(
         PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
       );
+      console.log('[FCM] POST_NOTIFICATIONS result:', granted);
       if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-        console.warn('POST_NOTIFICATIONS permission denied');
+        console.warn('[FCM] POST_NOTIFICATIONS permission denied');
         return false;
       }
     }
 
     const authStatus = await messaging().requestPermission();
+    console.log('[FCM] messaging.requestPermission authStatus:', authStatus);
     const enabled =
       authStatus === messaging.AuthorizationStatus.AUTHORIZED ||
       authStatus === messaging.AuthorizationStatus.PROVISIONAL;
 
     if (!enabled) {
-      console.warn('FCM permission not granted, status:', authStatus);
+      console.warn('[FCM] permission not granted, status:', authStatus);
     }
 
     return enabled;
   } catch (error) {
-    console.error('Permission request error:', error);
+    console.error('[FCM] Permission request error:', error);
     return false;
   }
 };
 
 // Get FCM token
 export const getFCMToken = async () => {
+  console.log('[FCM] getFCMToken called');
   const hasPermission = await requestNotificationPermission();
+  console.log('[FCM] hasPermission:', hasPermission);
   if (!hasPermission) return null;
 
   try {
-    if (!messaging().isDeviceRegisteredForRemoteMessages) {
-      await messaging().registerDeviceForRemoteMessages();
+    if (Platform.OS === 'ios') {
+      const isRegistered = messaging().isDeviceRegisteredForRemoteMessages;
+      console.log('[FCM] iOS isDeviceRegisteredForRemoteMessages:', isRegistered);
+      if (!isRegistered) {
+        await messaging().registerDeviceForRemoteMessages();
+        console.log('[FCM] iOS registerDeviceForRemoteMessages done');
+      }
+      const apns = await messaging().getAPNSToken();
+      console.log('[FCM] APNs token:', apns);
     }
 
+    console.log('[FCM] calling messaging().getToken()...');
     const token = await messaging().getToken();
-    console.log('FCM Token:', token);
+    console.log('[FCM] Token:', token);
 
     messaging().onTokenRefresh(newToken => {
-      console.log('FCM Token refreshed:', newToken);
+      console.log('[FCM] Token refreshed:', newToken);
     });
 
     return token;
   } catch (error) {
-    console.error('Error getting FCM token:', error);
+    console.error('[FCM] Error getting FCM token:', error?.message, error?.code, error);
     return null;
   }
 };

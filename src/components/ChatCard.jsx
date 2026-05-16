@@ -136,7 +136,15 @@ const ChatCard = ({
           <TouchableOpacity
             onPress={onAvatarPress || onPress}
             activeOpacity={0.85}
-            style={styles.avatarTouch}
+            style={[
+              styles.avatarTouch,
+              {
+                borderColor:
+                  !isGroup && item?.peerUser?.isOnline
+                    ? '#25D366'
+                    : (theme.colors.themeColor || '#1DA1F2') + '40',
+              },
+            ]}
           >
             {isGroup ? (
               groupAvatarUri ? (
@@ -243,19 +251,23 @@ const styles = StyleSheet.create({
 
   // Avatar
   avatarTouch: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    borderWidth: 1.5,
+    padding: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   avatarImage: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
   },
   avatarFallback: {
-    width: 52,
-    height: 52,
-    borderRadius: 26,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
     alignItems: 'center',
     justifyContent: 'center',
   },
