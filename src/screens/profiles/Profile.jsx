@@ -335,13 +335,13 @@ export default function Profile({ navigation }) {
             onPress={() => navigation.navigate('SettingsTab')}
           />
           <View style={[styles.divider, { backgroundColor: borderClr }]} />
-          <ActionRow
+          {/* <ActionRow
             icon="qr-code-outline"
             iconColor={themeColor}
             label="Linked Devices"
             primary={primaryText}
             onPress={() => navigation.navigate('LinkDevice')}
-          />
+          /> */}
         </View>
       </Animated.ScrollView>
     </Animated.View>

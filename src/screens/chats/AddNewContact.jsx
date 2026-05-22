@@ -9,13 +9,6 @@ import CountryCodeContact from "../../components/CountryCodeContact";
 import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
 import { APP_TAG_NAME } from '@env';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
-import {
-  saveToDeviceContacts,
-  upsertContactToSQLite,
-  findInDeviceContacts,
-} from '../../services/SaveContactService';
-import contactHasher from '../../Redux/Services/Contact/ContactHasher';
-import { useContactSync } from '../../contexts/useContactSync';
 
 // ============================================
 // 🎯 DEBOUNCE DELAY CONFIGURATION (in milliseconds)
@@ -32,13 +25,6 @@ export default function AddNewContact({ navigation }) {
     const [isSearching, setIsSearching] = useState(false);
     const [searchResult, setSearchResult] = useState(null);
 
-    // Save Contact state
-    const [fullNameInput, setFullNameInput] = useState('');
-    const [isSavedInDevice, setIsSavedInDevice] = useState(false); // true = number already in device book
-    const [isSavingContact, setIsSavingContact] = useState(false);
-    const [contactSavedOk, setContactSavedOk] = useState(false);
-    const [saveErrorMsg, setSaveErrorMsg] = useState(null);
-    const { refreshContacts } = useContactSync();
     const socketRef = useRef(null);
     const searchTimeoutRef = useRef(null);
     const isSocketListenerActive = useRef(false);
@@ -72,22 +58,13 @@ export default function AddNewContact({ navigation }) {
       navigation?.navigate?.('ChatList');
     };
 
-    const resetSaveState = () => {
-      setFullNameInput('');
-      setIsSavedInDevice(false);
-      setContactSavedOk(false);
-      setSaveErrorMsg(null);
-      setIsSavingContact(false);
-    };
-
     const handleClearPhoneNumber = () => {
       console.log('🗑️ Clearing phone number and search results');
       setPhoneNumber('');
       setSearchResult(null);
       pendingUserDataRef.current = null; // Clear stored user data
       setIsSearching(false);
-      resetSaveState();
-      
+
       if (searchTimeoutRef.current) {
         clearTimeout(searchTimeoutRef.current);
         searchTimeoutRef.current = null;
@@ -157,25 +134,6 @@ export default function AddNewContact({ navigation }) {
                 hasExistingChat: response.data.hasExistingChat,
                 isContact: response.data.isContact
               });
-
-              // Prefill name input from server-provided fullName (user can edit)
-              const serverName = response.data.user?.fullName || response.data.user?.name || '';
-              setFullNameInput(serverName);
-
-              // Server is the source of truth: isContact === false → show Save UI.
-              // Also do a parallel device check as a defensive fallback.
-              const serverSaysSaved = response.data.isContact === true;
-              setIsSavedInDevice(serverSaysSaved);
-
-              if (!serverSaysSaved) {
-                const u = response.data.user || {};
-                const code = u.mobile?.code || u.countryCode || selectedCountry.code;
-                const num = u.mobile?.number || u.mobileNumber || u.phone || phoneNumber;
-                const phoneE164 = String(num).startsWith('+') ? num : `${code}${num}`;
-                findInDeviceContacts(phoneE164)
-                  .then((existing) => { if (existing) setIsSavedInDevice(true); })
-                  .catch(() => {});
-              }
             } else {
               pendingUserDataRef.current = null;
               setSearchResult({
@@ -484,12 +442,11 @@ export default function AddNewContact({ navigation }) {
       console.log(`⌨️ User typing: "${text}" (Length: ${text.length})`);
       
       setPhoneNumber(text);
-      
+
       if (searchResult !== null) {
         console.log('🗑️ Clearing previous search result');
         setSearchResult(null);
         pendingUserDataRef.current = null;
-        resetSaveState();
       }
       
       if (searchTimeoutRef.current) {
@@ -536,90 +493,6 @@ export default function AddNewContact({ navigation }) {
         }
       };
     }, [selectedCountry]);
-
-    // ── Save Contact handler ──────────────────────────────────────────────
-    const handleSaveContactToDevice = async () => {
-      if (isSavingContact || contactSavedOk) return;
-      const trimmedName = (fullNameInput || '').trim();
-      if (!trimmedName) {
-        setSaveErrorMsg('Please enter a name');
-        return;
-      }
-      if (!searchResult?.user) {
-        setSaveErrorMsg('No user data available');
-        return;
-      }
-
-      setSaveErrorMsg(null);
-      setIsSavingContact(true);
-
-      try {
-        const user = searchResult.user;
-        const code = user.mobile?.code || user.countryCode || selectedCountry.code;
-        const num = user.mobile?.number || user.mobileNumber || user.phone || phoneNumber;
-        const fullPhoneNumber = String(num).startsWith('+')
-          ? String(num)
-          : `${code}${num}`;
-
-        let normalizedPhone = fullPhoneNumber;
-        try {
-          normalizedPhone = contactHasher.normalizePhoneNumber(fullPhoneNumber) || fullPhoneNumber;
-        } catch {}
-
-        // 1. Save to device phonebook
-        const nameParts = trimmedName.split(/\s+/);
-        const firstName = nameParts[0] || trimmedName;
-        const lastName = nameParts.slice(1).join(' ') || '';
-
-        const result = await saveToDeviceContacts({
-          firstName,
-          lastName,
-          phone: normalizedPhone,
-          imageUri: user.profileImage || user.profilePicture || null,
-        });
-
-        if (!result.success) {
-          if (result.error === 'permission_denied') {
-            setSaveErrorMsg('Contacts permission denied. Enable it from Settings.');
-          } else {
-            setSaveErrorMsg(result.error || 'Failed to save contact');
-          }
-          return;
-        }
-
-        // 2. Update local SQLite immediately (so UI reflects the change)
-        const hashResult = contactHasher.hashPhoneNumber(normalizedPhone);
-        await upsertContactToSQLite({
-          userId: String(user._id || ''),
-          fullName: trimmedName,
-          normalizedPhone,
-          profileImage: user.profileImage || user.profilePicture || null,
-          hash: hashResult?.hash || null,
-        });
-
-        // 3. Notify backend (Redis pub-sub trigger) + run full re-sync
-        try {
-          const socket = getSocket();
-          socket?.emit?.('contact:sync:notify', { reason: 'add_new_contact_save' });
-        } catch {}
-
-        // 4. Run full contact sync — re-uploads device contacts so server (Mongo + Redis)
-        // re-matches and returns updated registered list. Updates SQLite via the hook.
-        try {
-          await refreshContacts({ fallbackToSync: true });
-        } catch (err) {
-          console.warn('[AddNewContact] refreshContacts after save failed:', err?.message);
-        }
-
-        setContactSavedOk(true);
-        setIsSavedInDevice(true);
-      } catch (err) {
-        console.error('[AddNewContact] save contact error:', err);
-        setSaveErrorMsg(err?.message || 'Failed to save contact');
-      } finally {
-        setIsSavingContact(false);
-      }
-    };
 
     return(
        <Animated.View style={{ flex: 1, opacity: fadeAnim, backgroundColor: theme.colors.background }} >
@@ -737,171 +610,6 @@ export default function AddNewContact({ navigation }) {
                  </View>
                </View>
              </TouchableOpacity>
-
-             {/* ── Save Contact section — shown when user is on Vibe Connect but NOT in device phonebook ── */}
-             {!isSavedInDevice && !contactSavedOk && (
-               <View style={{
-                 marginTop: 18,
-                 padding: 14,
-                 backgroundColor: theme.colors.cardBackground,
-                 borderRadius: 10,
-                 borderWidth: 1,
-                 borderColor: theme.colors.borderColor,
-               }}>
-                 <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
-                   <Ionicons name="person-add-outline" size={18} color={theme.colors.themeColor} style={{ marginRight: 8 }} />
-                   <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
-                     Save to your contacts
-                   </Text>
-                 </View>
-                 <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', fontSize: 12, marginBottom: 10 }}>
-                   This number is not saved on your phone. Add a name to save it.
-                 </Text>
-
-                 <TextInput
-                   mode="outlined"
-                   label="Full name"
-                   value={fullNameInput}
-                   onChangeText={(t) => { setFullNameInput(t); if (saveErrorMsg) setSaveErrorMsg(null); }}
-                   activeOutlineColor={theme.colors.themeColor}
-                   outlineColor={theme.colors.borderColor}
-                   textColor={theme.colors.primaryTextColor}
-                   style={{ backgroundColor: 'transparent' }}
-                   theme={{ colors: { background: theme.colors.background, surfaceVariant: 'transparent', onSurfaceVariant: theme.colors.placeHolderTextColor } }}
-                 />
-
-                 {saveErrorMsg ? (
-                   <Text style={{ color: '#FF3B30', fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: 6 }}>
-                     {saveErrorMsg}
-                   </Text>
-                 ) : null}
-
-                 {/* Action buttons: Save + Message side-by-side */}
-                 <View style={{ flexDirection: 'row', marginTop: 12, gap: 10 }}>
-                   <TouchableOpacity
-                     onPress={handleSaveContactToDevice}
-                     disabled={isSavingContact || !fullNameInput.trim()}
-                     activeOpacity={0.8}
-                     style={{
-                       flex: 1,
-                       backgroundColor: (isSavingContact || !fullNameInput.trim())
-                         ? theme.colors.themeColor + '80'
-                         : theme.colors.themeColor,
-                       paddingVertical: 11,
-                       borderRadius: 8,
-                       alignItems: 'center',
-                       justifyContent: 'center',
-                       flexDirection: 'row',
-                     }}
-                   >
-                     {isSavingContact ? (
-                       <>
-                         <ActivityIndicator size="small" color="#fff" />
-                         <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 13, marginLeft: 8 }}>
-                           Saving…
-                         </Text>
-                       </>
-                     ) : (
-                       <>
-                         <Ionicons name="person-add" size={16} color="#fff" style={{ marginRight: 6 }} />
-                         <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 13 }}>
-                           Save Contact
-                         </Text>
-                       </>
-                     )}
-                   </TouchableOpacity>
-
-                   <TouchableOpacity
-                     onPress={handleAddContact}
-                     disabled={isSavingContact}
-                     activeOpacity={0.8}
-                     style={{
-                       flex: 1,
-                       backgroundColor: 'transparent',
-                       borderWidth: 1.5,
-                       borderColor: theme.colors.themeColor,
-                       paddingVertical: 10,
-                       borderRadius: 8,
-                       alignItems: 'center',
-                       justifyContent: 'center',
-                       flexDirection: 'row',
-                     }}
-                   >
-                     <Ionicons name="chatbubble-ellipses-outline" size={16} color={theme.colors.themeColor} style={{ marginRight: 6 }} />
-                     <Text style={{ color: theme.colors.themeColor, fontFamily: 'Roboto-SemiBold', fontSize: 13 }}>
-                       Message
-                     </Text>
-                   </TouchableOpacity>
-                 </View>
-               </View>
-             )}
-
-             {/* Save success state */}
-             {contactSavedOk && (
-               <View style={{ marginTop: 18 }}>
-                 <View style={{
-                   padding: 12,
-                   backgroundColor: '#22C55E15',
-                   borderRadius: 10,
-                   borderWidth: 1,
-                   borderColor: '#22C55E40',
-                   flexDirection: 'row',
-                   alignItems: 'center',
-                 }}>
-                   <Ionicons name="checkmark-circle" size={20} color="#22C55E" style={{ marginRight: 8 }} />
-                   <Text style={{ color: '#15803D', fontFamily: 'Roboto-Medium', fontSize: 13, flex: 1 }}>
-                     Contact saved successfully
-                   </Text>
-                 </View>
-                 <TouchableOpacity
-                   onPress={handleAddContact}
-                   activeOpacity={0.8}
-                   style={{
-                     marginTop: 12,
-                     backgroundColor: theme.colors.themeColor,
-                     paddingVertical: 11,
-                     borderRadius: 8,
-                     alignItems: 'center',
-                     justifyContent: 'center',
-                     flexDirection: 'row',
-                   }}
-                 >
-                   <Ionicons name="chatbubble-ellipses" size={16} color="#fff" style={{ marginRight: 6 }} />
-                   <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
-                     Message
-                   </Text>
-                 </TouchableOpacity>
-               </View>
-             )}
-
-             {/* Already in device contacts */}
-             {isSavedInDevice && !contactSavedOk && (
-               <View style={{ marginTop: 18 }}>
-                 <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
-                   <Ionicons name="checkmark-circle-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 6 }} />
-                   <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', fontSize: 12 }}>
-                     Already in your phone contacts
-                   </Text>
-                 </View>
-                 <TouchableOpacity
-                   onPress={handleAddContact}
-                   activeOpacity={0.8}
-                   style={{
-                     backgroundColor: theme.colors.themeColor,
-                     paddingVertical: 11,
-                     borderRadius: 8,
-                     alignItems: 'center',
-                     justifyContent: 'center',
-                     flexDirection: 'row',
-                   }}
-                 >
-                   <Ionicons name="chatbubble-ellipses" size={16} color="#fff" style={{ marginRight: 6 }} />
-                   <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
-                     Message
-                   </Text>
-                 </TouchableOpacity>
-               </View>
-             )}
            </View>
          )}
 

@@ -2,7 +2,7 @@
   "expo": {
     "name": "VibeConnect",
     "slug": "baatCheet",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "scheme": "VibeConnect",
     "userInterfaceStyle": "automatic",
@@ -21,15 +21,16 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chat.baatCheet",
+      "buildNumber": "2",
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSCameraUsageDescription": "This app needs access to your camera to take photos and videos.",
-        "NSMicrophoneUsageDescription": "This app needs access to your microphone to record audio.",
-        "NSPhotoLibraryUsageDescription": "This app needs access to your photo library to select media.",
-        "NSPhotoLibraryAddUsageDescription": "This app needs permission to save photos to your library.",
-        "NSContactsUsageDescription": "Allow VibeConnect to access your contacts to find friends already using the app.",
-        "NSLocationWhenInUseUsageDescription": "Allow VibeConnect to access your location when sharing a location in chat."
+        "NSCameraUsageDescription": "VibeConnect needs camera access so you can take photos and record videos to share in your chats and status updates.",
+        "NSMicrophoneUsageDescription": "VibeConnect needs microphone access so you can record and send voice messages and voice notes to your contacts.",
+        "NSPhotoLibraryUsageDescription": "VibeConnect needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
+        "NSPhotoLibraryAddUsageDescription": "VibeConnect needs permission to save photos and videos you receive in chats to your photo library.",
+        "NSContactsUsageDescription": "VibeConnect uses your contacts only to help you find friends who already use the app. Phone numbers are securely hashed before being checked. You can use VibeConnect without granting this permission.",
+        "NSLocationWhenInUseUsageDescription": "VibeConnect accesses your location only when you choose to share your current location in a chat. Location is never collected in the background."
       }
     },
     "android": {
@@ -90,8 +91,8 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera",
-          "microphonePermission": "Allow $(PRODUCT_NAME) to access your microphone",
+          "cameraPermission": "VibeConnect needs camera access so you can take photos and record videos to share in your chats and status updates.",
+          "microphonePermission": "VibeConnect needs microphone access so you can record and send voice messages and voice notes to your contacts.",
           "recordAudioAndroid": true,
           "isAccessMediaLocationEnabled": true
         }
@@ -99,8 +100,8 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "Allow $(PRODUCT_NAME) to access your photos to save media.",
-          "savePhotosPermission": "Allow $(PRODUCT_NAME) to save photos to your library.",
+          "photosPermission": "VibeConnect needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
+          "savePhotosPermission": "VibeConnect needs permission to save photos and videos you receive in chats to your photo library.",
           "isAccessMediaLocationEnabled": true
         }
       ],

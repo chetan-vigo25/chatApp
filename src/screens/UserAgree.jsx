@@ -13,14 +13,10 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { APP_TAG_NAME } from '@env';
 
-import { useContacts } from '../contexts/ContactContext';
-
 export default function UserAgree({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const [isAgreed, setIsAgreed] = useState(false);
-
-  const { askPermissionAndLoadContacts } = useContacts();
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -32,10 +28,6 @@ export default function UserAgree({ navigation }) {
     }, 800);
 
     return () => clearTimeout(timer);
-  }, []);
-
-  useEffect(() => {
-    askPermissionAndLoadContacts();
   }, []);
 
   const colors = theme.colors;

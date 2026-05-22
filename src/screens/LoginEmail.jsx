@@ -36,7 +36,7 @@ const EMAIL_REGEX = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
 export default function LoginEmail({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const deviceInfo = useDeviceInfo();
-  const { location, address, requestLocationPermission } = useDeviceLocation();
+  const { location, address } = useDeviceLocation();
   const dispatch = useDispatch();
   const { isLoading } = useSelector((state) => state.authentication);
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -55,7 +55,6 @@ export default function LoginEmail({ navigation }) {
   const passwordGlow = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
-    requestLocationPermission();
     AsyncStorage.getItem('fcmToken').then(setFcmToken).catch(() => {});
 
     Animated.parallel([

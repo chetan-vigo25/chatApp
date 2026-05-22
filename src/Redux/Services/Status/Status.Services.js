@@ -15,9 +15,14 @@ export const statusServices = {
   },
 
   async getMyStatuses() {
-    const response = await apiCall('POST', `${BASE}/my`);
-    if (response?.statusCode === 200) return response;
-    return { data: [] };
+    try {
+      const response = await apiCall('POST', `${BASE}/my`, {}, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return { data: [] };
+    } catch (err) {
+      console.log('[getMyStatuses] silent failure:', err?.code || err?.message);
+      return { data: [] };
+    }
   },
 
   /** Feed — contacts, grouped, Redis-cached 60 s.
@@ -38,9 +43,14 @@ export const statusServices = {
   },
 
   async getStatusById(statusId) {
-    const response = await apiCall('GET', `${BASE}/${statusId}`);
-    if (response?.statusCode === 200) return response;
-    return null;
+    try {
+      const response = await apiCall('GET', `${BASE}/${statusId}`, {}, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return null;
+    } catch (err) {
+      console.log('[getStatusById] silent failure:', err?.code || err?.message);
+      return null;
+    }
   },
 
   async deleteStatus(statusId) {
@@ -62,15 +72,25 @@ export const statusServices = {
   // ── Interactions ──────────────────────────────────────────────────────────
 
   async viewStatus(statusId) {
-    const response = await apiCall('POST', `${BASE}/${statusId}/view`);
-    if (response?.statusCode === 200) return response;
-    return Promise.reject(response?.message);
+    try {
+      const response = await apiCall('POST', `${BASE}/${statusId}/view`, {}, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return Promise.reject(response?.message);
+    } catch (err) {
+      console.log('[viewStatus] silent failure:', err?.code || err?.message);
+      return Promise.reject(err);
+    }
   },
 
   async reactToStatus(statusId, reactionType) {
-    const response = await apiCall('POST', `${BASE}/${statusId}/react`, { reactionType });
-    if (response?.statusCode === 200) return response;
-    return Promise.reject(response?.message);
+    try {
+      const response = await apiCall('POST', `${BASE}/${statusId}/react`, { reactionType }, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return Promise.reject(response?.message);
+    } catch (err) {
+      console.log('[reactToStatus] silent failure:', err?.code || err?.message);
+      return Promise.reject(err);
+    }
   },
 
   async replyToStatus(statusId, message) {
@@ -107,16 +127,26 @@ export const statusServices = {
   // ── Viewers (owner only) ───────────────────────────────────────────────────
 
   async getStatusViewers(statusId) {
-    const response = await apiCall('POST', `${BASE}/viewers`, { statusId });
-    if (response?.statusCode === 200) return response;
-    return { data: { viewCount: 0, viewers: [] } };
+    try {
+      const response = await apiCall('POST', `${BASE}/viewers`, { statusId }, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return { data: { viewCount: 0, viewers: [] } };
+    } catch (err) {
+      console.log('[getStatusViewers] silent failure:', err?.code || err?.message);
+      return { data: { viewCount: 0, viewers: [] } };
+    }
   },
 
   // ── Likers (owner only) ────────────────────────────────────────────────────
 
   async getStatusLikers(statusId) {
-    const response = await apiCall('GET', `${BASE}/${statusId}/likes`);
-    if (response?.statusCode === 200) return response;
-    return { data: { likedBy: [], total: 0 } };
+    try {
+      const response = await apiCall('GET', `${BASE}/${statusId}/likes`, {}, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return { data: { likedBy: [], total: 0 } };
+    } catch (err) {
+      console.log('[getStatusLikers] silent failure:', err?.code || err?.message);
+      return { data: { likedBy: [], total: 0 } };
+    }
   },
 };

@@ -1,13 +1,11 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { StyleSheet, View, Text, ActivityIndicator, Animated, TouchableOpacity, TextInput, Alert, Platform, ToastAndroid } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
-import { useContacts } from '../contexts/ContactContext';
 import { useDeviceInfo } from '../contexts/DeviceInfoContext';
 import CountryCodeSelector from '../components/CountryCodeSelector';
 import countryCodes from '../jsonFile/countryCodes.json';
 import { useDispatch, useSelector } from "react-redux";
 import { generateOtpAction } from '../Redux/Reducer/Auth/Auth.reducer';
-import { useDeviceLocation } from '../contexts/DeviceLoc';
 import { APP_TAG_NAME } from '@env';
 
 function showToast(message) {
@@ -20,8 +18,6 @@ function showToast(message) {
 
 export default function Login({ navigation }) {
   const { theme, isDarkMode, toggleTheme } = useTheme();
-  const { askPermissionAndLoadContacts, permissionStatus, contacts } = useContacts();
-  const { location, address, errorMsg, requestLocationPermission } = useDeviceLocation();
   const deviceInfo = useDeviceInfo();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const dispatch = useDispatch();
@@ -30,8 +26,6 @@ export default function Login({ navigation }) {
   const [phoneNumber, setPhoneNumber] = useState('');
 
   useEffect(() => {
-    requestLocationPermission();
-    
     const timer = setTimeout(() => {
       Animated.timing(fadeAnim, {
         toValue: 1,
@@ -64,8 +58,6 @@ export default function Login({ navigation }) {
       navigation.navigate('Otp', {
         selectedCountry,
         phoneNumber,
-        location,
-        address,
         generatedOtp: otp,
       });
       setPhoneNumber('');

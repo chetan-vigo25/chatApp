@@ -23,7 +23,7 @@ function showToast(message) {
 
 export default function Otp({ navigation, route }) {
     const deviceInfo = useDeviceInfo();
-    const { selectedCountry, phoneNumber, location, address, generatedOtp: initialOtp } = route.params;
+    const { selectedCountry, phoneNumber, location, address, generatedOtp: initialOtp } = route.params || {};
     const dispatch = useDispatch();
     const { isLoading, otpMessage, otpData, error } = useSelector((state) => state.authentication);
     const fadeAnim = useRef(new Animated.Value(0)).current;

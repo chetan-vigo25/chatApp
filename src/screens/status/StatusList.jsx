@@ -1,5 +1,5 @@
 import { useCallback, useState, useEffect, useRef } from 'react';
-import { View, Text, FlatList, TouchableOpacity, Image, StyleSheet, RefreshControl } from 'react-native';
+import { View, Text, FlatList, TouchableOpacity, Image, StyleSheet, RefreshControl, Platform } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
@@ -7,6 +7,8 @@ import { fetchMyStatuses, fetchStatusFeed, addNewStatusFromSocket, removeStatusF
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import SegmentedRing from '../../components/SegmentedRing';
+
+const IS_IPAD = Platform.OS === 'ios' && Platform.isPad;
 
 /**
  * Shows the first status's content as a small square thumbnail.
@@ -237,13 +239,22 @@ export default function StatusList({ navigation }) {
         ListEmptyComponent={() => (
           !isLoading && (
             <View style={styles.emptyContainer}>
-              <MaterialCommunityIcons name="circle-outline" size={60} color={theme.colors.placeHolderTextColor} />
-              <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor }]}>
-                No status updates from contacts
+              <View style={[styles.emptyIconCircle, { backgroundColor: theme.colors.themeColor + '22' }]}>
+                <MaterialCommunityIcons name="message-image-outline" size={48} color={theme.colors.themeColor} />
+              </View>
+              <Text style={[styles.emptyText, { color: theme.colors.primaryTextColor }]}>
+                No status updates yet
               </Text>
               <Text style={[styles.emptySubText, { color: theme.colors.placeHolderTextColor }]}>
-                Status updates from your contacts will appear here
+                When your contacts share photos, videos, or text updates, they'll appear here for 24 hours.
               </Text>
+              <TouchableOpacity
+                style={[styles.emptyCta, { backgroundColor: theme.colors.themeColor }]}
+                onPress={() => navigation.navigate('StatusCreate')}
+              >
+                <Ionicons name="camera" size={18} color="#fff" />
+                <Text style={styles.emptyCtaText}>Share your first status</Text>
+              </TouchableOpacity>
             </View>
           )
         )}
@@ -268,7 +279,10 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 20, fontWeight: '700' },
   headerActions: { flexDirection: 'row', gap: 16 },
   headerBtn: { padding: 4 },
-  listContent: { paddingBottom: 80 },
+  listContent: {
+    paddingBottom: 80,
+    ...(IS_IPAD ? { maxWidth: 640, width: '100%', alignSelf: 'center' } : null),
+  },
   statusItem: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 8, minHeight: 72 },
   avatarContainer: { marginRight: 16 },
   avatar: { width: 50, height: 50, borderRadius: 25 },
@@ -284,8 +298,11 @@ const styles = StyleSheet.create({
   rowTimestamp: { fontSize: 12, alignSelf: 'flex-start', paddingTop: 2 },
   cameraBtn: { padding: 8 },
   sectionTitle: { fontSize: 13, fontWeight: '600', paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, textTransform: 'uppercase', letterSpacing: 0.5 },
-  emptyContainer: { alignItems: 'center', paddingTop: 80, paddingHorizontal: 40 },
-  emptyText: { fontSize: 16, fontWeight: '600', marginTop: 16 },
-  emptySubText: { fontSize: 13, marginTop: 6, textAlign: 'center' },
+  emptyContainer: { alignItems: 'center', paddingTop: 80, paddingHorizontal: 40, maxWidth: 420, alignSelf: 'center' },
+  emptyIconCircle: { width: 96, height: 96, borderRadius: 48, alignItems: 'center', justifyContent: 'center', marginBottom: 20 },
+  emptyText: { fontSize: 18, fontWeight: '700', marginTop: 4 },
+  emptySubText: { fontSize: 14, marginTop: 8, textAlign: 'center', lineHeight: 20 },
+  emptyCta: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 20, paddingVertical: 12, borderRadius: 24, marginTop: 24 },
+  emptyCtaText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   fab: { position: 'absolute', bottom: 24, right: 20, width: 56, height: 56, borderRadius: 28, alignItems: 'center', justifyContent: 'center', elevation: 6, shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, shadowRadius: 6 },
 });
