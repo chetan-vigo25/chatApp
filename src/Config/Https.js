@@ -4,12 +4,31 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { BACKEND_URL } from "@env";
 import { performSessionReset, refreshAccessToken } from "../services/sessionManager";
 
+// In-memory throttle so we never spam multiple alerts in a row.
+// Apple flags blocking modals from background fetches under 2.1.0
+// (App Completeness), so on iOS we only show a toast-style alert if
+// the user hasn't seen one in the last few seconds.
+let lastToastAt = 0;
+let lastToastMessage = '';
+const TOAST_THROTTLE_MS = 4000;
+
 function showToast(message) {
   if (!message) return;
+  const text = String(message);
+  const now = Date.now();
+  if (text === lastToastMessage && now - lastToastAt < TOAST_THROTTLE_MS) {
+    return;
+  }
+  lastToastAt = now;
+  lastToastMessage = text;
   if (Platform.OS === 'android') {
-    ToastAndroid.show(String(message), ToastAndroid.SHORT);
+    ToastAndroid.show(text, ToastAndroid.SHORT);
+  } else if (Platform.OS === 'ios') {
+    // Avoid blocking Alert popups on iOS for transient API failures;
+    // a console warning is enough — caller renders inline state instead.
+    console.warn('[API]', text);
   } else {
-    Alert.alert('', String(message));
+    Alert.alert('', text);
   }
 }
 
@@ -73,18 +92,24 @@ api.interceptors.response.use(
     const originalRequest = error?.config;
     const status = error?.response?.status;
 
-    // One-shot retry for transient iOS network drops on idempotent GETs.
+    // One-shot retry for transient iOS network drops.
     // ERR_NETWORK on RN/iOS often means the underlying request was aborted
     // (component unmount, app backgrounding, brief connectivity blip).
+    // We also retry POSTs flagged as safe to retry (idempotent reads like
+    // user/auth/view, profile fetches, etc.) — the caller opts in via
+    // { retryOnNetwork: true } in apiCall config.
     if (
       originalRequest &&
       !originalRequest._netRetry &&
-      error?.code === 'ERR_NETWORK' &&
-      (originalRequest.method || 'get').toLowerCase() === 'get'
+      (error?.code === 'ERR_NETWORK' || /Network Error|timeout/i.test(error?.message || ''))
     ) {
-      originalRequest._netRetry = true;
-      await new Promise(r => setTimeout(r, 400));
-      return api(originalRequest);
+      const method = (originalRequest.method || 'get').toLowerCase();
+      const safeRetry = method === 'get' || originalRequest._retryOnNetwork;
+      if (safeRetry) {
+        originalRequest._netRetry = true;
+        await new Promise(r => setTimeout(r, 600));
+        return api(originalRequest);
+      }
     }
 
     if (!originalRequest || status !== 401 || originalRequest._retry) {
@@ -186,8 +211,9 @@ const buildUrl = (endpoint) => {
 
 // Generic API call for JSON
 // Pass { silent: true } in config to suppress error toasts (e.g., expected 404s)
+// Pass { retryOnNetwork: true } to retry POSTs on transient ERR_NETWORK / timeout
 export const apiCall = async (method, endpoint, data = {}, config = {}) => {
-  const { silent, ...restConfig } = config;
+  const { silent, retryOnNetwork, ...restConfig } = config;
   try {
     const url = buildUrl(endpoint);
     if (!url) {
@@ -197,7 +223,13 @@ export const apiCall = async (method, endpoint, data = {}, config = {}) => {
       return Promise.reject(new Error(msg));
     }
 
-    const response = await api({ method, url, data, ...restConfig });
+    const response = await api({
+      method,
+      url,
+      data,
+      ...restConfig,
+      _retryOnNetwork: retryOnNetwork,
+    });
     return response.data;
   } catch (error) {
     if (silent) {
@@ -211,6 +243,11 @@ export const apiCall = async (method, endpoint, data = {}, config = {}) => {
 
 // API call for FormData (file uploads)
 // Important: Do NOT manually set a Content-Type with a boundary here — let axios set it for FormData.
+//
+// Supported config:
+//   timeout         — ms before the request aborts (default 30000)
+//   signal          — caller-supplied AbortSignal for cancel (back nav, retry, etc.)
+//   onUploadProgress— if provided, switches to XHR so byte-level progress works
 export const apiCallForm = async (method, endpoint, formData, config = {}) => {
   try {
     const url = buildUrl(endpoint);
@@ -227,10 +264,30 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
     if (token) headers.Authorization = `Bearer ${token}`;
     // Do NOT set Content-Type for FormData; fetch will handle it.
 
-    // Use fetch with timeout (AbortController) because RN axios/FormData is sometimes unreliable
+    // Compose an AbortController that fires on timeout OR on caller-supplied signal
     const controller = new AbortController();
     const timeoutMs = config.timeout || 30000;
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort('timeout'), timeoutMs);
+
+    let externalAbortHandler;
+    if (config.signal) {
+      if (config.signal.aborted) {
+        clearTimeout(timeoutId);
+        controller.abort('caller_aborted');
+      } else {
+        externalAbortHandler = () => controller.abort('caller_aborted');
+        config.signal.addEventListener('abort', externalAbortHandler);
+      }
+    }
+
+    // XHR path — only when caller wants real byte-level progress.
+    if (typeof config.onUploadProgress === 'function') {
+      clearTimeout(timeoutId);
+      if (config.signal && externalAbortHandler) {
+        config.signal.removeEventListener('abort', externalAbortHandler);
+      }
+      return xhrUpload({ method, url, headers, formData, config });
+    }
 
     const fetchOptions = {
       method: method || 'POST',
@@ -239,8 +296,15 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
       signal: controller.signal,
     };
 
-    const response = await fetch(url, fetchOptions);
-    clearTimeout(timeoutId);
+    let response;
+    try {
+      response = await fetch(url, fetchOptions);
+    } finally {
+      clearTimeout(timeoutId);
+      if (config.signal && externalAbortHandler) {
+        config.signal.removeEventListener('abort', externalAbortHandler);
+      }
+    }
 
     const text = await response.text();
     let data = null;
@@ -293,5 +357,85 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
     return handleApiError(error);
   }
 };
+
+/**
+ * XHR-based upload — used when the caller passes `onUploadProgress`.
+ * Returns the parsed JSON body on 2xx, rejects with an Error otherwise.
+ * Honours `config.signal` for cancellation and `config.timeout` for hard
+ * timeout. Does NOT auto-refresh on 401 (matches fetch path's behaviour
+ * pre-refresh; the caller will see the 401 and can retry).
+ */
+function xhrUpload({ method, url, headers, formData, config }) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const timeoutMs = config.timeout || 30000;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { xhr.abort(); } catch {}
+    }, timeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (config.signal && abortHandler) {
+        config.signal.removeEventListener('abort', abortHandler);
+      }
+    };
+
+    const abortHandler = () => {
+      try { xhr.abort(); } catch {}
+    };
+
+    if (config.signal) {
+      if (config.signal.aborted) {
+        cleanup();
+        return reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      }
+      config.signal.addEventListener('abort', abortHandler);
+    }
+
+    xhr.open(method || 'POST', url, true);
+    Object.keys(headers || {}).forEach(k => {
+      try { xhr.setRequestHeader(k, headers[k]); } catch {}
+    });
+
+    if (xhr.upload && typeof config.onUploadProgress === 'function') {
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        try { config.onUploadProgress({ loaded: e.loaded, total: e.total }); } catch {}
+      };
+    }
+
+    xhr.onload = () => {
+      cleanup();
+      const text = xhr.responseText;
+      let data = null;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = text; }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(data);
+      const msg = data?.message || xhr.statusText || 'Upload failed';
+      showToast(msg);
+      const err = new Error(msg);
+      err.response = { data, status: xhr.status, statusText: xhr.statusText, url };
+      reject(err);
+    };
+
+    xhr.onerror = () => {
+      cleanup();
+      const msg = timedOut ? 'Request timed out' : 'Network error';
+      showToast(msg);
+      reject(Object.assign(new Error(msg), { name: timedOut ? 'AbortError' : 'NetworkError' }));
+    };
+
+    xhr.onabort = () => {
+      cleanup();
+      reject(Object.assign(new Error(timedOut ? 'Request timed out' : 'aborted'), {
+        name: 'AbortError',
+      }));
+    };
+
+    xhr.send(formData);
+  });
+}
 
 export default api;

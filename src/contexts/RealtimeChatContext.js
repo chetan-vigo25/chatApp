@@ -4,6 +4,8 @@ import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
+import { performDurableChatClear } from '../utils/chatClearStorage';
+import OutboxWorker from '../services/OutboxWorker';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -940,6 +942,14 @@ const reducer = (state, action) => {
         };
       });
 
+      // If this chat was previously removed (user "deleted chat for me"), a fresh
+      // incoming message is the explicit "the chat is back" signal — clear the
+      // tombstone so the next chat:list:update / HYDRATE_CHATS can fully hydrate
+      // it (peer name, avatar, etc.) instead of skipping it.
+      const nextRemovedChatIds = { ...state.removedChatIds };
+      if (nextRemovedChatIds[chatId]) delete nextRemovedChatIds[chatId];
+      if (aliasChatId && nextRemovedChatIds[aliasChatId]) delete nextRemovedChatIds[aliasChatId];
+
       return {
         ...state,
         chatMap: nextMap,
@@ -948,6 +958,7 @@ const reducer = (state, action) => {
         regularChatIds: sections.regularChatIds,
         archivedChatIds: sections.archivedChatIds,
         unreadByChat,
+        removedChatIds: nextRemovedChatIds,
         highlightByChat: {
           ...state.highlightByChat,
           ...(existing?.isMuted ? {} : { [chatId]: Date.now() }),
@@ -1968,6 +1979,14 @@ const RealtimeChatContext = createContext(null);
 
 export function RealtimeChatProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
+
+  // Start the durable send-outbox worker once per provider lifetime.
+  // It drains the SQLite `outbox` table on a 1.5s poll (or wakes
+  // immediately when something is enqueued).
+  useEffect(() => {
+    OutboxWorker.start();
+    return () => OutboxWorker.stop();
+  }, []);
   const typingTimersRef = useRef({});
   const chatHighlightTimersRef = useRef({});
   const chatListUpdateQueueRef = useRef([]);
@@ -2373,6 +2392,16 @@ export function RealtimeChatProvider({ children }) {
     const onChatListUpdate = (payload) => {
       chatListUpdateQueueRef.current.push(payload);
 
+      // INSTANT FLUSH for the active chat — batching this means the user
+      // sees their own chat preview update 90ms late, which feels janky.
+      // Other chats keep the 90ms batch to coalesce burst updates.
+      const incomingChatId = normalizeId(payload?.chatId);
+      const activeChatId = state.activeChatId ? normalizeId(state.activeChatId) : null;
+      if (incomingChatId && activeChatId && incomingChatId === activeChatId) {
+        flushChatListUpdates();
+        return;
+      }
+
       if (chatListUpdateFlushRef.current) {
         return;
       }
@@ -2499,7 +2528,10 @@ export function RealtimeChatProvider({ children }) {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.data?.chatId || source?.chat || source?.roomId);
       if (!chatId) return;
+      const serverClearedAt = Number(source?.clearedAt || source?.timestamp) || Date.now();
 
+      // 1. Update the in-memory chat list preview immediately so the UI reflects
+      //    the cleared state regardless of which screen the user is on.
       onChatListUpdate({
         type: 'chat_cleared',
         reason: 'chat:cleared',
@@ -2520,6 +2552,15 @@ export function RealtimeChatProvider({ children }) {
           lastMessageSender: null,
         },
       });
+
+      // 2. Durable cleanup — must run regardless of whether the chat screen is
+      //    mounted (the per-chat useChatLogic handler runs only when the user
+      //    is actively inside the chat). Without this, User B keeps the SQLite
+      //    history if they're on ChatList when User A clears the chat.
+      //    `performDurableChatClear` is module-level deduped, so concurrent
+      //    callers (this handler + useChatLogic + REST resolution) cooperate
+      //    on a single SQLite write instead of racing the lock.
+      performDurableChatClear(chatId, { clearedAt: serverClearedAt }).catch(() => {});
     };
 
     // Handle message:delivered:response — update last message status in chat list
@@ -2659,6 +2700,73 @@ export function RealtimeChatProvider({ children }) {
 
     socket.on('message:new', onMessage);
     socket.on('message:received', onMessage);
+
+    // ── Reconnect catchup ─────────────────────────────────────────────────
+    // On every (re)connect, send one event listing every known chat + its
+    // highest local seq. Server returns differential payload per chat in a
+    // single round-trip. Covers the offline-then-online case the user
+    // described (User B was offline; new messages should sync into SQLite
+    // and appear instantly on reopen).
+    const onConnectCatchup = async () => {
+      try {
+        const knownChatIds = Object.keys(state.chatMap || {});
+        if (knownChatIds.length === 0) return;
+
+        // Gather { chatId, lastSeq } per chat.
+        const entries = await Promise.all(knownChatIds.map(async (chatId) => {
+          try {
+            const lastSeq = await ChatDatabase.getLatestSeq(chatId);
+            return { chatId, lastSeq };
+          } catch { return { chatId, lastSeq: 0 }; }
+        }));
+
+        socket.emit('message:sync:catchup', { chats: entries }, async (response) => {
+          const payload = response?.data || response || {};
+          const chats = Array.isArray(payload?.chats) ? payload.chats : [];
+
+          for (const entry of chats) {
+            if (!entry || !entry.chatId) continue;
+            const newMessages = Array.isArray(entry.newMessages) ? entry.newMessages : [];
+
+            // Persist through the writer queue — serialized, never races.
+            if (newMessages.length > 0) {
+              try {
+                const { default: SqliteWriter } = await import('../services/SqliteWriter');
+                SqliteWriter.enqueue('upsertMessages', newMessages.map((m) => ({
+                  ...m,
+                  chatId: m.chatId || entry.chatId,
+                }))).catch(() => {});
+              } catch {}
+              // Dispatch realtime updates so any open chat screen renders the
+              // new tail immediately.
+              newMessages.forEach((m) => {
+                dispatch({ type: 'INCOMING_MESSAGE', payload: { ...m, chatId: m.chatId || entry.chatId } });
+              });
+            }
+
+            // Peer's read watermark — drives our outgoing-message ticks.
+            if (entry.peerReadUpToSeq) {
+              ChatDatabase.setPeerReadWatermark(entry.chatId, entry.peerReadUpToSeq, entry.peerReadUpToSeq).catch(() => {});
+            }
+
+            // Peer's chat-cleared timestamp — replay durable cleanup if
+            // we missed the live event.
+            if (entry.peerClearedAt) {
+              try {
+                const localClearedAt = (await ChatDatabase.getClearedAt(entry.chatId)) || 0;
+                if (entry.peerClearedAt > localClearedAt) {
+                  await performDurableChatClear(entry.chatId, { clearedAt: entry.peerClearedAt });
+                }
+              } catch {}
+            }
+          }
+        });
+      } catch (err) {
+        // Best-effort — catchup is a non-essential reconciliation path.
+      }
+    };
+    socket.on('connect', onConnectCatchup);
+    if (socket.connected) onConnectCatchup();
     socket.on('message:delivered', onMessageDelivered);
     socket.on('message:delivered:response', onMessageDeliveredResponse);
     socket.on('message:seen', onMessageSeen);
@@ -2688,6 +2796,31 @@ export function RealtimeChatProvider({ children }) {
     socket.on('group:typing:start', onGroupTypingStarted);
     socket.on('group:typing:stop', onGroupTypingStopped);
     socket.on('chat:list:update', onChatListUpdate);
+
+    // Peer's read watermark — drives the sender-side tick from gray → blue
+    // without N per-message events. Body: { chatId, readerId, readUpToSeq,
+    // deliveredUpToSeq }. We store it on the chat row so any message with
+    // seq <= readUpToSeq renders as read.
+    const onPeerReadWatermark = (payload) => {
+      const data = payload?.data || payload || {};
+      const chatId = normalizeId(data?.chatId);
+      if (!chatId) return;
+      const readUpTo = Number(data?.readUpToSeq) || 0;
+      const delUpTo  = Number(data?.deliveredUpToSeq) || 0;
+      ChatDatabase.setPeerReadWatermark(chatId, readUpTo, delUpTo).catch(() => {});
+      // Tell the in-memory reducer too so open chat lists redraw ticks now.
+      dispatch({
+        type: 'APPLY_CHAT_LIST_UPDATES',
+        payload: [{
+          chatId,
+          type: 'peer_read_watermark',
+          item: { peerReadUpToSeq: readUpTo, peerDeliveredUpToSeq: delUpTo },
+          timestamp: Date.now(),
+        }],
+      });
+    };
+    socket.on('message:read:upto', onPeerReadWatermark);
+
     socket.on('message:edit:response', onMessageEditedForChatList);
     socket.on('message:edited', onMessageEditedForChatList);
     socket.on('chat:info:response', onChatInfoResponse);
@@ -3341,6 +3474,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('group:message:send:response', onSentAckForChatList),
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
+      () => socket.off('connect', onConnectCatchup),
       () => socket.off('message:delivered', onMessageDelivered),
       () => socket.off('message:seen', onMessageSeen),
       () => socket.off('message:read', onMessageRead),
@@ -3365,6 +3499,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('group:typing:start', onGroupTypingStarted),
       () => socket.off('group:typing:stop', onGroupTypingStopped),
       () => socket.off('chat:list:update', onChatListUpdate),
+      () => socket.off('message:read:upto', onPeerReadWatermark),
       () => socket.off('message:edit:response', onMessageEditedForChatList),
       () => socket.off('message:edited', onMessageEditedForChatList),
       () => socket.off('chat:info:response', onChatInfoResponse),
@@ -3582,6 +3717,29 @@ export function RealtimeChatProvider({ children }) {
       ChatDatabase.upsertChats(chats || []).catch(() => {});
     }
 
+    // ── Server "cleared chat" reconciliation ─────────────────────────────
+    // If the peer cleared this chat while we were offline, the socket event
+    // never reached us — but the server still set ChatSummary.clearedAt.
+    // For every chat whose server clearedAt is ahead of our local SQLite
+    // tombstone, replay the durable cleanup so old SQLite history can't
+    // resurface on app reload.
+    (async () => {
+      for (const chat of (chats || [])) {
+        const chatId = normalizeId(chat?.chatId || chat?._id);
+        if (!chatId) continue;
+        const serverClearedAt = chat?.clearedAt ? new Date(chat.clearedAt).getTime() : 0;
+        if (!serverClearedAt) continue;
+        try {
+          const localClearedAt = (await ChatDatabase.getClearedAt(chatId)) || 0;
+          if (serverClearedAt > localClearedAt) {
+            await performDurableChatClear(chatId, { clearedAt: serverClearedAt });
+          }
+        } catch (e) {
+          // best-effort — next hydration will retry
+        }
+      }
+    })();
+
     // Sync lastMessage from SQLite — SQLite is the source of truth for message content.
     // The API/cache may have stale lastMessage (before edit/delete).
     try {
@@ -3669,6 +3827,22 @@ export function RealtimeChatProvider({ children }) {
           // Fallback without senderId
           socket.emit('message:read', { chatId });
         }
+
+        // ── Advance the read watermark immediately ───────────────────────
+        // Single bulk call that drives the sender's outgoing-message ticks
+        // to blue without waiting for the legacy per-message read events
+        // to round-trip. The server's chatReadState lookup is keyed by seq,
+        // so we send the highest local seq we know about.
+        try {
+          const lastSeq = await ChatDatabase.getLatestSeq(chatId);
+          if (lastSeq > 0) {
+            socket.emit('message:read:upto', {
+              chatId,
+              readUpToSeq: lastSeq,
+              deliveredUpToSeq: lastSeq,
+            });
+          }
+        } catch (e) { /* best-effort */ }
       }
     }
   }, [deferDispatch]);

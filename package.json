@@ -1,6 +1,6 @@
 {
   "name": "baatcheet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "index.js",
   "scripts": {
     "start": "expo start",
@@ -42,6 +42,7 @@
     "expo-location": "~19.0.8",
     "expo-media-library": "~18.2.1",
     "expo-notifications": "~0.32.16",
+    "expo-screen-capture": "~8.0.9",
     "expo-secure-store": "~15.0.8",
     "expo-sharing": "~14.0.8",
     "expo-sms": "~14.0.8",

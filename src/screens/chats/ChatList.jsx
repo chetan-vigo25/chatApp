@@ -28,7 +28,7 @@ import ChatDatabase from '../../services/ChatDatabase';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -72,6 +72,38 @@ export default function ChatList({ navigation }) {
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [currentUserId, setCurrentUserId] = useState(null);
 
+  // Multi-select state (WhatsApp-style "delete for me" of multiple chats)
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedChatIds, setSelectedChatIds] = useState([]);
+  const [bulkDeleteModalVisible, setBulkDeleteModalVisible] = useState(false);
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  // Visible during the entire blocking delete (server call + local cleanup).
+  // Prevents the user from interacting with the list mid-delete.
+  const [bulkDeleteProgress, setBulkDeleteProgress] = useState({ visible: false, label: '' });
+
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedChatIds([]);
+  }, []);
+
+  const toggleChatSelection = useCallback((chatId) => {
+    if (!chatId) return;
+    setSelectedChatIds((prev) => {
+      if (prev.includes(chatId)) {
+        const next = prev.filter((id) => id !== chatId);
+        if (next.length === 0) setSelectionMode(false);
+        return next;
+      }
+      return [...prev, chatId];
+    });
+  }, []);
+
+  const enterSelectionMode = useCallback((chatId) => {
+    if (!chatId) return;
+    setSelectionMode(true);
+    setSelectedChatIds((prev) => (prev.includes(chatId) ? prev : [...prev, chatId]));
+  }, []);
+
   // Load current user id once — used to gate tick rendering to outgoing last-messages only
   useEffect(() => {
     (async () => {
@@ -84,27 +116,29 @@ export default function ChatList({ navigation }) {
     })();
   }, []);
 
-  // Preload messages into cache before navigating — makes chat screen open instantly
-  const openChat = useCallback(async (item) => {
+  // Navigate IMMEDIATELY. The previous version awaited SQLite reads first,
+  // which on a freshly-updated app would block behind expo-sqlite schema
+  // migrations — making the chat list look unresponsive until migrations
+  // finished. The preload is now fire-and-forget; ChatScreen has its own
+  // SQLite load fallback if the cache is cold when it mounts.
+  const openChat = useCallback((item) => {
     const chatId = item?.chatId || item?._id;
-    if (!chatId) { navigation.navigate('ChatScreen', { item }); return; }
-
-    // If cache already has messages, navigate immediately
-    if (ChatCache.hasMessages(chatId)) {
-      navigation.navigate('ChatScreen', { item });
-      return;
-    }
-
-    // Preload from SQLite (fast — indexed query, LIMIT 30)
-    try {
-      const msgs = await ChatDatabase.loadMessages(chatId, { limit: 30 });
-      if (msgs && msgs.length > 0) {
-        ChatCache.setMessages(chatId, msgs);
-      }
-    } catch {}
-
-    // Navigate regardless — never block on DB failure
+    // Always navigate first — never let a tap depend on async work completing.
     navigation.navigate('ChatScreen', { item });
+
+    if (!chatId) return;
+    if (ChatCache.hasMessages(chatId)) return; // cache already warm
+
+    // Fire-and-forget preload. Honors the per-chat tombstone. Any error
+    // (including a hang during schema migration) is swallowed silently —
+    // ChatScreen will read SQLite directly once it's ready.
+    (async () => {
+      try {
+        const clearedAt = (await ChatDatabase.getClearedAt(chatId)) || 0;
+        const msgs = await ChatDatabase.loadMessages(chatId, { limit: 30, afterTimestamp: clearedAt });
+        if (msgs && msgs.length > 0) ChatCache.setMessages(chatId, msgs);
+      } catch {}
+    })();
   }, [navigation]);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
   const [imageViewerVisible, setImageViewerVisible] = useState(false);
@@ -493,8 +527,19 @@ export default function ChatList({ navigation }) {
       }
       await removeMessagesByChatId(chatId);
       applyChatClearedPreview(chatId, scope);
+      // Delete all SQLite messages for this chat AND stamp chat_meta.cleared_at
+      // so any post-delete message from the peer never resurfaces old history.
+      try { await ChatDatabase.clearChat(chatId, Date.now()); } catch (e) { console.warn('clearChat failed', e); }
       // Remove the chat row from the list on the user's own side.
       try { await ChatDatabase.deleteChatRow(chatId); } catch (e) { console.warn('deleteChatRow failed', e); }
+      // Wipe the in-memory ChatCache — without this, openChat() finds cached
+      // messages via ChatCache.hasMessages() and re-shows the deleted history.
+      try { ChatCache.clearMessages(chatId); } catch (e) {}
+      try { ChatCache.removeChat(chatId); } catch (e) {}
+      // Forget this chatId so a future incoming message from User B is treated as
+      // a brand-new chat and triggers the hydration refetch below (otherwise the
+      // row re-appears as a bare stub with no name / avatar).
+      knownChatIdsRef.current.delete(String(chatId));
       removeChat?.(chatId);
       setDeleteModalVisible(false);
       setDeleteForEveryone(false);
@@ -506,6 +551,97 @@ export default function ChatList({ navigation }) {
       setIsDeletingChat(false);
     }
   }, [selectedChatItem, isDeletingChat, deleteForEveryone, applyChatClearedPreview, removeChat]);
+
+  const onConfirmBulkDelete = useCallback(async () => {
+    if (isBulkDeleting) return;
+    const normalizedIds = selectedChatIds
+      .map((id) => normalizeChatStorageId(id))
+      .filter(Boolean);
+    if (normalizedIds.length === 0) {
+      setBulkDeleteModalVisible(false);
+      exitSelectionMode();
+      return;
+    }
+
+    setIsBulkDeleting(true);
+    setBulkDeleteModalVisible(false);
+    setBulkDeleteProgress({ visible: true, label: `Deleting ${normalizedIds.length} chat${normalizedIds.length === 1 ? '' : 's'}...` });
+
+    let serverDeletedIds = [];
+    let serverFailed = [];
+    try {
+      // 1. Server delete (Kafka publish happens server-side as part of this call).
+      //    The response tells us EXACTLY which chats were deleted server-side.
+      const response = await apiCall('POST', 'user/chat/delete/bulk', { chatIds: normalizedIds });
+      const hasFailure = response && (response.success === false || response.status === false || response.ok === false || response.error);
+      if (hasFailure) throw new Error(response?.message || 'Bulk delete failed');
+
+      const data = response?.data || {};
+      serverDeletedIds = Array.isArray(data.deletedChatIds) ? data.deletedChatIds.map(String) : normalizedIds.map(String);
+      serverFailed = Array.isArray(data.failed) ? data.failed : [];
+
+      // 2. Local cleanup — ONLY for chats the server actually deleted.
+      //    Each step is sequential and per-chat errors are tracked so we can
+      //    report them instead of silently dropping work.
+      const clearedAt = Date.now();
+      const localErrors = [];
+      let processed = 0;
+      for (const chatId of serverDeletedIds) {
+        processed += 1;
+        setBulkDeleteProgress({
+          visible: true,
+          label: `Cleaning up ${processed} of ${serverDeletedIds.length}...`
+        });
+
+        try {
+          await removeMessagesByChatId(chatId);
+        } catch (e) { localErrors.push({ chatId, step: 'asyncStorage', error: e?.message }); }
+
+        try {
+          applyChatClearedPreview(chatId, 'me');
+        } catch (e) { localErrors.push({ chatId, step: 'previewReset', error: e?.message }); }
+
+        // SQLite messages delete + tombstone — this is what guarantees that
+        // re-deleting after a peer message works the same as the first delete.
+        try {
+          await ChatDatabase.clearChat(chatId, clearedAt);
+        } catch (e) { localErrors.push({ chatId, step: 'sqliteClearChat', error: e?.message }); }
+
+        try {
+          await ChatDatabase.deleteChatRow(chatId);
+        } catch (e) { localErrors.push({ chatId, step: 'sqliteDeleteRow', error: e?.message }); }
+
+        // Wipe in-memory ChatCache so openChat() can't surface deleted messages
+        // from the cache after the chat is re-created by a new peer message.
+        try { ChatCache.clearMessages(chatId); } catch (e) { localErrors.push({ chatId, step: 'cacheClearMessages', error: e?.message }); }
+        try { ChatCache.removeChat(chatId); } catch (e) { localErrors.push({ chatId, step: 'cacheRemoveChat', error: e?.message }); }
+
+        try { knownChatIdsRef.current.delete(String(chatId)); } catch (e) {}
+        try { removeChat?.(chatId); } catch (e) {}
+      }
+
+      if (localErrors.length > 0) {
+        console.warn('[bulkDelete] partial local cleanup errors', localErrors);
+      }
+
+      exitSelectionMode();
+
+      // 3. Surface partial server failures explicitly
+      if (serverFailed.length > 0) {
+        const failedNames = serverFailed.map((f) => f?.chatId).filter(Boolean).join(', ');
+        Alert.alert(
+          'Some chats not deleted',
+          `Deleted ${serverDeletedIds.length} chat(s). ${serverFailed.length} could not be deleted${failedNames ? ` (${failedNames})` : ''}. Please try again.`
+        );
+      }
+    } catch (error) {
+      console.error('Bulk chat delete failed', error);
+      Alert.alert('Delete Chats', error?.message || 'Could not delete the selected chats. Please try again.');
+    } finally {
+      setBulkDeleteProgress({ visible: false, label: '' });
+      setIsBulkDeleting(false);
+    }
+  }, [selectedChatIds, isBulkDeleting, applyChatClearedPreview, removeChat, exitSelectionMode]);
 
   useEffect(() => {
     if (Array.isArray(chatsData)) {
@@ -702,23 +838,58 @@ export default function ChatList({ navigation }) {
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: theme.colors.background }]}>
 
-      {/* ─── HEADER ─── */}
+      {/* ─── SELECTION HEADER (multi-select mode) ─── */}
+      {selectionMode ? (
+        <View style={[styles.header, { backgroundColor: theme.colors.themeColor + '14' }]}>
+          <View style={styles.headerLeft}>
+            <TouchableOpacity
+              onPress={exitSelectionMode}
+              activeOpacity={0.6}
+              style={[styles.headerBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}
+            >
+              <Ionicons name="close" size={20} color={theme.colors.primaryTextColor} />
+            </TouchableOpacity>
+            <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor, fontSize: 18 }]}>
+              {selectedChatIds.length} selected
+            </Text>
+          </View>
+          <View style={styles.headerRight}>
+            <TouchableOpacity
+              onPress={() => {
+                const allIds = filteredChats.map((c) => c?.chatId || c?._id).filter(Boolean);
+                setSelectedChatIds(allIds);
+              }}
+              activeOpacity={0.6}
+              style={[styles.headerBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}
+            >
+              <MaterialCommunityIcons name="select-all" size={18} color={theme.colors.primaryTextColor} />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => {
+                if (selectedChatIds.length === 0) return;
+                setBulkDeleteModalVisible(true);
+              }}
+              activeOpacity={0.6}
+              style={[styles.headerBtn, { backgroundColor: '#E06A6A22' }]}
+            >
+              <MaterialCommunityIcons name="delete-outline" size={20} color="#E06A6A" />
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <View style={{ width:50, height:50, }} >
-            <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={{ width:50, height:50 }} />
+          <View style={styles.headerLogoWrap}>
+            <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
           </View>
-          {/* <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>
-            <Text style={{ color: theme.colors.themeColor, fontSize: 22, fontFamily: 'Roboto-SemiBold' }}>{name.slice(0,4)}</Text>
-            <Text style={{ color: theme.colors.themeColor, fontSize: 22, fontFamily: 'Roboto-Regular' }}>{name.slice(4)}</Text>
-          </Text> */}
-          {/* {Number(realtimeState?.totalUnread || 0) > 0 && (
+          <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>{name}</Text>
+          {Number(realtimeState?.totalUnread || 0) > 0 && (
             <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Text style={styles.unreadBadgeText}>
                 {Number(realtimeState.totalUnread) > 99 ? '99+' : Number(realtimeState.totalUnread)}
               </Text>
             </View>
-          )} */}
+          )}
         </View>
 
         <View style={styles.headerRight}>
@@ -758,6 +929,7 @@ export default function ChatList({ navigation }) {
           </Menu>
         </View>
       </View>
+      )}
 
       {/* ─── PINNED: Search bar + filter pills (do NOT scroll with the list) ─── */}
       {pinnedSearchAndFilters}
@@ -775,14 +947,36 @@ export default function ChatList({ navigation }) {
           <FlatList
             data={filteredChats}
             keyExtractor={(item) => String(item?.chatId || item?._id)}
-            renderItem={({ item }) => (
+            renderItem={({ item }) => {
+              const itemChatId = item?.chatId || item?._id;
+              const isSelected = selectionMode && selectedChatIds.includes(itemChatId);
+              return (
+              <View style={isSelected ? { backgroundColor: theme.colors.themeColor + '22' } : null}>
               <ChatCard
                 item={item}
                 theme={theme}
                 openSwipeableRef={openSwipeableRef}
-                onPress={() => openChat(item)}
-                onLongPress={() => openActionMenu(item)}
-                onAvatarPress={() => openProfilePreview(item)}
+                onPress={() => {
+                  if (selectionMode) {
+                    toggleChatSelection(itemChatId);
+                  } else {
+                    openChat(item);
+                  }
+                }}
+                onLongPress={() => {
+                  if (selectionMode) {
+                    toggleChatSelection(itemChatId);
+                  } else {
+                    enterSelectionMode(itemChatId);
+                  }
+                }}
+                onAvatarPress={() => {
+                  if (selectionMode) {
+                    toggleChatSelection(itemChatId);
+                  } else {
+                    openProfilePreview(item);
+                  }
+                }}
                 onSwipePin={() => {
                   const ct = item?.chatType || 'private';
                   if (item?.isPinned) unpinChat(item?.chatId || item?._id, ct);
@@ -805,7 +999,16 @@ export default function ChatList({ navigation }) {
                 getLastMessageText={getLastMessageText}
                 renderMessageStatus={renderMessageStatus}
               />
-            )}
+              {isSelected && (
+                <View style={styles.selectionCheckOverlay} pointerEvents="none">
+                  <View style={[styles.selectionCheckCircle, { backgroundColor: theme.colors.themeColor }]}>
+                    <Ionicons name="checkmark" size={14} color="#fff" />
+                  </View>
+                </View>
+              )}
+              </View>
+              );
+            }}
             showsVerticalScrollIndicator={false}
             refreshing={refreshing}
             onRefresh={handleRefresh}
@@ -978,8 +1181,77 @@ export default function ChatList({ navigation }) {
         </TouchableOpacity>
       </Modal>
 
+      {/* ─── BLOCKING DELETE PROGRESS OVERLAY ─── */}
+      <Modal
+        animationType="fade"
+        transparent
+        visible={bulkDeleteProgress.visible}
+        statusBarTranslucent
+        onRequestClose={() => { /* swallow back-press during delete */ }}
+      >
+        <View style={styles.deleteProgressOverlay}>
+          <View style={[styles.deleteProgressCard, { backgroundColor: theme.colors.cardBackground }]}>
+            <ActivityIndicator size="large" color={theme.colors.themeColor} />
+            <Text style={[styles.deleteProgressLabel, { color: theme.colors.primaryTextColor }]}>
+              {bulkDeleteProgress.label || 'Deleting...'}
+            </Text>
+            <Text style={[styles.deleteProgressHint, { color: theme.colors.placeHolderTextColor }]}>
+              Please wait — do not close the app
+            </Text>
+          </View>
+        </View>
+      </Modal>
+
+      {/* ─── BULK DELETE MODAL ─── */}
+      <Modal
+        animationType="fade"
+        transparent
+        visible={bulkDeleteModalVisible}
+        onRequestClose={() => { if (!isBulkDeleting) setBulkDeleteModalVisible(false); }}
+      >
+        <TouchableOpacity
+          activeOpacity={1}
+          onPress={() => { if (!isBulkDeleting) setBulkDeleteModalVisible(false); }}
+          style={styles.deleteOverlay}
+        >
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+            <View style={styles.deleteIconWrap}>
+              <MaterialCommunityIcons name="delete-alert-outline" size={30} color="#E06A6A" />
+            </View>
+            <Text style={[styles.deleteTitle, { color: theme.colors.primaryTextColor }]}>
+              Delete {selectedChatIds.length} chat{selectedChatIds.length === 1 ? '' : 's'}?
+            </Text>
+            <Text style={[styles.deleteSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+              The selected chats will be removed from your device. Other participants will still see them.
+            </Text>
+
+            <View style={styles.deleteActions}>
+              <TouchableOpacity
+                onPress={() => setBulkDeleteModalVisible(false)}
+                disabled={isBulkDeleting}
+                activeOpacity={0.7}
+                style={[styles.deleteCancelBtn, { borderColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)' }]}
+              >
+                <Text style={[styles.deleteCancelText, { color: theme.colors.primaryTextColor }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={onConfirmBulkDelete}
+                disabled={isBulkDeleting}
+                activeOpacity={0.7}
+                style={styles.deleteConfirmBtn}
+              >
+                {isBulkDeleting ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.deleteConfirmText}>Delete</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
+
       {/* ─── PROFILE PREVIEW MODAL ─── */}
-      {/* Profile Preview Modal — WhatsApp-style (matches AddUser) */}
       <Modal transparent visible={profilePreviewVisible} onRequestClose={closeProfilePreview} statusBarTranslucent>
         <TouchableOpacity onPress={closeProfilePreview} activeOpacity={1} style={styles.profileOverlay}>
           <Animated.View style={[
@@ -994,18 +1266,18 @@ export default function ChatList({ navigation }) {
               {previewImage ? (
                 <TouchableOpacity
                   activeOpacity={0.9}
-                  style={{ width: '100%', height: '100%' }}
+                  style={styles.profileImageInner}
                   onPress={() => {
                     closeProfilePreview();
                     setTimeout(() => setImageViewerVisible(true), 250);
                   }}
                 >
-                  <Image resizeMode="cover" source={{ uri: previewImage }} style={{ width: '100%', height: '100%' }} fadeDuration={0} />
+                  <Image resizeMode="cover" source={{ uri: previewImage }} style={styles.profileImageInner} fadeDuration={0} />
                 </TouchableOpacity>
               ) : (
                 <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
                   {isPreviewGroup ? (
-                    <Ionicons name="people" size={48} color="#fff" />
+                    <Ionicons name="people" size={64} color="#fff" />
                   ) : (
                     <Text style={styles.profileFallbackText}>
                       {(previewName || '?').charAt(0).toUpperCase()}
@@ -1014,12 +1286,15 @@ export default function ChatList({ navigation }) {
                 </View>
               )}
 
-              {/* Name overlay */}
+              {/* Name + meta overlay */}
               <View style={styles.profileNameOverlay}>
                 <Text style={styles.profileNameText} numberOfLines={1}>{previewName}</Text>
+                <Text style={styles.profileMetaText} numberOfLines={1}>
+                  {isPreviewGroup ? 'Group' : 'Tap photo to view full size'}
+                </Text>
               </View>
 
-              {/* Action buttons — top right corner */}
+              {/* Action buttons */}
               <View style={styles.profileActions}>
                 <TouchableOpacity
                   onPress={() => {
@@ -1079,14 +1354,14 @@ export default function ChatList({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              <ImageZoom
+              {/* <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              />
+              /> */}
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>
@@ -1116,8 +1391,8 @@ const styles = StyleSheet.create({
   // ─── HEADER ───
   header: {
     flexDirection: 'row',
-    paddingHorizontal: 20,
-    paddingTop: 14,
+    paddingHorizontal: 16,
+    paddingTop: 10,
     paddingBottom: 8,
     justifyContent: 'space-between',
     alignItems: 'center',
@@ -1125,50 +1400,110 @@ const styles = StyleSheet.create({
   headerLeft: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 10,
   },
+  headerLogoWrap: {
+    width: 38, height: 38, borderRadius: 12,
+    overflow: 'hidden',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  headerLogoImg: { width: 38, height: 38 },
   headerTitle: {
-    fontSize: 24,
-    fontFamily: 'Roboto-SemiBold',
+    fontSize: 22,
+    fontFamily: 'Roboto-Bold',
+    letterSpacing: -0.4,
     textTransform: 'capitalize',
-    letterSpacing: 0.2,
   },
   unreadBadge: {
-    minWidth: 20,
-    height: 20,
-    paddingHorizontal: 6,
-    borderRadius: 10,
+    minWidth: 22,
+    height: 22,
+    paddingHorizontal: 7,
+    borderRadius: 11,
     alignItems: 'center',
     justifyContent: 'center',
   },
   unreadBadgeText: {
-    fontSize: 10,
+    fontSize: 11,
     fontFamily: 'Roboto-SemiBold',
     color: '#fff',
+    letterSpacing: 0.2,
   },
   headerRight: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 8,
   },
   headerBtn: {
-    width: 38,
-    height: 38,
+    width: 40,
+    height: 40,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 19,
+    borderRadius: 14,
   },
   menuContent: {
-    borderRadius: 14,
-    marginTop: 4,
-    elevation: 6,
+    borderRadius: 16,
+    marginTop: 6,
+    paddingVertical: 4,
+    elevation: 8,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.12,
-    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.16,
+    shadowRadius: 14,
   },
   menuItemText: {
-    fontFamily: 'Roboto-Regular',
+    fontFamily: 'Roboto-Medium',
     fontSize: 14,
+  },
+
+  // ─── DELETE PROGRESS OVERLAY ───
+  deleteProgressOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 40,
+  },
+  deleteProgressCard: {
+    width: '100%',
+    maxWidth: 320,
+    borderRadius: 18,
+    paddingVertical: 28,
+    paddingHorizontal: 22,
+    alignItems: 'center',
+    gap: 14,
+    elevation: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+  },
+  deleteProgressLabel: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 15,
+    letterSpacing: 0.2,
+    textAlign: 'center',
+  },
+  deleteProgressHint: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    letterSpacing: 0.2,
+    textAlign: 'center',
+  },
+
+  // ─── SELECTION OVERLAY ───
+  selectionCheckOverlay: {
+    position: 'absolute',
+    left: 50,
+    top: 38,
+  },
+  selectionCheckCircle: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#fff',
   },
 
   // ─── LIST ───
@@ -1183,33 +1518,33 @@ const styles = StyleSheet.create({
   pinnedHeaderWrap: {
     paddingHorizontal: 16,
     paddingTop: 4,
-    paddingBottom: 4,
+    paddingBottom: 6,
   },
   listContent: {
     flexGrow: 1,
-    paddingBottom: 90,
+    paddingBottom: 100,
   },
   loadingWrap: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     paddingBottom: 80,
-    gap: 12,
+    gap: 14,
   },
   loadingText: {
     fontFamily: 'Roboto-Regular',
     fontSize: 13,
+    letterSpacing: 0.2,
   },
 
   // ─── SEARCH ───
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 24,
+    borderRadius: 14,
     paddingHorizontal: 14,
-    height: 40,
-    gap: 8,
-    marginBottom: 4,
+    height: 46,
+    gap: 10,
   },
   searchInput: {
     flex: 1,
@@ -1217,11 +1552,12 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto-Regular',
     paddingVertical: 0,
     height: '100%',
+    letterSpacing: 0.1,
   },
   searchClearCircle: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -1231,64 +1567,69 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    paddingTop: 6,
-    paddingBottom: 4,
+    paddingTop: 10,
+    paddingBottom: 6,
   },
   filterPill: {
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 12,
   },
   filterPillText: {
-    fontSize: 13,
-    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+    fontFamily: 'Roboto-SemiBold',
+    letterSpacing: 0.3,
   },
 
   // ─── ARCHIVE ROW ───
   archiveRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 4,
-    paddingVertical: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
     gap: 12,
+    borderRadius: 14,
+    marginTop: 8,
+    marginBottom: 2,
   },
   archiveIconWrap: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 38,
+    height: 38,
+    borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
   },
   archiveLabel: {
-    fontFamily: 'Roboto-Medium',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 14,
     flex: 1,
   },
   archiveCount: {
-    fontFamily: 'Roboto-Regular',
+    fontFamily: 'Roboto-Medium',
     fontSize: 12,
-    marginRight: 2,
+    marginRight: 4,
   },
 
   // ─── EMPTY STATE ───
   emptyWrap: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 100,
+    paddingTop: 110,
     paddingHorizontal: 40,
   },
   emptyIconCircle: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
+    width: 96,
+    height: 96,
+    borderRadius: 32,
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 18,
+    marginBottom: 20,
   },
   emptyTitle: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 17,
-    marginBottom: 6,
+    fontFamily: 'Roboto-Bold',
+    fontSize: 18,
+    marginBottom: 8,
+    letterSpacing: -0.2,
   },
   emptySubtitle: {
     fontFamily: 'Roboto-Regular',
@@ -1302,16 +1643,16 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 24,
     right: 20,
-    width: 56,
-    height: 56,
-    borderRadius: 16,
+    width: 60,
+    height: 60,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
-    elevation: 6,
+    elevation: 10,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.2,
-    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.28,
+    shadowRadius: 14,
   },
 
   // ─── ACTION SHEET ───
@@ -1524,26 +1865,33 @@ const styles = StyleSheet.create({
   },
 
   // ─── PROFILE PREVIEW MODAL ───
+  profileBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
   profileOverlay: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: 'transparent',
+    paddingHorizontal: 30,
   },
   profileCard: {
-    width: SCREEN_WIDTH * 0.60,
-    borderRadius: 6,
+    width: SCREEN_WIDTH * 0.78,
+    maxWidth: 360,
+    borderRadius: 24,
     overflow: 'hidden',
-    elevation: 10,
+    elevation: 16,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.4,
+    shadowRadius: 24,
   },
   profileImageWrap: {
     width: '100%',
     aspectRatio: 1,
   },
+  profileImageInner: { width: '100%', height: '100%' },
   profileFallback: {
     width: '100%',
     height: '100%',
@@ -1552,35 +1900,56 @@ const styles = StyleSheet.create({
   },
   profileFallbackText: {
     color: '#fff',
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 60,
+    fontFamily: 'Roboto-Bold',
+    fontSize: 88,
+    letterSpacing: -2,
+  },
+  profileNameGradient: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 90,
+    justifyContent: 'flex-end',
   },
   profileNameOverlay: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingHorizontal: 18,
+    paddingTop: 14,
+    paddingBottom: 16,
   },
   profileNameText: {
     color: '#fff',
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 17,
+    fontFamily: 'Roboto-Bold',
+    fontSize: 20,
+    letterSpacing: -0.3,
+    textShadowColor: 'rgba(0,0,0,0.4)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  profileMetaText: {
+    color: 'rgba(255,255,255,0.78)',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 2,
   },
   profileActions: {
     position: 'absolute',
-    top: 8,
-    right: 8,
+    top: 12,
+    right: 12,
     flexDirection: 'row',
     gap: 8,
   },
   profileActionBtn: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     backgroundColor: 'rgba(0,0,0,0.45)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.18)',
     alignItems: 'center',
     justifyContent: 'center',
   },

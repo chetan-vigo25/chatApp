@@ -1018,7 +1018,7 @@ export default function AddUser({ navigation }) {
                 <Image
                   resizeMode="cover"
                   source={{ uri: selectedChatItem?.profilePicture || selectedChatItem?.profileImage }}
-                  style={{ width: '100%', height: '100%' }}
+                  style={styles.modalImageInner}
                   fadeDuration={0}
                 />
               ) : (
@@ -1033,6 +1033,9 @@ export default function AddUser({ navigation }) {
                 <Text style={styles.modalName} numberOfLines={1}>
                   {selectedChatItem?.fullName || selectedChatItem?.name || 'Unknown'}
                 </Text>
+                <Text style={styles.modalMeta} numberOfLines={1}>
+                  {selectedChatItem?.type === 'registered' ? `On ${APP_TAG_NAME}` : 'From your contacts'}
+                </Text>
               </View>
 
               {selectedChatItem?.type === "registered" && (
@@ -1045,7 +1048,7 @@ export default function AddUser({ navigation }) {
                     activeOpacity={0.8}
                     style={styles.modalActionBtn}
                   >
-                    <MaterialCommunityIcons name="message-reply-text-outline" size={22} color="#fff" />
+                    <MaterialCommunityIcons name="message-reply-text-outline" size={20} color="#fff" />
                   </TouchableOpacity>
                   <TouchableOpacity
                     onPress={() => {
@@ -1055,7 +1058,7 @@ export default function AddUser({ navigation }) {
                     activeOpacity={0.8}
                     style={styles.modalActionBtn}
                   >
-                    <Ionicons name="information-circle-outline" size={22} color="#fff" />
+                    <Ionicons name="information-circle-outline" size={20} color="#fff" />
                   </TouchableOpacity>
                 </View>
               )}
@@ -1076,16 +1079,17 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 6,
-    paddingVertical: 10,
-    gap: 4,
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    paddingBottom: 12,
+    gap: 8,
   },
   headerBackBtn: {
     width: 42,
     height: 42,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 21,
+    borderRadius: 12,
   },
   headerTitleWrap: {
     flex: 1,
@@ -1094,26 +1098,26 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   headerTitle: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 18,
-    letterSpacing: 0.2,
+    fontFamily: 'Roboto-Bold',
+    fontSize: 22,
+    letterSpacing: -0.3,
   },
   headerSubtitle: {
     fontFamily: 'Roboto-Regular',
     fontSize: 12,
-    marginTop: -2,
+    marginTop: 1,
   },
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 2,
+    gap: 4,
   },
   headerActionBtn: {
     width: 40,
     height: 40,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 20,
+    borderRadius: 12,
   },
 
   // ─── COLLAPSIBLE (SEARCH + NEW CONTACT) ───
@@ -1122,14 +1126,14 @@ const styles = StyleSheet.create({
   },
   searchBarOuter: {
     paddingHorizontal: 14,
-    paddingTop: 2,
-    paddingBottom: 8,
+    paddingTop: 4,
+    paddingBottom: 10,
   },
   searchBarInner: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 25,
-    height: 44,
+    borderRadius: 14,
+    height: 48,
   },
   searchInput: {
     flex: 1,
@@ -1137,25 +1141,25 @@ const styles = StyleSheet.create({
     fontSize: 14,
     paddingHorizontal: 10,
     paddingVertical: 0,
-    height: 44,
+    height: 48,
   },
   newContactBtn: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingVertical: 12,
     gap: 14,
   },
   newContactIcon: {
     width: 42,
     height: 42,
-    borderRadius: 21,
+    borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
   },
   newContactText: {
     flex: 1,
-    fontFamily: 'Roboto-Medium',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 15,
   },
 
@@ -1180,24 +1184,25 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 8,
+    paddingHorizontal: 22,
+    paddingTop: 16,
+    paddingBottom: 10,
   },
   sectionHeaderText: {
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 13,
-    letterSpacing: 0.5,
+    fontSize: 11,
+    letterSpacing: 1.2,
     textTransform: 'uppercase',
   },
   sectionBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 2,
+    paddingHorizontal: 9,
+    paddingVertical: 3,
     borderRadius: 10,
   },
   sectionBadgeText: {
-    fontFamily: 'Roboto-Medium',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 11,
+    letterSpacing: 0.3,
   },
   sectionEmptyText: {
     fontFamily: 'Roboto-Regular',
@@ -1364,26 +1369,33 @@ const styles = StyleSheet.create({
   },
 
   // ─── MODAL ───
+  modalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
   modalOverlay: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: 'transparent',
+    paddingHorizontal: 30,
   },
   modalCard: {
-    width: SCREEN_WIDTH * 0.60,
-    borderRadius: 6,
+    width: SCREEN_WIDTH * 0.78,
+    maxWidth: 360,
+    borderRadius: 24,
     overflow: 'hidden',
-    elevation: 10,
+    elevation: 16,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.3,
-    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.4,
+    shadowRadius: 24,
   },
   modalImageWrap: {
     width: '100%',
     aspectRatio: 1,
   },
+  modalImageInner: { width: '100%', height: '100%' },
   modalFallback: {
     width: '100%',
     height: '100%',
@@ -1392,35 +1404,56 @@ const styles = StyleSheet.create({
   },
   modalFallbackText: {
     color: '#fff',
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 60,
+    fontFamily: 'Roboto-Bold',
+    fontSize: 88,
+    letterSpacing: -2,
+  },
+  modalNameGradient: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: 90,
+    justifyContent: 'flex-end',
   },
   modalNameOverlay: {
     position: 'absolute',
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingHorizontal: 18,
+    paddingTop: 14,
+    paddingBottom: 16,
   },
   modalName: {
     color: '#fff',
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 17,
+    fontFamily: 'Roboto-Bold',
+    fontSize: 20,
+    letterSpacing: -0.3,
+    textShadowColor: 'rgba(0,0,0,0.4)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
+  },
+  modalMeta: {
+    color: 'rgba(255,255,255,0.78)',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 2,
   },
   modalActions: {
     position: 'absolute',
-    bottom: 52,
-    right: 10,
+    top: 12,
+    right: 12,
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
   },
   modalActionBtn: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.18)',
     alignItems: 'center',
     justifyContent: 'center',
   },

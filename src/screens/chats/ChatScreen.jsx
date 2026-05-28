@@ -32,7 +32,7 @@ import * as Location from "expo-location";
 import * as Contacts from "expo-contacts";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
-import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, Entypo } from "@expo/vector-icons";
+import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -43,7 +43,7 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
@@ -54,12 +54,17 @@ import MentionText from '../../components/MentionText';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
 import ScheduleTimePicker from '../../components/ScheduleTimePicker';
 import ReplyBubble from '../../components/ReplyBubble';
+import StatusReplyPreview from '../../components/StatusReplyPreview';
+import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import LocationBubble from '../../components/LocationBubble';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
 import SaveContactBanner from '../../components/SaveContactBanner';
 import useSaveContact from '../../hooks/useSaveContact';
+import useContactDirectory from '../../hooks/useContactDirectory';
+import * as ScreenCapture from 'expo-screen-capture';
+import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -195,11 +200,9 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
         flexDirection: 'row',
         alignItems: 'flex-end',
         paddingHorizontal: 10,
-        paddingTop: 6,
-        paddingBottom: Platform.OS === 'ios' ? 10 : 8,
-        backgroundColor: theme.colors.cardBackground,
-        // borderTopWidth: 1,
-        borderTopColor: theme.colors.borderColor,
+        paddingTop: 8,
+        paddingBottom: Platform.OS === 'ios' ? 12 : 10,
+        backgroundColor: theme.colors.background,
         overflow: 'visible',
         borderWidth: 0,
         zIndex: 10,
@@ -213,15 +216,16 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           borderRadius: 26,
           paddingHorizontal: 8,
           paddingVertical: 2,
-          backgroundColor: theme.colors.menuBackground,
-          borderWidth: 0.5,
-          borderColor: isInputFocused ? theme.colors.themeColor : theme.colors.borderColor,
+          backgroundColor: theme.colors.cardBackground,
+          borderWidth: 1.5,
+          borderColor: isInputFocused ? theme.colors.themeColor : 'transparent',
           justifyContent: 'center',
           overflow: 'hidden',
           shadowColor: '#000',
-          shadowOffset: { width: 0, height: 2 },
-          shadowOpacity: 0.2,
-          shadowRadius: 4,
+          shadowOffset: { width: 0, height: 3 },
+          shadowOpacity: 0.08,
+          shadowRadius: 8,
+          elevation: 2,
         }}
       >
 
@@ -347,18 +351,16 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
             height: 52,
             borderRadius: 26,
             backgroundColor: ((!text.trim() && !pendingMedia) || isSearching)
-              ? (chatColor ||  'rgba(37, 160, 235, 0.74)' )
+              ? (chatColor || 'rgba(37, 160, 235, 0.74)')
               : (chatColor || '#1DA1F2'),
             alignItems: 'center',
             justifyContent: 'center',
             opacity: 1,
-            borderWidth: 2,
-            borderColor: 'rgba(0,0,0,0.18)',
-            shadowColor: '#0B4667',
-            shadowOffset: { width: 0, height: 3 },
-            shadowOpacity: 0.3,
-            shadowRadius: 6,
-            elevation: 7,
+            shadowColor: chatColor || '#0B4667',
+            shadowOffset: { width: 0, height: 6 },
+            shadowOpacity: 0.42,
+            shadowRadius: 10,
+            elevation: 8,
           }}
         >
           <Animated.View
@@ -684,7 +686,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
             <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On VibeConnect</Text>
+            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On VibeConnect Messenger</Text>
           </View>
         )}
 
@@ -754,6 +756,132 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
   );
 });
 
+// ─── Chat menu sheet — polished bottom sheet item ──────────────────────
+// A single tappable row inside the redesigned 3-dot menu. Uses a tinted
+// circular icon + label (+ optional sublabel) to match the production design
+// vocabulary already established by the ChatList action sheet.
+const ChatMenuItem = ({ label, sublabel, onPress, theme, isDanger = false }) => (
+  <TouchableOpacity onPress={onPress} activeOpacity={0.7} style={chatMenuStyles.menuItem}>
+    <View style={{ flex: 1 }}>
+      <Text style={[chatMenuStyles.menuItemLabel, { color: isDanger ? '#E06A6A' : theme.colors.primaryTextColor }]}>
+        {label}
+      </Text>
+      {sublabel ? (
+        <Text style={[chatMenuStyles.menuItemSub, { color: theme.colors.placeHolderTextColor }]}>
+          {sublabel}
+        </Text>
+      ) : null}
+    </View>
+  </TouchableOpacity>
+);
+
+const chatMenuStyles = StyleSheet.create({
+  // Popover container — fills the screen so taps outside dismiss
+  popoverRoot: {
+    flex: 1,
+    backgroundColor: 'transparent',
+  },
+  // The dropdown card itself — anchored near the top-right where the 3-dot
+  // button lives. Compact width, soft elevation, hairline border for a
+  // premium feel in both light and dark themes.
+  popoverCard: {
+    position: 'absolute',
+    top: Platform.select({ ios: 92, android: 80 }),
+    right: 10,
+    // Size to content — no fixed width. minWidth keeps short labels readable;
+    // maxWidth caps a long label from stretching across the screen.
+    minWidth: 170,
+    maxWidth: 260,
+    borderRadius: 16,
+    paddingVertical: 6,
+    borderWidth: StyleSheet.hairlineWidth,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.22,
+    shadowRadius: 22,
+    elevation: 18,
+  },
+  popoverDivider: {
+    height: StyleSheet.hairlineWidth,
+    marginVertical: 6,
+    marginHorizontal: 10,
+  },
+
+  // Menu item rows — text-only, WhatsApp-style compact list
+  menuItem: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 10,
+    marginHorizontal: 4,
+  },
+  menuItemLabel: { fontFamily: 'Roboto-Medium', fontSize: 14.5, letterSpacing: 0.1 },
+  menuItemSub: { fontFamily: 'Roboto-Regular', fontSize: 11.5, letterSpacing: 0.2, marginTop: 2 },
+
+  // Confirm modal
+  confirmOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 28,
+  },
+  confirmCard: {
+    width: '100%',
+    maxWidth: 360,
+    borderRadius: 22,
+    paddingVertical: 24,
+    paddingHorizontal: 22,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    elevation: 14,
+  },
+  confirmIconWrap: {
+    width: 60,
+    height: 60,
+    borderRadius: 20,
+    backgroundColor: '#E06A6A18',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  confirmTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 17, letterSpacing: 0.1, textAlign: 'center' },
+  confirmSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    lineHeight: 19,
+    letterSpacing: 0.2,
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  confirmActions: {
+    flexDirection: 'row',
+    width: '100%',
+    gap: 10,
+    marginTop: 22,
+  },
+  confirmCancelBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 14,
+    borderWidth: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  confirmCancelText: { fontFamily: 'Roboto-SemiBold', fontSize: 14, letterSpacing: 0.2 },
+  confirmDangerBtn: {
+    flex: 1,
+    height: 46,
+    borderRadius: 14,
+    backgroundColor: '#E06A6A',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  confirmDangerText: { fontFamily: 'Roboto-SemiBold', fontSize: 14, color: '#fff', letterSpacing: 0.2 },
+});
+
 export default function ChatScreen({ navigation, route }) {
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
@@ -796,6 +924,94 @@ export default function ChatScreen({ navigation, route }) {
     handleReportChat();
   };
 
+  // Tap the status-reply preview pill in a chat bubble → open the StatusViewer
+  // for that owner. We try the live status first so the viewer can render the
+  // full slideshow (with reactions, viewers, etc.). If that fails for any
+  // reason (expired, network, auth) we silently fall back to a single-card
+  // viewer seeded from the snapshot we captured at reply-time, so the user
+  // still sees the status they originally replied to.
+  const handleOpenStatusFromChat = useCallback(async (statusRef, statusPreview) => {
+    const buildSnapshotStatus = () => ({
+      _id:         statusRef,
+      ownerId:     statusPreview?.ownerId || null,
+      mediaItems: [{
+        _id:          `${statusRef}_snap`,
+        mediaType:    statusPreview?.mediaType || 'text',
+        mediaUrl:     statusPreview?.mediaUrl || null,
+        thumbnailUrl: statusPreview?.thumbnailUrl || statusPreview?.mediaUrl || null,
+        order:        0,
+      }],
+      caption:     statusPreview?.text || null,
+      textContent: statusPreview?.text || null,
+      bgColor:     statusPreview?.backgroundColor || '#075e54',
+      createdAt:   statusPreview?.createdAt || new Date().toISOString(),
+      expiresAt:   null,
+      viewCount:   0,
+      likeCount:   0,
+      dislikeCount: 0,
+      replyCount:  0,
+      myReaction:  null,
+      _isExpiredSnapshot: true,
+    });
+
+    const ownerIdForResolve = String(statusPreview?.ownerId || '');
+    const isOwnStatusNav = currentUserId && ownerIdForResolve === String(currentUserId);
+    const resolvedNavName = isOwnStatusNav
+      ? (statusPreview?.ownerName || 'You')
+      : resolveContactName(
+          ownerIdForResolve,
+          statusPreview?.ownerName,
+          statusPreview?.ownerPhone || statusPreview?.phone
+        );
+
+    const navigateWithSnapshot = () => {
+      const fallback = buildSnapshotStatus();
+      navigation.navigate('StatusViewer', {
+        statuses:   [fallback],
+        startIndex: 0,
+        isMine:     isOwnStatusNav,
+        userName:   resolvedNavName,
+        userImage:  '',
+        userId:     ownerIdForResolve,
+      });
+    };
+
+    try {
+      const resp = await statusServices.getStatusById(statusRef);
+      const live = resp?.data?.status || resp?.data;
+
+      if (live && (live._id || live.id)) {
+        const ownerIdStr = String(live.ownerId?._id || live.ownerId || statusPreview?.ownerId || '');
+        const isMine     = currentUserId && String(currentUserId) === ownerIdStr;
+        // Prefer the saved contact name; fall back to live profile name, then
+        // the snapshot's server name. Phone number is used if none are saved.
+        const liveName = isMine
+          ? (live.ownerId?.fullName || 'You')
+          : resolveContactName(
+              ownerIdStr,
+              live.ownerId?.fullName || statusPreview?.ownerName,
+              live.ownerId?.mobile?.number || statusPreview?.ownerPhone
+            );
+        navigation.navigate('StatusViewer', {
+          statuses:  [live],
+          startIndex: 0,
+          isMine,
+          userName:  liveName,
+          userImage: live.ownerId?.profileImage || '',
+          userId:    ownerIdStr,
+        });
+        return;
+      }
+
+      // Live fetch returned null/empty (expired, hidden, etc.) — silently use
+      // the snapshot. The viewer will render the preview without the live-only
+      // affordances (reactions, view count) which is fine for an old status.
+      navigateWithSnapshot();
+    } catch {
+      navigateWithSnapshot();
+    }
+  }, [navigation, currentUserId, resolveContactName]);
+
   const { theme, chatColor, isDarkMode } = useTheme();
   const { isConnected, networkType } = useNetwork();
   const { width: windowWidth } = useWindowDimensions();
@@ -805,6 +1021,17 @@ export default function ChatScreen({ navigation, route }) {
   const [isAtLatest, setIsAtLatest] = useState(true);
   const [showSearchBar, setShowSearchBar] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  // WhatsApp-style dropdown — pop-in from the top-right corner via combined
+  // scale + opacity. Origin is set so the transform appears to grow out of
+  // the 3-dot button rather than from the center.
+  const menuScaleAnim = useRef(new Animated.Value(0.85)).current;
+  const menuOpacityAnim = useRef(new Animated.Value(0)).current;
+  // Clear-chat confirmation modal (delete for me)
+  const [clearChatModalVisible, setClearChatModalVisible] = useState(false);
+  const [isClearingChat, setIsClearingChat] = useState(false);
+  // Delete-for-everyone confirmation modal (soft-deletes the chat on both sides)
+  const [deleteEveryoneModalVisible, setDeleteEveryoneModalVisible] = useState(false);
+  const [isDeletingEveryone, setIsDeletingEveryone] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [newMessagesCount, setNewMessagesCount] = useState(0);
   const [inputHeight, setInputHeight] = useState(34);
@@ -1314,6 +1541,68 @@ export default function ChatScreen({ navigation, route }) {
   // Sync chatData to ref for callbacks declared before destructuring (web TDZ fix)
   useEffect(() => { chatDataRef.current = chatData; }, [chatData]);
 
+  // Screenshot detection — notifies the peer that this user captured the chat.
+  // Silent for the screenshotter (the system message is hidden on their side
+  // server-side via deletedFor + skipped chat-summary update).
+  //
+  // Why permissions: on Android, expo-screen-capture's listener is backed by a
+  // ContentObserver on MediaStore. Without READ_MEDIA_IMAGES / READ_EXTERNAL_STORAGE
+  // the observer never receives change notifications, so the listener silently
+  // never fires — that's the "some devices don't notify" bug. We request the
+  // permission lazily right before subscribing.
+  useEffect(() => {
+    const isGroup = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+    if (isGroup) return undefined;
+
+    const peerId = chatData?.peerUser?._id || chatData?.peerUserId;
+    const cid = chatData?.chatId || chatData?._id || route?.params?.chatId;
+    if (!peerId || !cid) return undefined;
+
+    let sub = null;
+    let cancelled = false;
+
+    const onScreenshot = () => {
+      try {
+        const socket = getSocket();
+        if (socket && isSocketConnected()) {
+          socket.emit('chat:screenshot', {
+            chatId: String(cid),
+            receiverId: String(peerId),
+          });
+        }
+      } catch (_err) {
+        // best-effort — never crash the chat screen on screenshot detection
+      }
+    };
+
+    (async () => {
+      try {
+        if (Platform.OS === 'android') {
+          // Required for the MediaStore ContentObserver that backs the listener.
+          // Use the granular READ_MEDIA_IMAGES on Android 13+ (handled internally).
+          try {
+            const perm = await MediaLibrary.getPermissionsAsync();
+            if (!perm?.granted) {
+              await MediaLibrary.requestPermissionsAsync(false, ['photo']);
+            }
+          } catch (_e) {
+            // If permission flow fails, still try to subscribe — iOS path and
+            // newer Android (14+) ScreenCaptureCallback don't need it.
+          }
+        }
+        if (cancelled) return;
+        sub = ScreenCapture.addScreenshotListener(onScreenshot);
+      } catch (_err) {
+        // listener registration failed — nothing we can do, fail silently
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      try { sub?.remove?.(); } catch (_err) {}
+    };
+  }, [chatData, route?.params?.chatId]);
+
   // ── Mentions ──
   const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
 
@@ -1326,6 +1615,10 @@ export default function ChatScreen({ navigation, route }) {
     saveError: contactSaveError,
     saveContact,
   } = useSaveContact(!isGroupChat ? chatData?.peerUser : null);
+
+  // Used to resolve status-reply preview owner names against the local
+  // saved-contacts directory (saved name → phone number → server name).
+  const { resolveName: resolveContactName } = useContactDirectory();
   const {
     showSuggestions: showMentionSuggestions,
     suggestions: mentionSuggestions,
@@ -2187,6 +2480,74 @@ export default function ChatScreen({ navigation, route }) {
     if (isGroupChat) resetMentions();
   };
 
+  // ── Reply-tap navigation (supports chain replies) ───────────────────────
+  // Tapping the ↪ preview on a reply scrolls the chat to the parent and
+  // flashes the highlight. Works for any depth of reply chain because each
+  // ReplyBubble carries its OWN replyToMessageId — the user can keep
+  // tapping back through the chain. When the parent is older than the
+  // currently-loaded `messages` window, this paginates older messages in.
+  const navigateToReplyParent = useCallback(async (originalMsgId, depth = 0) => {
+    if (!originalMsgId) return;
+    const idStr = String(originalMsgId);
+
+    const findIdx = (list) => list.findIndex(m =>
+      sameId(m.serverMessageId, idStr) ||
+      sameId(m.id, idStr) ||
+      sameId(m.tempId, idStr) ||
+      sameId(m.clientMessageId, idStr) ||
+      sameId(m.messageId, idStr)
+    );
+
+    let idx = findIdx(messages);
+
+    // Not in current window? Try paging older messages in — once. Depth cap
+    // prevents an infinite loop if the parent really doesn't exist locally.
+    if (idx === -1 && hasMoreMessages && depth < 4) {
+      try {
+        await loadMoreMessages();
+      } catch {}
+      // Try again with the (possibly) updated list. Note: messages is a
+      // closure capture, so re-derive via state setter or call setImmediate.
+      // The simplest robust path: requestAnimationFrame + recurse with depth+1.
+      requestAnimationFrame(() => navigateToReplyParent(originalMsgId, depth + 1));
+      return;
+    }
+
+    if (idx === -1) {
+      // Last-ditch fallback — flash the highlight on whichever id matches
+      // when this row eventually renders. Gives the user a visual cue.
+      if (replyHighlightTimer.current) clearTimeout(replyHighlightTimer.current);
+      setReplyHighlightId(idStr);
+      replyHighlightTimer.current = setTimeout(() => {
+        setReplyHighlightId(null);
+        replyHighlightTimer.current = null;
+      }, 3000);
+      return;
+    }
+
+    if (flatListRef?.current) {
+      try {
+        flatListRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0.5 });
+      } catch {}
+    }
+
+    const targetMsg = messages[idx];
+    const targetKey =
+      targetMsg?.serverMessageId ||
+      targetMsg?.id ||
+      targetMsg?.tempId ||
+      targetMsg?.clientMessageId ||
+      targetMsg?.messageId;
+    if (targetKey) {
+      if (replyHighlightTimer.current) clearTimeout(replyHighlightTimer.current);
+      setReplyHighlightId(targetKey);
+      replyHighlightTimer.current = setTimeout(() => {
+        setReplyHighlightId(null);
+        replyHighlightTimer.current = null;
+      }, 3000);
+    }
+  }, [messages, hasMoreMessages, loadMoreMessages]);
+
   const recordingDurationLabel = useMemo(() => {
     const totalSec = Math.max(0, Math.floor(recordingDurationMs / 1000));
     const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
@@ -2710,38 +3071,71 @@ export default function ChatScreen({ navigation, route }) {
     await refreshMessagesFromLocal();
   };
 
-  const handleClearChatOptions = useCallback(() => {
-    setShowMenu(false);
+  // Animated open/close for the WhatsApp-style dropdown popover
+  const openChatMenu = useCallback(() => {
+    setShowMenu(true);
+    menuScaleAnim.setValue(0.85);
+    menuOpacityAnim.setValue(0);
+    Animated.parallel([
+      Animated.spring(menuScaleAnim, { toValue: 1, tension: 110, friction: 9, useNativeDriver: true }),
+      Animated.timing(menuOpacityAnim, { toValue: 1, duration: 140, useNativeDriver: true }),
+    ]).start();
+  }, [menuScaleAnim, menuOpacityAnim]);
 
-    Alert.alert(
-      'Clear Chat',
-      'Are you sure you want to clear this chat?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Clear for me',
-          onPress: async () => {
-            try {
-              await clearChatForMe();
-            } catch {
-              Alert.alert('Error', 'Unable to clear chat for you right now.');
-            }
-          },
-        },
-        {
-          text: 'Clear for everyone',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await clearChatForEveryone();
-            } catch {
-              Alert.alert('Error', 'Unable to clear chat for everyone right now.');
-            }
-          },
-        },
-      ]
-    );
-  }, [clearChatForMe, clearChatForEveryone]);
+  const closeChatMenu = useCallback(() => {
+    Animated.parallel([
+      Animated.timing(menuScaleAnim, { toValue: 0.9, duration: 110, useNativeDriver: true }),
+      Animated.timing(menuOpacityAnim, { toValue: 0, duration: 110, useNativeDriver: true }),
+    ]).start(() => setShowMenu(false));
+  }, [menuScaleAnim, menuOpacityAnim]);
+
+  // Open the confirmation modal — "Clear chat" only soft-deletes for the
+  // requesting user (User A). The peer's chat history stays intact.
+  const handleClearChatOptions = useCallback(() => {
+    closeChatMenu();
+    // small delay so the sheet exits before the modal enters
+    setTimeout(() => setClearChatModalVisible(true), 200);
+  }, [closeChatMenu]);
+
+  const onConfirmClearChat = useCallback(async () => {
+    if (isClearingChat) return;
+    setIsClearingChat(true);
+    try {
+      await clearChatForMe();
+      setClearChatModalVisible(false);
+    } catch (error) {
+      Alert.alert('Clear Chat', error?.message || 'Unable to clear chat right now. Please try again.');
+    } finally {
+      setIsClearingChat(false);
+    }
+  }, [clearChatForMe, isClearingChat]);
+
+  // Delete for everyone — soft-deletes the chat on the server for both
+  // participants (each message gets BOTH users added to `deletedFor`,
+  // each user's ChatSummary is removed). Both User A and User B see the
+  // chat disappear from their list.
+  const handleDeleteForEveryone = useCallback(() => {
+    closeChatMenu();
+    setTimeout(() => setDeleteEveryoneModalVisible(true), 200);
+  }, [closeChatMenu]);
+
+  const onConfirmDeleteForEveryone = useCallback(async () => {
+    if (isDeletingEveryone) return;
+    setIsDeletingEveryone(true);
+    try {
+      await clearChatForEveryone();
+      setDeleteEveryoneModalVisible(false);
+      // Chat row stays in both users' lists — only the messages are cleared.
+      // The user remains in the chat, which now shows the empty state.
+    } catch (error) {
+      Alert.alert(
+        'Clear for everyone',
+        error?.message || 'Unable to clear this chat for everyone right now. Please try again.'
+      );
+    } finally {
+      setIsDeletingEveryone(false);
+    }
+  }, [clearChatForEveryone, isDeletingEveryone]);
 
   const renderChatEmptyState = useCallback(() => (
     <View style={{ flexGrow: 1, justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 24, paddingBottom: 20, transform: [{ rotate: '180deg' }] }}>
@@ -3740,7 +4134,7 @@ export default function ChatScreen({ navigation, route }) {
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
                 <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
-                  On VibeConnect
+                  On VibeConnect Messenger
                 </Text>
               </View>
             )}
@@ -3782,7 +4176,17 @@ export default function ChatScreen({ navigation, route }) {
       : sameId(msg.senderId, currentUserId);
     const highlightedId = searchResults[currentSearchIndex]?.serverMessageId || searchResults[currentSearchIndex]?.id || searchResults[currentSearchIndex]?.tempId;
     const isSearchHighlighted = isSearching && searchResults.length > 0 && currentSearchIndex >= 0 && sameId(highlightedId, messageKey);
-    const isReplyHighlighted = replyHighlightId && sameId(replyHighlightId, messageKey);
+    // Match against every identifier the parent might have stored — same set
+    // the reply-tap handler tries — so the highlight survives the temp→server
+    // id swap that happens when an optimistic parent is acked.
+    const isReplyHighlighted = replyHighlightId && (
+      sameId(replyHighlightId, messageKey) ||
+      sameId(replyHighlightId, msg?.serverMessageId) ||
+      sameId(replyHighlightId, msg?.id) ||
+      sameId(replyHighlightId, msg?.tempId) ||
+      sameId(replyHighlightId, msg?.clientMessageId) ||
+      sameId(replyHighlightId, msg?.messageId)
+    );
     const isHighlighted = isSearchHighlighted || isReplyHighlighted;
     
     const progress = resolveMediaProgress(msg);
@@ -3885,23 +4289,23 @@ export default function ChatScreen({ navigation, route }) {
                 : "transparent",
           }}
         >
-          <View style={{ 
-            maxWidth: "80%", 
-            borderRadius: 16, 
+          <View style={{
+            maxWidth: "80%",
+            borderRadius: 18,
             backgroundColor: isDeletedMessage
               ? theme.colors.menuBackground
-              : (isMyMessage ? chatColor : theme.colors.cardBackground), 
-            borderBottomRightRadius: isMyMessage ? 4 : 16, 
-            borderBottomLeftRadius: isMyMessage ? 16 : 4, 
-            paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 2 : 7,
-            paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 10,
-            borderWidth: isHighlighted ? 2 : 0, 
+              : (isMyMessage ? chatColor : theme.colors.cardBackground),
+            borderBottomRightRadius: isMyMessage ? 6 : 18,
+            borderBottomLeftRadius: isMyMessage ? 18 : 6,
+            paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 3 : 8,
+            paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 12,
+            borderWidth: isHighlighted ? 2 : 0,
             borderColor: '#FFC107',
-            shadowColor: "#000",
-            shadowOffset: { width: 0, height: 1 },
-            shadowOpacity: 0.1,
-            shadowRadius: 1,
-            elevation: 1,
+            shadowColor: isMyMessage ? (chatColor || '#000') : '#000',
+            shadowOffset: { width: 0, height: 2 },
+            shadowOpacity: isMyMessage ? 0.18 : (isDarkMode ? 0 : 0.06),
+            shadowRadius: isMyMessage ? 6 : 4,
+            elevation: isMyMessage ? 2 : 1,
           }}>
             
             {/* Sender name for group chats */}
@@ -3964,6 +4368,35 @@ export default function ChatScreen({ navigation, route }) {
               </View>
             )}
 
+            {/* Status reply / share preview — tap opens the StatusViewer */}
+            {msg.statusRef && msg.statusPreview && !isDeletedMessage && (() => {
+              const sp = msg.statusPreview;
+              // Resolve the owner label: saved contact name → phone number →
+              // server-side name. Own status keeps its server name (it's you).
+              const isOwnStatus = sp.ownerId && currentUserId
+                && String(sp.ownerId) === String(currentUserId);
+              const resolvedOwnerName = isOwnStatus
+                ? (sp.ownerName || 'You')
+                : resolveContactName(
+                    sp.ownerId,
+                    sp.ownerName,
+                    sp.ownerPhone || sp.phone
+                  );
+              const resolvedPreview = resolvedOwnerName === sp.ownerName
+                ? sp
+                : { ...sp, ownerName: resolvedOwnerName };
+              return (
+                <StatusReplyPreview
+                  statusRef={msg.statusRef}
+                  statusPreview={resolvedPreview}
+                  isMyMessage={isMyMessage}
+                  chatColor={chatColor}
+                  theme={theme}
+                  onPress={handleOpenStatusFromChat}
+                />
+              );
+            })()}
+
             {/* Reply quote bubble — resolve missing data from messages array at render time */}
             {msg.replyToMessageId && !isDeletedMessage && (() => {
               let replyText = msg.replyPreviewText;
@@ -4008,28 +4441,7 @@ export default function ChatScreen({ navigation, route }) {
                   isMyMessage={isMyMessage}
                   chatColor={chatColor}
                   theme={theme}
-                  onPress={(originalMsgId) => {
-                    const idx = messages.findIndex(m =>
-                      sameId(m.serverMessageId, originalMsgId) ||
-                      sameId(m.id, originalMsgId) ||
-                      sameId(m.tempId, originalMsgId)
-                    );
-                    if (idx !== -1 && flatListRef?.current) {
-                      try {
-                        flatListRef.current.scrollToIndex({ index: idx, animated: true, viewPosition: 0.5 });
-                      } catch {}
-                      const targetMsg = messages[idx];
-                      const targetKey = targetMsg?.serverMessageId || targetMsg?.id || targetMsg?.tempId;
-                      if (targetKey) {
-                        if (replyHighlightTimer.current) clearTimeout(replyHighlightTimer.current);
-                        setReplyHighlightId(targetKey);
-                        replyHighlightTimer.current = setTimeout(() => {
-                          setReplyHighlightId(null);
-                          replyHighlightTimer.current = null;
-                        }, 3000);
-                      }
-                    }
-                  }}
+                  onPress={(originalMsgId) => navigateToReplyParent(originalMsgId)}
                 />
               );
             })()}
@@ -4496,8 +4908,9 @@ export default function ChatScreen({ navigation, route }) {
                   <Ionicons name="notifications-off" size={20} color={theme.colors.placeHolderTextColor} />
                 </View>
               )}
-              <TouchableOpacity 
-                onPress={() => setShowMenu(true)} 
+              <TouchableOpacity
+                onPress={openChatMenu}
+                activeOpacity={0.7}
                 style={{ padding: 8, borderRadius: 20, backgroundColor: theme.colors.menuBackground }} >
                 <Ionicons name="ellipsis-vertical" size={18} color={theme.colors.primaryTextColor} />
               </TouchableOpacity>
@@ -5078,110 +5491,182 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {/* Menu Modal */}
-        <Modal visible={showMenu} transparent animationType="fade" onRequestClose={() => setShowMenu(false)}>
+        {/* ─── REDESIGNED 3-DOT DROPDOWN (WhatsApp-style popover) ─── */}
+        <Modal visible={showMenu} transparent animationType="none" onRequestClose={closeChatMenu} statusBarTranslucent>
+          {/* Translucent tap-catcher — the dropdown floats over the chat */}
+          <TouchableOpacity activeOpacity={1} onPress={closeChatMenu} style={chatMenuStyles.popoverRoot}>
+            {/* The dropdown card itself. transformOrigin via small offset and scale
+                + opacity gives the impression of popping out of the 3-dot icon. */}
+            <Animated.View
+              pointerEvents="box-none"
+              style={[
+                chatMenuStyles.popoverCard,
+                {
+                  backgroundColor: theme.colors.cardBackground,
+                  borderColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+                  opacity: menuOpacityAnim,
+                  transform: [
+                    { scale: menuScaleAnim },
+                    { translateX: menuOpacityAnim.interpolate({ inputRange: [0, 1], outputRange: [6, 0] }) },
+                    { translateY: menuOpacityAnim.interpolate({ inputRange: [0, 1], outputRange: [-6, 0] }) },
+                  ],
+                },
+              ]}
+            >
+              <ChatMenuItem
+                icon="search-outline"
+                iconLib="Ionicons"
+                color="#4D7CFE"
+                label="Search"
+                onPress={() => { closeChatMenu(); setTimeout(() => handleToggleSearchBar(), 140); }}
+                theme={theme}
+              />
+              <ChatMenuItem
+                icon="person-outline"
+                iconLib="Ionicons"
+                color="#7C4DFF"
+                label="Contact info"
+                onPress={() => { closeChatMenu(); setTimeout(() => handleOpenContactInfo(), 140); }}
+                theme={theme}
+              />
+              <ChatMenuItem
+                icon="refresh-outline"
+                iconLib="Ionicons"
+                color="#00B894"
+                label="Reload"
+                onPress={() => { closeChatMenu(); setTimeout(() => handleMenuReload(), 140); }}
+                theme={theme}
+              />
+              <ChatMenuItem
+                icon="restore"
+                iconLib="MaterialIcons"
+                color="#F0A030"
+                label="Refresh local"
+                onPress={() => { closeChatMenu(); setTimeout(() => handleMenuLocalRefresh(), 140); }}
+                theme={theme}
+              />
+
+              <View style={[chatMenuStyles.popoverDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)' }]} />
+
+              <ChatMenuItem
+                icon="delete-sweep-outline"
+                iconLib="MaterialCommunityIcons"
+                color="#E06A6A"
+                label="Clear chat"
+                onPress={handleClearChatOptions}
+                theme={theme}
+                isDanger
+              />
+              <ChatMenuItem
+                icon="broom"
+                iconLib="MaterialCommunityIcons"
+                color="#E06A6A"
+                label="Clear for everyone"
+                onPress={handleDeleteForEveryone}
+                theme={theme}
+                isDanger
+              />
+            </Animated.View>
+          </TouchableOpacity>
+        </Modal>
+
+        {/* ─── CLEAR CHAT CONFIRMATION ─── */}
+        <Modal
+          animationType="fade"
+          transparent
+          visible={clearChatModalVisible}
+          statusBarTranslucent
+          onRequestClose={() => { if (!isClearingChat) setClearChatModalVisible(false); }}
+        >
           <TouchableOpacity
             activeOpacity={1}
-            onPress={() => setShowMenu(false)}
-            style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.3)' }}
+            onPress={() => { if (!isClearingChat) setClearChatModalVisible(false); }}
+            style={chatMenuStyles.confirmOverlay}
           >
-            <View style={{ 
-              marginTop: 84, 
-              marginRight: 12, 
-              backgroundColor: theme.colors.cardBackground, 
-              borderRadius: 12, 
-              borderWidth: 1, 
-              borderColor: theme.colors.borderColor, 
-              overflow: 'hidden', 
-              alignSelf: 'flex-end', 
-              minWidth: 200,
-              shadowColor: "#000",
-              shadowOffset: { width: 0, height: 2 },
-              shadowOpacity: 0.2,
-              shadowRadius: 4,
-              elevation: 5,
-            }}>
-              <TouchableOpacity 
-                onPress={handleToggleSearchBar} 
-                style={{ 
-                  paddingVertical: 14, 
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                }}
-              >
-                <Ionicons name="search" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
-                  Search
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                onPress={handleMenuReload} 
-                style={{ 
-                  paddingVertical: 14, 
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                }}
-              >
-                <Ionicons name="refresh" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
-                  Reload
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                onPress={handleMenuLocalRefresh} 
-                style={{ 
-                  paddingVertical: 14, 
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                }}
-              >
-                <MaterialIcons name="restore" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
-                  Refresh
-                </Text>
-              </TouchableOpacity>
-              
-              <TouchableOpacity 
-                onPress={handleOpenContactInfo} 
-                style={{ 
-                  paddingVertical: 14, 
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                }}
-              >
-                <Ionicons name="person" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
-                  Contact Info
-                </Text>
-              </TouchableOpacity>
-{/* Report Chat removed — use Report Message via long press instead */}
+            <TouchableOpacity activeOpacity={1} style={[chatMenuStyles.confirmCard, { backgroundColor: theme.colors.cardBackground }]}>
+              <View style={chatMenuStyles.confirmIconWrap}>
+                <MaterialIcons name="delete-sweep" size={30} color="#E06A6A" />
+              </View>
+              <Text style={[chatMenuStyles.confirmTitle, { color: theme.colors.primaryTextColor }]}>
+                Clear this chat?
+              </Text>
+              <Text style={[chatMenuStyles.confirmSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+                All messages will be removed from your device. The other person will still see them and can continue messaging you in this chat.
+              </Text>
 
-              {/* <TouchableOpacity
-                onPress={handleClearChatOptions}
-                style={{
-                  paddingVertical: 14,
-                  paddingHorizontal: 16,
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: 10,
-                }}
-              >
-                <MaterialIcons name="delete-sweep" size={18} color={theme.colors.primaryTextColor} />
-                <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Regular' }}>
-                  Clear Chat
-                </Text>
-              </TouchableOpacity> */}
-            </View>
+              <View style={chatMenuStyles.confirmActions}>
+                <TouchableOpacity
+                  onPress={() => setClearChatModalVisible(false)}
+                  disabled={isClearingChat}
+                  activeOpacity={0.7}
+                  style={[chatMenuStyles.confirmCancelBtn, { borderColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)' }]}
+                >
+                  <Text style={[chatMenuStyles.confirmCancelText, { color: theme.colors.primaryTextColor }]}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={onConfirmClearChat}
+                  disabled={isClearingChat}
+                  activeOpacity={0.7}
+                  style={chatMenuStyles.confirmDangerBtn}
+                >
+                  {isClearingChat ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={chatMenuStyles.confirmDangerText}>Clear chat</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          </TouchableOpacity>
+        </Modal>
+
+        {/* ─── DELETE FOR EVERYONE CONFIRMATION ─── */}
+        <Modal
+          animationType="fade"
+          transparent
+          visible={deleteEveryoneModalVisible}
+          statusBarTranslucent
+          onRequestClose={() => { if (!isDeletingEveryone) setDeleteEveryoneModalVisible(false); }}
+        >
+          <TouchableOpacity
+            activeOpacity={1}
+            onPress={() => { if (!isDeletingEveryone) setDeleteEveryoneModalVisible(false); }}
+            style={chatMenuStyles.confirmOverlay}
+          >
+            <TouchableOpacity activeOpacity={1} style={[chatMenuStyles.confirmCard, { backgroundColor: theme.colors.cardBackground }]}>
+              <View style={chatMenuStyles.confirmIconWrap}>
+                <MaterialCommunityIcons name="broom" size={30} color="#E06A6A" />
+              </View>
+              <Text style={[chatMenuStyles.confirmTitle, { color: theme.colors.primaryTextColor }]}>
+                Clear chat for everyone?
+              </Text>
+              <Text style={[chatMenuStyles.confirmSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+                All messages will be cleared for both you and {chatData?.peerUser?.fullName || 'the other person'}. The chat stays in both lists, so you can keep messaging. This cannot be undone.
+              </Text>
+
+              <View style={chatMenuStyles.confirmActions}>
+                <TouchableOpacity
+                  onPress={() => setDeleteEveryoneModalVisible(false)}
+                  disabled={isDeletingEveryone}
+                  activeOpacity={0.7}
+                  style={[chatMenuStyles.confirmCancelBtn, { borderColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)' }]}
+                >
+                  <Text style={[chatMenuStyles.confirmCancelText, { color: theme.colors.primaryTextColor }]}>Cancel</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={onConfirmDeleteForEveryone}
+                  disabled={isDeletingEveryone}
+                  activeOpacity={0.7}
+                  style={chatMenuStyles.confirmDangerBtn}
+                >
+                  {isDeletingEveryone ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={chatMenuStyles.confirmDangerText}>Clear for all</Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
           </TouchableOpacity>
         </Modal>
 
@@ -5386,7 +5871,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                <ImageZoom
+                {/* <ImageZoom
                   uri={localMediaViewer.uri}
                   minScale={1}
                   maxScale={5}
@@ -5396,7 +5881,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                />
+                /> */}
               </GestureHandlerRootView>
             )}
 

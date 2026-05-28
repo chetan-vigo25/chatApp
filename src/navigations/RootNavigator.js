@@ -22,6 +22,11 @@ import EditProfile from "../screens/profiles/EditProfile";
 import PersonalInfoEdit from "../screens/profiles/PersonalInfoEdit";
 import UserB from "../screens/profiles/UserB";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
+import ChatPrivacy from "../screens/profiles/ChatPrivacy";
+import DeletedChatsPassword from "../screens/profiles/DeletedChatsPassword";
+import TwoStepPassword from "../screens/profiles/TwoStepPassword";
+import DeletedPasswordGate from "../screens/profiles/DeletedPasswordGate";
+import DeletedChatsSelector from "../screens/profiles/DeletedChatsSelector";
 import ChatMedia from "../screens/chats/ChatMedia";
 import AddNewContact from "../screens/chats/AddNewContact";
 import ArchivedChats from "../screens/chats/ArchivedChats";
@@ -106,6 +111,19 @@ export default function RootNavigator() {
           <Stack.Screen name="PersonalInfoEdit" component={PersonalInfoEdit} />
           <Stack.Screen name="UserB" component={UserB} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
+          <Stack.Screen name="ChatPrivacy" component={ChatPrivacy} />
+          <Stack.Screen name="DeletedChatsPassword" component={DeletedChatsPassword} />
+          <Stack.Screen name="TwoStepPassword" component={TwoStepPassword} />
+          <Stack.Screen
+            name="DeletedPasswordGate"
+            component={DeletedPasswordGate}
+            options={{ gestureEnabled: false }}
+          />
+          <Stack.Screen
+            name="DeletedChatsSelector"
+            component={DeletedChatsSelector}
+            options={{ gestureEnabled: false }}
+          />
           <Stack.Screen name="ArchivedChats" component={ArchivedChats} />
           <Stack.Screen name="AddNewContact" component={AddNewContact} />
           <Stack.Screen name="StatusScreen" component={StatusScreen} />

@@ -18,7 +18,7 @@ import {
   View, Text, Image, TouchableOpacity, StyleSheet,
   Dimensions, StatusBar, Alert, FlatList, TextInput,
   KeyboardAvoidingView, Platform, ActionSheetIOS,
-  Modal, ActivityIndicator, Animated, Linking,
+  Modal, ActivityIndicator, Animated, Linking, AppState,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { Video, ResizeMode } from 'expo-av';
@@ -26,12 +26,13 @@ import { useDispatch, useSelector } from 'react-redux';
 import { Ionicons } from '@expo/vector-icons';
 import {
   viewStatusAction, deleteStatusAction, fetchStatusViewers, fetchStatusLikers,
-  removeLocalStatus, reactToStatusAction, replyToStatusAction,
+  removeLocalStatus, reactToStatusAction, replyToStatusAction, optimisticReact,
   reportStatusAction, hideStatusAction, removeStatusFromSocket,
   handleReactionUpdateFromSocket, triggerLikeAnimation,
   clearLikeAnimation, seedReactionCache,
 } from '../../Redux/Reducer/Status/Status.reducer';
 import { getSocket } from '../../Redux/Services/Socket/socket';
+import useContactDirectory from '../../hooks/useContactDirectory';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 const STORY_DURATION = 5000;
@@ -88,6 +89,9 @@ export default function StatusViewer({ navigation, route }) {
   const dispatch = useDispatch();
   const { viewers, likers, reactionCache, likeAnimationStatusId } = useSelector(s => s.status);
   const { user }  = useSelector(s => s.authentication);
+  // Saved-contact resolver for the viewers/likers lists. Saved name → phone
+  // number → server-provided name. Same rule used across the status list.
+  const { resolveName: resolveContactName } = useContactDirectory();
 
   const [statuses, setStatuses]           = useState(initialStatuses);
   const [currentIndex, setCurrentIndex]   = useState(Math.min(startIndex, Math.max(0, initialStatuses.length - 1)));
@@ -100,6 +104,10 @@ export default function StatusViewer({ navigation, route }) {
   const [replyText, setReplyText]         = useState('');
   const [sending, setSending]             = useState(false);
   const [hearts, setHearts]               = useState([]);
+  // Mute toggle for video / audio statuses (top-right speaker icon). Default
+  // to unmuted; the user can tap to silence — preference persists across
+  // slides within the same viewer session.
+  const [isMuted, setIsMuted]             = useState(false);
 
   const progressAnim = useRef(new Animated.Value(0)).current;
   const animRef      = useRef(null);
@@ -129,7 +137,11 @@ export default function StatusViewer({ navigation, route }) {
       animRef.current?.stop();
       return;
     }
-    const isVideo = currentStatus?.type === 'video';
+    // Schema has no top-level `type` field on a Status — derive from the
+    // first media item's mediaType so videos actually run for their full
+    // duration instead of getting auto-skipped after STORY_DURATION.
+    const firstMedia = currentStatus?.mediaItems?.[0];
+    const isVideo = firstMedia?.mediaType === 'video' || currentStatus?.type === 'video';
     startProgress(isVideo ? videoDuration : STORY_DURATION);
     return () => animRef.current?.stop();
   }, [currentIndex, paused, videoDuration]);
@@ -203,6 +215,21 @@ export default function StatusViewer({ navigation, route }) {
       dispatch(fetchStatusLikers(currentStatus._id));
     }
   }, [currentIndex, currentStatus?._id, isMine, dispatch]);
+
+  // ── Pause auto-progress when app backgrounded ─────────────────────────────
+  // Without this the progress timer keeps running while the user is in
+  // another app, then snaps several slides forward on return.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        pausedRef.current = false; setPaused(false);
+      } else {
+        pausedRef.current = true;  setPaused(true);
+        animRef.current?.stop();
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   // ── Socket listeners ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -328,26 +355,26 @@ export default function StatusViewer({ navigation, route }) {
     } else {
       if (Platform.OS === 'ios') {
         ActionSheetIOS.showActionSheetWithOptions(
-          { options: ['Cancel', 'Report', 'Hide this status'], cancelButtonIndex: 0, destructiveButtonIndex: 1 },
+          { options: ['Cancel', 'Report'], cancelButtonIndex: 0, destructiveButtonIndex: 1 },
           (idx) => {
             if (idx === 1) { handleReport(); return; }
-            if (idx === 2) { resume(); handleHide(); return; }
             resume(); // Cancel
           },
         );
       } else {
         Alert.alert('Status Options', '', [
-          { text: 'Report',           style: 'destructive', onPress: handleReport },
-          { text: 'Hide this status', onPress: () => { resume(); handleHide(); } },
-          { text: 'Cancel',           style: 'cancel',      onPress: resume },
+          { text: 'Report', style: 'destructive', onPress: handleReport },
+          { text: 'Cancel', style: 'cancel',     onPress: resume },
         ], { cancelable: false });
       }
     }
-  }, [isMine, pause, resume, handleDelete, handleReport, handleHide, openPanel]);
+  }, [isMine, pause, resume, handleDelete, handleReport, openPanel]);
 
   const handleReact = useCallback((reactionType) => {
     if (!currentStatus) return;
-    // Always send reactionType — backend toggle() removes if already liked, adds if not
+    // Optimistic flip first so the heart/icon updates instantly; the thunk's
+    // .rejected handler rolls back from the snapshot if the request fails.
+    dispatch(optimisticReact({ statusId: currentStatus._id, reactionType }));
     dispatch(reactToStatusAction({ statusId: currentStatus._id, reactionType }));
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   }, [currentStatus?._id, dispatch]);
@@ -355,8 +382,53 @@ export default function StatusViewer({ navigation, route }) {
   const handleReply = useCallback(async () => {
     if (!replyText.trim() || !currentStatus) return;
     setSending(true);
+    const body = replyText.trim();
     try {
-      await dispatch(replyToStatusAction({ statusId: currentStatus._id, message: replyText.trim() })).unwrap();
+      const res = await dispatch(replyToStatusAction({
+        statusId: currentStatus._id,
+        message:  body,
+      })).unwrap();
+
+      // Optimistically write the chat-side message into local SQLite so the
+      // sender immediately sees it in their chat thread with the status
+      // preview attached. Server has already created the canonical record;
+      // this just keeps the local DB in sync without waiting for a sync round.
+      try {
+        const ChatDatabase = require('../../services/ChatDatabase');
+        const chatMessage = res?.data?.chatMessage;
+        if (chatMessage && ChatDatabase?.upsertMessage) {
+          const firstMedia = currentStatus?.mediaItems?.[0] || {};
+          await ChatDatabase.upsertMessage({
+            id:               String(chatMessage._id || chatMessage.messageId),
+            serverMessageId:  String(chatMessage._id || chatMessage.messageId),
+            chatId:           chatMessage.chatId,
+            senderId:         String(user?._id || user?.id),
+            senderName:       user?.fullName || null,
+            receiverId:       String(userId || currentStatus.ownerId),
+            text:             body,
+            type:             'text',
+            status:           'sent',
+            timestamp:        Date.parse(chatMessage.createdAt) || Date.now(),
+            createdAt:        chatMessage.createdAt || new Date().toISOString(),
+            synced:           true,
+            statusRef:        String(currentStatus._id),
+            statusPreview:    chatMessage.statusPreview || {
+              statusId:        String(currentStatus._id),
+              ownerId:         String(currentStatus.ownerId || userId),
+              ownerName:       userName || null,
+              mediaType:       firstMedia.mediaType || 'text',
+              mediaUrl:        firstMedia.mediaUrl || null,
+              thumbnailUrl:    firstMedia.thumbnailUrl || firstMedia.mediaUrl || null,
+              text:            currentStatus.caption || currentStatus.textContent || null,
+              backgroundColor: currentStatus.bgColor || null,
+              createdAt:       currentStatus.createdAt || null,
+            },
+          });
+        }
+      } catch (e) {
+        // Local optimistic write is best-effort — chat will pick it up on sync
+      }
+
       setReplyText('');
       setShowReply(false);
       resume();
@@ -365,7 +437,7 @@ export default function StatusViewer({ navigation, route }) {
     } finally {
       setSending(false);
     }
-  }, [replyText, currentStatus?._id, dispatch, resume]);
+  }, [replyText, currentStatus, dispatch, resume, user, userId, userName]);
 
   const onPlaybackStatusUpdate = useCallback((status) => {
     if (status.isLoaded && status.durationMillis && videoDuration === STORY_DURATION) {
@@ -384,8 +456,26 @@ export default function StatusViewer({ navigation, route }) {
   if (!currentStatus) return null;
 
   const displayName  = isMine ? (user?.fullName || 'My Status') : userName;
-  const displayImage = isMine ? user?.profileImage : userImage;
+  // For "My Status" the auth slice may expose the profile image under
+  // any of several keys depending on which API last hydrated it
+  // (profileImage / profilePicture / avatar / image). Try them all so
+  // the header shows the real avatar instead of falling back to the app
+  // logo.
+  const displayImage = isMine
+    ? (user?.profileImage
+        || user?.profilePicture
+        || user?.profilePic
+        || user?.avatar
+        || user?.image
+        || null)
+    : userImage;
   const likeActive = reactionData.myReaction === 'like';
+
+  // Does the currently-visible slide play audio? Used to gate the mute icon.
+  const currentSlideIsAudible = (() => {
+    const t = currentStatus?.mediaItems?.[0]?.mediaType;
+    return t === 'video' || t === 'audio';
+  })();
 
   // ── Render content ────────────────────────────────────────────────────────
   // Backend schema:  status.mediaItems[0].mediaType / mediaUrl
@@ -423,6 +513,7 @@ export default function StatusViewer({ navigation, route }) {
             resizeMode={ResizeMode.CONTAIN}
             shouldPlay={!paused}
             isLooping={false}
+            isMuted={isMuted}
             onPlaybackStatusUpdate={onPlaybackStatusUpdate}
             useNativeControls={false}
           />
@@ -435,31 +526,35 @@ export default function StatusViewer({ navigation, route }) {
           </View>
         );
       case 'link': {
-        const linkHref = currentStatus.ogMetadata?.url || currentStatus.textContent;
+        // Pure visual card — the actual tap target is rendered AFTER the
+        // touchZones overlay (see openLinkOverlay below) so navigation taps
+        // don't swallow the Open Link button.
         return (
-          <TouchableOpacity
-            style={styles.linkContent}
-            activeOpacity={0.85}
-            onPress={() => linkHref && Linking.openURL(linkHref).catch(() => Alert.alert('Cannot open link', linkHref))}
-          >
+          <View style={styles.linkContent}>
             {currentStatus.ogMetadata?.image
               ? <Image source={{ uri: currentStatus.ogMetadata.image }} style={styles.linkImage} resizeMode="cover" />
               : null
             }
             <View style={styles.linkBody}>
               <Text style={styles.linkTitle} numberOfLines={2}>
-                {currentStatus.ogMetadata?.title || linkHref}
+                {currentStatus.ogMetadata?.title || currentStatus.textContent}
               </Text>
               {currentStatus.ogMetadata?.description
                 ? <Text style={styles.linkDesc} numberOfLines={3}>{currentStatus.ogMetadata.description}</Text>
                 : null
               }
+              {currentStatus.ogMetadata?.siteName
+                ? <Text style={styles.linkSite} numberOfLines={1}>{currentStatus.ogMetadata.siteName}</Text>
+                : null
+              }
               <View style={styles.linkUrlRow}>
-                <Ionicons name="open-outline" size={12} color="#60a5fa" style={{ marginRight: 4 }} />
-                <Text style={styles.linkUrl} numberOfLines={1}>{linkHref}</Text>
+                <Ionicons name="link-outline" size={12} color="#60a5fa" style={{ marginRight: 4 }} />
+                <Text style={styles.linkUrl} numberOfLines={1}>
+                  {currentStatus.ogMetadata?.url || currentStatus.textContent}
+                </Text>
               </View>
             </View>
-          </TouchableOpacity>
+          </View>
         );
       }
       default:
@@ -516,21 +611,29 @@ export default function StatusViewer({ navigation, route }) {
         />
       </View>
 
-      {/* Top gradient overlay — dark scrim behind progress + header */}
-      <View style={styles.topGradient} pointerEvents="none">
-        <View style={[styles.gradientLayer, { opacity: 0.55 }]} />
-        <View style={[styles.gradientLayer, { opacity: 0.35 }]} />
-        <View style={[styles.gradientLayer, { opacity: 0.18 }]} />
-        <View style={[styles.gradientLayer, { opacity: 0.07 }]} />
-      </View>
-
-      {/* Bottom gradient overlay — dark scrim behind action bars */}
-      <View style={styles.bottomGradient} pointerEvents="none">
-        <View style={[styles.gradientLayer, { opacity: 0.07 }]} />
-        <View style={[styles.gradientLayer, { opacity: 0.18 }]} />
-        <View style={[styles.gradientLayer, { opacity: 0.35 }]} />
-        <View style={[styles.gradientLayer, { opacity: 0.55 }]} />
-      </View>
+      {/* Open-link CTA — rendered AFTER touchZones so the navigation overlay
+          doesn't steal the tap. Only shown for link-type statuses. */}
+      {currentStatus.mediaItems?.[0]?.mediaType === 'link' && (() => {
+        const linkHref = currentStatus.ogMetadata?.url || currentStatus.textContent;
+        if (!linkHref) return null;
+        const openLink = () => {
+          pause();
+          Linking.openURL(linkHref).catch(() => Alert.alert('Cannot open link', linkHref));
+        };
+        return (
+          <View style={styles.openLinkOverlay} pointerEvents="box-none">
+            <TouchableOpacity
+              style={styles.openLinkBtn}
+              activeOpacity={0.85}
+              onPress={openLink}
+              accessibilityLabel="Open link"
+            >
+              <Ionicons name="open-outline" size={16} color="#fff" />
+              <Text style={styles.openLinkBtnText}>Open Link</Text>
+            </TouchableOpacity>
+          </View>
+        );
+      })()}
 
       {/* Progress bars */}
       <View style={styles.progressContainer}>
@@ -560,10 +663,13 @@ export default function StatusViewer({ navigation, route }) {
           onPress={() => {
             pause();
             if (isMine) {
-              navigation.navigate('UserB', {
-                item: { _id: user?._id, fullName: user?.fullName, profileImage: user?.profileImage },
-              });
-            } else if (userId) {
+              // Own status — go to the ProfileTab inside the bottom-tab
+              // navigator. UserB is the "other user" profile screen and
+              // doesn't make sense for the logged-in user.
+              navigation.navigate('ChatList', { screen: 'ProfileTab' });
+              return;
+            }
+            if (userId) {
               navigation.navigate('UserB', {
                 item: { _id: userId, fullName: displayName, profileImage: displayImage },
               });
@@ -580,6 +686,22 @@ export default function StatusViewer({ navigation, route }) {
           </View>
         </TouchableOpacity>
 
+        {/* Mute toggle — only shown when the current slide has audio */}
+        {currentSlideIsAudible && (
+          <TouchableOpacity
+            onPress={() => setIsMuted(m => !m)}
+            style={styles.muteBtn}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            accessibilityLabel={isMuted ? 'Unmute' : 'Mute'}
+          >
+            <Ionicons
+              name={isMuted ? 'volume-mute' : 'volume-high'}
+              size={20}
+              color="#fff"
+            />
+          </TouchableOpacity>
+        )}
+
         {/* Options only in header for owner; non-owner gets it in the bottom bar */}
         {isMine && (
           <TouchableOpacity onPress={openOptions} style={styles.moreBtn}>
@@ -588,49 +710,73 @@ export default function StatusViewer({ navigation, route }) {
         )}
       </View>
 
-      {/* Bottom bar */}
+      {/* Bottom bar — WhatsApp-style: no dark scrim, no pill tabs */}
       {isMine ? (
-        /* ── Owner bottom: tab bar ── */
+        /* ── Owner bottom: single-row Views/Likes summary + delete ── */
         <View style={styles.ownerBar}>
-          <View style={styles.ownerTabs}>
-            <TouchableOpacity
-              style={[styles.ownerTab, showViewers && activeTab === 'views' && styles.ownerTabActive]}
-              onPress={() => showViewers && activeTab === 'views' ? closePanel() : openPanel('views')}
-            >
-              <Ionicons name="eye-outline" size={15} color="#fff" />
-              <Text style={styles.ownerTabText}>
-                {viewers?.viewCount ?? currentStatus.viewCount ?? 0} Viewed
+          <TouchableOpacity
+            style={styles.ownerSummary}
+            activeOpacity={0.7}
+            onPress={() => showViewers ? closePanel() : openPanel('views')}
+            accessibilityLabel="Open viewers list"
+          >
+            <View style={styles.ownerStat}>
+              <Ionicons name="eye" size={18} color="#fff" />
+              <Text style={styles.ownerStatText}>
+                {viewers?.viewCount ?? currentStatus.viewCount ?? 0}
               </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.ownerTab, showViewers && activeTab === 'likes' && styles.ownerTabActive]}
-              onPress={() => showViewers && activeTab === 'likes' ? closePanel() : openPanel('likes')}
-            >
-              <Ionicons name="heart-outline" size={15} color="#fff" />
-              <Text style={styles.ownerTabText}>
-                {likers?.total ?? currentStatus.likeCount ?? 0} Liked
+            </View>
+            <View style={styles.ownerStat}>
+              <Ionicons
+                name={(likers?.total ?? currentStatus.likeCount ?? 0) > 0 ? 'heart' : 'heart-outline'}
+                size={18}
+                color={(likers?.total ?? currentStatus.likeCount ?? 0) > 0 ? '#FF3B5C' : '#fff'}
+              />
+              <Text style={styles.ownerStatText}>
+                {likers?.total ?? currentStatus.likeCount ?? 0}
               </Text>
-            </TouchableOpacity>
-          </View>
-          <TouchableOpacity onPress={handleDelete} style={styles.deleteBtn}>
-            <Ionicons name="trash-outline" size={20} color="rgba(255,255,255,0.8)" />
+            </View>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={handleDelete}
+            style={styles.ownerIconBtn}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            accessibilityLabel="Delete status"
+          >
+            <Ionicons name="trash-outline" size={22} color="#fff" />
           </TouchableOpacity>
         </View>
       ) : (
-        /* ── Viewer bottom bar ── */
+        /* ── Viewer bottom: rounded reply + heart, no background scrim ── */
         <View style={styles.viewerBar}>
           <TouchableOpacity
             style={styles.replyInputTrigger}
+            activeOpacity={0.85}
             onPress={() => { pause(); setShowReply(true); }}
+            accessibilityLabel={`Reply to ${displayName}`}
           >
-            <Text style={styles.replyPlaceholder}>Reply to {displayName}…</Text>
+            <Ionicons name="chevron-up" size={14} color="rgba(255,255,255,0.75)" style={{ marginRight: 6 }} />
+            <Text style={styles.replyPlaceholder}>Reply</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.reactBtn} onPress={() => handleReact('like')}>
-            <Ionicons name={likeActive ? 'heart' : 'heart-outline'} size={24} color={likeActive ? '#FF4757' : '#fff'} />
-            {(reactionData.likeCount > 0) && <Text style={styles.reactCount}>{reactionData.likeCount}</Text>}
+          <TouchableOpacity
+            style={styles.reactBtn}
+            onPress={() => handleReact('like')}
+            accessibilityLabel={likeActive ? 'Unlike' : 'Like'}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            <Ionicons
+              name={likeActive ? 'heart' : 'heart-outline'}
+              size={28}
+              color={likeActive ? '#FF3B5C' : '#fff'}
+            />
           </TouchableOpacity>
-          <TouchableOpacity style={styles.reactBtn} onPress={openOptions}>
-            <Ionicons name="ellipsis-vertical" size={20} color="#fff" />
+          <TouchableOpacity
+            style={styles.reactBtn}
+            onPress={openOptions}
+            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+          >
+            <Ionicons name="ellipsis-vertical" size={22} color="#fff" />
           </TouchableOpacity>
         </View>
       )}
@@ -659,7 +805,7 @@ export default function StatusViewer({ navigation, route }) {
                 onPress={() => setActiveTab('views')}
               >
                 <Text style={[styles.panelTabText, activeTab === 'views' && styles.panelTabTextActive]}>
-                  Viewed by {viewers?.viewCount || 0}
+                  Viewed · {viewers?.viewCount || 0}
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -667,52 +813,112 @@ export default function StatusViewer({ navigation, route }) {
                 onPress={() => setActiveTab('likes')}
               >
                 <Text style={[styles.panelTabText, activeTab === 'likes' && styles.panelTabTextActive]}>
-                  Liked by {likers?.total || 0}
+                  Liked · {likers?.total || 0}
                 </Text>
               </TouchableOpacity>
             </View>
 
             {activeTab === 'views' ? (
-              <FlatList
-                data={viewers?.viewers || []}
-                keyExtractor={(item, i) => item?.viewerId?._id || item?.userId?._id || String(i)}
-                renderItem={({ item }) => {
-                  const viewer = item.viewerId || item.userId;
-                  return (
-                    <View style={styles.viewerItem}>
-                      <Image
-                        source={viewer?.profileImage ? { uri: viewer.profileImage } : require('../../../assets/icon.png')}
-                        style={styles.viewerAvatar}
-                      />
-                      <View style={{ flex: 1 }}>
-                        <Text style={styles.viewerName}>{viewer?.fullName || viewer?.userName || 'Unknown'}</Text>
-                        <Text style={styles.viewerTime}>{timeAgo(item.viewedAt)}</Text>
-                      </View>
-                      {item.reactionType === 'like' && (
-                        <Text style={{ fontSize: 16 }}>❤️</Text>
-                      )}
-                    </View>
-                  );
-                }}
-                ListEmptyComponent={<Text style={styles.noViewers}>No views yet</Text>}
-              />
+              (() => {
+                // Build a Set of userIds who liked, so even an older backend
+                // that doesn't enrich /viewers with reactionType still gets a
+                // heart rendered next to viewers who appear in the likers list.
+                const likedSet = new Set(
+                  (likers?.likedBy || []).map(l => String(l.userId || l._id || ''))
+                );
+                return (
+                  <FlatList
+                    data={viewers?.viewers || []}
+                    keyExtractor={(item, i) => item?.viewerId?._id || item?.userId?._id || String(i)}
+                    renderItem={({ item }) => {
+                      const viewer = item.viewerId || item.userId;
+                      const viewerIdStr = String(viewer?._id || viewer || '');
+                      const liked = item.reactionType === 'like' || likedSet.has(viewerIdStr);
+                      // Resolve label using local saved-contacts first, then
+                      // server's phone field, then server-supplied name.
+                      const serverName = viewer?.fullName || viewer?.userName;
+                      const phone      = item.phone || viewer?.phone
+                        || (viewer?.mobile?.code && viewer?.mobile?.number
+                              ? `${viewer.mobile.code} ${viewer.mobile.number}`
+                              : viewer?.mobile?.number);
+                      const displayName = resolveContactName(viewerIdStr, serverName, phone);
+                      const openProfile = () => {
+                        if (!viewerIdStr) return;
+                        closePanel();
+                        navigation.navigate('UserB', {
+                          item: {
+                            _id:          viewerIdStr,
+                            fullName:     displayName,
+                            profileImage: viewer?.profileImage || null,
+                          },
+                        });
+                      };
+                      return (
+                        <TouchableOpacity
+                          style={styles.viewerItem}
+                          activeOpacity={0.7}
+                          onPress={openProfile}
+                          accessibilityLabel={`Open ${displayName}'s profile`}
+                        >
+                          <Image
+                            source={viewer?.profileImage ? { uri: viewer.profileImage } : require('../../../assets/icon.png')}
+                            style={styles.viewerAvatar}
+                          />
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.viewerName}>{displayName}</Text>
+                            <Text style={styles.viewerTime}>{timeAgo(item.viewedAt)}</Text>
+                          </View>
+                          {liked && (
+                            <Ionicons name="heart" size={18} color="#FF3B5C" />
+                          )}
+                        </TouchableOpacity>
+                      );
+                    }}
+                    ListEmptyComponent={<Text style={styles.noViewers}>No views yet</Text>}
+                  />
+                );
+              })()
             ) : (
               <FlatList
                 data={likers?.likedBy || []}
                 keyExtractor={(item, i) => item?.userId || String(i)}
-                renderItem={({ item }) => (
-                  <View style={styles.viewerItem}>
-                    <Image
-                      source={item.avatar ? { uri: item.avatar } : require('../../../assets/icon.png')}
-                      style={styles.viewerAvatar}
-                    />
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.viewerName}>{item.name || 'Unknown'}</Text>
-                      <Text style={styles.viewerTime}>{timeAgo(item.likedAt)}</Text>
-                    </View>
-                    <Text style={{ fontSize: 16 }}>❤️</Text>
-                  </View>
-                )}
+                renderItem={({ item }) => {
+                  const likerIdStr = String(item?.userId || item?._id || '');
+                  const phone      = item.phone
+                    || (item.mobile?.code && item.mobile?.number
+                          ? `${item.mobile.code} ${item.mobile.number}`
+                          : item.mobile?.number);
+                  const displayName = resolveContactName(likerIdStr, item.name, phone);
+                  const openProfile = () => {
+                    if (!likerIdStr) return;
+                    closePanel();
+                    navigation.navigate('UserB', {
+                      item: {
+                        _id:          likerIdStr,
+                        fullName:     displayName,
+                        profileImage: item.avatar || null,
+                      },
+                    });
+                  };
+                  return (
+                    <TouchableOpacity
+                      style={styles.viewerItem}
+                      activeOpacity={0.7}
+                      onPress={openProfile}
+                      accessibilityLabel={`Open ${displayName}'s profile`}
+                    >
+                      <Image
+                        source={item.avatar ? { uri: item.avatar } : require('../../../assets/icon.png')}
+                        style={styles.viewerAvatar}
+                      />
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.viewerName}>{displayName}</Text>
+                        <Text style={styles.viewerTime}>{timeAgo(item.likedAt)}</Text>
+                      </View>
+                      <Ionicons name="heart" size={18} color="#FF3B5C" />
+                    </TouchableOpacity>
+                  );
+                }}
                 ListEmptyComponent={<Text style={styles.noViewers}>No likes yet</Text>}
               />
             )}
@@ -720,31 +926,84 @@ export default function StatusViewer({ navigation, route }) {
         </>
       )}
 
-      {/* Reply modal */}
+      {/* Reply modal — WhatsApp-style composer pinned above the keyboard */}
       <Modal visible={showReply} transparent animationType="slide" onRequestClose={() => { setShowReply(false); resume(); }}>
-        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.replyModal}>
-          <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => { setShowReply(false); resume(); }} />
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+          style={styles.replyModal}
+        >
+          {/* Tap anywhere on the dim backdrop to dismiss — status stays
+              faintly visible behind it like WhatsApp does. */}
+          <TouchableOpacity
+            style={styles.replyBackdrop}
+            activeOpacity={1}
+            onPress={() => { setShowReply(false); resume(); }}
+          />
+
           <View style={styles.replySheet}>
-            <Text style={styles.replySheetTitle}>Reply to {displayName}</Text>
-            <View style={styles.replyRow}>
-              <TextInput
-                style={styles.replyInput}
-                placeholder="Type a reply…"
-                placeholderTextColor="#94a3b8"
-                value={replyText}
-                onChangeText={setReplyText}
-                autoFocus
-                multiline
-                maxLength={500}
-              />
+            {/* Drag handle hints "swipe to dismiss" */}
+            <View style={styles.replyHandle} />
+
+            {/* "Replying to {name}" header strip with the status thumbnail
+                so the recipient sees the context of what they're answering. */}
+            <View style={styles.replyContext}>
+              <View style={styles.replyContextThumb}>
+                {currentStatus?.mediaItems?.[0]?.thumbnailUrl || currentStatus?.mediaItems?.[0]?.mediaUrl ? (
+                  <Image
+                    source={{ uri: currentStatus.mediaItems[0].thumbnailUrl || currentStatus.mediaItems[0].mediaUrl }}
+                    style={styles.replyContextThumbImg}
+                  />
+                ) : (
+                  <View
+                    style={[
+                      styles.replyContextThumbImg,
+                      styles.replyContextThumbFallback,
+                      { backgroundColor: currentStatus?.bgColor || '#075e54' },
+                    ]}
+                  >
+                    <Ionicons name="chatbubble-ellipses" size={14} color="#fff" />
+                  </View>
+                )}
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.replyContextLabel}>Replying to</Text>
+                <Text style={styles.replyContextName} numberOfLines={1}>{displayName}</Text>
+              </View>
               <TouchableOpacity
-                style={[styles.replySend, { opacity: replyText.trim() ? 1 : 0.4 }]}
+                onPress={() => { setShowReply(false); resume(); }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Ionicons name="close" size={20} color="rgba(255,255,255,0.7)" />
+              </TouchableOpacity>
+            </View>
+
+            {/* Composer — emoji + pill input + green circular send (WhatsApp) */}
+            <View style={styles.replyRow}>
+              <View style={styles.replyInputPill}>
+                <Ionicons name="happy-outline" size={22} color="rgba(255,255,255,0.55)" />
+                <TextInput
+                  style={styles.replyInput}
+                  placeholder="Message"
+                  placeholderTextColor="rgba(255,255,255,0.45)"
+                  value={replyText}
+                  onChangeText={setReplyText}
+                  autoFocus
+                  multiline
+                  maxLength={500}
+                />
+              </View>
+              <TouchableOpacity
+                style={[
+                  styles.replySend,
+                  { opacity: replyText.trim() ? 1 : 0.55 },
+                ]}
                 onPress={handleReply}
                 disabled={sending || !replyText.trim()}
+                accessibilityLabel="Send reply"
               >
                 {sending
                   ? <ActivityIndicator size="small" color="#fff" />
-                  : <Ionicons name="send" size={20} color="#fff" />
+                  : <Ionicons name="send" size={18} color="#fff" />
                 }
               </TouchableOpacity>
             </View>
@@ -773,71 +1032,140 @@ const styles = StyleSheet.create({
   leftZone:   { width: SW * 0.30 },
   rightZone:  { flex: 1 },
 
-  // Gradient overlays (simulated with stacked semi-transparent layers)
-  topGradient: {
-    position: 'absolute', top: 0, left: 0, right: 0,
-    height: 110,
-    flexDirection: 'column',
-    overflow: 'hidden',
-  },
-  bottomGradient: {
-    position: 'absolute', bottom: 0, left: 0, right: 0,
-    height: 130,
-    flexDirection: 'column',
-    overflow: 'hidden',
-  },
-  gradientLayer: {
-    flex: 1,
-    backgroundColor: '#000',
-  },
+  // ── Progress bars — WhatsApp top edge ────────────────────────────────────
+  progressContainer: { position: 'absolute', top: 46, left: 8, right: 8, flexDirection: 'row', gap: 3 },
+  progressTrack:     { flex: 1, height: 2.5, backgroundColor: 'rgba(255,255,255,0.35)', borderRadius: 2, overflow: 'hidden' },
+  progressFill:      { height: '100%', backgroundColor: '#fff', borderRadius: 2 },
 
-  // Progress
-  progressContainer: { position: 'absolute', top: 48, left: 8, right: 8, flexDirection: 'row', gap: 3 },
-  progressTrack:     { flex: 1, height: 2, backgroundColor: 'rgba(255,255,255,0.4)', borderRadius: 1, overflow: 'hidden' },
-  progressFill:      { height: '100%', backgroundColor: '#fff', borderRadius: 1 },
-
-  // Header
-  header:        { position: 'absolute', top: 56, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12 },
-  backBtn:       { padding: 4, marginRight: 8 },
+  // ── Header — WhatsApp style: compact, transparent, text-shadow for legibility ──
+  header: {
+    position: 'absolute', top: 56, left: 0, right: 0,
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12,
+  },
+  backBtn:       { padding: 4, marginRight: 6 },
   headerProfile: { flex: 1, flexDirection: 'row', alignItems: 'center' },
-  headerAvatar:  { width: 38, height: 38, borderRadius: 19, marginRight: 10, borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.6)' },
+  headerAvatar:  { width: 38, height: 38, borderRadius: 19, marginRight: 10 },
   headerText:    { flex: 1 },
-  headerName:  { color: '#fff', fontSize: 15, fontWeight: '600' },
-  headerTime:  { color: 'rgba(255,255,255,0.65)', fontSize: 12 },
+  headerName: {
+    color: '#fff', fontSize: 16, fontWeight: '600',
+    textShadowColor: 'rgba(0,0,0,0.55)',
+    textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
+  headerTime: {
+    color: 'rgba(255,255,255,0.85)', fontSize: 12,
+    marginTop: 1,
+    textShadowColor: 'rgba(0,0,0,0.55)',
+    textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
   moreBtn:     { padding: 8 },
+  muteBtn:     { padding: 8, marginRight: 2 },
   deleteBtn:   { padding: 8 },
 
-  // Owner bar
-  ownerBar:       { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 14, paddingBottom: 28, backgroundColor: 'rgba(0,0,0,0.5)' },
-  ownerTabs:      { flexDirection: 'row', flex: 1, gap: 8 },
-  ownerTab:       { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.12)' },
-  ownerTabActive: { backgroundColor: 'rgba(255,255,255,0.25)' },
-  ownerTabText:   { color: '#fff', fontSize: 13, fontWeight: '600' },
-  // Panel tabs (inside the slide-up sheet)
-  panelTabs:        { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.1)', marginBottom: 8 },
-  panelTab:         { flex: 1, paddingVertical: 10, alignItems: 'center' },
-  panelTabActive:   { borderBottomWidth: 2, borderBottomColor: '#25D366' },
-  panelTabText:     { color: 'rgba(255,255,255,0.55)', fontSize: 14, fontWeight: '600' },
+  // ── Owner bar — counts pill on the left, delete pill on the right ───────
+  ownerBar: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 14,
+    paddingTop: 12, paddingBottom: 26,
+    gap: 10,
+  },
+  // Tinted pill behind the views/likes counts so they stay legible on
+  // bright media without darkening the whole bottom band.
+  ownerSummary: {
+    flexDirection: 'row', alignItems: 'center', gap: 18,
+    paddingVertical: 10, paddingHorizontal: 16,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    borderRadius: 999,
+  },
+  ownerStat: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+  },
+  ownerStatText: {
+    color: '#fff', fontSize: 14, fontWeight: '600',
+  },
+  // Matching circular pill for the delete affordance — same surface tone
+  // so the two controls read as one row visually.
+  ownerIconBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+
+  // ── Panel tabs (inside slide-up sheet) — small caps + accent underline ───
+  panelTabs:        {
+    flexDirection: 'row', marginHorizontal: 4, marginBottom: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.12)',
+  },
+  panelTab:         { flex: 1, paddingVertical: 14, alignItems: 'center' },
+  panelTabActive:   { borderBottomWidth: 2, borderBottomColor: '#fff' },
+  panelTabText:     {
+    color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: '700',
+    letterSpacing: 1.6, textTransform: 'uppercase',
+  },
   panelTabTextActive: { color: '#fff' },
 
-  // Viewer bar
-  viewerBar:         { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 14, paddingBottom: 28, backgroundColor: 'rgba(0,0,0,0.3)' },
+  // ── Viewer bar (non-owner) — WhatsApp style: transparent, rounded reply ──
+  viewerBar: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 12, paddingTop: 10, paddingBottom: 26,
+  },
   reactBtn:          { alignItems: 'center', paddingHorizontal: 6 },
   reactCount:        { color: '#fff', fontSize: 11, marginTop: 2 },
-  replyInputTrigger: { flex: 1, marginHorizontal: 8, height: 42, borderRadius: 21, borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.7)', justifyContent: 'center', paddingHorizontal: 16 },
-  replyPlaceholder:  { color: 'rgba(255,255,255,0.75)', fontSize: 14 },
+  // WhatsApp's status reply hint: chevron + "Reply" centred in a small pill.
+  replyInputTrigger: {
+    flex: 1, marginRight: 6, height: 42,
+    borderRadius: 22,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.45)',
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    flexDirection: 'row',
+    alignItems: 'center', justifyContent: 'center',
+    paddingHorizontal: 18,
+  },
+  replyPlaceholder: {
+    color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: '500',
+  },
 
-  // Viewers panel
+  // ── Viewers panel — editorial sheet ──────────────────────────────────────
   panelBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'transparent' },
-  viewersList:   { position: 'absolute', bottom: 0, left: 0, right: 0, height: SH * 0.50, backgroundColor: '#1D2B33', borderTopLeftRadius: 20, borderTopRightRadius: 20, paddingHorizontal: 16, paddingBottom: 32 },
-  viewersHandle: { alignItems: 'center', paddingVertical: 10 },
-  viewersHandleBar: { width: 36, height: 4, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 2 },
-  viewersTitle:  { color: '#fff', fontSize: 16, fontWeight: '700', marginBottom: 8 },
-  viewerItem:   { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, gap: 12 },
-  viewerAvatar: { width: 40, height: 40, borderRadius: 20 },
-  viewerName:   { color: '#fff', fontSize: 14, fontWeight: '600' },
-  viewerTime:   { color: 'rgba(255,255,255,0.55)', fontSize: 12 },
-  noViewers:    { color: 'rgba(255,255,255,0.45)', textAlign: 'center', paddingVertical: 20 },
+  viewersList:   {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    height: SH * 0.58,
+    backgroundColor: '#10171B',
+    borderTopLeftRadius: 28, borderTopRightRadius: 28,
+    paddingHorizontal: 22, paddingBottom: 32,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+  },
+  viewersHandle:    { alignItems: 'center', paddingVertical: 14 },
+  viewersHandleBar: { width: 40, height: 3, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 2 },
+  viewersTitle:     {
+    color: '#fff', fontSize: 13, fontWeight: '700', marginBottom: 6,
+    letterSpacing: 1.6, textTransform: 'uppercase',
+  },
+  viewerItem:   {
+    flexDirection: 'row', alignItems: 'center',
+    paddingVertical: 12, gap: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  viewerAvatar: { width: 42, height: 42, borderRadius: 21 },
+  viewerName:   {
+    color: '#fff', fontSize: 15, fontWeight: '500', marginBottom: 2,
+    fontFamily: Platform.select({ ios: 'Georgia', android: 'serif', default: 'serif' }),
+    letterSpacing: -0.2,
+  },
+  viewerTime:   {
+    color: 'rgba(255,255,255,0.55)', fontSize: 11,
+    fontFamily: Platform.select({ ios: 'Georgia', android: 'serif', default: 'serif' }),
+    fontStyle: 'italic',
+  },
+  noViewers:    {
+    color: 'rgba(255,255,255,0.45)', textAlign: 'center', paddingVertical: 32,
+    fontSize: 13, letterSpacing: 0.3,
+  },
 
   // Link status
   linkContent: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e', padding: 20 },
@@ -847,12 +1175,88 @@ const styles = StyleSheet.create({
   linkDesc:    { color: 'rgba(255,255,255,0.7)', fontSize: 14, marginBottom: 8 },
   linkUrlRow:  { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
   linkUrl:     { color: '#60a5fa', fontSize: 12, flex: 1 },
+  linkSite:    { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: '700', marginBottom: 2 },
+  // Centred floating CTA layered on top of the tap-zones overlay so the
+  // navigation taps can't steal it. `pointerEvents: 'box-none'` on the
+  // parent lets background taps still go through to the navigation zones.
+  openLinkOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    paddingBottom: 160, // sits above the bottom action bar
+  },
+  openLinkBtn: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#3b82f6',
+    paddingHorizontal: 22, paddingVertical: 12,
+    borderRadius: 24,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  openLinkBtnText: { color: '#fff', fontSize: 14, fontWeight: '700' },
 
-  // Reply modal
-  replyModal:      { flex: 1, justifyContent: 'flex-end' },
-  replySheet:      { backgroundColor: '#1D2B33', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: Platform.OS === 'ios' ? 36 : 20 },
-  replySheetTitle: { color: '#fff', fontSize: 16, fontWeight: '700', marginBottom: 12 },
-  replyRow:        { flexDirection: 'row', alignItems: 'flex-end', gap: 10 },
-  replyInput:      { flex: 1, borderRadius: 18, backgroundColor: '#2A3942', paddingHorizontal: 14, paddingVertical: 10, color: '#fff', fontSize: 15, maxHeight: 120 },
-  replySend:       { width: 44, height: 44, borderRadius: 22, backgroundColor: '#25D366', alignItems: 'center', justifyContent: 'center' },
+  // ── Reply modal — WhatsApp composer ──────────────────────────────────────
+  replyModal:    { flex: 1, justifyContent: 'flex-end' },
+  // Dim backdrop — status stays faintly visible above it.
+  replyBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  // Floating composer sheet pinned to the bottom edge.
+  replySheet: {
+    backgroundColor: '#0B141A',           // WhatsApp dark chat bg
+    borderTopLeftRadius: 18, borderTopRightRadius: 18,
+    paddingHorizontal: 12,
+    paddingTop: 10,
+    paddingBottom: Platform.OS === 'ios' ? 32 : 14,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(255,255,255,0.08)',
+  },
+  replyHandle: {
+    alignSelf: 'center',
+    width: 38, height: 4, borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    marginBottom: 12,
+  },
+  // "Replying to" context row — small thumb + label + close.
+  replyContext: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 4, paddingBottom: 10, gap: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+    marginBottom: 10,
+  },
+  replyContextThumb:    { width: 34, height: 34 },
+  replyContextThumbImg: { width: 34, height: 34, borderRadius: 6, resizeMode: 'cover' },
+  replyContextThumbFallback: { alignItems: 'center', justifyContent: 'center' },
+  replyContextLabel:    { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginBottom: 1 },
+  replyContextName:     { color: '#fff', fontSize: 14, fontWeight: '600' },
+
+  // Composer row: pill input + circular send (matches WhatsApp chat).
+  replyRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, paddingHorizontal: 4 },
+  replyInputPill: {
+    flex: 1,
+    flexDirection: 'row', alignItems: 'flex-end',
+    gap: 8,
+    backgroundColor: '#1F2C33',
+    borderRadius: 24,
+    paddingHorizontal: 14, paddingVertical: Platform.OS === 'ios' ? 10 : 6,
+    minHeight: 44,
+    maxHeight: 130,
+  },
+  replyInput: {
+    flex: 1,
+    color: '#fff', fontSize: 15, lineHeight: 20,
+    paddingVertical: Platform.OS === 'ios' ? 0 : 4,
+    maxHeight: 110,
+  },
+  replySend: {
+    width: 44, height: 44, borderRadius: 22,
+    backgroundColor: '#25D366', alignItems: 'center', justifyContent: 'center',
+    shadowColor: '#25D366', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.35, shadowRadius: 6,
+    elevation: 4,
+  },
 });

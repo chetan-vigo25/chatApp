@@ -249,7 +249,7 @@ export default function GroupInfo({ navigation, route }) {
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
-      <StatusBar translucent backgroundColor="transparent" barStyle="light-content" />
+      <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
 
       {/* ─── Floating header over hero — SafeAreaView handles the top inset ─── */}
       <SafeAreaView edges={['top']} style={styles.floatingHeaderSafe}>

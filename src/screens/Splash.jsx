@@ -7,6 +7,7 @@ import { initSocket, getSocket, isSocketConnected, reconnectSocket } from '../Re
 import { useDeviceInfo } from '../contexts/DeviceInfoContext';
 import { bootstrapSession, getStoredSession } from '../services/sessionManager';
 import ChatDatabase from '../services/ChatDatabase';
+import { getUserSettings } from '../Redux/Services/Profile/Settings.Services';
  
 const { width } = Dimensions.get('window');
  
@@ -97,10 +98,20 @@ export default function Splash({ navigation }) {
                     } catch { syncDone = false; }
 
                     if (syncDone) {
-                        // Already synced — go straight to ChatList
+                        // Already synced — check the "deleted chats" lock before
+                        // dropping the user into the regular chat list. If a
+                        // deletedPassword is configured, route through the gate.
+                        let hasDeletedPwd = false;
+                        try {
+                            const settings = await getUserSettings();
+                            hasDeletedPwd = !!settings?.chat?.hasDeletedPassword;
+                        } catch { /* offline / first run — skip gate */ }
+
                         navigation.reset({
                             index: 0,
-                            routes: [{ name: 'ChatList' }],
+                            routes: [{
+                                name: hasDeletedPwd ? 'DeletedPasswordGate' : 'ChatList',
+                            }],
                         });
                     } else {
                         // First time on this device — sync chats + messages from API

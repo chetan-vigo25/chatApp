@@ -166,3 +166,59 @@ export const clearChatLocalArtifacts = async (chatId, options = {}) => {
 export const removeMessagesByChatId = async (chatId) => {
   await clearChatLocalArtifacts(chatId, { markCleared: true });
 };
+
+// ─── Shared durable cleanup (cross-caller deduped) ────────────────────────
+//
+// Multiple code paths can ask to wipe a chat's local persistence at the
+// same instant:
+//   1. REST resolution in useChatLogic.clearChatFor{Me,Everyone}.
+//   2. `chat:cleared:*` socket echo received by RealtimeChatContext (global).
+//   3. The same socket echo received by useChatLogic when its chat screen is open.
+//
+// If two of these race the SQLite writes, expo-sqlite throws
+// "database is locked". A module-level in-flight Map lets every caller
+// cooperate: the first one in does the work, everyone else awaits the
+// same Promise.
+let _ChatDatabaseRef = null;
+let _ChatCacheRef = null;
+
+// Lazy-bind to avoid circular imports at module init.
+const getChatDatabaseRef = () => {
+  if (!_ChatDatabaseRef) {
+    // eslint-disable-next-line global-require
+    _ChatDatabaseRef = require('../services/ChatDatabase').default;
+  }
+  return _ChatDatabaseRef;
+};
+const getChatCacheRef = () => {
+  if (!_ChatCacheRef) {
+    // eslint-disable-next-line global-require
+    _ChatCacheRef = require('../services/ChatCache').default;
+  }
+  return _ChatCacheRef;
+};
+
+const _durableClearInFlight = new Map(); // chatId -> Promise
+
+export const performDurableChatClear = (chatId, opts = {}) => {
+  const normalized = normalizeChatStorageId(chatId);
+  if (!normalized) return Promise.resolve();
+
+  const existing = _durableClearInFlight.get(normalized);
+  if (existing) return existing;
+
+  // Use the server's clearedAt timestamp when reconciling so messages that
+  // arrived AFTER the server clear (but before the local replay) survive.
+  // Falls back to Date.now() for the user-initiated path.
+  const clearedAt = Number(opts?.clearedAt) || Date.now();
+
+  const work = (async () => {
+    try { await clearChatLocalArtifacts(normalized, { markCleared: true }); } catch (e) {}
+    try { await getChatDatabaseRef().clearChat(normalized, clearedAt); } catch (e) {}
+    try { getChatCacheRef().clearMessages(normalized); } catch (e) {}
+  })();
+
+  _durableClearInFlight.set(normalized, work);
+  work.finally(() => _durableClearInFlight.delete(normalized));
+  return work;
+};

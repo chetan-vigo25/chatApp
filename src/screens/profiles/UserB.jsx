@@ -99,17 +99,6 @@ export default function UserB({ navigation, route }) {
     return () => { cancelled = true; };
   }, [peerProfile?.mobile?.code, peerProfile?.mobile?.number, localContact?.originalId, localContact?.normalizedPhone]);
 
-  // Display info — LOCAL contact (device-saved) takes priority over server
-  const displayName =
-    localContact?.fullName ||
-    peerProfile?.fullName ||
-    peer?.fullName ||
-    peer?.name ||
-    peer?.username ||
-    "User";
-  const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
-  const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
-  const about = peerProfile?.about || peer?.about || '';
   // Phone: prefer device-saved number, then server's mobile
   const serverNumber = peerProfile?.mobile?.number || peer?.mobile?.number || '';
   const serverCode = peerProfile?.mobile?.code || peerProfile?.mobile?.countryCode || peer?.mobile?.code || peer?.mobile?.countryCode || '';
@@ -118,6 +107,27 @@ export default function UserB({ navigation, route }) {
   const displayPhone = localContact?.normalizedPhone
     ? localContact.normalizedPhone
     : (countryCode ? `${countryCode} ${phoneNumber}` : phoneNumber);
+
+  // Display info — apply the same rule used everywhere else:
+  //   1. Locally-saved contact name (device-saved wins)
+  //   2. Server's saved-contact name when this viewer has them synced
+  //      server-side (peerProfile.displayName + isSavedContact flag)
+  //   3. Formatted phone number
+  //   4. Server profile fullName (last-resort fallback)
+  const serverDisplayName =
+    peerProfile?.isSavedContact ? peerProfile?.displayName : null;
+  const displayName =
+    localContact?.fullName ||
+    serverDisplayName ||
+    displayPhone ||
+    peerProfile?.fullName ||
+    peer?.fullName ||
+    peer?.name ||
+    peer?.username ||
+    "User";
+  const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
+  const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
+  const about = peerProfile?.about || peer?.about || '';
 
   // Image source — local profile image wins
   const peerProfileImage = peerProfile?.profileImage;

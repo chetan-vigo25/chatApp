@@ -22,6 +22,7 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import { Ionicons, MaterialCommunityIcons, FontAwesome5 } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
+import useStatusSettings from '../../hooks/useStatusSettings';
 
 const BG_COLORS = [
   '#075e54', '#128C7E', '#25D366', '#FF6B6B',
@@ -30,9 +31,23 @@ const BG_COLORS = [
 ];
 const MAX_FILES = 10;
 
+// Normalize an ImagePicker asset into our internal item shape.
+function normaliseAsset(a) {
+  return {
+    uri:       a.uri,
+    type:      a.type === 'video' ? 'video' : 'image',
+    width:     a.width,
+    height:    a.height,
+    duration:  a.duration || null,
+    fileSize:  a.fileSize || a.size || null,
+    mimeType:  a.mimeType || (a.type === 'video' ? 'video/mp4' : 'image/jpeg'),
+  };
+}
+
 export default function StatusCreate({ navigation, route }) {
   const { theme } = useTheme();
   const initialMode = route?.params?.type || null;
+  const { validateMediaList, limits } = useStatusSettings();
 
   const [mode, setMode]       = useState(initialMode);
   const [text, setText]       = useState('');
@@ -42,50 +57,66 @@ export default function StatusCreate({ navigation, route }) {
 
   // ── Camera ──────────────────────────────────────────────────────────────
   const launchCamera = useCallback(async () => {
-    const perm = await ImagePicker.requestCameraPermissionsAsync();
-    if (!perm.granted) return Alert.alert('Permission needed', 'Please allow camera access');
+    try {
+      const perm = await ImagePicker.requestCameraPermissionsAsync();
+      if (!perm.granted) return Alert.alert('Permission needed', 'Please allow camera access');
 
-    const result = await ImagePicker.launchCameraAsync({ quality: 0.85, allowsEditing: false });
-    if (!result.canceled && result.assets?.[0]) {
-      const asset = result.assets[0];
-      navigation.navigate('StatusCustomise', {
-        items: [{
-          uri:       asset.uri,
-          type:      asset.type === 'video' ? 'video' : 'image',
-          width:     asset.width,
-          height:    asset.height,
-          duration:  asset.duration || null,
-          mimeType:  asset.mimeType || (asset.type === 'video' ? 'video/mp4' : 'image/jpeg'),
-        }],
+      // Pre-cap video recording length to the configured limit so the OS
+      // won't even capture a video that we'd have to reject afterwards.
+      const result = await ImagePicker.launchCameraAsync({
+        quality: 0.85,
+        allowsEditing: false,
+        videoMaxDuration: limits.maxVideoSecs,
       });
+      if (result.canceled || !result.assets?.[0]) return;
+
+      const item = normaliseAsset(result.assets[0]);
+      const check = validateMediaList([item]);
+      if (!check.ok) return Alert.alert('Cannot use this media', check.message);
+
+      navigation.navigate('StatusCustomise', { items: [item] });
+    } catch (err) {
+      Alert.alert('Camera error', err?.message || 'Could not open camera');
     }
-  }, [navigation]);
+  }, [navigation, limits.maxVideoSecs, validateMediaList]);
 
   // ── Gallery multi-select ─────────────────────────────────────────────────
   const launchGallery = useCallback(async () => {
-    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!perm.granted) return Alert.alert('Permission needed', 'Please allow media library access');
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) return Alert.alert('Permission needed', 'Please allow media library access');
 
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images', 'videos'],
-      allowsMultipleSelection: true,
-      selectionLimit: MAX_FILES,
-      quality: 0.85,
-      orderedSelection: true,
-    });
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images', 'videos'],
+        allowsMultipleSelection: true,
+        selectionLimit: MAX_FILES,
+        quality: 0.85,
+        orderedSelection: true,
+        videoMaxDuration: limits.maxVideoSecs,
+      });
+      if (result.canceled || !result.assets?.length) return;
 
-    if (!result.canceled && result.assets?.length) {
-      const items = result.assets.map(a => ({
-        uri:      a.uri,
-        type:     a.type === 'video' ? 'video' : 'image',
-        width:    a.width,
-        height:   a.height,
-        duration: a.duration || null,
-        mimeType: a.mimeType || (a.type === 'video' ? 'video/mp4' : 'image/jpeg'),
-      }));
+      // De-dupe by URI (multi-select picker can return the same asset twice).
+      const seen = new Set();
+      const items = [];
+      for (const a of result.assets) {
+        const item = normaliseAsset(a);
+        if (item.uri && !seen.has(item.uri)) {
+          seen.add(item.uri);
+          items.push(item);
+        }
+      }
+
+      // Pre-validate every picked file against the backend-driven limits.
+      // First failure short-circuits with a specific message.
+      const check = validateMediaList(items);
+      if (!check.ok) return Alert.alert('Cannot use this media', check.message);
+
       navigation.navigate('StatusCustomise', { items });
+    } catch (err) {
+      Alert.alert('Gallery error', err?.message || 'Could not open gallery');
     }
-  }, [navigation]);
+  }, [navigation, limits.maxVideoSecs, validateMediaList]);
 
   // ── Text status — go straight to Preview ────────────────────────────────
   const submitText = useCallback(() => {

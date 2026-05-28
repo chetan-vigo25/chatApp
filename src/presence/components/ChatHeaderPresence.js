@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Image, Text, TouchableOpacity, View } from 'react-native';
+import { Image, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react-native';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
@@ -20,12 +20,10 @@ export default function ChatHeaderPresence({
   groupAvatar,
   memberCount,
 }) {
-  const { theme } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const { presence, lastSeenFormatted } = useUserPresence(isGroup ? null : user?._id);
   const { state } = useRealtimeChat();
 
-  // Look up the device-saved (SQLite) contact by userId. If present, use the
-  // locally-saved name/image so the header always matches the user's phonebook.
   const [localContact, setLocalContact] = useState(null);
   useEffect(() => {
     if (isGroup || !user?._id) { setLocalContact(null); return; }
@@ -46,10 +44,8 @@ export default function ChatHeaderPresence({
   );
 
   const effectivePresence = realtimePresence || presence || {};
-
   const normalizedStatus = (effectivePresence?.status || '').toLowerCase();
 
-  // Status text for 1:1 chats
   const peerStatusText = (isPeerTyping || isRealtimeTyping)
     ? 'typing...'
     : (
@@ -64,16 +60,11 @@ export default function ChatHeaderPresence({
       'offline'
     );
 
-  // For groups: show member count or typing indicator
   const groupStatusText = isPeerTyping
     ? 'typing...'
     : (memberCount ? `${memberCount} members` : 'tap here for group info');
 
   const statusText = isGroup ? groupStatusText : peerStatusText;
-  // Display name priority for 1:1 chats:
-  //   1. Local device contact name (SQLite)
-  //   2. peerUser fullName passed via route
-  //   3. Fallback
   const peerDisplayName =
     localContact?.fullName ||
     user?.fullName ||
@@ -87,55 +78,139 @@ export default function ChatHeaderPresence({
   const displayName = isGroup ? (groupName || 'Group') : peerDisplayName;
 
   const isPeerOnline = !isGroup && normalizedStatus === 'online';
-  const borderColor = isGroup ? '#ececec' : (isPeerOnline ? '#2CC84D' : '#ececec');
+  const isTyping = isPeerTyping || isRealtimeTyping;
+  const themeColor = theme.colors.themeColor;
+  const primaryText = theme.colors.primaryTextColor;
+  const subText = theme.colors.placeHolderTextColor;
+  const bg = theme.colors.background;
+  const borderColor = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.08)';
+  const ringColor = isPeerOnline ? '#25D366' : (themeColor + '30');
+
+  const statusColor = isTyping
+    ? themeColor
+    : isPeerOnline ? '#25D366' : subText;
 
   return (
-    <View style={{ width: '100%', flexDirection: 'row', alignItems: 'center', padding: 10, gap: 10, backgroundColor: theme.colors.background,
-        borderBottomColor: theme.colors.borderColor,}} >
-      <TouchableOpacity onPress={onBack} style={{ width: 40, height: 40, justifyContent: 'center', alignItems: 'center' }}>
-        <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
+    <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
+      <TouchableOpacity onPress={onBack} activeOpacity={0.6} style={styles.backBtn}>
+        <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={onPressProfile} style={{ width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor }}>
+      <TouchableOpacity
+        onPress={onPressProfile}
+        activeOpacity={0.85}
+        style={[styles.avatarRing, { borderColor: ringColor }]}
+      >
         {isGroup ? (
           groupAvatar ? (
-            <Image source={{ uri: groupAvatar }} style={{ width: '100%', height: '100%', borderRadius: 24 }} />
+            <Image source={{ uri: groupAvatar }} style={styles.avatarImg} />
           ) : (
-            <View style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: getUserColor?.(groupName || 'Group') || '#6C5CE7' }}>
+            <View style={[styles.avatarFallback, { backgroundColor: getUserColor?.(groupName || 'Group') || '#6C5CE7' }]}>
               <Ionicons name="people" size={20} color="#fff" />
             </View>
           )
         ) : peerAvatar ? (
-          <Image source={{ uri: peerAvatar }} style={{ width: '100%', height: '100%', borderRadius: 24 }} />
+          <Image source={{ uri: peerAvatar }} style={styles.avatarImg} />
         ) : (
-          <View style={{ width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: getUserColor?.(user?._id || '') || '#888' }}>
-            <Text style={{ color: theme.colors.textWhite, fontFamily: 'Roboto-Medium', fontSize: 18 }}>
+          <View style={[styles.avatarFallback, { backgroundColor: getUserColor?.(user?._id || '') || '#888' }]}>
+            <Text style={styles.avatarLetter}>
               {peerDisplayName?.charAt(0).toUpperCase() || '?'}
             </Text>
           </View>
         )}
+        {isPeerOnline && !isGroup && (
+          <View style={[styles.onlineDot, { borderColor: bg }]} />
+        )}
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={onPressProfile} activeOpacity={0.7} style={{ flex: 1 }}>
-        <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16 }} numberOfLines={1}>
-          {displayName}
-        </Text>
+      <TouchableOpacity onPress={onPressProfile} activeOpacity={0.7} style={styles.textWrap}>
         <Text
           numberOfLines={1}
-          style={{
-            color: (isPeerTyping || isRealtimeTyping)
-              ? theme.colors.themeColor
-              : (isPeerOnline ? '#2CC84D' : theme.colors.placeHolderTextColor),
-            fontFamily: 'Roboto-Medium',
-            fontSize: 12,
-            fontStyle: (isPeerTyping || isRealtimeTyping) ? 'italic' : 'normal',
-          }}
+          style={[styles.nameText, { color: primaryText }]}
         >
-          {statusText}
+          {displayName}
         </Text>
+        <View style={styles.statusRow}>
+          {isTyping && <View style={[styles.typingDot, { backgroundColor: themeColor }]} />}
+          <Text
+            numberOfLines={1}
+            style={[
+              styles.statusText,
+              {
+                color: statusColor,
+                fontStyle: isTyping ? 'italic' : 'normal',
+              },
+            ]}
+          >
+            {statusText}
+          </Text>
+        </View>
       </TouchableOpacity>
 
       {rightActions}
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  root: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: Platform.OS === 'ios' ? 8 : 10,
+    gap: 8,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  backBtn: {
+    width: 40, height: 40,
+    justifyContent: 'center', alignItems: 'center',
+    borderRadius: 12,
+  },
+  avatarRing: {
+    width: 46, height: 46, borderRadius: 23,
+    borderWidth: 2, padding: 1.5,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  avatarImg: {
+    width: '100%', height: '100%', borderRadius: 21,
+  },
+  avatarFallback: {
+    width: '100%', height: '100%', borderRadius: 21,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  avatarLetter: {
+    color: '#fff',
+    fontFamily: 'Roboto-Bold',
+    fontSize: 17,
+  },
+  onlineDot: {
+    position: 'absolute',
+    bottom: 0, right: 0,
+    width: 12, height: 12, borderRadius: 6,
+    backgroundColor: '#25D366',
+    borderWidth: 2,
+  },
+  textWrap: {
+    flex: 1,
+    paddingLeft: 4,
+  },
+  nameText: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 16,
+    letterSpacing: -0.1,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    marginTop: 2,
+  },
+  typingDot: {
+    width: 5, height: 5, borderRadius: 2.5,
+  },
+  statusText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+  },
+});

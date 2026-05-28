@@ -1,0 +1,607 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  View, Text, ScrollView, TouchableOpacity, Animated,
+  StyleSheet, TextInput, ActivityIndicator, Alert,
+  KeyboardAvoidingView, Platform,
+} from 'react-native';
+import { FontAwesome6, Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { useTheme } from '../../contexts/ThemeContext';
+import {
+  getUserSettings,
+  updateUserSettings,
+} from '../../Redux/Services/Profile/Settings.Services';
+
+export default function DeletedChatsPassword({ navigation }) {
+  const { theme, isDarkMode } = useTheme();
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(16)).current;
+
+  const [loading, setLoading] = useState(true);
+  const [hasPassword, setHasPassword] = useState(false);
+  const [pwd, setPwd] = useState('');
+  const [confirmPwd, setConfirmPwd] = useState('');
+  const [showPwd, setShowPwd] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fadeAnim, { toValue: 1, duration: 350, useNativeDriver: true }),
+      Animated.spring(slideAnim, { toValue: 0, friction: 9, tension: 60, useNativeDriver: true }),
+    ]).start();
+
+    let alive = true;
+    (async () => {
+      try {
+        const settings = await getUserSettings();
+        if (!alive) return;
+        const chat = settings?.chat || {};
+        const flag =
+          typeof chat.hasDeletedPassword === 'boolean'
+            ? chat.hasDeletedPassword
+            : !!chat.deletedPassword;
+        setHasPassword(flag);
+      } catch {
+        /* leave defaults */
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const themeColor = theme.colors.themeColor;
+  const primaryText = theme.colors.primaryTextColor;
+  const subText = theme.colors.placeHolderTextColor;
+  const pageBg = isDarkMode ? '#0B141A' : '#F4F6F9';
+  const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
+  const inputBg = isDarkMode ? '#0F1A21' : '#F2F4F8';
+  const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.06)';
+
+  const clearMessages = () => {
+    if (error) setError('');
+    if (success) setSuccess('');
+  };
+
+  const handleSave = async () => {
+    clearMessages();
+    const trimmed = pwd.trim();
+    if (trimmed.length < 4) {
+      setError('Password must be at least 4 characters.');
+      return;
+    }
+    if (trimmed.length > 128) {
+      setError('Password is too long (max 128 chars).');
+      return;
+    }
+    if (trimmed !== confirmPwd.trim()) {
+      setError('Passwords do not match.');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await updateUserSettings({ chat: { deletedPassword: trimmed } });
+      setHasPassword(true);
+      setPwd('');
+      setConfirmPwd('');
+      setSuccess(hasPassword ? 'Password updated.' : 'Password set.');
+    } catch (e) {
+      setError(typeof e === 'string' ? e : 'Could not save password. Try again.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleReset = () => {
+    if (!hasPassword) return;
+    Alert.alert(
+      'Reset password?',
+      'Your current password will be cleared. The recently-deleted area will be unlocked until you set a new one.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset',
+          style: 'destructive',
+          onPress: async () => {
+            clearMessages();
+            setResetting(true);
+            try {
+              await updateUserSettings({ chat: { deletedPassword: null } });
+              setHasPassword(false);
+              setPwd('');
+              setConfirmPwd('');
+              setSuccess('Password reset. You can set a new one below.');
+            } catch (e) {
+              setError(typeof e === 'string' ? e : 'Could not reset password.');
+            } finally {
+              setResetting(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  // ─── Header ───
+  const renderHeader = () => (
+    <View style={styles.header}>
+      <TouchableOpacity
+        onPress={() => navigation.goBack()}
+        activeOpacity={0.6}
+        style={[styles.headerBackBtn, { backgroundColor: cardBg }]}
+      >
+        <FontAwesome6 name="arrow-left" size={18} color={primaryText} />
+      </TouchableOpacity>
+      <View style={styles.flex}>
+        <Text style={[styles.headerTitle, { color: primaryText }]}>
+          Deleted chats password
+        </Text>
+      </View>
+    </View>
+  );
+
+  // ─── Info hero ───
+  const renderHero = () => (
+    <Animated.View
+      style={[
+        styles.heroWrap,
+        { opacity: fadeAnim, transform: [{ translateY: slideAnim }] },
+      ]}
+    >
+      <View pointerEvents="none" style={[styles.heroHalo, { backgroundColor: themeColor + '22' }]} />
+      <View pointerEvents="none" style={[styles.heroHalo2, { backgroundColor: themeColor + '10' }]} />
+      <View style={[styles.heroCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+        <View style={[styles.heroBadge, { backgroundColor: themeColor + '1A' }]}>
+          <Ionicons name="lock-closed" size={26} color={themeColor} />
+        </View>
+        <Text style={[styles.heroTitle, { color: primaryText }]}>
+          Lock recently-deleted chats
+        </Text>
+        <Text style={[styles.heroBody, { color: subText }]}>
+          This password is required to view or restore chats from the
+          recently-deleted area. It is hashed on the server with bcrypt
+          — we never store or send it in plaintext.
+        </Text>
+
+        <View style={[styles.statusPill, {
+          backgroundColor: hasPassword ? '#00B89420' : '#FFA50020',
+          borderColor: hasPassword ? '#00B89460' : '#FFA50060',
+        }]}>
+          <View style={[styles.statusDot, {
+            backgroundColor: hasPassword ? '#00B894' : '#FFA500',
+          }]} />
+          <Text style={[styles.statusText, {
+            color: hasPassword ? '#00B894' : '#C97B00',
+          }]}>
+            {hasPassword ? 'Active' : 'Not set'}
+          </Text>
+        </View>
+      </View>
+    </Animated.View>
+  );
+
+  // ─── Info rows ───
+  const renderDetails = () => (
+    <View style={styles.section}>
+      <Text style={[styles.sectionTitle, { color: subText }]}>DETAILS</Text>
+      <View style={[styles.sectionCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+        <DetailRow
+          icon="shield-key-outline"
+          label="Hashing"
+          value="bcrypt"
+          borderClr={borderClr} primaryText={primaryText} subText={subText} themeColor={themeColor}
+        />
+        <DetailRow
+          icon="format-letter-case"
+          label="Length"
+          value="4 – 128 characters"
+          borderClr={borderClr} primaryText={primaryText} subText={subText} themeColor={themeColor}
+        />
+        <DetailRow
+          icon="eye-off-outline"
+          label="Stored as"
+          value="One-way hash (never plaintext)"
+          borderClr={borderClr} primaryText={primaryText} subText={subText} themeColor={themeColor}
+          isLast
+        />
+      </View>
+    </View>
+  );
+
+  // ─── Form ───
+  const renderForm = () => (
+    <View style={styles.section}>
+      <Text style={[styles.sectionTitle, { color: subText }]}>
+        {hasPassword ? 'UPDATE PASSWORD' : 'SET PASSWORD'}
+      </Text>
+      <View style={[styles.formCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+        <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
+          <Ionicons name="key-outline" size={18} color={subText} />
+          <TextInput
+            value={pwd}
+            onChangeText={(t) => { setPwd(t); clearMessages(); }}
+            placeholder={hasPassword ? 'New password' : 'Password'}
+            placeholderTextColor={subText}
+            secureTextEntry={!showPwd}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!submitting && !resetting}
+            style={[styles.input, { color: primaryText }]}
+          />
+          <TouchableOpacity
+            onPress={() => setShowPwd((s) => !s)}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <Ionicons
+              name={showPwd ? 'eye-off-outline' : 'eye-outline'}
+              size={20}
+              color={subText}
+            />
+          </TouchableOpacity>
+        </View>
+
+        <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
+          <Ionicons name="checkmark-circle-outline" size={18} color={subText} />
+          <TextInput
+            value={confirmPwd}
+            onChangeText={(t) => { setConfirmPwd(t); clearMessages(); }}
+            placeholder="Confirm password"
+            placeholderTextColor={subText}
+            secureTextEntry={!showPwd}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!submitting && !resetting}
+            style={[styles.input, { color: primaryText }]}
+          />
+        </View>
+
+        {!!error && (
+          <View style={styles.msgRow}>
+            <Ionicons name="alert-circle" size={14} color="#E53935" />
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+        {!!success && (
+          <View style={styles.msgRow}>
+            <Ionicons name="checkmark-circle" size={14} color="#00B894" />
+            <Text style={styles.successText}>{success}</Text>
+          </View>
+        )}
+
+        <TouchableOpacity
+          activeOpacity={0.85}
+          onPress={handleSave}
+          disabled={submitting || resetting || loading}
+          style={[styles.primaryBtn, {
+            backgroundColor: themeColor,
+            opacity: (submitting || resetting || loading) ? 0.7 : 1,
+          }]}
+        >
+          {submitting ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <Ionicons name="save-outline" size={18} color="#fff" />
+              <Text style={styles.primaryBtnText}>
+                {hasPassword ? 'Update password' : 'Set password'}
+              </Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
+  // ─── Reset ───
+  const renderReset = () => (
+    <View style={styles.section}>
+      <Text style={[styles.sectionTitle, { color: subText }]}>RECOVERY</Text>
+      <View style={[styles.sectionCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+        <TouchableOpacity
+          activeOpacity={0.7}
+          onPress={handleReset}
+          disabled={!hasPassword || resetting || submitting}
+          style={styles.row}
+        >
+          <View style={[styles.rowIconWrap, {
+            backgroundColor: hasPassword ? '#E5393520' : (isDarkMode ? '#243340' : '#F2F4F8'),
+          }]}>
+            {resetting ? (
+              <ActivityIndicator size="small" color="#E53935" />
+            ) : (
+              <MaterialCommunityIcons
+                name="lock-reset"
+                size={22}
+                color={hasPassword ? '#E53935' : subText}
+              />
+            )}
+          </View>
+          <View style={styles.rowTextWrap}>
+            <View style={styles.flex}>
+              <Text style={[styles.rowLabel, {
+                color: hasPassword ? '#E53935' : subText,
+              }]}>
+                Reset password
+              </Text>
+              <Text style={[styles.rowSub, { color: subText }]}>
+                {hasPassword
+                  ? 'Clear the current password and start over'
+                  : 'Available once a password is set'}
+              </Text>
+            </View>
+            {hasPassword && (
+              <Ionicons name="chevron-forward" size={17} color={subText} />
+            )}
+          </View>
+        </TouchableOpacity>
+      </View>
+      <Text style={[styles.footerHint, { color: subText }]}>
+        Resetting clears the saved password instantly. There is no email or
+        OTP recovery — set a password you can remember.
+      </Text>
+    </View>
+  );
+
+  return (
+    <View style={[styles.container, { backgroundColor: pageBg }]}>
+      {renderHeader()}
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={styles.flex}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 24}
+      >
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          {renderHero()}
+          {renderForm()}
+          {renderReset()}
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </View>
+  );
+}
+
+function DetailRow({ icon, label, value, borderClr, primaryText, subText, themeColor, isLast }) {
+  return (
+    <View style={styles.detailRow}>
+      <View style={[styles.detailIconWrap, { backgroundColor: themeColor + '14' }]}>
+        <MaterialCommunityIcons name={icon} size={18} color={themeColor} />
+      </View>
+      <View style={[
+        styles.detailTextWrap,
+        !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: borderClr },
+      ]}>
+        <Text style={[styles.detailLabel, { color: subText }]}>{label}</Text>
+        <Text style={[styles.detailValue, { color: primaryText }]}>{value}</Text>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  flex: { flex: 1 },
+
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
+    gap: 12,
+  },
+  headerBackBtn: {
+    width: 40, height: 40, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  headerTitle: {
+    fontFamily: 'Roboto-Bold',
+    fontSize: 20,
+    letterSpacing: -0.3,
+  },
+  headerSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 1,
+  },
+  scrollContent: { paddingHorizontal: 16, paddingBottom: 40 },
+
+  // Hero
+  heroWrap: { position: 'relative', marginTop: 4, marginBottom: 22 },
+  heroHalo: {
+    position: 'absolute',
+    top: -40, right: -40,
+    width: 200, height: 200, borderRadius: 100,
+  },
+  heroHalo2: {
+    position: 'absolute',
+    bottom: -30, left: -40,
+    width: 160, height: 160, borderRadius: 80,
+  },
+  heroCard: {
+    borderRadius: 22,
+    padding: 22,
+    shadowOpacity: 0.08,
+    shadowOffset: { width: 0, height: 12 },
+    shadowRadius: 22,
+    elevation: 4,
+  },
+  heroBadge: {
+    width: 56, height: 56, borderRadius: 16,
+    alignItems: 'center', justifyContent: 'center',
+    marginBottom: 14,
+  },
+  heroTitle: {
+    fontFamily: 'Roboto-Bold',
+    fontSize: 18,
+    marginBottom: 6,
+  },
+  heroBody: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 14,
+  },
+  statusPill: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  statusDot: { width: 7, height: 7, borderRadius: 4 },
+  statusText: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 11,
+    letterSpacing: 0.4,
+  },
+
+  // Sections
+  section: { marginBottom: 18 },
+  sectionTitle: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 11,
+    letterSpacing: 1.2,
+    marginBottom: 10,
+    marginLeft: 8,
+  },
+  sectionCard: {
+    borderRadius: 18,
+    overflow: 'hidden',
+    shadowOpacity: 0.04,
+    shadowOffset: { width: 0, height: 4 },
+    shadowRadius: 10,
+    elevation: 2,
+  },
+
+  // Detail rows
+  detailRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: 14,
+    gap: 14,
+  },
+  detailIconWrap: {
+    width: 38, height: 38, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  detailTextWrap: {
+    flex: 1,
+    paddingVertical: 14,
+    paddingRight: 16,
+  },
+  detailLabel: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 11,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 2,
+  },
+  detailValue: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 14,
+  },
+
+  // Form
+  formCard: {
+    borderRadius: 18,
+    padding: 16,
+    shadowOpacity: 0.04,
+    shadowOffset: { width: 0, height: 4 },
+    shadowRadius: 10,
+    elevation: 2,
+  },
+  inputWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    height: 50,
+    marginBottom: 12,
+    gap: 10,
+  },
+  input: {
+    flex: 1,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 15,
+    paddingVertical: 0,
+  },
+  msgRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 10,
+    marginLeft: 4,
+  },
+  errorText: {
+    color: '#E53935',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+  },
+  successText: {
+    color: '#00B894',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+  },
+  primaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    height: 50,
+    borderRadius: 14,
+    marginTop: 4,
+  },
+  primaryBtnText: {
+    color: '#fff',
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 15,
+  },
+
+  // Reset row
+  row: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: 14,
+    gap: 14,
+  },
+  rowIconWrap: {
+    width: 42, height: 42, borderRadius: 14,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  rowTextWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingRight: 16,
+    gap: 10,
+  },
+  rowLabel: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 15,
+    lineHeight: 20,
+  },
+  rowSub: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 2,
+  },
+
+  footerHint: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    textAlign: 'center',
+    lineHeight: 17,
+    paddingHorizontal: 24,
+    marginTop: 14,
+  },
+});

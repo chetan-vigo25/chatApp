@@ -142,24 +142,30 @@ const CountryCodeSelector = ({
 
   return (
     <>
-      <View style={[styles.selectorRow, { borderBottomColor: theme.colors.themeColor }]}>
-        <View style={styles.selectorCenter}>
+      <TouchableOpacity
+        onPress={openModal}
+        disabled={disabled}
+        activeOpacity={0.7}
+        style={[styles.selectorRow, style, { opacity: disabled ? 0.5 : 1 }]}
+      >
+        {showFlag && selectedCountry?.flag ? (
+          <Text style={styles.selectorFlag}>{selectedCountry.flag}</Text>
+        ) : null}
+        {showName ? (
           <Text
             style={[styles.selectorText, { color: theme.colors.primaryTextColor }]}
             numberOfLines={1}
           >
             {selectedCountry?.name || placeholder}
           </Text>
-        </View>
-        <TouchableOpacity
-          onPress={openModal}
-          disabled={disabled}
-          activeOpacity={0.7}
-          style={[styles.selectorArrow, { opacity: disabled ? 0.5 : 1 }]}
-        >
-          <Ionicons name="chevron-down" size={16} color={theme.colors.themeColor} />
-        </TouchableOpacity>
-      </View>
+        ) : null}
+        {showCode ? (
+          <Text style={[styles.selectorText, styles.selectorCode, { color: theme.colors.primaryTextColor }]}>
+            {selectedCountry?.code}
+          </Text>
+        ) : null}
+        <Ionicons name="chevron-down" size={16} color={theme.colors.themeColor} style={styles.selectorChevron} />
+      </TouchableOpacity>
 
       <Modal
         visible={showModal}
@@ -263,27 +269,22 @@ const CountryCodeSelector = ({
 
 const styles = StyleSheet.create({
   selectorRow: {
-    width: '50%',
-    height: 40,
-    marginTop: 40,
     flexDirection: 'row',
-    alignSelf: 'center',
-    borderBottomWidth: 1.5,
-  },
-  selectorCenter: {
-    flex: 1,
     alignItems: 'center',
-    justifyContent: 'center',
+  },
+  selectorFlag: {
+    fontSize: 20,
+    marginRight: 4,
   },
   selectorText: {
     fontFamily: 'Roboto-Regular',
     fontSize: 14,
   },
-  selectorArrow: {
-    width: 20,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
+  selectorCode: {
+    marginLeft: 2,
+  },
+  selectorChevron: {
+    marginLeft: 2,
   },
   modalWrapper: {
     flex: 1,

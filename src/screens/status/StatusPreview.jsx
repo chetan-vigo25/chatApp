@@ -20,25 +20,38 @@
  *   filtersApplied  — string[] of filter IDs used
  *   visibility      — 'contacts' | 'all'  (backend enum: all/contacts/except/only)
  */
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View, Text, Image, TouchableOpacity, StyleSheet,
   ScrollView, TextInput, ActivityIndicator, Alert,
-  Platform, FlatList, Dimensions,
+  Platform, FlatList, Dimensions, BackHandler,
 } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { BlurView } from 'expo-blur';
 import { useDispatch } from 'react-redux';
 import { createStatus } from '../../Redux/Reducer/Status/Status.reducer';
 import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import { useTheme } from '../../contexts/ThemeContext';
+import useStatusSettings from '../../hooks/useStatusSettings';
+import { STATUS_TYPE, STATUS_SPACE, STATUS_RADIUS, STATUS_ACCENT } from './_statusDesign';
 
 const { width: SW } = Dimensions.get('window');
 
 // Backend enum: ['all', 'contacts', 'except', 'only']
 const VISIBILITY_OPTIONS = [
-  { id: 'contacts', label: 'My Contacts', icon: 'people-outline' },
-  { id: 'all',      label: 'Everyone',    icon: 'globe-outline' },
+  {
+    id: 'contacts',
+    label: 'My Contacts',
+    icon: 'people-outline',
+    hint: 'Only people saved in your contacts',
+  },
+  {
+    id: 'all',
+    label: 'Everyone',
+    icon: 'globe-outline',
+    hint: 'Contacts + people you have chatted with',
+  },
 ];
 
 export default function StatusPreview({ navigation, route }) {
@@ -56,22 +69,68 @@ export default function StatusPreview({ navigation, route }) {
 
   const { theme } = useTheme();
   const dispatch  = useDispatch();
+  const { validateMediaList } = useStatusSettings();
 
   const [caption, setCaption]       = useState(initialCaption);
   const [visibility, setVisibility] = useState(initialVisibility);
   const [posting, setPosting]       = useState(false);
-  const [progress, setProgress]     = useState({ current: 0, total: items.length || 1 });
+  const [progress, setProgress]     = useState({ current: 0, total: items.length || 1, percent: 0 });
   const [currentPreview, setCurrentPreview] = useState(0);
   const flatRef = useRef(null);
+  const abortRef = useRef(null);
+  const postingRef = useRef(false);
 
   const totalItems = items.length;
 
+  // ── Abort handler ────────────────────────────────────────────────────────
+  // Cancels the in-flight upload if user backs out or component unmounts.
+  const cancelUpload = useCallback((reason) => {
+    if (abortRef.current && !abortRef.current.signal.aborted) {
+      try { abortRef.current.abort(reason || 'user_cancelled'); } catch {}
+    }
+  }, []);
+
+  // Intercept Android hardware-back during posting → confirm before cancelling.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (!postingRef.current) return false;
+      Alert.alert('Cancel upload?', 'Your status has not been posted yet.', [
+        { text: 'Keep uploading', style: 'cancel' },
+        {
+          text: 'Cancel',
+          style: 'destructive',
+          onPress: () => {
+            cancelUpload('back_pressed');
+            navigation.goBack();
+          },
+        },
+      ]);
+      return true;
+    });
+    return () => sub.remove();
+  }, [cancelUpload, navigation]);
+
+  // On unmount, make sure no orphaned request keeps draining bandwidth.
+  useEffect(() => () => cancelUpload('unmount'), [cancelUpload]);
+
   // ── Upload + create ──────────────────────────────────────────────────────
   const handlePost = useCallback(async () => {
+    if (postingRef.current) return; // double-tap guard
+
+    // Re-validate against backend-driven limits right before upload — the
+    // user may have left the picker hours ago and the admin row could have
+    // changed (limits hook re-fetches every 5 min).
+    if (items.length) {
+      const check = validateMediaList(items);
+      if (!check.ok) return Alert.alert('Cannot post', check.message);
+    }
+
+    postingRef.current = true;
     setPosting(true);
+    abortRef.current = new AbortController();
+
     try {
       if (statusType === 'text') {
-        // Backend expects: textContent, bgColor (NOT text / backgroundColor)
         await dispatch(createStatus({
           textContent,
           bgColor: backgroundColor,
@@ -79,18 +138,22 @@ export default function StatusPreview({ navigation, route }) {
           visibility,
         })).unwrap();
       } else if (statusType === 'link') {
-        // Link — send as textContent with ogMetadata so the backend stores it
+        // Explicit link type — backend's mediaItem schema enum includes
+        // 'link', so a single mediaItem with mediaType:'link' lets the
+        // feed/list code identify the status as a link instead of falling
+        // back to "looks like a text status that has a URL in it".
         await dispatch(createStatus({
+          mediaItems: [{ mediaType: 'link' }],
           textContent: linkUrl,
-          ogMetadata: ogData || null,
-          caption: caption.trim() || null,
+          ogMetadata:  ogData || null,
+          caption:     caption.trim() || null,
           visibility,
         })).unwrap();
       } else {
         // Media — upload each item then send assembled mediaItems[]
         const mediaItems = [];
         for (let i = 0; i < items.length; i++) {
-          setProgress({ current: i + 1, total: items.length });
+          setProgress({ current: i + 1, total: items.length, percent: 0 });
           const item = items[i];
           const ext  = item.uri.split('.').pop()?.split('?')[0] || (item.type === 'video' ? 'mp4' : 'jpg');
           const fd   = new FormData();
@@ -100,21 +163,32 @@ export default function StatusPreview({ navigation, route }) {
             type: item.mimeType || (item.type === 'video' ? `video/${ext}` : `image/${ext}`),
           });
 
-          const uploadRes = await statusServices.uploadStatusMedia(fd);
-          // uploadMediaBatch returns an array via Promise.all; unwrap the first element
-          const rawData   = uploadRes?.data;
-          const media     = Array.isArray(rawData) ? rawData[0] : rawData;
+          const uploadRes = await statusServices.uploadStatusMedia(fd, {
+            signal: abortRef.current.signal,
+            // Videos can be much larger than the default 30s timeout allows.
+            timeoutMs: item.type === 'video' ? 300000 : 60000,
+            onProgress: (percent) => {
+              setProgress((p) => ({ ...p, percent }));
+            },
+          });
 
-          if (!media) throw new Error(`Upload failed for item ${i + 1}`);
+          if (abortRef.current?.signal?.aborted) {
+            throw Object.assign(new Error('Upload cancelled'), { name: 'AbortError' });
+          }
 
-          // Backend mediaItem schema fields: mediaType, mediaUrl, thumbnailUrl, duration, width, height
+          const rawData = uploadRes?.data;
+          const media   = Array.isArray(rawData) ? rawData[0] : rawData;
+          if (!media || (!media.mediaUrl && !media.url)) {
+            throw new Error(`Upload failed for item ${i + 1}`);
+          }
+
           mediaItems.push({
-            mediaType:       item.type,
-            mediaUrl:        media.mediaUrl || media.url,
-            thumbnailUrl:    media.thumbnailUrl || null,
-            duration:        media.duration || item.duration || null,
-            width:           media.width  || item.width  || 0,
-            height:          media.height || item.height || 0,
+            mediaType:    item.type,
+            mediaUrl:     media.mediaUrl || media.url,
+            thumbnailUrl: media.thumbnailUrl || null,
+            duration:     media.duration || item.duration || null,
+            width:        media.width  || item.width  || 0,
+            height:       media.height || item.height || 0,
           });
         }
 
@@ -125,19 +199,35 @@ export default function StatusPreview({ navigation, route }) {
         })).unwrap();
       }
 
-      // Navigate back to StatusList tab
+      // After a successful post, drop the user on the Status tab (not the
+      // chat list). `ChatList` is the bottom-tab navigator; `StatusTab` is
+      // the StatusList screen inside it.
       navigation.reset({
         index: 0,
-        routes: [{ name: 'ChatList' }],
+        routes: [
+          {
+            name: 'ChatList',
+            state: {
+              index: 0,
+              routes: [{ name: 'StatusTab' }],
+            },
+          },
+        ],
       });
     } catch (err) {
-      Alert.alert('Failed to post', err?.message || 'Please try again.');
+      if (err?.name === 'AbortError' || /cancel/i.test(err?.message || '')) {
+        // Silent on user-driven cancel — no scary toast.
+      } else {
+        Alert.alert('Failed to post', err?.message || 'Please try again.');
+      }
     } finally {
+      postingRef.current = false;
       setPosting(false);
+      abortRef.current = null;
     }
   }, [
     statusType, textContent, backgroundColor, linkUrl, ogData,
-    items, caption, visibility, filtersApplied, dispatch, navigation,
+    items, caption, visibility, dispatch, navigation, validateMediaList,
   ]);
 
   // ── Render preview content ────────────────────────────────────────────────
@@ -173,49 +263,83 @@ export default function StatusPreview({ navigation, route }) {
     </View>
   );
 
-  const renderLinkPreview = () => (
-    <View style={[styles.linkPreview, { backgroundColor: theme.colors.surface }]}>
-      {ogData?.imageUrl && (
-        <Image source={{ uri: ogData.imageUrl }} style={styles.ogImage} resizeMode="cover" />
-      )}
-      <View style={styles.ogBody}>
-        <MaterialCommunityIcons name="link-variant" size={16} color={theme.colors.themeColor} style={{ marginBottom: 4 }} />
-        <Text style={[styles.ogTitle, { color: theme.colors.primaryTextColor }]} numberOfLines={2}>{ogData?.title || linkUrl}</Text>
-        {ogData?.description ? (
-          <Text style={[styles.ogDesc, { color: theme.colors.placeHolderTextColor }]} numberOfLines={2}>{ogData.description}</Text>
+  const renderLinkPreview = () => {
+    // Backend `ogMetadata` schema uses `image` (not `imageUrl`). Tolerate
+    // either so older route params (pre-fix) still render.
+    const ogImage = ogData?.image || ogData?.imageUrl || null;
+    return (
+      <View style={[styles.linkPreview, { backgroundColor: theme.colors.surface }]}>
+        {ogImage ? (
+          <Image source={{ uri: ogImage }} style={styles.ogImage} resizeMode="cover" />
         ) : null}
-        <Text style={[styles.ogUrl, { color: theme.colors.themeColor }]} numberOfLines={1}>{ogData?.url || linkUrl}</Text>
+        <View style={styles.ogBody}>
+          <MaterialCommunityIcons name="link-variant" size={16} color={theme.colors.themeColor} style={{ marginBottom: 4 }} />
+          <Text style={[styles.ogTitle, { color: theme.colors.primaryTextColor }]} numberOfLines={2}>{ogData?.title || linkUrl}</Text>
+          {ogData?.description ? (
+            <Text style={[styles.ogDesc, { color: theme.colors.placeHolderTextColor }]} numberOfLines={2}>{ogData.description}</Text>
+          ) : null}
+          {ogData?.siteName ? (
+            <Text style={[styles.ogSite, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>{ogData.siteName}</Text>
+          ) : null}
+          <Text style={[styles.ogUrl, { color: theme.colors.themeColor }]} numberOfLines={1}>{ogData?.url || linkUrl}</Text>
+        </View>
       </View>
-    </View>
-  );
+    );
+  };
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
-      {/* ── Posting overlay ── */}
+      {/* ── Posting overlay — glass blur + progress bar ── */}
       {posting && (
-        <View style={styles.postingOverlay}>
-          <ActivityIndicator size="large" color="#fff" />
-          <Text style={styles.postingText}>
-            Posting{totalItems > 1 ? ` (${progress.current}/${progress.total})` : ''}…
-          </Text>
-        </View>
+        <BlurView intensity={50} tint="dark" style={styles.postingOverlay}>
+          <View style={styles.postingCard}>
+            <Text style={styles.postingEyebrow}>SENDING TO YOUR STORY</Text>
+            <Text style={styles.postingTitle}>
+              {totalItems > 1
+                ? `Uploading ${progress.current} of ${progress.total}`
+                : 'Uploading…'}
+            </Text>
+
+            <View style={styles.progressBarTrack}>
+              <View style={[styles.progressBarFill, { width: `${progress.percent || 0}%` }]} />
+            </View>
+            <Text style={styles.postingPercent}>{progress.percent || 0}%</Text>
+
+            <TouchableOpacity
+              onPress={() => cancelUpload('user_tap_cancel')}
+              style={styles.cancelUploadBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              <Text style={styles.cancelUploadText}>Cancel upload</Text>
+            </TouchableOpacity>
+          </View>
+        </BlurView>
       )}
 
-      {/* ── Header ── */}
+      {/* ── Editorial header ── */}
       <View style={[styles.header, { backgroundColor: theme.colors.background }]}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <Ionicons name="arrow-back" size={24} color={theme.colors.themeColor} />
+        <TouchableOpacity
+          onPress={() => navigation.goBack()}
+          style={styles.backBtn}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        >
+          <Ionicons name="chevron-back" size={26} color={theme.colors.primaryTextColor} />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
+          <Text style={[styles.headerEyebrow, { color: theme.colors.placeHolderTextColor }]}>
+            NEW STORY
+          </Text>
           <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
             Preview
           </Text>
-          {totalItems > 1 && (
-            <Text style={[styles.headerSub, { color: theme.colors.placeHolderTextColor }]}>
-              {currentPreview + 1} of {totalItems}
-            </Text>
-          )}
         </View>
+        {totalItems > 1 && (
+          <View style={[styles.headerCounter, { borderColor: theme.colors.border }]}>
+            <Text style={[styles.headerCounterText, { color: theme.colors.primaryTextColor }]}>
+              {currentPreview + 1} / {totalItems}
+            </Text>
+          </View>
+        )}
       </View>
 
       {/* ── Preview area ── */}
@@ -259,10 +383,15 @@ export default function StatusPreview({ navigation, route }) {
       >
         {/* Caption */}
         <View style={styles.section}>
-          <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor }]}>CAPTION</Text>
+          <View style={styles.captionHead}>
+            <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor }]}>CAPTION</Text>
+            <Text style={[styles.captionCounter, { color: theme.colors.placeHolderTextColor }]}>
+              {caption.length}/500
+            </Text>
+          </View>
           <TextInput
             style={[styles.captionInput, { backgroundColor: theme.colors.surface, color: theme.colors.primaryTextColor, borderColor: theme.colors.border }]}
-            placeholder="Write a caption…"
+            placeholder="Add a few words…"
             placeholderTextColor={theme.colors.placeHolderTextColor}
             value={caption}
             onChangeText={setCaption}
@@ -275,31 +404,55 @@ export default function StatusPreview({ navigation, route }) {
         <View style={styles.section}>
           <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor }]}>WHO CAN SEE</Text>
           <View style={styles.visibilityRow}>
-            {VISIBILITY_OPTIONS.map(opt => (
-              <TouchableOpacity
-                key={opt.id}
-                style={[
-                  styles.visibilityChip,
-                  { borderColor: theme.colors.border, backgroundColor: theme.colors.surface },
-                  visibility === opt.id && { borderColor: theme.colors.themeColor, backgroundColor: `${theme.colors.themeColor}22` },
-                ]}
-                onPress={() => setVisibility(opt.id)}
-              >
-                <Ionicons
-                  name={opt.icon}
-                  size={16}
-                  color={visibility === opt.id ? theme.colors.themeColor : theme.colors.placeHolderTextColor}
-                />
-                <Text
+            {VISIBILITY_OPTIONS.map(opt => {
+              const active = visibility === opt.id;
+              return (
+                <TouchableOpacity
+                  key={opt.id}
                   style={[
-                    styles.visibilityLabel,
-                    { color: visibility === opt.id ? theme.colors.themeColor : theme.colors.placeHolderTextColor },
+                    styles.visibilityChip,
+                    { borderColor: theme.colors.border, backgroundColor: theme.colors.surface },
+                    active && { borderColor: theme.colors.themeColor, backgroundColor: `${theme.colors.themeColor}22` },
                   ]}
+                  onPress={() => setVisibility(opt.id)}
+                  accessibilityRole="radio"
+                  accessibilityState={{ selected: active }}
+                  accessibilityLabel={`${opt.label}. ${opt.hint}`}
                 >
-                  {opt.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
+                  <View style={styles.visibilityChipRow}>
+                    <Ionicons
+                      name={opt.icon}
+                      size={16}
+                      color={active ? theme.colors.themeColor : theme.colors.placeHolderTextColor}
+                    />
+                    <Text
+                      style={[
+                        styles.visibilityLabel,
+                        { color: active ? theme.colors.themeColor : theme.colors.placeHolderTextColor },
+                      ]}
+                    >
+                      {opt.label}
+                    </Text>
+                    {active ? (
+                      <Ionicons
+                        name="checkmark-circle"
+                        size={14}
+                        color={theme.colors.themeColor}
+                        style={styles.visibilityCheck}
+                      />
+                    ) : null}
+                  </View>
+                  <Text
+                    style={[
+                      styles.visibilityHint,
+                      { color: theme.colors.placeHolderTextColor },
+                    ]}
+                  >
+                    {opt.hint}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
           </View>
         </View>
 
@@ -313,18 +466,19 @@ export default function StatusPreview({ navigation, route }) {
           </View>
         )}
 
-        {/* Post button */}
+        {/* Post button — full-width pill */}
         <TouchableOpacity
           style={[styles.postBtn, { backgroundColor: theme.colors.themeColor, opacity: posting ? 0.6 : 1 }]}
           onPress={handlePost}
           disabled={posting}
+          activeOpacity={0.85}
         >
           {posting ? (
             <ActivityIndicator color="#fff" />
           ) : (
             <>
-              <Ionicons name="checkmark-circle-outline" size={22} color="#fff" />
-              <Text style={styles.postBtnText}>Post Status</Text>
+              <Text style={styles.postBtnText}>Share to your story</Text>
+              <Ionicons name="arrow-forward" size={20} color="#fff" />
             </>
           )}
         </TouchableOpacity>
@@ -340,66 +494,114 @@ export default function StatusPreview({ navigation, route }) {
 const styles = StyleSheet.create({
   container: { flex: 1 },
 
-  // Posting overlay
+  // ── Posting overlay — glass card + progress bar ───────────────────────────
   postingOverlay: {
     ...StyleSheet.absoluteFillObject, zIndex: 999,
-    backgroundColor: 'rgba(0,0,0,0.75)',
-    justifyContent: 'center', alignItems: 'center', gap: 14,
+    alignItems: 'center', justifyContent: 'center',
+    paddingHorizontal: STATUS_SPACE.gutter,
   },
-  postingText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  postingCard: {
+    width: '100%', maxWidth: 360,
+    backgroundColor: 'rgba(20,20,22,0.85)',
+    borderRadius: STATUS_RADIUS.lg,
+    paddingVertical: 28, paddingHorizontal: 22,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.1)',
+    alignItems: 'center',
+  },
+  postingEyebrow: { ...STATUS_TYPE.caps, color: 'rgba(255,255,255,0.55)', marginBottom: 6 },
+  postingTitle:   { ...STATUS_TYPE.title, color: '#fff', marginBottom: 22, textAlign: 'center' },
+  progressBarTrack: {
+    width: '100%', height: 6, borderRadius: 3,
+    backgroundColor: 'rgba(255,255,255,0.12)',
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%', borderRadius: 3,
+    backgroundColor: '#fff',
+  },
+  postingPercent: { color: '#fff', fontSize: 13, fontWeight: '600', marginTop: 10, opacity: 0.85 },
+  cancelUploadBtn: {
+    marginTop: 22,
+    paddingVertical: 10, paddingHorizontal: 22,
+    borderRadius: STATUS_RADIUS.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.45)',
+  },
+  cancelUploadText: { color: '#fff', fontSize: 13, fontWeight: '600', letterSpacing: 0.3 },
 
-  // Header
+  // ── Editorial header ──────────────────────────────────────────────────────
   header: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 16, paddingBottom: 12,
+    paddingHorizontal: STATUS_SPACE.gutter,
+    paddingTop: STATUS_SPACE.sm, paddingBottom: STATUS_SPACE.md,
+    gap: 14,
   },
-  backBtn:    { marginRight: 14 },
-  headerTitle:{ fontSize: 18, fontWeight: '700' },
-  headerSub:  { fontSize: 12, marginTop: 1 },
+  backBtn:        { padding: 4, marginLeft: -4 },
+  headerEyebrow:  { ...STATUS_TYPE.caps, marginBottom: 2 },
+  headerTitle:    { ...STATUS_TYPE.title, fontWeight: '400' },
+  headerCounter:  {
+    paddingHorizontal: 10, paddingVertical: 5,
+    borderRadius: STATUS_RADIUS.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  headerCounterText: { fontSize: 11, fontWeight: '700', letterSpacing: 0.5 },
 
-  // Preview area
-  previewArea: { height: 280, backgroundColor: '#000', position: 'relative' },
-  previewMedia:{ width: SW, height: 280 },
-  textPreview: { width: SW, height: 280, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 },
-  textPreviewBody: { color: '#fff', fontSize: 22, fontWeight: '600', textAlign: 'center' },
+  // ── Preview area ──────────────────────────────────────────────────────────
+  previewArea: { height: 320, backgroundColor: '#000', position: 'relative' },
+  previewMedia:{ width: SW, height: 320 },
+  textPreview: { width: SW, height: 320, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 28 },
+  textPreviewBody: { color: '#fff', fontSize: 24, fontWeight: '600', textAlign: 'center', lineHeight: 32 },
   textOverlayBadge:{ position: 'absolute', top: '35%', left: 20, right: 20, alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)', padding: 8, borderRadius: 8 },
   textOverlayText: { color: '#fff', fontSize: 20, fontWeight: '700', textAlign: 'center' },
 
-  // Link preview
-  linkPreview: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  ogImage:     { width: '100%', height: 150 },
-  ogBody:      { padding: 14, width: '100%' },
-  ogTitle:     { fontSize: 15, fontWeight: '700', marginBottom: 4 },
-  ogDesc:      { fontSize: 12, marginBottom: 4 },
-  ogUrl:       { fontSize: 11 },
+  // ── Link preview card ─────────────────────────────────────────────────────
+  linkPreview: { flex: 1, justifyContent: 'center', alignItems: 'stretch' },
+  ogImage:     { width: '100%', height: 170 },
+  ogBody:      { padding: 18, width: '100%' },
+  ogTitle:     { ...STATUS_TYPE.title, fontSize: 17, lineHeight: 22, marginBottom: 6 },
+  ogDesc:      { ...STATUS_TYPE.body, fontSize: 13, marginBottom: 6 },
+  ogSite:      { ...STATUS_TYPE.caps, marginBottom: 4 },
+  ogUrl:       { fontSize: 12, fontWeight: '600' },
 
-  // Dot indicators
-  dotRow:      { position: 'absolute', bottom: 8, left: 0, right: 0, flexDirection: 'row', justifyContent: 'center', gap: 5 },
-  dot:         { width: 7, height: 7, borderRadius: 4 },
-  dotActive:   { backgroundColor: '#fff' },
+  // ── Dots ──────────────────────────────────────────────────────────────────
+  dotRow:      { position: 'absolute', bottom: 10, left: 0, right: 0, flexDirection: 'row', justifyContent: 'center', gap: 6 },
+  dot:         { width: 6, height: 6, borderRadius: 3 },
+  dotActive:   { backgroundColor: '#fff', width: 18 },
   dotInactive: { backgroundColor: 'rgba(255,255,255,0.4)' },
 
-  // Settings panel
-  panel: { flex: 1 },
-  section: { paddingHorizontal: 16, paddingTop: 18 },
-  sectionLabel: { fontSize: 11, fontWeight: '600', letterSpacing: 0.6, marginBottom: 8 },
+  // ── Settings panel ────────────────────────────────────────────────────────
+  panel:        { flex: 1 },
+  section:      { paddingHorizontal: STATUS_SPACE.gutter, paddingTop: 22 },
+  sectionLabel: { ...STATUS_TYPE.caps, marginBottom: 12 },
+  captionHead:    { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
+  captionCounter: { ...STATUS_TYPE.meta, fontSize: 11, marginBottom: 12 },
   captionInput: {
-    borderRadius: 12, borderWidth: 1, padding: 12,
-    fontSize: 15, minHeight: 70, textAlignVertical: 'top',
+    borderRadius: STATUS_RADIUS.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 14, paddingVertical: 12,
+    fontSize: 15, lineHeight: 22,
+    minHeight: 84, textAlignVertical: 'top',
   },
-  visibilityRow:  { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
-  visibilityChip: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    paddingHorizontal: 12, paddingVertical: 7,
-    borderRadius: 20, borderWidth: 1.5,
-  },
-  visibilityLabel: { fontSize: 13, fontWeight: '600' },
-  filtersSummary:  { fontSize: 13, textTransform: 'capitalize' },
 
-  // Post button
+  // ── Visibility — card-style ───────────────────────────────────────────────
+  visibilityRow:     { gap: 10 },
+  visibilityChipRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  visibilityCheck:   { marginLeft: 'auto' },
+  visibilityHint:    { ...STATUS_TYPE.meta, marginTop: 6, marginLeft: 26 },
+  visibilityChip:    {
+    paddingHorizontal: 16, paddingVertical: 14,
+    borderRadius: STATUS_RADIUS.md, borderWidth: StyleSheet.hairlineWidth,
+  },
+  visibilityLabel:   { fontSize: 15, fontWeight: '600' },
+  filtersSummary:    { fontSize: 13, textTransform: 'capitalize' },
+
+  // ── Post button — full-width pill ─────────────────────────────────────────
   postBtn: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    margin: 16, borderRadius: 14, paddingVertical: 14, gap: 8,
+    marginHorizontal: STATUS_SPACE.gutter, marginTop: 28,
+    borderRadius: STATUS_RADIUS.pill, paddingVertical: 16, gap: 10,
+    shadowColor: STATUS_ACCENT, shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.18, shadowRadius: 14,
+    elevation: 4,
   },
-  postBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  postBtnText: { color: '#fff', fontSize: 16, fontWeight: '700', letterSpacing: 0.3 },
 });

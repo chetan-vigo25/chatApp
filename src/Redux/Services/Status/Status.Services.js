@@ -60,13 +60,66 @@ export const statusServices = {
     return Promise.reject(response?.message);
   },
 
+  // ── Link preview (server-side OG scrape) ──────────────────────────────────
+  /**
+   * Server-side OG fetch. Backend always responds 200 with a fallback
+   * `{ title: url, ... }` even on failure, so this never rejects on UX paths.
+   */
+  async fetchLinkPreview(url) {
+    try {
+      const response = await apiCall(
+        'GET',
+        `${BASE}/link-preview?url=${encodeURIComponent(url)}`,
+        {},
+        { silent: true, timeout: 12000 }
+      );
+      if (response?.statusCode === 200) return response?.data || null;
+      return null;
+    } catch {
+      return null;
+    }
+  },
+
+  // ── Settings (public read-only) ────────────────────────────────────────────
+
+  /**
+   * Fetch the public status settings (driven by the admin DB row).
+   * Backend always responds with sane defaults — never null fields.
+   * Silent: this runs on boot and must not toast.
+   */
+  async getStatusSettings() {
+    try {
+      const response = await apiCall('GET', `${BASE}/settings`, {}, { silent: true });
+      if (response?.statusCode === 200) return response;
+      return null;
+    } catch (err) {
+      return null;
+    }
+  },
+
   // ── Media upload (batch) ───────────────────────────────────────────────────
 
-  /** Upload 1–10 files.  Accepts a FormData with field name 'files' or 'file'. */
-  async uploadStatusMedia(formData) {
-    const response = await apiCallForm('POST', `${BASE}/upload-media`, formData);
+  /**
+   * Upload 1–10 files. Accepts a FormData with field name 'files' or 'file'.
+   * Optional `{ signal, onProgress, timeoutMs }` for cancellation, byte-level
+   * progress, and overriding the default upload timeout (300s — videos can be
+   * large and slow to upload on mobile networks).
+   */
+  async uploadStatusMedia(formData, opts = {}) {
+    const { signal, onProgress, timeoutMs = 300000 } = opts;
+    const response = await apiCallForm('POST', `${BASE}/upload-media`, formData, {
+      timeout: timeoutMs,
+      signal,
+      onUploadProgress: typeof onProgress === 'function'
+        ? (evt) => {
+            if (!evt || !evt.total) return;
+            const percent = Math.min(100, Math.round((evt.loaded / evt.total) * 100));
+            try { onProgress(percent, evt.loaded, evt.total); } catch {}
+          }
+        : undefined,
+    });
     if (response?.statusCode === 200) return response;
-    return Promise.reject(response?.message);
+    return Promise.reject(response?.message || 'Upload failed');
   },
 
   // ── Interactions ──────────────────────────────────────────────────────────

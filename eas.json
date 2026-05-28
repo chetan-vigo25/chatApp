@@ -22,7 +22,8 @@
       "channel": "production",
       "distribution": "store",
       "android": {
-        "buildType": "app-bundle"
+        "buildType": "app-bundle",
+        "autoIncrement": true
       }
     }
   },

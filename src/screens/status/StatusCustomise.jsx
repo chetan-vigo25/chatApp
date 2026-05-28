@@ -23,6 +23,7 @@ import {
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
+import { statusServices } from '../../Redux/Services/Status/Status.Services';
 
 const { width: SW } = Dimensions.get('window');
 
@@ -52,22 +53,31 @@ function FilterThumb({ uri, filter, selected, onPress }) {
 }
 
 // ── OG preview fetch ────────────────────────────────────────────────────────
+// Uses our backend's /user/status/link-preview endpoint which scrapes OG tags
+// server-side. Previously hit api.microlink.io directly — that's rate-limited
+// (50 req/day free), unreliable in regions where it's blocked, and leaked the
+// user's IP to a third party.
+//
+// Always resolves with an object so the screen can render *something* even if
+// the URL has no OG tags.
 async function fetchOgPreview(url) {
+  // Returned shape matches the backend `ogMetadata` sub-schema exactly
+  // ({ title, description, image, url, siteName }) so the same object can be
+  // forwarded straight to createStatus without renaming fields.
+  const fallback = { title: url, description: '', image: null, url, siteName: null };
   try {
-    const res  = await fetch(`https://api.microlink.io?url=${encodeURIComponent(url)}&screenshot=false&meta=true`);
-    const json = await res.json();
-    if (json.status === 'success') {
-      return {
-        title:       json.data?.title || url,
-        description: json.data?.description || '',
-        imageUrl:    json.data?.image?.url || null,
-        url:         json.data?.url || url,
-      };
-    }
+    const data = await statusServices.fetchLinkPreview(url);
+    if (!data) return fallback;
+    return {
+      title:       data.title       || url,
+      description: data.description || '',
+      image:       data.image       || null,
+      url:         data.url         || url,
+      siteName:    data.siteName    || null,
+    };
   } catch {
-    // Silently fail — user still proceeds with plain URL
+    return fallback;
   }
-  return { title: url, description: '', imageUrl: null, url };
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -103,11 +113,12 @@ export default function StatusCustomise({ navigation, route }) {
   // ── Fetch OG on mount if link ─────────────────────────────────────────
   useEffect(() => {
     if (!isLink || !linkUrl) return;
+    let cancelled = false;
     setOgLoading(true);
-    fetchOgPreview(linkUrl).then(data => {
-      setOgData(data);
-      setOgLoading(false);
-    });
+    fetchOgPreview(linkUrl)
+      .then(data => { if (!cancelled) setOgData(data); })
+      .finally(() => { if (!cancelled) setOgLoading(false); });
+    return () => { cancelled = true; };
   }, [isLink, linkUrl]);
 
   // ── Assemble payload and go to Preview ───────────────────────────────────
@@ -154,9 +165,14 @@ export default function StatusCustomise({ navigation, route }) {
             <ActivityIndicator color={theme.colors.themeColor} style={{ marginTop: 40 }} size="large" />
           ) : ogData ? (
             <View style={[styles.ogCard, { backgroundColor: theme.colors.surface, borderColor: theme.colors.border }]}>
-              {ogData.imageUrl && (
-                <Image source={{ uri: ogData.imageUrl }} style={styles.ogImage} resizeMode="cover" />
-              )}
+              {ogData.image ? (
+                <Image
+                  source={{ uri: ogData.image }}
+                  style={styles.ogImage}
+                  resizeMode="cover"
+                  onError={() => setOgData(d => (d ? { ...d, image: null } : d))}
+                />
+              ) : null}
               <View style={styles.ogBody}>
                 <Text style={[styles.ogTitle, { color: theme.colors.primaryTextColor }]} numberOfLines={2}>
                   {ogData.title}
@@ -164,6 +180,11 @@ export default function StatusCustomise({ navigation, route }) {
                 {ogData.description ? (
                   <Text style={[styles.ogDesc, { color: theme.colors.placeHolderTextColor }]} numberOfLines={3}>
                     {ogData.description}
+                  </Text>
+                ) : null}
+                {ogData.siteName ? (
+                  <Text style={[styles.ogSite, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
+                    {ogData.siteName}
                   </Text>
                 ) : null}
                 <Text style={[styles.ogUrl, { color: theme.colors.themeColor }]} numberOfLines={1}>
@@ -402,6 +423,7 @@ const styles = StyleSheet.create({
   ogBody:      { padding: 14 },
   ogTitle:     { fontSize: 16, fontWeight: '700', marginBottom: 4 },
   ogDesc:      { fontSize: 13, marginBottom: 6 },
+  ogSite:      { fontSize: 11, marginBottom: 4, fontWeight: '600', opacity: 0.85 },
   ogUrl:       { fontSize: 12 },
   captionInput:{ borderRadius: 12, borderWidth: 1, padding: 12, fontSize: 15, minHeight: 80, textAlignVertical: 'top' },
 });

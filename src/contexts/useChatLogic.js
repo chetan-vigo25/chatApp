@@ -23,12 +23,14 @@ import {
   getChatClearedAt,
   getChatMessagesKey,
   removeMessagesByChatId,
+  performDurableChatClear,
 } from '../utils/chatClearStorage';
 
 import {
   normalizeUri,
   uploadMediaFile,
 } from "../utils/mediaService";
+import SqliteWriter from "../services/SqliteWriter";
 
 /* Constants */
 const MAX_LOCAL_SAVE = 300;
@@ -170,7 +172,7 @@ export default function useChatLogic({ navigation, route }) {
   const dispatch = useDispatch();
   const { isConnected, networkType } = useNetwork();
   const { pickMedia } = useImage();
-  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview } = useRealtimeChat();
+  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat } = useRealtimeChat();
   const { currentGroup } = useSelector((s) => s.group || {});
 
   const deferRealtimeUpdate = useCallback((fn) => {
@@ -306,6 +308,10 @@ export default function useChatLogic({ navigation, route }) {
   const lastInitializedChatRef = useRef(null);
   const isHardReloadingRef = useRef(false);
   const deletedTombstonesRef = useRef({});
+  // Tracks chatIds whose local "clear" cleanup is currently in-flight.
+  // Prevents the REST success path and the `chat:cleared:*` socket echo from
+  // racing on the same SQLite writes (which surfaces as "database is locked").
+  const clearInFlightRef = useRef(new Set());
   // Track tempIds of recently sent messages for dedup against sync responses
   const sentTempIdsRef = useRef(new Set());
   // Track message IDs that were created by forwarding — persists across chat navigations
@@ -1654,6 +1660,17 @@ export default function useChatLogic({ navigation, route }) {
         || normalizedPayload?.replySenderId || normalizedPayload?._replySenderId
         || replyObj?.senderId || replyObj?.sender?._id || (typeof replyObj?.sender === 'string' ? replyObj.sender : null)
         || null,
+      // Status reply / share — preserve both the id reference and the preview snapshot
+      // so the chat bubble can render the preview pill and link back to the StatusViewer.
+      statusRef: apiMsg?.statusRef
+        || apiMsg?.statusRefId
+        || normalizedPayload?.statusRef
+        || (apiMsg?.statusPreview && (apiMsg.statusPreview.statusId || apiMsg.statusPreview._id))
+        || (normalizedPayload?.statusPreview && (normalizedPayload.statusPreview.statusId || normalizedPayload.statusPreview._id))
+        || null,
+      statusPreview: apiMsg?.statusPreview
+        || normalizedPayload?.statusPreview
+        || null,
     };
   }, [normalizeMessageStatus]);
 
@@ -2016,6 +2033,10 @@ export default function useChatLogic({ navigation, route }) {
       try {
         const cid = chatIdRef.current;
         if (!cid) return;
+        // Wait for any pending SqliteWriter ops to drain so we don't read
+        // before the realtime handlers' upserts have landed. In practice this
+        // is sub-50ms — the writer is single-FIFO and never deep.
+        try { await SqliteWriter.awaitDrain(); } catch {}
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
         // skipCleanup on subsequent refreshes — cleanup only runs on initial load
         const isSubsequent = initialLoadDoneRef.current;
@@ -2037,7 +2058,7 @@ export default function useChatLogic({ navigation, route }) {
         if (otherCancelled.length > 0) {
           for (const m of otherCancelled) {
             const delId = m.serverMessageId || m.id || m.tempId;
-            if (delId) ChatDatabase.deleteMessageForMe(delId).catch(() => {});
+            if (delId) SqliteWriter.enqueue('deleteMessageForMe', { messageId: delId }).catch(() => {});
           }
         }
 
@@ -2503,6 +2524,13 @@ export default function useChatLogic({ navigation, route }) {
     const normalizedChatId = normalizeId(targetChatId || chatIdRef.current);
     if (!normalizedChatId) return;
 
+    // Re-entrancy guard — a concurrent call for the same chat (REST resolution
+    // + socket echo arriving in the same tick) would race two transactions
+    // against the same SQLite db and surface as "database is locked".
+    const inFlightKey = `${normalizedChatId}::${scope}`;
+    if (clearInFlightRef.current.has(inFlightKey)) return;
+    clearInFlightRef.current.add(inFlightKey);
+
     const isCurrentChat = sameId(normalizedChatId, chatIdRef.current);
     deferRealtimeUpdate(() => markChatRead(normalizedChatId));
 
@@ -2518,32 +2546,43 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     try {
-      await clearChatLocalArtifacts(normalizedChatId, { markCleared: true });
       await AsyncStorage.removeItem(deletedKeyForChat(normalizedChatId));
-      // Clear from SQLite
-      await ChatDatabase.clearChat(normalizedChatId);
+      // Durable cleanup (AsyncStorage tombstone + SQLite messages wipe +
+      // chat_meta.cleared_at stamp + in-memory ChatCache messages) runs
+      // through the shared module-level helper. That helper dedupes across
+      // every code path that can request a clear (REST resolution, the
+      // global socket echo handler in RealtimeChatContext, and this hook),
+      // so we never race the SQLite "database is locked" error.
+      await performDurableChatClear(normalizedChatId);
+
       if (isCurrentChat) {
         deletedTombstonesRef.current = {};
       }
+
+      // Both scopes reset the preview to "No messages yet" — the chat row
+      // stays in the list. 'everyone' just means the peer also sees this
+      // reset (driven by the backend ChatSummary update and the matching
+      // `chat:cleared:everyone` socket event on the peer's device).
+      updateLocalLastMessagePreview({
+        chatId: normalizedChatId,
+        lastMessage: {
+          text: 'No messages yet',
+          type: 'text',
+          senderId: null,
+          status: null,
+          createdAt: null,
+          isDeleted: false,
+        },
+        lastMessageAt: null,
+        lastMessageType: 'text',
+        lastMessageSender: null,
+      });
     } catch (error) {
       console.error('applyChatClearedLocally storage cleanup error', error);
+    } finally {
+      clearInFlightRef.current.delete(inFlightKey);
     }
-
-    updateLocalLastMessagePreview({
-      chatId: normalizedChatId,
-      lastMessage: {
-        text: scope === 'everyone' ? 'Chat cleared' : 'No messages yet',
-        type: 'text',
-        senderId: null,
-        status: null,
-        createdAt: null,
-        isDeleted: false,
-      },
-      lastMessageAt: null,
-      lastMessageType: 'text',
-      lastMessageSender: null,
-    });
-  }, [deletedKeyForChat, markChatRead, updateLocalLastMessagePreview, deferRealtimeUpdate]);
+  }, [deletedKeyForChat, markChatRead, updateLocalLastMessagePreview, deferRealtimeUpdate, removeChat]);
 
   const clearChatForMe = useCallback(async () => {
     const targetChatId = normalizeId(chatIdRef.current);
@@ -3264,16 +3303,30 @@ export default function useChatLogic({ navigation, route }) {
     const onMessageSentAck = (data) => {
       // Skip scheduled message acks — handled by onScheduledSentAck below
       if (data?.isScheduled || data?.data?.isScheduled) return;
-      const messageId = data.messageId || data._id || data.data?.messageId || data.data?._id;
-      const tempId = data.tempId || data.data?.tempId;
+      const source = data?.data || data || {};
+      const messageId = source.messageId || source._id;
+      // Server now echoes both clientMessageId AND tempId; older builds may
+      // only send one. Use whichever is present — both refer to the same row.
+      const tempId =
+        source.clientMessageId ||
+        source.tempId ||
+        data.tempId ||
+        null;
       if (data.persistenceConfirmed === true || data.status === true || messageId) {
-        updateMessageStatus(tempId, 'sent', { messageId, ...data });
+        if (tempId) {
+          updateMessageStatus(tempId, 'sent', { messageId, ...source });
+        }
         if (tempId && messageId) {
+          // Swap the optimistic temp_xxx PK for the canonical server id so any
+          // subsequent action that takes `messageId` (reply / read / edit /
+          // delete / reaction) uses the value the server recognizes.
           ChatDatabase.acknowledgeMessage(tempId, messageId).catch(() => {});
         }
       }
     };
     registerSocketHandler('message:sent:ack', onMessageSentAck);
+    // Group send: matching ack event — same reconciliation logic.
+    registerSocketHandler('group:message:sent', onMessageSentAck);
 
     // Handle message:quote:response and message:reply:response — ACK for quoted/reply messages
     const onQuoteResponse = (data) => {
@@ -3323,8 +3376,10 @@ export default function useChatLogic({ navigation, route }) {
             : { peerUser: chatData?.peerUser ? { ...chatData.peerUser, _id: chatData.peerUser._id || chatData.peerUser.userId || null } : null }),
         });
       }
-      // Trigger a sync to pick up forwarded messages
-      setTimeout(() => refreshMessagesFromDB(), 500);
+      // Trigger an immediate sync to pick up forwarded messages.
+      // The previous 500ms artificial delay made forwards appear sluggish;
+      // refreshMessagesFromDB already has its own internal debounce.
+      refreshMessagesFromDB(true);
     };
     registerSocketHandler('message:forward:response', onForwardedMessage);
     registerSocketHandler('message:forward:multiple:response', onForwardedMessage);
@@ -3437,8 +3492,9 @@ export default function useChatLogic({ navigation, route }) {
         );
         return filtered.length !== prev.length ? filtered : prev;
       });
-      // Remove from DB, then refresh to ensure clean state
-      ChatDatabase.deleteMessageForMe(msgId).then(() => {
+      // Remove from DB through the writer queue (avoids racing other writes);
+      // refresh once the queue drains so we see the post-delete state.
+      SqliteWriter.enqueue('deleteMessageForMe', { messageId: msgId }).then(() => {
         refreshMessagesFromDB(true);
       }).catch(() => {});
     };
@@ -3816,7 +3872,7 @@ export default function useChatLogic({ navigation, route }) {
           updateChatListLastMessagePreview(updated);
           // Persist 'seen' to SQLite for each matched message
           messageIds.forEach(msgId => {
-            ChatDatabase.updateMessageStatus(String(msgId), 'seen').catch(() => {});
+            SqliteWriter.enqueue('updateMessageStatus', { id: String(msgId), status: 'seen' }).catch(() => {});
           });
           // Update chats table last_message_status
           if (bulkChatId) {
@@ -4434,7 +4490,7 @@ export default function useChatLogic({ navigation, route }) {
           }
           const finalReactions = Object.keys(sanitized).length > 0 ? sanitized : undefined;
           // Persist to SQLite + memory cache
-          ChatDatabase.updateReactions(mid, finalReactions || null).catch(() => {});
+          SqliteWriter.enqueue('updateReactions', { messageId: mid, reactions: finalReactions || null }).catch(() => {});
           ChatCache.updateMessage(chatIdRef.current, mid, { reactions: finalReactions });
           return { ...m, reactions: finalReactions };
         });
@@ -5058,7 +5114,7 @@ export default function useChatLogic({ navigation, route }) {
 
     const targetId = serverMessageId || tempId;
     if (targetId) {
-      ChatDatabase.updateMessageStatus(targetId, normalizedStatus).catch(() => {});
+      SqliteWriter.enqueue('updateMessageStatus', { id: targetId, status: normalizedStatus }).catch(() => {});
     }
 
     // Debounced DB refresh (merge strategy preserves optimistic messages)
@@ -5106,28 +5162,43 @@ export default function useChatLogic({ navigation, route }) {
           pendingReplyTempIdRef.current = tempId;
         }
 
-        // Emit the message
-        socket.emit(sendEvent, payload, (response) => {
+        // The server now echoes both the canonical messageId AND the
+        // clientMessageId (== our tempId) in the ack. Match on
+        // clientMessageId to be 100% certain we're updating the right
+        // optimistic row, then write `server_message_id` to SQLite.
+        const reconcile = (ack) => {
+          const ackData = ack?.data || ack || {};
+          const serverMessageId =
+            ackData.messageId || ackData._id || ack?.messageId || ack?._id;
+          const ackClientId =
+            ackData.clientMessageId || ack?.clientMessageId ||
+            ackData.tempId          || ack?.tempId          || null;
+          // Trust the echo when present; otherwise fall back to our own
+          // tempId (server may be older and not echoing yet).
+          const targetTempId = ackClientId || tempId;
+          if (!serverMessageId || !targetTempId) return;
+          updateMessageStatus(targetTempId, 'sent', { messageId: serverMessageId, ...ackData });
+          // SQLite — swap `id = temp_xxx` for the canonical `server_message_id`
+          // so all future actions (reply / react / read / edit / delete) use
+          // the server-recognized id, not the temp one.
+          ChatDatabase.acknowledgeMessage(targetTempId, serverMessageId).catch(() => {});
+        };
+
+        // Emit the message — clientMessageId is the explicit idempotency
+        // key the server stores on the doc and echoes back. `tempId` is
+        // kept as a legacy alias.
+        const emitPayload = { ...payload, clientMessageId: tempId, tempId };
+        socket.emit(sendEvent, emitPayload, (response) => {
           if (response && (response.status === true || response.success === true || response.data)) {
-            const serverMessageId = response.data?.messageId || response.data?._id || response.messageId || response._id;
-            // Update with server message ID if available
-            if (serverMessageId && tempId) {
-              updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response.data });
-              ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
-            }
+            reconcile(response);
             return resolve(response);
           } else if (response && response.status === false) {
-            // Only mark as failed if server explicitly rejects
             updateMessageStatus(tempId, 'failed');
             return reject(new Error(response.message || 'send failed'));
           } else {
+            reconcile(response);
             const serverMessageId = response?.messageId || response?._id;
-            if (serverMessageId) {
-              updateMessageStatus(tempId, 'sent', { messageId: serverMessageId, ...response });
-              if (tempId) ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
-              return resolve(response);
-            }
-            // No response data but no error — message was sent successfully
+            if (serverMessageId) return resolve(response);
             return resolve({ status: true, noAck: true });
           }
         });
@@ -5935,17 +6006,34 @@ export default function useChatLogic({ navigation, route }) {
       receivedMessage.senderName = groupMembersMapRef.current?.[receivedMessage.senderId]?.fullName || null;
     }
 
-    // Write to SQLite BEFORE adding to state — so refreshMessagesFromDB won't lose data
-    await ChatDatabase.upsertMessage({ ...receivedMessage, chatId: receivedMessage.chatId || chatIdRef.current }).catch(() => {});
-
-    // Update memory cache instantly
-    ChatCache.addMessage(receivedMessage.chatId || chatIdRef.current, receivedMessage);
+    // RENDER FIRST — never block the React render on SQLite. expo-sqlite
+    // upsert can take 500ms-2s on slow Android devices; awaiting it before
+    // state update is what caused the perceived "few seconds delay" the
+    // user reported. State + ChatCache update synchronously here; the
+    // SQLite write is queued through SqliteWriter (single-writer FIFO).
+    // `refreshMessagesFromDB` calls awaitDrain() before reading, so it
+    // still sees this row when it runs.
+    const persistChatId = receivedMessage.chatId || chatIdRef.current;
+    ChatCache.addMessage(persistChatId, receivedMessage);
+    SqliteWriter.enqueue('upsertMessage', { ...receivedMessage, chatId: persistChatId }).catch(() => {});
 
     // INSTANT UI: merge into state — update existing if reply/sender data was missing
     setAllMessages(prev => {
-      const ids = [receivedMessage.serverMessageId, receivedMessage.id, receivedMessage.tempId].filter(Boolean);
+      // Dedup chain — clientMessageId is the most reliable handle (echoed by
+      // server on every reconnect retry); serverMessageId/id/tempId as fallback.
+      const ids = [
+        receivedMessage.clientMessageId,
+        receivedMessage.serverMessageId,
+        receivedMessage.id,
+        receivedMessage.tempId,
+      ].filter(Boolean);
       const existingIdx = prev.findIndex(m =>
-        ids.some(id => sameId(id, m.serverMessageId) || sameId(id, m.id) || sameId(id, m.tempId))
+        ids.some(id =>
+          sameId(id, m.clientMessageId) ||
+          sameId(id, m.serverMessageId) ||
+          sameId(id, m.id) ||
+          sameId(id, m.tempId)
+        )
       );
 
       if (existingIdx !== -1) {
@@ -5973,9 +6061,17 @@ export default function useChatLogic({ navigation, route }) {
         return updated;
       }
 
-      // New message — insert
+      // New message — insert. Sort by server-assigned `seq` (monotonic per
+      // chat — never lies about ordering even when two messages share a
+      // millisecond timestamp), falling back to timestamp for legacy rows
+      // that don't have seq yet.
       const merged = [receivedMessage, ...prev];
-      merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      merged.sort((a, b) => {
+        const aSeq = typeof a.seq === 'number' ? a.seq : null;
+        const bSeq = typeof b.seq === 'number' ? b.seq : null;
+        if (aSeq != null && bSeq != null) return bSeq - aSeq;
+        return (b.timestamp || 0) - (a.timestamp || 0);
+      });
       return merged;
     });
 
@@ -7270,7 +7366,7 @@ export default function useChatLogic({ navigation, route }) {
     ChatCache.updateMessage(chatIdRef.current, msgId, { reactions: Object.keys(reactions).length > 0 ? reactions : undefined });
 
     // Persist to SQLite SYNCHRONOUSLY (awaited) — must complete before any refreshMessagesFromDB
-    ChatDatabase.updateReactions(msgId, reactions).catch(() => {});
+    SqliteWriter.enqueue('updateReactions', { messageId: msgId, reactions }).catch(() => {});
 
     // Emit to server
     const socket = socketRef.current || getSocket();
@@ -7296,7 +7392,7 @@ export default function useChatLogic({ navigation, route }) {
             const normalized = sanitizeReactions(rawReactions);
             if (normalized) {
               updateReactionsInState(msgId, normalized);
-              ChatDatabase.updateReactions(msgId, normalized).catch(() => {});
+              SqliteWriter.enqueue('updateReactions', { messageId: msgId, reactions: normalized }).catch(() => {});
             }
           }
         });
@@ -7318,7 +7414,7 @@ export default function useChatLogic({ navigation, route }) {
           // If server returns authoritative reactions map, apply it
           if (source?.reactions && typeof source.reactions === 'object') {
             updateReactionsInState(msgId, source.reactions);
-            ChatDatabase.updateReactions(msgId, source.reactions).catch(() => {});
+            SqliteWriter.enqueue('updateReactions', { messageId: msgId, reactions: source.reactions }).catch(() => {});
           }
         });
       }
@@ -7363,7 +7459,7 @@ export default function useChatLogic({ navigation, route }) {
     ChatCache.updateMessage(chatIdRef.current, msgId, { reactions: Object.keys(reactions).length > 0 ? reactions : undefined });
 
     // Persist to SQLite
-    ChatDatabase.updateReactions(msgId, reactions).catch(() => {});
+    SqliteWriter.enqueue('updateReactions', { messageId: msgId, reactions }).catch(() => {});
 
     // Emit to server
     const socket = socketRef.current || getSocket();
@@ -7387,7 +7483,7 @@ export default function useChatLogic({ navigation, route }) {
             const normalized = sanitizeReactions(rawReactions);
             if (normalized) {
               updateReactionsInState(msgId, normalized);
-              ChatDatabase.updateReactions(msgId, normalized).catch(() => {});
+              SqliteWriter.enqueue('updateReactions', { messageId: msgId, reactions: normalized }).catch(() => {});
             }
           }
         });
@@ -7405,7 +7501,7 @@ export default function useChatLogic({ navigation, route }) {
           const source = ack?.data || ack;
           if (source?.reactions && typeof source.reactions === 'object') {
             updateReactionsInState(msgId, source.reactions);
-            ChatDatabase.updateReactions(msgId, source.reactions).catch(() => {});
+            SqliteWriter.enqueue('updateReactions', { messageId: msgId, reactions: source.reactions }).catch(() => {});
           }
         });
       }

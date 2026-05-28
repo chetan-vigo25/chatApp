@@ -25,9 +25,11 @@ import { Ionicons } from '@expo/vector-icons';
 import {
   fetchMyStatuses, fetchStatusFeed,
   addNewStatusFromSocket, removeStatusFromSocket,
+  hydrateViewedStatusIds,
 } from '../Redux/Reducer/Status/Status.reducer';
 import { useTheme } from '../contexts/ThemeContext';
 import { getSocket } from '../Redux/Services/Socket/socket';
+import useContactDirectory from '../hooks/useContactDirectory';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -52,6 +54,7 @@ export default function StatusFeedRow({ navigation, style }) {
 
   const { myStatuses, contactStatuses, viewedStatusIds } = useSelector(s => s.status);
   const { user } = useSelector(s => s.authentication);
+  const { resolveName } = useContactDirectory();
 
   const viewedSet = new Set(viewedStatusIds.map(String));
   const hasMyStatus = myStatuses && myStatuses.length > 0;
@@ -59,6 +62,9 @@ export default function StatusFeedRow({ navigation, style }) {
 
   // ── Load feed on mount ─────────────────────────────────────────────────────
   useEffect(() => {
+    // Rehydrate persisted viewed-set FIRST so rings render with the correct
+    // colour on cold open, before /feed resolves.
+    dispatch(hydrateViewedStatusIds());
     dispatch(fetchMyStatuses());
     dispatch(fetchStatusFeed());
   }, [dispatch]);
@@ -72,12 +78,16 @@ export default function StatusFeedRow({ navigation, style }) {
       const onNew     = (p) => dispatch(addNewStatusFromSocket(p));
       const onExpired = (p) => dispatch(removeStatusFromSocket(p));
 
+      // Backend canonical event is `status:new` (colon). Keep `new_status`
+      // as a legacy alias so older server builds still notify the feed.
+      socket.on('status:new',     onNew);
       socket.on('new_status',     onNew);
       socket.on('status_expired', onExpired);
       socket.on('status_deleted', onExpired);
       socketRef.current = socket;
 
       return () => {
+        socket.off('status:new',     onNew);
         socket.off('new_status',     onNew);
         socket.off('status_expired', onExpired);
         socket.off('status_deleted', onExpired);
@@ -107,15 +117,18 @@ export default function StatusFeedRow({ navigation, style }) {
   }, [hasMyStatus, myStatuses, navigation]);
 
   const openContactStatus = useCallback((group) => {
+    const serverName = group.name || group.fullName || group.userName;
+    const phone      = group.phone || group.number || group.mobile?.number || group.mobileNumber;
+    const label      = resolveName(group.userId, serverName, phone);
     navigation.navigate('StatusViewer', {
       statuses:  group.statuses || [],
       startIndex: 0,
       isMine:    false,
-      userName:  group.name || group.fullName || group.userName,
+      userName:  label,
       userImage: group.avatar || group.profileImage || group.userAvatar,
       userId:    group.userId,
     });
-  }, [navigation]);
+  }, [navigation, resolveName]);
 
   // Don't render if there's nothing to show
   if (!hasMyStatus && (!contactStatuses || contactStatuses.length === 0)) {
@@ -192,7 +205,10 @@ export default function StatusFeedRow({ navigation, style }) {
           const viewed   = group.allViewed || isGroupFullyViewed(group, viewedSet);
           const ringColor = viewed ? RING_VIEWED : RING_UNSEEN;
           const avatarUri = group.avatar || group.profileImage || group.userAvatar;
-          const name      = group.name || group.fullName || group.userName || 'Unknown';
+          const serverName = group.name || group.fullName || group.userName;
+          const phone      = group.phone || group.number || group.mobile?.number || group.mobileNumber;
+          // Saved contact name → phone number → server-provided name.
+          const name       = resolveName(group.userId, serverName, phone);
 
           return (
             <TouchableOpacity

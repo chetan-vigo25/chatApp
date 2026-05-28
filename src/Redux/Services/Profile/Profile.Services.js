@@ -10,22 +10,27 @@ function showToast(message) {
       Alert.alert('', message);
     }
   }
-// Chat
+// Profile fetch — safe to retry on transient network errors and silent
+// on failure (caller renders an inline empty/error state instead of an
+// Alert popup). This avoids the App Store reviewer seeing a blocking
+// modal on the Settings screen during a transient connectivity blip.
 export async function profileDetails(id) {
-    // console.log("selected profile id",id)
     try {
-      const payload = id ? { _id: id } : {}; // ✅ handle both cases
-  
-      const response = await apiCall("POST","user/auth/view", payload);
-  
+      const payload = id ? { _id: id } : {};
+
+      const response = await apiCall(
+        "POST",
+        "user/auth/view",
+        payload,
+        { silent: true, retryOnNetwork: true }
+      );
+
       if (response?.statusCode === 200) {
         return response;
-      } else {
-        showToast(response?.message || "Something went wrong");
-        return Promise.reject(response?.message);
       }
+      return Promise.reject(response?.message || "Something went wrong");
     } catch (error) {
-      console.error("profileDetails error:", error);
+      console.log("[profileDetails] failed silently:", error?.message || error);
       return Promise.reject(error);
     }
   }

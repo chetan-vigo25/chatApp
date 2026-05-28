@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'vibeconnect_chat.db';
-const DB_VERSION = 6;
+const DB_VERSION = 8;
 
 let _db = null;
 let _hasReplyColumns = false;
@@ -244,6 +244,74 @@ const runMigrations = async (db) => {
       }
     }
 
+    // V7: Status-reply preview is stored inside the `payload` JSON column
+    // (keys `statusRef` + `statusPreview`), mirroring how forwardedFrom and
+    // isScheduled are persisted. No schema change is required; the bump is
+    // here so older clients re-read payload on next sync.
+
+    // V8: Realtime pipeline upgrade
+    //  - `messages.client_message_id` — client-generated UUID, idempotency key.
+    //  - `messages.seq`               — server-allocated monotonic seq (per chat).
+    //  - `messages.seen_by`           — JSON array, mirrors Mongo `seenBy`.
+    //  - `messages.status_ref` + `messages.status_preview` — promoted out of payload JSON.
+    //  - `messages.reply_preview_*`   — sender/text/type already existed; add media fields.
+    //  - `chats.cleared_at`           — mirrors server ChatSummary.clearedAt.
+    //  - `chats.read_up_to_seq` / `delivered_up_to_seq` — peer's watermark for our ticks.
+    //  - `outbox`                     — durable pending-send queue with retry.
+    //  - `reactions_v2`               — reaction store (single row per user-per-message).
+    if (currentVersion < 8) {
+      const addCol = async (table, col) => {
+        try { await db.execAsync(`ALTER TABLE ${table} ADD COLUMN ${col};`); } catch {}
+      };
+      await addCol('messages', 'client_message_id TEXT');
+      await addCol('messages', 'seq INTEGER');
+      await addCol('messages', 'seen_by TEXT');
+      await addCol('messages', 'status_ref TEXT');
+      await addCol('messages', 'status_preview TEXT');
+      await addCol('messages', 'forwarded_from TEXT');
+      await addCol('messages', 'forwarded_count INTEGER DEFAULT 0');
+      await addCol('messages', 'reaction_counts TEXT');
+      await addCol('chats',    'cleared_at INTEGER DEFAULT 0');
+      await addCol('chats',    'read_up_to_seq INTEGER DEFAULT 0');
+      await addCol('chats',    'delivered_up_to_seq INTEGER DEFAULT 0');
+
+      try {
+        await db.execAsync(`
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_uuid
+            ON messages(client_message_id) WHERE client_message_id IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS idx_messages_chat_seq
+            ON messages(chat_id, seq);
+
+          CREATE TABLE IF NOT EXISTS outbox (
+            client_message_id TEXT PRIMARY KEY NOT NULL,
+            chat_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            attempts INTEGER DEFAULT 0,
+            max_attempts INTEGER DEFAULT 6,
+            next_retry_at INTEGER DEFAULT 0,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_outbox_next_retry ON outbox(next_retry_at);
+          CREATE INDEX IF NOT EXISTS idx_outbox_chat       ON outbox(chat_id);
+
+          CREATE TABLE IF NOT EXISTS reactions_v2 (
+            message_id TEXT NOT NULL,
+            chat_id    TEXT NOT NULL,
+            user_id    TEXT NOT NULL,
+            emoji      TEXT NOT NULL,
+            skin_tone  TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (message_id, user_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_reactions_v2_message ON reactions_v2(message_id);
+        `);
+      } catch (e) {
+        console.warn('[ChatDB] V8 migration warning:', e?.message);
+      }
+    }
+
     await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
   } catch (err) {
     console.error('[ChatDB] Migration error:', err);
@@ -340,6 +408,9 @@ const rowToMsg = (row) => {
     isScheduled: Boolean(pp?.isScheduled),
     scheduleTime: pp?.scheduleTime || null,
     scheduleTimeLabel: pp?.scheduleTimeLabel || null,
+    // Status reply / share — snapshot persisted in payload
+    statusRef: pp?.statusRef || null,
+    statusPreview: pp?.statusPreview || null,
     // Reply: check column first, then payload fallback
     replyToMessageId: row.reply_to_message_id || pp?._replyToMessageId || null,
     replyPreviewText: row.reply_preview_text || pp?._replyPreviewText || null,
@@ -673,6 +744,11 @@ const _runInsert = async (db, msg, _retried = false) => {
       _replySenderName: msg.replySenderName || null,
       _replySenderId: msg.replySenderId || null,
     } : {}),
+    // Status reply / share — snapshot kept so the preview survives status expiry
+    ...(msg.statusRef ? { statusRef: String(msg.statusRef) } : {}),
+    ...(msg.statusPreview && typeof msg.statusPreview === 'object'
+      ? { statusPreview: msg.statusPreview }
+      : {}),
   };
 
   const baseParams = {
@@ -1265,6 +1341,23 @@ const getLatestMessage = async (chatId) => {
   return rowToMsg(r);
 };
 
+/**
+ * Highest server-assigned `seq` known locally for a chat. Used by the
+ * reconnect catchup path — the client sends this value, the server
+ * returns every message with seq > this. Robust against soft-deletes:
+ * a deleted-for-me message still has its seq, so the cursor never gets
+ * "stuck" on a missing row the way lastMessageId-based sync did.
+ */
+const getLatestSeq = async (chatId) => {
+  if (!chatId) return 0;
+  const db = await getDB();
+  const r = await db.getFirstAsync(
+    `SELECT MAX(seq) as max_seq FROM messages WHERE chat_id = $c AND seq IS NOT NULL`,
+    { $c: chatId }
+  );
+  return Number(r?.max_seq || 0);
+};
+
 const deduplicateChat = async (chatId) => {
   if (!chatId) return;
   const db = await getDB();
@@ -1583,6 +1676,110 @@ const getChatCount = async () => {
   return r?.cnt || 0;
 };
 
+// ─── OUTBOX ─────────────────────────────────────────────
+// Durable pending-send queue. A row is INSERTed when a message is composed,
+// REMOVEd after the server acks. Survives app kills. The retry worker
+// (src/services/OutboxWorker.js) drains it with exponential backoff.
+
+const outboxEnqueue = async ({ clientMessageId, chatId, payload }) => {
+  if (!clientMessageId || !chatId) return;
+  const db = await getDB();
+  const now = Date.now();
+  await db.runAsync(
+    `INSERT OR REPLACE INTO outbox
+       (client_message_id, chat_id, payload, attempts, next_retry_at, created_at, updated_at)
+     VALUES ($c, $cid, $p, 0, 0, $n, $n)`,
+    { $c: clientMessageId, $cid: chatId, $p: JSON.stringify(payload), $n: now }
+  );
+};
+
+const outboxRemove = async (clientMessageId) => {
+  if (!clientMessageId) return;
+  const db = await getDB();
+  await db.runAsync(`DELETE FROM outbox WHERE client_message_id = $c`, { $c: clientMessageId });
+};
+
+const outboxRecordFailure = async (clientMessageId, errMessage) => {
+  if (!clientMessageId) return;
+  const db = await getDB();
+  // Exponential backoff: 2s, 8s, 32s, 2m, 8m, 30m — capped.
+  const row = await db.getFirstAsync(
+    `SELECT attempts, max_attempts FROM outbox WHERE client_message_id = $c`,
+    { $c: clientMessageId }
+  );
+  const attempts = (row?.attempts || 0) + 1;
+  const max = row?.max_attempts || 6;
+  const delays = [2_000, 8_000, 32_000, 120_000, 480_000, 1_800_000];
+  const delay = delays[Math.min(attempts - 1, delays.length - 1)];
+  await db.runAsync(
+    `UPDATE outbox
+       SET attempts = $a, last_error = $e, next_retry_at = $r, updated_at = $n
+     WHERE client_message_id = $c`,
+    {
+      $a: attempts,
+      $e: String(errMessage || '').slice(0, 500),
+      $r: Date.now() + delay,
+      $n: Date.now(),
+      $c: clientMessageId,
+    }
+  );
+  return { attempts, exhausted: attempts >= max };
+};
+
+const outboxDrainDue = async (limit = 20) => {
+  const db = await getDB();
+  const rows = await db.getAllAsync(
+    `SELECT * FROM outbox WHERE next_retry_at <= $now ORDER BY created_at ASC LIMIT $l`,
+    { $now: Date.now(), $l: limit }
+  );
+  return rows.map((r) => ({
+    ...r,
+    payload: r.payload ? safeParse(r.payload) : null,
+  }));
+};
+
+const safeParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+
+const outboxCount = async () => {
+  const db = await getDB();
+  const r = await db.getFirstAsync(`SELECT COUNT(*) as cnt FROM outbox`);
+  return r?.cnt || 0;
+};
+
+// ─── READ / DELIVERED WATERMARKS (peer-side, drives our outgoing ticks) ───
+
+const setPeerReadWatermark = async (chatId, readUpToSeq, deliveredUpToSeq) => {
+  if (!chatId) return;
+  const db = await getDB();
+  // Use MAX to never regress the watermark.
+  await db.runAsync(
+    `UPDATE chats
+       SET read_up_to_seq      = MAX(COALESCE(read_up_to_seq, 0),      COALESCE($r, 0)),
+           delivered_up_to_seq = MAX(COALESCE(delivered_up_to_seq, 0), COALESCE($d, 0)),
+           updated_at = $n
+     WHERE chat_id = $cid`,
+    {
+      $r:  typeof readUpToSeq === 'number'      ? readUpToSeq      : 0,
+      $d:  typeof deliveredUpToSeq === 'number' ? deliveredUpToSeq : 0,
+      $n:  Date.now(),
+      $cid: chatId,
+    }
+  );
+};
+
+const getPeerReadWatermark = async (chatId) => {
+  if (!chatId) return { readUpToSeq: 0, deliveredUpToSeq: 0 };
+  const db = await getDB();
+  const r = await db.getFirstAsync(
+    `SELECT read_up_to_seq, delivered_up_to_seq FROM chats WHERE chat_id = $c`,
+    { $c: chatId }
+  );
+  return {
+    readUpToSeq:      r?.read_up_to_seq      || 0,
+    deliveredUpToSeq: r?.delivered_up_to_seq || 0,
+  };
+};
+
 // ─── SYNC META ──────────────────────────────────────────
 
 const getSyncMeta = async (key) => {
@@ -1625,7 +1822,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getMessageCount, searchMessages, getClearedAt,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getMessageCount, searchMessages, getClearedAt,
   markMessageDeleted, deleteMessageForMe, clearChat, deduplicateChat,
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
@@ -1637,4 +1834,7 @@ export default {
   updateChatPin, updateChatMute, updateChatArchive, deleteChatRow, getChatCount,
   // Sync meta
   getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData,
+  // Outbox + watermarks (V8)
+  outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
+  setPeerReadWatermark, getPeerReadWatermark,
 };

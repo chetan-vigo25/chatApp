@@ -210,7 +210,7 @@ export default function EditProfile({ navigation, route }) {
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
-      <StatusBar translucent backgroundColor="transparent" barStyle="light-content" />
+      <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
 
       {/* Floating back button */}
       <SafeAreaView edges={['top']} style={styles.topBarSafe}>

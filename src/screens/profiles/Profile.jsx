@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback } from "react";
 import {
-  View, Text, Image, Animated, TouchableOpacity, ScrollView,
+  View, Text, Image, Animated, TouchableOpacity,
   Alert, Platform, ToastAndroid, ActivityIndicator, StatusBar,
   Dimensions, StyleSheet,
 } from "react-native";
@@ -11,33 +11,15 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { BACKEND_URL } from '@env';
-import {
-  FontAwesome6, Ionicons, FontAwesome5, MaterialCommunityIcons,
-} from '@expo/vector-icons';
+import { FontAwesome6, Ionicons, FontAwesome5 } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 
 const { width: SCREEN_W } = Dimensions.get('window');
-const HERO_H = Math.min(SCREEN_W, 420);
+const HERO_H = Math.min(SCREEN_W, 440);
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
   else Alert.alert('', message);
-}
-
-// Smooth dark bottom gradient using stacked thin bands
-function HeroGradient() {
-  const BANDS = 14;
-  const TOTAL = 220;
-  const bandH = TOTAL / BANDS;
-  return (
-    <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, bottom: 0, justifyContent: 'flex-end' }}>
-      {Array.from({ length: BANDS }).map((_, i) => {
-        const t = (i + 1) / BANDS;
-        const alpha = Math.min(0.62, t * t * 0.7);
-        return <View key={i} style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
-      })}
-    </View>
-  );
 }
 
 export default function Profile({ navigation }) {
@@ -49,16 +31,21 @@ export default function Profile({ navigation }) {
   const [loader, setLoader] = useState(false);
   const scrollY = useRef(new Animated.Value(0)).current;
 
-  const shadeOpacity = scrollY.interpolate({
-    inputRange: [0, HERO_H * 0.8],
-    outputRange: [0, 0.85],
+  const heroScale = scrollY.interpolate({
+    inputRange: [-100, 0],
+    outputRange: [1.15, 1],
+    extrapolateRight: 'clamp',
+  });
+  const heroTranslate = scrollY.interpolate({
+    inputRange: [0, HERO_H],
+    outputRange: [0, -HERO_H * 0.35],
     extrapolate: 'clamp',
   });
 
   useFocusEffect(
     useCallback(() => {
       dispatch(profileDetail());
-      Animated.timing(fadeAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
+      Animated.timing(fadeAnim, { toValue: 1, duration: 320, useNativeDriver: true }).start();
     }, [])
   );
 
@@ -87,7 +74,6 @@ export default function Profile({ navigation }) {
         await imageEdit(uri);
       }
     } catch (e) {
-      console.error('pickImage', e);
       showToast('Failed to pick image');
     }
   };
@@ -116,7 +102,6 @@ export default function Profile({ navigation }) {
         showToast(result?.message || "Image upload failed");
       }
     } catch (e) {
-      console.error(e);
       showToast("Network request failed");
     } finally {
       setLoader(false);
@@ -140,7 +125,6 @@ export default function Profile({ navigation }) {
         showToast(result?.message || "Failed to remove profile image");
       }
     } catch (e) {
-      console.error(e);
       showToast("Failed to remove profile image");
     } finally {
       setLoader(false);
@@ -164,61 +148,79 @@ export default function Profile({ navigation }) {
   const aboutText = profileData?.about || '';
   const userName = profileData?.userName || '';
 
-  // ─── Theme helpers ─────────────────────────
-  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
-  const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
-  const borderClr = isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+  const pageBg = isDarkMode ? '#0B141A' : '#F4F6F9';
+  const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
+  const borderClr = isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(15,30,50,0.06)';
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
   const themeColor = theme.colors.themeColor || '#1DA1F2';
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
-      <StatusBar translucent backgroundColor="transparent" barStyle="light-content" />
+      <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
 
-      {/* Floating top bar — only back arrow, no edit icon */}
+      {/* Top bar */}
       <SafeAreaView edges={['top']} style={styles.topBarSafe}>
         <View style={styles.topBarRow}>
           <TouchableOpacity onPress={() => navigation.goBack()} style={styles.floatingBtn} activeOpacity={0.7}>
             <FontAwesome6 name="arrow-left" size={18} color="#fff" />
           </TouchableOpacity>
-          <View style={{ flex: 1 }} />
+          <View style={styles.flex} />
+          <TouchableOpacity
+            onPress={() => navigation.navigate('SettingsTab')}
+            style={styles.floatingBtn}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="settings-outline" size={18} color="#fff" />
+          </TouchableOpacity>
         </View>
       </SafeAreaView>
 
-      {/* ─── Parallax background image with scroll shade ─── */}
-      <View
-        style={[styles.hero, { backgroundColor: imageUri ? '#000' : themeColor }]}
+      {/* Hero (parallax) */}
+      <Animated.View
+        style={[
+          styles.hero,
+          {
+            backgroundColor: imageUri ? '#000' : themeColor,
+            transform: [{ translateY: heroTranslate }, { scale: heroScale }],
+          },
+        ]}
         pointerEvents="none"
       >
         {imageUri ? (
           <Image source={{ uri: imageUri }} style={styles.heroImage} resizeMode="cover" />
         ) : (
           <View style={styles.heroFallback}>
-            <FontAwesome5 name="user-alt" size={96} color="rgba(255,255,255,0.85)" />
+            <FontAwesome5 name="user-alt" size={108} color="rgba(255,255,255,0.85)" />
           </View>
         )}
-        <HeroGradient />
-        <Animated.View
-          pointerEvents="none"
-          style={[
-            { ...StyleSheet.absoluteFillObject, backgroundColor: '#000' },
-            { opacity: shadeOpacity },
-          ]}
-        />
-      </View>
+      </Animated.View>
 
       <Animated.ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={{ paddingBottom: 40 }}
+        contentContainerStyle={styles.scrollContent}
         scrollEventThrottle={16}
         onScroll={Animated.event(
           [{ nativeEvent: { contentOffset: { y: scrollY } } }],
           { useNativeDriver: true }
         )}
       >
-        {/* Scrollable hero foreground (name + camera) */}
+        {/* Hero foreground */}
         <View style={styles.heroForeground}>
+          <View style={styles.heroOverlay} pointerEvents="none">
+            <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
+            <View style={styles.heroStatusRow}>
+              <View style={styles.onlineDot} />
+              <Text style={styles.heroStatus} numberOfLines={1}>online</Text>
+              {userName ? (
+                <>
+                  <View style={styles.heroDivider} />
+                  <Text style={styles.heroStatus} numberOfLines={1}>@{userName}</Text>
+                </>
+              ) : null}
+            </View>
+          </View>
+
           <TouchableOpacity
             onPress={showImagePickerOptions}
             disabled={loader}
@@ -231,21 +233,18 @@ export default function Profile({ navigation }) {
               <Ionicons name="camera" size={20} color="#fff" />
             )}
           </TouchableOpacity>
-
-          <View style={styles.heroOverlay} pointerEvents="none">
-            <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
-            <Text style={styles.heroStatus} numberOfLines={1}>online</Text>
-          </View>
         </View>
 
-        {/* ─── ACCOUNT section ─── */}
+        {/* ACCOUNT */}
         <Text style={[styles.sectionLabel, { color: subText }]}>ACCOUNT</Text>
-        <View style={[styles.card, { backgroundColor: cardBg }]}>
-          {/* Phone — tappable ONLY when empty (locked once set) */}
+        <View style={[
+          styles.card,
+          { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' },
+        ]}>
           <InfoTappableRow
             icon="call-outline"
             iconColor={themeColor}
-            label="mobile number"
+            label="Mobile number"
             value={displayPhone || 'Add mobile number'}
             valueColor={displayPhone ? primaryText : themeColor}
             sub={subText}
@@ -253,40 +252,31 @@ export default function Profile({ navigation }) {
               phoneNumber
                 ? null
                 : () => navigation.navigate('PersonalInfoEdit', {
-                    field: 'mobile',
-                    value: phoneNumber,
-                    extra: { code: phoneCode },
+                    field: 'mobile', value: phoneNumber, extra: { code: phoneCode },
                   })
             }
           />
-
           <View style={[styles.divider, { backgroundColor: borderClr }]} />
-
-          {/* Email — tappable ONLY when empty (locked once set) */}
           <InfoTappableRow
             icon="mail-outline"
             iconColor={themeColor}
-            label="email"
+            label="Email"
             value={userEmail || 'Add email'}
             valueColor={userEmail ? primaryText : themeColor}
             sub={subText}
             onPress={
               userEmail
                 ? null
-                : () => navigation.navigate('PersonalInfoEdit', {
-                    field: 'email',
-                    value: userEmail,
-                  })
+                : () => navigation.navigate('PersonalInfoEdit', { field: 'email', value: userEmail })
             }
           />
-
           {userName ? (
             <>
               <View style={[styles.divider, { backgroundColor: borderClr }]} />
               <InfoTappableRow
                 icon="at-outline"
                 iconColor={themeColor}
-                label="username"
+                label="Username"
                 value={`@${userName}`}
                 valueColor={primaryText}
                 sub={subText}
@@ -295,28 +285,27 @@ export default function Profile({ navigation }) {
           ) : null}
         </View>
 
-        {/* ─── INFO section ─── */}
-        <Text style={[styles.sectionLabel, { color: subText }]}>INFO</Text>
-        <View style={[styles.card, { backgroundColor: cardBg }]}>
-          {/* Name */}
+        {/* INFO */}
+        <Text style={[styles.sectionLabel, { color: subText }]}>PROFILE INFO</Text>
+        <View style={[
+          styles.card,
+          { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' },
+        ]}>
           <InfoTappableRow
             icon="person-outline"
             iconColor={themeColor}
-            label="name"
+            label="Name"
             value={profileData?.fullName || 'Add name'}
             valueColor={profileData?.fullName ? primaryText : themeColor}
             sub={subText}
             onPress={() => navigation.navigate('PersonalInfoEdit', { field: 'fullName', value: profileData?.fullName })}
           />
-
           <View style={[styles.divider, { backgroundColor: borderClr }]} />
-
-          {/* About */}
           <InfoTappableRow
             icon="information-circle-outline"
             iconColor={themeColor}
-            label="about"
-            value={aboutText || 'Add bio'}
+            label="About"
+            value={aboutText || 'Add a bio'}
             valueColor={aboutText ? primaryText : themeColor}
             sub={subText}
             multiline
@@ -324,31 +313,26 @@ export default function Profile({ navigation }) {
           />
         </View>
 
-        {/* ─── ACTIONS card ─── */}
-        <Text style={[styles.sectionLabel, { color: subText }]}>SETTINGS</Text>
-        <View style={[styles.card, { backgroundColor: cardBg }]}>
+        {/* SETTINGS */}
+        <Text style={[styles.sectionLabel, { color: subText }]}>PREFERENCES</Text>
+        <View style={[
+          styles.card,
+          { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' },
+        ]}>
           <ActionRow
             icon="settings-outline"
             iconColor={themeColor}
-            label="Settings"
+            label="Settings & Privacy"
             primary={primaryText}
+            sub={subText}
             onPress={() => navigation.navigate('SettingsTab')}
           />
-          <View style={[styles.divider, { backgroundColor: borderClr }]} />
-          {/* <ActionRow
-            icon="qr-code-outline"
-            iconColor={themeColor}
-            label="Linked Devices"
-            primary={primaryText}
-            onPress={() => navigation.navigate('LinkDevice')}
-          /> */}
         </View>
       </Animated.ScrollView>
     </Animated.View>
   );
 }
 
-// ─── Reusable rows ───
 function InfoTappableRow({ icon, iconColor, label, value, valueColor, sub, onPress, multiline }) {
   const Wrapper = onPress ? TouchableOpacity : View;
   return (
@@ -356,39 +340,39 @@ function InfoTappableRow({ icon, iconColor, label, value, valueColor, sub, onPre
       <View style={[styles.rowIcon, { backgroundColor: iconColor + '18' }]}>
         <Ionicons name={icon} size={18} color={iconColor} />
       </View>
-      <View style={{ flex: 1 }}>
+      <View style={styles.flex}>
+        <Text style={[styles.rowLabel, { color: sub }]}>{label}</Text>
         <Text style={[styles.rowValue, { color: valueColor }]} numberOfLines={multiline ? 0 : 1}>
           {value}
         </Text>
-        <Text style={[styles.rowLabel, { color: sub }]}>{label}</Text>
       </View>
       {onPress && <Ionicons name="chevron-forward" size={16} color={sub} />}
     </Wrapper>
   );
 }
 
-function ActionRow({ icon, iconColor, label, primary, onPress }) {
+function ActionRow({ icon, iconColor, label, primary, sub, onPress }) {
   return (
     <TouchableOpacity style={styles.row} onPress={onPress} activeOpacity={0.6}>
       <View style={[styles.rowIcon, { backgroundColor: iconColor + '18' }]}>
         <Ionicons name={icon} size={18} color={iconColor} />
       </View>
       <Text style={[styles.actionLabel, { color: primary }]}>{label}</Text>
-      <Ionicons name="chevron-forward" size={16} color={primary + '70'} />
+      <Ionicons name="chevron-forward" size={16} color={sub} />
     </TouchableOpacity>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  flex: { flex: 1 },
 
-  // Top bar
   topBarSafe: {
     position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100,
   },
   topBarRow: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 10, paddingTop: 4, paddingBottom: 6,
+    paddingHorizontal: 12, paddingTop: 4, paddingBottom: 6,
   },
   floatingBtn: {
     width: 40, height: 40, borderRadius: 20,
@@ -396,51 +380,74 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
 
-  // Hero
   hero: {
     position: 'absolute', top: 0, left: 0, right: 0,
     width: '100%', height: HERO_H, overflow: 'hidden',
   },
-  heroForeground: { width: '100%', height: HERO_H, position: 'relative' },
   heroImage: { width: '100%', height: '100%' },
   heroFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  heroOverlay: { position: 'absolute', left: 20, right: 80, bottom: 18 },
+
+  heroForeground: { width: '100%', height: HERO_H, position: 'relative' },
+  heroOverlay: { position: 'absolute', left: 22, right: 90, bottom: 20 },
   heroName: {
-    color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 26,
-    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4,
+    color: '#fff',
+    fontFamily: 'Roboto-Bold',
+    fontSize: 28,
+    letterSpacing: -0.4,
+  },
+  heroStatusRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    marginTop: 6,
+  },
+  onlineDot: {
+    width: 8, height: 8, borderRadius: 4,
+    backgroundColor: '#25D366',
+  },
+  heroDivider: {
+    width: 3, height: 3, borderRadius: 1.5,
+    backgroundColor: 'rgba(255,255,255,0.6)',
   },
   heroStatus: {
-    color: 'rgba(255,255,255,0.85)', fontFamily: 'Roboto-Regular', fontSize: 13, marginTop: 4,
-    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+    color: 'rgba(255,255,255,0.92)',
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
   },
   cameraFab: {
-    position: 'absolute', right: 18, bottom: 18,
-    width: 50, height: 50, borderRadius: 25,
+    position: 'absolute', right: 20, bottom: 18,
+    width: 52, height: 52, borderRadius: 26,
     alignItems: 'center', justifyContent: 'center',
-    elevation: 5,
-    shadowColor: '#000', shadowOpacity: 0.3, shadowOffset: { width: 0, height: 2 }, shadowRadius: 4,
+    elevation: 6,
+    shadowColor: '#000', shadowOpacity: 0.3,
+    shadowOffset: { width: 0, height: 4 }, shadowRadius: 6,
   },
 
-  // Section label
+  scrollContent: { paddingBottom: 48 },
+
   sectionLabel: {
-    fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.8,
-    marginTop: 18, marginBottom: 6, paddingHorizontal: 24,
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 11, letterSpacing: 1.2,
+    marginTop: 22, marginBottom: 10, paddingHorizontal: 26,
   },
 
-  // Cards
   card: {
-    marginHorizontal: 12, borderRadius: 14, overflow: 'hidden',
+    marginHorizontal: 14, borderRadius: 18, overflow: 'hidden',
+    shadowOpacity: 0.05, shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 12, elevation: 2,
   },
   row: {
     flexDirection: 'row', alignItems: 'center',
-    paddingVertical: 12, paddingHorizontal: 14, gap: 14,
+    paddingVertical: 14, paddingHorizontal: 14, gap: 14,
   },
   rowIcon: {
-    width: 36, height: 36, borderRadius: 18,
+    width: 38, height: 38, borderRadius: 12,
     alignItems: 'center', justifyContent: 'center',
   },
-  rowValue: { fontFamily: 'Roboto-Medium', fontSize: 15 },
-  rowLabel: { fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: 2 },
-  actionLabel: { flex: 1, fontFamily: 'Roboto-Medium', fontSize: 15 },
-  divider: { height: StyleSheet.hairlineWidth, marginLeft: 64 },
+  rowLabel: {
+    fontFamily: 'Roboto-Medium', fontSize: 11,
+    letterSpacing: 0.8, textTransform: 'uppercase',
+    marginBottom: 3,
+  },
+  rowValue: { fontFamily: 'Roboto-SemiBold', fontSize: 15 },
+  actionLabel: { flex: 1, fontFamily: 'Roboto-SemiBold', fontSize: 15 },
+  divider: { height: StyleSheet.hairlineWidth, marginLeft: 66 },
 });

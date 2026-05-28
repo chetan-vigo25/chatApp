@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useRef } from "react";
-import { View, Text, ScrollView, Animated, TouchableOpacity, Image, ActivityIndicator, Alert } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { View, Text, ScrollView, Animated, TouchableOpacity, Image, ActivityIndicator, Alert, StyleSheet, Dimensions } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { TextInput } from 'react-native-paper';
 import countryCodes from '../../jsonFile/countryCodes.json';
 import CountryCodeContact from "../../components/CountryCodeContact";
 import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
 import { APP_TAG_NAME } from '@env';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
+
+const { width: SCREEN_W } = Dimensions.get('window');
 
 // ============================================
 // 🎯 DEBOUNCE DELAY CONFIGURATION (in milliseconds)
@@ -494,19 +494,63 @@ export default function AddNewContact({ navigation }) {
       };
     }, [selectedCountry]);
 
-    return(
-       <Animated.View style={{ flex: 1, opacity: fadeAnim, backgroundColor: theme.colors.background }} >
-         <View style={{ width:'100%', flexDirection:'row', gap:10, alignItems:'center', padding:10, borderBottomWidth:1, borderBottomColor:theme.colors.borderColor }} >
-            <TouchableOpacity onPress={handleBack} style={{ width:40, height:40, alignItems:'center', justifyContent:'center', }} >
-              <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
-           </TouchableOpacity>
-           <View style={{ flex:1 }} >
-               <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-Medium', fontSize:16, textTransform:'capitalize' }} >New Contact</Text>
-           </View>
-         </View>
-         <ScrollView style={{ flex:1, padding:20 }} >
-         <View style={{ width:'100%', gap:10, flexDirection:"row" }} >
-            <TouchableOpacity onPress={handleCountrySelect} style={{ width:60, height:52, marginTop:5, justifyContent:"center", alignItems:"center", borderWidth:1.5, borderColor:theme.colors.themeColor, borderRadius:6 }} >
+    const themeColor = theme.colors.themeColor;
+    const primaryText = theme.colors.primaryTextColor;
+    const subText = theme.colors.placeHolderTextColor;
+    const pageBg = theme.colors.background;
+    const cardBg = theme.colors.cardBackground || theme.colors.menuBackground;
+
+    const userFound = !!(searchResult && searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching);
+    const userNotFound = !!(searchResult && !searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching);
+    const userDisplayName = searchResult?.user?.fullName || searchResult?.user?.name || 'User';
+    const userAvatar = searchResult?.user?.profileImage || searchResult?.user?.profilePicture;
+
+    return (
+      <Animated.View style={[styles.root, { opacity: fadeAnim, backgroundColor: pageBg }]}>
+        {/* Header */}
+        <View style={styles.header}>
+          <TouchableOpacity
+            onPress={handleBack}
+            activeOpacity={0.6}
+            style={[styles.headerBackBtn, { backgroundColor: cardBg }]}
+          >
+            <FontAwesome6 name="arrow-left" size={18} color={primaryText} />
+          </TouchableOpacity>
+          <View style={styles.headerTitleWrap}>
+            <Text style={[styles.headerTitle, { color: primaryText }]}>New Contact</Text>
+            <Text style={[styles.headerSubtitle, { color: subText }]}>
+              Search by phone number
+            </Text>
+          </View>
+        </View>
+
+        <ScrollView
+          style={styles.flex}
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          {/* Hero halo + illustration */}
+          <View style={styles.illustrationWrap}>
+            <View style={[styles.illHalo, { backgroundColor: themeColor + '14' }]} />
+            <View style={[styles.illHalo2, { backgroundColor: themeColor + '08' }]} />
+            <View style={[styles.illIcon, { backgroundColor: themeColor + '18', borderColor: themeColor + '30' }]}>
+              <Ionicons name="person-add-outline" size={36} color={themeColor} />
+            </View>
+            <Text style={[styles.illTitle, { color: primaryText }]}>
+              Add a new contact
+            </Text>
+            <Text style={[styles.illSubtitle, { color: subText }]}>
+              Enter their {APP_TAG_NAME} registered number to start chatting.
+            </Text>
+          </View>
+
+          {/* Input row */}
+          <View style={styles.inputRow}>
+            <TouchableOpacity
+              activeOpacity={0.75}
+              style={[styles.countryBtn, { borderColor: themeColor, backgroundColor: cardBg }]}
+            >
               <CountryCodeContact
                 selectedCountry={selectedCountry}
                 onCountrySelect={handleCountrySelect}
@@ -515,7 +559,7 @@ export default function AddNewContact({ navigation }) {
                 showName={false}
               />
             </TouchableOpacity>
-            <View style={{ flex:1 }} >
+            <View style={styles.flex}>
               <TextInput
                 mode="outlined"
                 label="Phone"
@@ -523,107 +567,294 @@ export default function AddNewContact({ navigation }) {
                 maxLength={10}
                 keyboardType="phone-pad"
                 onChangeText={handlePhoneNumberChange}
-                activeOutlineColor={ theme.colors.themeColor }
-                outlineColor={ theme.colors.themeColor }
-                textColor={ theme.colors.primaryTextColor }
-                style={{ backgroundColor: 'transparent' }}
-                theme={{ colors: { background: theme.colors.background, surfaceVariant: 'transparent', onSurfaceVariant: theme.colors.placeHolderTextColor } }}
+                activeOutlineColor={themeColor}
+                outlineColor={themeColor + '60'}
+                textColor={primaryText}
+                outlineStyle={styles.paperOutline}
+                style={styles.paperInput}
+                theme={{
+                  colors: {
+                    background: pageBg,
+                    surfaceVariant: 'transparent',
+                    onSurfaceVariant: subText,
+                  },
+                }}
                 right={
-                    isSearching ? (
-                      <TextInput.Icon
-                        icon={() => <ActivityIndicator size={20} color={theme.colors.themeColor} />}
-                      />
-                    ) : searchResult && searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH ? (
-                      <TextInput.Icon
-                        icon={'check-circle'}
-                        color={'#25D366'}
-                        onPress={handleClearPhoneNumber}
-                      />
-                    ) : searchResult && !searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH ? (
-                      <TextInput.Icon
-                        icon={'close-circle'}
-                        color={'#FF3B30'}
-                        onPress={handleClearPhoneNumber}
-                      />
-                    ) : phoneNumber.length > 0 ? (
-                      <TextInput.Icon
-                        icon={'close-circle'}
-                        color={theme.colors.secondaryTextColor}
-                        onPress={handleClearPhoneNumber}
-                      />
-                    ) : null
-                  }
+                  isSearching ? (
+                    <TextInput.Icon
+                      icon={() => <ActivityIndicator size={20} color={themeColor} />}
+                    />
+                  ) : userFound ? (
+                    <TextInput.Icon icon={'check-circle'} color={'#25D366'} onPress={handleClearPhoneNumber} />
+                  ) : userNotFound ? (
+                    <TextInput.Icon icon={'close-circle'} color={'#FF3B30'} onPress={handleClearPhoneNumber} />
+                  ) : phoneNumber.length > 0 ? (
+                    <TextInput.Icon icon={'close-circle'} color={subText} onPress={handleClearPhoneNumber} />
+                  ) : null
+                }
               />
             </View>
-         </View>
+          </View>
 
-         {/* Display search result - User Found */}
-         {searchResult && searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching && (
-           <View style={{ marginTop: 20 }}>
-             <View style={{ flex: 1 }}>
-               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium', fontSize: 14, marginTop: 2 }}>
-                 This phone number is on {APP_TAG_NAME}.
-               </Text>
-             </View>
-             <View style={{ alignSelf:'flex-start', marginTop: 8 }}>
-               <Text style={{ color: theme.colors.themeColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
-                 View Contact →
-               </Text>
-             </View>
+          {/* Status pill */}
+          {phoneNumber.length > 0 && phoneNumber.length < MIN_SEARCH_LENGTH && (
+            <View style={[styles.statusPill, { backgroundColor: themeColor + '12' }]}>
+              <Ionicons name="information-circle" size={14} color={themeColor} />
+              <Text style={[styles.statusPillText, { color: themeColor }]}>
+                Enter at least {MIN_SEARCH_LENGTH} digits to search
+              </Text>
+            </View>
+          )}
 
-             {/* Show user info preview — tap to open chat directly */}
-             <TouchableOpacity onPress={handleAddContact} activeOpacity={0.7} style={{
-               marginTop: 16,
-               padding: 12,
-               backgroundColor: theme.colors.cardBackground,
-               borderRadius: 8,
-               borderWidth: 1,
-               borderColor: theme.colors.borderColor
-             }}>
-               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                 {searchResult.user?.profileImage || searchResult.user?.profilePicture ? (
-                   <Image 
-                     source={{ uri: searchResult.user.profileImage || searchResult.user.profilePicture }}
-                     style={{ width: 40, height: 40, borderRadius: 20 }}
-                   />
-                 ) : (
-                   <View style={{ 
-                     width: 40, 
-                     height: 40, 
-                     borderRadius: 20, 
-                     backgroundColor: theme.colors.themeColor,
-                     justifyContent: 'center',
-                     alignItems: 'center'
-                   }}>
-                     <Text style={{ color: '#fff', fontSize: 18, fontFamily: 'Roboto-Medium' }}>
-                       {(searchResult.user?.fullName || searchResult.user?.name || 'U').charAt(0).toUpperCase()}
-                     </Text>
-                   </View>
-                 )}
-                 <View style={{ marginLeft: 12 }}>
-                   <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium', fontSize: 16 }}>
-                     {searchResult.user?.fullName || searchResult.user?.name || 'User'}
-                   </Text>
-                   <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', fontSize: 12 }}>
-                     {selectedCountry.code} {phoneNumber}
-                   </Text>
-                 </View>
-               </View>
-             </TouchableOpacity>
-           </View>
-         )}
+          {/* User Found card */}
+          {userFound && (
+            <View style={styles.resultWrap}>
+              <View style={styles.resultHeader}>
+                <View style={styles.resultStatusDot} />
+                <Text style={[styles.resultStatusText, { color: subText }]}>
+                  Found on {APP_TAG_NAME}
+                </Text>
+              </View>
 
-         {/* Display search result - User Not Found */}
-         {searchResult && !searchResult.found && phoneNumber.length >= MIN_SEARCH_LENGTH && !isSearching && (
-           <View style={{ marginTop: 20 }}>
-             <View style={{ flex: 1 }}>
-               <Text style={{ color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium', fontSize: 14, marginTop: 2 }}>
-                 This phone number is not on {APP_TAG_NAME}.
-               </Text>
-             </View>
-           </View>
-         )}
-         </ScrollView>
-       </Animated.View>
-    )
+              <TouchableOpacity
+                onPress={handleAddContact}
+                activeOpacity={0.85}
+                style={[styles.userCard, { backgroundColor: cardBg }]}
+              >
+                <View style={[styles.userAvatarRing, { borderColor: themeColor + '30' }]}>
+                  {userAvatar ? (
+                    <Image source={{ uri: userAvatar }} style={styles.userAvatar} />
+                  ) : (
+                    <View style={[styles.userAvatar, styles.userAvatarFallback, { backgroundColor: themeColor }]}>
+                      <Text style={styles.userAvatarLetter}>
+                        {userDisplayName.charAt(0).toUpperCase()}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                <View style={styles.flex}>
+                  <Text style={[styles.userName, { color: primaryText }]} numberOfLines={1}>
+                    {userDisplayName}
+                  </Text>
+                  <Text style={[styles.userPhone, { color: subText }]} numberOfLines={1}>
+                    {selectedCountry.code} {phoneNumber}
+                  </Text>
+                </View>
+                <View style={[styles.userCta, { backgroundColor: themeColor }]}>
+                  <Ionicons name="chatbubble-ellipses-outline" size={18} color="#fff" />
+                </View>
+              </TouchableOpacity>
+
+              <Text style={[styles.resultHint, { color: subText }]}>
+                Tap to open a new conversation.
+              </Text>
+            </View>
+          )}
+
+          {/* Not found state */}
+          {userNotFound && (
+            <View style={styles.notFoundWrap}>
+              <View style={[styles.notFoundIcon, { backgroundColor: '#FF3B3015' }]}>
+                <Ionicons name="search" size={26} color="#FF3B30" />
+              </View>
+              <Text style={[styles.notFoundTitle, { color: primaryText }]}>
+                Not on {APP_TAG_NAME}
+              </Text>
+              <Text style={[styles.notFoundSubtitle, { color: subText }]}>
+                This phone number isn't registered yet. Double-check the country code and number, or invite them later.
+              </Text>
+            </View>
+          )}
+        </ScrollView>
+      </Animated.View>
+    );
 }
+
+const styles = StyleSheet.create({
+  root: { flex: 1 },
+  flex: { flex: 1 },
+  scrollContent: { paddingHorizontal: 20, paddingBottom: 40 },
+
+  // Header
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 12,
+    gap: 12,
+  },
+  headerBackBtn: {
+    width: 40, height: 40, borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  headerTitleWrap: { flex: 1 },
+  headerTitle: {
+    fontFamily: 'Roboto-Bold',
+    fontSize: 20,
+    letterSpacing: -0.3,
+  },
+  headerSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 2,
+  },
+
+  // Illustration
+  illustrationWrap: {
+    alignItems: 'center',
+    paddingTop: 26,
+    paddingBottom: 26,
+    position: 'relative',
+  },
+  illHalo: {
+    position: 'absolute', top: 4,
+    width: 150, height: 150, borderRadius: 75,
+  },
+  illHalo2: {
+    position: 'absolute', top: -16,
+    width: 200, height: 200, borderRadius: 100,
+  },
+  illIcon: {
+    width: 78, height: 78, borderRadius: 24,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1,
+    marginBottom: 16,
+  },
+  illTitle: {
+    fontFamily: 'Roboto-Bold',
+    fontSize: 18,
+    letterSpacing: -0.2,
+  },
+  illSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 6,
+    paddingHorizontal: 30,
+    lineHeight: 18,
+  },
+
+  // Input
+  inputRow: {
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'flex-start',
+    marginTop: 4,
+  },
+  countryBtn: {
+    width: 64, height: 56,
+    marginTop: 6,
+    justifyContent: 'center', alignItems: 'center',
+    borderWidth: 1.5,
+    borderRadius: 14,
+  },
+  paperInput: { backgroundColor: 'transparent' },
+  paperOutline: { borderRadius: 14, borderWidth: 1.5 },
+
+  // Status pill
+  statusPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 20,
+    marginTop: 14,
+  },
+  statusPillText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+  },
+
+  // Result
+  resultWrap: { marginTop: 22 },
+  resultHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 10,
+    paddingHorizontal: 4,
+  },
+  resultStatusDot: {
+    width: 8, height: 8, borderRadius: 4,
+    backgroundColor: '#25D366',
+  },
+  resultStatusText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+    letterSpacing: 0.3,
+  },
+  userCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 14,
+    gap: 14,
+    borderRadius: 18,
+    shadowColor: '#000',
+    shadowOpacity: 0.05,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 12,
+    elevation: 2,
+  },
+  userAvatarRing: {
+    width: 56, height: 56, borderRadius: 28,
+    borderWidth: 2,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  userAvatar: {
+    width: 48, height: 48, borderRadius: 24,
+  },
+  userAvatarFallback: {
+    alignItems: 'center', justifyContent: 'center',
+  },
+  userAvatarLetter: {
+    color: '#fff',
+    fontFamily: 'Roboto-Bold',
+    fontSize: 20,
+  },
+  userName: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 16,
+    textTransform: 'capitalize',
+  },
+  userPhone: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    marginTop: 2,
+  },
+  userCta: {
+    width: 44, height: 44, borderRadius: 14,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  resultHint: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 10,
+    marginLeft: 4,
+  },
+
+  // Not found
+  notFoundWrap: {
+    alignItems: 'center',
+    paddingTop: 30,
+    paddingHorizontal: 30,
+  },
+  notFoundIcon: {
+    width: 64, height: 64, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
+    marginBottom: 14,
+  },
+  notFoundTitle: {
+    fontFamily: 'Roboto-Bold',
+    fontSize: 17,
+  },
+  notFoundSubtitle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    textAlign: 'center',
+    marginTop: 6,
+    lineHeight: 19,
+  },
+});
