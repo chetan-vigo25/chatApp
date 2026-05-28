@@ -33,6 +33,8 @@ import {
 } from '../../Redux/Reducer/Status/Status.reducer';
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import { toSecureMediaUri } from '../../utils/mediaService';
+import { profileDetail } from '../../Redux/Reducer/Profile/Profile.reducer';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 const STORY_DURATION = 5000;
@@ -89,6 +91,7 @@ export default function StatusViewer({ navigation, route }) {
   const dispatch = useDispatch();
   const { viewers, likers, reactionCache, likeAnimationStatusId } = useSelector(s => s.status);
   const { user }  = useSelector(s => s.authentication);
+  const { profileData } = useSelector(s => s.profile);
   // Saved-contact resolver for the viewers/likers lists. Saved name → phone
   // number → server-provided name. Same rule used across the status list.
   const { resolveName: resolveContactName } = useContactDirectory();
@@ -198,6 +201,15 @@ export default function StatusViewer({ navigation, route }) {
       pausedRef.current = false; setPaused(false);
     });
   }, [panelSlide]);
+
+  // Ensure the current user's profile image is loaded for the "My Status"
+  // header avatar — the profile slice may be empty if the user hasn't opened
+  // the Profile/Settings screen this session.
+  useEffect(() => {
+    if (isMine && !profileData?.profileImage) {
+      dispatch(profileDetail()).catch?.(() => {});
+    }
+  }, [isMine, profileData?.profileImage, dispatch]);
 
   // ── View + seed reactions on index change ──────────────────────────────────
   useEffect(() => {
@@ -456,19 +468,21 @@ export default function StatusViewer({ navigation, route }) {
   if (!currentStatus) return null;
 
   const displayName  = isMine ? (user?.fullName || 'My Status') : userName;
-  // For "My Status" the auth slice may expose the profile image under
-  // any of several keys depending on which API last hydrated it
-  // (profileImage / profilePicture / avatar / image). Try them all so
-  // the header shows the real avatar instead of falling back to the app
-  // logo.
+  // For "My Status" show the current user's real avatar in the header instead
+  // of the app logo. The reliable source is the profile slice (same one the
+  // Profile screen uses); fall back to whatever the auth slice happens to hold.
+  // Run it through toSecureMediaUri so an http URL still loads on iOS (ATS).
   const displayImage = isMine
-    ? (user?.profileImage
+    ? (toSecureMediaUri(
+        profileData?.profileImage
+        || profileData?.profileImageThumbnailUrl
+        || user?.profileImage
         || user?.profilePicture
         || user?.profilePic
         || user?.avatar
         || user?.image
-        || null)
-    : userImage;
+      ) || null)
+    : toSecureMediaUri(userImage);
   const likeActive = reactionData.myReaction === 'like';
 
   // Does the currently-visible slide play audio? Used to gate the mute icon.
@@ -487,7 +501,7 @@ export default function StatusViewer({ navigation, route }) {
     // Derive type: prefer the mediaItem's mediaType, fall back to text if textContent exists
     const statusType = firstItem?.mediaType
       ?? (currentStatus?.textContent ? 'text' : null);
-    const mediaUrl   = firstItem?.mediaUrl;
+    const mediaUrl   = toSecureMediaUri(firstItem?.mediaUrl);
 
     switch (statusType) {
       case 'text':
@@ -532,7 +546,7 @@ export default function StatusViewer({ navigation, route }) {
         return (
           <View style={styles.linkContent}>
             {currentStatus.ogMetadata?.image
-              ? <Image source={{ uri: currentStatus.ogMetadata.image }} style={styles.linkImage} resizeMode="cover" />
+              ? <Image source={{ uri: toSecureMediaUri(currentStatus.ogMetadata.image) }} style={styles.linkImage} resizeMode="cover" />
               : null
             }
             <View style={styles.linkBody}>
@@ -950,7 +964,7 @@ export default function StatusViewer({ navigation, route }) {
               <View style={styles.replyContextThumb}>
                 {currentStatus?.mediaItems?.[0]?.thumbnailUrl || currentStatus?.mediaItems?.[0]?.mediaUrl ? (
                   <Image
-                    source={{ uri: currentStatus.mediaItems[0].thumbnailUrl || currentStatus.mediaItems[0].mediaUrl }}
+                    source={{ uri: toSecureMediaUri(currentStatus.mediaItems[0].thumbnailUrl || currentStatus.mediaItems[0].mediaUrl) }}
                     style={styles.replyContextThumbImg}
                   />
                 ) : (

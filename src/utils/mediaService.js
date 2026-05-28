@@ -34,6 +34,20 @@ export const normalizeUri = (uri) => {
   return uri;
 };
 
+// Make a REMOTE media URL safe to load in <Image>/<Video>.
+// iOS App Transport Security blocks cleartext http:// (Android debug allows it
+// via usesCleartextTraffic), so remote media loads on Android but silently
+// fails on iOS. Upgrade http→https (and protocol-relative //host → https://).
+// Local URIs (file://, content://, ph://, assets-library://, data:) and existing
+// https URLs are returned unchanged — so this is a safe no-op when not needed.
+export const toSecureMediaUri = (uri) => {
+  if (!uri || typeof uri !== 'string') return uri;
+  const u = uri.trim();
+  if (/^http:\/\//i.test(u)) return u.replace(/^http:\/\//i, 'https://');
+  if (/^\/\//.test(u)) return `https:${u}`;
+  return u;
+};
+
 // Initialize all app directories (export this function)
 export const initializeAppDirectories = async () => {
   // Return existing promise if already initializing
@@ -232,7 +246,7 @@ export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = 
     // Handle remote URLs
     if (/^https?:\/\//i.test(normalizedUri)) {
       const downloadResumable = FileSystem.createDownloadResumable(
-        normalizedUri,
+        toSecureMediaUri(normalizedUri),
         destination,
         {},
         (downloadProgress) => {
@@ -310,7 +324,7 @@ export const downloadRemoteToReceived = async (remoteUrl, filename, onProgress =
     }
 
     const downloadResumable = FileSystem.createDownloadResumable(
-      remoteUrl,
+      toSecureMediaUri(remoteUrl),
       destination,
       {},
       (downloadProgress) => {
@@ -530,7 +544,7 @@ export async function persistDownloadedMedia({ mediaId, chatId, sourceUrl, fileN
   console.log('[MEDIA:DOWNLOAD:START]', mediaId);
   
   const resumable = FileSystem.createDownloadResumable(
-    sourceUrl,
+    toSecureMediaUri(sourceUrl),
     destination,
     {},
     (event) => {

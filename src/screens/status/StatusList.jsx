@@ -12,6 +12,7 @@ import { Ionicons, MaterialCommunityIcons, Feather } from '@expo/vector-icons';
 import SegmentedRing from '../../components/SegmentedRing';
 import { STATUS_ACCENT } from './_statusDesign';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import { toSecureMediaUri } from '../../utils/mediaService';
 
 const IS_IPAD = Platform.OS === 'ios' && Platform.isPad;
 
@@ -25,7 +26,7 @@ function StatusThumb({ status, style }) {
   const statusType = firstItem?.mediaType ?? (status.textContent ? 'text' : null);
 
   if ((statusType === 'image' || statusType === 'video') && (firstItem?.thumbnailUrl || firstItem?.mediaUrl)) {
-    return <Image source={{ uri: firstItem.thumbnailUrl || firstItem.mediaUrl }} style={[style, styles.thumbCover]} />;
+    return <Image source={{ uri: toSecureMediaUri(firstItem.thumbnailUrl || firstItem.mediaUrl) }} style={[style, styles.thumbCover]} />;
   }
   if (statusType === 'text') {
     return (
@@ -38,7 +39,7 @@ function StatusThumb({ status, style }) {
   }
   if (statusType === 'link') {
     const ogImage = status.ogMetadata?.image;
-    if (ogImage) return <Image source={{ uri: ogImage }} style={[style, styles.thumbCover]} />;
+    if (ogImage) return <Image source={{ uri: toSecureMediaUri(ogImage) }} style={[style, styles.thumbCover]} />;
     return (
       <View style={[style, styles.thumbLink]}>
         <Feather name="link" size={16} color="#cbd5e1" />

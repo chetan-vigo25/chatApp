@@ -43,11 +43,11 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
-import { mediaDownloadSigned } from '../../utils/mediaService';
+import { mediaDownloadSigned, toSecureMediaUri } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import MentionText from '../../components/MentionText';
@@ -202,7 +202,8 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
         paddingHorizontal: 10,
         paddingTop: 8,
         paddingBottom: Platform.OS === 'ios' ? 12 : 10,
-        backgroundColor: theme.colors.background,
+        // backgroundColor: theme.colors.background,
+        backgroundColor: 'transparent',
         overflow: 'visible',
         borderWidth: 0,
         zIndex: 10,
@@ -225,7 +226,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           shadowOffset: { width: 0, height: 3 },
           shadowOpacity: 0.08,
           shadowRadius: 8,
-          elevation: 2,
+          elevation: 1,
         }}
       >
 
@@ -886,6 +887,9 @@ export default function ChatScreen({ navigation, route }) {
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
   const [reportPayload, setReportPayload] = useState({});
+  // Tracks media whose local downloaded file failed to render, so we fall back
+  // to the remote https URL (keyed by message key).
+  const [failedLocalMedia, setFailedLocalMedia] = useState({});
   const [replyHighlightId, setReplyHighlightId] = useState(null);
   const replyHighlightTimer = useRef(null);
   const [reportAnalytics, setReportAnalytics] = useState({
@@ -1719,7 +1723,7 @@ export default function ChatScreen({ navigation, route }) {
           responseData?.mediaUrl ||
           responseData?.previewUrl || null;
         if (signedUrl && (signedUrl.startsWith('http://') || signedUrl.startsWith('https://'))) {
-          const result = await FileSystem.downloadAsync(signedUrl, dest);
+          const result = await FileSystem.downloadAsync(toSecureMediaUri(signedUrl), dest);
           if (result?.uri && await verifyFileExists(result.uri)) {
             console.log('✅ [resolveFileForOpen] Downloaded via signed URL');
             return result.uri;
@@ -1742,7 +1746,7 @@ export default function ChatScreen({ navigation, route }) {
 
     for (const url of allServerUrls) {
       try {
-        const result = await FileSystem.downloadAsync(url, dest);
+        const result = await FileSystem.downloadAsync(toSecureMediaUri(url), dest);
         if (result?.uri && await verifyFileExists(result.uri)) {
           console.log('✅ [resolveFileForOpen] Downloaded via direct URL');
           return result.uri;
@@ -3138,7 +3142,11 @@ export default function ChatScreen({ navigation, route }) {
   }, [clearChatForEveryone, isDeletingEveryone]);
 
   const renderChatEmptyState = useCallback(() => (
-    <View style={{ flexGrow: 1, justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 24, paddingBottom: 20, transform: [{ rotate: '180deg' }] }}>
+    // The list is `inverted` (flipped vertically via scaleY:-1), so this empty
+    // component renders upside down unless we flip it back. Counter with the
+    // exact inverse — scaleY:-1 — on BOTH platforms. (rotate:180deg also flips
+    // horizontally, which mirrors the text on iOS.)
+    <View style={{ flexGrow: 1, justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 24, paddingBottom: 20, transform: [{ scaleY: -1 }] }}>
       <View style={{
         backgroundColor: isDarkMode ? 'rgba(25,40,55,0.85)' : 'rgba(225,230,236,0.85)',
         paddingHorizontal: 14,
@@ -3650,9 +3658,22 @@ export default function ChatScreen({ navigation, route }) {
     const status = normalizeDownloadStatus(downloadState?.status);
     const mediaInfo = resolveMediaInfo(msg);
 
-    const imageSource = isMyMessage
+    // Remote https URL (server thumbnail / full media) — the fallback when the
+    // local downloaded file is missing or unreadable (common on the iOS
+    // simulator after reinstalls, where the app container path goes stale).
+    const remoteImageSource = toSecureMediaUri(getServerThumbnailUrl(msg) || msg?.mediaUrl);
+    const localImageSource = toSecureMediaUri(isMyMessage
       ? (msg.localUri || resolveCachedThumbnailUrl(msg) || msg.mediaUrl)
-      : (downloadedUri || resolveCachedThumbnailUrl(msg));
+      : (downloadedUri || resolveCachedThumbnailUrl(msg)));
+    // If the local file already failed to render once, use the remote URL.
+    const imageSource = (failedLocalMedia[messageKey] && remoteImageSource)
+      ? remoteImageSource
+      : (localImageSource || remoteImageSource);
+    const onImageLoadError = () => {
+      if (!failedLocalMedia[messageKey] && remoteImageSource && imageSource !== remoteImageSource) {
+        setFailedLocalMedia(prev => (prev[messageKey] ? prev : { ...prev, [messageKey]: true }));
+      }
+    };
     const shouldRenderThumbnail = Boolean(imageSource);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
     // Blur: full (20) before download, reduces progressively during download, 0 when done
@@ -3708,6 +3729,7 @@ export default function ChatScreen({ navigation, route }) {
               style={imageStyle}
               resizeMode="cover"
               blurRadius={blurAmount}
+              onError={onImageLoadError}
             />
           ) : (
             <View style={[imageStyle, { backgroundColor: theme.colors.menuBackground, alignItems: 'center', justifyContent: 'center' }]}>
@@ -3735,7 +3757,7 @@ export default function ChatScreen({ navigation, route }) {
     const downloadedUri = downloaded ? resolveDownloadedUri(msg) : null;
     const status = normalizeDownloadStatus(downloadState?.status);
     const sendingProgress = resolveUploadProgress(msg);
-    const thumbnailSource = resolveCachedThumbnailUrl(msg);
+    const thumbnailSource = toSecureMediaUri(resolveCachedThumbnailUrl(msg));
     const shouldRenderThumbnail = Boolean(thumbnailSource || downloaded);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
     const videoBlurAmount = (!isMyMessage && !downloaded && Boolean(thumbnailSource))
@@ -5871,8 +5893,8 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                {/* <ImageZoom
-                  uri={localMediaViewer.uri}
+                <ImageZoom
+                  uri={toSecureMediaUri(localMediaViewer.uri)}
                   minScale={1}
                   maxScale={5}
                   doubleTapScale={3}
@@ -5881,7 +5903,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                /> */}
+                />
               </GestureHandlerRootView>
             )}
 
@@ -5889,7 +5911,7 @@ export default function ChatScreen({ navigation, route }) {
             {localMediaViewer.type === 'video' && localMediaViewer.uri && (
               <Video
                 ref={ref => { videoRefs.current[localMediaViewer.uri] = ref; }}
-                source={{ uri: localMediaViewer.uri }}
+                source={{ uri: toSecureMediaUri(localMediaViewer.uri) }}
                 style={{ width: '100%', height: '100%' }}
                 useNativeControls
                 resizeMode={ResizeMode.CONTAIN}

@@ -317,11 +317,19 @@ const normalizeChatListUpdate = (payload = {}) => {
 
   if (!chatId) return null;
 
+  // Who triggered a read/seen update. Read from the top-level payload, NOT from
+  // `item` (whose senderId is the last-message author). Used to stop our own
+  // "open the chat" reads from falsely turning our OUTGOING ticks blue.
+  const readerId = normalizeId(
+    source?.readerId || source?.readBy || source?.reader || source?.senderId || source?.userId || null
+  );
+
   return {
     chatId,
     type,
     reason,
     item,
+    readerId,
     timestamp: Number(source?.timestamp || item?.lastMessageAt || Date.now()),
   };
 };
@@ -1215,7 +1223,7 @@ const reducer = (state, action) => {
         const update = normalizeChatListUpdate(rawUpdate);
         if (!update) return;
 
-        const { chatId: rawUpdateChatId, type, item, timestamp } = update;
+        const { chatId: rawUpdateChatId, type, item, timestamp, readerId } = update;
         const itemPeerUserId = getPeerUserId(item);
         const aliasChatId = findChatIdByPeer(nextMap, itemPeerUserId, rawUpdateChatId);
         // For group chats, resolve the chatId if it doesn't directly match a key in chatMap
@@ -1352,7 +1360,20 @@ const reducer = (state, action) => {
             // The backend's per-user `item.unreadCount` is authoritative when
             // present. If it's missing (e.g. group status emits use a minimal
             // patch), keep the existing unread count — never blindly zero.
-            const nextStatus = pickHighestMessageStatus(existing?.lastMessage?.status, 'read') || 'read';
+            // Only a CONFIRMED peer read may turn our outgoing tick blue. The
+            // backend fans this 'message.read' update to the reader too, and that
+            // self-ack frequently arrives WITHOUT a readerId — so treat both
+            // "no readerId" and "readerId === us" the same: keep the existing
+            // tick (just clear unread below). This stops a blue/seen double-tick
+            // from showing before the peer has actually opened the message.
+            const isPeerRead = readerId && state.currentUserId
+              && String(readerId) !== String(state.currentUserId);
+            const existingStatus = normalizeMessageDeliveryStatus(existing?.lastMessage?.status)
+              || normalizeMessageDeliveryStatus(existing?.lastMessageStatus)
+              || null;
+            const nextStatus = isPeerRead
+              ? (pickHighestMessageStatus(existing?.lastMessage?.status, 'read') || 'read')
+              : existingStatus;
             const lastMessage = {
               ...(existing?.lastMessage || {}),
               status: nextStatus,
@@ -2572,22 +2593,27 @@ export function RealtimeChatProvider({ children }) {
     const onMessageReadAllResponse = (payload) => {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat);
-      // readerId = the person who read (peer). If it's us, clear our unread badge.
-      // If it's the peer, update our outgoing last-message tick to 'read'.
       const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
-      const isOwnRead = readerId && String(readerId) === String(currentUserIdRef.current);
-      if (chatId && isOwnRead) {
-        dispatch({ type: 'MARK_READ', payload: chatId });
+      // Only a CONFIRMED peer read turns our outgoing tick blue. Our own read-all
+      // (emitted when WE open the chat) is fanned back to us — often WITHOUT a
+      // readerId — so anything that isn't a confirmed peer just clears our unread
+      // badge and must NOT bump the tick to 'read'.
+      const isPeerRead = readerId && String(readerId) !== String(currentUserIdRef.current);
+      if (!isPeerRead) {
+        if (chatId) dispatch({ type: 'MARK_READ', payload: chatId });
         return;
       }
-      // Peer read all our messages in this chat → update last message tick
-      if (!readerId || !isOwnRead) {
-        dispatchLastMessageStatusUpdate(payload, 'read');
-      }
+      dispatchLastMessageStatusUpdate(payload, 'read');
     };
 
     // Handle message:seen:response — update last message seen status
     const onMessageSeenResponse = (payload) => {
+      const source = unwrapPayload(payload);
+      const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
+      // Only a CONFIRMED peer read turns our outgoing tick blue. A seen-ack with
+      // no readerId (or our own id) must not bump the tick — it's the echo of our
+      // own chat-open read, not the peer actually seeing the message.
+      if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
 

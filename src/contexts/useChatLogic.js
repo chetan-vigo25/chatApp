@@ -5087,16 +5087,37 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     // INSTANT UI: update status in state immediately (no flicker)
+    // Mirrors the SQLite guard in ChatDatabase.updateMessageStatus so the live
+    // ticks and the persisted truth agree.
+    const STATUS_OWNED_BY_HANDLERS = new Set(['scheduled', 'processing', 'cancelled']);
     setAllMessages(prev => {
       let changed = false;
       const updated = prev.map(m => {
         const isMatch = (tempId && (m.id === tempId || m.tempId === tempId)) ||
                         (serverMessageId && (m.id === serverMessageId || m.serverMessageId === serverMessageId));
         if (!isMatch) return m;
+
+        // Never downgrade a live message: a late 'delivered' must not undo 'seen',
+        // a stale 'sent' must not undo 'delivered', etc. 'failed' is the one
+        // exception (an error state may replace a higher one), and scheduled/
+        // processing/cancelled are owned by their dedicated handlers.
+        let nextStatus = normalizedStatus;
+        if (normalizedStatus !== 'failed') {
+          if (STATUS_OWNED_BY_HANDLERS.has(m.status)) {
+            nextStatus = m.status;
+          } else if (getMessageStatusPriority(normalizedStatus) < getMessageStatusPriority(m.status)) {
+            nextStatus = m.status;
+          }
+        }
+
+        const needsIdSync = !!serverMessageId &&
+          (m.serverMessageId !== serverMessageId || m.id !== serverMessageId || !m.synced);
+        if (nextStatus === m.status && !needsIdSync) return m;
+
         changed = true;
         return {
           ...m,
-          status: normalizedStatus,
+          status: nextStatus,
           ...(serverMessageId ? { serverMessageId, id: serverMessageId, synced: true } : {}),
         };
       });
@@ -5127,6 +5148,7 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, [
     normalizeMessageStatus,
+    getMessageStatusPriority,
     refreshMessagesFromDB,
     updateChatListLastMessagePreview,
   ]);

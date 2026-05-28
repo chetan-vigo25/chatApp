@@ -149,19 +149,57 @@ export const getFCMToken = async () => {
   }
 };
 
+// ─── DE-DUPLICATION ───
+// The same chat message can reach us twice: e.g. a notification+data message
+// the OS renders itself plus a data twin, or a listener firing more than once.
+// Track recently-shown message keys and drop repeats within a short window.
+const recentlyShownNotifications = new Map();
+const NOTIF_DEDUPE_WINDOW_MS = 10000;
+
+const isDuplicateNotification = (key) => {
+  if (!key) return false;
+  const now = Date.now();
+  for (const [k, ts] of recentlyShownNotifications) {
+    if (now - ts > NOTIF_DEDUPE_WINDOW_MS) recentlyShownNotifications.delete(k);
+  }
+  if (recentlyShownNotifications.has(key)) return true;
+  recentlyShownNotifications.set(key, now);
+  return false;
+};
+
 // ─── SHOW LOCAL NOTIFICATION ───
 // Used for foreground messages and data-only background messages
 const showLocalNotification = async (remoteMessage) => {
   if (!remoteMessage) return;
 
   const { notification, data } = remoteMessage;
-  const title = notification?.title || data?.title || 'New Message';
-  const body = notification?.body || data?.body || '';
+
+  // Resolve real content: notification payload first, then the common data keys
+  // the backend may use. Without this, a content-bearing data message renders as
+  // a generic "New Message".
+  const title =
+    notification?.title || data?.title || data?.senderName ||
+    data?.senderFullName || data?.fullName || data?.name || data?.chatName || '';
+  const body =
+    notification?.body || data?.body || data?.message || data?.text ||
+    data?.messageText || data?.content || '';
+
+  // Contentless payloads (routing-only data) must NOT produce a notification —
+  // that is the spurious generic "New Message" duplicate. The real message is
+  // shown either by the OS (notification payload) or by a content-bearing one.
+  if (!title && !body) return;
+
+  // Drop duplicates of the same message.
+  const dedupeKey = String(
+    data?.messageId || data?._id || data?.serverMessageId ||
+    notification?.tag || (data?.chatId ? `${data.chatId}:${body}` : '')
+  );
+  if (isDuplicateNotification(dedupeKey)) return;
 
   try {
     await Notifications.scheduleNotificationAsync({
       content: {
-        title,
+        title: title || 'New Message',
         body,
         data: data || {},
         sound: Platform.OS === 'ios' ? CUSTOM_SOUND_IOS : true,
