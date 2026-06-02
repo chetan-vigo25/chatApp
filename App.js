@@ -73,6 +73,5 @@ export default function App() {
          </NetworkProvider>
        </ThemeProvider>
     </SafeAreaProvider>
-   
   );
 }

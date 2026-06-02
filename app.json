@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "VibeConnect Messenger",
+    "name": "TalksTry",
     "slug": "baatCheet",
     "version": "1.1.0",
     "orientation": "portrait",
@@ -25,12 +25,12 @@
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSCameraUsageDescription": "VibeConnect Messenger needs camera access so you can take photos and record videos to share in your chats and status updates.",
-        "NSMicrophoneUsageDescription": "VibeConnect Messenger needs microphone access so you can record and send voice messages and voice notes to your contacts.",
-        "NSPhotoLibraryUsageDescription": "VibeConnect Messenger needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
-        "NSPhotoLibraryAddUsageDescription": "VibeConnect Messenger needs permission to save photos and videos you receive in chats to your photo library.",
-        "NSContactsUsageDescription": "VibeConnect Messenger uses your contacts only to help you find friends who already use the app. Phone numbers are securely hashed before being checked. You can use VibeConnect Messenger without granting this permission.",
-        "NSLocationWhenInUseUsageDescription": "VibeConnect Messenger accesses your location only when you choose to share your current location in a chat. Location is never collected in the background."
+        "NSCameraUsageDescription": "TalksTry needs camera access so you can take photos and record videos to share in your chats and status updates.",
+        "NSMicrophoneUsageDescription": "TalksTry needs microphone access so you can record and send voice messages and voice notes to your contacts.",
+        "NSPhotoLibraryUsageDescription": "TalksTry needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
+        "NSPhotoLibraryAddUsageDescription": "TalksTry needs permission to save photos and videos you receive in chats to your photo library.",
+        "NSContactsUsageDescription": "TalksTry uses your contacts only to help you find friends who already use the app. Phone numbers are securely hashed before being checked. You can use TalksTry without granting this permission.",
+        "NSLocationWhenInUseUsageDescription": "TalksTry accesses your location only when you choose to share your current location in a chat. Location is never collected in the background."
       }
     },
     "android": {
@@ -92,8 +92,8 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "VibeConnect Messenger needs camera access so you can take photos and record videos to share in your chats and status updates.",
-          "microphonePermission": "VibeConnect Messenger needs microphone access so you can record and send voice messages and voice notes to your contacts.",
+          "cameraPermission": "TalksTry needs camera access so you can take photos and record videos to share in your chats and status updates.",
+          "microphonePermission": "TalksTry needs microphone access so you can record and send voice messages and voice notes to your contacts.",
           "recordAudioAndroid": true,
           "isAccessMediaLocationEnabled": true
         }
@@ -101,8 +101,8 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "VibeConnect Messenger needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
-          "savePhotosPermission": "VibeConnect Messenger needs permission to save photos and videos you receive in chats to your photo library.",
+          "photosPermission": "TalksTry needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
+          "savePhotosPermission": "TalksTry needs permission to save photos and videos you receive in chats to your photo library.",
           "isAccessMediaLocationEnabled": true
         }
       ],

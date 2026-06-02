@@ -301,7 +301,7 @@ export default function EditProfile({ navigation, route }) {
           </View>
 
           <Text style={[styles.helperText, { color: subText }]}>
-            Your profile is visible to people you chat with on baatcheet.
+            Your profile is visible to people you chat with on TalksTry.
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>

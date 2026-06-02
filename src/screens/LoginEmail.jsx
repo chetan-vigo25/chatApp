@@ -159,7 +159,7 @@ export default function LoginEmail({ navigation }) {
               <View style={[styles.brandRing, { borderColor: themeColor + '22' }]}>
                 <View style={[styles.brandRing2, { borderColor: themeColor + '38' }]}>
                   <View style={[styles.brandBadge, { backgroundColor: themeColor + '18' }]}>
-                    <Image source={require('../../assets/icon0.png')} resizeMode="cover" style={styles.brandLogo} />
+                    <Image source={require('../../assets/icon.png')} resizeMode="cover" style={styles.brandLogo} />
                   </View>
                 </View>
               </View>

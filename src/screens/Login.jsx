@@ -128,7 +128,7 @@ export default function Login({ navigation }) {
                 <View style={[styles.brandRing2, { borderColor: themeColor + '38' }]}>
                   <View style={[styles.brandBadge, { backgroundColor: themeColor + '18' }]}>
                     <Image
-                      source={require('../../assets/icon0.png')}
+                      source={require('../../assets/icon.png')}
                       resizeMode="cover"
                       style={styles.brandLogo}
                     />
