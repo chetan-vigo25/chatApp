@@ -16,6 +16,7 @@ import { PresenceProvider } from './src/presence/store/PresenceContext';
 import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
 import {  getFCMToken, initializeNotifications, setupNotificationCategory, setupCallNotificationCategory } from './src/firebase/fcmService';
+import { registerNotifeeForeground, ensureCallChannel } from './src/firebase/callNotifee';
 import 'react-native-get-random-values';
 import NoInternet from './src/screens/NoInternet';
 import { CallProvider } from './src/calls/CallProvider';
@@ -28,10 +29,16 @@ export default function App() {
 
     useEffect(() => {
       let cleanup;
+      let notifeeCleanup;
       const setup = async () => {
         try {
           // Setup iOS notification categories (reply buttons etc.)
           await setupNotificationCategory();
+          // Register the incoming-call category (Accept / Decline) up front so the
+          // buttons appear on the FIRST call push too — on iOS the OS needs the
+          // category registered before the notification arrives (Android presents
+          // it locally so this is just a safe, idempotent pre-warm there).
+          await setupCallNotificationCategory();
 
           // Get and store FCM token
           const token = await getFCMToken();
@@ -42,6 +49,14 @@ export default function App() {
 
           // Setup foreground listeners (background handler is in index.js)
           cleanup = initializeNotifications();
+
+          // Full-screen incoming-call notifications (Android): pre-create the ring
+          // channel and listen for Accept/Decline taps while the app is open. The
+          // cold-start launch action is replayed by CallProvider (once its call
+          // listeners + auth are ready), not here — doing it here races auth
+          // restore and the Accept-from-notification action gets lost.
+          await ensureCallChannel();
+          notifeeCleanup = registerNotifeeForeground();
         } catch (error) {
           console.error('FCM setup error:', error);
         }
@@ -49,6 +64,7 @@ export default function App() {
       setup();
       return () => {
         if (cleanup) cleanup();
+        if (notifeeCleanup) notifeeCleanup();
       };
     }, []);
 

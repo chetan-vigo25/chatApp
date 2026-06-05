@@ -1,0 +1,22 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="expo.modules.callui" >
+4
+5    <uses-sdk android:minSdkVersion="24" />
+6
+7    <application>
+7-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:2:3-8:17
+8
+9        <!--
+10         Receives the Answer / Decline taps from the CallStyle notification.
+11         Runs natively even when the JS app is killed.
+12        -->
+13        <receiver
+13-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:5:5-7:34
+14            android:name="expo.modules.callui.CallActionReceiver"
+14-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:6:7-41
+15            android:exported="false" />
+15-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:7:7-31
+16    </application>
+17
+18</manifest>

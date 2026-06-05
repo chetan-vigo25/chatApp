@@ -33,7 +33,7 @@ import ContactDatabase from '../../services/ContactDatabase';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
-// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -1145,16 +1145,16 @@ export default function ChatList({ navigation }) {
       ) : (
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <Text style={[styles.headerWordmark, { color: theme.colors.themeColor }]}>
-            {String(name || 'VibeConnect').split(' ')[0]}
-          </Text>
-          {Number(realtimeState?.totalUnread || 0) > 0 && (
+          <View style={styles.headerLogoWrap}>
+            <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
+          </View>
+          {/* {Number(realtimeState?.totalUnread || 0) > 0 && (
             <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Text style={styles.unreadBadgeText}>
                 {Number(realtimeState.totalUnread) > 99 ? '99+' : Number(realtimeState.totalUnread)}
               </Text>
             </View>
-          )}
+          )} */}
         </View>
 
         <View style={styles.headerRight}>
@@ -1567,14 +1567,14 @@ export default function ChatList({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              {/* <ImageZoom
+              <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              /> */}
+              />
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>
@@ -2223,4 +2223,10 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto-Regular',
     marginTop: 20,
   },
+  headerLogoWrap: {
+    width: 38, height: 38, borderRadius: 12,
+    overflow: 'hidden',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  headerLogoImg: { width: 38, height: 38 },
 });

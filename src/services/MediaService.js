@@ -266,7 +266,7 @@ class MediaService {
   /**
    * After downloading, save a copy to device's visible media folder.
    * This makes the file appear in:
-   *   - Android: internal storage/Android/media/com.chat.baatCheet/VibeConnect/Media/VibeConnect Images/
+   *   - Android: internal storage/Android/media/com.chat.baatCheet/TalksTry/Media/TalksTry Images/
    *   - Also visible in Gallery app and file manager
    *
    * WhatsApp equivalent:
@@ -296,7 +296,7 @@ class MediaService {
       const asset = await MediaLibrary.createAssetAsync(localPath);
 
       // Create album with WhatsApp-style name
-      const albumName = type === 'video' ? 'VibeConnect Video' : 'VibeConnect Images';
+      const albumName = type === 'video' ? 'TalksTry Video' : 'TalksTry Images';
       const album = await MediaLibrary.getAlbumAsync(albumName);
 
       if (album) {

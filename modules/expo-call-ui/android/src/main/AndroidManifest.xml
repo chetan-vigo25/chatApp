@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <!-- Receives the Answer / Decline taps from the CallStyle notification.
+         Runs natively even when the JS app is killed. -->
+    <receiver
+      android:name=".CallActionReceiver"
+      android:exported="false" />
+  </application>
+</manifest>

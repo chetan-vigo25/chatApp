@@ -1,14 +1,14 @@
 import * as Notifications from 'expo-notifications';
 import { Platform, PermissionsAndroid, DeviceEventEmitter } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { isGroupInactive } from '../utils/inactiveGroups';
+import { setPushToken } from '../Redux/Services/Socket/socket';
+import { CALL_PUSH_EVENTS } from './callEvents';
+import { displayIncomingCallNotifee, isNotifeeCallAvailable } from './callNotifee';
 
-// Cross-module events the call layer (CallProvider) listens to. A call push,
-// once received/tapped, is routed into the live call flow through these.
-export const CALL_PUSH_EVENTS = {
-  INCOMING: 'call:push:incoming', // show the ringing UI (foreground / tap)
-  ACCEPT: 'call:push:accept',     // Accept action / tap → answer
-  REJECT: 'call:push:reject',     // Decline action → reject
-};
+// Cross-module events the call layer (CallProvider) listens to. Defined in
+// ./callEvents and re-exported here for back-compat with existing importers.
+export { CALL_PUSH_EVENTS };
 // Notification category that carries the Accept / Decline buttons (WhatsApp-style).
 const CALL_CATEGORY_ID = 'incoming_call';
 
@@ -251,8 +251,15 @@ export const getFCMToken = async () => {
     const token = await m().getToken();
     console.log('[FCM] Token:', token);
 
-    m().onTokenRefresh(newToken => {
-      console.log('[FCM] Token refreshed:', newToken);
+    // A rotated token (new install, app data clear, FCM refresh) must be pushed
+    // to the backend or call/message notifications go to a dead token and never
+    // arrive. Re-register it over the socket + persist it. (A fresh build install
+    // ALSO rotates the token — the most common reason background calls stop
+    // notifying after `expo run:android` until the device re-registers/relogs.)
+    m().onTokenRefresh((newToken) => {
+      console.log('[FCM] Token refreshed → re-registering:', newToken);
+      try { setPushToken(newToken); } catch (_) {}
+      AsyncStorage.setItem('fcmToken', newToken).catch(() => {});
     });
 
     return token;
@@ -350,10 +357,24 @@ export const registerBackgroundHandler = () => {
     m().setBackgroundMessageHandler(async (remoteMessage) => {
       console.log('Background message received:', JSON.stringify(remoteMessage));
 
-      // Incoming call (data-only, high priority): present our OWN heads-up with
-      // Accept / Decline action buttons on the 'calls' channel — WhatsApp-style.
+      // Incoming call (data-only, high priority). On Android show a notifee
+      // FULL-SCREEN-INTENT notification → launches the app's full-screen call UI
+      // over the lock screen (WhatsApp-style). On iOS (no full-screen intent)
+      // fall back to the expo-notifications heads-up with Accept/Decline. If the
+      // notifee path errors for any reason, fall back to the proven expo heads-up
+      // so the user ALWAYS gets a ringing notification.
       if (remoteMessage?.data?.type === 'call') {
-        await presentIncomingCallNotification(remoteMessage.data);
+        console.log('[FCM][bg] incoming-call push received', JSON.stringify(remoteMessage.data));
+        try {
+          if (isNotifeeCallAvailable()) {
+            await displayIncomingCallNotifee(remoteMessage.data);
+          } else {
+            await presentIncomingCallNotification(remoteMessage.data);
+          }
+        } catch (err) {
+          console.warn('[FCM][bg] full-screen call notif failed — falling back to heads-up:', err?.message);
+          try { await presentIncomingCallNotification(remoteMessage.data); } catch (_) {}
+        }
         return;
       }
 

@@ -3,7 +3,7 @@ import React, {
 } from 'react';
 import {
   Vibration, Alert, StyleSheet, View, DeviceEventEmitter, Linking, Platform,
-  Animated, Pressable, TouchableOpacity,
+  Animated, Pressable, TouchableOpacity, AppState,
 } from 'react-native';
 import Constants from 'expo-constants';
 import { Audio } from 'expo-av';
@@ -32,6 +32,8 @@ import {
 } from './services/callSignalService';
 import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 import { CALL_PUSH_EVENTS } from '../firebase/fcmService';
+import { cancelIncomingCallNotifee, consumeInitialNotifeeCall } from '../firebase/callNotifee';
+import { notifyIncomingCall } from './services/callNotifyService';
 
 export const CallContext = createContext(null);
 export const useCall = () => useContext(CallContext) || {};
@@ -362,6 +364,9 @@ export const CallProvider = ({ children }) => {
 
     // Dismiss the native call UI (no-op unless CallKeep is installed).
     if (snap.callId) nativeCall.endCall(snap.callId);
+    // Dismiss the OS full-screen incoming-call notification (notifee), keyed on
+    // the signaling id that the push/notification used as its callId.
+    cancelIncomingCallNotifee(snap.signalId);
 
     // Release the server-side busy lock + notify the peer over the app socket,
     // keyed on the signaling id. Only when this call used the signaling path
@@ -843,10 +848,18 @@ export const CallProvider = ({ children }) => {
     // The SDK's startCall acquires local media before it reaches the server; if
     // that hangs, surface it rather than ringing forever with no audio.
     armMediaWatchdog();
-    // NOTE: the offline-callee wake push is now sent SERVER-SIDE from the
-    // `call:ring` handler (presence-gated, with the real signaling callId +
-    // caller identity), so the app no longer fires a blind per-peer /call/notify
-    // here — that double-pushed offline users and needlessly pushed online ones.
+    // Wake-push the callee so a BACKGROUNDED / CLOSED / LOCKED device rings.
+    // A closed app can't receive the socket `call:incoming`, so the only way to
+    // ring it is a high-priority FCM push from the backend. We ask the backend
+    // explicitly here (POST /call/notify) rather than relying solely on its
+    // server-side `call:ring` wake push — so the callee is notified even if that
+    // path isn't firing. The backend keys the push on the same signaling callId,
+    // so a duplicate (server-side + this) collapses to one notification, and an
+    // online callee's push is harmless (a foreground call push only wakes the
+    // ring; it renders no banner). Best-effort — never blocks the call.
+    peers.forEach((p) => {
+      notifyIncomingCall({ peerId: p.id, media, callId: signalId });
+    });
   }, [ensureConnected, ensureMediaPermissions, myId, sendCmd, startRinging, stopRinging, armRingTimeout, armMediaWatchdog]);
 
   const startAudioCall = useCallback((peer, chatId) => startCall(peer, 'audio', { chatId }), [startCall]);
@@ -869,6 +882,10 @@ export const CallProvider = ({ children }) => {
     if (!permOk) { finalizeEnd('rejected', 'Permission denied'); return; }
     clearRingTimeout();
     stopRinging();
+    // Answering on the in-app screen → dismiss the OS call notification too, so
+    // the pop-up/heads-up doesn't linger in the shade once the call is connecting.
+    // (Tapping Accept/Decline on the notification itself is dismissed natively.)
+    cancelIncomingCallNotifee(snap.signalId);
     dispatch({ type: ACT.ACCEPT, nowMs: Date.now() });
     // The ring timeout is now cleared, so from here a stalled connect would hang
     // forever — arm the connect watchdog to fail cleanly if we never reach ACTIVE
@@ -1003,7 +1020,7 @@ export const CallProvider = ({ children }) => {
   // app socket is always connected, so the server pushes `call:incoming` here:
   // we show the ring immediately AND wake the engine so the real WebRTC incoming
   // (carrying the callId needed to accept) can arrive and reconcile.
-  const onSignalIncoming = useCallback((payload) => {
+  const onSignalIncoming = useCallback((payload, opts = {}) => {
     const snap = stateRef.current;
     const callerId = payload?.from?.id ? String(payload.from.id) : null;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 0 call:incoming signal (app socket) ═════', { callerId, currentStatus: snap.status, payload });
@@ -1039,6 +1056,20 @@ export const CallProvider = ({ children }) => {
     startRinging('incoming');
     armRingTimeout();
     ensureConnected(); // wake the WebRTC engine so its `incoming` can land
+    // Show the WhatsApp-style FULL-SCREEN incoming screen (rather than the
+    // compact top banner) when the ring comes up while the app isn't in the
+    // foreground — i.e. woken from background / over the lock screen. When the
+    // app is actively in use, keep the non-intrusive banner. Callers may force
+    // this via opts.expand (e.g. a full-screen-intent launch).
+    const shouldExpand = opts.expand !== undefined
+      ? opts.expand
+      : AppState.currentState !== 'active';
+    if (shouldExpand) {
+      dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
+    }
+    // The in-app ring (ringtone + UI) is now up — dismiss the OS full-screen
+    // notification so its looping ringtone doesn't double with ours.
+    cancelIncomingCallNotifee(payload?.callId);
     nativeCall.displayIncomingCall(
       payload?.callId, callerId,
       isGroup ? (payload?.groupName || 'Group call') : peer.name,
@@ -1128,14 +1159,17 @@ export const CallProvider = ({ children }) => {
 
   const onPushIncoming = useCallback((data) => {
     if (!data?.callerId) return;
-    onSignalIncoming(mapPushToIncoming(data));
+    // A push-driven ring means the app wasn't foreground (or it's a full-screen
+    // intent launch) → bring up the full-screen incoming screen.
+    const expand = !!data?._fullScreen || AppState.currentState !== 'active';
+    onSignalIncoming(mapPushToIncoming(data), { expand });
   }, [onSignalIncoming, mapPushToIncoming]);
 
   // Accept tapped on the notification (or a plain tap): make sure the ringing
   // state exists (cold start from a killed app), then answer once it commits.
   const onPushAccept = useCallback((data) => {
     if (!data?.callerId) return;
-    onSignalIncoming(mapPushToIncoming(data));
+    onSignalIncoming(mapPushToIncoming(data), { expand: true });
     pushAcceptPendingRef.current = true;
   }, [onSignalIncoming, mapPushToIncoming]);
 
@@ -1154,6 +1188,12 @@ export const CallProvider = ({ children }) => {
       DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.ACCEPT, onPushAccept),
       DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.REJECT, onPushReject),
     ];
+    // Cold start: replay the notification that launched the app (Accept tap /
+    // full-screen / body) ONLY now that these listeners are attached and the user
+    // is authenticated — otherwise the launch action races auth restore and is
+    // lost, so an Accept-from-notification never opens/connects the call. This is
+    // the single source of truth for the initial action (App.js no longer does it).
+    consumeInitialNotifeeCall();
     return () => subs.forEach((s) => { try { s.remove(); } catch (_) {} });
   }, [isAuthenticated, onPushIncoming, onPushAccept, onPushReject]);
 

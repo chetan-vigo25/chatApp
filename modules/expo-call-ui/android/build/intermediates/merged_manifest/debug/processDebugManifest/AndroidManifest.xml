@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="expo.modules.callui" >
+
+    <uses-sdk android:minSdkVersion="24" />
+
+    <application>
+
+        <!--
+         Receives the Answer / Decline taps from the CallStyle notification.
+         Runs natively even when the JS app is killed.
+        -->
+        <receiver
+            android:name="expo.modules.callui.CallActionReceiver"
+            android:exported="false" />
+    </application>
+
+</manifest>

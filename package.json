@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@likashefqet/react-native-image-zoom": "^4.3.0",
+    "@notifee/react-native": "^9.1.8",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/netinfo": "11.4.1",
     "@react-native-firebase/app": "^23.8.6",
@@ -77,6 +78,7 @@
   },
   "private": true,
   "devDependencies": {
-    "babel-preset-expo": "^54.0.10"
+    "babel-preset-expo": "^54.0.10",
+    "typescript": "~5.9.2"
   }
 }

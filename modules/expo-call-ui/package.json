@@ -1,0 +1,7 @@
+{
+  "name": "expo-call-ui",
+  "version": "0.1.0",
+  "description": "WhatsApp-style Android CallStyle incoming-call notification (green Answer / red Decline) for the chat app.",
+  "main": "index.ts",
+  "private": true
+}

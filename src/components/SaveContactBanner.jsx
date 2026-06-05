@@ -91,7 +91,7 @@ const SaveContactBanner = ({
 
       {/* <View style={styles.textBlock}>
         <Text style={[styles.mainText, { color: textColor }]} numberOfLines={1}>
-          {peerName ? `${peerName} is on Vibe Connect` : 'This contact is on Vibe Connect'}
+          {peerName ? `${peerName} is on TalksTry` : 'This contact is on TalksTry'}
         </Text>
         <Text style={[styles.subText, { color: subColor }]}>
           {saveError && saveError !== 'permission_denied'

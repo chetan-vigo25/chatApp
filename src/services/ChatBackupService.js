@@ -10,13 +10,13 @@ import { Platform, ToastAndroid } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import ChatDatabase from './ChatDatabase';
 
-const APP_FOLDER_NAME = 'VibeConnect';
+const APP_FOLDER_NAME = 'TalksTry';
 const SAF_URI_KEY = '@backup_saf_directory_uri';
 
 /**
  * WhatsApp-style AUTOMATIC backup to device storage.
  *
- * First time:  Shows folder picker pre-selected at "VibeConnect" folder
+ * First time:  Shows folder picker pre-selected at "TalksTry" folder
  *              → User taps "Use this folder" ONCE
  * After that:  Saves directly — NO picker, NO share sheet, fully automatic
  *

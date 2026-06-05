@@ -524,7 +524,7 @@ export default function AppLockGate() {
                 </View>
 
                 <Text style={[styles.title, { color: primaryText }]}>
-                  {inCooldown ? 'Try again later' : 'Unlock to use VibeConnect'}
+                  {inCooldown ? 'Try again later' : 'Unlock to use TalksTry'}
                 </Text>
                 <Text style={[styles.body, { color: subText }]}>
                   {inCooldown
@@ -612,7 +612,7 @@ export default function AppLockGate() {
                   Locked for your privacy
                 </Text>
               </View>
-              <Text style={[styles.brand, { color: subText }]}>VibeConnect</Text>
+              <Text style={[styles.brand, { color: subText }]}>TalksTry</Text>
             </View>
           </View>
         </KeyboardAvoidingView>

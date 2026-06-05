@@ -140,7 +140,7 @@ const LocationBubble = memo(function LocationBubble({
               {mapData.tiles.map((tile) => (
                 <Image
                   key={tile.key}
-                  source={{ uri: tile.uri, headers: { 'User-Agent': 'VibeConnect/1.0' } }}
+                  source={{ uri: tile.uri, headers: { 'User-Agent': 'TalksTry/1.0' } }}
                   style={{
                     position: 'absolute',
                     left: tile.col * TILE_SIZE * scale,
