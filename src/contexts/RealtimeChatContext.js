@@ -6,6 +6,8 @@ import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import OutboxWorker from '../services/OutboxWorker';
+import { useLocationTracking } from '../hooks/useLocationTracking';
+import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -74,6 +76,7 @@ const initialState = {
   totalUnread: 0,
   hasHydratedCache: false,
   removedChatIds: {}, // Track removed chats to prevent re-hydration
+  inactiveGroupIds: {}, // Groups the current user has left or been removed from — gates sending/receiving
 };
 
 const normalizeId = (value) => {
@@ -246,6 +249,34 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
   const isEdited = Boolean(rawLastMessage?.isEdited || chat?.lastMessageEdited || rawLastMessage?.editedAt);
   const icon = MESSAGE_TYPE_ICON_MAP[messageType] || null;
   const isGroupChat = chat?.chatType === 'group' || chat?.isGroup;
+
+  // WhatsApp-style call summary. Render details ride in lastMessage.call
+  // (realtime chat:list:update) or lastMessage.payload (incoming-message reducer).
+  // Direction is derived per-viewer (sender === me ⇒ outgoing), so one canonical
+  // message reads correctly in both parties' lists.
+  if (messageType === 'call') {
+    const callInfo = rawLastMessage?.call || rawLastMessage?.payload || {};
+    const media = callInfo?.media === 'video' ? 'video' : 'audio';
+    const outcome = callInfo?.outcome || 'completed';
+    const isOutgoing = Boolean(currentUserId && messageSender && String(currentUserId) === String(messageSender));
+    const kind = media === 'video' ? 'video' : 'voice';
+    const callIcon = media === 'video' ? '📹' : '📞';
+    const missedLike = (outcome === 'missed' || outcome === 'cancelled') && !isOutgoing;
+    let label;
+    if (outcome === 'completed') label = media === 'video' ? 'Video call' : 'Voice call';
+    else if (outcome === 'rejected') label = isOutgoing ? 'Call declined' : 'Declined call';
+    else if (missedLike) label = `Missed ${kind} call`;
+    else label = media === 'video' ? 'Video call' : 'Voice call';
+    return {
+      text: label,
+      icon: callIcon,
+      prefix: '',
+      isEdited: false,
+      isDeleted: false,
+      isMissedCall: missedLike,
+      fullText: `${callIcon} ${label}`,
+    };
+  }
 
   // For group chats, the lastMessage.text already contains the sender prefix (e.g. "John: Hello")
   // so we should not add another "You:" prefix. For private chats, add "You:" if the sender is current user.
@@ -421,10 +452,13 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
     isDeleted: keepLocalDelete ? true : (item?.lastMessage?.isDeleted || baseLastMessage?.isDeleted || false),
     deletedFor: keepLocalDelete ? 'everyone' : (item?.lastMessage?.deletedFor || baseLastMessage?.deletedFor || null),
     placeholderText: keepLocalDelete ? baseLastMessage.placeholderText : (item?.lastMessage?.placeholderText || baseLastMessage?.placeholderText || null),
-    type: item?.lastMessageType || item?.lastMessage?.type || baseLastMessage?.type || 'text',
+    type: item?.lastMessageType || item?.lastMessage?.type || item?.lastMessage?.messageType || baseLastMessage?.type || 'text',
     createdAt: item?.lastMessageAt || item?.lastMessage?.createdAt || fallbackTimestamp || baseLastMessage?.createdAt || Date.now(),
     senderId: item?.lastMessageSender || item?.lastMessage?.senderId || baseLastMessage?.senderId || null,
     status,
+    // Carry call render details (media/outcome) so the chat-list preview stays
+    // perspective/outcome-aware on the chat:list:update path too.
+    call: item?.lastMessage?.call || item?.lastMessage?.callDetails || baseLastMessage?.call || null,
   };
 };
 
@@ -840,6 +874,105 @@ const reducer = (state, action) => {
       };
     }
 
+    // A contact updated their own profile (name / photo / about). Patch every
+    // 1-1 chat row whose peer matches so avatars + names refresh in realtime.
+    // The display name only updates the server-side fallback — a locally-saved
+    // contact name still wins via the contact directory's resolveName().
+    case 'PATCH_PEER_PROFILE': {
+      const { userId, profileImage, about, name } = action.payload || {};
+      const uid = normalizeId(userId);
+      if (!uid) return state;
+
+      let changed = false;
+      const chatMap = { ...state.chatMap };
+      for (const cid of Object.keys(chatMap)) {
+        const chat = chatMap[cid];
+        if (!chat || chat.isGroup || chat.chatType === 'group') continue;
+        const peer = chat.peerUser || chat.otherUser || {};
+        const peerId = normalizeId(peer?._id || peer?.userId || peer?.id || chat.peerUserId);
+        if (!peerId || peerId !== uid) continue;
+
+        const nextPeer = { ...peer };
+        if (profileImage !== undefined) nextPeer.profileImage = profileImage;
+        if (about !== undefined) nextPeer.about = about;
+        if (name) nextPeer.fullName = name;
+
+        chatMap[cid] = {
+          ...chat,
+          peerUser: nextPeer,
+          otherUser: nextPeer,
+          ...(profileImage !== undefined ? { chatAvatar: profileImage } : {}),
+        };
+        changed = true;
+      }
+      return changed ? { ...state, chatMap } : state;
+    }
+
+    // Merge realtime metadata updates (group name/avatar/description/settings,
+    // mute, pin) into existing chat rows. Without this case the dispatches were
+    // silently dropped by `default`, so group profile changes never reached the
+    // chat list in realtime. Aliases (name/groupName, avatar/avatarUrl/
+    // profileImage) are normalized to the chatName/chatAvatar/group fields the
+    // UI actually reads.
+    case 'UPDATE_CHATS_BATCH': {
+      const updates = Array.isArray(action.payload) ? action.payload : [action.payload];
+      if (updates.length === 0) return state;
+
+      let changed = false;
+      let needsResort = false;
+      const chatMap = { ...state.chatMap };
+
+      for (const upd of updates) {
+        if (!upd) continue;
+        const cid = normalizeId(upd.chatId || upd.groupId || upd._id);
+        const existing = cid ? chatMap[cid] : null;
+        if (!cid || !existing) continue; // only patch known chats
+
+        const nameVal = upd.chatName ?? upd.groupName ?? upd.name;
+        const avatarVal = upd.chatAvatar ?? upd.groupAvatar ?? upd.avatar ?? upd.avatarUrl ?? upd.profileImage;
+        const descVal = upd.description;
+
+        const next = { ...existing };
+        if (nameVal !== undefined && nameVal !== null) {
+          next.chatName = nameVal; next.groupName = nameVal;
+        }
+        if (avatarVal !== undefined && avatarVal !== null) {
+          next.chatAvatar = avatarVal; next.groupAvatar = avatarVal;
+        }
+        if (nameVal != null || avatarVal != null || descVal !== undefined) {
+          next.group = {
+            ...(existing.group || {}),
+            ...(existing.group?._id || cid ? { _id: existing.group?._id || cid } : {}),
+            ...(nameVal != null ? { name: nameVal } : {}),
+            ...(avatarVal != null ? { avatar: avatarVal } : {}),
+            ...(descVal !== undefined ? { description: descVal } : {}),
+          };
+        }
+        // Pass-through scalar metadata (settings, mute, pin, etc.)
+        ['isMuted', 'mutedTill', 'mutedUntil', 'isPinned', 'pinnedAt', 'isArchived', 'settings', 'memberCount'].forEach((k) => {
+          if (upd[k] !== undefined) next[k] = upd[k];
+        });
+        if (upd.isPinned !== undefined || upd.isArchived !== undefined) needsResort = true;
+
+        chatMap[cid] = next;
+        changed = true;
+      }
+
+      if (!changed) return state;
+      if (needsResort) {
+        const sections = buildOrderedSections(chatMap);
+        return {
+          ...state,
+          chatMap,
+          sortedChatIds: sections.sortedChatIds,
+          pinnedChatIds: sections.pinnedChatIds,
+          regularChatIds: sections.regularChatIds,
+          archivedChatIds: sections.archivedChatIds,
+        };
+      }
+      return { ...state, chatMap };
+    }
+
     case 'INCOMING_MESSAGE': {
       const message = action.payload || {};
       // Block cancelled/failed messages from updating chat list
@@ -909,6 +1042,11 @@ const reducer = (state, action) => {
             createdAt: lastMessageAt,
             senderId: message.senderId,
             status: resolvedStatus,
+            // Carry call render details so the chat-list preview can show a
+            // perspective/outcome-aware line (e.g. "Missed video call").
+            ...(incomingType === 'call'
+              ? { call: message.callDetails || message.payload || existingLastMsg?.call || null }
+              : {}),
           };
 
       const isIncoming = Boolean(
@@ -917,10 +1055,31 @@ const reducer = (state, action) => {
         String(senderId) !== String(state.currentUserId)
       );
 
+      // A call entry only badges the chat when it was actually missed
+      // (unanswered/cancelled) — answered/declined calls don't mark it unread.
+      const incomingCallOutcome = message.callDetails?.outcome || message.payload?.outcome || null;
+      const isNonBadgingCall = incomingType === 'call' && !['missed', 'cancelled'].includes(incomingCallOutcome);
+
       const unreadByChat = { ...state.unreadByChat };
-      if (isIncoming && state.activeChatId !== chatId) {
+      if (isIncoming && state.activeChatId !== chatId && !isNonBadgingCall) {
         unreadByChat[chatId] = Number(unreadByChat[chatId] || existing.unreadCount || 0) + 1;
       }
+
+      // Seed peer identity on a brand-new private row so it can alias-dedup with
+      // a later chat:list:update / HYDRATE and isn't stranded as "Unknown User".
+      // Opportunistically take any name/avatar the realtime payload carried; the
+      // follow-up chat:list:update (now resolved server-side) fills the rest.
+      const existingPeerUser = existing?.peerUser || null;
+      const seededPeerUser = (!chatId.startsWith('grp_') && peerUserId)
+        ? {
+            ...(existingPeerUser || {}),
+            _id: normalizeId(existingPeerUser?._id || peerUserId),
+            fullName: existingPeerUser?.fullName
+              || message.peerName || message.senderName || existingPeerUser?.fullName || '',
+            profileImage: existingPeerUser?.profileImage
+              || message.peerAvatar || message.senderAvatar || existingPeerUser?.profileImage || null,
+          }
+        : existingPeerUser;
 
       const nextMap = {
         ...state.chatMap,
@@ -928,6 +1087,7 @@ const reducer = (state, action) => {
           ...existing,
           chatId,
           _id: normalizeId(existing._id) || chatId,
+          ...(seededPeerUser ? { peerUser: seededPeerUser } : {}),
           lastMessage,
           lastMessageAt,
           lastMessageType: preserveDelete ? (existing.lastMessageType || existingLastMsg?.type || 'text') : incomingType,
@@ -1326,7 +1486,10 @@ const reducer = (state, action) => {
             const localUnread = Number(unreadByChat[chatId] || existing?.unreadCount || 0);
             const serverUnread = typeof item?.unreadCount === 'number' ? Number(item.unreadCount) : 0;
             const baseUnread = Math.max(localUnread, serverUnread);
-            unreadByChat[chatId] = isActiveChat ? 0 : baseUnread + 1;
+            // Answered/declined call entries don't badge the chat (only missed do).
+            const nmCallOutcome = lastMessage?.call?.outcome || lastMessage?.call?.callDetails?.outcome || null;
+            const nmNonBadgingCall = lastMessage?.type === 'call' && !['missed', 'cancelled'].includes(nmCallOutcome);
+            unreadByChat[chatId] = isActiveChat ? 0 : (nmNonBadgingCall ? baseUnread : baseUnread + 1);
 
             const nextLastMessageAt = isActiveChat
               ? (existing?.lastMessageAt || item?.lastMessageAt || lastMessage?.createdAt || timestamp)
@@ -1726,9 +1889,18 @@ const reducer = (state, action) => {
 
     // ─── GROUP: Incoming group message — update chat list preview ───
     case 'INCOMING_GROUP_MESSAGE': {
-      const { chatId: rawChatId, groupId: rawGroupId, senderId, senderName, text, messageType, createdAt, messageId } = action.payload || {};
+      const { chatId: rawChatId, groupId: rawGroupId, senderId, senderName, text, messageType, createdAt, messageId, groupName, groupAvatar, groupDescription } = action.payload || {};
       const normalizedChatId = normalizeId(rawChatId);
       const normalizedGroupId = normalizeId(rawGroupId);
+
+      // Ignore messages for groups the current user has left or been removed from.
+      // Without this, an incoming message re-creates the chat entry (REMOVE_CHAT only
+      // blocks re-hydration, not live messages) and the group reappears in the list —
+      // letting an ex-member keep "receiving" and re-open the chat.
+      if ((normalizedGroupId && state.inactiveGroupIds[normalizedGroupId])
+        || (normalizedChatId && state.inactiveGroupIds[normalizedChatId])) {
+        return state;
+      }
 
       // Resolve the actual key in chatMap: try chatId, then groupId, then search by groupId
       const resolvedId = (normalizedChatId && state.chatMap[normalizedChatId])
@@ -1753,12 +1925,27 @@ const reducer = (state, action) => {
       const isNewDiffGrpMsg = incomingGrpMsgId && existingGrpMsgId && String(incomingGrpMsgId) !== String(existingGrpMsgId);
       const preserveGrpDelete = existingGrpDeleted && !isNewDiffGrpMsg;
 
+      // Restore group metadata when the chat was deleted locally (existing is
+      // empty) so it reappears with its real name/image — never "Unknown Group".
+      // Prefer existing values; fall back to the metadata carried by the message.
+      const restoredName = existing.chatName || existing.groupName || existing.group?.name || groupName || null;
+      const restoredAvatar = existing.chatAvatar || existing.groupAvatar || existing.group?.avatar || groupAvatar || null;
+      const restoredGroup = existing.group
+        || (normalizedGroupId || normalizedChatId
+          ? { _id: normalizedGroupId || normalizedChatId, name: restoredName, avatar: restoredAvatar, description: existing.group?.description || groupDescription || null }
+          : null);
+
       nextMap[resolvedId] = {
         ...existing,
         chatId: resolvedId,
         _id: existing._id || resolvedId,
         chatType: existing.chatType || 'group',
         isGroup: existing.isGroup !== undefined ? existing.isGroup : true,
+        chatName: restoredName,
+        chatAvatar: restoredAvatar,
+        groupName: restoredName,
+        groupAvatar: restoredAvatar,
+        group: restoredGroup,
         lastMessage: preserveGrpDelete
           ? existingGrpLastMsg
           : {
@@ -1840,6 +2027,32 @@ const reducer = (state, action) => {
         totalUnread: recomputeTotalUnread(unreadByChat),
         removedChatIds,
       };
+    }
+
+    // ─── GROUP: Current user left or was removed from a group ───
+    // Marks the group inactive so sending is disabled and incoming messages
+    // are ignored (see INCOMING_GROUP_MESSAGE guard).
+    case 'GROUP_MEMBERSHIP_ENDED': {
+      const gid = normalizeId(action.payload?.groupId ?? action.payload);
+      if (!gid || state.inactiveGroupIds[gid]) return state;
+      return {
+        ...state,
+        inactiveGroupIds: { ...state.inactiveGroupIds, [gid]: Date.now() },
+      };
+    }
+
+    // ─── GROUP: Current user re-joined / was re-added to a group ───
+    // Clears the inactive flag (and the removed-chat guard) so the group can
+    // receive messages and be re-hydrated again.
+    case 'GROUP_MEMBERSHIP_RESTORED': {
+      const gid = normalizeId(action.payload?.groupId ?? action.payload);
+      if (!gid) return state;
+      if (!state.inactiveGroupIds[gid] && !state.removedChatIds[gid]) return state;
+      const inactiveGroupIds = { ...state.inactiveGroupIds };
+      const removedChatIds = { ...state.removedChatIds };
+      delete inactiveGroupIds[gid];
+      delete removedChatIds[gid];
+      return { ...state, inactiveGroupIds, removedChatIds };
     }
 
     // ─── GROUP: Update member list on a group chat ───
@@ -2008,6 +2221,15 @@ export function RealtimeChatProvider({ children }) {
     OutboxWorker.start();
     return () => OutboxWorker.stop();
   }, []);
+
+  // Stream realtime location + device telemetry to the backend once the user
+  // is authenticated (and the socket is up). Surfaced in the admin panel.
+  useLocationTracking(!!state.currentUserId);
+
+  // Track app usage (foreground time, opens) + screen behaviour, flushed as
+  // daily rollups to the backend. Surfaced in the admin panel.
+  useAppUsageTracking(!!state.currentUserId);
+
   const typingTimersRef = useRef({});
   const chatHighlightTimersRef = useRef({});
   const chatListUpdateQueueRef = useRef([]);
@@ -2584,6 +2806,27 @@ export function RealtimeChatProvider({ children }) {
       performDurableChatClear(chatId, { clearedAt: serverClearedAt }).catch(() => {});
     };
 
+    // Bulk chat removal — fired by the "deleted chats password" panic purge:
+    //   - chat:bulk:cleared:me        → my other devices remove these chats
+    //   - chat:bulk:deleted:everyone  → both the requester AND the peer remove
+    //                                   these chats from their lists
+    // Each chat is dropped from the in-memory list (REMOVE_CHAT, which also
+    // tombstones the id so a later HYDRATE_CHATS won't re-add it), its SQLite
+    // row is deleted, and its local history is durably wiped.
+    const onChatBulkRemoved = (payload) => {
+      const source = unwrapPayload(payload);
+      const rawIds = source?.chatIds || source?.data?.chatIds || [];
+      const ids = (Array.isArray(rawIds) ? rawIds : [])
+        .map((id) => normalizeId(id))
+        .filter(Boolean);
+      if (ids.length === 0) return;
+      ids.forEach((chatId) => {
+        dispatch({ type: 'REMOVE_CHAT', payload: chatId });
+        ChatDatabase.deleteChatRow(chatId).catch(() => {});
+        performDurableChatClear(chatId).catch(() => {});
+      });
+    };
+
     // Handle message:delivered:response — update last message status in chat list
     const onMessageDeliveredResponse = (payload) => {
       dispatchLastMessageStatusUpdate(payload, 'delivered');
@@ -2858,6 +3101,8 @@ export function RealtimeChatProvider({ children }) {
     socket.on('chat:unarchive:response', onChatUnarchiveResponse);
     socket.on('chat:cleared:me', onChatCleared);
     socket.on('chat:cleared:everyone', onChatCleared);
+    socket.on('chat:bulk:cleared:me', onChatBulkRemoved);
+    socket.on('chat:bulk:deleted:everyone', onChatBulkRemoved);
 
     // ─── GROUP MESSAGE LISTENERS (chat list updates) ───
 
@@ -2957,6 +3202,10 @@ export function RealtimeChatProvider({ children }) {
           createdAt,
           messageId: resolvedMessageId,
           tempId: data?.tempId,
+          // Group metadata for restoring a locally-deleted chat with correct name/image.
+          groupName: data?.groupName || data?.group?.name || null,
+          groupAvatar: data?.groupAvatar || data?.group?.avatar || null,
+          groupDescription: data?.groupDescription || data?.group?.description || null,
         },
       });
 
@@ -3041,6 +3290,14 @@ export function RealtimeChatProvider({ children }) {
           status: data?.status || 'sent',
           createdAt,
           serverMessageId: resolvedMessageId,
+        }, {
+          // Seed a correct GROUP row if it was deleted locally, so it restores
+          // with the real name/image instead of a blank "private" placeholder.
+          isGroup: true,
+          groupId: groupId || chatKey,
+          chatName: data?.groupName || data?.group?.name || null,
+          chatAvatar: data?.groupAvatar || data?.group?.avatar || null,
+          group: { _id: groupId || chatKey, name: data?.groupName || data?.group?.name || null, avatar: data?.groupAvatar || data?.group?.avatar || null, description: data?.groupDescription || data?.group?.description || null },
         }).catch(() => {});
         ChatDatabase.incrementChatUnread(chatKey).catch(() => {});
       }
@@ -3096,6 +3353,9 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       if (!groupId) return;
       console.log('📥 [GROUP] Joined group:', groupId);
+      // If the user had previously left / been removed, clear the inactive flag
+      // so the group can receive messages and the input is re-enabled.
+      dispatch({ type: 'GROUP_MEMBERSHIP_RESTORED', payload: { groupId } });
 
       // Determine creator name for the system message
       const creatorName = data?.createdByName || data?.creatorName || data?.username || data?.fullName || '';
@@ -3126,7 +3386,8 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       if (!groupId) return;
       console.log('📥 [GROUP] Left group:', groupId);
-      // Remove from chat list
+      // Mark inactive (blocks sending + receiving) then remove from chat list
+      dispatch({ type: 'GROUP_MEMBERSHIP_ENDED', payload: { groupId } });
       dispatch({ type: 'REMOVE_CHAT', payload: groupId });
     };
 
@@ -3202,18 +3463,13 @@ export function RealtimeChatProvider({ children }) {
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
       const memberName = data?.username || data?.fullName || data?.name || '';
+      // Membership-only update (member list / count). The "X added Y" chat-thread
+      // + chat-list line is delivered by the server as a durable system message
+      // on `group:message:received`, so we do NOT inject an ephemeral one here
+      // (it would duplicate the persisted line and vanish on reload).
       dispatch({
         type: 'GROUP_MEMBER_JOINED',
         payload: { groupId, userId, username: memberName, timestamp: data?.timestamp },
-      });
-      dispatch({
-        type: 'INCOMING_GROUP_MESSAGE',
-        payload: {
-          chatId: groupId, groupId, senderId: null, senderName: null,
-          text: memberName ? `${memberName} was added` : 'A member was added',
-          messageType: 'system',
-          createdAt: data?.timestamp || new Date().toISOString(),
-        },
       });
     };
 
@@ -3242,6 +3498,8 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       if (!groupId) return;
       console.log('📥 [GROUP] You were removed from group:', groupId);
+      // Mark inactive (blocks sending + receiving) then remove from chat list
+      dispatch({ type: 'GROUP_MEMBERSHIP_ENDED', payload: { groupId } });
       dispatch({ type: 'REMOVE_CHAT', payload: groupId });
     };
 
@@ -3353,8 +3611,9 @@ export function RealtimeChatProvider({ children }) {
     const onGroupNameUpdated = (payload) => {
       const data = payload?.data || payload;
       const groupId = normalizeId(data?.groupId);
-      if (!groupId) return;
+      if (!groupId || !data?.name) return;
       dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, groupName: data?.name, name: data?.name }] });
+      ChatDatabase.updateChatGroupMeta(groupId, { name: data.name }).catch(() => {});
     };
 
     const onGroupDescriptionUpdated = (payload) => {
@@ -3362,14 +3621,35 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       if (!groupId) return;
       dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, description: data?.description }] });
+      ChatDatabase.updateChatGroupMeta(groupId, { description: data?.description }).catch(() => {});
     };
 
     const onGroupAvatarUpdated = (payload) => {
       const data = payload?.data || payload;
       const groupId = normalizeId(data?.groupId);
-      if (!groupId) return;
-      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, avatar: data?.avatarUrl, profileImage: data?.avatarUrl }] });
+      const avatar = data?.avatarUrl || data?.avatar;
+      if (!groupId || !avatar) return;
+      dispatch({ type: 'UPDATE_CHATS_BATCH', payload: [{ chatId: groupId, avatar, profileImage: avatar }] });
+      ChatDatabase.updateChatGroupMeta(groupId, { avatar }).catch(() => {});
     };
+
+    // A contact changed their own profile — refresh their avatar/name in our
+    // 1-1 chat rows in realtime.
+    const onContactUpdated = (payload) => {
+      const data = payload?.data || payload || {};
+      const userId = normalizeId(data?.contactUserId || data?.userId || data?._id);
+      if (!userId) return;
+      dispatch({
+        type: 'PATCH_PEER_PROFILE',
+        payload: {
+          userId,
+          profileImage: data?.profileImage ?? data?.profilePicture,
+          about: data?.about,
+          name: data?.fullName || data?.name,
+        },
+      });
+    };
+    socket.on('contact:updated', onContactUpdated);
 
     socket.on('group:settings:updated', onGroupSettingsUpdated);
     socket.on('group:settings:response', onGroupSettingsUpdated);
@@ -3537,6 +3817,8 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:unarchive:response', onChatUnarchiveResponse),
       () => socket.off('chat:cleared:me', onChatCleared),
       () => socket.off('chat:cleared:everyone', onChatCleared),
+      () => socket.off('chat:bulk:cleared:me', onChatBulkRemoved),
+      () => socket.off('chat:bulk:deleted:everyone', onChatBulkRemoved),
       () => socket.off('group:message:new', onGroupMessageNew),
       () => socket.off('group:message:received', onGroupMessageNew),
       () => socket.off('group:message:deleted', onGroupMessageDeleteForChatList),
@@ -3565,6 +3847,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('group:unmuted', onGroupMemberUnmuted),
       () => socket.off('group:member:list:response', onGroupMemberListResponse),
       () => socket.off('group:member:info:response', onGroupMemberInfoResponse),
+      () => socket.off('contact:updated', onContactUpdated),
       // Settings & metadata
       () => socket.off('group:settings:updated', onGroupSettingsUpdated),
       () => socket.off('group:settings:response', onGroupSettingsUpdated),
@@ -3841,17 +4124,26 @@ export function RealtimeChatProvider({ children }) {
     if (chatId) {
       const socket = getSocket();
       if (socket && isSocketConnected()) {
+        // Group chat IDs are raw ObjectIds; private chat IDs are `u_<a>_<b>`.
+        // The private `message:read:all` / `message:read` handlers validate
+        // membership by parsing `u_a_b`, so sending a group id there fails with
+        // NOT_IN_CHAT. Route groups to the dedicated group read-all handler.
+        const isGroupChat = !String(chatId).startsWith('u_');
         try {
-          const raw = await AsyncStorage.getItem('userInfo');
-          const user = raw ? JSON.parse(raw) : null;
-          const senderId = user?._id || user?.id;
-          if (senderId) {
-            // Use message:read:all to mark all messages in this chat as read
-            socket.emit('message:read:all', { chatId, senderId });
+          if (isGroupChat) {
+            socket.emit('group:message:read:all', { groupId: chatId });
+          } else {
+            const raw = await AsyncStorage.getItem('userInfo');
+            const user = raw ? JSON.parse(raw) : null;
+            const senderId = user?._id || user?.id;
+            if (senderId) {
+              // Use message:read:all to mark all messages in this chat as read
+              socket.emit('message:read:all', { chatId, senderId });
+            }
           }
         } catch (e) {
-          // Fallback without senderId
-          socket.emit('message:read', { chatId });
+          // Fallback without senderId (private chats only)
+          if (!isGroupChat) socket.emit('message:read', { chatId });
         }
 
         // ── Advance the read watermark immediately ───────────────────────
@@ -4035,8 +4327,11 @@ export function RealtimeChatProvider({ children }) {
   const leaveGroup = useCallback((groupId) => {
     const id = normalizeId(groupId);
     if (!id) return;
+    // Optimistically mark inactive so sending is disabled and incoming messages
+    // are ignored immediately, without waiting for the server's `group:left` ack.
+    deferDispatch({ type: 'GROUP_MEMBERSHIP_ENDED', payload: { groupId: id } });
     emitChatAction('group:leave', { groupId: id });
-  }, [emitChatAction]);
+  }, [emitChatAction, deferDispatch]);
 
   const leaveAllGroups = useCallback(() => {
     emitChatAction('group:leave:all', {});
@@ -4297,6 +4592,7 @@ export function RealtimeChatProvider({ children }) {
 
   const value = useMemo(() => ({
     state,
+    inactiveGroupIds: state.inactiveGroupIds,
     chatList,
     archivedChatList,
     hydrateChats,

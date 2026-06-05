@@ -5,85 +5,70 @@ import {
   Text,
   Animated,
   StyleSheet,
-  Dimensions,
   Platform,
 } from 'react-native';
-import { Ionicons } from '@expo/vector-icons';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
+// WhatsApp-style bottom tabs. The active tab shows a filled "pill" highlight
+// behind the icon (Material-You / WhatsApp Android pattern) with the label
+// beneath it. Order here is the visible left→right order of the bar.
 const TABS = [
-  { key: 'chats', label: 'Chats', icon: 'chatbubbles', iconOutline: 'chatbubbles-outline' },
-  { key: 'status', label: 'Status', icon: 'ellipse', iconOutline: 'ellipse-outline' },
-  // { key: 'contacts', label: 'Contacts', icon: 'people', iconOutline: 'people-outline' },
-  { key: 'profile', label: 'Profile', icon: 'person', iconOutline: 'person-outline' },
-  { key: 'settings', label: 'Settings', icon: 'settings', iconOutline: 'settings-outline' },
+  { key: 'chats',    label: 'Chats',    lib: 'ion', icon: 'chatbubble',    iconOutline: 'chatbubble-outline' },
+  { key: 'status',   label: 'Updates',  lib: 'mci', icon: 'record-circle', iconOutline: 'record-circle-outline' },
+  { key: 'calls',    label: 'Calls',    lib: 'ion', icon: 'call',          iconOutline: 'call-outline' },
+  { key: 'settings', label: 'Settings', lib: 'ion', icon: 'settings',      iconOutline: 'settings-outline' },
 ];
-const TAB_COUNT = TABS.length;
-const TAB_WIDTH = SCREEN_WIDTH / TAB_COUNT;
+
+function TabIcon({ lib, name, size, color }) {
+  if (lib === 'mci') return <MaterialCommunityIcons name={name} size={size} color={color} />;
+  return <Ionicons name={name} size={size} color={color} />;
+}
 
 export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode, unreadCount }) {
-  const indicatorAnim = useRef(new Animated.Value(0)).current;
   const scaleAnims = useRef(TABS.map(() => new Animated.Value(1))).current;
-  const iconColorAnims = useRef(TABS.map((_, i) => new Animated.Value(i === 0 ? 1 : 0))).current;
+  const pillAnims = useRef(
+    TABS.map((t) => new Animated.Value(t.key === activeTab ? 1 : 0))
+  ).current;
 
   const activeIndex = TABS.findIndex((t) => t.key === activeTab);
 
   useEffect(() => {
-    // Slide indicator — fast timing instead of heavy spring
-    Animated.timing(indicatorAnim, {
-      toValue: activeIndex * TAB_WIDTH,
-      duration: 150,
-      useNativeDriver: true,
-    }).start();
-
-    // Animate icon colors
     TABS.forEach((_, i) => {
-      Animated.timing(iconColorAnims[i], {
+      Animated.timing(pillAnims[i], {
         toValue: i === activeIndex ? 1 : 0,
-        duration: 120,
+        duration: 180,
         useNativeDriver: false,
       }).start();
     });
   }, [activeIndex]);
 
   const handlePress = (tab, index) => {
-    // Quick scale tap feedback
     Animated.sequence([
-      Animated.timing(scaleAnims[index], {
-        toValue: 0.9,
-        duration: 50,
-        useNativeDriver: true,
-      }),
-      Animated.timing(scaleAnims[index], {
-        toValue: 1,
-        duration: 80,
-        useNativeDriver: true,
-      }),
+      Animated.timing(scaleAnims[index], { toValue: 0.9, duration: 50, useNativeDriver: true }),
+      Animated.timing(scaleAnims[index], { toValue: 1, duration: 90, useNativeDriver: true }),
     ]).start();
-
     onTabPress(tab.key);
   };
 
-  const barBg = isDarkMode ? '#1A2630' : '#FFFFFF';
+  // WhatsApp's bottom bar is flat — the same colour as the screen background,
+  // not an elevated lighter surface.
+  const barBg = theme.colors.background;
   const activeTint = theme.colors.themeColor;
   const inactiveTint = theme.colors.placeHolderTextColor;
+  const pillBg = (theme.colors.themeColor || '#00A884') + (isDarkMode ? '40' : '24');
 
   return (
-    <View style={[styles.container, { backgroundColor: barBg, borderTopColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)' }]}>
-      {/* Animated indicator */}
-      <Animated.View
-        style={[
-          styles.indicator,
-          {
-            backgroundColor: activeTint,
-            transform: [{ translateX: Animated.add(indicatorAnim, (TAB_WIDTH - 40) / 2) }],
-          },
-        ]}
-      />
-
+    <View
+      style={[
+        styles.container,
+        {
+          backgroundColor: barBg,
+          borderTopColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+        },
+      ]}
+    >
       {TABS.map((tab, index) => {
         const isActive = index === activeIndex;
-
         return (
           <TouchableOpacity
             key={tab.key}
@@ -92,26 +77,40 @@ export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode,
             style={styles.tab}
           >
             <Animated.View style={[styles.tabInner, { transform: [{ scale: scaleAnims[index] }] }]}>
-              <View style={styles.iconWrap}>
-                <Ionicons
-                  name={isActive ? tab.icon : tab.iconOutline}
-                  size={22}
-                  color={isActive ? activeTint : inactiveTint}
-                />
-                {tab.key === 'chats' && unreadCount > 0 && (
-                  <View style={[styles.badge, { backgroundColor: activeTint }]}>
-                    <Text style={styles.badgeText}>
-                      {unreadCount > 99 ? '99+' : unreadCount}
-                    </Text>
-                  </View>
-                )}
-              </View>
+              {/* Pill highlight behind the icon */}
+              <Animated.View
+                style={[
+                  styles.pill,
+                  {
+                    backgroundColor: pillAnims[index].interpolate({
+                      inputRange: [0, 1],
+                      outputRange: ['rgba(0,0,0,0)', pillBg],
+                    }),
+                  },
+                ]}
+              >
+                <View style={styles.iconWrap}>
+                  <TabIcon
+                    lib={tab.lib}
+                    name={isActive ? tab.icon : tab.iconOutline}
+                    size={22}
+                    color={isActive ? activeTint : inactiveTint}
+                  />
+                  {tab.key === 'chats' && unreadCount > 0 && (
+                    <View style={[styles.badge, { backgroundColor: activeTint }]}>
+                      <Text style={styles.badgeText}>{unreadCount > 99 ? '99+' : unreadCount}</Text>
+                    </View>
+                  )}
+                </View>
+              </Animated.View>
               <Text
                 style={[
                   styles.label,
                   {
-                    color: isActive ? activeTint : inactiveTint,
-                    fontFamily: isActive ? 'Roboto-SemiBold' : 'Roboto-Regular',
+                    // Label color is FIXED — black in light mode, white in dark mode —
+                    // regardless of active/inactive state (only the icon tints green).
+                    color: theme.colors.primaryTextColor,
+                    fontFamily: isActive ? 'Roboto-Bold' : 'Roboto-Medium',
                   },
                 ]}
               >
@@ -128,22 +127,10 @@ export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode,
 const styles = StyleSheet.create({
   container: {
     flexDirection: 'row',
-    height: Platform.OS === 'ios' ? 82 : 64,
-    paddingBottom: Platform.OS === 'ios' ? 18 : 4,
+    height: Platform.OS === 'ios' ? 84 : 66,
+    paddingBottom: Platform.OS === 'ios' ? 20 : 6,
+    paddingTop: 6,
     borderTopWidth: StyleSheet.hairlineWidth,
-    elevation: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -3 },
-    shadowOpacity: 0.08,
-    shadowRadius: 8,
-  },
-  indicator: {
-    position: 'absolute',
-    top: 0,
-    width: 40,
-    height: 3,
-    borderBottomLeftRadius: 3,
-    borderBottomRightRadius: 3,
   },
   tab: {
     flex: 1,
@@ -153,16 +140,21 @@ const styles = StyleSheet.create({
   tabInner: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 6,
+  },
+  pill: {
+    width: 60,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   iconWrap: {
     position: 'relative',
-    marginBottom: 2,
   },
   badge: {
     position: 'absolute',
-    top: -4,
-    right: -10,
+    top: -6,
+    right: -12,
     minWidth: 16,
     height: 16,
     paddingHorizontal: 4,
@@ -176,7 +168,8 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto-SemiBold',
   },
   label: {
-    fontSize: 10.5,
-    marginTop: 1,
+    fontSize: 14,
+    marginTop: 4,
+    letterSpacing: 0.1,
   },
 });

@@ -9,15 +9,17 @@ import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { updateUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 
 const { width: SCREEN_W } = Dimensions.get('window');
-const SWATCH_GAP = 12;
-const SWATCHES_PER_ROW = 5;
+const SWATCH_GAP = 14;
+const SWATCHES_PER_ROW = 6;
 const SWATCH_SIZE = (SCREEN_W - 32 - 28 - SWATCH_GAP * (SWATCHES_PER_ROW - 1)) / SWATCHES_PER_ROW;
 
+// Curated, cohesive palette. #00A884 (the WhatsApp brand green) leads as the
+// default so the out-of-the-box selection always resolves to a swatch.
+const DEFAULT_ACCENT = '#00A884';
 const ACCENT_COLORS = [
-  '#25D366', '#128C7E', '#075E54',
-  '#34B7F1', '#0984E3', '#6C5CE7',
-  '#833AB4', '#E84393', '#FF5A5F',
-  '#F56040', '#FDCB6E', '#00B894',
+  '#00A884', '#128C7E', '#075E54', '#25D366',
+  '#0099A8', '#34B7F1', '#0084FF', '#6C5CE7',
+  '#9B59B6', '#E84393', '#FF6B6B', '#F2994A',
 ];
 
 const THEME_OPTIONS = [
@@ -52,7 +54,7 @@ export default function ChatColorTheme({ navigation }) {
   } = useTheme();
 
   const fadeAnim = useRef(new Animated.Value(0)).current;
-  const slideAnim = useRef(new Animated.Value(16)).current;
+  const slideAnim = useRef(new Animated.Value(14)).current;
   const scaleAnims = useRef({}).current;
   const [selectedColor, setSelectedColor] = useState(null);
 
@@ -67,7 +69,7 @@ export default function ChatColorTheme({ navigation }) {
     });
 
     Animated.parallel([
-      Animated.timing(fadeAnim, { toValue: 1, duration: 400, useNativeDriver: true }),
+      Animated.timing(fadeAnim, { toValue: 1, duration: 380, useNativeDriver: true }),
       Animated.spring(slideAnim, { toValue: 0, friction: 9, tension: 60, useNativeDriver: true }),
     ]).start();
   }, []);
@@ -105,41 +107,57 @@ export default function ChatColorTheme({ navigation }) {
   const accent = selectedColor || theme.colors.themeColor;
 
   const primaryText = theme.colors.primaryTextColor;
-  const subText = theme.colors.placeHolderTextColor;
-  const pageBg = theme.colors.background;
-  const cardBg = theme.colors.menuBackground;
-  const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.06)';
+  const subText = theme.colors.secondaryTextColor;
+  const iconColor = theme.colors.iconColor;
+  const pageBg = isDarkMode ? '#0B141A' : '#F7F8FA';
+  const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
+  const bubbleRecvBg = isDarkMode ? '#202C33' : '#FFFFFF';
+  const previewBg = isDarkMode ? '#0B141A' : '#ECE5DD';
+  const sepClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)';
 
-  // ─── Chat preview (large, top) ───
+  // ─── Chat preview (WhatsApp wallpaper-style) ───
   const renderPreview = () => (
-    <Animated.View
-      style={[
-        styles.previewWrap,
-        { opacity: fadeAnim, transform: [{ translateY: slideAnim }] },
-      ]}
-    >
-      <View pointerEvents="none" style={[styles.previewHalo, { backgroundColor: accent + '20' }]} />
-      <View pointerEvents="none" style={[styles.previewHalo2, { backgroundColor: accent + '10' }]} />
-
-      <View style={[styles.previewCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
-        {/* Phone notch */}
-        <View style={styles.previewTopBar}>
-          <View style={[styles.previewAvatar, { backgroundColor: accent + '30' }]}>
-            <Text style={[styles.previewAvatarText, { color: accent }]}>J</Text>
+    <View style={styles.previewWrap}>
+      <View style={[styles.previewCard, { backgroundColor: cardBg }]}>
+        {/* Chat header */}
+        <View style={[styles.previewTopBar, { backgroundColor: accent }]}>
+          <Ionicons name="arrow-back" size={20} color="#fff" />
+          <View style={styles.previewAvatar}>
+            <Text style={styles.previewAvatarText}>J</Text>
           </View>
           <View style={styles.flex}>
-            <Text style={[styles.previewName, { color: primaryText }]}>Jordan</Text>
-            <Text style={[styles.previewStatus, { color: subText }]}>online</Text>
+            <Text style={styles.previewName}>Jordan</Text>
+            <Text style={styles.previewStatus}>online</Text>
           </View>
-          <Ionicons name="videocam-outline" size={20} color={subText} />
-          <Ionicons name="call-outline" size={18} color={subText} style={styles.gap10} />
+          <Ionicons name="videocam" size={19} color="#fff" />
+          <Ionicons name="call" size={17} color="#fff" style={styles.gap14} />
         </View>
 
-        <View style={[styles.previewDivider, { backgroundColor: borderClr }]} />
+        {/* Conversation over wallpaper */}
+        <View style={[styles.previewChat, { backgroundColor: previewBg }]}>
+          {/* Date chip */}
+          <View style={styles.previewCenterRow}>
+            <View style={[styles.previewDatePill, {
+              backgroundColor: isDarkMode ? 'rgba(31,44,51,0.92)' : 'rgba(255,255,255,0.92)',
+            }]}>
+              <Text style={[styles.previewDateText, { color: subText }]}>TODAY</Text>
+            </View>
+          </View>
 
-        <View style={styles.previewChat}>
+          {/* End-to-end encryption notice (WhatsApp's pale chip) */}
+          <View style={styles.previewCenterRow}>
+            <View style={[styles.previewEncPill, {
+              backgroundColor: isDarkMode ? 'rgba(31,44,51,0.92)' : 'rgba(255,243,197,0.95)',
+            }]}>
+              <Ionicons name="lock-closed" size={9} color={isDarkMode ? '#8696a0' : '#8a7b3a'} />
+              <Text style={[styles.previewEncText, { color: isDarkMode ? '#8696a0' : '#8a7b3a' }]}>
+                Messages are end-to-end encrypted
+              </Text>
+            </View>
+          </View>
+
           <View style={styles.previewRowLeft}>
-            <View style={[styles.bubbleReceived, { backgroundColor: pageBg }]}>
+            <View style={[styles.bubbleReceived, { backgroundColor: bubbleRecvBg }]}>
               <Text style={[styles.bubbleText, { color: primaryText }]}>Hey! How's the new design coming along?</Text>
               <Text style={[styles.bubbleTime, { color: subText }]}>10:30 AM</Text>
             </View>
@@ -150,13 +168,13 @@ export default function ChatColorTheme({ navigation }) {
               <Text style={styles.bubbleSentText}>Almost done — looks great in {isDarkMode ? 'dark' : 'light'} mode ✨</Text>
               <View style={styles.bubbleSentMeta}>
                 <Text style={styles.bubbleSentTime}>10:31 AM</Text>
-                <Ionicons name="checkmark-done" size={13} color="rgba(255,255,255,0.85)" style={styles.gap4} />
+                <Ionicons name="checkmark-done" size={14} color="rgba(255,255,255,0.9)" style={styles.gap4} />
               </View>
             </View>
           </View>
 
           <View style={styles.previewRowLeft}>
-            <View style={[styles.bubbleReceived, { backgroundColor: pageBg }]}>
+            <View style={[styles.bubbleReceived, { backgroundColor: bubbleRecvBg }]}>
               <Text style={[styles.bubbleText, { color: primaryText }]}>Can't wait to see it 🎉</Text>
               <Text style={[styles.bubbleTime, { color: subText }]}>10:32 AM</Text>
             </View>
@@ -164,47 +182,36 @@ export default function ChatColorTheme({ navigation }) {
         </View>
 
         {/* Composer mock */}
-        <View style={[styles.composer, { backgroundColor: pageBg }]}>
-          <View style={[styles.composerInput, { backgroundColor: cardBg }]}>
+        <View style={[styles.composer, { backgroundColor: cardBg }]}>
+          <View style={[styles.composerInput, { backgroundColor: previewBg }]}>
             <Text style={[styles.composerText, { color: subText }]}>Message</Text>
           </View>
           <View style={[styles.composerSend, { backgroundColor: accent }]}>
-            <Ionicons name="mic" size={16} color="#fff" />
+            <Ionicons name="mic" size={17} color="#fff" />
           </View>
         </View>
       </View>
-    </Animated.View>
+    </View>
   );
 
-  // ─── Theme picker (WhatsApp style radio cards) ───
+  // ─── Theme picker (WhatsApp radio list) ───
   const renderThemePicker = () => (
     <View style={styles.section}>
-      <Text style={[styles.sectionTitle, { color: subText }]}>THEME</Text>
-      <View style={[styles.sectionCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+      <Text style={[styles.sectionTitle, { color: subText }]}>Theme</Text>
+      <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
         {THEME_OPTIONS.map((opt, i) => {
           const active = activeThemeKey === opt.key;
           const isLast = i === THEME_OPTIONS.length - 1;
           return (
-            <TouchableOpacity
-              key={opt.key}
-              activeOpacity={0.7}
-              onPress={() => handleThemeSelect(opt.key)}
-              style={styles.themeRow}
-            >
-              <View style={[
-                styles.themeIconWrap,
-                {
-                  backgroundColor: active ? accent + '18' : (isDarkMode ? '#243340' : '#F2F4F8'),
-                  borderColor: active ? accent + '50' : 'transparent',
-                },
-              ]}>
-                <Ionicons name={opt.icon} size={20} color={active ? accent : subText} />
-              </View>
-
-              <View style={[
-                styles.themeTextWrap,
-                !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: borderClr },
-              ]}>
+            <View key={opt.key}>
+              <TouchableOpacity
+                activeOpacity={0.6}
+                onPress={() => handleThemeSelect(opt.key)}
+                style={styles.themeRow}
+              >
+                <View style={styles.themeIconWrap}>
+                  <Ionicons name={opt.icon} size={23} color={active ? accent : iconColor} />
+                </View>
                 <View style={styles.flex}>
                   <Text style={[styles.themeLabel, { color: primaryText }]}>{opt.label}</Text>
                   <Text style={[styles.themeDesc, { color: subText }]}>{opt.description}</Text>
@@ -215,8 +222,9 @@ export default function ChatColorTheme({ navigation }) {
                 ]}>
                   {active && <View style={[styles.radioInner, { backgroundColor: accent }]} />}
                 </View>
-              </View>
-            </TouchableOpacity>
+              </TouchableOpacity>
+              {!isLast && <View style={[styles.separator, { backgroundColor: sepClr }]} />}
+            </View>
           );
         })}
       </View>
@@ -224,38 +232,68 @@ export default function ChatColorTheme({ navigation }) {
   );
 
   // ─── Accent color picker ───
-  const renderColorGrid = () => (
-    <View style={styles.section}>
-      <Text style={[styles.sectionTitle, { color: subText }]}>CHAT ACCENT</Text>
-      <View style={[styles.sectionCard, styles.colorCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
-        <View style={styles.colorGrid}>
-          {ACCENT_COLORS.map((color) => {
-            const isSel = selectedColor === color;
-            return (
-              <Animated.View
-                key={color}
-                style={[styles.swatchOuter, { transform: [{ scale: scaleAnims[color] }] }]}
+  const renderColorGrid = () => {
+    const current = (selectedColor || accent || '').toUpperCase();
+    const isDefault = current === DEFAULT_ACCENT.toUpperCase();
+    return (
+      <View style={styles.section}>
+        <Text style={[styles.sectionTitle, { color: subText }]}>Chat accent</Text>
+        <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
+          {/* Current selection summary */}
+          <View style={styles.accentHeader}>
+            <View style={[styles.accentCurrentDot, { backgroundColor: accent }]}>
+              <Ionicons name="color-palette-outline" size={18} color="#fff" />
+            </View>
+            <View style={styles.flex}>
+              <Text style={[styles.accentCurrentLabel, { color: primaryText }]}>
+                {isDefault ? 'Default theme' : 'Custom color'}
+              </Text>
+              <Text style={[styles.accentCurrentSub, { color: subText }]}>{current}</Text>
+            </View>
+            {!isDefault && (
+              <TouchableOpacity
+                activeOpacity={0.7}
+                onPress={() => handleColorSelect(DEFAULT_ACCENT)}
+                style={[styles.resetBtn, { borderColor: theme.colors.border }]}
               >
-                <TouchableOpacity
-                  activeOpacity={0.8}
-                  onPress={() => handleColorSelect(color)}
-                  style={[styles.swatchRing, { borderColor: isSel ? color : 'transparent' }]}
-                >
-                  <View style={[styles.swatchBtn, { backgroundColor: color }]}>
-                    {isSel && <Ionicons name="checkmark" size={18} color="#fff" />}
-                  </View>
-                </TouchableOpacity>
-              </Animated.View>
-            );
-          })}
-        </View>
-      </View>
+                <Ionicons name="refresh" size={13} color={accent} />
+                <Text style={[styles.resetBtnText, { color: accent }]}>Reset</Text>
+              </TouchableOpacity>
+            )}
+          </View>
 
-      <Text style={[styles.footerHint, { color: subText }]}>
-        Accent applies to your sent messages, buttons, and highlights.
-      </Text>
-    </View>
-  );
+          <View style={[styles.separator, { backgroundColor: sepClr, marginLeft: 16 }]} />
+
+          {/* Swatch grid */}
+          <View style={styles.colorGrid}>
+            {ACCENT_COLORS.map((color) => {
+              const isSel = (selectedColor || '').toUpperCase() === color.toUpperCase();
+              return (
+                <Animated.View
+                  key={color}
+                  style={[styles.swatchOuter, { transform: [{ scale: scaleAnims[color] }] }]}
+                >
+                  <TouchableOpacity
+                    activeOpacity={0.8}
+                    onPress={() => handleColorSelect(color)}
+                    style={[styles.swatchRing, { borderColor: isSel ? color : 'transparent' }]}
+                  >
+                    <View style={[styles.swatchBtn, { backgroundColor: color }]}>
+                      {isSel && <Ionicons name="checkmark" size={18} color="#fff" />}
+                    </View>
+                  </TouchableOpacity>
+                </Animated.View>
+              );
+            })}
+          </View>
+        </View>
+
+        <Text style={[styles.footerHint, { color: subText }]}>
+          Accent applies to your sent messages, buttons, and highlights.
+        </Text>
+      </View>
+    );
+  };
 
   return (
     <View style={[styles.container, { backgroundColor: pageBg }]}>
@@ -264,9 +302,9 @@ export default function ChatColorTheme({ navigation }) {
         <TouchableOpacity
           onPress={() => navigation.goBack()}
           activeOpacity={0.6}
-          style={[styles.headerBackBtn, { backgroundColor: cardBg }]}
+          style={styles.headerBackBtn}
         >
-          <FontAwesome6 name="arrow-left" size={18} color={primaryText} />
+          <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
         </TouchableOpacity>
         <View style={styles.flex}>
           <Text style={[styles.headerTitle, { color: primaryText }]}>Appearance</Text>
@@ -274,14 +312,16 @@ export default function ChatColorTheme({ navigation }) {
         </View>
       </View>
 
-      <ScrollView
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.scrollContent}
-      >
-        {renderPreview()}
-        {renderThemePicker()}
-        {renderColorGrid()}
-      </ScrollView>
+      <Animated.View style={{ flex: 1, opacity: fadeAnim, transform: [{ translateY: slideAnim }] }}>
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.scrollContent}
+        >
+          {renderPreview()}
+          {renderThemePicker()}
+          {renderColorGrid()}
+        </ScrollView>
+      </Animated.View>
     </View>
   );
 }
@@ -290,19 +330,19 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   flex: { flex: 1 },
   gap4: { marginLeft: 4 },
-  gap10: { marginLeft: 14 },
+  gap14: { marginLeft: 16 },
 
   // Header
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 12,
-    gap: 12,
+    paddingHorizontal: 12,
+    paddingTop: 6,
+    paddingBottom: 8,
+    gap: 6,
   },
   headerBackBtn: {
-    width: 40, height: 40, borderRadius: 12,
+    width: 40, height: 40, borderRadius: 20,
     alignItems: 'center', justifyContent: 'center',
   },
   headerTitle: {
@@ -315,62 +355,83 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 1,
   },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40 },
+  scrollContent: { paddingHorizontal: 16, paddingBottom: 40, paddingTop: 4 },
 
   // Preview
   previewWrap: {
-    position: 'relative',
     marginTop: 4,
-    marginBottom: 22,
-  },
-  previewHalo: {
-    position: 'absolute',
-    top: -40, right: -40,
-    width: 220, height: 220, borderRadius: 110,
-  },
-  previewHalo2: {
-    position: 'absolute',
-    bottom: -30, left: -50,
-    width: 180, height: 180, borderRadius: 90,
+    marginBottom: 24,
   },
   previewCard: {
-    borderRadius: 22,
+    borderRadius: 18,
     overflow: 'hidden',
-    shadowOpacity: 0.08,
-    shadowOffset: { width: 0, height: 12 },
-    shadowRadius: 24,
-    elevation: 4,
+    shadowColor: '#0B141A',
+    shadowOpacity: 0.06,
+    shadowOffset: { width: 0, height: 6 },
+    shadowRadius: 14,
+    elevation: 3,
   },
   previewTopBar: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 14,
-    paddingVertical: 12,
-    gap: 12,
+    paddingVertical: 11,
+    gap: 11,
   },
   previewAvatar: {
-    width: 38, height: 38, borderRadius: 19,
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.25)',
     alignItems: 'center', justifyContent: 'center',
   },
   previewAvatarText: {
     fontFamily: 'Roboto-Bold',
     fontSize: 16,
+    color: '#fff',
   },
   previewName: {
     fontFamily: 'Roboto-SemiBold',
     fontSize: 15,
+    color: '#fff',
   },
   previewStatus: {
     fontFamily: 'Roboto-Regular',
     fontSize: 11,
+    color: 'rgba(255,255,255,0.85)',
     marginTop: 1,
   },
-  previewDivider: { height: StyleSheet.hairlineWidth },
 
   previewChat: {
     gap: 8,
     paddingHorizontal: 12,
     paddingVertical: 16,
+  },
+  previewCenterRow: {
+    alignItems: 'center',
+    marginBottom: 2,
+  },
+  previewDatePill: {
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 8,
+  },
+  previewDateText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 10,
+    letterSpacing: 0.5,
+  },
+  previewEncPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    maxWidth: '90%',
+  },
+  previewEncText: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 9.5,
+    textAlign: 'center',
   },
   previewRowLeft: {
     flexDirection: 'row',
@@ -381,18 +442,28 @@ const styles = StyleSheet.create({
     justifyContent: 'flex-end',
   },
   bubbleReceived: {
-    maxWidth: '80%',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 14,
-    borderBottomLeftRadius: 4,
+    maxWidth: '82%',
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 12,
+    borderTopLeftRadius: 4,
+    shadowColor: '#0B141A',
+    shadowOpacity: 0.05,
+    shadowOffset: { width: 0, height: 1 },
+    shadowRadius: 1.5,
+    elevation: 1,
   },
   bubbleSent: {
-    maxWidth: '80%',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 14,
-    borderBottomRightRadius: 4,
+    maxWidth: '82%',
+    paddingHorizontal: 11,
+    paddingVertical: 7,
+    borderRadius: 12,
+    borderTopRightRadius: 4,
+    shadowColor: '#0B141A',
+    shadowOpacity: 0.05,
+    shadowOffset: { width: 0, height: 1 },
+    shadowRadius: 1.5,
+    elevation: 1,
   },
   bubbleText: {
     fontFamily: 'Roboto-Regular',
@@ -432,8 +503,8 @@ const styles = StyleSheet.create({
   },
   composerInput: {
     flex: 1,
-    height: 36,
-    borderRadius: 18,
+    height: 38,
+    borderRadius: 19,
     justifyContent: 'center',
     paddingHorizontal: 14,
   },
@@ -442,54 +513,43 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   composerSend: {
-    width: 36, height: 36, borderRadius: 18,
+    width: 38, height: 38, borderRadius: 19,
     alignItems: 'center', justifyContent: 'center',
   },
 
   // Sections
-  section: { marginBottom: 18 },
+  section: { marginBottom: 22 },
   sectionTitle: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 11, letterSpacing: 1.2,
-    marginBottom: 10, marginLeft: 8,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13, letterSpacing: 0.2,
+    marginBottom: 8, marginLeft: 14,
   },
   sectionCard: {
-    borderRadius: 18,
+    borderRadius: 14,
     overflow: 'hidden',
-    shadowOpacity: 0.04,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 10,
-    elevation: 2,
   },
 
   // Theme rows
   themeRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingLeft: 14,
-    gap: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    gap: 16,
+    minHeight: 60,
   },
   themeIconWrap: {
-    width: 42, height: 42, borderRadius: 14,
+    width: 24, height: 24,
     alignItems: 'center', justifyContent: 'center',
-    borderWidth: 1,
-  },
-  themeTextWrap: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 16,
-    paddingRight: 16,
-    gap: 10,
   },
   themeLabel: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 15,
-    lineHeight: 20,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 16,
+    lineHeight: 21,
   },
   themeDesc: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
+    fontSize: 13,
     marginTop: 2,
   },
   radioOuter: {
@@ -500,14 +560,54 @@ const styles = StyleSheet.create({
   radioInner: {
     width: 12, height: 12, borderRadius: 6,
   },
+  separator: {
+    height: StyleSheet.hairlineWidth,
+    marginLeft: 56,
+  },
+
+  // Accent selection header
+  accentHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    gap: 14,
+  },
+  accentCurrentDot: {
+    width: 40, height: 40, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  accentCurrentLabel: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 15,
+  },
+  accentCurrentSub: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12.5,
+    marginTop: 2,
+    letterSpacing: 0.5,
+  },
+  resetBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 16,
+    borderWidth: 1,
+  },
+  resetBtnText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+  },
 
   // Color grid
-  colorCard: { padding: 14 },
   colorGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: SWATCH_GAP,
     rowGap: SWATCH_GAP + 2,
+    padding: 16,
   },
   swatchOuter: {
     width: SWATCH_SIZE,
@@ -531,9 +631,9 @@ const styles = StyleSheet.create({
 
   footerHint: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
+    fontSize: 13,
     textAlign: 'center',
-    lineHeight: 17,
+    lineHeight: 18,
     paddingHorizontal: 24,
     marginTop: 14,
   },

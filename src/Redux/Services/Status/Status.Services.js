@@ -42,6 +42,19 @@ export const statusServices = {
     return this.getStatusFeed();
   },
 
+  /** Official application broadcast updates — visible to every user.
+   * Silent on error: background fetch, no user-facing alert. */
+  async getBroadcasts() {
+    try {
+      const response = await apiCall('GET', `${BASE}/broadcasts`, {}, { timeout: 30000, silent: true });
+      if (response?.statusCode === 200) return response;
+      return { data: { broadcasts: [] } };
+    } catch (err) {
+      console.log('[getBroadcasts] silent failure:', err?.code || err?.message);
+      return { data: { broadcasts: [] } };
+    }
+  },
+
   async getStatusById(statusId) {
     try {
       const response = await apiCall('GET', `${BASE}/${statusId}`, {}, { silent: true });

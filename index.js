@@ -14,6 +14,9 @@ import App from './App';
 import store from './src/Redux/Store';
 import { registerBackgroundHandler } from './src/firebase/fcmService';
 
+// Must run at module top-level (before the app renders) so FCM can deliver
+// data/background messages — including incoming-call wake pushes — when the app
+// is backgrounded or killed.
 registerBackgroundHandler();
 
 const RootApp = () => (

@@ -178,7 +178,7 @@ const ReactionPicker = React.memo(({
               onPress={() => handleFullSelect(emoji)}
               style={[
                 styles.emojiItem,
-                hasReacted && { backgroundColor: (themeColor || '#03b0a2') + '20', borderRadius: 8 }
+                hasReacted && { backgroundColor: (themeColor || '#00A884') + '20', borderRadius: 8 }
               ]}
               activeOpacity={0.6}
             >
@@ -221,7 +221,7 @@ const ReactionPicker = React.memo(({
               style={[
                 styles.emojiButton,
                 hasReacted && { 
-                  backgroundColor: (themeColor || '#03b0a2') + '20',
+                  backgroundColor: (themeColor || '#00A884') + '20',
                   borderRadius: 20,
                 },
               ]}
@@ -393,7 +393,7 @@ const styles = StyleSheet.create({
   },
   modalTitle: {
     fontSize: 18,
-    fontWeight: '600',
+    fontFamily: 'Roboto-SemiBold',
   },
   closeButton: {
     padding: 4,
@@ -410,7 +410,7 @@ const styles = StyleSheet.create({
   },
   sectionTitle: {
     fontSize: 13,
-    fontWeight: '500',
+    fontFamily: 'Roboto-Medium',
     textTransform: 'uppercase',
   },
   emojiList: {

@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useState, useRef } from 'react';
 import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
@@ -37,6 +37,11 @@ export default function ArchivedChats({ navigation }) {
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
+
+  // Multi-select (long-press) mode — mirrors the ChatList selection header.
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedChatIds, setSelectedChatIds] = useState([]);
+  const [isBulkDelete, setIsBulkDelete] = useState(false);
 
   // Animations
   const profileOpacityAnim = useRef(new Animated.Value(0)).current;
@@ -241,28 +246,116 @@ export default function ArchivedChats({ navigation }) {
     setDeleteModalVisible(false);
     setDeleteForEveryone(false);
     setSelectedChatItem(null);
+    setIsBulkDelete(false);
   }, []);
 
   const onConfirmDeleteChat = useCallback(async () => {
-    const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
-    if (!chatId || isDeletingChat) return;
+    if (isDeletingChat) return;
+    // Single delete uses the tapped chat; bulk delete uses the multi-selection.
+    const ids = isBulkDelete
+      ? selectedChatIds.slice()
+      : [selectedChatItem?.chatId || selectedChatItem?._id].filter(Boolean);
+    if (!ids.length) return;
     setIsDeletingChat(true);
     try {
       const scope = deleteForEveryone ? 'everyone' : 'me';
-      const response = await apiCall(`/chats/${normalizeChatStorageId(chatId)}/clear`, 'DELETE', { scope });
-      if (!response || response.error) throw new Error(response?.message || 'Failed');
-      await removeMessagesByChatId(chatId);
-      applyChatClearedPreview(chatId, scope);
+      for (const chatId of ids) {
+        try {
+          const response = await apiCall(`/chats/${normalizeChatStorageId(chatId)}/clear`, 'DELETE', { scope });
+          if (!response || response.error) throw new Error(response?.message || 'Failed');
+          await removeMessagesByChatId(chatId);
+          applyChatClearedPreview(chatId, scope);
+        } catch (e) {
+          console.error('Chat delete failed', chatId, e);
+        }
+      }
       setDeleteModalVisible(false);
       setDeleteForEveryone(false);
       setSelectedChatItem(null);
+      if (isBulkDelete) {
+        setIsBulkDelete(false);
+        exitSelectionMode();
+      }
     } catch (error) {
       console.error('Chat delete failed', error);
       Alert.alert('Delete Chat', 'Could not delete this chat right now. Please try again.');
     } finally {
       setIsDeletingChat(false);
     }
-  }, [selectedChatItem, isDeletingChat, deleteForEveryone, applyChatClearedPreview]);
+  }, [selectedChatItem, isDeletingChat, deleteForEveryone, applyChatClearedPreview, isBulkDelete, selectedChatIds, exitSelectionMode]);
+
+  // ─── MULTI-SELECT (long-press) ───
+
+  const exitSelectionMode = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedChatIds([]);
+  }, []);
+
+  const toggleChatSelection = useCallback((chatId) => {
+    if (!chatId) return;
+    setSelectedChatIds((prev) => {
+      if (prev.includes(chatId)) {
+        const next = prev.filter((id) => id !== chatId);
+        if (next.length === 0) setSelectionMode(false);
+        return next;
+      }
+      return [...prev, chatId];
+    });
+  }, []);
+
+  const enterSelectionMode = useCallback((chatId) => {
+    if (!chatId) return;
+    setSelectionMode(true);
+    setSelectedChatIds((prev) => (prev.includes(chatId) ? prev : [...prev, chatId]));
+  }, []);
+
+  const getSelectedChats = useCallback(
+    () => (Array.isArray(archivedChatList) ? archivedChatList : [])
+      .filter((c) => selectedChatIds.includes(c?.chatId || c?._id)),
+    [archivedChatList, selectedChatIds],
+  );
+
+  const onBulkTogglePin = useCallback(() => {
+    const chats = getSelectedChats();
+    if (!chats.length) return;
+    const allPinned = chats.every((c) => c?.isPinned);
+    chats.forEach((c) => {
+      const id = c?.chatId || c?._id;
+      const ct = c?.chatType || 'private';
+      if (allPinned) unpinChat(id, ct);
+      else if (!c?.isPinned) pinChat(id, ct);
+    });
+    exitSelectionMode();
+  }, [getSelectedChats, pinChat, unpinChat, exitSelectionMode]);
+
+  const onBulkMute = useCallback(() => {
+    const chats = getSelectedChats();
+    if (!chats.length) return;
+    const allMuted = chats.every((c) => c?.isMuted);
+    chats.forEach((c) => {
+      const id = c?.chatId || c?._id;
+      const ct = c?.chatType || 'private';
+      if (allMuted) unmuteChat(id, ct);
+      else if (!c?.isMuted) muteChat(id, 8 * 60 * 60 * 1000, ct);
+    });
+    exitSelectionMode();
+  }, [getSelectedChats, muteChat, unmuteChat, exitSelectionMode]);
+
+  const onBulkUnarchive = useCallback(() => {
+    const chats = getSelectedChats();
+    if (!chats.length) return;
+    chats.forEach((c) => {
+      unarchiveChat(c?.chatId || c?._id, c?.chatType || 'private');
+    });
+    exitSelectionMode();
+  }, [getSelectedChats, unarchiveChat, exitSelectionMode]);
+
+  const onBulkDelete = useCallback(() => {
+    if (!selectedChatIds.length) return;
+    setIsBulkDelete(true);
+    setDeleteForEveryone(false);
+    setDeleteModalVisible(true);
+  }, [selectedChatIds]);
 
   // ─── ACTION SHEET OPTIONS ───
 
@@ -322,18 +415,62 @@ export default function ArchivedChats({ navigation }) {
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;
   const previewAvatarColor = getUserColor(previewName);
+  const headerBtnBg = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
-      {/* Header */}
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.headerBackBtn}>
-          <Ionicons name="arrow-back" size={22} color={theme.colors.primaryTextColor} />
-        </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
-          Archived Chats
-        </Text>
-      </View>
+      {/* Header — swaps to a selection header (icons on top) in multi-select. */}
+      {selectionMode ? (
+        <View style={[styles.header, styles.selectionHeader, { backgroundColor: theme.colors.themeColor + '14' }]}>
+          <View style={styles.headerSideRow}>
+            <TouchableOpacity
+              onPress={exitSelectionMode}
+              activeOpacity={0.6}
+              style={[styles.headerActionBtn, { backgroundColor: headerBtnBg }]}
+            >
+              <Ionicons name="arrow-back" size={22} color={theme.colors.primaryTextColor} />
+            </TouchableOpacity>
+            <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor, fontSize: 18 }]}>
+              {selectedChatIds.length}
+            </Text>
+          </View>
+          {(() => {
+            const sel = getSelectedChats();
+            const allPinned = sel.length > 0 && sel.every((c) => c?.isPinned);
+            const allMuted = sel.length > 0 && sel.every((c) => c?.isMuted);
+            const iconColor = theme.colors.primaryTextColor;
+            return (
+              <View style={styles.headerSideRow}>
+                {/* Pin */}
+                <TouchableOpacity onPress={onBulkTogglePin} activeOpacity={0.6} style={[styles.headerActionBtn, { backgroundColor: headerBtnBg }]}>
+                  <MaterialCommunityIcons name={allPinned ? 'pin-off-outline' : 'pin-outline'} size={20} color={iconColor} />
+                </TouchableOpacity>
+                {/* Mute */}
+                <TouchableOpacity onPress={onBulkMute} activeOpacity={0.6} style={[styles.headerActionBtn, { backgroundColor: headerBtnBg }]}>
+                  <Ionicons name={allMuted ? 'notifications-outline' : 'notifications-off-outline'} size={20} color={iconColor} />
+                </TouchableOpacity>
+                {/* Unarchive */}
+                <TouchableOpacity onPress={onBulkUnarchive} activeOpacity={0.6} style={[styles.headerActionBtn, { backgroundColor: headerBtnBg }]}>
+                  <MaterialCommunityIcons name="archive-arrow-up-outline" size={20} color={iconColor} />
+                </TouchableOpacity>
+                {/* Delete */}
+                <TouchableOpacity onPress={onBulkDelete} activeOpacity={0.6} style={[styles.headerActionBtn, { backgroundColor: '#E06A6A22' }]}>
+                  <MaterialCommunityIcons name="delete-outline" size={20} color="#E06A6A" />
+                </TouchableOpacity>
+              </View>
+            );
+          })()}
+        </View>
+      ) : (
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.headerBackBtn}>
+            <Ionicons name="arrow-back" size={22} color={theme.colors.primaryTextColor} />
+          </TouchableOpacity>
+          <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
+            Archived Chats
+          </Text>
+        </View>
+      )}
 
       {!Array.isArray(archivedChatList) || archivedChatList.length === 0 ? (
         <View style={styles.emptyWrap}>
@@ -349,23 +486,43 @@ export default function ArchivedChats({ navigation }) {
         <FlatList
           data={archivedChatList}
           keyExtractor={(item) => String(item?.chatId || item?._id)}
-          renderItem={({ item }) => (
-            <ChatCard
-              item={item}
-              theme={theme}
-              onPress={() => navigation.navigate('ChatScreen', { item })}
-              onLongPress={() => openActionMenu(item)}
-              onAvatarPress={() => openProfilePreview(item)}
-              onSwipePin={() => { const ct = item?.chatType || 'private'; item?.isPinned ? unpinChat(item?.chatId || item?._id, ct) : pinChat(item?.chatId || item?._id, ct); }}
-              onSwipeMute={() => { const ct = item?.chatType || 'private'; item?.isMuted ? unmuteChat(item?.chatId || item?._id, ct) : muteChat(item?.chatId || item?._id, 8 * 60 * 60 * 1000, ct); }}
-              onSwipeArchive={() => unarchiveChat(item?.chatId || item?._id, item?.chatType || 'private')}
-              getUserColor={getUserColor}
-              getPreviewText={getPreviewText}
-              getRelativeTime={getRelativeTime}
-              getLastMessageText={getLastMessageText}
-              renderMessageStatus={renderMessageStatus}
-            />
-          )}
+          renderItem={({ item }) => {
+            const itemChatId = item?.chatId || item?._id;
+            const isSelected = selectionMode && selectedChatIds.includes(itemChatId);
+            return (
+              <View>
+                <ChatCard
+                  item={item}
+                  theme={theme}
+                  isSelected={isSelected}
+                  onPress={() => {
+                    if (selectionMode) toggleChatSelection(itemChatId);
+                    else navigation.navigate('ChatScreen', { item });
+                  }}
+                  onLongPress={() => {
+                    if (selectionMode) toggleChatSelection(itemChatId);
+                    else enterSelectionMode(itemChatId);
+                  }}
+                  onAvatarPress={() => {
+                    if (selectionMode) toggleChatSelection(itemChatId);
+                    else openProfilePreview(item);
+                  }}
+                  getUserColor={getUserColor}
+                  getPreviewText={getPreviewText}
+                  getRelativeTime={getRelativeTime}
+                  getLastMessageText={getLastMessageText}
+                  renderMessageStatus={renderMessageStatus}
+                />
+                {isSelected && (
+                  <View style={styles.selectionCheckOverlay} pointerEvents="none">
+                    <View style={[styles.selectionCheckCircle, { backgroundColor: theme.colors.themeColor }]}>
+                      <Ionicons name="checkmark" size={14} color="#fff" />
+                    </View>
+                  </View>
+                )}
+              </View>
+            );
+          }}
           removeClippedSubviews
           showsVerticalScrollIndicator={false}
           contentContainerStyle={{ paddingBottom: 30 }}
@@ -475,10 +632,14 @@ export default function ArchivedChats({ navigation }) {
             </View>
 
             <Text style={[styles.deleteTitle, { color: theme.colors.primaryTextColor }]}>
-              Delete Chat
+              {isBulkDelete
+                ? `Delete ${selectedChatIds.length} chat${selectedChatIds.length === 1 ? '' : 's'}`
+                : 'Delete Chat'}
             </Text>
             <Text style={[styles.deleteSubtitle, { color: theme.colors.placeHolderTextColor }]}>
-              This will clear all messages in this chat on your device.
+              {isBulkDelete
+                ? `This will clear all messages in ${selectedChatIds.length === 1 ? 'this chat' : 'these chats'} on your device.`
+                : 'This will clear all messages in this chat on your device.'}
             </Text>
 
             <TouchableOpacity
@@ -604,14 +765,14 @@ export default function ArchivedChats({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              <ImageZoom
+              {/* <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              />
+              /> */}
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>
@@ -649,6 +810,38 @@ const styles = StyleSheet.create({
   headerTitle: {
     fontSize: 20,
     fontFamily: 'Roboto-SemiBold',
+  },
+
+  // ─── SELECTION HEADER (multi-select) ───
+  selectionHeader: {
+    justifyContent: 'space-between',
+    paddingHorizontal: 14,
+  },
+  headerSideRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  headerActionBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  selectionCheckOverlay: {
+    position: 'absolute',
+    left: 50,
+    top: 38,
+  },
+  selectionCheckCircle: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#fff',
   },
 
   // ─── EMPTY STATE ───

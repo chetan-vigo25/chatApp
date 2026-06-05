@@ -24,7 +24,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View, Text, Image, TouchableOpacity, StyleSheet,
   ScrollView, TextInput, ActivityIndicator, Alert,
-  Platform, FlatList, Dimensions, BackHandler,
+  Platform, FlatList, Dimensions, BackHandler, Animated, Easing, KeyboardAvoidingView,
 } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
@@ -34,7 +34,7 @@ import { createStatus } from '../../Redux/Reducer/Status/Status.reducer';
 import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import { useTheme } from '../../contexts/ThemeContext';
 import useStatusSettings from '../../hooks/useStatusSettings';
-import { STATUS_TYPE, STATUS_SPACE, STATUS_RADIUS, STATUS_ACCENT } from './_statusDesign';
+import { STATUS_TYPE, STATUS_SPACE, STATUS_RADIUS } from './_statusDesign';
 
 const { width: SW } = Dimensions.get('window');
 
@@ -53,6 +53,83 @@ const VISIBILITY_OPTIONS = [
     hint: 'Contacts + people you have chatted with',
   },
 ];
+
+// Animated upload progress bar — smooth fill, glowing leading cap, and a
+// looping shimmer sweep. Pure RN Animated (no extra deps).
+function UploadProgressBar({ percent = 0, color = '#25D366', trackWidth = 0 }) {
+  const fill = useRef(new Animated.Value(0)).current;
+  const shimmer = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(fill, {
+      toValue: Math.max(0, Math.min(100, percent)),
+      duration: 320,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false,
+    }).start();
+  }, [percent, fill]);
+
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.timing(shimmer, {
+        toValue: 1,
+        duration: 1100,
+        easing: Easing.inOut(Easing.quad),
+        useNativeDriver: true,
+      })
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [shimmer]);
+
+  const widthInterpolate = fill.interpolate({
+    inputRange: [0, 100],
+    outputRange: ['0%', '100%'],
+  });
+  const shimmerX = shimmer.interpolate({
+    inputRange: [0, 1],
+    outputRange: [-60, (trackWidth || 280) + 60],
+  });
+
+  return (
+    <View style={progressStyles.track}>
+      <Animated.View style={[progressStyles.fill, { width: widthInterpolate, backgroundColor: color }]}>
+        {/* Glowing leading cap */}
+        <View style={[progressStyles.cap, { backgroundColor: '#fff', shadowColor: color }]} />
+      </Animated.View>
+      {/* Shimmer sweep */}
+      <Animated.View
+        pointerEvents="none"
+        style={[progressStyles.shimmer, { transform: [{ translateX: shimmerX }, { rotate: '18deg' }] }]}
+      />
+    </View>
+  );
+}
+
+const progressStyles = StyleSheet.create({
+  track: {
+    width: '100%', height: 10, borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.14)',
+    overflow: 'hidden',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  fill: {
+    height: '100%', borderRadius: 6,
+    alignItems: 'flex-end', justifyContent: 'center',
+    minWidth: 10,
+  },
+  cap: {
+    width: 6, height: 6, borderRadius: 3,
+    marginRight: 3,
+    shadowOpacity: 0.9, shadowRadius: 5, shadowOffset: { width: 0, height: 0 },
+    elevation: 4,
+  },
+  shimmer: {
+    position: 'absolute', top: -8, bottom: -8, width: 26,
+    backgroundColor: 'rgba(255,255,255,0.22)',
+  },
+});
 
 export default function StatusPreview({ navigation, route }) {
   const {
@@ -182,13 +259,25 @@ export default function StatusPreview({ navigation, route }) {
             throw new Error(`Upload failed for item ${i + 1}`);
           }
 
+          // Forward the full storage metadata the upload returns. Without
+          // mediaKey + mediaStorageType the backend's transformStatusUrls()
+          // can't re-sign the URL on later fetches, so in production the
+          // initial pre-signed S3 URL expires (~1h) and the status stops
+          // rendering. (storageType → mediaStorageType is the schema field name.)
           mediaItems.push({
-            mediaType:    item.type,
-            mediaUrl:     media.mediaUrl || media.url,
-            thumbnailUrl: media.thumbnailUrl || null,
-            duration:     media.duration || item.duration || null,
-            width:        media.width  || item.width  || 0,
-            height:       media.height || item.height || 0,
+            mediaType:        item.type,
+            mediaUrl:         media.mediaUrl || media.url,
+            mediaKey:         media.mediaKey || null,
+            mediaStorageType: media.storageType || media.mediaStorageType || 'local',
+            thumbnailUrl:     media.thumbnailUrl || null,
+            thumbnailKey:     media.thumbnailKey || null,
+            duration:         media.duration || item.duration || null,
+            width:            media.width  || item.width  || 0,
+            height:           media.height || item.height || 0,
+            mimeType:         media.mediaMeta?.mimeType     || item.mimeType || null,
+            fileSize:         media.mediaMeta?.fileSize     || null,
+            originalName:     media.mediaMeta?.originalName || null,
+            order:            i,
           });
         }
 
@@ -232,7 +321,7 @@ export default function StatusPreview({ navigation, route }) {
 
   // ── Render preview content ────────────────────────────────────────────────
   const renderPreviewItem = ({ item, index }) => (
-    <View style={{ width: SW }}>
+    <View style={styles.previewItem}>
       {item.type === 'video' ? (
         <Video
           source={{ uri: item.uri }}
@@ -287,12 +376,25 @@ export default function StatusPreview({ navigation, route }) {
     );
   };
 
+  const currentVisibility =
+    VISIBILITY_OPTIONS.find(o => o.id === visibility) || VISIBILITY_OPTIONS[0];
+
   return (
-    <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
+    <View style={[styles.container, { backgroundColor: '#000' }]}>
       {/* ── Posting overlay — glass blur + progress bar ── */}
       {posting && (
         <BlurView intensity={50} tint="dark" style={styles.postingOverlay}>
           <View style={styles.postingCard}>
+            {/* Thumbnail of what's uploading */}
+            {items?.[Math.max(0, (progress.current || 1) - 1)]?.uri ? (
+              <View style={[styles.postingThumbRing, { borderColor: theme.colors.themeColor }]}>
+                <Image
+                  source={{ uri: items[Math.max(0, (progress.current || 1) - 1)].uri }}
+                  style={styles.postingThumb}
+                />
+              </View>
+            ) : null}
+
             <Text style={styles.postingEyebrow}>SENDING TO YOUR STORY</Text>
             <Text style={styles.postingTitle}>
               {totalItems > 1
@@ -300,9 +402,11 @@ export default function StatusPreview({ navigation, route }) {
                 : 'Uploading…'}
             </Text>
 
-            <View style={styles.progressBarTrack}>
-              <View style={[styles.progressBarFill, { width: `${progress.percent || 0}%` }]} />
-            </View>
+            <UploadProgressBar
+              percent={progress.percent || 0}
+              color={theme.colors.themeColor || '#25D366'}
+              trackWidth={Math.min(SW - 2 * STATUS_SPACE.gutter - 44, 316)}
+            />
             <Text style={styles.postingPercent}>{progress.percent || 0}%</Text>
 
             <TouchableOpacity
@@ -316,33 +420,7 @@ export default function StatusPreview({ navigation, route }) {
         </BlurView>
       )}
 
-      {/* ── Editorial header ── */}
-      <View style={[styles.header, { backgroundColor: theme.colors.background }]}>
-        <TouchableOpacity
-          onPress={() => navigation.goBack()}
-          style={styles.backBtn}
-          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-        >
-          <Ionicons name="chevron-back" size={26} color={theme.colors.primaryTextColor} />
-        </TouchableOpacity>
-        <View style={{ flex: 1 }}>
-          <Text style={[styles.headerEyebrow, { color: theme.colors.placeHolderTextColor }]}>
-            NEW STORY
-          </Text>
-          <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
-            Preview
-          </Text>
-        </View>
-        {totalItems > 1 && (
-          <View style={[styles.headerCounter, { borderColor: theme.colors.border }]}>
-            <Text style={[styles.headerCounterText, { color: theme.colors.primaryTextColor }]}>
-              {currentPreview + 1} / {totalItems}
-            </Text>
-          </View>
-        )}
-      </View>
-
-      {/* ── Preview area ── */}
+      {/* ── Full-screen media preview ── */}
       <View style={styles.previewArea}>
         {statusType === 'text' ? renderTextPreview()
           : statusType === 'link' ? renderLinkPreview()
@@ -352,6 +430,7 @@ export default function StatusPreview({ navigation, route }) {
               data={items}
               horizontal
               pagingEnabled
+              style={styles.flex}
               showsHorizontalScrollIndicator={false}
               keyExtractor={(_, i) => String(i)}
               renderItem={renderPreviewItem}
@@ -362,37 +441,47 @@ export default function StatusPreview({ navigation, route }) {
             />
           )
         }
+      </View>
 
-        {/* Batch dot indicators */}
+      {/* ── Top controls overlay (close + counter) ── */}
+      <View style={styles.topBar} pointerEvents="box-none">
+        <TouchableOpacity
+          onPress={() => navigation.goBack()}
+          style={styles.topBtn}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        >
+          <Ionicons name="close" size={26} color="#fff" />
+        </TouchableOpacity>
+        <View style={styles.flex} />
         {totalItems > 1 && (
-          <View style={styles.dotRow}>
-            {items.map((_, i) => (
-              <View
-                key={i}
-                style={[styles.dot, i === currentPreview ? styles.dotActive : styles.dotInactive]}
-              />
-            ))}
+          <View style={styles.counterPill}>
+            <Text style={styles.counterText}>{currentPreview + 1}/{totalItems}</Text>
           </View>
         )}
       </View>
 
-      {/* ── Settings panel ── */}
-      <ScrollView
-        style={[styles.panel, { backgroundColor: theme.colors.background }]}
-        keyboardShouldPersistTaps="handled"
+      {/* Batch dot indicators */}
+      {totalItems > 1 && (
+        <View style={styles.dotRow} pointerEvents="none">
+          {items.map((_, i) => (
+            <View key={i} style={[styles.dot, i === currentPreview ? styles.dotActive : styles.dotInactive]} />
+          ))}
+        </View>
+      )}
+
+      {/* ── Bottom composer: caption + visibility + send (WhatsApp style) ── */}
+      <KeyboardAvoidingView
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        style={styles.bottomWrap}
+        pointerEvents="box-none"
       >
-        {/* Caption */}
-        <View style={styles.section}>
-          <View style={styles.captionHead}>
-            <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor }]}>CAPTION</Text>
-            <Text style={[styles.captionCounter, { color: theme.colors.placeHolderTextColor }]}>
-              {caption.length}/500
-            </Text>
-          </View>
+        {/* Caption pill */}
+        <View style={styles.captionRow}>
+          <Ionicons name="happy-outline" size={22} color="rgba(255,255,255,0.7)" style={styles.captionEmoji} />
           <TextInput
-            style={[styles.captionInput, { backgroundColor: theme.colors.surface, color: theme.colors.primaryTextColor, borderColor: theme.colors.border }]}
-            placeholder="Add a few words…"
-            placeholderTextColor={theme.colors.placeHolderTextColor}
+            style={styles.captionInput}
+            placeholder="Add a caption…"
+            placeholderTextColor="rgba(255,255,255,0.6)"
             value={caption}
             onChangeText={setCaption}
             maxLength={500}
@@ -400,91 +489,36 @@ export default function StatusPreview({ navigation, route }) {
           />
         </View>
 
-        {/* Visibility */}
-        <View style={styles.section}>
-          <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor }]}>WHO CAN SEE</Text>
-          <View style={styles.visibilityRow}>
-            {VISIBILITY_OPTIONS.map(opt => {
-              const active = visibility === opt.id;
-              return (
-                <TouchableOpacity
-                  key={opt.id}
-                  style={[
-                    styles.visibilityChip,
-                    { borderColor: theme.colors.border, backgroundColor: theme.colors.surface },
-                    active && { borderColor: theme.colors.themeColor, backgroundColor: `${theme.colors.themeColor}22` },
-                  ]}
-                  onPress={() => setVisibility(opt.id)}
-                  accessibilityRole="radio"
-                  accessibilityState={{ selected: active }}
-                  accessibilityLabel={`${opt.label}. ${opt.hint}`}
-                >
-                  <View style={styles.visibilityChipRow}>
-                    <Ionicons
-                      name={opt.icon}
-                      size={16}
-                      color={active ? theme.colors.themeColor : theme.colors.placeHolderTextColor}
-                    />
-                    <Text
-                      style={[
-                        styles.visibilityLabel,
-                        { color: active ? theme.colors.themeColor : theme.colors.placeHolderTextColor },
-                      ]}
-                    >
-                      {opt.label}
-                    </Text>
-                    {active ? (
-                      <Ionicons
-                        name="checkmark-circle"
-                        size={14}
-                        color={theme.colors.themeColor}
-                        style={styles.visibilityCheck}
-                      />
-                    ) : null}
-                  </View>
-                  <Text
-                    style={[
-                      styles.visibilityHint,
-                      { color: theme.colors.placeHolderTextColor },
-                    ]}
-                  >
-                    {opt.hint}
-                  </Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
+        {/* Send row */}
+        <View style={styles.sendRow}>
+          <TouchableOpacity
+            onPress={() => {
+              const idx = VISIBILITY_OPTIONS.findIndex(o => o.id === visibility);
+              const next = VISIBILITY_OPTIONS[(idx + 1) % VISIBILITY_OPTIONS.length];
+              setVisibility(next.id);
+            }}
+            activeOpacity={0.8}
+            style={styles.visPill}
+          >
+            <Ionicons name={currentVisibility.icon} size={15} color="#fff" />
+            <Text style={styles.visPillText} numberOfLines={1}>{currentVisibility.label}</Text>
+            <Ionicons name="chevron-up" size={14} color="rgba(255,255,255,0.7)" />
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={handlePost}
+            disabled={posting}
+            activeOpacity={0.85}
+            style={[styles.sendFab, { backgroundColor: theme.colors.themeColor, opacity: posting ? 0.6 : 1 }]}
+          >
+            {posting ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Ionicons name="send" size={22} color="#fff" style={{ marginLeft: 2 }} />
+            )}
+          </TouchableOpacity>
         </View>
-
-        {/* Filters summary (if any applied) */}
-        {filtersApplied.length > 0 && (
-          <View style={styles.section}>
-            <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor }]}>FILTERS APPLIED</Text>
-            <Text style={[styles.filtersSummary, { color: theme.colors.primaryTextColor }]}>
-              {filtersApplied.join(', ')}
-            </Text>
-          </View>
-        )}
-
-        {/* Post button — full-width pill */}
-        <TouchableOpacity
-          style={[styles.postBtn, { backgroundColor: theme.colors.themeColor, opacity: posting ? 0.6 : 1 }]}
-          onPress={handlePost}
-          disabled={posting}
-          activeOpacity={0.85}
-        >
-          {posting ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <>
-              <Text style={styles.postBtnText}>Share to your story</Text>
-              <Ionicons name="arrow-forward" size={20} color="#fff" />
-            </>
-          )}
-        </TouchableOpacity>
-
-        <View style={{ height: 40 }} />
-      </ScrollView>
+      </KeyboardAvoidingView>
     </View>
   );
 }
@@ -508,18 +542,16 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.1)',
     alignItems: 'center',
   },
+  postingThumbRing: {
+    width: 72, height: 72, borderRadius: 36,
+    borderWidth: 2.5, padding: 3,
+    alignItems: 'center', justifyContent: 'center',
+    marginBottom: 18,
+  },
+  postingThumb: { width: '100%', height: '100%', borderRadius: 33 },
   postingEyebrow: { ...STATUS_TYPE.caps, color: 'rgba(255,255,255,0.55)', marginBottom: 6 },
   postingTitle:   { ...STATUS_TYPE.title, color: '#fff', marginBottom: 22, textAlign: 'center' },
-  progressBarTrack: {
-    width: '100%', height: 6, borderRadius: 3,
-    backgroundColor: 'rgba(255,255,255,0.12)',
-    overflow: 'hidden',
-  },
-  progressBarFill: {
-    height: '100%', borderRadius: 3,
-    backgroundColor: '#fff',
-  },
-  postingPercent: { color: '#fff', fontSize: 13, fontWeight: '600', marginTop: 10, opacity: 0.85 },
+  postingPercent: { color: '#fff', fontSize: 14, fontFamily: 'Roboto-Bold', marginTop: 12, opacity: 0.92, letterSpacing: 0.5 },
   cancelUploadBtn: {
     marginTop: 22,
     paddingVertical: 10, paddingHorizontal: 22,
@@ -527,81 +559,85 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: 'rgba(255,255,255,0.45)',
   },
-  cancelUploadText: { color: '#fff', fontSize: 13, fontWeight: '600', letterSpacing: 0.3 },
+  cancelUploadText: { color: '#fff', fontSize: 13, fontFamily: 'Roboto-SemiBold', letterSpacing: 0.3 },
 
-  // ── Editorial header ──────────────────────────────────────────────────────
-  header: {
-    flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: STATUS_SPACE.gutter,
-    paddingTop: STATUS_SPACE.sm, paddingBottom: STATUS_SPACE.md,
-    gap: 14,
-  },
-  backBtn:        { padding: 4, marginLeft: -4 },
-  headerEyebrow:  { ...STATUS_TYPE.caps, marginBottom: 2 },
-  headerTitle:    { ...STATUS_TYPE.title, fontWeight: '400' },
-  headerCounter:  {
-    paddingHorizontal: 10, paddingVertical: 5,
-    borderRadius: STATUS_RADIUS.pill,
-    borderWidth: StyleSheet.hairlineWidth,
-  },
-  headerCounterText: { fontSize: 11, fontWeight: '700', letterSpacing: 0.5 },
-
-  // ── Preview area ──────────────────────────────────────────────────────────
-  previewArea: { height: 320, backgroundColor: '#000', position: 'relative' },
-  previewMedia:{ width: SW, height: 320 },
-  textPreview: { width: SW, height: 320, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 28 },
-  textPreviewBody: { color: '#fff', fontSize: 24, fontWeight: '600', textAlign: 'center', lineHeight: 32 },
-  textOverlayBadge:{ position: 'absolute', top: '35%', left: 20, right: 20, alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)', padding: 8, borderRadius: 8 },
-  textOverlayText: { color: '#fff', fontSize: 20, fontWeight: '700', textAlign: 'center' },
+  // ── Full-screen media preview ─────────────────────────────────────────────
+  previewArea: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000' },
+  previewItem: { width: SW, height: '100%', alignItems: 'center', justifyContent: 'center' },
+  previewMedia: { width: SW, height: '100%' },
+  textPreview: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 36 },
+  textPreviewBody: { color: '#fff', fontSize: 26, fontFamily: 'Roboto-SemiBold', textAlign: 'center', lineHeight: 34 },
+  textOverlayBadge: { position: 'absolute', top: '35%', left: 20, right: 20, alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)', padding: 8, borderRadius: 8 },
+  textOverlayText: { color: '#fff', fontSize: 20, fontFamily: 'Roboto-Bold', textAlign: 'center' },
 
   // ── Link preview card ─────────────────────────────────────────────────────
-  linkPreview: { flex: 1, justifyContent: 'center', alignItems: 'stretch' },
-  ogImage:     { width: '100%', height: 170 },
+  linkPreview: { flex: 1, justifyContent: 'center', alignItems: 'stretch', backgroundColor: '#111B21' },
+  ogImage:     { width: '100%', height: 200 },
   ogBody:      { padding: 18, width: '100%' },
-  ogTitle:     { ...STATUS_TYPE.title, fontSize: 17, lineHeight: 22, marginBottom: 6 },
-  ogDesc:      { ...STATUS_TYPE.body, fontSize: 13, marginBottom: 6 },
-  ogSite:      { ...STATUS_TYPE.caps, marginBottom: 4 },
-  ogUrl:       { fontSize: 12, fontWeight: '600' },
+  ogTitle:     { ...STATUS_TYPE.title, color: '#fff', fontSize: 18, lineHeight: 24, marginBottom: 6 },
+  ogDesc:      { ...STATUS_TYPE.body, color: 'rgba(255,255,255,0.7)', fontSize: 13, marginBottom: 6 },
+  ogSite:      { ...STATUS_TYPE.caps, color: 'rgba(255,255,255,0.55)', marginBottom: 4 },
+  ogUrl:       { fontSize: 12, fontFamily: 'Roboto-SemiBold', color: '#53BDEB' },
+
+  // ── Top controls overlay ──────────────────────────────────────────────────
+  topBar: {
+    position: 'absolute', top: 0, left: 0, right: 0,
+    flexDirection: 'row', alignItems: 'center',
+    paddingTop: Platform.OS === 'ios' ? 54 : 36,
+    paddingHorizontal: 14, paddingBottom: 12,
+    gap: 12,
+  },
+  topBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
+  counterPill: {
+    paddingHorizontal: 12, paddingVertical: 6,
+    borderRadius: 14, backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  counterText: { color: '#fff', fontSize: 12, fontFamily: 'Roboto-Bold', letterSpacing: 0.5 },
 
   // ── Dots ──────────────────────────────────────────────────────────────────
-  dotRow:      { position: 'absolute', bottom: 10, left: 0, right: 0, flexDirection: 'row', justifyContent: 'center', gap: 6 },
-  dot:         { width: 6, height: 6, borderRadius: 3 },
-  dotActive:   { backgroundColor: '#fff', width: 18 },
-  dotInactive: { backgroundColor: 'rgba(255,255,255,0.4)' },
+  dotRow: { position: 'absolute', bottom: 150, left: 0, right: 0, flexDirection: 'row', justifyContent: 'center', gap: 6 },
+  dot: { width: 6, height: 6, borderRadius: 3 },
+  dotActive: { backgroundColor: '#fff', width: 18 },
+  dotInactive: { backgroundColor: 'rgba(255,255,255,0.45)' },
 
-  // ── Settings panel ────────────────────────────────────────────────────────
-  panel:        { flex: 1 },
-  section:      { paddingHorizontal: STATUS_SPACE.gutter, paddingTop: 22 },
-  sectionLabel: { ...STATUS_TYPE.caps, marginBottom: 12 },
-  captionHead:    { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between' },
-  captionCounter: { ...STATUS_TYPE.meta, fontSize: 11, marginBottom: 12 },
+  // ── Bottom composer ───────────────────────────────────────────────────────
+  bottomWrap: {
+    position: 'absolute', left: 0, right: 0, bottom: 0,
+    paddingHorizontal: 12,
+    paddingBottom: Platform.OS === 'ios' ? 30 : 14,
+  },
+  captionRow: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: 26, paddingHorizontal: 14,
+    paddingVertical: Platform.OS === 'ios' ? 10 : 4,
+    minHeight: 48,
+  },
+  captionEmoji: { marginRight: 8 },
   captionInput: {
-    borderRadius: STATUS_RADIUS.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    paddingHorizontal: 14, paddingVertical: 12,
-    fontSize: 15, lineHeight: 22,
-    minHeight: 84, textAlignVertical: 'top',
+    flex: 1,
+    color: '#fff', fontSize: 16, fontFamily: 'Roboto-Regular',
+    paddingVertical: 0, maxHeight: 110,
   },
-
-  // ── Visibility — card-style ───────────────────────────────────────────────
-  visibilityRow:     { gap: 10 },
-  visibilityChipRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  visibilityCheck:   { marginLeft: 'auto' },
-  visibilityHint:    { ...STATUS_TYPE.meta, marginTop: 6, marginLeft: 26 },
-  visibilityChip:    {
-    paddingHorizontal: 16, paddingVertical: 14,
-    borderRadius: STATUS_RADIUS.md, borderWidth: StyleSheet.hairlineWidth,
+  sendRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    marginTop: 12,
   },
-  visibilityLabel:   { fontSize: 15, fontWeight: '600' },
-  filtersSummary:    { fontSize: 13, textTransform: 'capitalize' },
-
-  // ── Post button — full-width pill ─────────────────────────────────────────
-  postBtn: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    marginHorizontal: STATUS_SPACE.gutter, marginTop: 28,
-    borderRadius: STATUS_RADIUS.pill, paddingVertical: 16, gap: 10,
-    shadowColor: STATUS_ACCENT, shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.18, shadowRadius: 14,
-    elevation: 4,
+  visPill: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: 22, paddingVertical: 9, paddingHorizontal: 14,
+    maxWidth: SW * 0.62,
   },
-  postBtnText: { color: '#fff', fontSize: 16, fontWeight: '700', letterSpacing: 0.3 },
+  visPillText: { color: '#fff', fontSize: 14, fontFamily: 'Roboto-SemiBold' },
+  sendFab: {
+    width: 56, height: 56, borderRadius: 28,
+    alignItems: 'center', justifyContent: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3, shadowRadius: 8, elevation: 6,
+  },
 });

@@ -5,6 +5,7 @@ import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ContactDatabase from '../../services/ContactDatabase';
+import { getSocket } from '../../Redux/Services/Socket/socket';
 
 export default function ChatHeaderPresence({
   user,
@@ -32,6 +33,34 @@ export default function ChatHeaderPresence({
       .then((row) => { if (!cancelled) setLocalContact(row); })
       .catch(() => { if (!cancelled) setLocalContact(null); });
     return () => { cancelled = true; };
+  }, [isGroup, user?._id]);
+
+  // Live profile-photo override: reflect the peer's photo change in realtime
+  // without leaving the chat. Resets when the peer changes.
+  const [liveProfileImage, setLiveProfileImage] = useState(null);
+  useEffect(() => {
+    setLiveProfileImage(null);
+    if (isGroup || !user?._id) return undefined;
+    let socket = null;
+    const onContactUpdated = (payload) => {
+      const data = payload?.data || payload || {};
+      const updatedId = String(data?.contactUserId || data?.userId || data?._id || '');
+      if (!updatedId || updatedId !== String(user._id)) return;
+      const image = data?.profileImage ?? data?.profilePicture;
+      if (image !== undefined) setLiveProfileImage(image);
+    };
+    const attach = () => {
+      const s = getSocket?.();
+      if (!s || socket === s) return;
+      socket = s;
+      s.on('contact:updated', onContactUpdated);
+    };
+    attach();
+    const interval = setInterval(attach, 2000);
+    return () => {
+      clearInterval(interval);
+      if (socket) socket.off('contact:updated', onContactUpdated);
+    };
   }, [isGroup, user?._id]);
 
   const realtimePresence = (!isGroup && user?._id) ? state?.presenceByUser?.[user._id] : null;
@@ -70,10 +99,14 @@ export default function ChatHeaderPresence({
     user?.fullName ||
     user?.name ||
     'Unknown User';
+  // Prefer the live server photo (realtime override → chat's peerUser) so a
+  // profile-picture change shows immediately; the locally-saved contact image
+  // is only a stale snapshot, used last. Saved-contact NAME still wins above.
   const peerAvatar =
-    localContact?.profileImage ||
+    liveProfileImage ||
     user?.profileImage ||
     user?.profilePicture ||
+    localContact?.profileImage ||
     null;
   const displayName = isGroup ? (groupName || 'Group') : peerDisplayName;
 

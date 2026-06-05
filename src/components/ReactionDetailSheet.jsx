@@ -188,11 +188,11 @@ const ReactionDetailSheet = React.memo(({
             {/* All tab */}
             <TouchableOpacity
               onPress={() => setSelectedEmoji('all')}
-              style={[styles.tab, selectedEmoji === 'all' && { borderBottomColor: themeColor || '#03b0a2' }]}
+              style={[styles.tab, selectedEmoji === 'all' && { borderBottomColor: themeColor || '#00A884' }]}
             >
               <Text style={[
                 styles.tabText,
-                { color: selectedEmoji === 'all' ? (themeColor || '#03b0a2') : (placeholderColor || '#999') },
+                { color: selectedEmoji === 'all' ? (themeColor || '#00A884') : (placeholderColor || '#999') },
               ]}>All {totalCount}</Text>
             </TouchableOpacity>
             {entries.map(([emoji, data]) => {
@@ -201,12 +201,12 @@ const ReactionDetailSheet = React.memo(({
                 <TouchableOpacity
                   key={emoji}
                   onPress={() => setSelectedEmoji(emoji)}
-                  style={[styles.tab, isSelected && { borderBottomColor: themeColor || '#03b0a2' }]}
+                  style={[styles.tab, isSelected && { borderBottomColor: themeColor || '#00A884' }]}
                 >
                   <Text style={styles.tabEmoji}>{emoji}</Text>
                   <Text style={[
                     styles.tabCount,
-                    { color: isSelected ? (themeColor || '#03b0a2') : (placeholderColor || '#999') },
+                    { color: isSelected ? (themeColor || '#00A884') : (placeholderColor || '#999') },
                   ]}>{data.count}</Text>
                 </TouchableOpacity>
               );

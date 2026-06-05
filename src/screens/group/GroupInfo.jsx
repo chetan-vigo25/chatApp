@@ -14,7 +14,11 @@ import { useDispatch, useSelector } from 'react-redux';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { viewGroup, deleteGroup, transferOwnership } from '../../Redux/Reducer/Group/Group.reducer';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { getSocket } from '../../Redux/Services/Socket/socket';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useCall } from '../../calls/useCall';
+import useContactDirectory from '../../hooks/useContactDirectory';
+import { hashPhoneForMatch, onlyDigits } from '../../utils/savedContactName';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
@@ -48,15 +52,33 @@ const getMemberUser = (m) => {
     fullName: u.fullName || m.fullName || m.name || 'Unknown',
     profileImage: u.profileImage || m.profileImage || null,
     email: u.email || m.email || null,
+    mobile: u.mobileNumber || u.phoneNumber || u.phone || m.mobileNumber || m.phone || null,
   };
 };
 
 export default function GroupInfo({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
+  const { startGroupAudioCall, startGroupVideoCall } = useCall();
   const { currentGroup, isLoading } = useSelector((s) => s.group);
   const { leaveGroup, removeChat, removeGroupMember: socketRemoveMember, promoteGroupMember, demoteGroupMember } = useRealtimeChat();
+  // Device contact directory (local SQLite only) for device-name-first display.
+  const { directory } = useContactDirectory();
+  // Priority: device/saved contact name > backend name. The saved contact is
+  // matched by user id first, then by the phone-number HASH (canonical join,
+  // works when the saved row has no user_id), then by normalized phone digits.
+  const resolveMemberName = (m) => {
+    const u = getMemberUser(m);
+    let saved = u.id && directory?.[String(u.id)]?.fullName?.trim();
+    if (!saved && u.mobile) {
+      const h = hashPhoneForMatch(u.mobile);
+      saved = (h && directory?.[`h:${h}`]?.fullName?.trim())
+        || directory?.[`p:${onlyDigits(u.mobile)}`]?.fullName?.trim();
+    }
+    return saved || u.fullName;
+  };
   const fadeAnim = useRef(new Animated.Value(0)).current;
+  const membersRef = useRef([]);
 
   const [currentUserId, setCurrentUserId] = useState(null);
   const [memberActionVisible, setMemberActionVisible] = useState(false);
@@ -76,6 +98,51 @@ export default function GroupInfo({ navigation, route }) {
     })();
   }, [groupId]);
 
+  // Realtime: when this group's name / avatar / description is changed by an
+  // admin, re-fetch so the open info screen reflects it without a reload.
+  useEffect(() => {
+    if (!groupId) return undefined;
+    let socket = null;
+    const onGroupProfileChanged = (payload) => {
+      const data = payload?.data || payload || {};
+      const gid = String(data?.groupId || '');
+      if (gid && gid === String(groupId)) dispatch(viewGroup({ groupId }));
+    };
+    // A member changed their own profile — refresh so their avatar/name in the
+    // member list updates live.
+    const onContactUpdated = (payload) => {
+      const data = payload?.data || payload || {};
+      const updatedId = String(data?.contactUserId || data?.userId || data?._id || '');
+      if (!updatedId) return;
+      const isMember = (membersRef.current || []).some((m) => {
+        const u = (typeof m?.userId === 'object' && m.userId) ? m.userId : {};
+        const mId = String(u._id || (typeof m?.userId === 'string' ? m.userId : '') || m?._id || '');
+        return mId && mId === updatedId;
+      });
+      if (isMember) dispatch(viewGroup({ groupId }));
+    };
+    const attach = () => {
+      const s = getSocket?.();
+      if (!s || socket === s) return;
+      socket = s;
+      s.on('group:name:updated', onGroupProfileChanged);
+      s.on('group:avatar:updated', onGroupProfileChanged);
+      s.on('group:description:updated', onGroupProfileChanged);
+      s.on('contact:updated', onContactUpdated);
+    };
+    attach();
+    const interval = setInterval(attach, 2000);
+    return () => {
+      clearInterval(interval);
+      if (socket) {
+        socket.off('group:name:updated', onGroupProfileChanged);
+        socket.off('group:avatar:updated', onGroupProfileChanged);
+        socket.off('group:description:updated', onGroupProfileChanged);
+        socket.off('contact:updated', onContactUpdated);
+      }
+    };
+  }, [groupId, dispatch]);
+
   // ─── DATA ───
   const apiGroup = currentGroup?.group;
   const apiMembers = currentGroup?.members;
@@ -85,6 +152,7 @@ export default function GroupInfo({ navigation, route }) {
   const createdAt = apiGroup?.createdAt || routeItem?.group?.createdAt;
   const isActive = apiGroup?.isActive !== false;
   const members = Array.isArray(apiMembers) ? apiMembers.filter((m) => m.status !== 'removed' && !m.isDeleted) : [];
+  membersRef.current = members;
   const ownerMember = members.find((m) => m.role === 'owner');
   const ownerId = getMemberUser(ownerMember).id || apiGroup?.ownerId || apiGroup?.createdBy || routeItem?.group?.ownerId || routeItem?.group?.createdBy;
   const ownerName = getMemberUser(ownerMember).fullName || 'Unknown';
@@ -104,6 +172,21 @@ export default function GroupInfo({ navigation, route }) {
   // ─── STATS ───
   const adminCount = members.filter((m) => m.role === 'admin').length;
   const memberCount = members.length;
+
+  // Start a group audio/video call with every other participant (WhatsApp parity).
+  const startGroupCall = (media) => {
+    const peers = (membersRef.current || [])
+      .map((m) => {
+        const u = getMemberUser(m);
+        return u?.id ? { id: String(u.id), name: u.fullName || 'Member', avatar: u.profileImage || null } : null;
+      })
+      .filter(Boolean)
+      .filter((p) => String(p.id) !== String(currentUserId));
+    if (!peers.length) { showToast('No participants to call'); return; }
+    const opts = { groupName };
+    if (media === 'video') startGroupVideoCall?.(peers, opts);
+    else startGroupAudioCall?.(peers, opts);
+  };
 
   // ─── HELPERS ───
   const formatDate = (d) => { if (!d) return ''; const dt = new Date(d); return dt.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); };
@@ -174,7 +257,8 @@ export default function GroupInfo({ navigation, route }) {
   // ─── RENDER MEMBER ───
   const renderMember = (member, index) => {
     const user = getMemberUser(member);
-    const color = getAvatarColor(user.fullName);
+    const displayName = resolveMemberName(member);
+    const color = getAvatarColor(displayName);
     const isSelf = String(user.id) === String(currentUserId);
     const memberIsOwner = member.role === 'owner' || String(user.id) === String(ownerId);
     const memberIsAdmin = member.role === 'admin';
@@ -193,7 +277,7 @@ export default function GroupInfo({ navigation, route }) {
             <Image source={{ uri: user.profileImage }} style={styles.memberAvatar} />
           ) : (
             <View style={[styles.memberAvatar, { backgroundColor: color }]}>
-              <Text style={styles.memberAvatarText}>{user.fullName.charAt(0).toUpperCase()}</Text>
+              <Text style={styles.memberAvatarText}>{(displayName || 'U').charAt(0).toUpperCase()}</Text>
             </View>
           )}
           {memberIsOwner && (
@@ -207,7 +291,7 @@ export default function GroupInfo({ navigation, route }) {
         <View style={styles.memberInfo}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
             <Text style={[styles.memberName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
-              {user.fullName}{isSelf ? ' (You)' : ''}
+              {displayName}{isSelf ? ' (You)' : ''}
             </Text>
             {isMuted && <Ionicons name="volume-mute" size={12} color={theme.colors.placeHolderTextColor} />}
           </View>
@@ -242,10 +326,10 @@ export default function GroupInfo({ navigation, route }) {
     );
   }
 
-  const cardBg = isDarkMode ? 'rgba(255,255,255,0.035)' : 'rgba(0,0,0,0.018)';
-  const dividerBg = isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)';
-
-  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+  // WhatsApp grouped palette: solid inset cards on a slightly darker page.
+  const cardBg = isDarkMode ? '#1F2C33' : '#FFFFFF';
+  const dividerBg = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
+  const pageBg = isDarkMode ? '#0B141A' : '#EFF2F5';
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
@@ -295,154 +379,118 @@ export default function GroupInfo({ navigation, route }) {
             activeOpacity={0.7}
             style={[styles.quickBtn, { backgroundColor: cardBg }]}
           >
-            <Ionicons name="chatbubble-outline" size={20} color={theme.colors.themeColor} />
-            <Text style={[styles.quickBtnLabel, { color: theme.colors.primaryTextColor }]}>Message</Text>
+            <Ionicons name="chatbubble" size={22} color={theme.colors.themeColor} />
+            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Message</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            onPress={() => {}}
+            onPress={() => startGroupCall('audio')}
             activeOpacity={0.7}
             style={[styles.quickBtn, { backgroundColor: cardBg }]}
           >
-            <Ionicons name="search-outline" size={20} color={theme.colors.themeColor} />
-            <Text style={[styles.quickBtnLabel, { color: theme.colors.primaryTextColor }]}>Search</Text>
+            <Ionicons name="call" size={21} color={theme.colors.themeColor} />
+            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Audio</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            onPress={() => Alert.alert('Report Group', 'Are you sure?', [
-              { text: 'Cancel', style: 'cancel' },
-              { text: 'Report', style: 'destructive', onPress: () => showToast('Group reported') },
-            ])}
+            onPress={() => startGroupCall('video')}
             activeOpacity={0.7}
             style={[styles.quickBtn, { backgroundColor: cardBg }]}
           >
-            <Ionicons name="flag-outline" size={20} color="#F0A030" />
-            <Text style={[styles.quickBtnLabel, { color: theme.colors.primaryTextColor }]}>Report</Text>
+            <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
+            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Video</Text>
           </TouchableOpacity>
         </View>
 
         {/* ═══ DESCRIPTION CARD ═══ */}
         {description ? (
-          <>
-            <View style={[styles.divider, { backgroundColor: dividerBg }]} />
-            <View style={styles.infoCard}>
-              <Text style={[styles.infoCardLabel, { color: theme.colors.placeHolderTextColor }]}>Description</Text>
+          <View style={[styles.gCard, { backgroundColor: cardBg }]}>
+            <View style={styles.gCardPad}>
+              <Text style={[styles.infoCardLabel, { color: theme.colors.themeColor }]}>Description</Text>
               <Text style={[styles.infoCardValue, { color: theme.colors.primaryTextColor }]}>{description}</Text>
             </View>
-          </>
+          </View>
         ) : null}
 
         {/* ═══ GROUP DETAILS CARD ═══ */}
-        <View style={[styles.divider, { backgroundColor: dividerBg }]} />
-        <View style={styles.detailsCard}>
+        <View style={[styles.gCard, { backgroundColor: cardBg }]}>
           {/* Created */}
           <View style={styles.detailRow}>
-            <View style={[styles.detailIcon, { backgroundColor: '#6C5CE7' + '15' }]}>
+            <View style={[styles.detailIcon, { backgroundColor: '#6C5CE7' + '18' }]}>
               <Ionicons name="calendar-outline" size={16} color="#6C5CE7" />
             </View>
             <View style={styles.detailText}>
-              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Created</Text>
               <Text style={[styles.detailValue, { color: theme.colors.primaryTextColor }]}>
                 {formatDate(createdAt)}{createdAt ? ` at ${formatTime(createdAt)}` : ''}
               </Text>
+              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Created</Text>
             </View>
           </View>
+          <View style={[styles.rowDivider, { backgroundColor: dividerBg }]} />
 
           {/* Created By */}
           <View style={styles.detailRow}>
-            <View style={[styles.detailIcon, { backgroundColor: '#00B894' + '15' }]}>
+            <View style={[styles.detailIcon, { backgroundColor: '#00B894' + '18' }]}>
               <Ionicons name="person-outline" size={16} color="#00B894" />
             </View>
             <View style={styles.detailText}>
-              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Created by</Text>
               <Text style={[styles.detailValue, { color: theme.colors.primaryTextColor }]}>{ownerName}</Text>
+              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Created by</Text>
             </View>
           </View>
-
-          {/* Members count */}
-          <View style={styles.detailRow}>
-            <View style={[styles.detailIcon, { backgroundColor: '#0984E3' + '15' }]}>
-              <Ionicons name="people-outline" size={16} color="#0984E3" />
-            </View>
-            <View style={styles.detailText}>
-              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Members</Text>
-              <Text style={[styles.detailValue, { color: theme.colors.primaryTextColor }]}>
-                {memberCount} total{adminCount > 0 ? ` · ${adminCount} admin${adminCount > 1 ? 's' : ''}` : ''}
-              </Text>
-            </View>
-          </View>
-
-          {/* Status */}
-          <View style={styles.detailRow}>
-            <View style={[styles.detailIcon, { backgroundColor: isActive ? '#25D366' + '15' : '#E53935' + '15' }]}>
-              <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: isActive ? '#25D366' : '#E53935' }} />
-            </View>
-            <View style={styles.detailText}>
-              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Status</Text>
-              <Text style={[styles.detailValue, { color: isActive ? '#25D366' : '#E53935' }]}>{isActive ? 'Active' : 'Inactive'}</Text>
-            </View>
-          </View>
+          <View style={[styles.rowDivider, { backgroundColor: dividerBg }]} />
 
           {/* Your Role */}
           <View style={styles.detailRow}>
-            <View style={[styles.detailIcon, { backgroundColor: '#E84393' + '15' }]}>
+            <View style={[styles.detailIcon, { backgroundColor: '#E84393' + '18' }]}>
               <Ionicons name="shield-checkmark-outline" size={16} color="#E84393" />
             </View>
             <View style={styles.detailText}>
-              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Your role</Text>
               <Text style={[styles.detailValue, { color: theme.colors.primaryTextColor, textTransform: 'capitalize' }]}>{myRole}</Text>
+              <Text style={[styles.detailLabel, { color: theme.colors.placeHolderTextColor }]}>Your role</Text>
             </View>
           </View>
         </View>
 
         {/* ═══ MEMBERS SECTION ═══ */}
-        <View style={[styles.divider, { backgroundColor: dividerBg }]} />
-        <View style={styles.membersSection}>
-          <View style={styles.membersSectionHeader}>
-            <Ionicons name="people" size={16} color={theme.colors.placeHolderTextColor} />
-            <Text style={[styles.sectionTitle, { color: theme.colors.placeHolderTextColor }]}>
-              {memberCount} PARTICIPANTS
-            </Text>
-          </View>
-
+        <Text style={[styles.gSectionLabel, { color: theme.colors.placeHolderTextColor }]}>
+          {memberCount} {memberCount === 1 ? 'PARTICIPANT' : 'PARTICIPANTS'}
+        </Text>
+        <View style={[styles.gCard, { backgroundColor: cardBg }]}>
           {canAddMembers && (
             <TouchableOpacity onPress={() => navigation.navigate('AddGroupMembers', { groupId, existingMemberIds: members.map((m) => getMemberUser(m).id).filter(Boolean) })} activeOpacity={0.6} style={styles.addMemberRow}>
               <View style={[styles.addMemberIcon, { backgroundColor: theme.colors.themeColor }]}>
                 <Ionicons name="person-add" size={18} color="#fff" />
               </View>
-              <Text style={[styles.addMemberText, { color: theme.colors.themeColor }]}>Add Participants</Text>
+              <Text style={[styles.addMemberText, { color: theme.colors.themeColor }]}>Add participants</Text>
             </TouchableOpacity>
           )}
-
           {members.map((member, i) => renderMember(member, i))}
         </View>
 
         {/* ═══ ACTIONS ═══ */}
-        <View style={[styles.divider, { backgroundColor: dividerBg }]} />
-        <View style={styles.actionsSection}>
+        <View style={[styles.gCard, { backgroundColor: cardBg, marginBottom: 18 }]}>
           {canTransferOwnership && members.length > 1 && (
             <TouchableOpacity onPress={() => setTransferModalVisible(true)} activeOpacity={0.6} style={styles.actionRow}>
-              <View style={[styles.actionIcon, { backgroundColor: theme.colors.themeColor + '12' }]}>
+              <View style={[styles.actionIcon, { backgroundColor: theme.colors.themeColor + '14' }]}>
                 <MaterialCommunityIcons name="account-switch" size={20} color={theme.colors.themeColor} />
               </View>
-              <Text style={[styles.actionLabel, { color: theme.colors.themeColor }]}>Transfer Ownership</Text>
+              <Text style={[styles.actionLabel, { color: theme.colors.themeColor }]}>Transfer ownership</Text>
               <Ionicons name="chevron-forward" size={16} color={theme.colors.placeHolderTextColor} />
             </TouchableOpacity>
           )}
 
           <TouchableOpacity onPress={handleExitGroup} activeOpacity={0.6} style={styles.actionRow}>
-            <View style={[styles.actionIcon, { backgroundColor: '#E5393512' }]}>
+            <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
               <Ionicons name="exit-outline" size={20} color="#E53935" />
             </View>
-            <Text style={[styles.actionLabel, { color: '#E53935' }]}>Exit Group</Text>
-            <Ionicons name="chevron-forward" size={16} color={theme.colors.placeHolderTextColor} />
+            <Text style={[styles.actionLabel, { color: '#E53935' }]}>Exit group</Text>
           </TouchableOpacity>
 
           {canDeleteGroup && (
             <TouchableOpacity onPress={handleDeleteGroup} activeOpacity={0.6} style={styles.actionRow}>
-              <View style={[styles.actionIcon, { backgroundColor: '#E5393512' }]}>
+              <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
                 <Ionicons name="trash-outline" size={20} color="#E53935" />
               </View>
-              <Text style={[styles.actionLabel, { color: '#E53935' }]}>Delete Group</Text>
-              <Ionicons name="chevron-forward" size={16} color={theme.colors.placeHolderTextColor} />
+              <Text style={[styles.actionLabel, { color: '#E53935' }]}>Delete group</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -580,25 +628,26 @@ const styles = StyleSheet.create({
   },
 
   // Quick Actions
-  quickActions: { flexDirection: 'row', justifyContent: 'center', paddingHorizontal: 20, gap: 12, paddingBottom: 12 },
-  quickBtn: { flex: 1, alignItems: 'center', paddingVertical: 14, borderRadius: 14, gap: 6 },
-  quickBtnLabel: { fontFamily: 'Roboto-Medium', fontSize: 12 },
+  quickActions: { flexDirection: 'row', justifyContent: 'center', paddingHorizontal: 10, gap: 8, paddingTop: 12, paddingBottom: 2 },
+  quickBtn: { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 14, gap: 5 },
+  quickBtnLabel: { fontFamily: 'Roboto-Medium', fontSize: 12.5, letterSpacing: 0.1 },
 
-  // Divider
-  divider: { height: 6 },
+  // Grouped inset card (WhatsApp)
+  gCard: { marginHorizontal: 10, marginTop: 12, borderRadius: 14, overflow: 'hidden' },
+  gCardPad: { paddingHorizontal: 16, paddingVertical: 14 },
+  gSectionLabel: { fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.8, marginTop: 16, marginBottom: 4, paddingHorizontal: 22 },
+  rowDivider: { height: StyleSheet.hairlineWidth, marginLeft: 62 },
 
-  // Info Card
-  infoCard: { paddingHorizontal: 20, paddingVertical: 14 },
-  infoCardLabel: { fontFamily: 'Roboto-SemiBold', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 },
-  infoCardValue: { fontFamily: 'Roboto-Regular', fontSize: 14, lineHeight: 20 },
+  // Description
+  infoCardLabel: { fontFamily: 'Roboto-Medium', fontSize: 13, marginBottom: 5 },
+  infoCardValue: { fontFamily: 'Roboto-Regular', fontSize: 15, lineHeight: 21 },
 
   // Details Card
-  detailsCard: { paddingHorizontal: 16, paddingVertical: 8 },
-  detailRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, gap: 14 },
-  detailIcon: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
-  detailText: { flex: 1, gap: 1 },
-  detailLabel: { fontFamily: 'Roboto-Regular', fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.3 },
-  detailValue: { fontFamily: 'Roboto-Medium', fontSize: 14 },
+  detailRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 14, gap: 14 },
+  detailIcon: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center' },
+  detailText: { flex: 1, gap: 2 },
+  detailLabel: { fontFamily: 'Roboto-Regular', fontSize: 12.5 },
+  detailValue: { fontFamily: 'Roboto-Medium', fontSize: 15 },
 
   // Members
   membersSection: { paddingTop: 8 },

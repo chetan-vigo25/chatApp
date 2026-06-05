@@ -34,6 +34,7 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
+import { useSelector } from "react-redux";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as MediaLibrary from 'expo-media-library';
@@ -43,12 +44,13 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
 import { mediaDownloadSigned, toSecureMediaUri } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
+import ChatWallpaper from '../../components/ChatWallpaper';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import MentionText from '../../components/MentionText';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
@@ -65,6 +67,9 @@ import useSaveContact from '../../hooks/useSaveContact';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import * as ScreenCapture from 'expo-screen-capture';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
+import CallButtons from '../../calls/components/CallButtons';
+import GroupCallButtons from '../../calls/components/GroupCallButtons';
+import CallMessageBubble from '../../calls/components/CallMessageBubble';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -88,35 +93,77 @@ const MEDIA_PANEL_OPTIONS = [
   { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', color: '#10B981' },
 ];
 
-const CHAT_WALLPAPER_TEXTURE = require('../../../assets/images/chat-background.jpg');
-
-const ChatWallpaperLayer = React.memo(function ChatWallpaperLayer({ isDarkMode }) {
-  // WhatsApp-style: no overlay — background color shows through, image as subtle doodle pattern
-  return (
-    <View pointerEvents="none" style={[wpStyles.container, {
-      backgroundColor: isDarkMode ? '#0B141A' : '#E4DDD6',
-    }]}>
-      <Image
-        source={CHAT_WALLPAPER_TEXTURE}
-        resizeMode="cover"
-        style={[wpStyles.image, {
-          opacity: isDarkMode ? 0.04 : 0.35,
-        }]}
-      />
-    </View>
-  );
-});
-
-const wpStyles = StyleSheet.create({
-  container: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 },
-  image: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, width: '100%', height: '100%' },
-});
+// Theme-aware chat wallpaper. Rendered as a tiled SVG doodle pattern
+// (WhatsApp-style) — see components/ChatWallpaper. No raster image assets.
 
 const EMOJI_SECTIONS = {
-  smileys: ['😀', '😄', '😁', '😂', '😊', '😍', '😘', '😎', '🤩', '🥰', '😇', '🤗', '🙂', '🙃', '😉', '🤔', '😴', '😭', '😤', '🥲'],
-  animals: ['🐶', '🐱', '🐼', '🦁', '🐯', '🐮', '🐸', '🐵', '🐨', '🐰', '🦊', '🐧', '🐦', '🦄', '🐙', '🦋', '🐢', '🐬', '🦜', '🐘'],
-  food: ['🍎', '🍇', '🍉', '🍌', '🍕', '🍔', '🍟', '🌮', '🍣', '🍩', '🍪', '🍫', '🍿', '🥗', '🍜', '🍛', '🍦', '🍓', '🥑', '☕'],
-  activities: ['⚽', '🏀', '🏏', '🏸', '🎮', '🎯', '🎸', '🎹', '🎬', '📸', '✈️', '🏖️', '🚴', '🏃', '🧘', '🎉', '🎁', '🏆', '🎲', '🧩'],
+  smileys: [
+    '😀', '😃', '😄', '😁', '😆', '😅', '🤣', '😂', '🙂', '🙃', '🫠', '😉', '😊', '😇',
+    '🥰', '😍', '🤩', '😘', '😗', '😚', '😙', '🥲', '😋', '😛', '😜', '🤪', '😝', '🤑',
+    '🤗', '🤭', '🫢', '🫣', '🤫', '🤔', '🫡', '🤐', '🤨', '😐', '😑', '😶', '🫥', '😏',
+    '😒', '🙄', '😬', '🤥', '😌', '😔', '😪', '🤤', '😴', '😷', '🤒', '🤕', '🤢', '🤮',
+    '🤧', '🥵', '🥶', '🥴', '😵', '🤯', '🤠', '🥳', '🥸', '😎', '🤓', '🧐', '😕', '🫤',
+    '😟', '🙁', '😮', '😯', '😲', '😳', '🥺', '🥹', '😦', '😧', '😨', '😰', '😥', '😢',
+    '😭', '😱', '😖', '😣', '😞', '😓', '😩', '😫', '🥱', '😤', '😡', '😠', '🤬', '😈',
+    '👿', '💀', '💩', '🤡', '👹', '👺', '👻', '👽', '🤖', '😺', '😸', '😹', '😻', '😼',
+  ],
+  gestures: [
+    '👋', '🤚', '🖐️', '✋', '🖖', '🫱', '🫲', '🫳', '🫴', '👌', '🤌', '🤏', '✌️', '🤞',
+    '🫰', '🤟', '🤘', '🤙', '👈', '👉', '👆', '🖕', '👇', '☝️', '👍', '👎', '✊', '👊',
+    '🤛', '🤜', '👏', '🙌', '🫶', '👐', '🤲', '🙏', '✍️', '💅', '🤳', '💪', '🦾', '🦵',
+    '🦶', '👂', '👃', '🧠', '👀', '👁️', '👅', '👄', '🫦', '💋', '🩸', '💯', '💢', '💥',
+  ],
+  animals: [
+    '🐶', '🐱', '🐭', '🐹', '🐰', '🦊', '🐻', '🐼', '🐻‍❄️', '🐨', '🐯', '🦁', '🐮', '🐷',
+    '🐸', '🐵', '🙈', '🙉', '🙊', '🐒', '🐔', '🐧', '🐦', '🐤', '🦆', '🦅', '🦉', '🦇',
+    '🐺', '🐗', '🐴', '🦄', '🐝', '🪲', '🐛', '🦋', '🐌', '🐞', '🐜', '🦗', '🕷️', '🦂',
+    '🐢', '🐍', '🦎', '🦖', '🐙', '🦑', '🦐', '🦀', '🐡', '🐠', '🐟', '🐬', '🐳', '🐋',
+    '🦈', '🐊', '🐅', '🐆', '🦓', '🦍', '🦣', '🐘', '🦏', '🐪', '🐫', '🦒', '🦘', '🐃',
+    '🐎', '🐖', '🐏', '🐑', '🐐', '🦌', '🐕', '🐩', '🐈', '🐓', '🦃', '🦚', '🦜', '🐉',
+    '🌵', '🌲', '🌳', '🌴', '🌱', '🌿', '☘️', '🍀', '🎋', '🍃', '🍂', '🍁', '🌾', '🌷',
+    '🌹', '🥀', '🌺', '🌸', '🌼', '🌻', '🌞', '🌝', '🌙', '⭐', '🌟', '✨', '⚡', '🔥',
+  ],
+  food: [
+    '🍏', '🍎', '🍐', '🍊', '🍋', '🍌', '🍉', '🍇', '🍓', '🫐', '🍈', '🍒', '🍑', '🥭',
+    '🍍', '🥥', '🥝', '🍅', '🍆', '🥑', '🥦', '🥬', '🥒', '🌶️', '🫑', '🌽', '🥕', '🫒',
+    '🧄', '🧅', '🥔', '🍠', '🥐', '🥯', '🍞', '🥖', '🧀', '🥚', '🍳', '🧈', '🥞', '🧇',
+    '🥓', '🥩', '🍗', '🍖', '🌭', '🍔', '🍟', '🍕', '🥪', '🌮', '🌯', '🫔', '🥗', '🥘',
+    '🍝', '🍜', '🍲', '🍛', '🍣', '🍱', '🥟', '🦪', '🍤', '🍙', '🍚', '🍘', '🍥', '🥠',
+    '🍢', '🍡', '🍧', '🍨', '🍦', '🥧', '🧁', '🍰', '🎂', '🍮', '🍭', '🍬', '🍫', '🍿',
+    '🍩', '🍪', '🌰', '🥜', '🍯', '🥛', '🍼', '☕', '🍵', '🧃', '🥤', '🧋', '🍺', '🍷',
+  ],
+  activities: [
+    '⚽', '🏀', '🏈', '⚾', '🥎', '🎾', '🏐', '🏉', '🥏', '🎱', '🪀', '🏓', '🏸', '🏒',
+    '🏑', '🥍', '🏏', '🥅', '⛳', '🪁', '🎣', '🤿', '🎽', '🛹', '🛼', '🛷', '⛸️', '🥌',
+    '🎿', '⛷️', '🏂', '🏋️', '🤼', '🤸', '⛹️', '🤺', '🤾', '🏌️', '🏇', '🧘', '🏄', '🏊',
+    '🤽', '🚣', '🧗', '🚵', '🚴', '🏆', '🥇', '🥈', '🥉', '🏅', '🎖️', '🎗️', '🎫', '🎟️',
+    '🎪', '🤹', '🎭', '🎨', '🎬', '🎤', '🎧', '🎼', '🎹', '🥁', '🎷', '🎺', '🎸', '🪕',
+    '🎻', '🎲', '♟️', '🎯', '🎳', '🎮', '🕹️', '🎰', '🧩', '🎉', '🎊', '🎈', '🎁', '🎀',
+  ],
+  travel: [
+    '🚗', '🚕', '🚙', '🚌', '🚎', '🏎️', '🚓', '🚑', '🚒', '🚐', '🛻', '🚚', '🚛', '🚜',
+    '🦯', '🦽', '🦼', '🛴', '🚲', '🛵', '🏍️', '🛺', '🚨', '🚔', '🚍', '🚘', '🚖', '🚡',
+    '🚠', '🚟', '🚃', '🚋', '🚞', '🚝', '🚄', '🚅', '🚈', '🚂', '🚆', '🚇', '🚊', '🚉',
+    '✈️', '🛫', '🛬', '🛩️', '💺', '🛰️', '🚀', '🛸', '🚁', '🛶', '⛵', '🚤', '🛥️', '🛳️',
+    '⛴️', '🚢', '⚓', '⛽', '🚧', '🚦', '🚥', '🗺️', '🗿', '🗽', '🗼', '🏰', '🏯', '🏟️',
+    '🎡', '🎢', '🎠', '⛲', '⛱️', '🏖️', '🏝️', '🏜️', '🌋', '⛰️', '🏔️', '🗻', '🏕️', '⛺',
+  ],
+  objects: [
+    '⌚', '📱', '💻', '⌨️', '🖥️', '🖨️', '🖱️', '💽', '💾', '💿', '📷', '📸', '📹', '🎥',
+    '📞', '☎️', '📟', '📠', '📺', '📻', '🎙️', '⏰', '⏱️', '⏲️', '🕰️', '🔋', '🔌', '💡',
+    '🔦', '🕯️', '🧯', '🛢️', '💸', '💵', '💴', '💶', '💷', '🪙', '💰', '💳', '💎', '⚖️',
+    '🔧', '🔨', '⚒️', '🛠️', '🪛', '🔩', '⚙️', '🧰', '🧲', '🔫', '💣', '🪦', '🔪', '🗡️',
+    '🚪', '🪑', '🚽', '🚿', '🛁', '🧴', '🧷', '🧹', '🧺', '🧻', '🪣', '🧼', '🪥', '🧽',
+    '🔑', '🗝️', '🔒', '🔓', '📦', '📫', '📬', '📭', '✉️', '📧', '📝', '📚', '📖', '🔖',
+  ],
+  symbols: [
+    '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔', '❣️', '💕', '💞', '💓',
+    '💗', '💖', '💘', '💝', '💟', '☮️', '✝️', '☪️', '🕉️', '☸️', '✡️', '🔯', '🕎', '☯️',
+    '☦️', '⛎', '♈', '♉', '♊', '♋', '♌', '♍', '♎', '♏', '♐', '♑', '♒', '♓',
+    '🆔', '⚛️', '🉑', '☢️', '☣️', '📴', '📳', '🈶', '🈚', '🈸', '🈺', '🈷️', '✴️', '🆚',
+    '✅', '❎', '➕', '➖', '➗', '✖️', '♾️', '‼️', '⁉️', '❓', '❔', '❕', '❗', '〰️',
+    '🔆', '🔅', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️', '✳️', '❇️', '💲', '💱', '©️', '®️',
+  ],
 };
 
 const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
@@ -352,12 +399,12 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
             height: 52,
             borderRadius: 26,
             backgroundColor: ((!text.trim() && !pendingMedia) || isSearching)
-              ? (chatColor || 'rgba(37, 160, 235, 0.74)')
-              : (chatColor || '#1DA1F2'),
+              ? (chatColor || 'rgba(0,168,132,0.5)')
+              : (chatColor || '#00A884'),
             alignItems: 'center',
             justifyContent: 'center',
             opacity: 1,
-            shadowColor: chatColor || '#0B4667',
+            shadowColor: chatColor || '#00A884',
             shadowOffset: { width: 0, height: 6 },
             shadowOpacity: 0.42,
             shadowRadius: 10,
@@ -631,7 +678,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
   const cardBg = isDarkMode ? '#1a2b3c' : '#fff';
   const textColor = isDarkMode ? '#EDF6FC' : '#111';
   const subColor = isDarkMode ? 'rgba(200,216,228,0.6)' : '#666';
-  const accentColor = theme.colors.themeColor || '#1DA1F2';
+  const accentColor = theme.colors.themeColor || '#00A884';
   const borderColor = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
 
   const saveContactToDevice = () => {
@@ -687,7 +734,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
             <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On TalksTry</Text>
+            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On VibeConnect Messenger</Text>
           </View>
         )}
 
@@ -1096,13 +1143,6 @@ export default function ChatScreen({ navigation, route }) {
     minimumViewTime: 80
   }).current;
 
-  useEffect(() => {
-    const resolved = Image.resolveAssetSource(CHAT_WALLPAPER_TEXTURE);
-    if (resolved?.uri) {
-      Image.prefetch(resolved.uri).catch(() => {});
-    }
-  }, []);
-
   const getMessageDateKey = useCallback((msg) => {
     const rawTs = msg?.timestamp || msg?.createdAt || msg?.updatedAt || msg?.date || null;
     const parsed = moment(rawTs);
@@ -1481,6 +1521,7 @@ export default function ChatScreen({ navigation, route }) {
   const {
     flatListRef,
     chatData,
+    amNotGroupMember,
     getUserColor,
     groupMembersMap,
     messages,
@@ -1529,8 +1570,6 @@ export default function ChatScreen({ navigation, route }) {
     onRefresh,
     loadMoreMessages,
     currentUserId,
-    manualReloadMessages,
-    refreshMessagesFromLocal,
     isChatMuted,
     muteUntil,
     toggleChatMute,
@@ -1541,6 +1580,10 @@ export default function ChatScreen({ navigation, route }) {
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
+
+  // A blocked user (set by an admin) can still browse chats but cannot send.
+  // The server rejects sends too; this just gives immediate feedback.
+  const amBlocked = useSelector((s) => s?.profile?.isBlocked);
 
   // Sync chatData to ref for callbacks declared before destructuring (web TDZ fix)
   useEffect(() => { chatDataRef.current = chatData; }, [chatData]);
@@ -1653,15 +1696,17 @@ export default function ChatScreen({ navigation, route }) {
   const [reactionDetailModal, setReactionDetailModal] = useState({ visible: false, reactions: null, selectedEmoji: null, messageId: null });
   const reactionScaleAnims = useRef({}).current;
 
-  // Resolve userId to display name
+  // Resolve userId to display name — saved contact name (matched by id / phone
+  // hash) first, then member/peer name, then phone number.
   const getReactionUserName = useCallback((userId) => {
     if (userId === currentUserId) return 'You';
     const member = groupMembersMap?.[userId];
-    if (member?.fullName) return member.fullName;
-    // For 1-on-1 chats, use peer name
-    if (chatData?.peerUser?.fullName && !chatData?.isGroup) return chatData.peerUser.fullName;
-    return userId;
-  }, [currentUserId, groupMembersMap, chatData]);
+    const peer = !chatData?.isGroup ? chatData?.peerUser : null;
+    const fallback = member?.fullName || peer?.fullName || peer?.name || userId;
+    const phone = member?.mobileNumber
+      || peer?.mobileNumber || peer?.mobile?.number || peer?.phone || null;
+    return resolveContactName(userId, fallback, phone);
+  }, [currentUserId, groupMembersMap, chatData, resolveContactName]);
 
   // Local media viewer state
   const [localMediaViewer, setLocalMediaViewer] = useState({
@@ -2284,9 +2329,13 @@ export default function ChatScreen({ navigation, route }) {
   const emojiSectionsMeta = useMemo(() => ([
     { key: 'recent', label: 'Recent', icon: 'time-outline' },
     { key: 'smileys', label: 'Smileys', icon: 'happy-outline' },
-    { key: 'animals', label: 'Animals', icon: 'paw-outline' },
+    { key: 'gestures', label: 'Gestures', icon: 'hand-left-outline' },
+    { key: 'animals', label: 'Animals & Nature', icon: 'paw-outline' },
     { key: 'food', label: 'Food', icon: 'pizza-outline' },
     { key: 'activities', label: 'Activities', icon: 'football-outline' },
+    { key: 'travel', label: 'Travel', icon: 'airplane-outline' },
+    { key: 'objects', label: 'Objects', icon: 'bulb-outline' },
+    { key: 'symbols', label: 'Symbols', icon: 'heart-outline' },
   ]), []);
 
   const activeEmojiList = useMemo(() => {
@@ -2453,6 +2502,12 @@ export default function ChatScreen({ navigation, route }) {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     setShowEmojiPanel(false);
 
+    // Blocked accounts can't send anything — text, media, contact or voice note.
+    if (amBlocked) {
+      Alert.alert('Account blocked', 'Your account has been blocked by an admin. You cannot send messages.');
+      return;
+    }
+
     // Handle edit mode submission
     if (editingMessage) {
       if (text.trim()) {
@@ -2480,6 +2535,10 @@ export default function ChatScreen({ navigation, route }) {
     // Extract mentions before sending (text gets cleared after send)
     const mentions = isGroupChat ? getMentionsPayload(text) : undefined;
     // Fire-and-forget: message appears instantly via optimistic UI, no need to await
+    if (amBlocked) {
+      Alert.alert('Account blocked', 'Your account has been blocked by an admin. You cannot send messages.');
+      return;
+    }
     handleSendText(mentions).catch(err => console.warn('[Send] error:', err?.message));
     if (isGroupChat) resetMentions();
   };
@@ -3065,15 +3124,6 @@ export default function ChatScreen({ navigation, route }) {
     Alert.alert('Mute notifications', 'Choose mute duration', options);
   };
 
-  const handleMenuReload = async () => {
-    setShowMenu(false);
-    await manualReloadMessages();
-  };
-
-  const handleMenuLocalRefresh = async () => {
-    setShowMenu(false);
-    await refreshMessagesFromLocal();
-  };
 
   // Animated open/close for the WhatsApp-style dropdown popover
   const openChatMenu = useCallback(() => {
@@ -3142,11 +3192,11 @@ export default function ChatScreen({ navigation, route }) {
   }, [clearChatForEveryone, isDeletingEveryone]);
 
   const renderChatEmptyState = useCallback(() => (
-    // The list is `inverted` (flipped vertically via scaleY:-1), so this empty
-    // component renders upside down unless we flip it back. Counter with the
-    // exact inverse — scaleY:-1 — on BOTH platforms. (rotate:180deg also flips
-    // horizontally, which mirrors the text on iOS.)
-    <View style={{ flexGrow: 1, justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 24, paddingBottom: 20, transform: [{ scaleY: -1 }] }}>
+    // Rendered as a normal (non-inverted) overlay OUTSIDE the inverted FlatList,
+    // so NO inversion transform is applied — text stays upright on both iOS and
+    // Android (incl. the new architecture, where a manual scaleY:-1 inside an
+    // inverted list was rendering mirrored).
+    <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 }}>
       <View style={{
         backgroundColor: isDarkMode ? 'rgba(25,40,55,0.85)' : 'rgba(225,230,236,0.85)',
         paddingHorizontal: 14,
@@ -3237,7 +3287,7 @@ export default function ChatScreen({ navigation, route }) {
     const parts = (textToHighlight || "").split(regex);
     return parts.map((part, i) => 
       part.toLowerCase() === searchQuery.toLowerCase() 
-        ? <Text key={i} style={{ backgroundColor: '#FFEB3B', color: '#000', fontWeight: '600' }}>{part}</Text> 
+        ? <Text key={i} style={{ backgroundColor: '#FFEB3B', color: '#000', fontFamily: 'Roboto-SemiBold' }}>{part}</Text>
         : part
     );
   };
@@ -3428,7 +3478,7 @@ export default function ChatScreen({ navigation, route }) {
 
     const baseColor = isMyMessage ? '#FFFFFF' : theme.colors.primaryTextColor;
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
-    const mentionColor = isMyMessage ? '#D8ECFF' : '#1DA1F2';
+    const mentionColor = isMyMessage ? '#D8ECFF' : '#00A884';
     const msgMentions = msg?.mentions || msg?.payload?.mentions;
 
     const handleMeasureLayout = (event) => {
@@ -3849,7 +3899,7 @@ export default function ChatScreen({ navigation, route }) {
     const isDownloading = dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
     const canPlay = isMyMessage || downloaded;
     const bubbleColor = isMyMessage
-      ? (chatColor || '#1DA1F2')
+      ? (chatColor || '#00A884')
       : (isDarkMode ? 'rgba(30, 45, 60, 0.95)' : '#fff');
     const textColor = isMyMessage ? '#fff' : theme.colors.primaryTextColor;
     const subColor = isMyMessage ? 'rgba(255,255,255,0.65)' : theme.colors.placeHolderTextColor;
@@ -4156,7 +4206,7 @@ export default function ChatScreen({ navigation, route }) {
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
                 <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
-                  On TalksTry
+                  On VibeConnect Messenger
                 </Text>
               </View>
             )}
@@ -4228,10 +4278,34 @@ export default function ChatScreen({ navigation, route }) {
     const isFile = msg.type === 'file' || msg.type === 'document';
     const isLocation = msg.type === 'location' || msg.mediaType === 'location';
     const isContact = msg.type === 'contact' || msg.mediaType === 'contact';
+    const isCall = (msg.type === 'call' || msg.messageType === 'call') && !isDeletedMessage;
     const isMediaMessage = isImage || isVideo || isAudio || isFile || isLocation || isContact;
     const inlineMediaTime = !isDeletedMessage && (isImage || isVideo || isAudio || isLocation || isContact);
 
     const dateBadgeKey = shouldShowDateAbove(msg, index, messages);
+
+    // ── Call log entry (audio/video call, missed/outgoing/incoming) ──
+    if (isCall) {
+      return (
+        <React.Fragment>
+          {dateBadgeKey && (
+            <View style={{ alignItems: 'center', paddingVertical: 8 }}>
+              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12 }}>
+                <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>{dateBadgeKey}</Text>
+              </View>
+            </View>
+          )}
+          <View style={{ paddingHorizontal: 12 }}>
+            <CallMessageBubble
+              msg={msg}
+              peer={chatData?.peerUser}
+              chatId={chatData?.chatId || chatData?._id || route?.params?.chatId}
+              timeText={msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
+            />
+          </View>
+        </React.Fragment>
+      );
+    }
 
     // ── System messages (group created, member joined/left/removed) ──
     if (isSystemMessage) {
@@ -4264,6 +4338,32 @@ export default function ChatScreen({ navigation, route }) {
         </React.Fragment>
       );
     }
+
+    // Group chats only: show the SENDER's avatar beside RECEIVED messages.
+    // Tapping it opens that member's profile. Own messages get no avatar.
+    const isGroupChatRow = chatData?.chatType === 'group' || chatData?.isGroup;
+    const showSenderAvatar = !isMyMessage && isGroupChatRow && !isSystemMessage;
+    const senderMeta = showSenderAvatar ? (groupMembersMap?.[msg.senderId] || {}) : {};
+    const senderAvatarUri = senderMeta.profileImage ? toSecureMediaUri(senderMeta.profileImage) : null;
+    // Always prefer the device's saved contact name for this user (registered
+    // contact name). When they're NOT a saved contact, show their phone number
+    // (passed as the 3rd arg), and only fall back to the backend/profile name
+    // when no number is known — matching the contacts-app behaviour the user
+    // expects in group chats.
+    const senderLabel = resolveContactName(
+      msg.senderId,
+      senderMeta.fullName || msg.senderName || 'Member',
+      senderMeta.mobileNumber
+    );
+    const openSenderProfile = () => {
+      if (!msg.senderId) return;
+      navigation.navigate('UserB', {
+        item: {
+          peerUser: { _id: msg.senderId, fullName: senderLabel, profileImage: senderMeta.profileImage || null },
+          chatType: 'private',
+        },
+      });
+    };
 
     return (
       <React.Fragment>
@@ -4300,17 +4400,31 @@ export default function ChatScreen({ navigation, route }) {
             }
           }}
           delayLongPress={300}
-          style={{ 
-            alignItems: isMyMessage ? "flex-end" : "flex-start", 
-            paddingVertical: 2, 
-            paddingHorizontal: 12, 
-            backgroundColor: isSelected 
+          style={{
+            flexDirection: showSenderAvatar ? "row" : "column",
+            alignItems: showSenderAvatar ? "flex-start" : (isMyMessage ? "flex-end" : "flex-start"),
+            paddingVertical: 2,
+            paddingHorizontal: 12,
+            backgroundColor: isSelected
               ? theme.colors.themeColor + '20'
               : isHighlighted 
                 ? 'rgba(255, 193, 7, 0.15)' 
                 : "transparent",
           }}
         >
+          {showSenderAvatar && (
+            <TouchableOpacity onPress={openSenderProfile} activeOpacity={0.7} style={{ marginRight: 6, marginTop: 2 }}>
+              {senderAvatarUri ? (
+                <Image source={{ uri: senderAvatarUri }} style={{ width: 30, height: 30, borderRadius: 15 }} />
+              ) : (
+                <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: getUserColor?.(msg.senderId) || theme.colors.themeColor, alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 13 }}>
+                    {String(senderLabel || 'M').charAt(0).toUpperCase()}
+                  </Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          )}
           <View style={{
             maxWidth: "80%",
             borderRadius: 18,
@@ -4341,9 +4455,16 @@ export default function ChatScreen({ navigation, route }) {
                   marginBottom: 2,
                   paddingRight: 8,
                 }}>
-                {msg.senderName
-                  || groupMembersMap?.[msg.senderId]?.fullName
-                  || 'Member'}
+                {/* Saved contact → device contact name. Not saved → phone
+                    number (3rd arg). Backend/profile name is only the final
+                    fallback when no number is known. */}
+                {resolveContactName(
+                  msg.senderId,
+                  groupMembersMap?.[msg.senderId]?.fullName
+                    || msg.senderName
+                    || 'Member',
+                  groupMembersMap?.[msg.senderId]?.mobileNumber
+                )}
               </Text>
             )}
 
@@ -4397,8 +4518,10 @@ export default function ChatScreen({ navigation, route }) {
               // server-side name. Own status keeps its server name (it's you).
               const isOwnStatus = sp.ownerId && currentUserId
                 && String(sp.ownerId) === String(currentUserId);
+              // Own status → show "Your status". Otherwise resolve the owner's
+              // display name (saved contact → phone → server name).
               const resolvedOwnerName = isOwnStatus
-                ? (sp.ownerName || 'You')
+                ? sp.ownerName
                 : resolveContactName(
                     sp.ownerId,
                     sp.ownerName,
@@ -4412,6 +4535,7 @@ export default function ChatScreen({ navigation, route }) {
                   statusRef={msg.statusRef}
                   statusPreview={resolvedPreview}
                   isMyMessage={isMyMessage}
+                  isOwnStatus={isOwnStatus}
                   chatColor={chatColor}
                   theme={theme}
                   onPress={handleOpenStatusFromChat}
@@ -4450,6 +4574,17 @@ export default function ChatScreen({ navigation, route }) {
                   replySName = groupMembersMap?.[replySId]?.fullName
                     || (sameId(replySId, currentUserId) ? 'You' : null);
                 }
+              }
+
+              // Keep the quoted-sender label consistent with the bubble label:
+              // saved contact name → phone number → backend name. Leave "You"
+              // (own messages) untouched.
+              if (replySId && !sameId(replySId, currentUserId)) {
+                replySName = resolveContactName(
+                  replySId,
+                  replySName || groupMembersMap?.[replySId]?.fullName || 'Member',
+                  groupMembersMap?.[replySId]?.mobileNumber
+                );
               }
 
               return (
@@ -4753,15 +4888,41 @@ export default function ChatScreen({ navigation, route }) {
   });
   const memberCanSend = myMemberRecord?.canSendMessage !== false;
   const messagingDisabled = isGroupChat && ((adminsOnlyMessaging && !isGroupAdmin) || !memberCanSend);
+
+  // Other members to ring for a group call (everyone except me). Resolves
+  // name/avatar from the populated member record or the groupMembersMap.
+  // NOTE: a plain computation (not useMemo) — this lives after the component's
+  // early returns above, so a hook here would break the rules-of-hooks order.
+  const groupCallPeers = (() => {
+    if (!isGroupChat) return [];
+    const out = [];
+    const seen = new Set();
+    (chatData?.members || []).forEach((m) => {
+      const u = (m && typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
+      const id = u._id || (typeof m?.userId === 'string' ? m.userId : null) || m?._id || m?.id;
+      if (!id) return;
+      const sid = String(id);
+      if (sid === String(currentUserId) || seen.has(sid)) return;
+      seen.add(sid);
+      const info = groupMembersMap?.[sid] || {};
+      const img = u.profileImage || info.profileImage || null;
+      out.push({
+        id: sid,
+        name: u.fullName || info.fullName || m?.name || 'Member',
+        avatar: img ? toSecureMediaUri(img) : null,
+      });
+    });
+    return out;
+  })();
   const messagingDisabledText = !memberCanSend
     ? 'You are restricted from sending messages'
     : 'Only admins can send messages';
 
   return (
-    <View style={{ flex: 1, backgroundColor: isDarkMode ? '#0b141a' : theme.colors.background }}>
-      <StatusBar backgroundColor={isDarkMode ? '#101D25' : theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+      <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
       <Animated.View style={{ flex: 1, paddingBottom: keyboardAnim }}>
-        <ChatWallpaperLayer isDarkMode={isDarkMode} />
+        <ChatWallpaper isDarkMode={isDarkMode} />
         
         {/* Header */}
         <ChatHeaderPresence
@@ -4925,6 +5086,18 @@ export default function ChatScreen({ navigation, route }) {
             );
           })() : (
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              {!isGroupChat ? (
+                <CallButtons
+                  peer={chatData.peerUser}
+                  chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
+                />
+              ) : (
+                <GroupCallButtons
+                  peers={groupCallPeers}
+                  groupId={chatData.chatId || chatData?._id || route?.params?.chatId}
+                  groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
+                />
+              )}
               {isChatMuted && (
                 <View style={{ marginRight: 8 }}>
                   <Ionicons name="notifications-off" size={20} color={theme.colors.placeHolderTextColor} />
@@ -5036,7 +5209,7 @@ export default function ChatScreen({ navigation, route }) {
         )}
 
         {/* Save Contact Banner — shown for unknown Vibe Connect users in 1:1 chats */}
-        {!isGroupChat && (isPeerUnknownContact || contactSavedSuccessfully) && (
+        {/* {!isGroupChat && (isPeerUnknownContact || contactSavedSuccessfully) && (
           <SaveContactBanner
             peerName={chatData?.peerUser?.fullName || chatData?.peerUser?.name || ''}
             isSaving={isContactSaving}
@@ -5045,7 +5218,7 @@ export default function ChatScreen({ navigation, route }) {
             saveError={contactSaveError}
             onSave={saveContact}
           />
-        )}
+        )} */}
 
         {/* Messages List */}
         {isSearching && messages.length === 0 ? (
@@ -5062,6 +5235,7 @@ export default function ChatScreen({ navigation, route }) {
             </Text>
           </View>
         ) : (
+          <View style={{ flex: 1 }}>
           <FlatList
             ref={flatListRef}
             data={messages}
@@ -5097,7 +5271,6 @@ export default function ChatScreen({ navigation, route }) {
             updateCellsBatchingPeriod={50}
             windowSize={11}
             ListFooterComponent={!isSearching ? renderFooter : null}
-            ListEmptyComponent={!isSearching ? renderChatEmptyState : null}
             maintainVisibleContentPosition={{
               minIndexForVisible: 0,
               autoscrollToTopThreshold: 5,
@@ -5113,6 +5286,15 @@ export default function ChatScreen({ navigation, route }) {
               }, 300);
             }}
           />
+          {/* Empty-state overlay — rendered outside the inverted list so it is
+              never affected by the inversion transform (fixes mirrored text on
+              Android new arch, correct on iOS too). */}
+          {!isSearching && !isLoadingInitial && messages.length === 0 && (
+            <View style={StyleSheet.absoluteFill} pointerEvents="none">
+              {renderChatEmptyState()}
+            </View>
+          )}
+          </View>
         )}
 
         <Animated.View
@@ -5374,10 +5556,10 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {messagingDisabled ? (
+        {(messagingDisabled || amBlocked || amNotGroupMember) ? (
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 14, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
             <Ionicons name="lock-closed-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
-            <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>{messagingDisabledText}</Text>
+            <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>{amNotGroupMember ? "You can't send messages because you're no longer a member of this group." : amBlocked ? "You can't send messages because your account has been blocked." : messagingDisabledText}</Text>
           </View>
         ) : (
           <ChatInputBar
@@ -5421,7 +5603,12 @@ export default function ChatScreen({ navigation, route }) {
             borderTopWidth: 0,
             borderTopColor: theme.colors.borderColor,
           }}>
-            <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', paddingHorizontal: 16, paddingTop: 6, paddingBottom: 4, gap: 20 }}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={{ flexGrow: 0, height: 44 }}
+              contentContainerStyle={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 18 }}
+            >
               {emojiSectionsMeta.map((section) => {
                 const active = section.key === activeEmojiSection;
                 return (
@@ -5430,12 +5617,12 @@ export default function ChatScreen({ navigation, route }) {
                     onPress={() => setActiveEmojiSection(section.key)}
                     activeOpacity={0.7}
                     style={{
+                      height: 44,
                       alignItems: 'center',
                       justifyContent: 'center',
-                      paddingVertical: 4,
                       paddingHorizontal: 6,
-                      borderBottomWidth: active ? 2 : 0,
-                      borderBottomColor: theme.colors.themeColor,
+                      borderBottomWidth: 2,
+                      borderBottomColor: active ? theme.colors.themeColor : 'transparent',
                     }}
                   >
                     <Ionicons
@@ -5448,7 +5635,7 @@ export default function ChatScreen({ navigation, route }) {
                   </TouchableOpacity>
                 );
               })}
-            </View>
+            </ScrollView>
 
             <ScrollView
               showsVerticalScrollIndicator={false}
@@ -5551,23 +5738,6 @@ export default function ChatScreen({ navigation, route }) {
                 onPress={() => { closeChatMenu(); setTimeout(() => handleOpenContactInfo(), 140); }}
                 theme={theme}
               />
-              <ChatMenuItem
-                icon="refresh-outline"
-                iconLib="Ionicons"
-                color="#00B894"
-                label="Reload"
-                onPress={() => { closeChatMenu(); setTimeout(() => handleMenuReload(), 140); }}
-                theme={theme}
-              />
-              <ChatMenuItem
-                icon="restore"
-                iconLib="MaterialIcons"
-                color="#F0A030"
-                label="Refresh local"
-                onPress={() => { closeChatMenu(); setTimeout(() => handleMenuLocalRefresh(), 140); }}
-                theme={theme}
-              />
-
               <View style={[chatMenuStyles.popoverDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)' }]} />
 
               <ChatMenuItem
@@ -5833,7 +6003,13 @@ export default function ChatScreen({ navigation, route }) {
               </TouchableOpacity>
               <View style={{ flex: 1, marginLeft: 12 }}>
                 <Text style={{ color: '#fff', fontSize: 15, fontFamily: 'Roboto-SemiBold' }} numberOfLines={1}>
-                  {localMediaViewer.message?.senderName || (localMediaViewer.message?.senderId === currentUserId ? 'You' : chatData?.peerUser?.name || 'Photo')}
+                  {localMediaViewer.message?.senderId === currentUserId
+                    ? 'You'
+                    : resolveContactName(
+                        localMediaViewer.message?.senderId,
+                        localMediaViewer.message?.senderName || chatData?.peerUser?.name || 'Photo',
+                        groupMembersMap?.[localMediaViewer.message?.senderId]?.mobileNumber
+                      )}
                 </Text>
                 {localMediaViewer.message?.time && (
                   <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: 'Roboto-Regular' }}>
@@ -5893,7 +6069,7 @@ export default function ChatScreen({ navigation, route }) {
             {/* ── Image with pinch & double-tap zoom ── */}
             {localMediaViewer.type === 'image' && localMediaViewer.uri && (
               <GestureHandlerRootView style={{ flex: 1 }}>
-                <ImageZoom
+                {/* <ImageZoom
                   uri={toSecureMediaUri(localMediaViewer.uri)}
                   minScale={1}
                   maxScale={5}
@@ -5903,7 +6079,7 @@ export default function ChatScreen({ navigation, route }) {
                   isDoubleTapEnabled
                   style={{ flex: 1 }}
                   resizeMode="contain"
-                />
+                /> */}
               </GestureHandlerRootView>
             )}
 

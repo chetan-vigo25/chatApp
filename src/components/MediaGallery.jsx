@@ -97,7 +97,7 @@ const styles = StyleSheet.create({
   },
   tabActive: { backgroundColor: '#25D366' },
   tabText: { color: '#bbb', fontSize: 12 },
-  tabTextActive: { color: '#fff', fontWeight: '700' },
+  tabTextActive: { color: '#fff', fontFamily: 'Roboto-Bold' },
   cell: { width: '33.33%', aspectRatio: 1, padding: 1 },
   image: { width: '100%', height: '100%', backgroundColor: '#222' },
   placeholder: { alignItems: 'center', justifyContent: 'center' },

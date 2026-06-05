@@ -23,12 +23,17 @@ import { useFocusEffect } from '@react-navigation/native';
 import { FontAwesome6, AntDesign, MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
+import ProfilePreviewModal from '../../components/ProfilePreviewModal';
+import useStatusIndicators from '../../hooks/useStatusIndicators';
+import useContactDirectory from '../../hooks/useContactDirectory';
+import { useCall } from '../../calls/useCall';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
+import ContactDatabase from '../../services/ContactDatabase';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
-import { ImageZoom } from '@likashefqet/react-native-image-zoom';
+// import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -51,12 +56,118 @@ const getAvatarColor = (name) => {
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 };
 
+// Resolve the peer's registered user id for a private chat. Prefer the explicit
+// peerUser id, then peerUserId, and finally fall back to parsing it out of a
+// canonical chatId (`u_<idA>_<idB>`) — that last case catches half-hydrated rows
+// (e.g. an incoming-message stub) that carry only a chatId. Returns '' for
+// groups or when nothing resolves.
+const peerIdOf = (chat, currentUserId) => {
+  const isGroup = chat?.chatType === 'group' || chat?.isGroup;
+  if (isGroup) return '';
+  const direct = String(chat?.peerUser?._id || chat?.peerUserId || '');
+  if (direct) return direct;
+  const cid = String(chat?.chatId || chat?._id || '');
+  if (currentUserId && cid.startsWith('u_')) {
+    const parts = cid.slice(2).split('_');
+    if (parts.length === 2) {
+      const other = parts.find((p) => p && p !== String(currentUserId));
+      if (other) return other;
+    }
+  }
+  return '';
+};
+
+// Force the chat row's displayed name to match the user's saved contact name.
+// `contactMap` is userId -> { fullName, profileImage } built from the locally
+// synced registered-contacts (ContactDatabase). When the peer is a saved
+// contact we override peerUser.fullName so the chat list name is ALWAYS the
+// same as the name in the registered contact list — regardless of which path
+// (socket / api / sqlite) delivered the row or what name it shipped. The
+// account profile image is kept (only used as a fallback). Unsaved peers and
+// groups are returned unchanged.
+const applyContactName = (chat, peerId, contactMap) => {
+  if (!contactMap || !peerId) return chat;
+  const saved = contactMap[peerId];
+  const savedName = saved && String(saved.fullName || '').trim();
+  if (!savedName) return chat;
+  return {
+    ...chat,
+    peerUser: {
+      ...(chat?.peerUser || {}),
+      _id: peerId,
+      fullName: savedName,
+      profileImage: chat?.peerUser?.profileImage || saved.profileImage || null,
+    },
+  };
+};
+
+// Collapse any private chats that resolve to the SAME peer user into ONE row,
+// so the chat list is always unique per contact. The in-memory state can
+// momentarily hold two rows for one peer — e.g. an old number-only row plus a
+// freshly saved-contact row, or a legacy unsorted chatId alongside the canonical
+// sorted one. We key strictly by the peer's registered user id. When a peer has
+// duplicates the CANONICAL (sorted-id) row wins, else the most recently active
+// one; name/avatar/unread are merged so the surviving row never loses data.
+// Groups and rows with no resolved peer id pass through untouched. The surviving
+// row's name is then forced to the saved-contact name via `contactMap`.
+const dedupeChatsByPeer = (list, currentUserId, contactMap) => {
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const canonicalId = (peerId) =>
+    currentUserId && peerId ? `u_${[String(currentUserId), String(peerId)].sort().join('_')}` : null;
+  const tsOf = (c) => new Date(c?.lastMessageAt || c?.updatedAt || 0).getTime() || 0;
+
+  const indexByPeer = new Map();
+  const result = [];
+  for (const chat of list) {
+    const peerId = peerIdOf(chat, currentUserId);
+    if (!peerId) { result.push(chat); continue; }
+
+    if (!indexByPeer.has(peerId)) {
+      indexByPeer.set(peerId, result.length);
+      result.push(applyContactName(chat, peerId, contactMap));
+      continue;
+    }
+
+    const idx = indexByPeer.get(peerId);
+    const keeper = result[idx];
+    const cid = canonicalId(peerId);
+    const chatCanon = Boolean(cid && String(chat?.chatId || chat?._id) === cid);
+    const keeperCanon = Boolean(cid && String(keeper?.chatId || keeper?._id) === cid);
+
+    let winner = keeper;
+    let loser = chat;
+    if (chatCanon && !keeperCanon) { winner = chat; loser = keeper; }
+    else if (chatCanon === keeperCanon && tsOf(chat) > tsOf(keeper)) { winner = chat; loser = keeper; }
+
+    const merged = {
+      ...loser,
+      ...winner,
+      peerUser: {
+        ...(loser?.peerUser || {}),
+        ...(winner?.peerUser || {}),
+        _id: peerId,
+        fullName: winner?.peerUser?.fullName || loser?.peerUser?.fullName || '',
+        profileImage: winner?.peerUser?.profileImage || loser?.peerUser?.profileImage || null,
+      },
+      unreadCount: Math.max(Number(winner?.unreadCount || 0), Number(loser?.unreadCount || 0)),
+    };
+    result[idx] = applyContactName(merged, peerId, contactMap);
+  }
+  return result;
+};
+
 export default function ChatList({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const openSwipeableRef = useRef(null);
   const dispatch = useDispatch();
   const { chatsData, isLoading } = useSelector((state) => state.chat);
+
+  // WhatsApp-style status rings on chat rows: a userId → indicator map kept live
+  // via the status feed + realtime sockets (see the hook for data-source order).
+  const statusByUserId = useStatusIndicators();
+  const { resolveName } = useContactDirectory();
+  const { startAudioCall, startVideoCall } = useCall();
 
   const [visible, setVisible] = useState(false);
   const [menuKey, setMenuKey] = useState(0);
@@ -71,6 +182,11 @@ export default function ChatList({ navigation }) {
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [deleteForEveryone, setDeleteForEveryone] = useState(false);
   const [currentUserId, setCurrentUserId] = useState(null);
+  // userId -> { fullName, profileImage } for locally-synced registered contacts.
+  // Used to force each chat row's name to the saved-contact name (the same name
+  // shown in the contact list). Refreshed whenever the screen regains focus, so
+  // a contact saved/renamed elsewhere is reflected on return.
+  const [contactMap, setContactMap] = useState(null);
 
   // Multi-select state (WhatsApp-style "delete for me" of multiple chats)
   const [selectionMode, setSelectionMode] = useState(false);
@@ -173,17 +289,27 @@ export default function ChatList({ navigation }) {
     ? realtimeArchivedChatList
     : (Array.isArray(chatsData) ? chatsData.filter((chat) => Boolean(chat?.isArchived)) : []);
 
+  // Guarantee a unique-per-contact list — never render two rows for the same
+  // peer user id. (Defensive: the realtime reducer alias-merges on updates, but
+  // this collapses any residual duplicates, e.g. a legacy unsorted-id row.)
+  const dedupedChatList = useMemo(
+    () => dedupeChatsByPeer(effectiveChatList, currentUserId, contactMap),
+    [effectiveChatList, currentUserId, contactMap]
+  );
+
   const getLastMessageText = (item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || item?.lastMessage?.text || 'No messages yet';
 
   // LayoutAnimation disabled — causes frame drops on low-end Android devices
 
   const filteredChats = useMemo(() => {
-    if (effectiveChatList.length === 0) return [];
-    let chats = effectiveChatList;
+    if (dedupedChatList.length === 0) return [];
+    let chats = dedupedChatList;
     if (activeFilter === 'groups') {
       chats = chats.filter((item) => item?.chatType === 'group' || item?.isGroup);
     } else if (activeFilter === 'chats') {
       chats = chats.filter((item) => item?.chatType !== 'group' && !item?.isGroup);
+    } else if (activeFilter === 'unread') {
+      chats = chats.filter((item) => Number(item?.unreadCount || 0) > 0);
     }
     if (searchQuery.trim() === '') return chats;
     const query = searchQuery.toLowerCase().trim();
@@ -195,7 +321,7 @@ export default function ChatList({ navigation }) {
       const lastMessage = getLastMessageText(item).toLowerCase();
       return chatDisplayName.includes(query) || lastMessage.includes(query);
     });
-  }, [searchQuery, effectiveChatList, activeFilter]);
+  }, [searchQuery, dedupedChatList, activeFilter]);
 
   const isSearching = searchQuery.trim() !== '';
 
@@ -218,6 +344,32 @@ export default function ChatList({ navigation }) {
     }
   }, [fadeAnim, effectiveChatList]);
 
+  // Build the saved-contact name map from the locally-synced registered
+  // contacts (ContactDatabase). Reloaded on every focus so a contact saved or
+  // renamed while away is reflected the moment the user returns to the list.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      (async () => {
+        try {
+          const registered = await ContactDatabase.loadRegisteredContacts();
+          if (!active) return;
+          const map = {};
+          for (const c of registered) {
+            if (!c?.userId) continue;
+            const fullName = String(c.fullName || c.name || '').trim();
+            if (!fullName) continue;
+            map[String(c.userId)] = { fullName, profileImage: c.profileImage || c.profilePicture || null };
+          }
+          setContactMap(map);
+        } catch (err) {
+          if (active) setContactMap((prev) => prev || {});
+        }
+      })();
+      return () => { active = false; };
+    }, [])
+  );
+
   // Initial sync: only call API if SQLite has no chatlist data (first login)
   // After first sync, chatlist is driven entirely by SQLite + socket updates
   const initialSyncDone = useRef(false);
@@ -232,28 +384,33 @@ export default function ChatList({ navigation }) {
     }, [dispatch, realtimeChatList])
   );
 
-  // When a brand-new chat appears (someone messages us for the first time),
-  // refetch the chat list from the server so the new peer is fully hydrated
-  // (name / number / avatar) instead of showing "Unknown".
+  // When a chat appears without a resolved peer (e.g. a brand-new chat created
+  // by an incoming message, which arrives over the socket with no name/avatar),
+  // refetch the chat list so the row is fully hydrated (name / number / avatar)
+  // instead of showing "Unknown". This is gated on MISSING IDENTITY rather than
+  // on "first population", so it also fixes the very first chat a user ever
+  // receives (the old `size === 0` early-return skipped it).
   const knownChatIdsRef = useRef(new Set());
   const newChatRefetchTimerRef = useRef(null);
   useEffect(() => {
     if (!Array.isArray(realtimeChatList) || realtimeChatList.length === 0) return;
 
-    const currentIds = realtimeChatList
-      .map((c) => String(c?.chatId || c?._id || ''))
-      .filter(Boolean);
+    let needsHydration = false;
+    realtimeChatList.forEach((c) => {
+      const id = String(c?.chatId || c?._id || '');
+      if (!id) return;
+      const isNew = !knownChatIdsRef.current.has(id);
+      knownChatIdsRef.current.add(id);
 
-    // First population — seed the known set, don't refetch
-    if (knownChatIdsRef.current.size === 0) {
-      currentIds.forEach((id) => knownChatIdsRef.current.add(id));
-      return;
-    }
+      // A private row with no resolved peer name still renders "Unknown".
+      const isGroupItem = c?.chatType === 'group' || c?.isGroup;
+      const hasName = isGroupItem
+        ? Boolean(c?.chatName || c?.group?.name || c?.groupName)
+        : Boolean(c?.peerUser?.fullName);
+      if (isNew && !isGroupItem && !hasName) needsHydration = true;
+    });
 
-    const newIds = currentIds.filter((id) => !knownChatIdsRef.current.has(id));
-    if (newIds.length === 0) return;
-
-    newIds.forEach((id) => knownChatIdsRef.current.add(id));
+    if (!needsHydration) return;
 
     // Debounce: bursts of incoming events should trigger a single refetch
     if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
@@ -397,43 +554,68 @@ export default function ChatList({ navigation }) {
 
   // ─── PROFILE PREVIEW ───
 
+  // The preview card (ProfilePreviewModal) owns its own enter/exit animation,
+  // so these just toggle visibility + remember which row was tapped.
   const openProfilePreview = useCallback((item) => {
     setSelectedChatItem(item);
     setProfilePreviewVisible(true);
-    profileScaleAnim.setValue(0);
-    profileOpacityAnim.setValue(0);
-    Animated.parallel([
-      Animated.spring(profileScaleAnim, {
-        toValue: 1,
-        tension: 65,
-        friction: 8,
-        useNativeDriver: true,
-      }),
-      Animated.timing(profileOpacityAnim, {
-        toValue: 1,
-        duration: 200,
-        useNativeDriver: true,
-      }),
-    ]).start();
-  }, [profileScaleAnim, profileOpacityAnim]);
+  }, []);
+
+  // WhatsApp behaviour: tapping a contact's avatar that has a live status opens
+  // the Status Viewer (oldest → newest); viewing marks each status seen, which
+  // clears the ring automatically (Redux viewedStatusIds → statusByUserId).
+  const openContactStatusViewer = useCallback((group) => {
+    if (!group) return;
+    const serverName = group.name || group.fullName || group.userName;
+    const phone = group.phone || group.number || group.mobile?.number || group.mobileNumber;
+    const label = resolveName(group.userId, serverName, phone);
+    navigation.navigate('StatusViewer', {
+      statuses: group.statuses || [],
+      startIndex: 0,
+      isMine: false,
+      userName: label,
+      userImage: group.avatar || group.profileImage || group.userAvatar,
+      userId: group.userId,
+    });
+  }, [navigation, resolveName]);
 
   const closeProfilePreview = useCallback(() => {
-    Animated.parallel([
-      Animated.timing(profileScaleAnim, {
-        toValue: 0,
-        duration: 180,
-        useNativeDriver: true,
-      }),
-      Animated.timing(profileOpacityAnim, {
-        toValue: 0,
-        duration: 180,
-        useNativeDriver: true,
-      }),
-    ]).start(() => {
-      setProfilePreviewVisible(false);
-      // Don't clear selectedChatItem here — image viewer may need it
-    });
-  }, [profileScaleAnim, profileOpacityAnim]);
+    setProfilePreviewVisible(false);
+    // Don't clear selectedChatItem here — image viewer may need it
+  }, []);
+
+  // Start an audio/video call to the previewed 1-1 contact (WhatsApp preview row).
+  const startPreviewCall = useCallback((media) => {
+    const peer = selectedChatItem?.peerUser;
+    const peerId = peer?._id || selectedChatItem?.peerUserId;
+    if (!peerId) return;
+    const peerObj = {
+      id: String(peerId),
+      name: peer?.fullName || 'Unknown User',
+      avatar: peer?.profileImage || null,
+    };
+    closeProfilePreview();
+    // Let the modal dismiss before the call engine takes over the screen.
+    setTimeout(() => {
+      if (media === 'video') startVideoCall?.(peerObj);
+      else startAudioCall?.(peerObj);
+    }, 220);
+  }, [selectedChatItem, closeProfilePreview, startVideoCall, startAudioCall]);
+
+  const openPreviewInfo = useCallback(() => {
+    const isGroup = selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup;
+    if (selectedChatItem) {
+      if (isGroup) {
+        navigation.navigate('GroupInfo', {
+          groupId: selectedChatItem?.groupId || selectedChatItem?.group?._id || selectedChatItem?.chatId,
+          item: selectedChatItem,
+        });
+      } else {
+        navigation.navigate('UserB', { item: selectedChatItem });
+      }
+    }
+    closeProfilePreview();
+  }, [selectedChatItem, navigation, closeProfilePreview]);
 
   // ─── CHAT ACTIONS ───
 
@@ -460,12 +642,21 @@ export default function ChatList({ navigation }) {
   }, [selectedChatItem, unmuteChat, closeActionMenu]);
 
   const onSelectMuteDuration = useCallback((duration) => {
+    // Multi-select: mute every selected chat for the chosen duration.
+    if (selectionMode && selectedChatIds.length) {
+      getSelectedChats().forEach(c => {
+        if (!c?.isMuted) muteChat(c?.chatId || c?._id, duration, c?.chatType || 'private');
+      });
+      setMuteSheetVisible(false);
+      exitSelectionMode();
+      return;
+    }
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
     if (!chatId) return;
     const ct = selectedChatItem?.chatType || 'private';
     muteChat(chatId, duration, ct);
     closeActionMenu();
-  }, [selectedChatItem, muteChat, closeActionMenu]);
+  }, [selectionMode, selectedChatIds, getSelectedChats, selectedChatItem, muteChat, closeActionMenu, exitSelectionMode]);
 
   const onToggleArchive = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
@@ -476,6 +667,52 @@ export default function ChatList({ navigation }) {
     else archiveChat(chatId, ct);
     closeActionMenu();
   }, [selectedChatItem, archiveChat, unarchiveChat, closeActionMenu]);
+
+  // ─── BULK ACTIONS (multi-select selection mode) ───
+  const getSelectedChats = useCallback(
+    () => (dedupedChatList || []).filter(c => selectedChatIds.includes(c?.chatId || c?._id)),
+    [dedupedChatList, selectedChatIds]
+  );
+
+  const onBulkTogglePin = useCallback(() => {
+    const chats = getSelectedChats();
+    if (!chats.length) return;
+    const allPinned = chats.every(c => c?.isPinned);
+    chats.forEach(c => {
+      const id = c?.chatId || c?._id;
+      const ct = c?.chatType || 'private';
+      if (allPinned) unpinChat(id, ct);
+      else if (!c?.isPinned) pinChat(id, ct);
+    });
+    exitSelectionMode();
+  }, [getSelectedChats, pinChat, unpinChat, exitSelectionMode]);
+
+  const onBulkToggleArchive = useCallback(() => {
+    const chats = getSelectedChats();
+    if (!chats.length) return;
+    const allArchived = chats.every(c => c?.isArchived);
+    chats.forEach(c => {
+      const id = c?.chatId || c?._id;
+      const ct = c?.chatType || 'private';
+      if (allArchived) unarchiveChat(id, ct);
+      else if (!c?.isArchived) archiveChat(id, ct);
+    });
+    exitSelectionMode();
+  }, [getSelectedChats, archiveChat, unarchiveChat, exitSelectionMode]);
+
+  const onBulkMute = useCallback(() => {
+    const chats = getSelectedChats();
+    if (!chats.length) return;
+    const allMuted = chats.every(c => c?.isMuted);
+    // Direct toggle — no duration picker. Mute uses "Always" (duration 0).
+    chats.forEach(c => {
+      const id = c?.chatId || c?._id;
+      const ct = c?.chatType || 'private';
+      if (allMuted) unmuteChat(id, ct);
+      else if (!c?.isMuted) muteChat(id, 0, ct);
+    });
+    exitSelectionMode();
+  }, [getSelectedChats, muteChat, unmuteChat, exitSelectionMode]);
 
   const onViewInfo = useCallback(() => {
     const chatId = selectedChatItem?.chatId || selectedChatItem?._id;
@@ -715,6 +952,9 @@ export default function ChatList({ navigation }) {
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;
   const previewAvatarColor = getAvatarColor(previewName);
+  // WhatsApp's profile-popup action icons are a bright green (dark mode) /
+  // teal-green (light mode) — distinct from the app's own brand teal.
+  const previewActionGreen = isDarkMode ? '#25D366' : '#008069';
 
   // ─── RENDER ───
 
@@ -776,10 +1016,10 @@ export default function ChatList({ navigation }) {
   // Pinned (non-scrolling) section: ONLY the search bar.
   const pinnedSearchAndFilters = (
     <View style={[styles.pinnedHeaderWrap, { backgroundColor: theme.colors.background }]}>
-      <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
-        <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
+      <View style={[styles.searchBar, { backgroundColor: isDarkMode ? '#1F2C33' : '#f0f2f5' }]}>
+        <Ionicons name="search" size={18} color={theme.colors.iconColor} />
         <TextInput
-          placeholder="Search chats..."
+          placeholder="Search"
           placeholderTextColor={theme.colors.placeHolderTextColor}
           value={searchQuery}
           onChangeText={setSearchQuery}
@@ -802,6 +1042,7 @@ export default function ChatList({ navigation }) {
       <View style={styles.filterRow}>
         {[
           { key: 'all', label: 'All' },
+          { key: 'unread', label: 'Unread' },
           { key: 'chats', label: 'Chats' },
           { key: 'groups', label: 'Groups' },
         ].map((f) => {
@@ -814,14 +1055,14 @@ export default function ChatList({ navigation }) {
               style={[
                 styles.filterPill,
                 isActive
-                  ? { backgroundColor: theme.colors.themeColor }
-                  : { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)' },
+                  ? { backgroundColor: isDarkMode ? theme.colors.themeColor + '33' : theme.colors.themeColor + '1F', borderColor: 'transparent' }
+                  : { backgroundColor: 'transparent', borderColor: isDarkMode ? 'rgba(255,255,255,0.16)' : '#d1d7db' },
               ]}
             >
               <Text
                 style={[
                   styles.filterPillText,
-                  { color: isActive ? '#fff' : theme.colors.placeHolderTextColor },
+                  { color: isActive ? theme.colors.themeColor : theme.colors.iconColor },
                 ]}
               >
                 {f.label}
@@ -847,42 +1088,66 @@ export default function ChatList({ navigation }) {
               activeOpacity={0.6}
               style={[styles.headerBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}
             >
-              <Ionicons name="close" size={20} color={theme.colors.primaryTextColor} />
+              <Ionicons name="arrow-back" size={22} color={theme.colors.primaryTextColor} />
             </TouchableOpacity>
             <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor, fontSize: 18 }]}>
-              {selectedChatIds.length} selected
+              {selectedChatIds.length}
             </Text>
           </View>
-          <View style={styles.headerRight}>
-            <TouchableOpacity
-              onPress={() => {
-                const allIds = filteredChats.map((c) => c?.chatId || c?._id).filter(Boolean);
-                setSelectedChatIds(allIds);
-              }}
-              activeOpacity={0.6}
-              style={[styles.headerBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}
-            >
-              <MaterialCommunityIcons name="select-all" size={18} color={theme.colors.primaryTextColor} />
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => {
-                if (selectedChatIds.length === 0) return;
-                setBulkDeleteModalVisible(true);
-              }}
-              activeOpacity={0.6}
-              style={[styles.headerBtn, { backgroundColor: '#E06A6A22' }]}
-            >
-              <MaterialCommunityIcons name="delete-outline" size={20} color="#E06A6A" />
-            </TouchableOpacity>
-          </View>
+          {(() => {
+            const sel = getSelectedChats();
+            const allPinned = sel.length > 0 && sel.every(c => c?.isPinned);
+            const allMuted = sel.length > 0 && sel.every(c => c?.isMuted);
+            const allArchived = sel.length > 0 && sel.every(c => c?.isArchived);
+            const btnBg = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
+            const iconColor = theme.colors.primaryTextColor;
+            return (
+              <View style={styles.headerRight}>
+                {/* Pin */}
+                <TouchableOpacity
+                  onPress={onBulkTogglePin}
+                  activeOpacity={0.6}
+                  style={[styles.headerBtn, { backgroundColor: btnBg }]}
+                >
+                  <MaterialCommunityIcons name={allPinned ? 'pin-off-outline' : 'pin-outline'} size={20} color={iconColor} />
+                </TouchableOpacity>
+                {/* Mute */}
+                <TouchableOpacity
+                  onPress={onBulkMute}
+                  activeOpacity={0.6}
+                  style={[styles.headerBtn, { backgroundColor: btnBg }]}
+                >
+                  <Ionicons name={allMuted ? 'notifications-outline' : 'notifications-off-outline'} size={20} color={iconColor} />
+                </TouchableOpacity>
+                {/* Archive */}
+                <TouchableOpacity
+                  onPress={onBulkToggleArchive}
+                  activeOpacity={0.6}
+                  style={[styles.headerBtn, { backgroundColor: btnBg }]}
+                >
+                  <MaterialCommunityIcons name={allArchived ? 'archive-arrow-up-outline' : 'archive-arrow-down-outline'} size={20} color={iconColor} />
+                </TouchableOpacity>
+                {/* Delete */}
+                <TouchableOpacity
+                  onPress={() => {
+                    if (selectedChatIds.length === 0) return;
+                    setBulkDeleteModalVisible(true);
+                  }}
+                  activeOpacity={0.6}
+                  style={[styles.headerBtn, { backgroundColor: '#E06A6A22' }]}
+                >
+                  <MaterialCommunityIcons name="delete-outline" size={20} color="#E06A6A" />
+                </TouchableOpacity>
+              </View>
+            );
+          })()}
         </View>
       ) : (
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <View style={styles.headerLogoWrap}>
-            <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
-          </View>
-          <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>{name}</Text>
+          <Text style={[styles.headerWordmark, { color: theme.colors.themeColor }]}>
+            {String(name || 'VibeConnect').split(' ')[0]}
+          </Text>
           {Number(realtimeState?.totalUnread || 0) > 0 && (
             <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Text style={styles.unreadBadgeText}>
@@ -902,9 +1167,10 @@ export default function ChatList({ navigation }) {
               <TouchableOpacity
                 onPress={() => setVisible(true)}
                 activeOpacity={0.6}
-                style={[styles.headerBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                style={styles.headerBtn}
               >
-                <Ionicons name="ellipsis-vertical" size={18} color={theme.colors.primaryTextColor} />
+                <Ionicons name="ellipsis-vertical" size={22} color={theme.colors.iconColor} />
               </TouchableOpacity>
             )}
           >
@@ -920,12 +1186,12 @@ export default function ChatList({ navigation }) {
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
             />
-            {/* <Menu.Item
+            <Menu.Item
               onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
               title="Linked Devices"
               titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
               leadingIcon={() => <Ionicons name="qr-code-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            /> */}
+            />
           </Menu>
         </View>
       </View>
@@ -950,11 +1216,16 @@ export default function ChatList({ navigation }) {
             renderItem={({ item }) => {
               const itemChatId = item?.chatId || item?._id;
               const isSelected = selectionMode && selectedChatIds.includes(itemChatId);
+              const isGroupRow = item?.chatType === 'group' || item?.isGroup;
+              const peerId = !isGroupRow ? String(item?.peerUser?._id || item?.peerUserId || '') : '';
+              const statusInfo = peerId ? (statusByUserId[peerId] || null) : null;
               return (
-              <View style={isSelected ? { backgroundColor: theme.colors.themeColor + '22' } : null}>
+              <View>
               <ChatCard
                 item={item}
                 theme={theme}
+                isSelected={isSelected}
+                statusInfo={statusInfo}
                 openSwipeableRef={openSwipeableRef}
                 onPress={() => {
                   if (selectionMode) {
@@ -973,6 +1244,9 @@ export default function ChatList({ navigation }) {
                 onAvatarPress={() => {
                   if (selectionMode) {
                     toggleChatSelection(itemChatId);
+                  } else if (statusInfo && statusInfo.count > 0) {
+                    // Has a live status → open the Status Viewer (WhatsApp behaviour).
+                    openContactStatusViewer(statusInfo.group);
                   } else {
                     openProfilePreview(item);
                   }
@@ -1010,6 +1284,7 @@ export default function ChatList({ navigation }) {
               );
             }}
             showsVerticalScrollIndicator={false}
+            extraData={statusByUserId}
             refreshing={refreshing}
             onRefresh={handleRefresh}
             ListHeaderComponent={listHeader}
@@ -1251,85 +1526,23 @@ export default function ChatList({ navigation }) {
         </TouchableOpacity>
       </Modal>
 
-      {/* ─── PROFILE PREVIEW MODAL ─── */}
-      <Modal transparent visible={profilePreviewVisible} onRequestClose={closeProfilePreview} statusBarTranslucent>
-        <TouchableOpacity onPress={closeProfilePreview} activeOpacity={1} style={styles.profileOverlay}>
-          <Animated.View style={[
-            styles.profileCard,
-            {
-              backgroundColor: theme.colors.cardBackground,
-              opacity: profileOpacityAnim,
-              transform: [{ scale: profileScaleAnim }],
-            }
-          ]}>
-            <View style={[styles.profileImageWrap, { backgroundColor: theme.colors.menuBackground }]}>
-              {previewImage ? (
-                <TouchableOpacity
-                  activeOpacity={0.9}
-                  style={styles.profileImageInner}
-                  onPress={() => {
-                    closeProfilePreview();
-                    setTimeout(() => setImageViewerVisible(true), 250);
-                  }}
-                >
-                  <Image resizeMode="cover" source={{ uri: previewImage }} style={styles.profileImageInner} fadeDuration={0} />
-                </TouchableOpacity>
-              ) : (
-                <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
-                  {isPreviewGroup ? (
-                    <Ionicons name="people" size={64} color="#fff" />
-                  ) : (
-                    <Text style={styles.profileFallbackText}>
-                      {(previewName || '?').charAt(0).toUpperCase()}
-                    </Text>
-                  )}
-                </View>
-              )}
-
-              {/* Name + meta overlay */}
-              <View style={styles.profileNameOverlay}>
-                <Text style={styles.profileNameText} numberOfLines={1}>{previewName}</Text>
-                <Text style={styles.profileMetaText} numberOfLines={1}>
-                  {isPreviewGroup ? 'Group' : 'Tap photo to view full size'}
-                </Text>
-              </View>
-
-              {/* Action buttons */}
-              <View style={styles.profileActions}>
-                <TouchableOpacity
-                  onPress={() => {
-                    if (selectedChatItem) openChat(selectedChatItem);
-                    closeProfilePreview();
-                  }}
-                  activeOpacity={0.8}
-                  style={styles.profileActionBtn}
-                >
-                  <MaterialCommunityIcons name="message-reply-text-outline" size={20} color="#fff" />
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() => {
-                    if (selectedChatItem) {
-                      if (isPreviewGroup) {
-                        navigation.navigate('GroupInfo', {
-                          groupId: selectedChatItem?.groupId || selectedChatItem?.group?._id || selectedChatItem?.chatId,
-                          item: selectedChatItem,
-                        });
-                      } else {
-                        navigation.navigate('UserB', { item: selectedChatItem });
-                      }
-                    }
-                    closeProfilePreview();
-                  }}
-                  activeOpacity={0.8}
-                  style={styles.profileActionBtn}
-                >
-                  <Ionicons name="information-circle-outline" size={20} color="#fff" />
-                </TouchableOpacity>
-              </View>
-            </View>
-          </Animated.View>
-        </TouchableOpacity>
-      </Modal>
+      {/* ─── PROFILE PREVIEW MODAL (shared WhatsApp popup) ─── */}
+      <ProfilePreviewModal
+        visible={profilePreviewVisible}
+        onClose={closeProfilePreview}
+        name={previewName}
+        image={previewImage}
+        avatarColor={previewAvatarColor}
+        isGroup={isPreviewGroup}
+        onMessage={() => { if (selectedChatItem) openChat(selectedChatItem); closeProfilePreview(); }}
+        onCall={isPreviewGroup ? undefined : () => startPreviewCall('audio')}
+        onVideo={isPreviewGroup ? undefined : () => startPreviewCall('video')}
+        onInfo={openPreviewInfo}
+        onViewPhoto={previewImage ? () => {
+          closeProfilePreview();
+          setTimeout(() => setImageViewerVisible(true), 250);
+        } : undefined}
+      />
 
       {/* Full-screen Image Viewer with zoom */}
       <Modal
@@ -1354,14 +1567,14 @@ export default function ChatList({ navigation }) {
 
           {previewImage ? (
             <GestureHandlerRootView style={{ flex: 1 }}>
-              <ImageZoom
+              {/* <ImageZoom
                 uri={previewImage}
                 minScale={1}
                 maxScale={5}
                 doubleTapScale={3}
                 style={{ flex: 1 }}
                 resizeMode="contain"
-              />
+              /> */}
             </GestureHandlerRootView>
           ) : (
             <View style={styles.imageViewerNoPhoto}>
@@ -1402,12 +1615,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 10,
   },
-  headerLogoWrap: {
-    width: 38, height: 38, borderRadius: 12,
-    overflow: 'hidden',
-    alignItems: 'center', justifyContent: 'center',
+  headerWordmark: {
+    fontSize: 25,
+    fontFamily: 'Roboto-Bold',
+    letterSpacing: -0.6,
   },
-  headerLogoImg: { width: 38, height: 38 },
   headerTitle: {
     fontSize: 22,
     fontFamily: 'Roboto-Bold',
@@ -1541,14 +1753,14 @@ const styles = StyleSheet.create({
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 14,
-    paddingHorizontal: 14,
+    borderRadius: 24,
+    paddingHorizontal: 16,
     height: 46,
-    gap: 10,
+    gap: 12,
   },
   searchInput: {
     flex: 1,
-    fontSize: 14,
+    fontSize: 15,
     fontFamily: 'Roboto-Regular',
     paddingVertical: 0,
     height: '100%',
@@ -1571,14 +1783,15 @@ const styles = StyleSheet.create({
     paddingBottom: 6,
   },
   filterPill: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 12,
+    paddingHorizontal: 15,
+    paddingVertical: 7,
+    borderRadius: 18,
+    borderWidth: 1,
   },
   filterPillText: {
-    fontSize: 12,
-    fontFamily: 'Roboto-SemiBold',
-    letterSpacing: 0.3,
+    fontSize: 13,
+    fontFamily: 'Roboto-Medium',
+    letterSpacing: 0.1,
   },
 
   // ─── ARCHIVE ROW ───
@@ -1873,23 +2086,61 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'transparent',
-    paddingHorizontal: 30,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    paddingHorizontal: 28,
   },
+  // WhatsApp profile popup: name header → square photo → action row.
+  // Width ≈ 70% of screen; the square photo drives the height, with a compact
+  // ~56dp header above and ~56dp action bar below (matches WhatsApp's popup).
   profileCard: {
-    width: SCREEN_WIDTH * 0.78,
-    maxWidth: 360,
-    borderRadius: 24,
+    width: SCREEN_WIDTH * 0.60,
+    maxWidth: 270,
+    borderRadius: 12,
     overflow: 'hidden',
-    elevation: 16,
+    elevation: 24,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 14 },
-    shadowOpacity: 0.4,
+    shadowOpacity: 0.45,
     shadowRadius: 24,
   },
   profileImageWrap: {
     width: '100%',
     aspectRatio: 1,
+    position: 'relative',
+  },
+  // Faux gradient scrim — stacked black layers anchored to the top edge; the
+  // overlap makes it darkest at the very top and fade to clear (~92px down).
+  profileNameScrim: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+  },
+  profileScrimLayer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(0,0,0,0.16)',
+  },
+  profileNameOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    minHeight: 46,
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    paddingTop: 4,
+  },
+  profileNameText: {
+    color: '#fff',
+    fontFamily: 'Roboto-Medium',
+    fontSize: 16,
+    letterSpacing: 0.1,
+    textShadowColor: 'rgba(0,0,0,0.75)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 6,
   },
   profileImageInner: { width: '100%', height: '100%' },
   profileFallback: {
@@ -1901,55 +2152,20 @@ const styles = StyleSheet.create({
   profileFallbackText: {
     color: '#fff',
     fontFamily: 'Roboto-Bold',
-    fontSize: 88,
+    fontSize: 92,
     letterSpacing: -2,
   },
-  profileNameGradient: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
-    height: 90,
-    justifyContent: 'flex-end',
-  },
-  profileNameOverlay: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    paddingHorizontal: 18,
-    paddingTop: 14,
-    paddingBottom: 16,
-  },
-  profileNameText: {
-    color: '#fff',
-    fontFamily: 'Roboto-Bold',
-    fontSize: 20,
-    letterSpacing: -0.3,
-    textShadowColor: 'rgba(0,0,0,0.4)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-  },
-  profileMetaText: {
-    color: 'rgba(255,255,255,0.78)',
-    fontFamily: 'Roboto-Regular',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  profileActions: {
-    position: 'absolute',
-    top: 12,
-    right: 12,
+  profileActionRow: {
     flexDirection: 'row',
-    gap: 8,
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    minHeight: 44,
+    paddingHorizontal: 4,
+    borderTopWidth: StyleSheet.hairlineWidth,
   },
   profileActionBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.18)',
+    flex: 1,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
   },

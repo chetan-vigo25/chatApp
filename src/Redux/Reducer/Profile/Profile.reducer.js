@@ -50,6 +50,7 @@ const profileSlice = createSlice({
   initialState: {
     token: null,
     profileData: null,
+    isBlocked: false,
     updateProfileData: null,
     messagesData: null,
     isLoading: false,
@@ -63,6 +64,11 @@ const profileSlice = createSlice({
       state.error = null;
       state.isLoading = false;
     },
+    // Set by the admin block/unblock realtime event (user:blocked / user:unblocked).
+    setBlocked: (state, action) => {
+      state.isBlocked = !!action.payload;
+      if (state.profileData) state.profileData.isBlocked = !!action.payload;
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -75,6 +81,7 @@ const profileSlice = createSlice({
         state.isLoading = false;
         state.otpMessage = action.payload?.message;   // ✅ FIX
         state.profileData = action.payload?.data || null;
+        state.isBlocked = !!(action.payload?.data?.isBlocked);
         state.error = null;
       })
       .addCase(profileDetail.rejected, (state, action) => {
@@ -125,5 +132,5 @@ const profileSlice = createSlice({
   },
 });
 
-export const { logout } = profileSlice.actions;
+export const { logout, setBlocked } = profileSlice.actions;
 export default profileSlice.reducer;

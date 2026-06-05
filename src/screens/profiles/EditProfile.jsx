@@ -203,7 +203,7 @@ export default function EditProfile({ navigation, route }) {
   const borderClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
-  const themeColor = theme.colors.themeColor || '#1DA1F2';
+  const themeColor = theme.colors.themeColor || '#00A884';
   const inputBg = isDarkMode ? '#0f1923' : '#F4F5F7';
 
   const imgSrc = getImageSource();
@@ -213,7 +213,7 @@ export default function EditProfile({ navigation, route }) {
       <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
 
       {/* Floating back button */}
-      <SafeAreaView edges={['top']} style={styles.topBarSafe}>
+      <View edges={['top']} style={styles.topBarSafe}>
         <View style={styles.topBarRow}>
           <TouchableOpacity onPress={() => navigation.goBack()} style={styles.floatingBtn} activeOpacity={0.7}>
             <FontAwesome6 name="arrow-left" size={18} color="#fff" />
@@ -221,7 +221,7 @@ export default function EditProfile({ navigation, route }) {
           <Text style={styles.topBarTitle}>Edit Profile</Text>
           <View style={{ width: 40 }} />
         </View>
-      </SafeAreaView>
+      </View>
 
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
@@ -301,7 +301,7 @@ export default function EditProfile({ navigation, route }) {
           </View>
 
           <Text style={[styles.helperText, { color: subText }]}>
-            Your profile is visible to people you chat with on TalksTry.
+            Your profile is visible to people you chat with on VibeConnect Messenger.
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>

@@ -137,7 +137,10 @@ export const useContactSync = () => {
     return incoming.filter(Boolean).map((contact) => {
       const hash = contact?.hash || null;
       const localMapEntry = hash ? localHashMap[hash] : null;
-      const fullName = contact?.fullName || contact?.name || contact?.displayName || localMapEntry?.localName || '';
+      // Device contact name takes priority over the backend-stored name, per
+      // product spec (show the name as saved on THIS device). Fall back to the
+      // backend name only when the number isn't in the device's contacts.
+      const fullName = localMapEntry?.localName || contact?.fullName || contact?.name || contact?.displayName || '';
       return {
         originalId: contact?.originalId || localMapEntry?.originalId || contact?.id || null,
         hash,
@@ -325,7 +328,9 @@ export const useContactSync = () => {
         contacts: hashed.map(contact => ({
           id: contact.id,
           originalId: contact.id,
-          fullName: contact.fullName || contact.name || '',
+          // Privacy: do NOT upload the device contact name. Matching is done
+          // purely by hashed phone; the display name is resolved locally from
+          // the device. (The backend `fullName` field is optional.)
           hash: contact.hash,
           salt: contact.salt,
           algorithm: contact.algorithm,

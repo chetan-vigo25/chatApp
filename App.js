@@ -15,9 +15,12 @@ import { AuthProvider } from './src/contexts/AuthContext';
 import { PresenceProvider } from './src/presence/store/PresenceContext';
 import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
-import {  getFCMToken, initializeNotifications, setupNotificationCategory } from './src/firebase/fcmService';
+import {  getFCMToken, initializeNotifications, setupNotificationCategory, setupCallNotificationCategory } from './src/firebase/fcmService';
 import 'react-native-get-random-values';
 import NoInternet from './src/screens/NoInternet';
+import { CallProvider } from './src/calls/CallProvider';
+import CallContentInset from './src/calls/components/CallContentInset';
+import AppLockGate from './src/components/AppLockGate';
 
 import 'react-native-gesture-handler';
 
@@ -61,7 +64,12 @@ export default function App() {
                 <DeviceLocationProvider>
                  <PresenceProvider>
                   <RealtimeChatProvider>
-                    <AppContent />
+                    <CallProvider>
+                      <CallContentInset>
+                        <AppContent />
+                        <AppLockGate />
+                      </CallContentInset>
+                    </CallProvider>
                   </RealtimeChatProvider>
                  </PresenceProvider>
                 </DeviceLocationProvider>

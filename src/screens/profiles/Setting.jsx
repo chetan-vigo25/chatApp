@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   View, Text, Image, Animated, TouchableOpacity, ScrollView,
-  Alert, StyleSheet, ActivityIndicator, Dimensions,
+  Alert, StyleSheet, ActivityIndicator,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
@@ -12,19 +12,21 @@ import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
 
-const { width: SCREEN_W } = Dimensions.get('window');
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
 export default function Setting({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
-  const slideAnim = useRef(new Animated.Value(16)).current;
+  const slideAnim = useRef(new Animated.Value(14)).current;
   const dispatch = useDispatch();
   const { profileData } = useSelector(state => state.profile);
 
+  const [isBackingUp, setIsBackingUp] = useState(false);
+  const [backupStatus, setBackupStatus] = useState('');
+
   useEffect(() => {
     Animated.parallel([
-      Animated.timing(fadeAnim, { toValue: 1, duration: 400, useNativeDriver: true }),
+      Animated.timing(fadeAnim, { toValue: 1, duration: 380, useNativeDriver: true }),
       Animated.spring(slideAnim, { toValue: 0, friction: 9, tension: 60, useNativeDriver: true }),
     ]).start();
   }, []);
@@ -51,19 +53,16 @@ export default function Setting({ navigation }) {
   };
 
   const confirmLogout = () => {
-    Alert.alert("Logout", "Are you sure you want to logout from this device?", [
+    Alert.alert("Log out", "Are you sure you want to log out from this device?", [
       { text: "Cancel", style: "cancel" },
-      { text: "Logout", style: "destructive", onPress: handleLogout },
+      { text: "Log out", style: "destructive", onPress: handleLogout },
     ]);
   };
-
-  const [isBackingUp, setIsBackingUp] = useState(false);
-  const [backupStatus, setBackupStatus] = useState('');
 
   const handleBackup = async () => {
     if (isBackingUp) return;
     setIsBackingUp(true);
-    setBackupStatus('Preparing...');
+    setBackupStatus('Preparing…');
     try {
       await ChatBackupService.createAndShareBackup((status) => setBackupStatus(status));
       setBackupStatus('');
@@ -77,144 +76,136 @@ export default function Setting({ navigation }) {
     }
   };
 
-  const themeColor = theme.colors.themeColor;
+  // ─── WhatsApp palette ───
+  const accent = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
-  const subText = theme.colors.placeHolderTextColor;
-  const pageBg = isDarkMode ? '#0B141A' : '#F4F6F9';
+  const subText = theme.colors.secondaryTextColor;
+  const iconColor = theme.colors.iconColor;
+  const pageBg = isDarkMode ? '#0B141A' : '#F7F8FA';
   const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
-  const borderClr = isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(15,30,50,0.06)';
+  const sepClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)';
 
   const avatarBg = AVATAR_COLORS[
     ((profileData?.fullName || '').charCodeAt(0) || 0) % AVATAR_COLORS.length
   ] || AVATAR_COLORS[0];
 
-  const menuSections = [
+  const menuSections = useMemo(() => ([
     {
-      title: 'General',
+      title: 'Preferences',
       items: [
         {
           icon: 'color-palette-outline',
-          iconColor: '#6C5CE7',
-          iconBg: '#6C5CE71A',
           label: 'Appearance',
           subtitle: isDarkMode ? 'Dark theme' : 'Light theme',
           onPress: () => navigation.navigate('ChatColorTheme'),
         },
         {
           icon: 'lock-closed-outline',
-          iconColor: '#0984E3',
-          iconBg: '#0984E31A',
-          label: 'Chat Privacy',
+          label: 'Chat privacy',
           subtitle: 'Deleted chats password',
           onPress: () => navigation.navigate('ChatPrivacy'),
         },
       ],
     },
     {
-      title: 'Support',
+      title: 'Chats',
+      items: [
+        {
+          icon: 'cloud-upload-outline',
+          label: 'Chat backup',
+          subtitle: backupStatus || 'Export and share your messages',
+          isLoading: isBackingUp,
+          onPress: handleBackup,
+        },
+      ],
+    },
+    {
+      title: 'About',
       items: [
         {
           icon: 'shield-checkmark-outline',
-          iconColor: '#00B894',
-          iconBg: '#00B8941A',
-          label: 'Privacy Policy',
+          label: 'Privacy policy',
           subtitle: 'How we protect your data',
           onPress: () => navigation.navigate('Privacy'),
         },
         {
           icon: 'document-text-outline',
-          iconColor: '#E17055',
-          iconBg: '#E170551A',
-          label: 'Terms & Conditions',
+          label: 'Terms & conditions',
           subtitle: 'Our terms of service',
           onPress: () => navigation.navigate('Term'),
         },
       ],
     },
-  ];
+  ]), [isDarkMode, isBackingUp, backupStatus]);
+
 
   const renderProfileCard = () => (
-    <Animated.View style={[
-      styles.profileCardWrap,
-      { opacity: fadeAnim, transform: [{ translateY: slideAnim }] },
-    ]}>
-      {/* Halo behind avatar */}
-      <View pointerEvents="none" style={[styles.profileHalo, { backgroundColor: themeColor + '15' }]} />
-      <View pointerEvents="none" style={[styles.profileHalo2, { backgroundColor: themeColor + '08' }]} />
+    <TouchableOpacity
+      onPress={() => navigation.navigate('ProfileTab')}
+      activeOpacity={0.65}
+      style={[styles.profileCard, { backgroundColor: cardBg }]}
+    >
+      <View style={[styles.profileAvatar, { backgroundColor: avatarBg }]}>
+        {profileData?.profileImage ? (
+          <Image resizeMode="cover" source={{ uri: profileData.profileImage }} style={styles.profileAvatarImage} />
+        ) : (
+          <Text style={styles.profileAvatarText}>{getInitials(profileData?.fullName)}</Text>
+        )}
+      </View>
 
-      <TouchableOpacity
-        onPress={() => navigation.navigate('ProfileTab')}
-        activeOpacity={0.85}
-        style={[styles.profileCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}
-      >
-        <View style={[styles.avatarRing, { borderColor: themeColor + '30' }]}>
-          <View style={[styles.profileAvatar, { backgroundColor: avatarBg }]}>
-            {profileData?.profileImage ? (
-              <Image resizeMode="cover" source={{ uri: profileData.profileImage }} style={styles.profileAvatarImage} />
-            ) : (
-              <Text style={styles.profileAvatarText}>{getInitials(profileData?.fullName)}</Text>
-            )}
-          </View>
-        </View>
+      <View style={styles.profileInfo}>
+        <Text style={[styles.profileName, { color: primaryText }]} numberOfLines={1}>
+          {profileData?.fullName || 'User'}
+        </Text>
+        <Text style={[styles.profileSub, { color: subText }]} numberOfLines={1}>
+          {profileData?.about || profileData?.email || 'Tap to set up your profile'}
+        </Text>
+      </View>
 
-        <View style={styles.profileInfo}>
-          <Text style={[styles.profileName, { color: primaryText }]} numberOfLines={1}>
-            {profileData?.fullName || 'User'}
-          </Text>
-          <Text style={[styles.profileSub, { color: subText }]} numberOfLines={1}>
-            {profileData?.about || profileData?.email || 'Tap to set up your profile'}
-          </Text>
-          <View style={[styles.viewProfilePill, { backgroundColor: themeColor + '15' }]}>
-            <Text style={[styles.viewProfileText, { color: themeColor }]}>View profile</Text>
-            <Ionicons name="chevron-forward" size={11} color={themeColor} />
-          </View>
-        </View>
-      </TouchableOpacity>
-    </Animated.View>
+      <View style={[styles.qrBtn, { backgroundColor: accent + '14' }]}>
+        <Ionicons name="qr-code-outline" size={20} color={accent} />
+      </View>
+    </TouchableOpacity>
   );
 
   const renderMenuItem = (item, index, isLast) => (
-    <TouchableOpacity
-      key={index}
-      onPress={item.onPress}
-      disabled={item.isLoading}
-      activeOpacity={0.6}
-      style={styles.menuItem}
-    >
-      <View style={[styles.menuIconWrap, { backgroundColor: item.iconBg }]}>
-        {item.isLoading ? (
-          <ActivityIndicator size="small" color={item.iconColor} />
-        ) : (
-          <Ionicons name={item.icon} size={20} color={item.iconColor} />
-        )}
-      </View>
-      <View style={[
-        styles.menuTextWrap,
-        !isLast && { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: borderClr },
-      ]}>
-        <View style={styles.menuLabelWrap}>
+    <View key={item.label}>
+      <TouchableOpacity
+        onPress={item.onPress}
+        disabled={item.isLoading}
+        activeOpacity={0.6}
+        style={styles.menuItem}
+      >
+        <View style={styles.menuIconWrap}>
+          {item.isLoading ? (
+            <ActivityIndicator size="small" color={accent} />
+          ) : (
+            <Ionicons name={item.icon} size={23} color={iconColor} />
+          )}
+        </View>
+        <View style={styles.menuTextWrap}>
           <Text style={[styles.menuLabel, { color: primaryText }]}>{item.label}</Text>
           {item.subtitle ? (
-            <Text style={[
-              styles.menuSubtitle,
-              { color: item.isLoading ? themeColor : subText },
-            ]}>{item.subtitle}</Text>
+            <Text
+              numberOfLines={1}
+              style={[styles.menuSubtitle, { color: item.isLoading ? accent : subText }]}
+            >
+              {item.subtitle}
+            </Text>
           ) : null}
         </View>
         {!item.isLoading && (
-          <Ionicons name="chevron-forward" size={17} color={subText} />
+          <Ionicons name="chevron-forward" size={18} color={subText} />
         )}
-      </View>
-    </TouchableOpacity>
+      </TouchableOpacity>
+      {!isLast && <View style={[styles.separator, { backgroundColor: sepClr }]} />}
+    </View>
   );
 
   const renderSection = (section, sectionIndex) => (
     <View key={sectionIndex} style={styles.sectionWrap}>
       <Text style={[styles.sectionTitle, { color: subText }]}>{section.title}</Text>
-      <View style={[
-        styles.sectionCard,
-        { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' },
-      ]}>
+      <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
         {section.items.map((item, i) =>
           renderMenuItem(item, i, i === section.items.length - 1)
         )}
@@ -226,10 +217,10 @@ export default function Setting({ navigation }) {
     <View style={styles.logoutWrap}>
       <TouchableOpacity
         onPress={confirmLogout}
-        activeOpacity={0.7}
-        style={[styles.logoutBtn, { borderColor: '#E5393530' }]}
+        activeOpacity={0.6}
+        style={[styles.logoutBtn, { backgroundColor: cardBg }]}
       >
-        <Ionicons name="log-out-outline" size={20} color="#E53935" />
+        <Ionicons name="log-out-outline" size={22} color="#E53935" />
         <Text style={styles.logoutText}>Log out</Text>
       </TouchableOpacity>
       <Text style={[styles.versionText, { color: subText }]}>
@@ -245,23 +236,28 @@ export default function Setting({ navigation }) {
         <TouchableOpacity
           onPress={() => navigation.goBack()}
           activeOpacity={0.6}
-          style={[styles.headerBackBtn, { backgroundColor: cardBg }]}
+          style={styles.headerBackBtn}
         >
-          <FontAwesome6 name="arrow-left" size={18} color={primaryText} />
+          <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
         </TouchableOpacity>
         <Text style={[styles.headerTitle, { color: primaryText }]}>Settings</Text>
         <View style={styles.headerSpacer} />
       </View>
 
-      <ScrollView
-        style={styles.flex}
-        showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.scrollContent}
-      >
-        {renderProfileCard()}
-        {menuSections.map((section, i) => renderSection(section, i))}
-        {renderLogout()}
-      </ScrollView>
+      <Animated.View style={{ flex: 1, opacity: fadeAnim, transform: [{ translateY: slideAnim }] }}>
+        <ScrollView
+          style={styles.flex}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={styles.scrollContent}
+        >
+          {renderProfileCard()}
+
+          {menuSections.map((section, i) => renderSection(section, i))}
+
+          {renderLogout()}
+        </ScrollView>
+      </Animated.View>
     </View>
   );
 }
@@ -274,13 +270,13 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 12,
-    gap: 12,
+    paddingHorizontal: 12,
+    paddingTop: 6,
+    paddingBottom: 8,
+    gap: 6,
   },
   headerBackBtn: {
-    width: 40, height: 40, borderRadius: 12,
+    width: 40, height: 40, borderRadius: 20,
     alignItems: 'center', justifyContent: 'center',
   },
   headerTitle: {
@@ -293,47 +289,26 @@ const styles = StyleSheet.create({
 
   scrollContent: {
     paddingHorizontal: 16,
-    paddingBottom: 36,
-    paddingTop: 6,
+    paddingBottom: 40,
+    paddingTop: 4,
   },
 
+
   // Profile card
-  profileCardWrap: {
-    position: 'relative',
-    marginBottom: 26,
-  },
-  profileHalo: {
-    position: 'absolute',
-    top: -36, left: -20,
-    width: 160, height: 160, borderRadius: 80,
-  },
-  profileHalo2: {
-    position: 'absolute',
-    top: -10, right: -30,
-    width: 130, height: 130, borderRadius: 65,
-  },
   profileCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 16,
-    borderRadius: 20,
+    padding: 14,
+    borderRadius: 16,
     gap: 14,
-    shadowOpacity: 0.06,
-    shadowOffset: { width: 0, height: 8 },
-    shadowRadius: 18,
-    elevation: 3,
-  },
-  avatarRing: {
-    width: 70, height: 70, borderRadius: 35,
-    borderWidth: 2,
-    alignItems: 'center', justifyContent: 'center',
+    marginBottom: 24,
   },
   profileAvatar: {
-    width: 60, height: 60, borderRadius: 30,
+    width: 58, height: 58, borderRadius: 29,
     alignItems: 'center', justifyContent: 'center',
     overflow: 'hidden',
   },
-  profileAvatarImage: { width: 60, height: 60, borderRadius: 30 },
+  profileAvatarImage: { width: 58, height: 58, borderRadius: 29 },
   profileAvatarText: {
     color: '#fff',
     fontFamily: 'Roboto-Bold',
@@ -342,106 +317,87 @@ const styles = StyleSheet.create({
   profileInfo: { flex: 1, gap: 3 },
   profileName: {
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 17,
+    fontSize: 18,
     textTransform: 'capitalize',
-    lineHeight: 22,
+    lineHeight: 23,
   },
   profileSub: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
-    lineHeight: 16,
+    fontSize: 13,
+    lineHeight: 17,
   },
-  viewProfilePill: {
-    alignSelf: 'flex-start',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 2,
-    paddingHorizontal: 9,
-    paddingVertical: 3,
-    borderRadius: 10,
-    marginTop: 5,
-  },
-  viewProfileText: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 11,
-    letterSpacing: 0.3,
+  qrBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
   },
 
   // Sections
-  sectionWrap: { marginBottom: 18 },
+  sectionWrap: { marginBottom: 22 },
   sectionTitle: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 11,
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
-    marginBottom: 10,
-    marginLeft: 8,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+    letterSpacing: 0.2,
+    marginBottom: 8,
+    marginLeft: 14,
   },
   sectionCard: {
-    borderRadius: 18,
+    borderRadius: 14,
     overflow: 'hidden',
-    shadowOpacity: 0.04,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 10,
-    elevation: 2,
   },
 
   // Menu items
   menuItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingLeft: 14,
-    gap: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    gap: 16,
+    minHeight: 58,
   },
   menuIconWrap: {
-    width: 40, height: 40, borderRadius: 12,
+    width: 24, height: 24,
     alignItems: 'center', justifyContent: 'center',
   },
-  menuTextWrap: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 16,
-    paddingRight: 16,
-  },
-  menuLabelWrap: { flex: 1 },
+  menuTextWrap: { flex: 1 },
   menuLabel: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 15,
-    lineHeight: 20,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 16,
+    lineHeight: 21,
   },
   menuSubtitle: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
+    fontSize: 13,
     marginTop: 2,
+    lineHeight: 17,
+  },
+  separator: {
+    height: StyleSheet.hairlineWidth,
+    marginLeft: 56,
   },
 
   // Logout
   logoutWrap: {
-    marginTop: 16,
+    marginTop: 4,
     alignItems: 'center',
-    gap: 16,
+    gap: 18,
   },
   logoutBtn: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
+    gap: 10,
     width: '100%',
     paddingVertical: 15,
-    borderRadius: 16,
-    borderWidth: 1.5,
-    backgroundColor: 'transparent',
+    borderRadius: 14,
   },
   logoutText: {
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 15,
+    fontSize: 16,
     color: '#E53935',
   },
   versionText: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 11,
+    fontSize: 12,
     letterSpacing: 0.3,
   },
 });

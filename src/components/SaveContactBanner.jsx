@@ -48,7 +48,7 @@ const SaveContactBanner = ({
     if (saveError === 'permission_denied') {
       Alert.alert(
         'Permission Required',
-        'Vibe Connect needs access to your contacts to save this number. Please allow it in Settings.',
+        'TalksTry needs access to your contacts to save this number. Please allow it in Settings.',
         [
           { text: 'Cancel', style: 'cancel' },
           {
@@ -89,7 +89,7 @@ const SaveContactBanner = ({
     <Animated.View style={[styles.banner, { backgroundColor: bg, borderColor: border, opacity: opacityAnim, transform: [{ translateY: slideAnim }] }]}>
       <Ionicons name="person-circle-outline" size={18} color={iconColor} style={styles.icon} />
 
-      <View style={styles.textBlock}>
+      {/* <View style={styles.textBlock}>
         <Text style={[styles.mainText, { color: textColor }]} numberOfLines={1}>
           {peerName ? `${peerName} is on Vibe Connect` : 'This contact is on Vibe Connect'}
         </Text>
@@ -98,7 +98,7 @@ const SaveContactBanner = ({
             ? saveError
             : 'Not saved in your phone contacts'}
         </Text>
-      </View>
+      </View> */}
 
       <TouchableOpacity
         onPress={handleSave}

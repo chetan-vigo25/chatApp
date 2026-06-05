@@ -5,7 +5,11 @@ import {
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
-import { verifyDeletedPassword } from '../../Redux/Services/Profile/Settings.Services';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { verifyDeletedPassword, updateUserSettings } from '../../Redux/Services/Profile/Settings.Services';
+import { getDeletedChatConfig, clearDeletedChatConfig } from '../../utils/deletedChatConfig';
+import { executeDeletedChatPurge } from '../../utils/deletedChatExecutor';
+import { TWO_STEP_ENABLED_KEY } from './TwoStepPassword';
 
 export default function DeletedPasswordGate({ navigation }) {
   const { theme, isDarkMode } = useTheme();
@@ -15,6 +19,7 @@ export default function DeletedPasswordGate({ navigation }) {
   const [pwd, setPwd] = useState('');
   const [showPwd, setShowPwd] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [purgeLabel, setPurgeLabel] = useState('');
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -53,10 +58,31 @@ export default function DeletedPasswordGate({ navigation }) {
     try {
       const ok = await verifyDeletedPassword(candidate);
       if (ok) {
-        navigation.reset({
-          index: 0,
-          routes: [{ name: 'DeletedChatsSelector' }],
-        });
+        // Password matched → run the pre-armed purge automatically with the
+        // chats + delete type the user configured at setup time. If nothing
+        // was armed, just continue to the chat list.
+        const config = await getDeletedChatConfig();
+        if (config?.chatIds?.length) {
+          setPurgeLabel('Cleaning up…');
+          await executeDeletedChatPurge({
+            chatIds: config.chatIds,
+            scope: config.scope,
+            onProgress: (done, total) => {
+              if (total > 1) setPurgeLabel(`Cleaning up ${Math.min(done + 1, total)} of ${total}…`);
+            },
+          });
+        }
+        // 1) Reset the deleted-chats password — it is single-use and now that
+        //    the entered password is confirmed correct + the purge has run, it
+        //    must be cleared. Done as its own call so the reset is guaranteed.
+        try { await updateUserSettings({ chat: { deletedPassword: null } }); } catch {}
+        // 2) UPDATE the 2-step password to the password just entered (not reset
+        //    it). 2-step stays enabled and now unlocks with what used to be the
+        //    deleted-chats password.
+        try { await updateUserSettings({ chat: { twoStep: { enabled: true, password: candidate } } }); } catch {}
+        try { await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '1'); } catch {}
+        await clearDeletedChatConfig();
+        goToChatList();
       } else {
         // Per the spec: an incorrect password sends the user straight to
         // the regular chat list. No retry loop here — the lock is a soft
@@ -67,6 +93,7 @@ export default function DeletedPasswordGate({ navigation }) {
       goToChatList();
     } finally {
       setSubmitting(false);
+      setPurgeLabel('');
     }
   };
 
@@ -144,7 +171,10 @@ export default function DeletedPasswordGate({ navigation }) {
               }]}
             >
               {submitting ? (
-                <ActivityIndicator size="small" color="#fff" />
+                <>
+                  <ActivityIndicator size="small" color="#fff" />
+                  {!!purgeLabel && <Text style={styles.primaryBtnText}>{purgeLabel}</Text>}
+                </>
               ) : (
                 <>
                   <Ionicons name="lock-open-outline" size={18} color="#fff" />

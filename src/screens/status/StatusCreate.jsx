@@ -13,16 +13,33 @@
  *
  * Text statuses skip Customise and go directly to StatusPreview.
  */
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   KeyboardAvoidingView, Platform, TextInput,
   ScrollView, ActivityIndicator, Alert,
+  FlatList, Image, Dimensions, Modal,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
+import * as MediaLibrary from 'expo-media-library';
+import { useFocusEffect } from '@react-navigation/native';
 import { Ionicons, MaterialCommunityIcons, FontAwesome5 } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useStatusSettings from '../../hooks/useStatusSettings';
+import { suspendAppLock, resumeAppLock } from '../../services/appLockGuard';
+
+const { width: SCREEN_W } = Dimensions.get('window');
+const GRID_COLS = 3;
+const GRID_GAP = 2;
+const CELL = Math.floor((SCREEN_W - GRID_GAP * (GRID_COLS - 1)) / GRID_COLS);
+
+// mm:ss for the video-duration badge.
+function fmtDuration(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
 
 const BG_COLORS = [
   '#075e54', '#128C7E', '#25D366', '#FF6B6B',
@@ -45,7 +62,7 @@ function normaliseAsset(a) {
 }
 
 export default function StatusCreate({ navigation, route }) {
-  const { theme } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const initialMode = route?.params?.type || null;
   const { validateMediaList, limits } = useStatusSettings();
 
@@ -55,8 +72,20 @@ export default function StatusCreate({ navigation, route }) {
   const [linkUrl, setLinkUrl] = useState('');
   const [fetching, setFetching] = useState(false);
 
+  // Device gallery for the WhatsApp-style picker.
+  const [permission, requestPermission] = MediaLibrary.usePermissions();
+  const [recents, setRecents] = useState([]);
+  const [loadingRecents, setLoadingRecents] = useState(false);
+  // Album (folder) filtering — Recents / Camera / Videos / Screenshots / …
+  const [albums, setAlbums] = useState([]);            // [{ id, title, count, cover }]
+  const [selectedAlbum, setSelectedAlbum] = useState({ id: null, title: 'Recents' });
+  const [albumPickerOpen, setAlbumPickerOpen] = useState(false);
+
   // ── Camera ──────────────────────────────────────────────────────────────
   const launchCamera = useCallback(async () => {
+    // Opening the camera backgrounds the app — keep the 2-step app lock from
+    // re-locking when we come back.
+    suspendAppLock();
     try {
       const perm = await ImagePicker.requestCameraPermissionsAsync();
       if (!perm.granted) return Alert.alert('Permission needed', 'Please allow camera access');
@@ -77,11 +106,127 @@ export default function StatusCreate({ navigation, route }) {
       navigation.navigate('StatusCustomise', { items: [item] });
     } catch (err) {
       Alert.alert('Camera error', err?.message || 'Could not open camera');
+    } finally {
+      resumeAppLock();
     }
   }, [navigation, limits.maxVideoSecs, validateMediaList]);
 
+  // Ensure we have photo-library permission, prompting if needed. Returns true
+  // when access is granted (full or limited).
+  const ensurePerm = useCallback(async () => {
+    if (permission?.granted) return true;
+    const res = await requestPermission();
+    return !!(res?.granted || res?.status === 'granted');
+  }, [permission, requestPermission]);
+
+  // Load assets for the grid. `album = null` → all recent media; otherwise the
+  // assets inside that device album/folder.
+  const loadAssets = useCallback(async (album) => {
+    setLoadingRecents(true);
+    try {
+      if (!(await ensurePerm())) { setRecents([]); return; }
+      const page = await MediaLibrary.getAssetsAsync({
+        first: 120,
+        mediaType: [MediaLibrary.MediaType.photo, MediaLibrary.MediaType.video],
+        sortBy: [[MediaLibrary.SortBy.creationTime, false]],
+        ...(album?.id ? { album: album.id } : {}),
+      });
+      setRecents(page.assets || []);
+    } catch (err) {
+      setRecents([]);
+    } finally {
+      setLoadingRecents(false);
+    }
+  }, [ensurePerm]);
+
+  // Load the device albums (folders) + a cover thumbnail and count for each,
+  // so the dropdown can mirror WhatsApp's "Recents / Camera / Videos / …" list.
+  const loadAlbums = useCallback(async () => {
+    try {
+      if (!(await ensurePerm())) return;
+      const raw = await MediaLibrary.getAlbumsAsync({ includeSmartAlbums: true });
+      const withAssets = (raw || []).filter(a => (a.assetCount || 0) > 0);
+      // Largest albums first (Camera, Screenshots, … bubble to the top).
+      withAssets.sort((a, b) => (b.assetCount || 0) - (a.assetCount || 0));
+      const enriched = await Promise.all(
+        withAssets.map(async (a) => {
+          let cover = null;
+          try {
+            const page = await MediaLibrary.getAssetsAsync({
+              first: 1, album: a.id,
+              mediaType: [MediaLibrary.MediaType.photo, MediaLibrary.MediaType.video],
+              sortBy: [[MediaLibrary.SortBy.creationTime, false]],
+            });
+            cover = page.assets?.[0]?.uri || null;
+          } catch {}
+          return { id: a.id, title: a.title, count: a.assetCount || 0, cover };
+        })
+      );
+      setAlbums(enriched);
+    } catch {}
+  }, [ensurePerm]);
+
+  // Load whenever the picker is shown / re-focused or the album changes.
+  useEffect(() => {
+    if (!mode) {
+      loadAssets(selectedAlbum);
+      loadAlbums();
+    }
+  }, [mode, selectedAlbum, loadAssets, loadAlbums]);
+
+  // Re-load on screen focus too (e.g. after the user grants access in Settings).
+  useFocusEffect(
+    useCallback(() => {
+      if (!mode) {
+        loadAssets(selectedAlbum);
+        loadAlbums();
+      }
+    }, [mode, selectedAlbum, loadAssets, loadAlbums])
+  );
+
+  const onSelectAlbum = useCallback((album) => {
+    setAlbumPickerOpen(false);
+    setSelectedAlbum(album);
+  }, []);
+
+  // Pick an asset from the in-app grid → resolve a usable local URI, validate,
+  // then continue to the editor.
+  const onPickAsset = useCallback(async (asset) => {
+    suspendAppLock();
+    try {
+      let uri = asset.uri;
+      // iOS ph:// URIs aren't directly usable — resolve the real localUri.
+      if (Platform.OS === 'ios' || String(uri).startsWith('ph://')) {
+        try {
+          const info = await MediaLibrary.getAssetInfoAsync(asset);
+          uri = info?.localUri || info?.uri || uri;
+        } catch {}
+      }
+      const isVideo = asset.mediaType === MediaLibrary.MediaType.video || asset.mediaType === 'video';
+      const item = {
+        uri,
+        type: isVideo ? 'video' : 'image',
+        width: asset.width,
+        height: asset.height,
+        duration: asset.duration || null,
+        fileSize: null,
+        mimeType: isVideo ? 'video/mp4' : 'image/jpeg',
+      };
+      const check = validateMediaList([item]);
+      if (!check.ok) return Alert.alert('Cannot use this media', check.message);
+      navigation.navigate('StatusCustomise', { items: [item] });
+    } catch (err) {
+      Alert.alert('Error', err?.message || 'Could not open this item');
+    } finally {
+      resumeAppLock();
+    }
+  }, [navigation, validateMediaList]);
+
   // ── Gallery multi-select ─────────────────────────────────────────────────
   const launchGallery = useCallback(async () => {
+    // Opening the gallery backgrounds the app — keep the 2-step app lock from
+    // re-locking when we come back.
+    suspendAppLock();
     try {
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!perm.granted) return Alert.alert('Permission needed', 'Please allow media library access');
@@ -115,6 +260,8 @@ export default function StatusCreate({ navigation, route }) {
       navigation.navigate('StatusCustomise', { items });
     } catch (err) {
       Alert.alert('Gallery error', err?.message || 'Could not open gallery');
+    } finally {
+      resumeAppLock();
     }
   }, [navigation, limits.maxVideoSecs, validateMediaList]);
 
@@ -143,39 +290,171 @@ export default function StatusCreate({ navigation, route }) {
     });
   }, [linkUrl, navigation]);
 
-  // ── Mode picker ──────────────────────────────────────────────────────────
+  // ── Add status picker (WhatsApp-style) ────────────────────────────────────
   if (!mode) {
+    const text2 = theme.colors.primaryTextColor;
+    const sub = theme.colors.placeHolderTextColor;
+    const cardBorder = isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.10)';
+    const cameraTileBg = isDarkMode ? '#0E1A22' : '#ECE7E1';
+
+    const actionCards = [
+      { key: 'text', label: 'Text', render: (c) => <MaterialCommunityIcons name="format-text" size={26} color={c} />, onPress: () => setMode('text') },
+      { key: 'link', label: 'Link', render: (c) => <FontAwesome5 name="link" size={20} color={c} />, onPress: () => setMode('link') },
+    ];
+
+    const gridData = [{ _camera: true, id: '__camera__' }, ...recents];
+
+    const renderCell = ({ item }) => {
+      if (item._camera) {
+        return (
+          <TouchableOpacity
+            activeOpacity={0.85}
+            onPress={launchCamera}
+            style={[styles.cell, styles.cameraTile, { backgroundColor: cameraTileBg }]}
+          >
+            <Ionicons name="camera" size={26} color={theme.colors.themeColor} />
+            <Text style={[styles.cameraTileLabel, { color: text2 }]}>Camera</Text>
+          </TouchableOpacity>
+        );
+      }
+      const isVideo = item.mediaType === MediaLibrary.MediaType.video || item.mediaType === 'video';
+      return (
+        <TouchableOpacity activeOpacity={0.85} onPress={() => onPickAsset(item)} style={styles.cell}>
+          <Image source={{ uri: item.uri }} style={styles.cellImg} />
+          {isVideo && (
+            <View style={styles.videoBadge}>
+              <Ionicons name="videocam" size={11} color="#fff" />
+              <Text style={styles.videoBadgeText}>{fmtDuration(item.duration)}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+      );
+    };
+
     return (
       <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
-        <View style={styles.header}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-            <Ionicons name="arrow-back" size={24} color={theme.colors.themeColor} />
+        {/* <SafeAreaView edges={['top']} /> */}
+        {/* Header */}
+        <View style={styles.addHeader}>
+          <TouchableOpacity onPress={() => navigation.goBack()} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+            <Ionicons name="close" size={26} color={text2} />
           </TouchableOpacity>
-          <Text style={[styles.headerTitle, { color: theme.colors.themeColor }]}>New Status</Text>
+          <Text style={[styles.addHeaderTitle, { color: text2 }]}>Add status</Text>
+          <View style={{ width: 26 }} />
         </View>
 
-        <View style={styles.grid}>
-          <TouchableOpacity style={[styles.card, { backgroundColor: '#075e54' }]} onPress={launchCamera}>
-            <Ionicons name="camera" size={40} color="#fff" />
-            <Text style={styles.cardLabel}>Camera</Text>
-          </TouchableOpacity>
+        {/* Quick-action cards */}
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.actionRow}
+        >
+          {actionCards.map((c) => (
+            <TouchableOpacity
+              key={c.key}
+              activeOpacity={0.8}
+              onPress={c.onPress}
+              style={[styles.actionCard, { borderColor: cardBorder }]}
+            >
+              {c.render(theme.colors.themeColor)}
+              <Text style={[styles.actionCardLabel, { color: text2 }]}>{c.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
 
-          <TouchableOpacity style={[styles.card, { backgroundColor: '#6C5CE7' }]} onPress={launchGallery}>
-            <Ionicons name="images" size={40} color="#fff" />
-            <Text style={styles.cardLabel}>Gallery</Text>
-            <Text style={styles.cardSub}>up to 10</Text>
-          </TouchableOpacity>
+        {/* Album selector (Recents / Camera / Videos / Screenshots / …) */}
+        <TouchableOpacity
+          style={styles.albumSelector}
+          activeOpacity={0.7}
+          onPress={() => setAlbumPickerOpen(true)}
+        >
+          <Text style={[styles.recentsLabel, { color: sub }]} numberOfLines={1}>
+            {selectedAlbum.title}
+          </Text>
+          <Ionicons name="chevron-down" size={16} color={sub} />
+        </TouchableOpacity>
 
-          <TouchableOpacity style={[styles.card, { backgroundColor: '#00B894' }]} onPress={() => setMode('text')}>
-            <MaterialCommunityIcons name="format-text" size={40} color="#fff" />
-            <Text style={styles.cardLabel}>Text</Text>
-          </TouchableOpacity>
+        <FlatList
+          data={gridData}
+          keyExtractor={(item) => (item._camera ? '__camera__' : String(item.id))}
+          renderItem={renderCell}
+          numColumns={GRID_COLS}
+          columnWrapperStyle={{ gap: GRID_GAP }}
+          contentContainerStyle={{ paddingBottom: 120, gap: GRID_GAP }}
+          showsVerticalScrollIndicator={false}
+          ListHeaderComponent={
+            permission && !permission.granted ? (
+              <TouchableOpacity
+                onPress={async () => {
+                  const res = await requestPermission();
+                  if (res?.granted) { loadAssets(selectedAlbum); loadAlbums(); }
+                }}
+                style={styles.permRow}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="lock-closed-outline" size={16} color={sub} />
+                <Text style={[styles.permText, { color: sub }]}>
+                  Tap to allow photo access and show your gallery
+                </Text>
+              </TouchableOpacity>
+            ) : loadingRecents && recents.length === 0 ? (
+              <ActivityIndicator style={{ marginVertical: 24 }} color={theme.colors.themeColor} />
+            ) : null
+          }
+        />
 
-          <TouchableOpacity style={[styles.card, { backgroundColor: '#0984e3' }]} onPress={() => setMode('link')}>
-            <FontAwesome5 name="link" size={34} color="#fff" />
-            <Text style={styles.cardLabel}>Link</Text>
+        {/* Floating folder button → full OS gallery picker */}
+        <TouchableOpacity
+          style={[styles.folderFab, { backgroundColor: isDarkMode ? theme.colors.surface : '#FFFFFF', borderColor: cardBorder }]}
+          activeOpacity={0.85}
+          onPress={launchGallery}
+          accessibilityLabel="Open gallery"
+        >
+          <Ionicons name="albums-outline" size={22} color={text2} />
+        </TouchableOpacity>
+
+        {/* Album dropdown */}
+        <Modal
+          visible={albumPickerOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setAlbumPickerOpen(false)}
+        >
+          <TouchableOpacity
+            style={styles.albumScrim}
+            activeOpacity={1}
+            onPress={() => setAlbumPickerOpen(false)}
+          >
+            <View style={[styles.albumSheet, { backgroundColor: isDarkMode ? theme.colors.surface : '#FFFFFF' }]}>
+              <FlatList
+                data={[{ id: null, title: 'Recents', count: recents.length, cover: recents[0]?.uri }, ...albums]}
+                keyExtractor={(a) => String(a.id ?? '__recents__')}
+                showsVerticalScrollIndicator={false}
+                renderItem={({ item: a }) => {
+                  const active = (selectedAlbum.id ?? null) === (a.id ?? null);
+                  return (
+                    <TouchableOpacity
+                      style={styles.albumRow}
+                      activeOpacity={0.7}
+                      onPress={() => onSelectAlbum({ id: a.id, title: a.title })}
+                    >
+                      {a.cover
+                        ? <Image source={{ uri: a.cover }} style={styles.albumCover} />
+                        : <View style={[styles.albumCover, { backgroundColor: 'rgba(127,127,127,0.2)' }]} />}
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.albumTitle, { color: text2 }]} numberOfLines={1}>{a.title}</Text>
+                        <Text style={[styles.albumCount, { color: sub }]} numberOfLines={1}>
+                          {a.count != null ? `${a.count} items` : ''}
+                        </Text>
+                      </View>
+                      {active && <Ionicons name="checkmark" size={20} color={theme.colors.themeColor} />}
+                    </TouchableOpacity>
+                  );
+                }}
+              />
+            </View>
           </TouchableOpacity>
-        </View>
+        </Modal>
       </View>
     );
   }
@@ -296,21 +575,75 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center',
   },
   backBtn: { marginRight: 14 },
-  headerTitle: { fontSize: 18, fontWeight: '700' },
+  headerTitle: { fontSize: 18, fontFamily: 'Roboto-Bold' },
 
-  // Picker grid
-  grid: {
-    flex: 1, flexDirection: 'row', flexWrap: 'wrap',
-    justifyContent: 'center', alignItems: 'center', gap: 20, padding: 30,
+  // ── Add status picker (WhatsApp-style) ─────────────────────────────────────
+  addHeader: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingVertical: 12,
   },
-  card: {
-    width: 140, height: 140, borderRadius: 20,
+  addHeaderTitle: { flex: 1, textAlign: 'center', fontSize: 20, fontFamily: 'Roboto-Medium' },
+
+  actionRow: { paddingHorizontal: 16, paddingTop: 6, paddingBottom: 16, gap: 12 },
+  actionCard: {
+    width: (SCREEN_W - 32 - 24) / 3,
+    height: 92, borderRadius: 14, borderWidth: 1,
+    alignItems: 'center', justifyContent: 'center', gap: 10,
+  },
+  actionCardLabel: { fontSize: 14, fontFamily: 'Roboto-Medium' },
+
+  albumSelector: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    alignSelf: 'flex-start',
+    paddingRight: 16,
+  },
+  recentsLabel: {
+    fontSize: 14, fontFamily: 'Roboto-Medium',
+    paddingLeft: 16, paddingBottom: 10,
+  },
+
+  // Album dropdown
+  albumScrim: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)' },
+  albumSheet: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 150 : 130,
+    left: 0,
+    width: '78%',
+    maxHeight: '70%',
+    borderTopRightRadius: 16, borderBottomRightRadius: 16,
+    paddingVertical: 8,
+    shadowColor: '#000', shadowOffset: { width: 2, height: 2 }, shadowOpacity: 0.3, shadowRadius: 12,
+    elevation: 12,
+  },
+  albumRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 14,
+    paddingHorizontal: 16, paddingVertical: 8,
+  },
+  albumCover: { width: 52, height: 52, borderRadius: 8 },
+  albumTitle: { fontSize: 16, fontFamily: 'Roboto-Medium' },
+  albumCount: { fontSize: 13, fontFamily: 'Roboto-Regular', marginTop: 2 },
+
+  cell: { width: CELL, height: CELL, backgroundColor: 'rgba(127,127,127,0.12)' },
+  cellImg: { width: '100%', height: '100%' },
+  cameraTile: { alignItems: 'center', justifyContent: 'center', gap: 8 },
+  cameraTileLabel: { fontSize: 13, fontFamily: 'Roboto-Medium' },
+
+  videoBadge: {
+    position: 'absolute', left: 6, bottom: 6,
+    flexDirection: 'row', alignItems: 'center', gap: 3,
+  },
+  videoBadgeText: { color: '#fff', fontSize: 11, fontFamily: 'Roboto-Medium' },
+
+  permRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 24, paddingTop: 30 },
+  permText: { fontSize: 13, fontFamily: 'Roboto-Regular', textAlign: 'center' },
+
+  folderFab: {
+    position: 'absolute', right: 18, bottom: 28,
+    width: 56, height: 56, borderRadius: 28, borderWidth: StyleSheet.hairlineWidth,
     alignItems: 'center', justifyContent: 'center',
-    elevation: 4, shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.2, shadowRadius: 4,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.25, shadowRadius: 8,
+    elevation: 6,
   },
-  cardLabel: { color: '#fff', fontSize: 16, fontWeight: '600', marginTop: 10 },
-  cardSub:   { color: 'rgba(255,255,255,0.7)', fontSize: 11, marginTop: 2 },
 
   // Text status
   textScreen:    { flex: 1 },
@@ -318,11 +651,11 @@ const styles = StyleSheet.create({
     paddingTop: 50, paddingHorizontal: 20,
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
   },
-  textHeaderTitle: { color: '#fff', fontSize: 17, fontWeight: '700' },
+  textHeaderTitle: { color: '#fff', fontSize: 17, fontFamily: 'Roboto-Bold' },
   nextBtn:       { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.2)' },
-  nextBtnText:   { color: '#fff', fontSize: 15, fontWeight: '600' },
+  nextBtnText:   { color: '#fff', fontSize: 15, fontFamily: 'Roboto-SemiBold' },
   textInputArea: { flex: 1, justifyContent: 'center', paddingHorizontal: 30 },
-  textInput:     { fontSize: 24, color: '#fff', textAlign: 'center', fontWeight: '500', maxHeight: 300 },
+  textInput:     { fontSize: 24, color: '#fff', textAlign: 'center', fontFamily: 'Roboto-Medium', maxHeight: 300 },
   palette:       { paddingBottom: 30 },
   paletteContent:{ paddingHorizontal: 20, gap: 10, alignItems: 'center' },
   colorDot:      { width: 36, height: 36, borderRadius: 18 },
@@ -338,5 +671,5 @@ const styles = StyleSheet.create({
   primaryBtn:    {
     borderRadius: 12, padding: 14, alignItems: 'center',
   },
-  primaryBtnText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  primaryBtnText: { color: '#fff', fontSize: 16, fontFamily: 'Roboto-SemiBold' },
 });

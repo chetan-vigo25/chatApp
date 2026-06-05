@@ -30,9 +30,11 @@ export default function Otp({ navigation, route }) {
     const otpInputRef = useRef(null);
     const { theme, isDarkMode } = useTheme();
     const [otp, setOtp] = useState("");
+    const [otpError, setOtpError] = useState("");
     const [seconds, setSeconds] = useState(60);
     const [isActive, setIsActive] = useState(true);
     const [fcmToken, setFcmToken] = useState(null);
+    const verifyingRef = useRef(false);
 
     // OTP Banner state
     const [otpBannerVisible, setOtpBannerVisible] = useState(false);
@@ -142,16 +144,20 @@ export default function Otp({ navigation, route }) {
           setIsActive(true);
         };
         
-        const handleVerifyOtp = async () => {
-          if (otp.length !== 6) {
-            showToast("Enter Valid OTP");
+        const handleVerifyOtp = async (codeArg) => {
+          const code = typeof codeArg === 'string' ? codeArg : otp;
+          if (code.length !== 6) {
+            setOtpError("Enter the 6-digit code");
             return;
           }
-        
+          if (verifyingRef.current || isLoading) return;
+          verifyingRef.current = true;
+          setOtpError("");
+
           const payload = {
             mobileCode: selectedCountry.code,
             userName: phoneNumber,
-            otp: otp,
+            otp: code,
             device: {
               deviceName: deviceInfo.brand,
               deviceType: deviceInfo.deviceType,
@@ -215,9 +221,13 @@ export default function Otp({ navigation, route }) {
             setOtp("");
           } catch (error) {
             console.error("OTP Verification Failed:", error);
-            showToast(typeof error === 'string' ? error : error?.message || 'Verification failed');
+            const msg = typeof error === 'string' ? error : error?.message || 'Invalid OTP. Please try again.';
+            setOtpError(msg);
+            showToast(msg);
             otpInputRef.current?.clear();
             setOtp("");
+          } finally {
+            verifyingRef.current = false;
           }
         };
 
@@ -267,10 +277,11 @@ export default function Otp({ navigation, route }) {
             type="numeric"
             secureTextEntry={false}
             focusStickBlinkingDuration={500}
-            onFocus={() => console.log("Focused")}
-            onBlur={() => console.log("Blurred")}
-            onTextChange={(text) => setOtp(text)}
-            onFilled={(text) => console.log(`OTP is ${text}`)}
+            onTextChange={(text) => {
+              setOtp(text);
+              if (otpError) setOtpError("");
+            }}
+            onFilled={(text) => handleVerifyOtp(text)}
             textInputProps={{
               accessibilityLabel: "One-Time Password",
               keyboardType: 'number-pad',
@@ -290,9 +301,9 @@ export default function Otp({ navigation, route }) {
               },
               pinCodeContainerStyle: {
                 backgroundColor: 'transparent',
-                borderWidth: 0,  
+                borderWidth: 0,
                 borderBottomWidth: 2,
-                borderBottomColor: theme.colors.themeColor,
+                borderBottomColor: otpError ? '#E5484D' : theme.colors.themeColor,
                 borderRadius: 0,
                 height: 40,
                 width: 210 / 6 - 0,
@@ -325,7 +336,7 @@ export default function Otp({ navigation, route }) {
              }}
            />
           </View>
-          <Text style={{ textAlign: 'center', fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.placeHolderTextColor, marginVertical:10 }} >Enter OTP</Text>
+          <Text style={{ textAlign: 'center', fontFamily: 'Roboto-Medium', fontSize: 14, color: otpError ? '#E5484D' : theme.colors.placeHolderTextColor, marginVertical:10 }} >{otpError || 'Enter OTP'}</Text>
           <View style={{ width:'100%', flexDirection:'row', borderBottomWidth:1, borderColor: theme.colors.borderColor, paddingHorizontal:10 }} >
              <View style={{ width:40, height:40, justifyContent:'center', alignItems:'flex-start', }} >
                <MaterialCommunityIcons name="message-processing" size={24} color={theme.colors.placeHolderTextColor} />

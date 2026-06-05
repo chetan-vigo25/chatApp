@@ -78,19 +78,22 @@ export default function StatusFeedRow({ navigation, style }) {
       const onNew     = (p) => dispatch(addNewStatusFromSocket(p));
       const onExpired = (p) => dispatch(removeStatusFromSocket(p));
 
-      // Backend canonical event is `status:new` (colon). Keep `new_status`
-      // as a legacy alias so older server builds still notify the feed.
+      // Backend canonical events use a colon (`status:new`, `status:deleted`).
+      // The underscore variants are legacy aliases kept so older server builds
+      // still notify the feed.
       socket.on('status:new',     onNew);
       socket.on('new_status',     onNew);
-      socket.on('status_expired', onExpired);
+      socket.on('status:deleted', onExpired);
       socket.on('status_deleted', onExpired);
+      socket.on('status_expired', onExpired);
       socketRef.current = socket;
 
       return () => {
         socket.off('status:new',     onNew);
         socket.off('new_status',     onNew);
-        socket.off('status_expired', onExpired);
+        socket.off('status:deleted', onExpired);
         socket.off('status_deleted', onExpired);
+        socket.off('status_expired', onExpired);
       };
     };
 
@@ -353,11 +356,11 @@ const styles = StyleSheet.create({
   unseenBadgeText: {
     color: '#fff',
     fontSize: 10,
-    fontWeight: '700',
+    fontFamily: 'Roboto-Bold',
   },
   label: {
     fontSize: 11,
-    fontWeight: '500',
+    fontFamily: 'Roboto-Medium',
     maxWidth: ITEM_WIDTH - 4,
     textAlign: 'center',
   },

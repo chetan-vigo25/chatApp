@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'vibeconnect_chat.db';
-const DB_VERSION = 8;
+const DB_VERSION = 10;
 
 let _db = null;
 let _hasReplyColumns = false;
@@ -309,6 +309,43 @@ const runMigrations = async (db) => {
         `);
       } catch (e) {
         console.warn('[ChatDB] V8 migration warning:', e?.message);
+      }
+    }
+
+    // V9: Official application broadcast statuses cache (offline cold-render)
+    if (currentVersion < 9) {
+      try {
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS broadcasts (
+            id TEXT PRIMARY KEY NOT NULL,
+            data TEXT NOT NULL,
+            published_at INTEGER DEFAULT 0,
+            expires_at INTEGER DEFAULT 0,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_broadcasts_published ON broadcasts(published_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_broadcasts_expires   ON broadcasts(expires_at);
+        `);
+      } catch (e) {
+        console.warn('[ChatDB] V9 migration warning:', e?.message);
+      }
+    }
+
+    // V10: Contact status-feed cache (chat-list status rings, offline cold-render)
+    if (currentVersion < 10) {
+      try {
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS status_feed (
+            user_id TEXT PRIMARY KEY NOT NULL,
+            data TEXT NOT NULL,
+            latest_at INTEGER DEFAULT 0,
+            has_unseen INTEGER DEFAULT 0,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_status_feed_latest ON status_feed(latest_at DESC);
+        `);
+      } catch (e) {
+        console.warn('[ChatDB] V10 migration warning:', e?.message);
       }
     }
 
@@ -1561,18 +1598,33 @@ const getChatById = async (chatId) => {
 // but rounded to the three states the chat list cares about.
 const CHAT_STATUS_PRIORITY = { sent: 1, delivered: 2, seen: 3, read: 3 };
 
-const updateChatLastMessage = async (chatId, lm) => {
+const updateChatLastMessage = async (chatId, lm, opts = {}) => {
   if (!chatId || !lm) return;
   const db = await getDB();
   const now = Date.now();
 
   // Ensure a row exists so realtime updates aren't no-ops for chats that haven't
-  // been hydrated from the API yet (e.g. a brand-new conversation).
-  // peer/group info will be filled in by the next full chat-list sync.
+  // been hydrated from the API yet (e.g. a brand-new conversation, or a group
+  // the user deleted locally that just received a new message). For groups we
+  // seed the correct chat_type + name/image/group_data so the restored row is
+  // never a blank "private" placeholder. INSERT OR IGNORE only seeds when the
+  // row is genuinely missing; existing rows are left untouched.
+  const isGroup = Boolean(opts.isGroup);
   await db.runAsync(
-    `INSERT OR IGNORE INTO chats (chat_id, chat_type, is_group, unread_count, created_at, updated_at)
-     VALUES ($chatId, 'private', 0, 0, $now, $now)`,
-    { $chatId: chatId, $now: now }
+    `INSERT OR IGNORE INTO chats (chat_id, chat_type, is_group, group_id, chat_name, chat_avatar, group_data, unread_count, created_at, updated_at)
+     VALUES ($chatId, $chatType, $isGroup, $groupId, $chatName, $chatAvatar, $groupData, 0, $now, $now)`,
+    {
+      $chatId: chatId,
+      $chatType: isGroup ? 'group' : 'private',
+      $isGroup: isGroup ? 1 : 0,
+      $groupId: isGroup ? (opts.groupId || chatId) : null,
+      $chatName: opts.chatName || null,
+      $chatAvatar: opts.chatAvatar || null,
+      $groupData: isGroup
+        ? JSON.stringify(opts.group || { _id: opts.groupId || chatId, name: opts.chatName || null, avatar: opts.chatAvatar || null })
+        : null,
+      $now: now,
+    }
   );
 
   // Anti-downgrade: don't let a stale 'sent' overwrite an existing 'delivered'/'read'
@@ -1662,6 +1714,40 @@ const updateChatArchive = async (chatId, isArchived) => {
   if (!chatId) return;
   const db = await getDB();
   await db.runAsync(`UPDATE chats SET is_archived = $a, updated_at = $n WHERE chat_id = $id`, { $a: isArchived ? 1 : 0, $n: Date.now(), $id: chatId });
+};
+
+// Targeted update of a group chat's name / avatar / description without
+// touching last-message or unread fields. COALESCE keeps existing values when
+// a field isn't part of this change. group_data JSON is merged so the chat
+// header/list reflect realtime group:name/avatar/description:updated events
+// and survive an app restart.
+const updateChatGroupMeta = async (chatId, { name, avatar, description } = {}) => {
+  if (!chatId) return;
+  const db = await getDB();
+  const existing = await db.getFirstAsync(
+    `SELECT group_data FROM chats WHERE chat_id = $id LIMIT 1`, { $id: chatId }
+  );
+  if (!existing) return; // only patch an existing row
+  let group = {};
+  try { group = existing.group_data ? (JSON.parse(existing.group_data) || {}) : {}; } catch { group = {}; }
+  if (name != null) group.name = name;
+  if (avatar != null) group.avatar = avatar;
+  if (description != null) group.description = description;
+  await db.runAsync(
+    `UPDATE chats SET
+       chat_name = COALESCE($name, chat_name),
+       chat_avatar = COALESCE($avatar, chat_avatar),
+       group_data = $group,
+       updated_at = $n
+     WHERE chat_id = $id`,
+    {
+      $name: name != null ? name : null,
+      $avatar: avatar != null ? avatar : null,
+      $group: JSON.stringify(group),
+      $n: Date.now(),
+      $id: chatId,
+    }
+  );
 };
 
 const deleteChatRow = async (chatId) => {
@@ -1815,6 +1901,103 @@ const clearSyncData = async () => {
   await db.runAsync(`DELETE FROM sync_meta`);
 };
 
+// ── Broadcast status cache (official application updates) ─────────────────────
+
+/** Replace the cached broadcast set with the latest live list. */
+const saveBroadcasts = async (broadcasts = []) => {
+  try {
+    const db = await getDB();
+    const now = Date.now();
+    // Snapshot is small (<=50) and fully authoritative — clear then insert.
+    await db.runAsync('DELETE FROM broadcasts;');
+    for (const b of broadcasts) {
+      if (!b || !b._id) continue;
+      await db.runAsync(
+        'INSERT OR REPLACE INTO broadcasts (id, data, published_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?);',
+        [
+          String(b._id),
+          JSON.stringify(b),
+          b.publishedAt ? new Date(b.publishedAt).getTime() : (b.createdAt ? new Date(b.createdAt).getTime() : now),
+          b.expiresAt ? new Date(b.expiresAt).getTime() : 0,
+          now,
+        ],
+      );
+    }
+  } catch (e) {
+    console.warn('[ChatDB] saveBroadcasts failed:', e?.message);
+  }
+};
+
+/** Load cached, non-expired broadcasts (newest first) for offline cold-render. */
+const loadBroadcasts = async () => {
+  try {
+    const db = await getDB();
+    const now = Date.now();
+    const rows = await db.getAllAsync(
+      'SELECT data FROM broadcasts WHERE expires_at = 0 OR expires_at > ? ORDER BY published_at DESC;',
+      [now],
+    );
+    return (rows || []).map((r) => { try { return JSON.parse(r.data); } catch { return null; } }).filter(Boolean);
+  } catch (e) {
+    console.warn('[ChatDB] loadBroadcasts failed:', e?.message);
+    return [];
+  }
+};
+
+/** Remove a single broadcast from cache (expired / deleted). */
+const removeBroadcast = async (statusId) => {
+  try {
+    const db = await getDB();
+    await db.runAsync('DELETE FROM broadcasts WHERE id = ?;', [String(statusId)]);
+  } catch (e) {
+    console.warn('[ChatDB] removeBroadcast failed:', e?.message);
+  }
+};
+
+// ── Contact status-feed cache (V10) ─────────────────────────────────────────
+// Caches the grouped contact-status feed so the Chat List avatar rings render
+// instantly on cold boot / offline, before /status/feed resolves. The full
+// authoritative snapshot replaces the cache on every successful fetch.
+
+/** Replace the cached contact status feed with the latest grouped list. */
+const saveStatusFeed = async (groups = []) => {
+  try {
+    const db = await getDB();
+    const now = Date.now();
+    await db.runAsync('DELETE FROM status_feed;');
+    for (const g of groups) {
+      const uid = String(g?.userId || g?._id || '');
+      if (!uid || !(g.statuses && g.statuses.length)) continue;
+      await db.runAsync(
+        'INSERT OR REPLACE INTO status_feed (user_id, data, latest_at, has_unseen, updated_at) VALUES (?, ?, ?, ?, ?);',
+        [
+          uid,
+          JSON.stringify(g),
+          g.latestAt ? new Date(g.latestAt).getTime() : now,
+          (g.hasUnseenStatus ?? (Number(g.unseenCount) > 0)) ? 1 : 0,
+          now,
+        ],
+      );
+    }
+  } catch (e) {
+    console.warn('[ChatDB] saveStatusFeed failed:', e?.message);
+  }
+};
+
+/** Load the cached contact status feed (unseen-first, newest-first) for cold render. */
+const loadStatusFeed = async () => {
+  try {
+    const db = await getDB();
+    const rows = await db.getAllAsync(
+      'SELECT data FROM status_feed ORDER BY has_unseen DESC, latest_at DESC;',
+    );
+    return (rows || []).map((r) => { try { return JSON.parse(r.data); } catch { return null; } }).filter(Boolean);
+  } catch (e) {
+    console.warn('[ChatDB] loadStatusFeed failed:', e?.message);
+    return [];
+  }
+};
+
 // Legacy aliases
 const saveMessageSync = upsertMessage;
 const saveMessages = upsertMessages;
@@ -1831,10 +2014,14 @@ export default {
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
   updateChatLastMessage, updateChatLastMessageStatusById, updateChatUnread, incrementChatUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
-  updateChatPin, updateChatMute, updateChatArchive, deleteChatRow, getChatCount,
+  updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, deleteChatRow, getChatCount,
   // Sync meta
   getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData,
   // Outbox + watermarks (V8)
   outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
   setPeerReadWatermark, getPeerReadWatermark,
+  // Broadcast status cache (V9)
+  saveBroadcasts, loadBroadcasts, removeBroadcast,
+  // Contact status-feed cache (V10)
+  saveStatusFeed, loadStatusFeed,
 };

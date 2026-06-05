@@ -227,7 +227,7 @@ export default function SyncScreen({ navigation, route }) {
     outputRange: [0, SCREEN_WIDTH - 80],
   });
 
-  const name = APP_TAG_NAME || 'TalksTry';
+  const name = APP_TAG_NAME || 'VibeConnect Messenger';
 
   return (
     <Animated.View style={[styles.container, { backgroundColor: theme.colors.background, opacity: fadeAnim }]}>

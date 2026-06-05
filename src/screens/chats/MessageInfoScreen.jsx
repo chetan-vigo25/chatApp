@@ -91,7 +91,7 @@ export default function MessageInfoScreen() {
   const palette = useMemo(() => {
     const c = theme?.colors || {};
     return {
-      background: c.background || (isDarkMode ? '#101D25' : '#ffffff'),
+      background: c.background || (isDarkMode ? '#0B141A' : '#ffffff'),
       surface: c.cardBackground || c.menuBackground || (isDarkMode ? '#1F2C33' : '#F7F8FA'),
       headerBg: c.menuBackground || c.cardBackground || (isDarkMode ? '#1F2C33' : '#F0F2F5'),
       text: c.primaryTextColor || (isDarkMode ? '#FFFFFF' : '#111B21'),
@@ -269,11 +269,11 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   headerBtn: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' },
-  headerTitle: { flex: 1, fontSize: 18, fontWeight: '600' },
+  headerTitle: { flex: 1, fontSize: 18, fontFamily: 'Roboto-SemiBold' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
-  errorText: { marginTop: 12, fontSize: 14, textAlign: 'center' },
+  errorText: { marginTop: 12, fontSize: 14, textAlign: 'center', fontFamily: 'Roboto-Regular' },
   retryBtn: { marginTop: 16, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20 },
-  retryBtnText: { fontWeight: '600' },
+  retryBtnText: { fontFamily: 'Roboto-SemiBold' },
   previewCard: {
     marginHorizontal: 12,
     marginTop: 12,
@@ -282,9 +282,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: StyleSheet.hairlineWidth,
   },
-  previewText: { fontSize: 15, lineHeight: 22 },
+  previewText: { fontSize: 15, lineHeight: 22, fontFamily: 'Roboto-Regular' },
   previewMeta: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', marginTop: 10 },
-  previewTime: { fontSize: 11 },
+  previewTime: { fontSize: 11, fontFamily: 'Roboto-Regular' },
   sectionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -292,8 +292,8 @@ const styles = StyleSheet.create({
     paddingTop: 18,
     paddingBottom: 8,
   },
-  sectionTitle: { marginLeft: 10, fontSize: 14, fontWeight: '600', letterSpacing: 0.2 },
-  empty: { paddingHorizontal: 16, paddingVertical: 10, fontSize: 13, fontStyle: 'italic' },
+  sectionTitle: { marginLeft: 10, fontSize: 14, fontFamily: 'Roboto-SemiBold', letterSpacing: 0.2 },
+  empty: { paddingHorizontal: 16, paddingVertical: 10, fontSize: 13, fontStyle: 'italic', fontFamily: 'Roboto-Regular' },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -303,8 +303,8 @@ const styles = StyleSheet.create({
   },
   avatar: { width: 42, height: 42, borderRadius: 21, marginRight: 12 },
   avatarFallback: { alignItems: 'center', justifyContent: 'center' },
-  avatarInitial: { fontSize: 17, fontWeight: '700' },
+  avatarInitial: { fontSize: 17, fontFamily: 'Roboto-Bold' },
   rowBody: { flex: 1 },
-  rowName: { fontSize: 15, fontWeight: '500' },
-  rowTime: { fontSize: 12, marginTop: 3 },
+  rowName: { fontSize: 15, fontFamily: 'Roboto-Medium' },
+  rowTime: { fontSize: 12, marginTop: 3, fontFamily: 'Roboto-Regular' },
 });

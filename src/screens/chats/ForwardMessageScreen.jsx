@@ -136,9 +136,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const groupId = isGroup ? (chat.groupId || chat.group?._id || chatId) : null;
 
         // Generate the correct chatId for cache (same logic as useChatLogic)
-        const chatIdForCache = isGroup 
+        const chatIdForCache = isGroup
           ? (chat.groupId || chat.group?._id || chat._id || chat.chatId)
-          : `u_${currentUserId}_${chat?.peerUser?._id || 'unknown'}`;
+          : `u_${[String(currentUserId), String(chat?.peerUser?._id || 'unknown')].sort().join('_')}`;
 
         for (const msg of messages) {
           const tempId = `temp_fwd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -219,9 +219,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
 
         if (targetChat) {
           const isGroup = targetChat?.chatType === 'group';
-          const navChatId = isGroup 
+          const navChatId = isGroup
             ? (targetChat.groupId || targetChat.group?._id || targetChat._id || targetChat.chatId)
-            : `u_${currentUserId}_${targetChat?.peerUser?._id || 'unknown'}`;
+            : `u_${[String(currentUserId), String(targetChat?.peerUser?._id || 'unknown')].sort().join('_')}`;
 
           showToast(`Message${msgCount > 1 ? 's' : ''} forwarded`);
 

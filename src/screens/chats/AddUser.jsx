@@ -29,6 +29,8 @@ import { useFocusEffect } from '@react-navigation/native';
 import { SALT_SECRET } from '@env';
 import contactHasher from "../../Redux/Services/Contact/ContactHasher";
 import * as SMS from 'expo-sms';
+import ProfilePreviewModal from "../../components/ProfilePreviewModal";
+import { useCall } from "../../calls/useCall";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const COLLAPSED_MAX_HEIGHT = 210;
@@ -132,6 +134,7 @@ const ContactRow = memo(function ContactRow({
 
 export default function AddUser({ navigation }) {
   const { theme } = useTheme();
+  const { startAudioCall, startVideoCall } = useCall();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const opacityAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0)).current;
@@ -552,41 +555,15 @@ export default function AddUser({ navigation }) {
     }
   }, [handleSenInvatation]);
 
+  // The preview card (ProfilePreviewModal) owns its own enter/exit animation.
   const handleModal = useCallback((contact) => {
     setSelectedChatItem(contact);
     setModalVisible(true);
-    Animated.parallel([
-      Animated.spring(scaleAnim, {
-        toValue: 1,
-        tension: 65,
-        friction: 8,
-        useNativeDriver: true,
-      }),
-      Animated.timing(opacityAnim, {
-        toValue: 1,
-        duration: 200,
-        useNativeDriver: true,
-      }),
-    ]).start();
-  }, [scaleAnim, opacityAnim]);
+  }, []);
 
   const closeModal = useCallback(() => {
-    Animated.parallel([
-      Animated.timing(scaleAnim, {
-        toValue: 0,
-        duration: 180,
-        useNativeDriver: true,
-      }),
-      Animated.timing(opacityAnim, {
-        toValue: 0,
-        duration: 180,
-        useNativeDriver: true,
-      }),
-    ]).start(() => {
-      setModalVisible(false);
-      setSelectedChatItem(null);
-    });
-  }, [scaleAnim, opacityAnim]);
+    setModalVisible(false);
+  }, []);
 
   // ─── SCROLL HANDLER FOR COLLAPSIBLE SECTION ───
 
@@ -997,75 +974,30 @@ export default function AddUser({ navigation }) {
         />
       )}
 
-      {/* Profile Preview Modal */}
-      <Modal
-        transparent
-        visible={modalVisible}
-        onRequestClose={closeModal}
-        statusBarTranslucent
-      >
-        <TouchableOpacity onPress={closeModal} activeOpacity={1} style={styles.modalOverlay}>
-          <Animated.View style={[
-            styles.modalCard,
-            {
-              backgroundColor: theme.colors.cardBackground,
-              opacity: opacityAnim,
-              transform: [{ scale: scaleAnim }],
-            }
-          ]}>
-            <View style={[styles.modalImageWrap, { backgroundColor: theme.colors.menuBackground }]}>
-              {(selectedChatItem?.profilePicture || selectedChatItem?.profileImage) ? (
-                <Image
-                  resizeMode="cover"
-                  source={{ uri: selectedChatItem?.profilePicture || selectedChatItem?.profileImage }}
-                  style={styles.modalImageInner}
-                  fadeDuration={0}
-                />
-              ) : (
-                <View style={[styles.modalFallback, { backgroundColor: getAvatarColor(selectedChatItem?.fullName || selectedChatItem?.name) }]}>
-                  <Text style={styles.modalFallbackText}>
-                    {(selectedChatItem?.fullName || selectedChatItem?.name || "?").charAt(0).toUpperCase()}
-                  </Text>
-                </View>
-              )}
-
-              <View style={styles.modalNameOverlay}>
-                <Text style={styles.modalName} numberOfLines={1}>
-                  {selectedChatItem?.fullName || selectedChatItem?.name || 'Unknown'}
-                </Text>
-                <Text style={styles.modalMeta} numberOfLines={1}>
-                  {selectedChatItem?.type === 'registered' ? `On ${APP_TAG_NAME}` : 'From your contacts'}
-                </Text>
-              </View>
-
-              {selectedChatItem?.type === "registered" && (
-                <View style={styles.modalActions}>
-                  <TouchableOpacity
-                    onPress={async () => {
-                      closeModal();
-                      await handleContactPress(selectedChatItem);
-                    }}
-                    activeOpacity={0.8}
-                    style={styles.modalActionBtn}
-                  >
-                    <MaterialCommunityIcons name="message-reply-text-outline" size={20} color="#fff" />
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    onPress={() => {
-                      closeModal();
-                      navigation.navigate('UserB', { item: selectedChatItem });
-                    }}
-                    activeOpacity={0.8}
-                    style={styles.modalActionBtn}
-                  >
-                    <Ionicons name="information-circle-outline" size={20} color="#fff" />
-                  </TouchableOpacity>
-                </View>
-              )}
-            </View>
-          </Animated.View>
-        </TouchableOpacity>
-      </Modal>
+      {/* Profile Preview Modal (shared WhatsApp popup) */}
+      {(() => {
+        const c = selectedChatItem;
+        const isReg = c?.type === 'registered' || !!(c?.userId || c?._id);
+        const peerId = c?.userId || c?._id || c?.id;
+        const cName = c?.fullName || c?.name || 'Unknown';
+        const cImg = c?.profilePicture || c?.profileImage || null;
+        const peerObj = { id: String(peerId || ''), name: cName, avatar: cImg };
+        const canCall = isReg && !!peerId;
+        return (
+          <ProfilePreviewModal
+            visible={modalVisible}
+            onClose={closeModal}
+            name={cName}
+            image={cImg}
+            avatarColor={getAvatarColor(cName)}
+            isGroup={false}
+            onMessage={isReg ? () => { closeModal(); handleContactPress(c); } : undefined}
+            onCall={canCall ? () => { closeModal(); setTimeout(() => startAudioCall?.(peerObj), 220); } : undefined}
+            onVideo={canCall ? () => { closeModal(); setTimeout(() => startVideoCall?.(peerObj), 220); } : undefined}
+            onInfo={isReg ? () => { closeModal(); navigation.navigate('UserB', { item: c }); } : undefined}
+          />
+        );
+      })()}
     </Animated.View>
   );
 }

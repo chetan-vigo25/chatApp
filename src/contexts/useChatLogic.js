@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Alert, AppState, Keyboard, Platform } from "react-native";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Alert, AppState, Keyboard, Platform, DeviceEventEmitter } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as FileSystem from 'expo-file-system/legacy';
 import moment from "moment";
@@ -14,6 +14,8 @@ import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../u
 import { useRealtimeChat } from "./RealtimeChatContext";
 import localStorageService from '../services/LocalStorageService';
 import ChatDatabase from '../services/ChatDatabase';
+import ContactDatabase from '../services/ContactDatabase';
+import { hashPhoneForMatch, onlyDigits } from '../utils/savedContactName';
 import ChatCache from '../services/ChatCache';
 import { isInForwardWindow, clearForwardTimestamp } from '../utils/forwardState';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
@@ -70,6 +72,17 @@ const sameId = (a, b) => {
   const left = normalizeId(a);
   const right = normalizeId(b);
   return Boolean(left && right && left === right);
+};
+
+// Private chat ids MUST be deterministic so the sender, the receiver, and the
+// backend all compute the SAME id for a pair. The backend sorts the two user
+// ids (`u_<min>_<max>`); the app must do the identical sort, otherwise the
+// sender stores `u_A_B` while everyone else uses `u_<min>_<max>` → duplicate
+// SQLite/chatMap rows and "Unknown User" on brand-new chats.
+export const buildPrivateChatId = (a, b) => {
+  const left = a == null ? '' : String(a);
+  const right = b == null ? '' : String(b);
+  return `u_${[left, right].sort().join('_')}`;
 };
 
 // Private chat ids are minted as `u_<userA>_<userB>` and the two participants may
@@ -172,7 +185,7 @@ export default function useChatLogic({ navigation, route }) {
   const dispatch = useDispatch();
   const { isConnected, networkType } = useNetwork();
   const { pickMedia } = useImage();
-  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat } = useRealtimeChat();
+  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, inactiveGroupIds } = useRealtimeChat();
   const { currentGroup } = useSelector((s) => s.group || {});
 
   const deferRealtimeUpdate = useCallback((fn) => {
@@ -187,7 +200,7 @@ export default function useChatLogic({ navigation, route }) {
   }, []);
   const chatMessagesData = useSelector(state => state.chat?.chatMessagesData || state.chat?.data || state.chat);
   
-  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system']);
+  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system', 'call']);
   const MEDIA_MESSAGE_TYPES = new Set(['image', 'photo', 'video', 'audio', 'file', 'document']);
 
   const normalizeOutboundMessageType = (value) => {
@@ -247,24 +260,56 @@ export default function useChatLogic({ navigation, route }) {
   // Preserve chatType + group fields from the route item
   const isGroupChat = item?.chatType === 'group' || item?.isGroup || Boolean(item?.group);
   const chatTypeField = item?.chatType || (isGroupChat ? 'group' : 'private');
+  // Live group metadata overlay — updated in realtime when an admin/owner
+  // changes the group name/avatar/description while this chat is open, so the
+  // header reflects it instantly. Keyed by groupId so it never leaks to another chat.
+  const [liveGroupMeta, setLiveGroupMeta] = useState(null);
+  const _gid = isGroupChat ? (item.groupId || item.group?._id) : null;
+  const _meta = (liveGroupMeta && _gid && String(liveGroupMeta.groupId) === String(_gid)) ? liveGroupMeta : null;
+  const _liveName = _meta?.name;
+  const _liveAvatar = _meta?.avatar;
   const groupFields = isGroupChat ? {
     isGroup: true,
-    groupId: item.groupId || item.group?._id,
-    group: item.group,
-    chatName: item.chatName || item.group?.name,
-    chatAvatar: item.chatAvatar || item.group?.avatar,
-    groupName: item.chatName || item.group?.name,
-    groupAvatar: item.chatAvatar || item.group?.avatar,
+    groupId: _gid,
+    group: {
+      ...(item.group || {}),
+      ...(_liveName != null ? { name: _liveName } : {}),
+      ...(_liveAvatar != null ? { avatar: _liveAvatar } : {}),
+      ...(_meta?.description != null ? { description: _meta.description } : {}),
+    },
+    chatName: _liveName || item.chatName || item.group?.name,
+    chatAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar,
+    groupName: _liveName || item.chatName || item.group?.name,
+    groupAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar,
     members: item.members,
     memberCount: item.members?.length || item.memberCount,
   } : {};
 
-  // Group chats take priority — even if peerUser exists on the item, treat as group
-  const chatData = isGroupChat
-    ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
-    : (item && normalizedPeerUser)
-      ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
-      : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' });
+  // Group chats take priority — even if peerUser exists on the item, treat as group.
+  // Memoized so its object reference stays stable across renders: chatData feeds
+  // many useCallback/useEffect dependency arrays (e.g. renderChatsItem), and an
+  // unstable reference here forces the whole message list to re-render every
+  // render — which shows up as old messages "blinking"/refreshing repeatedly.
+  // All inputs below are pure functions of [item, user, routeChatId, liveGroupMeta].
+  const chatData = useMemo(() => (
+    isGroupChat
+      ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
+      : (item && normalizedPeerUser)
+        ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
+        : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' })
+  ), [item, user, routeChatId, liveGroupMeta]);
+
+  // True when this is a group chat the current user has left or been removed
+  // from — used to disable the message input (you can no longer send messages).
+  const amNotGroupMember = useMemo(() => {
+    if (!isGroupChat || !inactiveGroupIds) return false;
+    const gid = _gid || chatData?.groupId || chatData?.chatId;
+    return Boolean(gid && inactiveGroupIds[String(gid)]);
+  }, [isGroupChat, inactiveGroupIds, _gid, chatData]);
+  // Mirror into a ref so send handlers can short-circuit without adding this to
+  // every useCallback dependency array.
+  const amNotGroupMemberRef = useRef(false);
+  amNotGroupMemberRef.current = amNotGroupMember;
 
   // Refs
   const fadeAnimRef = useRef(null);
@@ -754,7 +799,10 @@ export default function useChatLogic({ navigation, route }) {
     scheduledMessagesRef.current = scheduledMessages;
   }, [scheduledMessages]);
 
-  // Build group members name lookup map from route item members or Redux currentGroup
+  // Build group members name lookup map from route item members or Redux currentGroup.
+  // Display-name priority (per product spec): device contact name > backend name >
+  // mobile number. The device contact name is resolved purely client-side from the
+  // local contacts SQLite table (ContactDatabase) — contacts never leave the device.
   useEffect(() => {
     if (!isGroupChat) return;
     // Prefer currentGroup.members (from viewGroup API - has populated user objects with fullName)
@@ -762,55 +810,102 @@ export default function useChatLogic({ navigation, route }) {
     const membersList = (currentGroup?.members?.length > 0 ? currentGroup.members : null)
       || chatData.members;
     if (!membersList || !Array.isArray(membersList) || membersList.length === 0) return;
-    const map = {};
-    membersList.forEach((m) => {
-      const u = (typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
-      const id = u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id || m.id;
-      if (id) {
-        map[String(id)] = {
-          fullName: u.fullName || m.fullName || m.name || m.username || '',
-          profileImage: u.profileImage || m.profileImage || null,
-          role: m.role || 'member',
-        };
-      }
-    });
-    if (Object.keys(map).length === 0) return;
-    groupMembersMapRef.current = map;
 
-    // Patch existing messages with resolved sender names and reply sender names
-    setAllMessages((prev) => {
-      let changed = false;
-      const patched = prev.map((msg) => {
-        let updates = null;
+    let cancelled = false;
 
-        // Resolve missing senderName
-        if (!msg.senderName && msg.senderId) {
-          const resolved = map[String(msg.senderId)]?.fullName;
-          if (resolved) {
-            updates = { ...updates, senderName: resolved };
-          }
+    (async () => {
+      const map = {};
+      membersList.forEach((m) => {
+        const u = (typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
+        const id = u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id || m.id;
+        if (id) {
+          const serverName = u.fullName || m.fullName || m.name || m.username || '';
+          const mobileNumber = u.mobileNumber || u.phoneNumber || u.phone || m.mobileNumber || null;
+          map[String(id)] = {
+            // `fullName` is the resolved display name; device contact name is
+            // overlaid below. `serverName` keeps the backend name as fallback.
+            fullName: serverName || mobileNumber || '',
+            serverName,
+            profileImage: u.profileImage || m.profileImage || null,
+            mobileNumber,
+            role: m.role || 'member',
+          };
         }
+      });
+      if (Object.keys(map).length === 0) return;
 
-        // Resolve missing replySenderName
-        if (msg.replyToMessageId && !msg.replySenderName && msg.replySenderId) {
-          if (sameId(msg.replySenderId, currentUserIdRef.current)) {
-            updates = { ...updates, replySenderName: currentUserNameRef.current || 'You' };
-          } else {
-            const resolvedReply = map[String(msg.replySenderId)]?.fullName;
-            if (resolvedReply) {
-              updates = { ...updates, replySenderName: resolvedReply };
+      // Overlay device/saved contact names (single bulk read — O(contacts), no
+      // per-member DB hits, safe for large groups). Device name wins over backend.
+      // Match each member against the registered contact list by user id first,
+      // then by the phone-number HASH (the canonical join — works even when the
+      // saved contact row has no user_id), then by normalized phone digits.
+      try {
+        const contacts = await ContactDatabase.loadRegisteredContacts();
+        if (!cancelled && Array.isArray(contacts)) {
+          const byUserId = {};
+          const byHash = {};
+          const byPhone = {};
+          for (const c of contacts) {
+            const nm = (c?.fullName || '').trim();
+            if (!nm) continue;
+            if (c.userId) byUserId[String(c.userId)] = nm;
+            if (c.hash) byHash[String(c.hash).toLowerCase()] = nm;
+            const p = onlyDigits(c.normalizedPhone || c.phone || c.number);
+            if (p) byPhone[p] = nm;
+          }
+          Object.keys(map).forEach((id) => {
+            let saved = byUserId[id];
+            const mobile = map[id].mobileNumber;
+            if (!saved && mobile) {
+              const h = hashPhoneForMatch(mobile);
+              if (h) saved = byHash[h];
+              if (!saved) saved = byPhone[onlyDigits(mobile)];
+            }
+            if (saved) map[id].fullName = saved;
+          });
+        }
+      } catch (_) { /* contacts optional — fall back to backend names */ }
+
+      if (cancelled) return;
+      groupMembersMapRef.current = map;
+
+      // Patch existing messages so device-resolved names take effect immediately.
+      // Override (not just fill) so a device contact name replaces a stale backend name.
+      setAllMessages((prev) => {
+        let changed = false;
+        const patched = prev.map((msg) => {
+          let updates = null;
+
+          if (msg.senderId) {
+            const resolved = map[String(msg.senderId)]?.fullName;
+            if (resolved && resolved !== msg.senderName) {
+              updates = { ...updates, senderName: resolved };
             }
           }
-        }
 
-        if (updates) {
-          changed = true;
-          return { ...msg, ...updates };
-        }
-        return msg;
+          if (msg.replyToMessageId && msg.replySenderId) {
+            if (sameId(msg.replySenderId, currentUserIdRef.current)) {
+              const youName = currentUserNameRef.current || 'You';
+              if (msg.replySenderName !== youName) updates = { ...updates, replySenderName: youName };
+            } else {
+              const resolvedReply = map[String(msg.replySenderId)]?.fullName;
+              if (resolvedReply && resolvedReply !== msg.replySenderName) {
+                updates = { ...updates, replySenderName: resolvedReply };
+              }
+            }
+          }
+
+          if (updates) {
+            changed = true;
+            return { ...msg, ...updates };
+          }
+          return msg;
+        });
+        return changed ? patched : prev;
       });
-      return changed ? patched : prev;
-    });
+    })();
+
+    return () => { cancelled = true; };
   }, [isGroupChat, chatData.members, currentGroup?.members]);
 
   // Keyboard listeners
@@ -1241,7 +1336,7 @@ export default function useChatLogic({ navigation, route }) {
       const isGrpInit = chatData.chatType === 'group' || chatData.isGroup;
       const generatedChatId = chatData.chatId || routeChatId || (isGrpInit
         ? (chatData.groupId || chatData.group?._id || `grp_${Date.now()}`)
-        : `u_${userId}_${chatData.peerUser?._id || 'unknown'}`);
+        : buildPrivateChatId(userId, chatData.peerUser?._id || 'unknown'));
       if (lastInitializedChatRef.current && lastInitializedChatRef.current === generatedChatId) {
         setIsLoadingInitial(false);
         setIsLoadingFromLocal(false);
@@ -1335,7 +1430,14 @@ export default function useChatLogic({ navigation, route }) {
             requestUserPresence();
             socket.emit('user:status', { userId, status: 'online', chatId: generatedChatId });
             socket.emit('chat:join', { chatId: generatedChatId, userId }, (response) => {});
-            socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
+            // Group chat IDs are raw ObjectIds; the private `message:read:all`
+            // handler validates membership via `u_a_b` parsing and rejects
+            // group ids with NOT_IN_CHAT. Route groups to the group handler.
+            if (isGrpInit) {
+              socket.emit('group:message:read:all', { groupId: generatedChatId });
+            } else {
+              socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
+            }
             markUserOnline("chat-init");
             startHeartbeat();
             resetIdleTimer();
@@ -1573,6 +1675,17 @@ export default function useChatLogic({ navigation, route }) {
     if (resolvedMessageType === 'contact' && !basePayload.contact && apiMsg?.contact) {
       basePayload.contact = apiMsg.contact;
     }
+    // Call entries carry render details in `callDetails` over the wire (REST /
+    // sync) or already in `payload` (realtime). Normalize both into the payload
+    // shape CallMessageBubble reads (kind/media/outcome/durationSec). Direction
+    // is derived per-viewer from senderType, so it is intentionally NOT stored.
+    if (resolvedMessageType === 'call') {
+      const cd = apiMsg?.callDetails || {};
+      basePayload.kind = 'call';
+      basePayload.media = (basePayload.media || cd.media) === 'video' ? 'video' : 'audio';
+      basePayload.outcome = basePayload.outcome || cd.outcome || 'completed';
+      basePayload.durationSec = Math.max(0, Number(basePayload.durationSec ?? cd.durationSec) || 0);
+    }
     const normalizedPayload = normalizeMessagePayloadWithDownloadFlag(
       resolvedMessageType,
       {
@@ -1619,7 +1732,8 @@ export default function useChatLogic({ navigation, route }) {
       synced: true,
       chatId: apiMsg?.chatId || chatIdRef.current,
       groupId: apiMsg?.groupId || null,
-      senderName: apiMsg?.senderName || apiMsg?.sender?.fullName || apiMsg?.sender?.name || groupMembersMapRef.current?.[normalizedSenderId]?.fullName || null,
+      // Prefer the device-contact-resolved group member name over the backend name.
+      senderName: groupMembersMapRef.current?.[normalizedSenderId]?.fullName || apiMsg?.senderName || apiMsg?.sender?.fullName || apiMsg?.sender?.name || null,
       localUri: incomingLocalUri,
       payload: normalizedPayload,
       mediaMeta,
@@ -2241,6 +2355,18 @@ export default function useChatLogic({ navigation, route }) {
       refreshTimerRef.current = setTimeout(doRefresh, 50);
     }
   }, []);
+
+  // A call ended → the calling layer wrote an in-thread "call" entry to SQLite.
+  // Refresh if it belongs to the chat currently open.
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('call:thread:update', (payload) => {
+      const cid = payload?.chatId;
+      if (cid && chatIdRef.current && String(cid) === String(chatIdRef.current)) {
+        refreshMessagesFromDB(true);
+      }
+    });
+    return () => sub.remove();
+  }, [refreshMessagesFromDB]);
 
   /**
    * Legacy-compatible wrapper — writes to SQLite then refreshes UI.
@@ -4322,6 +4448,24 @@ export default function useChatLogic({ navigation, route }) {
       ChatDatabase.upsertMessage({ ...systemMsg, chatId: currentChatId }).catch(() => {});
     });
 
+    // ─── GROUP PROFILE (name / avatar / description) LIVE HEADER UPDATES ───
+    // When an admin/owner changes the group while this chat is open, update the
+    // header instantly via the liveGroupMeta overlay (keyed by groupId).
+    const applyGroupMeta = (source, patch) => {
+      const gid = source?.groupId || source?.group?._id;
+      if (!gid || (!sameId(gid, currentChatId) && !sameId(gid, groupOwnId))) return;
+      setLiveGroupMeta(prev => ({ ...(prev?.groupId === String(gid) ? prev : {}), groupId: String(gid), ...patch }));
+    };
+    registerSocketHandler('group:name:updated', (data) => {
+      const s = data?.data || data; if (s?.name != null) applyGroupMeta(s, { name: s.name });
+    });
+    registerSocketHandler('group:avatar:updated', (data) => {
+      const s = data?.data || data; const av = s?.avatarUrl || s?.avatar; if (av != null) applyGroupMeta(s, { avatar: av });
+    });
+    registerSocketHandler('group:description:updated', (data) => {
+      const s = data?.data || data; if (s?.description != null) applyGroupMeta(s, { description: s.description });
+    });
+
     const onGroupMessageEdited = async (data) => {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
@@ -5238,6 +5382,7 @@ export default function useChatLogic({ navigation, route }) {
   /* ========== Text send flow ========== */
   const handleSendText = useCallback(async (mentions) => {
     if (!text.trim()) return;
+    if (amNotGroupMemberRef.current) return; // left / removed from group — can't send
 
     const tempId = `temp_${Date.now()}_${Math.random()}`;
     const timestamp = new Date().toISOString();
@@ -5399,6 +5544,7 @@ export default function useChatLogic({ navigation, route }) {
   /* ========== Schedule message flow ========== */
   const scheduleMessage = useCallback(async (scheduleTime) => {
     if (!text.trim() || !scheduleTime) return;
+    if (amNotGroupMemberRef.current) return; // left / removed from group — can't send
 
     const msgText = text.trim();
     const tempId = `temp_sched_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -5572,6 +5718,7 @@ export default function useChatLogic({ navigation, route }) {
   }, [chatData]);
 
   const sendLocationMessage = useCallback(async ({ latitude, longitude, address = '', mapPreviewUrl = '' } = {}) => {
+    if (amNotGroupMemberRef.current) return; // left / removed from group — can't send
     const lat = Number(latitude);
     const lng = Number(longitude);
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
@@ -5653,6 +5800,7 @@ export default function useChatLogic({ navigation, route }) {
     fullName, countryCode = '', mobileNumber,
     userId = null, profileImage = '', isRegistered = false,
   } = {}) => {
+    if (amNotGroupMemberRef.current) return; // left / removed from group — can't send
     const name = String(fullName || '').trim();
     const phone = String(mobileNumber || '').trim();
     if (!name || !phone) {
@@ -6025,7 +6173,8 @@ export default function useChatLogic({ navigation, route }) {
 
     // Resolve senderName from group members if missing
     if (!receivedMessage.senderName && receivedMessage.senderId && !sameId(receivedMessage.senderId, currentUserIdRef.current)) {
-      receivedMessage.senderName = groupMembersMapRef.current?.[receivedMessage.senderId]?.fullName || null;
+      // Device-contact-resolved map name wins; keep any existing name as fallback.
+      receivedMessage.senderName = groupMembersMapRef.current?.[receivedMessage.senderId]?.fullName || receivedMessage.senderName || null;
     }
 
     // RENDER FIRST — never block the React render on SQLite. expo-sqlite
@@ -6205,6 +6354,10 @@ export default function useChatLogic({ navigation, route }) {
     console.log("messageId === ", messageId)
     setSelectedMessages((prevSelected) => prevSelected.includes(messageId) ? prevSelected.filter((id) => id !== messageId) : [...prevSelected, messageId]);
   }, []);
+
+  // Stable reference so it can safely sit in renderChatsItem's dependency array
+  // without forcing the whole message list to re-render every render.
+  const clearSelectedMessages = useCallback(() => setSelectedMessages([]), []);
 
   const deleteSelectedMessages = useCallback(async (deleteForEveryone) => {
     try {
@@ -6660,6 +6813,7 @@ export default function useChatLogic({ navigation, route }) {
 
   const sendMedia = useCallback(async (mediaObj, options = {}) => {
     if (!mediaObj || !mediaObj.file) return { success: false, error: 'invalid media payload' };
+    if (amNotGroupMemberRef.current) return { success: false, error: 'not a group member' }; // left / removed
 
     const { file, type } = mediaObj;
     const normalizedType = type === 'document' ? 'file' : type;
@@ -7601,6 +7755,7 @@ export default function useChatLogic({ navigation, route }) {
   return {
     fadeAnimRef, flatListRef,
     chatData, chatId, currentUserId, getUserColor, groupMembersMap: groupMembersMapRef.current,
+    amNotGroupMember,
     messages, allMessages, scheduledMessages, isLoadingInitial, isLoadingFromLocal, isRefreshing, isManualReloading, isSearching,
     // FIXED: Export the correct typing state
     isPeerTyping, // This is what the UI should use for "typing..." indicator
@@ -7627,6 +7782,6 @@ export default function useChatLogic({ navigation, route }) {
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,
-    clearSelectedMessages: () => setSelectedMessages([]),
+    clearSelectedMessages,
   };
 }

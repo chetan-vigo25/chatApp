@@ -1,7 +1,7 @@
 import { io } from 'socket.io-client';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SOCKET_URL } from '@env';
-import { AppState } from 'react-native';
+import { Alert, AppState, Platform } from 'react-native';
 import { performSessionReset, saveAuthSession } from '../../../services/sessionManager';
 
 const STORAGE_KEYS = {
@@ -28,6 +28,11 @@ let reauthPromise = null;
 let isReauthenticating = false;
 let currentNavigation = null;
 let currentDeviceInfo = null;
+// Device push (FCM/APNs) token. Registered with the backend session via
+// `notification:device:register` so the server can target this device with push
+// notifications (new messages AND incoming-call wake pushes). Without this the
+// session has no token and `sendPushToUser` reaches 0 devices.
+let pushToken = '';
 
 const socketStateSubscribers = new Set();
 const pendingEmitQueue = [];
@@ -168,7 +173,7 @@ const safeDisconnectSocket = () => {
   socketListenersBound = false;
 };
 
-const handleLogout = async (navigation = currentNavigation) => {
+const handleLogout = async (navigation = currentNavigation, alertMessage = null) => {
   try {
     console.warn('🚪 Logging out due to authentication/session failure');
     safeDisconnectSocket();
@@ -195,9 +200,33 @@ const handleLogout = async (navigation = currentNavigation) => {
         routes: [{ name: 'Login' }],
       });
     }
+
+    // Surface why the user was logged out (e.g. admin deactivated the account).
+    if (alertMessage) {
+      Alert.alert('Logged out', alertMessage);
+    }
   } catch (error) {
     console.error('❌ Error during logout:', error);
   }
+};
+
+// Register this device's push token on the active backend session so the server
+// can push to it. Safe to call repeatedly (idempotent upsert server-side).
+const emitDeviceRegister = () => {
+  if (!socket || !socket.connected || !pushToken || !deviceId) return;
+  socket.emit('notification:device:register', {
+    deviceId,
+    pushToken,
+    pushProvider: Platform.OS === 'ios' ? 'apns' : 'fcm',
+    deviceInfo: getDeviceInfoPayload(currentDeviceInfo),
+  }, (response) => {
+    if (response) {
+      console.log('📲 notification:device:register response', {
+        status: response?.status,
+        message: response?.message,
+      });
+    }
+  });
 };
 
 const emitDeviceEvents = () => {
@@ -210,6 +239,17 @@ const emitDeviceEvents = () => {
       });
     }
   });
+  // Push token registration rides along with the device events on (re)connect.
+  emitDeviceRegister();
+};
+
+// Called by the app once it has acquired an FCM/APNs token (and on refresh).
+// Stores it and immediately (re)registers if the socket is already connected.
+export const setPushToken = (token) => {
+  const next = token ? String(token) : '';
+  if (next === pushToken) return;
+  pushToken = next;
+  emitDeviceRegister();
 };
 
 const reconnectSocketWithFreshToken = async ({ accessToken, deviceId }) => {
@@ -346,6 +386,7 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
               connectTimeoutHandle = null;
             }
             socketRef.off('reauthenticated', onReauthenticated);
+            socketRef.off('reauthentication_failed', onReauthFailed);
             socketRef.off('connect', onConnect);
             socketRef.off('connect_error', onConnectError);
           };
@@ -375,6 +416,23 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
               .catch((err) => finalize(err));
           };
 
+          // The server replies to a REJECTED reauth with a dedicated
+          // `reauthentication_failed` event (not on `reauthenticated`). Without
+          // handling it the attempt just waits out REAUTH_TIMEOUT_MS and retries
+          // 3× — surfacing a misleading "reauthentication timeout". Settle now:
+          // fatal auth codes (bad/expired refresh token, device mismatch) →
+          // log out; system/timeout codes (retryable) → let the retry loop run.
+          const onReauthFailed = (response) => {
+            const data = response?.data || {};
+            const code = String(data.code || '');
+            const serverMessage = data.message || response?.message || 'Reauthentication rejected by server';
+            const retryable = data.retryable === true && (code === 'REAUTH_TIMEOUT' || code === 'REAUTH_ERROR');
+            console.warn('📥 reauthentication_failed received', { code, retryable, attempt });
+            finalize(retryable
+              ? new Error(`reauthentication temporary failure: ${serverMessage}`)
+              : createAuthRejectedError(serverMessage));
+          };
+
           const onConnectError = (error) => {
             finalize(new Error(error?.message || 'Socket connect_error during reauthentication'));
           };
@@ -399,6 +457,7 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
 
           // Use .once() to avoid listener leaks across retry attempts.
           socketRef.once('reauthenticated', onReauthenticated);
+          socketRef.once('reauthentication_failed', onReauthFailed);
           socketRef.once('connect_error', onConnectError);
 
           timeoutHandle = setTimeout(() => {
@@ -618,9 +677,38 @@ const attachCoreSocketListeners = (navigation) => {
     }
   });
 
-  socket.on('logout', () => {
-    handleLogout(navigation);
+  socket.on('logout', (payload) => {
+    handleLogout(
+      navigation,
+      payload?.message || 'Your account has been temporarily logged out by the admin.',
+    );
   });
+
+  // Admin blocked/unblocked this account. Unlike logout, the session stays
+  // alive — the user can still browse, but the server rejects any send. We
+  // flip the Redux flag (so the composer can lock) and inform the user.
+  const applyBlockState = (blocked, payload) => {
+    try {
+      const mod = require('../../Store');
+      const store = mod.store || mod.default || mod;
+      const pr = require('../../Reducer/Profile/Profile.reducer');
+      const setBlocked = pr.setBlocked || (pr.actions && pr.actions.setBlocked);
+      if (store?.dispatch && setBlocked) store.dispatch(setBlocked(blocked));
+    } catch (e) {}
+    try {
+      const { Alert } = require('react-native');
+      Alert.alert(
+        blocked ? 'Account blocked' : 'Account unblocked',
+        payload?.message ||
+          (blocked
+            ? 'An admin has blocked your account. You can view your chats but cannot send messages.'
+            : 'Your account has been unblocked. You can send messages again.'),
+      );
+    } catch (e) {}
+  };
+
+  socket.on('user:blocked', (payload) => applyBlockState(true, payload));
+  socket.on('user:unblocked', (payload) => applyBlockState(false, payload));
 };
 
 export const getSocketStateSnapshot = () => ({ ...socketState });
@@ -856,4 +944,5 @@ export default {
   disconnectSocket,
   reconnectSocket,
   reauthenticateSocket,
+  setPushToken,
 };

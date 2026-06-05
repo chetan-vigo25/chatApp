@@ -4,40 +4,67 @@ import { Appearance } from 'react-native';
 
 const ThemeContext = createContext();
 
+// Brand color — WhatsApp's modern in-app accent green (#00A884): the same teal-green
+// WhatsApp uses for its FAB, send button, links, active tabs and read context.
+// Single source of truth for the primary/accent color across modes. It is also the
+// default `chatColor`, so outgoing message bubbles are WhatsApp-green out of the box.
+const BRAND = '#00A884';
+
+// Roboto is the app-wide font family (matches the bottom tab bar and the
+// overwhelming majority of screens). Exposed so any component reading
+// theme.fonts gets Roboto instead of the OS "System" font.
+const fonts = {
+  thin: 'Roboto-Light',
+  light: 'Roboto-Light',
+  regular: 'Roboto-Regular',
+  medium: 'Roboto-Medium',
+  semibold: 'Roboto-SemiBold',
+  bold: 'Roboto-Bold',
+};
+
 // Light theme
 const lightTheme = {
   colors: {
     background: '#ffffff',
-    primaryTextColor: '#000000',
+    primaryTextColor: '#0B141A',
+    secondaryTextColor: '#667781',
     textWhite: '#ffffff',
-    themeColor: '#03b0a2',
+    themeColor: BRAND,
     placeHolderTextColor: '#a9a9a9',
-    borderColor: '#e0e0e0',
+    borderColor: '#e6e6e6',
+    border: '#e6e6e6',
     menuBackground: '#f5f5f5',
-    cardBackground:'#ffffff',
+    cardBackground: '#ffffff',
+    surface: '#f5f6f6',
+    headerBackground: '#ffffff',
+    iconColor: '#54656f',
+    danger: '#e53935',
+    success: BRAND,
   },
-  fonts: {
-    regular: 'System',
-    bold: 'System',
-  },
+  fonts,
 };
 
-// Dark theme
+// Dark theme — same design as light, with dark-appropriate values per token
+// so contrast holds (no light borders/surfaces bleeding onto a dark background).
 const darkTheme = {
   colors: {
-    background: '#101D25',
+    background: '#0B141A',
     primaryTextColor: '#ffffff',
+    secondaryTextColor: '#8696a0',
     textWhite: '#ffffff',
-    themeColor: '#03b0a2',
-    placeHolderTextColor: '#a9a9a9',
-    borderColor: '#e0e0e0',
-    menuBackground: '#232D36',
-    cardBackground:'#232D36',
+    themeColor: BRAND,
+    placeHolderTextColor: '#8696a0',
+    borderColor: '#2A3942',
+    border: '#2A3942',
+    menuBackground: '#16222C',
+    cardBackground: '#16222C',
+    surface: '#1F2C33',
+    headerBackground: '#1F2C33',
+    iconColor: '#aebac1',
+    danger: '#ff6b6b',
+    success: BRAND,
   },
-  fonts: {
-    regular: 'System',
-    bold: 'System',
-  },
+  fonts,
 };
 
 // Default fallback
@@ -46,7 +73,7 @@ export const defaultTheme = lightTheme;
 export const ThemeProvider = ({ children }) => {
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
-  const [chatColor, setChatColor] = useState('#128C7E');
+  const [chatColor, setChatColor] = useState(BRAND);
   const [hasManualTheme, setHasManualTheme] = useState(false);
 
   // 1️⃣ Load saved theme and chat color on mount

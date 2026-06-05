@@ -10,6 +10,7 @@ import {
   getUserSettings,
   updateUserSettings,
 } from '../../Redux/Services/Profile/Settings.Services';
+import { getDeletedChatConfig, clearDeletedChatConfig, markDeletedPasswordSet } from '../../utils/deletedChatConfig';
 
 export default function DeletedChatsPassword({ navigation }) {
   const { theme, isDarkMode } = useTheme();
@@ -18,10 +19,10 @@ export default function DeletedChatsPassword({ navigation }) {
 
   const [loading, setLoading] = useState(true);
   const [hasPassword, setHasPassword] = useState(false);
+  const [armedConfig, setArmedConfig] = useState(null);
   const [pwd, setPwd] = useState('');
   const [confirmPwd, setConfirmPwd] = useState('');
   const [showPwd, setShowPwd] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -31,26 +32,34 @@ export default function DeletedChatsPassword({ navigation }) {
       Animated.timing(fadeAnim, { toValue: 1, duration: 350, useNativeDriver: true }),
       Animated.spring(slideAnim, { toValue: 0, friction: 9, tension: 60, useNativeDriver: true }),
     ]).start();
+  }, []);
 
-    let alive = true;
-    (async () => {
+  // Reload the password flag + the armed selection every time the screen is
+  // focused — this keeps the status fresh after returning from the chat picker.
+  useEffect(() => {
+    const load = async () => {
       try {
-        const settings = await getUserSettings();
-        if (!alive) return;
+        const [settings, config] = await Promise.all([
+          getUserSettings().catch(() => null),
+          getDeletedChatConfig(),
+        ]);
         const chat = settings?.chat || {};
         const flag =
           typeof chat.hasDeletedPassword === 'boolean'
             ? chat.hasDeletedPassword
             : !!chat.deletedPassword;
         setHasPassword(flag);
+        setArmedConfig(config);
       } catch {
         /* leave defaults */
       } finally {
-        if (alive) setLoading(false);
+        setLoading(false);
       }
-    })();
-    return () => { alive = false; };
-  }, []);
+    };
+    load();
+    const unsub = navigation.addListener('focus', load);
+    return unsub;
+  }, [navigation]);
 
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
@@ -65,7 +74,11 @@ export default function DeletedChatsPassword({ navigation }) {
     if (success) setSuccess('');
   };
 
-  const handleSave = async () => {
+  // Step 1 of setup: validate the password, then hand off to the chat picker.
+  // The password is NOT persisted here — it is committed together with the
+  // chosen chats + delete type on the selector's "Set password & arm" action,
+  // so the lock is never left half-configured.
+  const handleSave = () => {
     clearMessages();
     const trimmed = pwd.trim();
     if (trimmed.length < 4) {
@@ -80,18 +93,14 @@ export default function DeletedChatsPassword({ navigation }) {
       setError('Passwords do not match.');
       return;
     }
-    setSubmitting(true);
-    try {
-      await updateUserSettings({ chat: { deletedPassword: trimmed } });
-      setHasPassword(true);
-      setPwd('');
-      setConfirmPwd('');
-      setSuccess(hasPassword ? 'Password updated.' : 'Password set.');
-    } catch (e) {
-      setError(typeof e === 'string' ? e : 'Could not save password. Try again.');
-    } finally {
-      setSubmitting(false);
-    }
+    setPwd('');
+    setConfirmPwd('');
+    navigation.navigate('DeletedChatsSelector', { password: trimmed });
+  };
+
+  // Edit only the armed chats / delete type without changing the password.
+  const handleEditSelection = () => {
+    navigation.navigate('DeletedChatsSelector', {});
   };
 
   const handleReset = () => {
@@ -109,7 +118,10 @@ export default function DeletedChatsPassword({ navigation }) {
             setResetting(true);
             try {
               await updateUserSettings({ chat: { deletedPassword: null } });
+              await clearDeletedChatConfig();
+              await markDeletedPasswordSet(false);
               setHasPassword(false);
+              setArmedConfig(null);
               setPwd('');
               setConfirmPwd('');
               setSuccess('Password reset. You can set a new one below.');
@@ -157,12 +169,13 @@ export default function DeletedChatsPassword({ navigation }) {
           <Ionicons name="lock-closed" size={26} color={themeColor} />
         </View>
         <Text style={[styles.heroTitle, { color: primaryText }]}>
-          Lock recently-deleted chats
+          Auto-delete chats with a password
         </Text>
         <Text style={[styles.heroBody, { color: subText }]}>
-          This password is required to view or restore chats from the
-          recently-deleted area. It is hashed on the server with bcrypt
-          — we never store or send it in plaintext.
+          Set a password and pick the chats plus a delete type. When this
+          password is entered at login, those chats are deleted automatically
+          and the password is then cleared (single-use). It is hashed on the
+          server with bcrypt — never plaintext.
         </Text>
 
         <View style={[styles.statusPill, {
@@ -227,7 +240,7 @@ export default function DeletedChatsPassword({ navigation }) {
             secureTextEntry={!showPwd}
             autoCapitalize="none"
             autoCorrect={false}
-            editable={!submitting && !resetting}
+            editable={!resetting}
             style={[styles.input, { color: primaryText }]}
           />
           <TouchableOpacity
@@ -252,7 +265,7 @@ export default function DeletedChatsPassword({ navigation }) {
             secureTextEntry={!showPwd}
             autoCapitalize="none"
             autoCorrect={false}
-            editable={!submitting && !resetting}
+            editable={!resetting}
             style={[styles.input, { color: primaryText }]}
           />
         </View>
@@ -273,26 +286,59 @@ export default function DeletedChatsPassword({ navigation }) {
         <TouchableOpacity
           activeOpacity={0.85}
           onPress={handleSave}
-          disabled={submitting || resetting || loading}
+          disabled={resetting || loading}
           style={[styles.primaryBtn, {
             backgroundColor: themeColor,
-            opacity: (submitting || resetting || loading) ? 0.7 : 1,
+            opacity: (resetting || loading) ? 0.7 : 1,
           }]}
         >
-          {submitting ? (
-            <ActivityIndicator size="small" color="#fff" />
-          ) : (
-            <>
-              <Ionicons name="save-outline" size={18} color="#fff" />
-              <Text style={styles.primaryBtnText}>
-                {hasPassword ? 'Update password' : 'Set password'}
-              </Text>
-            </>
-          )}
+          <Ionicons name="arrow-forward-circle-outline" size={18} color="#fff" />
+          <Text style={styles.primaryBtnText}>
+            {hasPassword ? 'Update password & chats' : 'Next: choose chats'}
+          </Text>
         </TouchableOpacity>
       </View>
     </View>
   );
+
+  // ─── Armed selection summary ───
+  // Shown once a password exists. Lets the user review / change which chats
+  // are deleted and the delete type, without re-entering the password.
+  const renderArmed = () => {
+    if (!hasPassword) return null;
+    const count = armedConfig?.chatIds?.length || 0;
+    const scopeLabel = armedConfig?.scope === 'everyone' ? 'For everyone' : 'For me';
+    return (
+      <View style={styles.section}>
+        <Text style={[styles.sectionTitle, { color: subText }]}>ARMED SELECTION</Text>
+        <View style={[styles.sectionCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+          <TouchableOpacity
+            activeOpacity={0.7}
+            onPress={handleEditSelection}
+            disabled={resetting}
+            style={styles.row}
+          >
+            <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '1A' }]}>
+              <MaterialCommunityIcons name="playlist-remove" size={22} color={themeColor} />
+            </View>
+            <View style={styles.rowTextWrap}>
+              <View style={styles.flex}>
+                <Text style={[styles.rowLabel, { color: primaryText }]}>
+                  {count > 0 ? `${count} chat${count === 1 ? '' : 's'} armed` : 'No chats selected yet'}
+                </Text>
+                <Text style={[styles.rowSub, { color: subText }]}>
+                  {count > 0
+                    ? `${scopeLabel} · tap to change chats or delete type`
+                    : 'Tap to choose chats and the delete type'}
+                </Text>
+              </View>
+              <Ionicons name="chevron-forward" size={17} color={subText} />
+            </View>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  };
 
   // ─── Reset ───
   const renderReset = () => (
@@ -302,7 +348,7 @@ export default function DeletedChatsPassword({ navigation }) {
         <TouchableOpacity
           activeOpacity={0.7}
           onPress={handleReset}
-          disabled={!hasPassword || resetting || submitting}
+          disabled={!hasPassword || resetting}
           style={styles.row}
         >
           <View style={[styles.rowIconWrap, {
@@ -359,6 +405,7 @@ export default function DeletedChatsPassword({ navigation }) {
         >
           {renderHero()}
           {renderForm()}
+          {renderArmed()}
           {renderReset()}
         </ScrollView>
       </KeyboardAvoidingView>

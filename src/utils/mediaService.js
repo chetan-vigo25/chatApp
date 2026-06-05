@@ -43,8 +43,28 @@ export const normalizeUri = (uri) => {
 export const toSecureMediaUri = (uri) => {
   if (!uri || typeof uri !== 'string') return uri;
   const u = uri.trim();
-  if (/^http:\/\//i.test(u)) return u.replace(/^http:\/\//i, 'https://');
+
+  // Protocol-relative → https
   if (/^\/\//.test(u)) return `https:${u}`;
+
+  const httpMatch = u.match(/^http:\/\/([^/:]+)/i);
+  if (httpMatch) {
+    // Dev / LAN servers (localhost, 127.x, 10.x, 172.16–31.x, 192.168.x,
+    // *.local) are http-only — forcing them to https makes the request fail
+    // and the media never loads. Leave those untouched; only upgrade real
+    // public hosts (iOS ATS blocks cleartext http to those).
+    const host = httpMatch[1].toLowerCase();
+    const isLocalHost =
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.local') ||
+      /^10\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host);
+    if (isLocalHost) return u;
+    return u.replace(/^http:\/\//i, 'https://');
+  }
+
   return u;
 };
 

@@ -44,7 +44,7 @@ export default function UserAgree({ navigation }) {
       {/* Bottom card */}
       <View style={[ styles.bottomCard,{ backgroundColor: colors.cardBackground, shadowColor: isDarkMode ? '#000' : '#999', }, ]} >
         <Text style={[styles.welcomeTitle, { color: colors.primaryTextColor }]}>
-          Welcome to TalksTry
+          Welcome to VibeConnect Messanger
         </Text>
 
         <Text style={[styles.subtitle, { color: colors.placeHolderTextColor }]}>

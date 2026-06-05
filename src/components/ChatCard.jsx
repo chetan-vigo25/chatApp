@@ -1,26 +1,27 @@
-import React, { memo, useRef, useCallback } from 'react';
+import React, { memo, useRef } from 'react';
 import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react-native';
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
-import { Swipeable } from 'react-native-gesture-handler';
+import SegmentedRing from './SegmentedRing';
+
+const AVATAR_SIZE = 52;
+const RING_SIZE   = 58; // outer ring diameter — leaves a small gap around the avatar
+const RING_STROKE = 2.5;
 
 const ChatCard = ({
   item,
   theme,
-  openSwipeableRef,
   onPress,
   onLongPress,
   onAvatarPress,
-  onSwipePin,
-  onSwipeMute,
-  onSwipeArchive,
   getUserColor,
   getPreviewText,
   getRelativeTime,
   getLastMessageText,
   renderMessageStatus,
+  isSelected = false,
+  statusInfo = null,
 }) => {
   const scale = useRef(new Animated.Value(1)).current;
-  const swipeableRef = useRef(null);
 
   const animateTo = (value) => {
     Animated.spring(scale, {
@@ -31,35 +32,6 @@ const ChatCard = ({
     }).start();
   };
 
-  const closeSwipeable = useCallback(() => {
-    swipeableRef.current?.close();
-  }, []);
-
-  const onSwipeableOpen = useCallback(() => {
-    if (openSwipeableRef?.current && openSwipeableRef.current !== swipeableRef.current) {
-      openSwipeableRef.current.close();
-    }
-    if (openSwipeableRef) {
-      openSwipeableRef.current = swipeableRef.current;
-    }
-  }, [openSwipeableRef]);
-
-  const handleSwipePin = useCallback(() => {
-    closeSwipeable();
-    if (onSwipePin) onSwipePin();
-  }, [onSwipePin, closeSwipeable]);
-
-  const handleSwipeMute = useCallback(() => {
-    closeSwipeable();
-    if (onSwipeMute) onSwipeMute();
-  }, [onSwipeMute, closeSwipeable]);
-
-  const handleSwipeArchive = useCallback(() => {
-    closeSwipeable();
-    if (onSwipeArchive) onSwipeArchive();
-  }, [onSwipeArchive, closeSwipeable]);
-
-  const isArchived = Boolean(item?.isArchived);
   const hasUnread = Number(item?.unreadCount || 0) > 0;
   const isTyping = item?.realtime?.typing?.isTyping;
   const isLastMsgDeleted = item?.lastMessageDisplay?.isDeleted || item?.lastMessage?.isDeleted;
@@ -70,59 +42,11 @@ const ChatCard = ({
   const groupAvatarUri = isGroup
     ? (item?.chatAvatar || item?.group?.avatar || item?.groupAvatar)
     : null;
-
-  const renderLeftActions = (progress) => {
-    const translateX = progress.interpolate({
-      inputRange: [0, 1],
-      outputRange: [-76, 0],
-      extrapolate: 'clamp',
-    });
-    return (
-      <Animated.View style={[styles.leftActionWrap, { transform: [{ translateX }] }]}>
-        <TouchableOpacity onPress={handleSwipePin} activeOpacity={0.8} style={styles.swipePinBtn}>
-          <MaterialCommunityIcons name={item?.isPinned ? 'pin-off-outline' : 'pin-outline'} size={20} color="#fff" />
-          <Text style={styles.swipeBtnText}>{item?.isPinned ? 'Unpin' : 'Pin'}</Text>
-        </TouchableOpacity>
-      </Animated.View>
-    );
-  };
-
-  const renderRightActions = (progress) => {
-    const translateX = progress.interpolate({
-      inputRange: [0, 1],
-      outputRange: [152, 0],
-      extrapolate: 'clamp',
-    });
-    return (
-      <Animated.View style={[styles.rightActionWrap, { transform: [{ translateX }] }]}>
-        <TouchableOpacity onPress={handleSwipeMute} activeOpacity={0.8} style={styles.swipeMuteBtn}>
-          <MaterialCommunityIcons name={item?.isMuted ? 'volume-high' : 'volume-off'} size={20} color="#fff" />
-          <Text style={styles.swipeBtnText}>{item?.isMuted ? 'Unmute' : 'Mute'}</Text>
-        </TouchableOpacity>
-        <TouchableOpacity onPress={handleSwipeArchive} activeOpacity={0.8} style={[styles.swipeArchiveBtn, isArchived && { backgroundColor: '#00B894' }]}>
-          <MaterialCommunityIcons name={isArchived ? 'archive-arrow-up-outline' : 'archive-arrow-down-outline'} size={20} color="#fff" />
-          <Text style={styles.swipeBtnText}>{isArchived ? 'Unarchive' : 'Archive'}</Text>
-        </TouchableOpacity>
-      </Animated.View>
-    );
-  };
+  // WhatsApp-style status ring: only for 1-1 chats whose peer has live statuses.
+  const hasStatusRing = !isGroup && statusInfo && statusInfo.count > 0;
 
   return (
-    <Swipeable
-      ref={swipeableRef}
-      overshootLeft={false}
-      overshootRight={false}
-      friction={2}
-      renderLeftActions={renderLeftActions}
-      renderRightActions={renderRightActions}
-      onSwipeableWillOpen={onSwipeableOpen}
-      onSwipeableClose={() => {
-        if (openSwipeableRef?.current === swipeableRef.current) {
-          openSwipeableRef.current = null;
-        }
-      }}
-    >
-      <Animated.View style={[styles.cardOuter, { backgroundColor: theme.colors.background, transform: [{ scale }] }]}>
+    <Animated.View style={[styles.cardOuter, { backgroundColor: isSelected ? theme.colors.themeColor + '33' : theme.colors.background, transform: [{ scale }] }]}>
         <TouchableOpacity
           onPress={onPress}
           onLongPress={onLongPress}
@@ -136,46 +60,53 @@ const ChatCard = ({
           <TouchableOpacity
             onPress={onAvatarPress || onPress}
             activeOpacity={0.85}
-            style={[
-              styles.avatarTouch,
-              {
-                borderColor:
-                  !isGroup && item?.peerUser?.isOnline
-                    ? '#25D366'
-                    : (theme.colors.themeColor || '#1DA1F2') + '40',
-              },
-            ]}
+            style={styles.avatarTouch}
           >
-            {isGroup ? (
-              groupAvatarUri ? (
-                <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={styles.avatarImage} />
-              ) : (
-                <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName) }]}>
-                  <Ionicons name="people" size={22} color="#fff" />
-                </View>
-              )
-            ) : item?.peerUser?.profileImage ? (
-              <Image
-                resizeMode="cover"
-                source={{ uri: item.peerUser.profileImage }}
-                style={styles.avatarImage}
-              />
-            ) : (
-              <View
-                style={[
-                  styles.avatarFallback,
-                  { backgroundColor: getUserColor(item?.peerUser?._id || peerName) },
-                ]}
-              >
-                <Text style={styles.avatarInitial}>
-                  {peerName.charAt(0).toUpperCase()}
-                </Text>
+            {/* Status ring (segmented for multiple statuses): unseen = green,
+                viewed = grey. Sits outside the avatar with a small gap. */}
+            {hasStatusRing && (
+              <View style={styles.ringOverlay} pointerEvents="none">
+                <SegmentedRing
+                  count={statusInfo.count}
+                  viewedCount={statusInfo.viewedCount}
+                  size={RING_SIZE}
+                  strokeWidth={RING_STROKE}
+                />
               </View>
             )}
-            {/* Online indicator (not for groups) */}
-            {!isGroup && item?.peerUser?.isOnline && (
-              <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
-            )}
+
+            <View style={styles.avatarInner}>
+              {isGroup ? (
+                groupAvatarUri ? (
+                  <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={styles.avatarImage} />
+                ) : (
+                  <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName) }]}>
+                    <Ionicons name="people" size={22} color="#fff" />
+                  </View>
+                )
+              ) : item?.peerUser?.profileImage ? (
+                <Image
+                  resizeMode="cover"
+                  source={{ uri: item.peerUser.profileImage }}
+                  style={styles.avatarImage}
+                />
+              ) : (
+                <View
+                  style={[
+                    styles.avatarFallback,
+                    { backgroundColor: getUserColor(item?.peerUser?._id || peerName) },
+                  ]}
+                >
+                  <Text style={styles.avatarInitial}>
+                    {peerName.charAt(0).toUpperCase()}
+                  </Text>
+                </View>
+              )}
+              {/* Online indicator (not for groups) */}
+              {!isGroup && item?.peerUser?.isOnline && (
+                <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
+              )}
+            </View>
           </TouchableOpacity>
 
           {/* Content */}
@@ -205,7 +136,11 @@ const ChatCard = ({
                   style={[
                     styles.previewText,
                     {
-                      color: isTyping ? theme.colors.themeColor : theme.colors.placeHolderTextColor,
+                      color: isTyping
+                        ? theme.colors.themeColor
+                        : (item?.lastMessageDisplay?.isMissedCall
+                          ? theme.colors.danger
+                          : theme.colors.placeHolderTextColor),
                       fontStyle: (isTyping || isLastMsgDeleted) ? 'italic' : 'normal',
                       fontFamily: hasUnread ? 'Roboto-Medium' : 'Roboto-Regular',
                     },
@@ -236,7 +171,6 @@ const ChatCard = ({
           </View>
         </TouchableOpacity>
       </Animated.View>
-    </Swipeable>
   );
 };
 
@@ -249,25 +183,41 @@ const styles = StyleSheet.create({
     paddingVertical: 11,
   },
 
-  // Avatar
+  // Avatar — fixed 52px slot so row height (and getItemLayout) is unchanged
+  // whether or not the peer has a status. The ring draws as an absolute overlay
+  // that overflows ~3px into the row padding, so it never grows the row.
   avatarTouch: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    borderWidth: 2,
-    padding: 1.5,
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
+    borderRadius: AVATAR_SIZE / 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  ringOverlay: {
+    position: 'absolute',
+    top: (AVATAR_SIZE - RING_SIZE) / 2,
+    left: (AVATAR_SIZE - RING_SIZE) / 2,
+    width: RING_SIZE,
+    height: RING_SIZE,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarInner: {
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
+    borderRadius: AVATAR_SIZE / 2,
     alignItems: 'center',
     justifyContent: 'center',
   },
   avatarImage: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
+    borderRadius: AVATAR_SIZE / 2,
   },
   avatarFallback: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
+    width: AVATAR_SIZE,
+    height: AVATAR_SIZE,
+    borderRadius: AVATAR_SIZE / 2,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -291,22 +241,22 @@ const styles = StyleSheet.create({
   // Content
   contentWrap: {
     flex: 1,
-    marginLeft: 14,
+    marginLeft: 13,
     justifyContent: 'center',
   },
   topRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 4,
+    marginBottom: 3,
   },
   nameText: {
-    fontSize: 16,
-    fontFamily: 'Roboto-SemiBold',
+    fontSize: 16.5,
+    fontFamily: 'Roboto-Medium',
     textTransform: 'capitalize',
     flex: 1,
     marginRight: 10,
-    letterSpacing: -0.1,
+    letterSpacing: 0,
   },
   timeText: {
     fontSize: 12,
@@ -326,9 +276,9 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   previewText: {
-    fontSize: 13.5,
+    fontSize: 14,
     flexShrink: 1,
-    lineHeight: 18,
+    lineHeight: 19,
     fontFamily: 'Roboto-Regular',
   },
   metaWrap: {
@@ -350,50 +300,6 @@ const styles = StyleSheet.create({
     letterSpacing: 0.1,
   },
 
-  // Swipe actions
-  leftActionWrap: {
-    justifyContent: 'center',
-    paddingLeft: 12,
-    paddingRight: 4,
-  },
-  rightActionWrap: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingLeft: 4,
-    paddingRight: 12,
-    gap: 6,
-  },
-  swipePinBtn: {
-    width: 64,
-    height: 64,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#4D7CFE',
-  },
-  swipeMuteBtn: {
-    width: 64,
-    height: 64,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#F0A030',
-  },
-  swipeArchiveBtn: {
-    width: 64,
-    height: 64,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#556070',
-  },
-  swipeBtnText: {
-    color: '#fff',
-    fontSize: 10,
-    fontFamily: 'Roboto-SemiBold',
-    marginTop: 3,
-    letterSpacing: 0.2,
-  },
 });
 
 export default memo(ChatCard);

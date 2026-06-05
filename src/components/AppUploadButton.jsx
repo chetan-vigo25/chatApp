@@ -163,7 +163,7 @@ const styles = StyleSheet.create({
     marginLeft: 16,
     fontSize: 16,
     color: '#222',
-    fontWeight: '500',
+    fontFamily: 'Roboto-Medium',
   },
   backdrop: {
     ...StyleSheet.absoluteFillObject,

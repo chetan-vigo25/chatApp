@@ -461,14 +461,15 @@ export default function useGroupChat(groupId, currentUserId) {
       }
     };
 
-    const onReactionUpdate = ({ groupId: gid, messageId, emoji, action, userId, reactions }) => {
+    const onReactionUpdate = ({ groupId: gid, messageId, emoji, action, userId, reactions, reactionCounts }) => {
       if (gid !== groupIdRef.current) return;
 
       updateMessage(messageId, (msg) => {
-        // If server sends full reactions map, use it
+        // If server sends a full reactions map, use it as-is.
         if (reactions) return { ...msg, reactions };
 
-        // Otherwise compute locally
+        // Apply this actor's add/remove to the local users lists first so the
+        // per-user "did I react" toggle stays correct.
         const rxns = { ...(msg.reactions || {}) };
         const existing = rxns[emoji] || { count: 0, users: [] };
 
@@ -485,6 +486,19 @@ export default function useGroupChat(groupId, currentUserId) {
             users: existing.users.filter((u) => u !== userId),
           };
           if (rxns[emoji].count === 0) delete rxns[emoji];
+        }
+
+        // Reconcile against the backend's authoritative reactionCounts
+        // ({ emoji: count }) so counts don't drift if an event was missed.
+        // Preserve any known users lists for the per-user toggle.
+        if (reactionCounts && typeof reactionCounts === 'object') {
+          const reconciled = {};
+          Object.entries(reactionCounts).forEach(([e, c]) => {
+            const count = Number(c) || 0;
+            if (count <= 0) return;
+            reconciled[e] = { count, users: rxns[e]?.users || [] };
+          });
+          return { ...msg, reactions: reconciled };
         }
 
         return { ...msg, reactions: rxns };

@@ -1,15 +1,13 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback } from 'react';
 import {
   View, Text, FlatList, TouchableOpacity, StyleSheet, Image,
-  ActivityIndicator, Alert, Modal,
+  ActivityIndicator, Alert,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons, MaterialCommunityIcons, FontAwesome6 } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import ChatDatabase from '../../services/ChatDatabase';
-import ChatCache from '../../services/ChatCache';
-import { apiCall } from '../../Config/Https';
 import { updateUserSettings } from '../../Redux/Services/Profile/Settings.Services';
+import { getDeletedChatConfig, saveDeletedChatConfig, markDeletedPasswordSet } from '../../utils/deletedChatConfig';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
@@ -20,23 +18,40 @@ const getInitials = (name) => {
 
 const normalizeId = (id) => (id == null ? '' : String(id));
 
-export default function DeletedChatsSelector({ navigation }) {
+// Setup screen for the "deleted chats password" automation.
+//
+// The user picks which chats to auto-delete and the delete type
+// ("me" | "everyone"), then saves. If a plaintext `password` was passed in
+// (from the password setup screen) it is persisted here too, so the password
+// and its armed selection are committed together. Nothing is deleted on this
+// screen — the purge runs later, at the login gate, when the matching
+// password is entered.
+export default function DeletedChatsSelector({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
+  const password = route?.params?.password || null;
 
   const [chats, setChats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedIds, setSelectedIds] = useState(new Set());
-  const [deleting, setDeleting] = useState(false);
-  const [scopeModal, setScopeModal] = useState(false);
-  const [progressLabel, setProgressLabel] = useState('');
+  const [scope, setScope] = useState('me');
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
-        const rows = await ChatDatabase.loadChatList({ includeArchived: true });
+        const [rows, existing] = await Promise.all([
+          ChatDatabase.loadChatList({ includeArchived: true }),
+          getDeletedChatConfig(),
+        ]);
         setChats(rows || []);
+        if (existing) {
+          setScope(existing.scope || 'me');
+          // Only pre-select chats that still exist on this device.
+          const available = new Set((rows || []).map((c) => normalizeId(c.chatId || c._id)));
+          setSelectedIds(new Set(existing.chatIds.filter((id) => available.has(id))));
+        }
       } catch (e) {
-        console.warn('[DeletedChatsSelector] loadChatList failed', e);
+        console.warn('[DeletedChatsSelector] load failed', e);
         setChats([]);
       } finally {
         setLoading(false);
@@ -69,78 +84,41 @@ export default function DeletedChatsSelector({ navigation }) {
     });
   }, [chats]);
 
-  const goToChatList = () => {
-    navigation.reset({ index: 0, routes: [{ name: 'ChatList' }] });
-  };
-
-  const performDelete = useCallback(async (scope) => {
-    if (deleting) return;
+  const handleSave = useCallback(async () => {
+    if (saving) return;
     const ids = Array.from(selectedIds).filter(Boolean);
     if (ids.length === 0) {
-      setScopeModal(false);
+      Alert.alert('No chats selected', 'Pick at least one chat to protect with the password.');
       return;
     }
-    setScopeModal(false);
-    setDeleting(true);
-    setProgressLabel(`Deleting ${ids.length} chat${ids.length === 1 ? '' : 's'}…`);
-
-    const rawUser = await AsyncStorage.getItem('userInfo');
-    const user = rawUser ? JSON.parse(rawUser) : null;
-    const userId = normalizeId(user?._id || user?.id);
-
-    let failures = 0;
-    for (let i = 0; i < ids.length; i++) {
-      const chatId = ids[i];
-      setProgressLabel(`Deleting ${i + 1} of ${ids.length}…`);
-      try {
-        // Mirrors the per-chat path in ChatList so the server + Kafka flow
-        // behaves identically to a user-initiated delete.
-        const endpoint = scope === 'everyone'
-          ? 'user/chat/clear/everyone'
-          : 'user/chat/clear/me';
-        const response = await apiCall('POST', endpoint, { chatId, userId });
-        const failed = response && (response.success === false || response.status === false || response.ok === false || response.error);
-        if (failed) {
-          failures += 1;
-          continue;
-        }
-        try { await ChatDatabase.clearChat(chatId, Date.now()); } catch {}
-        try { await ChatDatabase.deleteChatRow(chatId); } catch {}
-        try { ChatCache.clearMessages(chatId); } catch {}
-        try { ChatCache.removeChat(chatId); } catch {}
-      } catch (e) {
-        console.warn('[DeletedChatsSelector] delete failed', chatId, e?.message);
-        failures += 1;
-      }
-    }
-
-    // Per spec: once the locked workflow is done, the deleted-chats password
-    // is consumed — clear it so the next launch goes straight to the list.
+    setSaving(true);
     try {
-      await updateUserSettings({ chat: { deletedPassword: null } });
-    } catch (e) {
-      console.warn('[DeletedChatsSelector] could not reset deletedPassword', e);
-    }
-
-    setDeleting(false);
-    setProgressLabel('');
-
-    if (failures > 0) {
+      // Commit the password (if we arrived here from the password setup screen)
+      // and the armed selection together, so the lock is never half-configured.
+      if (password) {
+        await updateUserSettings({ chat: { deletedPassword: password } });
+      }
+      await saveDeletedChatConfig({ scope, chatIds: ids });
+      // Mirror the "deleted password is set" flag so the app-lock overlay arms
+      // on the next launch even without 2-step enabled.
+      await markDeletedPasswordSet(true);
       Alert.alert(
-        'Some chats not deleted',
-        `${ids.length - failures} chat(s) deleted. ${failures} could not be deleted.`,
-        [{ text: 'OK', onPress: goToChatList }]
+        password ? 'Password armed' : 'Selection updated',
+        `${ids.length} chat${ids.length === 1 ? '' : 's'} will be deleted (${scope === 'everyone' ? 'for everyone' : 'for me'}) when the password is entered at login.`,
+        [{ text: 'Done', onPress: () => navigation.goBack() }]
       );
-    } else {
-      goToChatList();
+    } catch (e) {
+      Alert.alert('Could not save', typeof e === 'string' ? e : 'Please try again.');
+    } finally {
+      setSaving(false);
     }
-  }, [deleting, selectedIds]);
+  }, [saving, selectedIds, scope, password, navigation]);
 
   // ─── Renderers ───
   const renderHeader = () => (
     <View style={[styles.header, { borderBottomColor: borderClr }]}>
       <TouchableOpacity
-        onPress={goToChatList}
+        onPress={() => navigation.goBack()}
         activeOpacity={0.6}
         style={[styles.headerBtn, { backgroundColor: cardBg }]}
       >
@@ -151,7 +129,7 @@ export default function DeletedChatsSelector({ navigation }) {
           {selectedCount > 0 ? `${selectedCount} selected` : 'Select chats to delete'}
         </Text>
         <Text style={[styles.headerSub, { color: subText }]} numberOfLines={1}>
-          Password verified · unlocked area
+          Auto-deleted when the password is entered
         </Text>
       </View>
       <TouchableOpacity
@@ -171,7 +149,7 @@ export default function DeletedChatsSelector({ navigation }) {
         <Text style={[styles.selectAllText, {
           color: allSelected ? '#fff' : themeColor,
         }]}>
-          {allSelected ? 'All' : 'All'}
+          All
         </Text>
       </TouchableOpacity>
     </View>
@@ -180,7 +158,17 @@ export default function DeletedChatsSelector({ navigation }) {
   const renderItem = ({ item }) => {
     const id = normalizeId(item.chatId || item._id);
     const selected = selectedIds.has(id);
-    const name = item.name || item.fullName || item.peerName || item.groupName || 'Chat';
+    // Resolve name + avatar the same way ChatCard does — loadChatList exposes
+    // these as chatName / chatAvatar / peerUser / group, not profileImage.
+    const isGroup = item.isGroup || item.chatType === 'group';
+    const name = (isGroup
+      ? (item.chatName || item.group?.name || item.groupName)
+      : (item.peerUser?.fullName || item.chatName))
+      || item.name || 'Chat';
+    const image = (isGroup
+      ? (item.chatAvatar || item.group?.avatar || item.groupAvatar)
+      : (item.peerUser?.profileImage || item.chatAvatar))
+      || item.profileImage || item.avatar || '';
     const avatarBg = AVATAR_COLORS[(name.charCodeAt(0) || 0) % AVATAR_COLORS.length];
     const lastMsg =
       item.lastMessage?.text ||
@@ -204,8 +192,8 @@ export default function DeletedChatsSelector({ navigation }) {
           {selected && <Ionicons name="checkmark" size={14} color="#fff" />}
         </View>
         <View style={[styles.avatar, { backgroundColor: avatarBg }]}>
-          {item.profileImage || item.avatar ? (
-            <Image source={{ uri: item.profileImage || item.avatar }} style={styles.avatarImg} />
+          {image ? (
+            <Image source={{ uri: image }} style={styles.avatarImg} />
           ) : (
             <Text style={styles.avatarText}>{getInitials(name)}</Text>
           )}
@@ -231,119 +219,72 @@ export default function DeletedChatsSelector({ navigation }) {
       </View>
       <Text style={[styles.emptyTitle, { color: primaryText }]}>No chats on this device</Text>
       <Text style={[styles.emptyBody, { color: subText }]}>
-        There's nothing to delete from here. The password will be reset when
-        you continue.
+        There's nothing to select yet. Start a chat first, then come back to
+        arm the password.
       </Text>
       <TouchableOpacity
         activeOpacity={0.85}
-        onPress={async () => {
-          try { await updateUserSettings({ chat: { deletedPassword: null } }); } catch {}
-          goToChatList();
-        }}
+        onPress={() => navigation.goBack()}
         style={[styles.emptyBtn, { backgroundColor: themeColor }]}
       >
-        <Text style={styles.emptyBtnText}>Continue to chat list</Text>
+        <Text style={styles.emptyBtnText}>Go back</Text>
       </TouchableOpacity>
     </View>
   );
 
+  // Inline delete-type picker + Save — replaces the old "delete now" modal.
   const renderActionBar = () => {
-    if (selectedCount === 0) return null;
+    if (chats.length === 0) return null;
+    const ScopeOption = ({ value, icon, label, danger }) => {
+      const active = scope === value;
+      const tint = danger ? '#E53935' : themeColor;
+      return (
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={() => setScope(value)}
+          style={[styles.scopeOption, {
+            borderColor: active ? tint : borderClr,
+            backgroundColor: active ? tint + '14' : 'transparent',
+          }]}
+        >
+          <Ionicons name={icon} size={18} color={active ? tint : subText} />
+          <Text style={[styles.scopeOptionText, { color: active ? tint : subText }]}>{label}</Text>
+          {active && <Ionicons name="checkmark-circle" size={16} color={tint} style={styles.scopeCheck} />}
+        </TouchableOpacity>
+      );
+    };
+
     return (
       <View style={[styles.actionBar, { backgroundColor: cardBg, borderTopColor: borderClr }]}>
-        <View style={styles.flex}>
-          <Text style={[styles.actionCount, { color: primaryText }]}>
-            {selectedCount} chat{selectedCount === 1 ? '' : 's'} selected
-          </Text>
-          <Text style={[styles.actionHint, { color: subText }]}>
-            Password resets after delete
-          </Text>
+        <Text style={[styles.scopeHeading, { color: subText }]}>DELETE TYPE</Text>
+        <View style={styles.scopeRowWrap}>
+          <ScopeOption value="me" icon="person-outline" label="For me" />
+          <ScopeOption value="everyone" icon="people-outline" label="For everyone" danger />
         </View>
         <TouchableOpacity
           activeOpacity={0.85}
-          onPress={() => setScopeModal(true)}
-          disabled={deleting}
-          style={[styles.deleteBtn, { backgroundColor: '#E53935', opacity: deleting ? 0.7 : 1 }]}
+          onPress={handleSave}
+          disabled={saving || selectedCount === 0}
+          style={[styles.saveBtn, {
+            backgroundColor: themeColor,
+            opacity: (saving || selectedCount === 0) ? 0.5 : 1,
+          }]}
         >
-          <Ionicons name="trash-outline" size={18} color="#fff" />
-          <Text style={styles.deleteBtnText}>Delete</Text>
+          {saving ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <>
+              <Ionicons name="lock-closed" size={18} color="#fff" />
+              <Text style={styles.saveBtnText}>
+                {password ? 'Set password & arm' : 'Save selection'}
+                {selectedCount > 0 ? ` (${selectedCount})` : ''}
+              </Text>
+            </>
+          )}
         </TouchableOpacity>
       </View>
     );
   };
-
-  const renderScopeModal = () => (
-    <Modal visible={scopeModal} transparent animationType="fade" onRequestClose={() => setScopeModal(false)}>
-      <TouchableOpacity
-        activeOpacity={1}
-        onPress={() => setScopeModal(false)}
-        style={styles.modalBackdrop}
-      >
-        <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: cardBg }]}>
-          <Text style={[styles.modalTitle, { color: primaryText }]}>
-            Delete {selectedCount} chat{selectedCount === 1 ? '' : 's'}?
-          </Text>
-          <Text style={[styles.modalBody, { color: subText }]}>
-            Choose how to delete. The deleted-chats password will be reset
-            after this action.
-          </Text>
-
-          <TouchableOpacity
-            activeOpacity={0.7}
-            onPress={() => performDelete('me')}
-            style={[styles.scopeRow, { borderColor: borderClr }]}
-          >
-            <View style={[styles.scopeIcon, { backgroundColor: themeColor + '1A' }]}>
-              <Ionicons name="person-outline" size={20} color={themeColor} />
-            </View>
-            <View style={styles.flex}>
-              <Text style={[styles.scopeLabel, { color: primaryText }]}>Delete for me</Text>
-              <Text style={[styles.scopeDesc, { color: subText }]}>
-                Removes these chats from your device only.
-              </Text>
-            </View>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            activeOpacity={0.7}
-            onPress={() => performDelete('everyone')}
-            style={[styles.scopeRow, { borderColor: borderClr }]}
-          >
-            <View style={[styles.scopeIcon, { backgroundColor: '#E5393520' }]}>
-              <Ionicons name="people-outline" size={20} color="#E53935" />
-            </View>
-            <View style={styles.flex}>
-              <Text style={[styles.scopeLabel, { color: '#E53935' }]}>Delete for everyone</Text>
-              <Text style={[styles.scopeDesc, { color: subText }]}>
-                Removes these chats for you and the other participants.
-              </Text>
-            </View>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            activeOpacity={0.7}
-            onPress={() => setScopeModal(false)}
-            style={styles.cancelBtn}
-          >
-            <Text style={[styles.cancelText, { color: subText }]}>Cancel</Text>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </TouchableOpacity>
-    </Modal>
-  );
-
-  const renderProgress = () => (
-    <Modal visible={deleting} transparent animationType="fade">
-      <View style={styles.progressBackdrop}>
-        <View style={[styles.progressCard, { backgroundColor: cardBg }]}>
-          <ActivityIndicator size="large" color={themeColor} />
-          <Text style={[styles.progressText, { color: primaryText }]}>
-            {progressLabel || 'Working…'}
-          </Text>
-        </View>
-      </View>
-    </Modal>
-  );
 
   if (loading) {
     return (
@@ -361,13 +302,11 @@ export default function DeletedChatsSelector({ navigation }) {
           data={chats}
           keyExtractor={(item) => normalizeId(item.chatId || item._id)}
           renderItem={renderItem}
-          contentContainerStyle={{ paddingBottom: selectedCount > 0 ? 96 : 24 }}
+          contentContainerStyle={{ paddingBottom: 200 }}
           showsVerticalScrollIndicator={false}
         />
       )}
       {renderActionBar()}
-      {renderScopeModal()}
-      {renderProgress()}
     </View>
   );
 }
@@ -489,107 +428,51 @@ const styles = StyleSheet.create({
   actionBar: {
     position: 'absolute',
     left: 0, right: 0, bottom: 0,
-    flexDirection: 'row',
-    alignItems: 'center',
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12,
+    paddingTop: 12,
+    paddingBottom: 16,
     borderTopWidth: StyleSheet.hairlineWidth,
   },
-  actionCount: {
+  scopeHeading: {
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 14,
-  },
-  actionHint: {
-    fontFamily: 'Roboto-Regular',
     fontSize: 11,
-    marginTop: 2,
+    letterSpacing: 1,
+    marginBottom: 8,
+    marginLeft: 2,
   },
-  deleteBtn: {
+  scopeRowWrap: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 12,
+  },
+  scopeOption: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 18,
-    height: 44,
+    gap: 8,
+    height: 46,
+    paddingHorizontal: 12,
     borderRadius: 12,
+    borderWidth: 1.5,
   },
-  deleteBtnText: {
+  scopeOptionText: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 13,
+  },
+  scopeCheck: {
+    marginLeft: 'auto',
+  },
+  saveBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    height: 50,
+    borderRadius: 14,
+  },
+  saveBtnText: {
     color: '#fff',
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 14,
-  },
-
-  // Scope modal
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    justifyContent: 'flex-end',
-  },
-  modalCard: {
-    padding: 20,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-  },
-  modalTitle: {
-    fontFamily: 'Roboto-Bold',
-    fontSize: 17,
-    marginBottom: 6,
-  },
-  modalBody: {
-    fontFamily: 'Roboto-Regular',
-    fontSize: 13,
-    lineHeight: 18,
-    marginBottom: 16,
-  },
-  scopeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    borderRadius: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    marginBottom: 10,
-  },
-  scopeIcon: {
-    width: 40, height: 40, borderRadius: 12,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  scopeLabel: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 14,
-  },
-  scopeDesc: {
-    fontFamily: 'Roboto-Regular',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  cancelBtn: {
-    alignItems: 'center',
-    paddingVertical: 14,
-    marginTop: 4,
-  },
-  cancelText: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 14,
-  },
-
-  // Progress
-  progressBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  progressCard: {
-    minWidth: 220,
-    paddingHorizontal: 24,
-    paddingVertical: 24,
-    borderRadius: 18,
-    alignItems: 'center',
-    gap: 12,
-  },
-  progressText: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 14,
+    fontSize: 15,
   },
 });

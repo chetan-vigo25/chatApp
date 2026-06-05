@@ -368,9 +368,9 @@ const styles = StyleSheet.create({
     paddingTop: Platform.OS === 'ios' ? 0 : 0, paddingBottom: 10,
   },
   headerBack:     { padding: 6, marginRight: 8 },
-  headerTitle:    { flex: 1, fontSize: 17, fontWeight: '700', textAlign: 'center' },
+  headerTitle:    { flex: 1, fontSize: 17, fontFamily: 'Roboto-Bold', textAlign: 'center' },
   headerNext:     { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20 },
-  headerNextText: { fontSize: 15, fontWeight: '600' },
+  headerNextText: { fontSize: 15, fontFamily: 'Roboto-SemiBold' },
 
   // Preview
   preview:      { flex: 1, position: 'relative' },
@@ -383,7 +383,7 @@ const styles = StyleSheet.create({
     left: 16, right: 16,
     backgroundColor: 'rgba(0,0,0,0.5)',
     borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8,
-    color: '#fff', fontSize: 14,
+    color: '#fff', fontSize: 14, fontFamily: 'Roboto-Regular',
   },
 
   // Text overlay
@@ -391,12 +391,12 @@ const styles = StyleSheet.create({
     position: 'absolute', top: '40%', left: 20, right: 20,
     alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.4)', padding: 10, borderRadius: 8,
   },
-  textOverlayText: { color: '#fff', fontSize: 22, fontWeight: '700', textAlign: 'center' },
+  textOverlayText: { color: '#fff', fontSize: 22, fontFamily: 'Roboto-Bold', textAlign: 'center' },
 
   // Toolbar
   toolbar: { flexDirection: 'row', padding: 10, gap: 20, justifyContent: 'center', backgroundColor: 'rgba(0,0,0,0.5)' },
   toolBtn:  { alignItems: 'center', gap: 3 },
-  toolLabel:{ color: '#fff', fontSize: 11 },
+  toolLabel:{ color: '#fff', fontSize: 11, fontFamily: 'Roboto-Regular' },
 
   // Filter strip
   filterStrip:        { backgroundColor: 'rgba(0,0,0,0.6)', maxHeight: 100 },
@@ -405,8 +405,8 @@ const styles = StyleSheet.create({
   filterThumbSelected:{ opacity: 1 },
   filterThumbFrame:   { width: FILTER_SIZE, height: FILTER_SIZE, borderRadius: 8, overflow: 'hidden', position: 'relative' },
   filterThumbImg:     { width: FILTER_SIZE, height: FILTER_SIZE },
-  filterLabel:        { color: 'rgba(255,255,255,0.6)', fontSize: 10 },
-  filterLabelSelected:{ color: '#fff', fontWeight: '700' },
+  filterLabel:        { color: 'rgba(255,255,255,0.6)', fontSize: 10, fontFamily: 'Roboto-Regular' },
+  filterLabelSelected:{ color: '#fff', fontFamily: 'Roboto-Bold' },
 
   // Thumb strip
   thumbStrip:        { backgroundColor: 'rgba(0,0,0,0.7)', maxHeight: THUMB_SIZE + 16 },
@@ -421,9 +421,9 @@ const styles = StyleSheet.create({
   ogCard:      { borderRadius: 16, overflow: 'hidden', borderWidth: 1 },
   ogImage:     { width: '100%', height: 180 },
   ogBody:      { padding: 14 },
-  ogTitle:     { fontSize: 16, fontWeight: '700', marginBottom: 4 },
-  ogDesc:      { fontSize: 13, marginBottom: 6 },
-  ogSite:      { fontSize: 11, marginBottom: 4, fontWeight: '600', opacity: 0.85 },
-  ogUrl:       { fontSize: 12 },
-  captionInput:{ borderRadius: 12, borderWidth: 1, padding: 12, fontSize: 15, minHeight: 80, textAlignVertical: 'top' },
+  ogTitle:     { fontSize: 16, fontFamily: 'Roboto-Bold', marginBottom: 4 },
+  ogDesc:      { fontSize: 13, marginBottom: 6, fontFamily: 'Roboto-Regular' },
+  ogSite:      { fontSize: 11, marginBottom: 4, fontFamily: 'Roboto-SemiBold', opacity: 0.85 },
+  ogUrl:       { fontSize: 12, fontFamily: 'Roboto-Regular' },
+  captionInput:{ borderRadius: 12, borderWidth: 1, padding: 12, fontSize: 15, minHeight: 80, textAlignVertical: 'top', fontFamily: 'Roboto-Regular' },
 });

@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import ContactDatabase from '../services/ContactDatabase';
+import { hashPhoneForMatch, onlyDigits } from '../utils/savedContactName';
 
 /**
  * useContactDirectory
@@ -29,10 +30,14 @@ const buildDirectory = (rows) => {
     if (!c) continue;
     const uid = c.userId ? String(c.userId) : null;
     if (uid) map[uid] = c;
+    // Index by the contact HASH — the canonical join key. Lets us match a
+    // sender/member by re-hashing their phone number even when the saved
+    // contact row never got a user_id from the backend.
+    if (c.hash) map[`h:${String(c.hash).toLowerCase()}`] = c;
     // Also index by normalized phone so we can resolve when only a number
     // is available (e.g. status snapshot with no userId on the link).
     const phone = c.normalizedPhone || c.phone || c.number;
-    if (phone) map[`p:${String(phone).replace(/\D/g, '')}`] = c;
+    if (phone) map[`p:${onlyDigits(phone)}`] = c;
   }
   return map;
 };
@@ -76,13 +81,21 @@ const formatPhone = (raw) => {
  *  • Otherwise       → fallbackName (server-provided name, profile name, etc.)
  */
 export const resolveDisplayName = (directory, userId, fallbackName, phone) => {
+  // 1) Saved contact matched by the registered user's id.
   if (directory && userId) {
     const c = directory[String(userId)];
     if (c?.fullName && c.fullName.trim()) return c.fullName.trim();
   }
   if (directory && phone) {
-    const key = `p:${String(phone).replace(/\D/g, '')}`;
-    const c = directory[key];
+    // 2) Saved contact matched by phone HASH (same salt/normalization as the
+    //    contact-sync pipeline — survives country-code / formatting diffs).
+    const h = hashPhoneForMatch(phone);
+    if (h) {
+      const c = directory[`h:${h}`];
+      if (c?.fullName && c.fullName.trim()) return c.fullName.trim();
+    }
+    // 3) Fallback: match by normalized phone digits.
+    const c = directory[`p:${onlyDigits(phone)}`];
     if (c?.fullName && c.fullName.trim()) return c.fullName.trim();
   }
   // No saved name — prefer the phone number over any server-side display name

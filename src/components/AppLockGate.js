@@ -5,15 +5,22 @@ import {
   KeyboardAvoidingView, Modal,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useDispatch } from 'react-redux';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
+import { useRealtimeChat } from '../contexts/RealtimeChatContext';
+import { chatListData } from '../Redux/Reducer/Chat/Chat.reducer';
 import {
   verifyTwoStepPassword,
   verifyDeletedPassword,
   getUserSettings,
+  updateUserSettings,
 } from '../Redux/Services/Profile/Settings.Services';
 import { navigationRef } from '../Redux/Services/navigationService';
 import { TWO_STEP_ENABLED_KEY } from '../screens/profiles/TwoStepPassword';
+import { isAppLockSuspended } from '../services/appLockGuard';
+import { getDeletedChatConfig, clearDeletedChatConfig, DELETED_PWD_SET_KEY } from '../utils/deletedChatConfig';
+import { executeDeletedChatPurge } from '../utils/deletedChatExecutor';
 
 // Minimum time the app can be in the background before we re-lock. Avoids
 // locking on every brief OS interruption (notification shade, control center).
@@ -30,6 +37,8 @@ const LOCKOUT_UNTIL_KEY = '@chat/twoStepLockoutUntil';
 
 export default function AppLockGate() {
   const { theme, isDarkMode } = useTheme();
+  const dispatch = useDispatch();
+  const { removeChat } = useRealtimeChat();
   const [enabled, setEnabled] = useState(false);
   const [locked, setLocked] = useState(false);
   const [pwd, setPwd] = useState('');
@@ -39,9 +48,22 @@ export default function AppLockGate() {
   const [attempts, setAttempts] = useState(0);
   const [lockoutUntil, setLockoutUntil] = useState(0);
   const [now, setNow] = useState(Date.now());
+  const [focused, setFocused] = useState(false);
+
+  // "Hold & load" state, shown after EITHER password unlocks. We keep this
+  // screen mounted, swap to a neutral full-screen loader, (invisibly) purge if
+  // it was the panic password, reload the chat list, then land on ChatList.
+  // The loader looks identical for both passwords by design.
+  const [purging, setPurging] = useState(false);
+  const [purgeStage, setPurgeStage] = useState('deleting'); // 'deleting' | 'reloading' | 'done'
+  const [purgeProgress, setPurgeProgress] = useState({ done: 0, total: 0 });
 
   const appState = useRef(AppState.currentState);
   const shakeAnim = useRef(new Animated.Value(0)).current;
+  const pulseAnim = useRef(new Animated.Value(0)).current;
+  const progressAnim = useRef(new Animated.Value(0)).current;
+  // Calm entrance for the lock card — a soft fade + lift, WhatsApp-style.
+  const entranceAnim = useRef(new Animated.Value(0)).current;
 
   const cooldownLeftMs = Math.max(0, lockoutUntil - now);
   const inCooldown = cooldownLeftMs > 0;
@@ -78,15 +100,22 @@ export default function AppLockGate() {
     })();
   }, []);
 
-  // Initial load: read the cached toggle (fast), then refresh from the API
-  // (authoritative). Lock immediately on cold start if 2-step is on.
+  // Initial load: read the cached flags (fast), then refresh from the API
+  // (authoritative). Lock immediately on cold start if EITHER the 2-step or
+  // the deleted-chats password is configured — this single screen verifies
+  // both, so it must arm for either.
   useEffect(() => {
     let alive = true;
     (async () => {
+      let cachedOn = false;
       try {
-        const cached = await AsyncStorage.getItem(TWO_STEP_ENABLED_KEY);
+        const [cachedTwo, cachedDel] = await Promise.all([
+          AsyncStorage.getItem(TWO_STEP_ENABLED_KEY),
+          AsyncStorage.getItem(DELETED_PWD_SET_KEY),
+        ]);
         if (!alive) return;
-        if (cached === '1') {
+        cachedOn = cachedTwo === '1' || cachedDel === '1';
+        if (cachedOn) {
           setEnabled(true);
           setLocked(true);
         }
@@ -96,11 +125,14 @@ export default function AppLockGate() {
         const settings = await getUserSettings();
         if (!alive) return;
         const two = settings?.chat?.twoStep || {};
-        const isOn = !!two.enabled && !!two.hasPassword;
+        const twoOn = !!two.enabled && !!two.hasPassword;
+        const delOn = !!settings?.chat?.hasDeletedPassword;
+        const isOn = twoOn || delOn;
         setEnabled(isOn);
-        await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, isOn ? '1' : '0');
+        await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, twoOn ? '1' : '0');
+        await AsyncStorage.setItem(DELETED_PWD_SET_KEY, delOn ? '1' : '0');
         if (!isOn) setLocked(false);
-        else if (cached !== '1') setLocked(true); // armed for the first time
+        else if (!cachedOn) setLocked(true); // armed for the first time
       } catch {
         /* offline — keep cached state */
       }
@@ -126,13 +158,25 @@ export default function AppLockGate() {
 
       // Coming back to the foreground.
       if (next === 'active' && (prev === 'background' || prev === 'inactive')) {
+        // An intentional in-app excursion (image picker, camera, document
+        // picker) backgrounds the app. Don't treat the return trip as a
+        // re-lock — just refresh the timestamp so a later genuine background
+        // still locks.
+        if (isAppLockSuspended()) {
+          try { await AsyncStorage.setItem(LAST_BACKGROUND_KEY, String(Date.now())); } catch {}
+          return;
+        }
+
         // Re-read the flag fresh — TwoStepPassword writes here on save, so
         // a newly-armed lock works on the very next foreground without
         // needing an app restart.
         let isOn = enabled;
         try {
-          const cached = await AsyncStorage.getItem(TWO_STEP_ENABLED_KEY);
-          isOn = cached === '1';
+          const [cachedTwo, cachedDel] = await Promise.all([
+            AsyncStorage.getItem(TWO_STEP_ENABLED_KEY),
+            AsyncStorage.getItem(DELETED_PWD_SET_KEY),
+          ]);
+          isOn = cachedTwo === '1' || cachedDel === '1';
           if (isOn !== enabled) setEnabled(isOn);
         } catch {}
         if (!isOn) return;
@@ -157,10 +201,10 @@ export default function AppLockGate() {
   // While locked, swallow the hardware back button — there's no escape
   // until the right password is entered.
   useEffect(() => {
-    if (!locked) return undefined;
+    if (!locked && !purging) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => true);
     return () => sub.remove();
-  }, [locked]);
+  }, [locked, purging]);
 
   const shake = useCallback(() => {
     Animated.sequence([
@@ -170,6 +214,110 @@ export default function AppLockGate() {
       Animated.timing(shakeAnim, { toValue: 0, duration: 50, useNativeDriver: true }),
     ]).start();
   }, [shakeAnim]);
+
+  // Play the entrance reveal each time the lock screen comes up.
+  useEffect(() => {
+    if (locked && !purging) {
+      entranceAnim.setValue(0);
+      Animated.timing(entranceAnim, {
+        toValue: 1,
+        duration: 420,
+        useNativeDriver: true,
+      }).start();
+    }
+  }, [locked, purging, entranceAnim]);
+
+  // Gently pulse the loader badge while the purge runs.
+  useEffect(() => {
+    if (!purging) { pulseAnim.setValue(0); return undefined; }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1, duration: 850, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 0, duration: 850, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [purging, pulseAnim]);
+
+  // Drive the progress bar. Deleting fills 10%→80% (by chat count), reloading
+  // settles at 90%, done snaps to 100%.
+  useEffect(() => {
+    if (!purging) { progressAnim.setValue(0); return; }
+    let target = 0.1;
+    if (purgeStage === 'deleting') {
+      target = purgeProgress.total > 0
+        ? 0.1 + (purgeProgress.done / purgeProgress.total) * 0.7
+        : 0.15;
+    } else if (purgeStage === 'reloading') {
+      target = 0.9;
+    } else if (purgeStage === 'done') {
+      target = 1;
+    }
+    Animated.timing(progressAnim, {
+      toValue: target,
+      duration: 350,
+      useNativeDriver: false,
+    }).start();
+  }, [purging, purgeStage, purgeProgress, progressAnim]);
+
+  // Unified unlock sequence. BOTH the 2-step password and the deleted-chats
+  // (panic) password run through the EXACT same visible loader, timing and
+  // destination — so an observer can't tell which one was entered. The only
+  // difference is invisible: when `purge` is true the armed chats are deleted
+  // and the panic password is consumed + promoted to the 2-step password.
+  const runUnlockSequence = useCallback(async (candidate, purge) => {
+    setPurging(true);
+    setPurgeStage('deleting');
+    setPurgeProgress({ done: 0, total: 0 });
+
+    const work = (async () => {
+      try {
+        if (purge) {
+          const config = await getDeletedChatConfig();
+          if (config?.chatIds?.length) {
+            await executeDeletedChatPurge({
+              chatIds: config.chatIds,
+              scope: config.scope,
+              onProgress: (done, total) => setPurgeProgress({ done, total }),
+              // Drop each purged chat from the in-memory list immediately.
+              onChatDeleted: (chatId) => { try { removeChat?.(chatId); } catch {} },
+            });
+          }
+        }
+        // Reload the chat list and HOLD until it resolves — for the panic path
+        // so the list never shows the deleted chats, and for the 2-step path so
+        // the two are indistinguishable.
+        setPurgeStage('reloading');
+        try { await dispatch(chatListData('')); } catch {}
+
+        if (purge) {
+          // 1) Reset the deleted-chats password (single-use).
+          try { await updateUserSettings({ chat: { deletedPassword: null } }); } catch {}
+          // 2) Promote the entered password to the 2-step password.
+          try { await updateUserSettings({ chat: { twoStep: { enabled: true, password: candidate } } }); } catch {}
+          try { await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '1'); } catch {}
+          try { await AsyncStorage.setItem(DELETED_PWD_SET_KEY, '0'); } catch {}
+          await clearDeletedChatConfig();
+        }
+      } catch { /* best-effort — never strand the user on the loader */ }
+    })();
+
+    // Hold the loader for a consistent minimum so the fast (2-step) path and
+    // the slower (purge) path feel identical.
+    await Promise.all([work, new Promise((resolve) => setTimeout(resolve, 900))]);
+
+    // Brief settle beat, then reset onto the chat list screen for BOTH paths.
+    setPurgeStage('done');
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    try {
+      if (navigationRef.isReady()) {
+        navigationRef.reset({ index: 0, routes: [{ name: 'ChatList' }] });
+      }
+    } catch {}
+    setPurging(false);
+    setLocked(false);
+  }, [dispatch, removeChat]);
 
   const handleSubmit = async () => {
     if (inCooldown) return;
@@ -191,24 +339,16 @@ export default function AppLockGate() {
       ]);
 
       if (twoStepOk || deletedOk) {
-        setLocked(false);
         setPwd('');
         setAttempts(0);
         setLockoutUntil(0);
         await AsyncStorage.multiRemove([ATTEMPTS_KEY, LOCKOUT_UNTIL_KEY]).catch(() => {});
 
-        // If the entered password was the deleted-chats one, override
-        // whatever Splash navigated to and drop the user straight into
-        // the chat-selection screen. The selector itself takes care of
-        // resetting the deleted password after the action completes.
-        if (deletedOk) {
-          if (navigationRef.isReady?.()) {
-            navigationRef.reset({
-              index: 0,
-              routes: [{ name: 'DeletedChatsSelector' }],
-            });
-          }
-        }
+        // Route BOTH passwords through the same loader so they're
+        // indistinguishable. `runUnlockSequence` owns unlocking; only when the
+        // deleted-chats password matched does it actually purge (invisibly).
+        setSubmitting(false);
+        await runUnlockSequence(candidate, deletedOk);
         return;
       }
 
@@ -249,14 +389,101 @@ export default function AppLockGate() {
     return `${m}:${String(s).padStart(2, '0')}`;
   };
 
-  if (!locked) return null;
+  if (!locked && !purging) return null;
 
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
-  const pageBg = isDarkMode ? '#0B141A' : '#F4F6F9';
-  const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
-  const inputBg = isDarkMode ? '#0F1A21' : '#F2F4F8';
+  // WhatsApp lock screen is flat and full-bleed — pure white / WhatsApp-dark,
+  // no floating card. Surfaces match WhatsApp's input/track greys per mode.
+  const pageBg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  const inputBg = isDarkMode ? '#1F2C33' : '#F0F2F5';
+  const trackBg = isDarkMode ? '#1F2C33' : '#E9EDEF';
+
+  const progressWidth = progressAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0%', '100%'],
+  });
+  const badgePulse = pulseAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [1, 1.12],
+  });
+  const ringOpacity = pulseAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.35, 0],
+  });
+  const ringScale = pulseAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [1, 1.6],
+  });
+  const enterTranslate = entranceAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [18, 0],
+  });
+
+  // Neutral, generic loading copy ONLY — the panic-password purge must never
+  // betray that chats are being deleted. To anyone watching, this looks like
+  // the app is simply loading the chat list.
+  const purgeTitle = 'Loading chats';
+  const purgeBody = 'Getting your chats ready…';
+
+  // While purging, render a dedicated full-screen loader instead of the
+  // password card — the screen is "held" until the chats are gone and the
+  // list has reloaded.
+  if (purging) {
+    return (
+      <Modal
+        visible
+        transparent={false}
+        animationType="fade"
+        statusBarTranslucent
+        onRequestClose={() => {}}
+      >
+        <View style={[styles.root, { backgroundColor: pageBg }]}>
+          <View style={styles.loaderInner}>
+            <View style={styles.badgeWrap}>
+              <Animated.View
+                pointerEvents="none"
+                style={[styles.pulseRing, {
+                  borderColor: themeColor,
+                  opacity: ringOpacity,
+                  transform: [{ scale: ringScale }],
+                }]}
+              />
+              <Animated.View
+                style={[styles.lockBadge, {
+                  backgroundColor: themeColor + '14',
+                  marginBottom: 0,
+                  transform: [{ scale: badgePulse }],
+                }]}
+              >
+                <Ionicons name="chatbubbles-outline" size={38} color={themeColor} />
+              </Animated.View>
+            </View>
+
+            <Text style={[styles.title, { color: primaryText, marginTop: 24 }]}>{purgeTitle}</Text>
+            <Text style={[styles.body, { color: subText }]}>{purgeBody}</Text>
+
+            {/* <View style={[styles.progressTrack, { backgroundColor: trackBg }]}>
+              <Animated.View
+                style={[styles.progressFill, {
+                  width: progressWidth,
+                  backgroundColor: themeColor,
+                }]}
+              />
+            </View> */}
+
+            {/* <View style={styles.purgeFooter}>
+              <ActivityIndicator size="small" color={themeColor} />
+              <Text style={[styles.footerHint, { color: subText }]}>
+                This only takes a moment
+              </Text>
+            </View> */}
+          </View>
+        </View>
+      </Modal>
+    );
+  }
 
   return (
     <Modal
@@ -273,106 +500,120 @@ export default function AppLockGate() {
           style={styles.flex}
         >
           <View style={styles.inner}>
-            <View pointerEvents="none" style={[styles.glow, { backgroundColor: themeColor + '22' }]} />
-            <View pointerEvents="none" style={[styles.glow2, { backgroundColor: themeColor + '10' }]} />
-
-            <Animated.View
-              style={[
-                styles.card,
-                { backgroundColor: cardBg, transform: [{ translateX: shakeAnim }] },
-              ]}
-            >
-              <View style={[styles.badge, {
-                backgroundColor: inCooldown ? '#E5393520' : themeColor + '1A',
-              }]}>
-                <MaterialCommunityIcons
-                  name={inCooldown ? 'timer-sand' : 'shield-key'}
-                  size={36}
-                  color={inCooldown ? '#E53935' : themeColor}
-                />
-              </View>
-              <Text style={[styles.title, { color: primaryText }]}>
-                {inCooldown ? 'Try again later' : 'App locked'}
-              </Text>
-              <Text style={[styles.body, { color: subText }]}>
-                {inCooldown
-                  ? 'Too many wrong attempts. The app is temporarily locked.'
-                  : 'Enter your 2-step verification password to continue.'}
-              </Text>
-
-              {inCooldown && (
-                <View style={[styles.countdownWrap, { borderColor: '#E5393540' }]}>
-                  <MaterialCommunityIcons name="clock-outline" size={18} color="#E53935" />
-                  <Text style={styles.countdownText}>
-                    {formatCooldown(cooldownSeconds)}
-                  </Text>
-                </View>
-              )}
-
-              <View style={[styles.inputWrap, {
-                backgroundColor: inputBg,
-                borderColor: error ? '#E5393580' : 'transparent',
-                opacity: inCooldown ? 0.5 : 1,
-              }]}>
-                <Ionicons name="key-outline" size={18} color={subText} />
-                <TextInput
-                  value={pwd}
-                  onChangeText={(t) => { setPwd(t); if (error && !inCooldown) setError(''); }}
-                  placeholder={inCooldown ? 'Locked' : 'Password'}
-                  placeholderTextColor={subText}
-                  secureTextEntry={!showPwd}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  autoFocus={!inCooldown}
-                  editable={!submitting && !inCooldown}
-                  onSubmitEditing={handleSubmit}
-                  returnKeyType="done"
-                  style={[styles.input, { color: primaryText }]}
-                />
-                <TouchableOpacity
-                  onPress={() => setShowPwd((s) => !s)}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                  disabled={inCooldown}
-                >
-                  <Ionicons
-                    name={showPwd ? 'eye-off-outline' : 'eye-outline'}
-                    size={20} color={subText}
-                  />
-                </TouchableOpacity>
-              </View>
-
-              {!!error && <Text style={styles.errorText}>{error}</Text>}
-
-              <TouchableOpacity
-                activeOpacity={0.85}
-                onPress={handleSubmit}
-                disabled={submitting || inCooldown}
-                style={[styles.primaryBtn, {
-                  backgroundColor: inCooldown ? (isDarkMode ? '#243340' : '#D5DAE2') : themeColor,
-                  opacity: submitting ? 0.7 : 1,
-                }]}
+            <View style={styles.centerArea}>
+              <Animated.View
+                style={[
+                  styles.centerBlock,
+                  {
+                    opacity: entranceAnim,
+                    transform: [
+                      { translateX: shakeAnim },
+                      { translateY: enterTranslate },
+                    ],
+                  },
+                ]}
               >
-                {submitting ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : inCooldown ? (
-                  <>
-                    <Ionicons name="time-outline" size={18} color={subText} />
+                <View style={[styles.lockBadge, {
+                  backgroundColor: inCooldown ? '#E5393514' : themeColor + '14',
+                }]}>
+                  <Ionicons
+                    name={inCooldown ? 'time-outline' : 'lock-closed'}
+                    size={38}
+                    color={inCooldown ? '#E53935' : themeColor}
+                  />
+                </View>
+
+                <Text style={[styles.title, { color: primaryText }]}>
+                  {inCooldown ? 'Try again later' : 'Unlock to use VibeConnect'}
+                </Text>
+                <Text style={[styles.body, { color: subText }]}>
+                  {inCooldown
+                    ? 'Too many wrong attempts. Please wait before trying again.'
+                    : 'Enter your password to continue.'}
+                </Text>
+
+                {inCooldown && (
+                  <View style={styles.countdownWrap}>
+                    <MaterialCommunityIcons name="clock-outline" size={16} color="#E53935" />
+                    <Text style={styles.countdownText}>
+                      {formatCooldown(cooldownSeconds)}
+                    </Text>
+                  </View>
+                )}
+
+                <View style={[styles.inputWrap, {
+                  backgroundColor: inputBg,
+                  borderBottomColor: error
+                    ? '#E53935'
+                    : (focused ? themeColor : 'transparent'),
+                  opacity: inCooldown ? 0.5 : 1,
+                }]}>
+                  <Ionicons
+                    name="key-outline"
+                    size={18}
+                    color={focused && !error ? themeColor : subText}
+                  />
+                  <TextInput
+                    value={pwd}
+                    onChangeText={(t) => { setPwd(t); if (error && !inCooldown) setError(''); }}
+                    onFocus={() => setFocused(true)}
+                    onBlur={() => setFocused(false)}
+                    placeholder={inCooldown ? 'Locked' : 'Password'}
+                    placeholderTextColor={subText}
+                    secureTextEntry={!showPwd}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoFocus={!inCooldown}
+                    editable={!submitting && !inCooldown}
+                    onSubmitEditing={handleSubmit}
+                    returnKeyType="done"
+                    style={[styles.input, { color: primaryText }]}
+                  />
+                  <TouchableOpacity
+                    onPress={() => setShowPwd((s) => !s)}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                    disabled={inCooldown}
+                  >
+                    <Ionicons
+                      name={showPwd ? 'eye-off-outline' : 'eye-outline'}
+                      size={20} color={subText}
+                    />
+                  </TouchableOpacity>
+                </View>
+
+                {!!error && <Text style={styles.errorText}>{error}</Text>}
+
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={handleSubmit}
+                  disabled={submitting || inCooldown}
+                  style={[styles.primaryBtn, {
+                    backgroundColor: inCooldown ? (isDarkMode ? '#243340' : '#E9EDEF') : themeColor,
+                    opacity: submitting ? 0.8 : 1,
+                  }]}
+                >
+                  {submitting ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : inCooldown ? (
                     <Text style={[styles.primaryBtnText, { color: subText }]}>
                       Wait {formatCooldown(cooldownSeconds)}
                     </Text>
-                  </>
-                ) : (
-                  <>
-                    <Ionicons name="lock-open-outline" size={18} color="#fff" />
+                  ) : (
                     <Text style={styles.primaryBtnText}>Unlock</Text>
-                  </>
-                )}
-              </TouchableOpacity>
+                  )}
+                </TouchableOpacity>
+              </Animated.View>
+            </View>
 
-              <Text style={[styles.footerHint, { color: subText }]}>
-                Wrong password? The app stays locked. There's no skip here.
-              </Text>
-            </Animated.View>
+            <View style={styles.footer}>
+              <View style={styles.footerRow}>
+                <Ionicons name="lock-closed" size={12} color={subText} />
+                <Text style={[styles.footerHint, { color: subText }]}>
+                  Locked for your privacy
+                </Text>
+              </View>
+              <Text style={[styles.brand, { color: subText }]}>VibeConnect</Text>
+            </View>
           </View>
         </KeyboardAvoidingView>
       </View>
@@ -385,69 +626,76 @@ const styles = StyleSheet.create({
   flex: { flex: 1 },
   inner: {
     flex: 1,
+    paddingHorizontal: 28,
+    paddingBottom: 22,
+  },
+  centerArea: {
+    flex: 1,
     justifyContent: 'center',
-    paddingHorizontal: 24,
-    position: 'relative',
-  },
-  glow: {
-    position: 'absolute',
-    top: '15%', right: -60,
-    width: 240, height: 240, borderRadius: 120,
-  },
-  glow2: {
-    position: 'absolute',
-    bottom: '15%', left: -50,
-    width: 200, height: 200, borderRadius: 100,
-  },
-  card: {
-    borderRadius: 24,
-    padding: 26,
     alignItems: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.1,
-    shadowOffset: { width: 0, height: 16 },
-    shadowRadius: 28,
-    elevation: 6,
   },
-  badge: {
-    width: 76, height: 76, borderRadius: 22,
+  centerBlock: {
+    width: '100%',
+    maxWidth: 400,
+    alignItems: 'center',
+  },
+  loaderInner: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 40,
+  },
+  lockBadge: {
+    width: 92, height: 92, borderRadius: 46,
     alignItems: 'center', justifyContent: 'center',
-    marginBottom: 18,
+    marginBottom: 22,
+  },
+  badgeWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pulseRing: {
+    position: 'absolute',
+    width: 92, height: 92, borderRadius: 46,
+    borderWidth: 2,
   },
   title: {
-    fontFamily: 'Roboto-Bold',
+    fontFamily: 'Roboto-Medium',
     fontSize: 22,
+    letterSpacing: 0.2,
+    textAlign: 'center',
     marginBottom: 8,
   },
   body: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 13,
-    lineHeight: 19,
+    fontSize: 14,
+    lineHeight: 20,
     textAlign: 'center',
-    marginBottom: 22,
-    paddingHorizontal: 6,
+    marginBottom: 28,
+    paddingHorizontal: 10,
   },
   inputWrap: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 14,
+    borderTopLeftRadius: 12,
+    borderTopRightRadius: 12,
     paddingHorizontal: 14,
-    height: 52,
+    height: 54,
     width: '100%',
     gap: 10,
-    borderWidth: 1.5,
+    borderBottomWidth: 2,
   },
   input: {
     flex: 1,
     fontFamily: 'Roboto-Regular',
-    fontSize: 15,
+    fontSize: 16,
     paddingVertical: 0,
   },
   errorText: {
     color: '#E53935',
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
-    marginTop: 8,
+    fontSize: 12.5,
+    marginTop: 10,
     alignSelf: 'flex-start',
     marginLeft: 4,
   },
@@ -456,36 +704,67 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
-    height: 50,
-    borderRadius: 14,
+    height: 52,
+    borderRadius: 26,
     width: '100%',
-    marginTop: 18,
+    marginTop: 26,
   },
   primaryBtnText: {
     color: '#fff',
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 15,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 16,
+    letterSpacing: 0.3,
+  },
+  footer: {
+    alignItems: 'center',
+    gap: 8,
+  },
+  footerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
   },
   footerHint: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12,
+    fontSize: 12.5,
     textAlign: 'center',
-    marginTop: 14,
+  },
+  brand: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+    letterSpacing: 1.5,
+    textTransform: 'uppercase',
+    opacity: 0.7,
   },
   countdownWrap: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 12,
-    borderWidth: 1,
-    marginBottom: 18,
+    gap: 6,
+    marginBottom: 22,
   },
   countdownText: {
     color: '#E53935',
     fontFamily: 'Roboto-Bold',
-    fontSize: 16,
+    fontSize: 15,
     letterSpacing: 1,
+  },
+  progressTrack: {
+    width: '100%',
+    maxWidth: 320,
+    alignSelf: 'center',
+    height: 6,
+    borderRadius: 6,
+    overflow: 'hidden',
+    marginTop: 6,
+  },
+  progressFill: {
+    height: '100%',
+    borderRadius: 6,
+  },
+  purgeFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 20,
   },
 });

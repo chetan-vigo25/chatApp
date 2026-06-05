@@ -216,7 +216,7 @@ export const ReportBottomSheet = ({
                       styles.reasonText,
                       dynamicStyles.reasonText,
                       isActive && dynamicStyles.reasonTextActive,
-                      isActive && { fontWeight: '600' },
+                      isActive && { fontFamily: 'Roboto-SemiBold' },
                     ]}>
                       {r.label}
                     </Text>
@@ -332,7 +332,7 @@ const styles = StyleSheet.create({
   },
   title: {
     fontSize: 18,
-    fontWeight: '700',
+    fontFamily: 'Roboto-Bold',
   },
   subtitle: {
     fontSize: 12,
@@ -347,7 +347,7 @@ const styles = StyleSheet.create({
   },
   closeIconText: {
     fontSize: 14,
-    fontWeight: '600',
+    fontFamily: 'Roboto-SemiBold',
   },
   divider: {
     height: 1,
@@ -358,7 +358,7 @@ const styles = StyleSheet.create({
   },
   sectionLabel: {
     fontSize: 14,
-    fontWeight: '600',
+    fontFamily: 'Roboto-SemiBold',
     marginBottom: 10,
   },
   reasonList: {
@@ -379,7 +379,7 @@ const styles = StyleSheet.create({
   },
   reasonText: {
     fontSize: 14,
-    fontWeight: '500',
+    fontFamily: 'Roboto-Medium',
     flex: 1,
   },
   checkMark: {
@@ -392,7 +392,7 @@ const styles = StyleSheet.create({
   checkMarkText: {
     color: '#fff',
     fontSize: 12,
-    fontWeight: 'bold',
+    fontFamily: 'Roboto-Bold',
   },
   input: {
     borderWidth: 1.5,
@@ -434,7 +434,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   cancelBtnText: {
-    fontWeight: '600',
+    fontFamily: 'Roboto-SemiBold',
     fontSize: 15,
   },
   submitBtn: {
@@ -455,7 +455,7 @@ const styles = StyleSheet.create({
   },
   submitBtnText: {
     color: '#fff',
-    fontWeight: '700',
+    fontFamily: 'Roboto-Bold',
     fontSize: 15,
   },
 });

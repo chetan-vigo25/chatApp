@@ -1,6 +1,7 @@
 import { createSlice, createAsyncThunk } from '@reduxjs/toolkit';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { statusServices } from '../../Services/Status/Status.Services';
+import ChatDatabase from '../../../services/ChatDatabase';
 
 // ── Persisted viewed-set ────────────────────────────────────────────────────
 // The server is authoritative (each /feed response stamps `isViewed`), but
@@ -71,6 +72,50 @@ export const fetchStatusFeed = createAsyncThunk(
 
 // Legacy alias kept so existing code doesn't break
 export const fetchContactStatuses = fetchStatusFeed;
+
+/** Hydrate the contact status feed from SQLite on boot (before /feed resolves)
+ *  so the Chat List avatar rings render instantly on cold open / offline. */
+export const hydrateStatusFeed = createAsyncThunk(
+  'status/hydrateFeed',
+  async () => {
+    try {
+      return (await ChatDatabase.loadStatusFeed?.()) || [];
+    } catch {
+      return [];
+    }
+  }
+);
+
+/**
+ * Official application broadcast updates — visible to every user.
+ * On success, persists the snapshot to SQLite so the "Official Updates"
+ * section renders instantly on the next cold open (offline-friendly).
+ */
+export const fetchBroadcasts = createAsyncThunk(
+  'status/fetchBroadcasts',
+  async (_, { rejectWithValue }) => {
+    try {
+      const response = await statusServices.getBroadcasts();
+      const broadcasts = response?.data?.broadcasts || [];
+      ChatDatabase.saveBroadcasts?.(broadcasts).catch?.(() => {});
+      return broadcasts;
+    } catch (error) {
+      return rejectWithValue(toSerializableError(error));
+    }
+  }
+);
+
+/** Hydrate broadcasts from SQLite on boot (before the network call resolves). */
+export const hydrateBroadcasts = createAsyncThunk(
+  'status/hydrateBroadcasts',
+  async () => {
+    try {
+      return (await ChatDatabase.loadBroadcasts?.()) || [];
+    } catch {
+      return [];
+    }
+  }
+);
 
 /**
  * Pull the public status settings (max sizes, max video secs, expiry hours,
@@ -261,6 +306,8 @@ const statusSlice = createSlice({
     myStatuses: [],
     /** Grouped contacts feed: [{ userId, userName, userAvatar, count, unseenCount, allViewed, latestAt, statuses[] }] */
     contactStatuses: [],
+    /** Official application broadcast updates (visible to all users), newest first. */
+    broadcasts: [],
     viewers: { viewCount: 0, viewers: [] },
     likers:  { likedBy: [], total: 0 },
     /** Dynamic limits/flags from backend — drives all upload validation. */
@@ -434,6 +481,19 @@ const statusSlice = createSlice({
       delete state.reactionCache[id];
     },
 
+    /**
+     * Socket: an official broadcast expired or was removed by an admin
+     * (event: broadcast:deleted). Drops it from the Official Updates section
+     * and clears its local SQLite cache + reaction cache.
+     */
+    removeBroadcastFromSocket: (state, action) => {
+      const id = String(action.payload?.statusId || '');
+      if (!id) return;
+      state.broadcasts = state.broadcasts.filter(b => String(b._id) !== id);
+      delete state.reactionCache[id];
+      ChatDatabase.removeBroadcast?.(id).catch?.(() => {});
+    },
+
     /** Socket: someone liked/reacted to my status (event: status_reaction_update) */
     handleReactionUpdateFromSocket: (state, action) => {
       const { statusId, likeCount, dislikeCount } = action.payload;
@@ -534,8 +594,47 @@ const statusSlice = createSlice({
           ).length;
           contact.allViewed = contact.unseenCount === 0;
         }
+
+        // Persist the authoritative snapshot to SQLite so the Chat List rings
+        // render instantly (offline) on the next cold boot.
+        ChatDatabase.saveStatusFeed?.(state.contactStatuses).catch?.(() => {});
       })
       .addCase(fetchStatusFeed.rejected, (state) => { state.isLoading = false; })
+
+      // Hydrate the contact feed from SQLite on boot — only fills the gap before
+      // the network /feed resolves; never clobbers a feed already in memory.
+      .addCase(hydrateStatusFeed.fulfilled, (state, action) => {
+        const stored = Array.isArray(action.payload) ? action.payload : [];
+        if (stored.length && state.contactStatuses.length === 0) {
+          state.contactStatuses = stored;
+        }
+      })
+
+      // Broadcasts — official application updates
+      .addCase(fetchBroadcasts.fulfilled, (state, action) => {
+        const list = Array.isArray(action.payload) ? action.payload : [];
+        state.broadcasts = list;
+        // Seed reaction cache from server-reported state so the heart renders
+        // correctly the moment a broadcast is opened.
+        for (const b of list) {
+          if (b?._id && (b.myReaction !== undefined || b.likeCount !== undefined)) {
+            const id = String(b._id);
+            const existing = state.reactionCache[id];
+            state.reactionCache[id] = {
+              myReaction: existing?.myReaction ?? (b.myReaction || null),
+              likeCount: b.likeCount ?? existing?.likeCount ?? 0,
+              dislikeCount: existing?.dislikeCount ?? 0,
+            };
+          }
+        }
+      })
+      // Hydrate broadcasts from SQLite on boot (before the network call)
+      .addCase(hydrateBroadcasts.fulfilled, (state, action) => {
+        const stored = Array.isArray(action.payload) ? action.payload : [];
+        if (stored.length && state.broadcasts.length === 0) {
+          state.broadcasts = stored;
+        }
+      })
 
       // Hydrate viewed-set from AsyncStorage on app boot (before any /feed call)
       .addCase(hydrateViewedStatusIds.fulfilled, (state, action) => {
@@ -563,6 +662,9 @@ const statusSlice = createSlice({
             break;
           }
         }
+        // Mark a viewed broadcast so its "official" ring/badge reflects state
+        const bc = state.broadcasts.find(b => String(b._id) === statusId);
+        if (bc) bc.isViewed = true;
       })
 
       // React — reconcile with the server's canonical counts on success,
@@ -636,6 +738,7 @@ export const {
   clearLikeAnimation,
   addNewStatusFromSocket,
   removeStatusFromSocket,
+  removeBroadcastFromSocket,
   handleReactionUpdateFromSocket,
   triggerLikeAnimation,
   seedReactionCache,

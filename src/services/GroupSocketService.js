@@ -603,6 +603,8 @@ export const attachGroupMessageListeners = (handlers = {}) => {
       userId: data?.userId,
       // Full reactions map: { emoji: { count, users: [userId, ...] } }
       reactions: data?.reactions || null,
+      // Authoritative denormalized counts from the backend V2 path: { emoji: count }
+      reactionCounts: data?.reactionCounts || null,
     });
   };
 

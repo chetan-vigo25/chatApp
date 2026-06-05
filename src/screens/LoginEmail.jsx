@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   StyleSheet, View, Text, TextInput, TouchableOpacity, Animated,
-  ActivityIndicator, KeyboardAvoidingView, Platform, Image, ScrollView,
-  Alert, ToastAndroid, Dimensions,
+  ActivityIndicator, KeyboardAvoidingView, Platform, ScrollView,
+  Alert, ToastAndroid,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useTheme } from "../contexts/ThemeContext";
@@ -15,34 +15,11 @@ import { performSessionReset, saveAuthSession } from "../services/sessionManager
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { APP_TAG_NAME } from '@env';
 
-const { width: SCREEN_W } = Dimensions.get('window');
 const EMAIL_REGEX = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
   else Alert.alert('', message);
-}
-
-// Stacked-bands radial halo
-function HeroHalo({ color }) {
-  const BANDS = 12;
-  return (
-    <View pointerEvents="none" style={styles.heroHalo}>
-      {Array.from({ length: BANDS }).map((_, i) => {
-        const t = (BANDS - i) / BANDS;
-        const alpha = Number((t * t * 0.18).toFixed(3));
-        return (
-          <View
-            key={i}
-            style={[
-              styles.heroHaloBand,
-              { backgroundColor: color, opacity: alpha, transform: [{ scale: 1 + i * 0.06 }] },
-            ]}
-          />
-        );
-      })}
-    </View>
-  );
 }
 
 export default function LoginEmail({ navigation }) {
@@ -53,21 +30,21 @@ export default function LoginEmail({ navigation }) {
   const { isLoading } = useSelector((state) => state.authentication);
 
   const fadeAnim = useRef(new Animated.Value(0)).current;
-  const slideAnim = useRef(new Animated.Value(20)).current;
-  const emailGlow = useRef(new Animated.Value(0)).current;
-  const passwordGlow = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(14)).current;
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [emailTouched, setEmailTouched] = useState(false);
+  const [emailFocused, setEmailFocused] = useState(false);
+  const [passwordFocused, setPasswordFocused] = useState(false);
   const [fcmToken, setFcmToken] = useState(null);
   const isSubmitting = isLoading;
 
   useEffect(() => {
     AsyncStorage.getItem('fcmToken').then(setFcmToken).catch(() => {});
     Animated.parallel([
-      Animated.timing(fadeAnim, { toValue: 1, duration: 500, useNativeDriver: true }),
+      Animated.timing(fadeAnim, { toValue: 1, duration: 420, useNativeDriver: true }),
       Animated.spring(slideAnim, { toValue: 0, friction: 9, tension: 60, useNativeDriver: true }),
     ]).start();
   }, []);
@@ -75,14 +52,6 @@ export default function LoginEmail({ navigation }) {
   const isEmailValid = EMAIL_REGEX.test(email.trim());
   const showEmailError = emailTouched && email.length > 0 && !isEmailValid;
   const isFormValid = isEmailValid && password.length >= 1;
-
-  const animateFocus = useCallback((animValue, focused) => {
-    Animated.timing(animValue, {
-      toValue: focused ? 1 : 0,
-      duration: 200,
-      useNativeDriver: false,
-    }).start();
-  }, []);
 
   const handleSubmit = async () => {
     if (!isFormValid || isLoading) return;
@@ -132,144 +101,139 @@ export default function LoginEmail({ navigation }) {
     }
   };
 
-  const themeColor = theme.colors.themeColor;
-  const bg = isDarkMode ? '#0B141A' : '#F4F6F9';
-  const card = isDarkMode ? '#16222C' : '#FFFFFF';
-  const inputBg = isDarkMode ? '#1F2C36' : '#F6F8FB';
-  const inputBorderIdle = isDarkMode ? '#243340' : '#E6EAF0';
+  // WhatsApp palette
+  const accent = isDarkMode ? '#00A884' : '#008069';
+  const link = isDarkMode ? '#53BDEB' : '#027EB5';
   const errorColor = '#E5484D';
-  const primaryText = theme.colors.primaryTextColor;
-  const subText = theme.colors.placeHolderTextColor;
-  const placeholderColor = isDarkMode ? '#5E7280' : '#A6B0BD';
+  const bg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';
+  const secondaryText = isDarkMode ? '#8696A0' : '#54656F';
+  const placeholderText = isDarkMode ? '#5E7280' : '#A6B0BD';
+  const underlineIdle = isDarkMode ? '#2A3942' : '#D1D7DB';
+  const disabledBtn = isDarkMode ? '#1F2C33' : '#D8DEE2';
+  const disabledTxt = isDarkMode ? '#54656F' : '#9AA6AE';
 
-  const getBorder = (glow, hasError) => {
-    if (hasError) return errorColor;
-    return glow.interpolate({ inputRange: [0, 1], outputRange: [inputBorderIdle, themeColor] });
-  };
+  const emailUnderline = showEmailError ? errorColor : (emailFocused ? accent : underlineIdle);
+  const passwordUnderline = passwordFocused ? accent : underlineIdle;
 
   return (
     <View style={[styles.root, { backgroundColor: bg }]}>
-      <HeroHalo color={themeColor} />
+      {/* Top bar */}
+      <View style={styles.topBar}>
+        <TouchableOpacity
+          onPress={() => navigation?.goBack?.()}
+          hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
+          activeOpacity={0.6}
+        >
+          <Ionicons name="arrow-back" size={24} color={secondaryText} />
+        </TouchableOpacity>
+        <Text style={[styles.topTitle, { color: accent }]} numberOfLines={1}>Sign in</Text>
+        <View style={styles.topSpacer} />
+      </View>
 
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <Animated.View style={[styles.content, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
-            {/* Brand mark */}
-            <View style={styles.brandWrap}>
-              <View style={[styles.brandRing, { borderColor: themeColor + '22' }]}>
-                <View style={[styles.brandRing2, { borderColor: themeColor + '38' }]}>
-                  <View style={[styles.brandBadge, { backgroundColor: themeColor + '18' }]}>
-                    <Image source={require('../../assets/icon.png')} resizeMode="cover" style={styles.brandLogo} />
-                  </View>
-                </View>
-              </View>
-            </View>
-
-            <Text style={[styles.eyebrow, { color: themeColor }]}>WELCOME BACK</Text>
-            <Text style={[styles.title, { color: primaryText }]}>Sign in to{'\n'}{APP_TAG_NAME || 'continue'}</Text>
-            <Text style={[styles.subtitle, { color: subText }]}>
+            <Text style={[styles.heading, { color: primaryText }]}>
+              Sign in to {String(APP_TAG_NAME || 'continue')}
+            </Text>
+            <Text style={[styles.blurb, { color: secondaryText }]}>
               Use your email and password to access your conversations.
             </Text>
 
-            {/* Card */}
-            <View style={[styles.card, { backgroundColor: card, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
-              {/* Email */}
-              <Text style={[styles.label, { color: subText }]}>EMAIL</Text>
-              <Animated.View style={[styles.inputRow, { backgroundColor: inputBg, borderColor: getBorder(emailGlow, showEmailError) }]}>
-                <Ionicons name="mail-outline" size={20} color={showEmailError ? errorColor : placeholderColor} style={styles.inputIcon} />
-                <TextInput
-                  style={[styles.input, { color: primaryText }]}
-                  placeholder="you@example.com"
-                  placeholderTextColor={placeholderColor}
-                  value={email}
-                  onChangeText={setEmail}
-                  onFocus={() => animateFocus(emailGlow, true)}
-                  onBlur={() => { setEmailTouched(true); animateFocus(emailGlow, false); }}
-                  keyboardType="email-address"
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  autoComplete="email"
-                  textContentType="emailAddress"
-                  returnKeyType="next"
-                />
-              </Animated.View>
-              {showEmailError && (
-                <View style={styles.errorRow}>
-                  <Ionicons name="alert-circle" size={14} color={errorColor} />
-                  <Text style={styles.errorText}>Please enter a valid email address</Text>
-                </View>
-              )}
-
-              {/* Password */}
-              <Text style={[styles.label, { color: subText, marginTop: 18 }]}>PASSWORD</Text>
-              <Animated.View style={[styles.inputRow, { backgroundColor: inputBg, borderColor: getBorder(passwordGlow, false) }]}>
-                <Ionicons name="lock-closed-outline" size={20} color={placeholderColor} style={styles.inputIcon} />
-                <TextInput
-                  style={[styles.input, { color: primaryText }]}
-                  placeholder="Enter your password"
-                  placeholderTextColor={placeholderColor}
-                  value={password}
-                  onChangeText={setPassword}
-                  onFocus={() => animateFocus(passwordGlow, true)}
-                  onBlur={() => animateFocus(passwordGlow, false)}
-                  secureTextEntry={!showPassword}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  autoComplete="password"
-                  textContentType="password"
-                  returnKeyType="done"
-                  onSubmitEditing={handleSubmit}
-                />
-                <TouchableOpacity
-                  onPress={() => setShowPassword((p) => !p)}
-                  hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                  style={styles.eyeBtn}
-                >
-                  <Ionicons name={showPassword ? "eye-off-outline" : "eye-outline"} size={22} color={placeholderColor} />
-                </TouchableOpacity>
-              </Animated.View>
-
-              {/* CTA */}
-              <TouchableOpacity
-                onPress={handleSubmit}
-                disabled={!isFormValid || isSubmitting}
-                activeOpacity={0.85}
-                style={[styles.cta, { backgroundColor: isFormValid ? themeColor : themeColor + '55' }]}
-              >
-                {isSubmitting ? (
-                  <ActivityIndicator size="small" color="#fff" />
-                ) : (
-                  <>
-                    <Text style={styles.ctaText}>Sign in</Text>
-                    <Ionicons name="arrow-forward" size={18} color="#fff" />
-                  </>
-                )}
-              </TouchableOpacity>
-
-              {/* Divider */}
-              <View style={styles.dividerRow}>
-                <View style={[styles.dividerLine, { backgroundColor: inputBorderIdle }]} />
-                <Text style={[styles.dividerText, { color: subText }]}>OR</Text>
-                <View style={[styles.dividerLine, { backgroundColor: inputBorderIdle }]} />
+            {/* Email */}
+            <Text style={[styles.label, { color: secondaryText }]}>EMAIL</Text>
+            <View style={[styles.inputRow, { borderBottomColor: emailUnderline }]}>
+              <Ionicons name="mail-outline" size={20} color={showEmailError ? errorColor : (emailFocused ? accent : placeholderText)} style={styles.inputIcon} />
+              <TextInput
+                style={[styles.input, { color: primaryText }]}
+                placeholder="you@example.com"
+                placeholderTextColor={placeholderText}
+                value={email}
+                onChangeText={setEmail}
+                onFocus={() => setEmailFocused(true)}
+                onBlur={() => { setEmailTouched(true); setEmailFocused(false); }}
+                keyboardType="email-address"
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="email"
+                textContentType="emailAddress"
+                returnKeyType="next"
+              />
+            </View>
+            {showEmailError ? (
+              <View style={styles.errorRow}>
+                <Ionicons name="alert-circle" size={14} color={errorColor} />
+                <Text style={styles.errorText}>Please enter a valid email address</Text>
               </View>
+            ) : null}
 
-              {/* Phone alt */}
+            {/* Password */}
+            <Text style={[styles.label, { color: secondaryText, marginTop: 26 }]}>PASSWORD</Text>
+            <View style={[styles.inputRow, { borderBottomColor: passwordUnderline }]}>
+              <Ionicons name="lock-closed-outline" size={20} color={passwordFocused ? accent : placeholderText} style={styles.inputIcon} />
+              <TextInput
+                style={[styles.input, { color: primaryText }]}
+                placeholder="Enter your password"
+                placeholderTextColor={placeholderText}
+                value={password}
+                onChangeText={setPassword}
+                onFocus={() => setPasswordFocused(true)}
+                onBlur={() => setPasswordFocused(false)}
+                secureTextEntry={!showPassword}
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="password"
+                textContentType="password"
+                returnKeyType="done"
+                onSubmitEditing={handleSubmit}
+              />
               <TouchableOpacity
-                onPress={() => navigation?.navigate('Login')}
-                activeOpacity={0.75}
-                style={[styles.altBtn, { borderColor: inputBorderIdle }]}
+                onPress={() => setShowPassword((p) => !p)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                style={styles.eyeBtn}
               >
-                <Ionicons name="call-outline" size={18} color={themeColor} />
-                <Text style={[styles.altBtnText, { color: themeColor }]}>Continue with Phone</Text>
+                <Ionicons name={showPassword ? "eye-off-outline" : "eye-outline"} size={22} color={placeholderText} />
               </TouchableOpacity>
             </View>
           </Animated.View>
         </ScrollView>
-      </KeyboardAvoidingView>
 
-      <Text style={[styles.footer, { color: subText }]}>
-        Protected by end-to-end encryption
-      </Text>
+        {/* Bottom actions */}
+        <View style={styles.bottomArea}>
+          <TouchableOpacity
+            onPress={handleSubmit}
+            disabled={!isFormValid || isSubmitting}
+            activeOpacity={0.85}
+            style={[styles.cta, { backgroundColor: isFormValid ? accent : disabledBtn }]}
+          >
+            {isSubmitting ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Text style={[styles.ctaText, { color: isFormValid ? '#FFFFFF' : disabledTxt }]}>SIGN IN</Text>
+            )}
+          </TouchableOpacity>
+
+          <View style={styles.dividerRow}>
+            <View style={[styles.dividerLine, { backgroundColor: underlineIdle }]} />
+            <Text style={[styles.dividerText, { color: secondaryText }]}>OR</Text>
+            <View style={[styles.dividerLine, { backgroundColor: underlineIdle }]} />
+          </View>
+
+          <TouchableOpacity
+            onPress={() => navigation?.navigate('Login')}
+            activeOpacity={0.75}
+            style={[styles.altBtn, { borderColor: accent }]}
+          >
+            <Ionicons name="call-outline" size={18} color={accent} />
+            <Text style={[styles.altBtnText, { color: accent }]}>Continue with phone</Text>
+          </TouchableOpacity>
+
+          <Text style={[styles.footer, { color: secondaryText }]}>
+            Protected by end-to-end encryption
+          </Text>
+        </View>
+      </KeyboardAvoidingView>
     </View>
   );
 }
@@ -277,109 +241,114 @@ export default function LoginEmail({ navigation }) {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   flex: { flex: 1 },
-  scroll: { flexGrow: 1, paddingHorizontal: 22, paddingTop: 28, paddingBottom: 16 },
-  content: { flex: 1, justifyContent: 'center' },
 
-  heroHalo: {
-    position: 'absolute',
-    top: -SCREEN_W * 0.55,
-    left: -SCREEN_W * 0.25,
-    width: SCREEN_W * 1.5,
-    height: SCREEN_W * 1.5,
-    alignItems: 'center', justifyContent: 'center',
+  topBar: {
+    height: 56,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
   },
-  heroHaloBand: {
-    position: 'absolute',
-    width: SCREEN_W, height: SCREEN_W, borderRadius: SCREEN_W / 2,
+  topTitle: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 19,
+    letterSpacing: 0.15,
+    marginLeft: 20,
+    flex: 1,
   },
+  topSpacer: { width: 24 },
 
-  brandWrap: { alignItems: 'center', marginBottom: 22 },
-  brandRing: {
-    width: 100, height: 100, borderRadius: 50,
-    borderWidth: 1, alignItems: 'center', justifyContent: 'center',
-  },
-  brandRing2: {
-    width: 82, height: 82, borderRadius: 41,
-    borderWidth: 1, alignItems: 'center', justifyContent: 'center',
-  },
-  brandBadge: {
-    width: 64, height: 64, borderRadius: 18,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  brandLogo: { width: 48, height: 48, borderRadius: 12 },
+  scroll: { flexGrow: 1, paddingHorizontal: 28, paddingTop: 16 },
+  content: { paddingTop: 8 },
 
-  eyebrow: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 11, letterSpacing: 2,
-    textAlign: 'center', marginBottom: 8,
+  heading: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 22,
+    marginBottom: 8,
   },
-  title: {
-    fontFamily: 'Roboto-Bold',
-    fontSize: 26, lineHeight: 32,
-    textAlign: 'center', letterSpacing: -0.4,
-  },
-  subtitle: {
+  blurb: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 14, textAlign: 'center',
-    marginTop: 8, marginBottom: 22,
-    paddingHorizontal: 16, lineHeight: 20,
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 36,
   },
 
-  card: {
-    borderRadius: 22, padding: 18,
-    shadowOpacity: 0.06, shadowOffset: { width: 0, height: 12 },
-    shadowRadius: 24, elevation: 4,
-  },
   label: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 11, letterSpacing: 1.2,
-    marginBottom: 8, marginLeft: 4,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+    letterSpacing: 1,
+    marginBottom: 6,
   },
   inputRow: {
-    flexDirection: 'row', alignItems: 'center',
-    height: 54, borderRadius: 14, borderWidth: 1.5,
-    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 48,
+    borderBottomWidth: 2,
   },
-  inputIcon: { marginRight: 10 },
+  inputIcon: { marginRight: 12 },
   input: {
-    flex: 1, fontFamily: 'Roboto-Regular',
-    fontSize: 15, paddingVertical: 0,
+    flex: 1,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 16,
+    paddingVertical: 0,
   },
-  eyeBtn: { paddingLeft: 10 },
+  eyeBtn: { paddingLeft: 12 },
   errorRow: {
-    flexDirection: 'row', alignItems: 'center',
-    gap: 6, marginTop: 8, marginLeft: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 8,
   },
   errorText: {
-    fontFamily: 'Roboto-Regular', fontSize: 12, color: '#E5484D',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    color: '#E5484D',
   },
 
+  bottomArea: {
+    paddingHorizontal: 28,
+    paddingBottom: 28,
+    paddingTop: 8,
+  },
   cta: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    gap: 8, height: 54, borderRadius: 16, marginTop: 22,
+    height: 50,
+    borderRadius: 25,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   ctaText: {
-    color: '#fff', fontFamily: 'Roboto-SemiBold',
-    fontSize: 16, letterSpacing: 0.3,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 15,
+    letterSpacing: 1.2,
   },
 
   dividerRow: {
-    flexDirection: 'row', alignItems: 'center', marginVertical: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 20,
   },
   dividerLine: { flex: 1, height: 1 },
   dividerText: {
-    fontFamily: 'Roboto-Medium', fontSize: 11,
-    marginHorizontal: 12, letterSpacing: 1,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 11,
+    marginHorizontal: 14,
+    letterSpacing: 1,
   },
 
   altBtn: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    gap: 8, height: 50, borderRadius: 14, borderWidth: 1.5,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    height: 48,
+    borderRadius: 24,
+    borderWidth: 1.5,
   },
-  altBtnText: { fontFamily: 'Roboto-SemiBold', fontSize: 14 },
+  altBtnText: { fontFamily: 'Roboto-Medium', fontSize: 14 },
 
   footer: {
-    fontFamily: 'Roboto-Regular', fontSize: 11,
-    textAlign: 'center', paddingBottom: 14,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 11,
+    textAlign: 'center',
+    marginTop: 18,
   },
 });

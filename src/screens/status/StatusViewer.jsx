@@ -86,6 +86,7 @@ export default function StatusViewer({ navigation, route }) {
     userName = '',
     userImage = '',
     userId = null,
+    isBroadcast = false,
   } = route.params || {};
 
   const dispatch = useDispatch();
@@ -262,16 +263,20 @@ export default function StatusViewer({ navigation, route }) {
         }
       };
 
-      socket.on('status_expired',        onExpired);
+      // Canonical backend event is `status:deleted` (colon); underscore
+      // variants kept as legacy aliases.
+      socket.on('status:deleted',        onExpired);
       socket.on('status_deleted',        onExpired);
+      socket.on('status_expired',        onExpired);
       // Only owner needs live reaction counts via socket; viewer gets it from API response
       if (isMine) socket.on('status_reaction_update', onReactionUpdate);
       socket.on('status_like_animation', onLikeAnim);
       socketRef.current = socket;
 
       return () => {
-        socket.off('status_expired',        onExpired);
+        socket.off('status:deleted',        onExpired);
         socket.off('status_deleted',        onExpired);
+        socket.off('status_expired',        onExpired);
         if (isMine) socket.off('status_reaction_update', onReactionUpdate);
         socket.off('status_like_animation', onLikeAnim);
       };
@@ -695,8 +700,17 @@ export default function StatusViewer({ navigation, route }) {
             style={styles.headerAvatar}
           />
           <View style={styles.headerText}>
-            <Text style={styles.headerName}>{displayName}</Text>
-            <Text style={styles.headerTime}>{timeAgo(currentStatus.createdAt)}</Text>
+            <View style={styles.headerNameRow}>
+              <Text style={styles.headerName}>{displayName}</Text>
+              {isBroadcast && (
+                <View style={styles.headerVerified}>
+                  <Ionicons name="checkmark-circle" size={15} color="#00A884" />
+                </View>
+              )}
+            </View>
+            <Text style={styles.headerTime}>
+              {isBroadcast ? 'Official update' : ''}{isBroadcast ? '  ·  ' : ''}{timeAgo(currentStatus.createdAt)}
+            </Text>
           </View>
         </TouchableOpacity>
 
@@ -764,34 +778,50 @@ export default function StatusViewer({ navigation, route }) {
       ) : (
         /* ── Viewer bottom: rounded reply + heart, no background scrim ── */
         <View style={styles.viewerBar}>
-          <TouchableOpacity
-            style={styles.replyInputTrigger}
-            activeOpacity={0.85}
-            onPress={() => { pause(); setShowReply(true); }}
-            accessibilityLabel={`Reply to ${displayName}`}
-          >
-            <Ionicons name="chevron-up" size={14} color="rgba(255,255,255,0.75)" style={{ marginRight: 6 }} />
-            <Text style={styles.replyPlaceholder}>Reply</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.reactBtn}
-            onPress={() => handleReact('like')}
-            accessibilityLabel={likeActive ? 'Unlike' : 'Like'}
-            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-          >
-            <Ionicons
-              name={likeActive ? 'heart' : 'heart-outline'}
-              size={28}
-              color={likeActive ? '#FF3B5C' : '#fff'}
-            />
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.reactBtn}
-            onPress={openOptions}
-            hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-          >
-            <Ionicons name="ellipsis-vertical" size={22} color="#fff" />
-          </TouchableOpacity>
+          {/* Reply: hidden entirely for official admin broadcasts; for normal
+              statuses it respects the per-status allowReplies flag. */}
+          {isBroadcast ? (
+            <View style={styles.replySpacer} />
+          ) : currentStatus?.allowReplies !== false ? (
+            <TouchableOpacity
+              style={styles.replyInputTrigger}
+              activeOpacity={0.85}
+              onPress={() => { pause(); setShowReply(true); }}
+              accessibilityLabel={`Reply to ${displayName}`}
+            >
+              <Ionicons name="chevron-up" size={14} color="rgba(255,255,255,0.75)" style={{ marginRight: 6 }} />
+              <Text style={styles.replyPlaceholder}>Reply</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={styles.replyInputTrigger}>
+              <Text style={styles.replyPlaceholder}>Replies are off</Text>
+            </View>
+          )}
+          {currentStatus?.allowReactions !== false && (
+            <TouchableOpacity
+              style={styles.reactBtn}
+              onPress={() => handleReact('like')}
+              accessibilityLabel={likeActive ? 'Unlike' : 'Like'}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons
+                name={likeActive ? 'heart' : 'heart-outline'}
+                size={28}
+                color={likeActive ? '#FF3B5C' : '#fff'}
+              />
+            </TouchableOpacity>
+          )}
+          {/* Options (report / hide) make no sense for an official broadcast,
+              so the menu is removed for admin statuses. */}
+          {!isBroadcast && (
+            <TouchableOpacity
+              style={styles.reactBtn}
+              onPress={openOptions}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons name="ellipsis-vertical" size={22} color="#fff" />
+            </TouchableOpacity>
+          )}
         </View>
       )}
 
@@ -1034,7 +1064,7 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#111B21' },
 
   textContent: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 30 },
-  textBody:    { fontSize: 24, color: '#fff', textAlign: 'center', fontWeight: '500', lineHeight: 34 },
+  textBody:    { fontSize: 24, color: '#fff', textAlign: 'center', fontFamily: 'Roboto-Medium', lineHeight: 34 },
   audioLabel:  { color: '#fff', marginTop: 12, fontSize: 16 },
   mediaContent:{ flex: 1, width: SW },
 
@@ -1060,8 +1090,10 @@ const styles = StyleSheet.create({
   headerProfile: { flex: 1, flexDirection: 'row', alignItems: 'center' },
   headerAvatar:  { width: 38, height: 38, borderRadius: 19, marginRight: 10 },
   headerText:    { flex: 1 },
+  headerNameRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  headerVerified: { marginLeft: 1 },
   headerName: {
-    color: '#fff', fontSize: 16, fontWeight: '600',
+    color: '#fff', fontSize: 16, fontFamily: 'Roboto-SemiBold',
     textShadowColor: 'rgba(0,0,0,0.55)',
     textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
   },
@@ -1095,7 +1127,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center', gap: 6,
   },
   ownerStatText: {
-    color: '#fff', fontSize: 14, fontWeight: '600',
+    color: '#fff', fontSize: 14, fontFamily: 'Roboto-SemiBold',
   },
   // Matching circular pill for the delete affordance — same surface tone
   // so the two controls read as one row visually.
@@ -1114,7 +1146,7 @@ const styles = StyleSheet.create({
   panelTab:         { flex: 1, paddingVertical: 14, alignItems: 'center' },
   panelTabActive:   { borderBottomWidth: 2, borderBottomColor: '#fff' },
   panelTabText:     {
-    color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: '700',
+    color: 'rgba(255,255,255,0.55)', fontSize: 11, fontFamily: 'Roboto-Bold',
     letterSpacing: 1.6, textTransform: 'uppercase',
   },
   panelTabTextActive: { color: '#fff' },
@@ -1139,8 +1171,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
   },
   replyPlaceholder: {
-    color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: '500',
+    color: 'rgba(255,255,255,0.85)', fontSize: 14, fontFamily: 'Roboto-Medium',
   },
+  // Keeps the heart button pinned right when the reply trigger is hidden
+  // (official admin broadcasts).
+  replySpacer: { flex: 1 },
 
   // ── Viewers panel — editorial sheet ──────────────────────────────────────
   panelBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'transparent' },
@@ -1156,7 +1191,7 @@ const styles = StyleSheet.create({
   viewersHandle:    { alignItems: 'center', paddingVertical: 14 },
   viewersHandleBar: { width: 40, height: 3, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 2 },
   viewersTitle:     {
-    color: '#fff', fontSize: 13, fontWeight: '700', marginBottom: 6,
+    color: '#fff', fontSize: 13, fontFamily: 'Roboto-Bold', marginBottom: 6,
     letterSpacing: 1.6, textTransform: 'uppercase',
   },
   viewerItem:   {
@@ -1185,11 +1220,11 @@ const styles = StyleSheet.create({
   linkContent: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e', padding: 20 },
   linkImage:   { width: SW, height: 220 },
   linkBody:    { padding: 20, width: '100%' },
-  linkTitle:   { color: '#fff', fontSize: 18, fontWeight: '700', marginBottom: 8 },
+  linkTitle:   { color: '#fff', fontSize: 18, fontFamily: 'Roboto-Bold', marginBottom: 8 },
   linkDesc:    { color: 'rgba(255,255,255,0.7)', fontSize: 14, marginBottom: 8 },
   linkUrlRow:  { flexDirection: 'row', alignItems: 'center', marginTop: 4 },
   linkUrl:     { color: '#60a5fa', fontSize: 12, flex: 1 },
-  linkSite:    { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontWeight: '700', marginBottom: 2 },
+  linkSite:    { color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: 'Roboto-Bold', marginBottom: 2 },
   // Centred floating CTA layered on top of the tap-zones overlay so the
   // navigation taps can't steal it. `pointerEvents: 'box-none'` on the
   // parent lets background taps still go through to the navigation zones.
@@ -1210,7 +1245,7 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 6,
   },
-  openLinkBtnText: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  openLinkBtnText: { color: '#fff', fontSize: 14, fontFamily: 'Roboto-Bold' },
 
   // ── Reply modal — WhatsApp composer ──────────────────────────────────────
   replyModal:    { flex: 1, justifyContent: 'flex-end' },
@@ -1247,7 +1282,7 @@ const styles = StyleSheet.create({
   replyContextThumbImg: { width: 34, height: 34, borderRadius: 6, resizeMode: 'cover' },
   replyContextThumbFallback: { alignItems: 'center', justifyContent: 'center' },
   replyContextLabel:    { color: 'rgba(255,255,255,0.5)', fontSize: 11, marginBottom: 1 },
-  replyContextName:     { color: '#fff', fontSize: 14, fontWeight: '600' },
+  replyContextName:     { color: '#fff', fontSize: 14, fontFamily: 'Roboto-SemiBold' },
 
   // Composer row: pill input + circular send (matches WhatsApp chat).
   replyRow: { flexDirection: 'row', alignItems: 'flex-end', gap: 8, paddingHorizontal: 4 },

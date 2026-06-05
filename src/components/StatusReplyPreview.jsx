@@ -34,6 +34,7 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
   statusRef,
   statusPreview,
   isMyMessage,
+  isOwnStatus,
   chatColor,
   theme,
   onPress,
@@ -113,9 +114,11 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
             style={[styles.headerText, { color: accent }]}
             numberOfLines={1}
           >
-            {statusPreview.ownerName
-              ? `${statusPreview.ownerName}’s status`
-              : 'Status'}
+            {isOwnStatus
+              ? 'Your status'
+              : statusPreview.ownerName
+                ? `${statusPreview.ownerName}’s status`
+                : 'Status'}
           </Text>
         </View>
 

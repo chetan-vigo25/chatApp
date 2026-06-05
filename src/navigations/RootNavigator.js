@@ -25,7 +25,6 @@ import ChatColorTheme from "../screens/chats/ChatColorTheme";
 import ChatPrivacy from "../screens/profiles/ChatPrivacy";
 import DeletedChatsPassword from "../screens/profiles/DeletedChatsPassword";
 import TwoStepPassword from "../screens/profiles/TwoStepPassword";
-import DeletedPasswordGate from "../screens/profiles/DeletedPasswordGate";
 import DeletedChatsSelector from "../screens/profiles/DeletedChatsSelector";
 import ChatMedia from "../screens/chats/ChatMedia";
 import AddNewContact from "../screens/chats/AddNewContact";
@@ -46,6 +45,8 @@ import StatusCreateScreen from "../screens/status/StatusCreate";
 import StatusCustomiseScreen from "../screens/status/StatusCustomise";
 import StatusPreviewScreen from "../screens/status/StatusPreview";
 import StatusViewerScreen from "../screens/status/StatusViewer";
+import CallDetailScreen from "../screens/calls/CallDetailScreen";
+import NewCallScreen from "../screens/calls/NewCallScreen";
 
 import BottomTabNavigator from "./BottomTabNavigator";
 
@@ -54,23 +55,23 @@ import { useTheme } from "../contexts/ThemeContext";
 const Stack = createStackNavigator();
 
 export default function RootNavigator() {
-  const { theme } = useTheme();
-  
+  const { theme, isDarkMode } = useTheme();
+
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }}>
-      <NavigationContainer 
+      <NavigationContainer
         ref={navigationRef}
         onReady={updateNavigationSnapshot}
         onStateChange={updateNavigationSnapshot}
         theme={{
-          dark: false, // We handle dark mode through our custom theme
+          dark: isDarkMode,
           colors: {
-            primary: theme.colors.primary,
+            primary: theme.colors.themeColor,
             background: theme.colors.background,
             card: theme.colors.surface,
-            text: theme.colors.text,
+            text: theme.colors.primaryTextColor,
             border: theme.colors.border,
-            notification: theme.colors.primary,
+            notification: theme.colors.themeColor,
           },
         }}
       >
@@ -115,11 +116,6 @@ export default function RootNavigator() {
           <Stack.Screen name="DeletedChatsPassword" component={DeletedChatsPassword} />
           <Stack.Screen name="TwoStepPassword" component={TwoStepPassword} />
           <Stack.Screen
-            name="DeletedPasswordGate"
-            component={DeletedPasswordGate}
-            options={{ gestureEnabled: false }}
-          />
-          <Stack.Screen
             name="DeletedChatsSelector"
             component={DeletedChatsSelector}
             options={{ gestureEnabled: false }}
@@ -141,6 +137,8 @@ export default function RootNavigator() {
           <Stack.Screen name="StatusCustomise" component={StatusCustomiseScreen} />
           <Stack.Screen name="StatusPreview"   component={StatusPreviewScreen} />
           <Stack.Screen name="StatusViewer"    component={StatusViewerScreen} options={{ gestureEnabled: false }} />
+          <Stack.Screen name="CallDetail"      component={CallDetailScreen} />
+          <Stack.Screen name="NewCall"         component={NewCallScreen} />
         </Stack.Navigator>
       </NavigationContainer>
     </SafeAreaView>

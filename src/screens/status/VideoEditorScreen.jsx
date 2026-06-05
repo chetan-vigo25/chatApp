@@ -478,13 +478,13 @@ const styles = StyleSheet.create({
   },
   closeBtn:  {},
   headerTitle: {
-    flex: 1, color: '#fff', fontSize: 17, fontWeight: '700', marginLeft: 16,
+    flex: 1, color: '#fff', fontSize: 17, fontFamily: 'Roboto-Bold', marginLeft: 16,
   },
   continueBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
     borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8,
   },
-  continueBtnText: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  continueBtnText: { color: '#fff', fontSize: 14, fontFamily: 'Roboto-Bold' },
 
   // ── Video ─────────────────────────────────────────────────────────────────
   videoArea: {
@@ -517,15 +517,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row', alignItems: 'center',
     paddingHorizontal: TRIM_PAD, marginBottom: 10,
   },
-  timeCurrent: { color: '#fff', fontSize: 13, fontWeight: '600' },
-  timeSep:     { color: 'rgba(255,255,255,0.3)', fontSize: 13 },
-  timeTotal:   { color: 'rgba(255,255,255,0.4)', fontSize: 13 },
+  timeCurrent: { color: '#fff', fontSize: 13, fontFamily: 'Roboto-SemiBold' },
+  timeSep:     { color: 'rgba(255,255,255,0.3)', fontSize: 13, fontFamily: 'Roboto-Regular' },
+  timeTotal:   { color: 'rgba(255,255,255,0.4)', fontSize: 13, fontFamily: 'Roboto-Regular' },
   trimBadge: {
     flexDirection: 'row', alignItems: 'center', gap: 5,
     paddingHorizontal: 9, paddingVertical: 4,
     borderRadius: 12, borderWidth: 1,
   },
-  trimBadgeText: { fontSize: 11, fontWeight: '600' },
+  trimBadgeText: { fontSize: 11, fontFamily: 'Roboto-SemiBold' },
 
   // Trim strip
   trimOuter: { marginBottom: 6 },
@@ -533,7 +533,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row', justifyContent: 'space-between',
     paddingHorizontal: 2, marginBottom: 4,
   },
-  tickText: { color: 'rgba(255,255,255,0.25)', fontSize: 9 },
+  tickText: { color: 'rgba(255,255,255,0.25)', fontSize: 9, fontFamily: 'Roboto-Regular' },
   trimTrack: {
     position: 'relative',
     backgroundColor: 'rgba(255,255,255,0.12)',
@@ -575,7 +575,7 @@ const styles = StyleSheet.create({
   // Crop
   secLabel: {
     color: 'rgba(255,255,255,0.3)', fontSize: 10, letterSpacing: 1.4,
-    fontWeight: '700', paddingHorizontal: TRIM_PAD, marginBottom: 8,
+    fontFamily: 'Roboto-Bold', paddingHorizontal: TRIM_PAD, marginBottom: 8,
   },
   aspectRow: {
     paddingHorizontal: TRIM_PAD, gap: 8, paddingBottom: 14,
@@ -585,7 +585,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14, paddingVertical: 7,
     borderRadius: 20, borderWidth: 1.5,
   },
-  aspectText: { color: 'rgba(255,255,255,0.55)', fontSize: 13, fontWeight: '600' },
+  aspectText: { color: 'rgba(255,255,255,0.55)', fontSize: 13, fontFamily: 'Roboto-SemiBold' },
 
   // Mute
   muteRow: {
@@ -596,8 +596,8 @@ const styles = StyleSheet.create({
     width: 38, height: 38, borderRadius: 19,
     justifyContent: 'center', alignItems: 'center',
   },
-  muteTitle: { fontSize: 13, fontWeight: '600' },
-  muteSub:   { fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 1 },
+  muteTitle: { fontSize: 13, fontFamily: 'Roboto-SemiBold' },
+  muteSub:   { fontSize: 11, color: 'rgba(255,255,255,0.3)', marginTop: 1, fontFamily: 'Roboto-Regular' },
   togglePill: {
     width: 38, height: 22, borderRadius: 11,
     position: 'relative',
@@ -618,10 +618,10 @@ const styles = StyleSheet.create({
     paddingVertical: 13, borderRadius: 12, gap: 6,
     borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.18)',
   },
-  skipText: { color: 'rgba(255,255,255,0.6)', fontSize: 12.5, fontWeight: '600' },
+  skipText: { color: 'rgba(255,255,255,0.6)', fontSize: 12.5, fontFamily: 'Roboto-SemiBold' },
   applyBtn: {
     flex: 1.4, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
     paddingVertical: 13, borderRadius: 12, gap: 8,
   },
-  applyText: { color: '#fff', fontSize: 13, fontWeight: '700' },
+  applyText: { color: '#fff', fontSize: 13, fontFamily: 'Roboto-Bold' },
 });
