@@ -2246,6 +2246,10 @@ export function RealtimeChatProvider({ children }) {
   const socketUnsubscribersRef = useRef([]);
   const attachedSocketRef = useRef(null);
   const handledGroupMsgIdsRef = useRef(new Set());
+  // Tracks messageIds we've already sent a delivery receipt for, so the same
+  // incoming message arriving via both 'message:new' and 'message:received'
+  // doesn't emit 'delivered' twice.
+  const deliveredEmittedRef = useRef(new Set());
   const currentUserIdRef = useRef(state.currentUserId);
   currentUserIdRef.current = state.currentUserId;
   const stateRef = useRef(state);
@@ -2323,6 +2327,35 @@ export function RealtimeChatProvider({ children }) {
       detachSocketListeners();
     }
 
+    // Emit a delivery receipt for an incoming message from a peer. This runs
+    // app-wide (the context is always mounted), so the SENDER gets the double
+    // gray "delivered" tick the moment the message reaches our device — even
+    // when we're on the chat list and haven't opened the conversation. (When
+    // the chat IS open, useChatLogic also emits this; duplicate delivered
+    // receipts are idempotent on the sender side.)
+    const emitDeliveryReceipt = ({ isGroup, messageId, chatId, groupId, senderId }) => {
+      if (!messageId) return;
+      const key = String(messageId);
+      if (deliveredEmittedRef.current.has(key)) return;
+      const socket = getSocket();
+      if (!socket || !isSocketConnected()) return;
+      deliveredEmittedRef.current.add(key);
+      if (deliveredEmittedRef.current.size > 2000) {
+        const first = deliveredEmittedRef.current.values().next().value;
+        deliveredEmittedRef.current.delete(first);
+      }
+      if (isGroup) {
+        socket.emit('group:message:delivered', {
+          groupId,
+          messageIds: [messageId],
+          userId: currentUserIdRef.current,
+          deliveredAt: new Date().toISOString(),
+        });
+      } else {
+        socket.emit('message:delivered', { messageId, chatId, senderId });
+      }
+    };
+
     const onMessage = (payload) => {
       const source = unwrapPayload(payload);
       // Handle group messages — forward to INCOMING_GROUP_MESSAGE for proper unread count tracking.
@@ -2386,6 +2419,16 @@ export function RealtimeChatProvider({ children }) {
 
         const fullPreview = isSystem ? previewText : (grpSenderName ? `${grpSenderName}: ${previewText}` : previewText);
 
+        // Delivery receipt for incoming group messages from other members.
+        const grpIsSelf = grpSenderId && currentUserIdRef.current && String(grpSenderId) === String(currentUserIdRef.current);
+        if (!grpIsSelf && !isSystem) {
+          emitDeliveryReceipt({
+            isGroup: true,
+            messageId: grpMsgId,
+            groupId: grpGroupId,
+          });
+        }
+
         dispatch({
           type: 'INCOMING_GROUP_MESSAGE',
           payload: {
@@ -2428,6 +2471,14 @@ export function RealtimeChatProvider({ children }) {
       // Persist to SQLite so messages are available when ChatScreen opens later
       const msgId = normalized.serverMessageId || normalized.messageId || normalized.id;
       if (msgId && !isSelf) {
+        // Send delivery receipt back to the sender (double gray tick) regardless
+        // of whether this chat is open.
+        emitDeliveryReceipt({
+          isGroup: false,
+          messageId: msgId,
+          chatId: normalized.chatId,
+          senderId: normalized.senderId,
+        });
         const ts = normalized.createdAt ? new Date(normalized.createdAt).getTime() : Date.now();
 
         // Extract reply data — server may send replyTo as object or string
@@ -3216,6 +3267,15 @@ export function RealtimeChatProvider({ children }) {
           groupDescription: data?.groupDescription || data?.group?.description || null,
         },
       });
+
+      // Send delivery receipt for incoming group messages from other members.
+      if (resolvedMessageId && !isSelf && !isSystemMsg) {
+        emitDeliveryReceipt({
+          isGroup: true,
+          messageId: resolvedMessageId,
+          groupId,
+        });
+      }
 
       // Persist to SQLite so messages are available when ChatScreen opens later
       if (resolvedMessageId && !isSelf) {

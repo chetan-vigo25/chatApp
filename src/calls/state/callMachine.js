@@ -33,6 +33,11 @@ export const initialCallState = {
   signalId: null,        // the app-socket signaling id (busy lock / call:* events)
   awaitingEngine: false, // incoming shown from the socket signal; WebRTC id pending
   pendingAccept: false,  // user tapped Accept before the WebRTC id arrived
+  // WhatsApp-style incoming UI: a call first rings as a compact top heads-up
+  // banner (incomingExpanded:false) while the user keeps using the app; tapping
+  // it expands to the full-screen ring screen (incomingExpanded:true). Reset to
+  // false on every new INCOMING since that action spreads initialCallState.
+  incomingExpanded: false,
   peer: null,            // { id, name, avatar } — 1:1 other party / group fallback
   peers: [],             // [{ id, name, avatar }] — full invited list
   participants: {},      // { [id]: { id, name, avatar, joined } }

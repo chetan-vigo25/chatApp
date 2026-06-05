@@ -81,6 +81,17 @@ export default function CallOverlay() {
   // stays full-screen with Accept/Decline like WhatsApp.
   const canMinimize = status === CALL_STATUS.ACTIVE || accepted || status === CALL_STATUS.OUTGOING;
 
+  // An unanswered incoming call first rings as the compact top heads-up banner
+  // (IncomingCallBanner) so the user can keep using the app — WhatsApp-style.
+  // Stay hidden until they tap it to expand (incomingExpanded) or answer it
+  // (accepted0 → the connecting screen below). Suppressing the full-screen ring
+  // here is what lets the banner show in its place. A call that lived its whole
+  // life as the banner (never expanded, never answered) also skips the terminal
+  // full-screen "Call declined"/"Missed" flash on ENDED — it just dismisses.
+  const ranAsBannerOnly = call?.direction === 'incoming' && !accepted0 && !call?.incomingExpanded;
+  const incomingCollapsed = ranAsBannerOnly
+    && (status === CALL_STATUS.INCOMING || status === CALL_STATUS.ENDED);
+
   // Android hardware back while a call is FULL-SCREEN must NOT end the call
   // (WhatsApp behaviour): instead it MINIMIZES the call to the floating banner/
   // PiP so the user can keep browsing the app, call still running. On an
@@ -90,14 +101,16 @@ export default function CallOverlay() {
   // (iOS has no hardware back, and the call UI is an overlay — not a navigation
   // screen — so the swipe-back gesture can never reach or dismiss it.)
   useEffect(() => {
-    if (!visible || minimized) return undefined;
+    // While only the compact banner is up (collapsed incoming) the overlay isn't
+    // full-screen, so back must work normally for the app behind it.
+    if (!visible || minimized || incomingCollapsed) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       if (canMinimize) minimize();
-      // else: unanswered incoming ring — consume back, keep the call ringing.
+      // else: unanswered incoming ring (expanded) — consume back, keep ringing.
       return true;
     });
     return () => sub.remove();
-  }, [visible, minimized, canMinimize, minimize]);
+  }, [visible, minimized, incomingCollapsed, canMinimize, minimize]);
 
   // A short haptic when an incoming call appears (in addition to the ringtone +
   // vibration loop) so the device "kicks" the moment the screen comes up.
@@ -107,7 +120,7 @@ export default function CallOverlay() {
     }
   }, [status]);
 
-  if (!visible) return null;
+  if (!visible || incomingCollapsed) return null;
 
   const peer = call?.peer || {};
   // Saved contact name > mobile number > backend name.

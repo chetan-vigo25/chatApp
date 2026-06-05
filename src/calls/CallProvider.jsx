@@ -13,6 +13,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../contexts/AuthContext';
 import CallEngineWebView from './engine/CallEngineWebView';
 import CallOverlay from './screens/CallOverlay';
+import IncomingCallBanner from './components/IncomingCallBanner';
 import CallTimer from './components/CallTimer';
 import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
@@ -978,6 +979,13 @@ export const CallProvider = ({ children }) => {
     dispatch({ type: ACT.SET_FLAG, key: 'minimized', value: false });
   }, []);
 
+  // Promote the compact incoming-call heads-up banner to the full-screen ring
+  // screen (tap the banner). Until this fires, an unanswered incoming call rings
+  // only as the top banner so the user can keep using the app (WhatsApp-style).
+  const expandIncoming = useCallback(() => {
+    dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
+  }, []);
+
   const queryPresence = useCallback((ids = []) => {
     return new Promise((resolve) => {
       const ref = `qp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -1224,6 +1232,7 @@ export const CallProvider = ({ children }) => {
     resumeAudio,
     minimize,
     maximize,
+    expandIncoming,
     queryPresence,
   };
 
@@ -1278,6 +1287,7 @@ export const CallProvider = ({ children }) => {
         </Animated.View>
       )}
       <CallOverlay />
+      <IncomingCallBanner />
     </CallContext.Provider>
   );
 };
