@@ -425,6 +425,10 @@ export default function WhatsAppBannerHost() {
       const groupId = data?.groupId;
       if (!groupId) return;
 
+      // Skip groups the user has left or been removed from — no banner for an ex-member.
+      const inactiveGroupIds = realtimeStateRef.current?.inactiveGroupIds || {};
+      if (inactiveGroupIds[String(groupId)] || (data?.chatId && inactiveGroupIds[String(data.chatId)])) return;
+
       // Skip own messages
       const currentUserId = realtimeStateRef.current?.currentUserId;
       if (currentUserId && data?.senderId && String(data.senderId) === String(currentUserId)) return;

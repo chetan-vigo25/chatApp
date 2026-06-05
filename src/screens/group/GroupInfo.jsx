@@ -11,7 +11,7 @@ const STATUS_H = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons, MaterialCommunityIcons, FontAwesome6 } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { viewGroup, deleteGroup, transferOwnership } from '../../Redux/Reducer/Group/Group.reducer';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import { getSocket } from '../../Redux/Services/Socket/socket';
@@ -58,6 +58,7 @@ const getMemberUser = (m) => {
 
 export default function GroupInfo({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
+  const insets = useSafeAreaInsets();
   const dispatch = useDispatch();
   const { startGroupAudioCall, startGroupVideoCall } = useCall();
   const { currentGroup, isLoading } = useSelector((s) => s.group);
@@ -108,6 +109,13 @@ export default function GroupInfo({ navigation, route }) {
       const gid = String(data?.groupId || '');
       if (gid && gid === String(groupId)) dispatch(viewGroup({ groupId }));
     };
+    // A member joined / left / was added / removed — re-fetch so the participant
+    // list and count reflect the change live (e.g. 3 → 2 when someone leaves).
+    const onGroupMembershipChanged = (payload) => {
+      const data = payload?.data || payload || {};
+      const gid = String(data?.groupId || '');
+      if (gid && gid === String(groupId)) dispatch(viewGroup({ groupId }));
+    };
     // A member changed their own profile — refresh so their avatar/name in the
     // member list updates live.
     const onContactUpdated = (payload) => {
@@ -129,6 +137,12 @@ export default function GroupInfo({ navigation, route }) {
       s.on('group:avatar:updated', onGroupProfileChanged);
       s.on('group:description:updated', onGroupProfileChanged);
       s.on('contact:updated', onContactUpdated);
+      s.on('group:member:left', onGroupMembershipChanged);
+      s.on('group:member:removed', onGroupMembershipChanged);
+      s.on('group:member:remove:success', onGroupMembershipChanged);
+      s.on('group:member:added', onGroupMembershipChanged);
+      s.on('group:member:add:success', onGroupMembershipChanged);
+      s.on('group:member:joined', onGroupMembershipChanged);
     };
     attach();
     const interval = setInterval(attach, 2000);
@@ -139,6 +153,12 @@ export default function GroupInfo({ navigation, route }) {
         socket.off('group:avatar:updated', onGroupProfileChanged);
         socket.off('group:description:updated', onGroupProfileChanged);
         socket.off('contact:updated', onContactUpdated);
+        socket.off('group:member:left', onGroupMembershipChanged);
+        socket.off('group:member:removed', onGroupMembershipChanged);
+        socket.off('group:member:remove:success', onGroupMembershipChanged);
+        socket.off('group:member:added', onGroupMembershipChanged);
+        socket.off('group:member:add:success', onGroupMembershipChanged);
+        socket.off('group:member:joined', onGroupMembershipChanged);
       }
     };
   }, [groupId, dispatch]);
@@ -335,8 +355,13 @@ export default function GroupInfo({ navigation, route }) {
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
       <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
 
-      {/* ─── Floating header over hero — SafeAreaView handles the top inset ─── */}
-      <SafeAreaView edges={['top']} style={styles.floatingHeaderSafe}>
+      {/* ─── Floating header over hero — explicit top inset so the back button
+           always sits below the (translucent) status bar, never under it ─── */}
+      {/* Android: the translucent status bar lets the hero bleed under it, and the
+          root SafeAreaView reports no top inset there — so push the header down by
+          the status-bar height. iOS: the root SafeAreaView already insets the top,
+          so only a small gap is needed (avoids a double-counted notch-height gap). */}
+      <View style={[styles.floatingHeaderSafe, { paddingTop: Platform.OS === 'android' ? Math.max(insets.top, STATUS_H) : 8 }]}>
         <View style={styles.floatingHeaderRow}>
           <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.7} style={styles.floatingBtn}>
             <FontAwesome6 name="arrow-left" size={18} color="#fff" />
@@ -348,7 +373,7 @@ export default function GroupInfo({ navigation, route }) {
             </TouchableOpacity>
           )}
         </View>
-      </SafeAreaView>
+      </View>
 
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 100 }}>
 

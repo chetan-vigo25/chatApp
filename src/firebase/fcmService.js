@@ -1,5 +1,6 @@
 import * as Notifications from 'expo-notifications';
 import { Platform, PermissionsAndroid, DeviceEventEmitter } from 'react-native';
+import { isGroupInactive } from '../utils/inactiveGroups';
 
 // Cross-module events the call layer (CallProvider) listens to. A call push,
 // once received/tapped, is routed into the live call flow through these.
@@ -293,6 +294,12 @@ const showLocalNotification = async (remoteMessage) => {
   // Presenting another notification here would double-ring and use the wrong
   // channel.
   if (data?.type === 'call') return;
+
+  // Suppress message notifications for groups the user has left or been removed
+  // from — an ex-member must not keep getting pinged. Checks groupId (and chatId,
+  // which equals the group id for group chats) against the inactive registry.
+  const notifGroupId = data?.groupId || (data?.chatType === 'group' ? data?.chatId : null);
+  if (notifGroupId && (await isGroupInactive(notifGroupId))) return;
 
   // Resolve real content: notification payload first, then the common data keys
   // the backend may use. Without this, a content-bearing data message renders as

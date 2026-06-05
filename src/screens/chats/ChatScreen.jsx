@@ -734,7 +734,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
             <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On VibeConnect Messenger</Text>
+            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On TalksTry</Text>
           </View>
         )}
 
@@ -1522,6 +1522,7 @@ export default function ChatScreen({ navigation, route }) {
     flatListRef,
     chatData,
     amNotGroupMember,
+    liveMemberCount,
     getUserColor,
     groupMembersMap,
     messages,
@@ -4206,7 +4207,7 @@ export default function ChatScreen({ navigation, route }) {
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
                 <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
-                  On VibeConnect Messenger
+                  On TalksTry
                 </Text>
               </View>
             )}
@@ -4936,7 +4937,7 @@ export default function ChatScreen({ navigation, route }) {
           isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup)}
           groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
           groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
-          memberCount={chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount}
+          memberCount={liveMemberCount ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount)}
           rightActions={selectedMessage.length > 0 ? (() => {
             const selMsg = selectedMessage.length === 1
               ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))

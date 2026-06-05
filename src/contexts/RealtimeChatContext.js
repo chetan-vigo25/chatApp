@@ -5,6 +5,7 @@ import { subscribeSessionReset, subscribeUserChanged } from '../services/session
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { performDurableChatClear } from '../utils/chatClearStorage';
+import { setInactiveGroupIds } from '../utils/inactiveGroups';
 import OutboxWorker from '../services/OutboxWorker';
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
@@ -2213,6 +2214,13 @@ const RealtimeChatContext = createContext(null);
 
 export function RealtimeChatProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
+
+  // Mirror the set of left/removed groups into a cross-module registry so the
+  // FCM service (including its headless background handler) can suppress
+  // notifications for groups the user is no longer a participant of.
+  useEffect(() => {
+    setInactiveGroupIds(state.inactiveGroupIds);
+  }, [state.inactiveGroupIds]);
 
   // Start the durable send-outbox worker once per provider lifetime.
   // It drains the SQLite `outbox` table on a 1.5s poll (or wakes

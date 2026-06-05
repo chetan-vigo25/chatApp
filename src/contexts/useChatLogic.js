@@ -311,6 +311,19 @@ export default function useChatLogic({ navigation, route }) {
   const amNotGroupMemberRef = useRef(false);
   amNotGroupMemberRef.current = amNotGroupMember;
 
+  // Live participant count for the header — prefer the freshly-fetched
+  // currentGroup.members (kept in sync by viewGroup) so the count drops live when
+  // a member leaves/is removed, instead of the stale route-param count. Guarded by
+  // a group-id match because currentGroup is a single shared redux slot.
+  const liveMemberCount = useMemo(() => {
+    if (!isGroupChat) return undefined;
+    const cgId = currentGroup?.group?._id || currentGroup?.group?.id;
+    if (cgId && _gid && sameId(cgId, _gid) && Array.isArray(currentGroup?.members)) {
+      return currentGroup.members.filter((m) => m?.status !== 'removed' && !m?.isDeleted).length;
+    }
+    return chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount;
+  }, [isGroupChat, currentGroup, _gid, chatData]);
+
   // Refs
   const fadeAnimRef = useRef(null);
   const flatListRef = useRef(null);
@@ -4284,6 +4297,8 @@ export default function useChatLogic({ navigation, route }) {
     const onGroupMessageNew = (data) => {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
+      // This screen's group was left / removed — don't show incoming messages.
+      if (amNotGroupMemberRef.current) return;
 
       // Block cancelled/failed
       if (source?.status === 'cancelled' || source?.status === 'failed') return;
@@ -7755,7 +7770,7 @@ export default function useChatLogic({ navigation, route }) {
   return {
     fadeAnimRef, flatListRef,
     chatData, chatId, currentUserId, getUserColor, groupMembersMap: groupMembersMapRef.current,
-    amNotGroupMember,
+    amNotGroupMember, liveMemberCount,
     messages, allMessages, scheduledMessages, isLoadingInitial, isLoadingFromLocal, isRefreshing, isManualReloading, isSearching,
     // FIXED: Export the correct typing state
     isPeerTyping, // This is what the UI should use for "typing..." indicator
