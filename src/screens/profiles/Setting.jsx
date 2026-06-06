@@ -8,7 +8,7 @@ import { useDispatch, useSelector } from "react-redux";
 import { useFocusEffect } from "@react-navigation/native";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { emitLogoutCurrentDevice, clearLocalStorageAndDisconnect } from "../../Redux/Services/Socket/socket";
-import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
+import { Ionicons, FontAwesome6, AntDesign } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
 
@@ -107,18 +107,18 @@ export default function Setting({ navigation }) {
         },
       ],
     },
-    {
-      title: 'Chats',
-      items: [
-        {
-          icon: 'cloud-upload-outline',
-          label: 'Chat backup',
-          subtitle: backupStatus || 'Export and share your messages',
-          isLoading: isBackingUp,
-          onPress: handleBackup,
-        },
-      ],
-    },
+    // {
+    //   title: 'Chats',
+    //   items: [
+    //     {
+    //       icon: 'cloud-upload-outline',
+    //       label: 'Chat backup',
+    //       subtitle: backupStatus || 'Export and share your messages',
+    //       isLoading: isBackingUp,
+    //       onPress: handleBackup,
+    //     },
+    //   ],
+    // },
     {
       title: 'About',
       items: [
@@ -163,7 +163,7 @@ export default function Setting({ navigation }) {
       </View>
 
       <View style={[styles.qrBtn, { backgroundColor: accent + '14' }]}>
-        <Ionicons name="qr-code-outline" size={20} color={accent} />
+        <AntDesign name="edit" size={20} color={accent} />
       </View>
     </TouchableOpacity>
   );
@@ -223,9 +223,9 @@ export default function Setting({ navigation }) {
         <Ionicons name="log-out-outline" size={22} color="#E53935" />
         <Text style={styles.logoutText}>Log out</Text>
       </TouchableOpacity>
-      <Text style={[styles.versionText, { color: subText }]}>
+      {/* <Text style={[styles.versionText, { color: subText }]}>
         {APP_TAG_NAME || 'App'} · v1.0.0
-      </Text>
+      </Text> */}
     </View>
   );
 

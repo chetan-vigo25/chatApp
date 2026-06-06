@@ -133,7 +133,20 @@ export default function RootNavigator() {
           <Stack.Screen name="ForwardMessage" component={ForwardMessageScreen} />
           <Stack.Screen name="MessageInfo" component={MessageInfoScreen} />
           <Stack.Screen name="StatusListScreen" component={StatusListScreen} />
-          <Stack.Screen name="StatusCreate"    component={StatusCreateScreen} />
+          <Stack.Screen
+            name="StatusCreate"
+            component={StatusCreateScreen}
+            options={{
+              // WhatsApp-style: slides up from the bottom as a sheet over the
+              // Updates list, which stays visible behind the dimmed top strip.
+              presentation: 'transparentModal',
+              gestureEnabled: true,
+              gestureDirection: 'vertical',
+              cardOverlayEnabled: false,
+              cardStyle: { backgroundColor: 'transparent' },
+              cardStyleInterpolator: CardStyleInterpolators.forBottomSheetAndroid,
+            }}
+          />
           <Stack.Screen name="StatusCustomise" component={StatusCustomiseScreen} />
           <Stack.Screen name="StatusPreview"   component={StatusPreviewScreen} />
           <Stack.Screen name="StatusViewer"    component={StatusViewerScreen} options={{ gestureEnabled: false }} />

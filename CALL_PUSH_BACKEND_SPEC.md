@@ -24,7 +24,7 @@ receive the socket `call:incoming`, so this push is the ONLY way to ring it.
 ```jsonc
 {
   "token": "<callee's CURRENT FCM token>",
-  "android": { "priority": "high" },
+  "android": { "priority": "high" }, 
   "apns": {
     "headers": { "apns-priority": "10", "apns-push-type": "alert" },
     "payload": { "aps": {

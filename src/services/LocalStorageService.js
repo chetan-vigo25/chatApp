@@ -12,11 +12,11 @@ const KEY_PENDING_UPLOADS = `${KEY_PREFIX}:pending_uploads`;
 //   WhatsApp/Media/WhatsApp Video/
 //   WhatsApp/Media/WhatsApp Documents/
 // Our equivalent:
-//   VibeConnect/Media/VibeConnect Images/
-//   VibeConnect/Media/VibeConnect Video/
-//   VibeConnect/Media/VibeConnect Documents/
-//   VibeConnect/Media/VibeConnect Audio/
-const APP_NAME = 'VibeConnect';
+//   TalksTry/Media/TalksTry Images/
+//   TalksTry/Media/TalksTry Video/
+//   TalksTry/Media/TalksTry Documents/
+//   TalksTry/Media/TalksTry Audio/
+const APP_NAME = 'TalksTry';
 const APP_MEDIA_ROOT = `${FileSystem.documentDirectory}${APP_NAME}/Media/`;
 const APP_MEDIA_IMAGES = `${APP_MEDIA_ROOT}${APP_NAME} Images/`;
 const APP_MEDIA_VIDEOS = `${APP_MEDIA_ROOT}${APP_NAME} Video/`;

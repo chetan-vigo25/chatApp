@@ -6,6 +6,7 @@ import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
+import { clearMessageNotification } from '../firebase/messageNotification';
 import OutboxWorker from '../services/OutboxWorker';
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
@@ -4190,6 +4191,9 @@ export function RealtimeChatProvider({ children }) {
   const setActiveChat = useCallback(async (chatId) => {
     deferDispatch({ type: 'SET_ACTIVE_CHAT', payload: chatId || null });
     if (chatId) {
+      // Opening a chat → clear its WhatsApp-style grouped message notification +
+      // accumulated thread so already-read messages don't linger in the shade.
+      clearMessageNotification(chatId);
       const socket = getSocket();
       if (socket && isSocketConnected()) {
         // Group chat IDs are raw ObjectIds; private chat IDs are `u_<a>_<b>`.

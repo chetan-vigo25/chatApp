@@ -415,8 +415,56 @@ export default function WhatsAppBannerHost() {
   }, []);
 
   useEffect(() => {
-    const handler = (payload) => {
-      enqueueBanner(payload);
+    // 1-on-1 messages arrive as `message:new` / `message:received` — the events
+    // the backend actually emits (and RealtimeChatContext consumes). The old
+    // binding to `notification:message:new` never fired because nothing emits it,
+    // so direct-message banners never showed. Transform the raw message payload
+    // into the banner shape here (mirrors groupMessageHandler).
+    const directMessageHandler = (payload) => {
+      const data = payload?.data || payload;
+      // Groups are handled by groupMessageHandler; only treat as group when the
+      // message explicitly targets a group (chatType 'group' AND a groupId), so a
+      // 1-on-1 message that merely references a groupId isn't dropped.
+      if (data?.chatType === 'group' && data?.groupId) return;
+
+      const chatId = data?.chatId || payload?.chatId;
+      const senderId = data?.senderId || data?.sender?._id || data?.sender?.id || payload?.senderId;
+      if (!chatId) return;
+
+      // Skip our own messages.
+      const currentUserId = realtimeStateRef.current?.currentUserId;
+      if (currentUserId && senderId && String(senderId) === String(currentUserId)) return;
+
+      const senderName = data?.senderName || data?.sender?.fullName || data?.sender?.name
+        || data?.sender?.username || 'New Message';
+      const avatar = data?.sender?.profileImage || data?.sender?.profileImageUrl
+        || data?.profileImage || data?.senderImage || null;
+
+      // Preview text per message type (WhatsApp-style).
+      const messageType = data?.messageType || data?.type || 'text';
+      let bodyText = data?.text || '';
+      if (messageType === 'image') bodyText = 'Photo';
+      else if (messageType === 'video') bodyText = 'Video';
+      else if (messageType === 'audio') bodyText = 'Audio';
+      else if (messageType === 'file') bodyText = 'Document';
+      else if (messageType === 'location') bodyText = 'Location';
+      else if (messageType === 'contact') bodyText = 'Contact';
+
+      enqueueBanner({
+        messageId: data?.messageId || data?._id,
+        chatId,
+        senderId,
+        senderName,
+        chatType: 'private',
+        isGroup: false,
+        text: bodyText,
+        profileImage: avatar,
+        timestamp: data?.timestamp || data?.sentAt || data?.createdAt || Date.now(),
+        notificationData: {
+          notification: { title: senderName, body: bodyText },
+          data: { ...data, chatType: 'private', senderName },
+        },
+      });
     };
 
     // Handler for group:message:received / group:message:new — look up names from chatMap
@@ -502,12 +550,14 @@ export default function WhatsAppBannerHost() {
       }
 
       if (listenerSocketRef.current) {
-        listenerSocketRef.current.off('notification:message:new', handler);
+        listenerSocketRef.current.off('message:new', directMessageHandler);
+        listenerSocketRef.current.off('message:received', directMessageHandler);
         listenerSocketRef.current.off('group:message:received', groupMessageHandler);
         listenerSocketRef.current.off('group:message:new', groupMessageHandler);
       }
 
-      socket.on('notification:message:new', handler);
+      socket.on('message:new', directMessageHandler);
+      socket.on('message:received', directMessageHandler);
       socket.on('group:message:received', groupMessageHandler);
       socket.on('group:message:new', groupMessageHandler);
       listenerSocketRef.current = socket;
@@ -524,7 +574,8 @@ export default function WhatsAppBannerHost() {
         attachTimerRef.current = null;
       }
       if (listenerSocketRef.current) {
-        listenerSocketRef.current.off('notification:message:new', handler);
+        listenerSocketRef.current.off('message:new', directMessageHandler);
+        listenerSocketRef.current.off('message:received', directMessageHandler);
         listenerSocketRef.current.off('group:message:received', groupMessageHandler);
         listenerSocketRef.current.off('group:message:new', groupMessageHandler);
         listenerSocketRef.current = null;

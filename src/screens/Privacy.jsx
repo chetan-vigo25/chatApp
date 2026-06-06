@@ -19,8 +19,8 @@ export default function Privacy({ navigation }) {
         <Text style={{ color: theme.colors.primaryTextColor, fontSize:16, fontFamily:'Roboto-Regular' }} >Privacy</Text>
       </View>
       <WebView
-        // source={{ uri: `${BASE_URL}/webview/privacy-policy` }}
-        source={{ uri: "https://whatback.tresting.com/webview/privacy-policy" }}
+        source={{ uri: `${BASE_URL}/webview/privacy-policy` }}
+        // source={{ uri: "https://whatback.tresting.com/webview/privacy-policy" }}
         style={{ flex:1 }}
         startInLoadingState={true}  // shows a loader while loading
       />

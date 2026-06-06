@@ -19,8 +19,8 @@ export default function Term({ navigation }) {
         <Text style={{ color: theme.colors.primaryTextColor, fontSize:16, fontFamily:'Roboto-Regular' }} >Term and Conditions</Text>
       </View>
       <WebView
-        // source={{ uri: `${BASE_URL}/webview/terms-and-conditions` }}
-        source={{ uri: "https://whatback.tresting.com/webview/privacy-policy" }}
+        source={{ uri: `${BASE_URL}/webview/terms-and-conditions` }}
+        // source={{ uri: "https://whatback.tresting.com/webview/privacy-policy" }}
         style={{ flex:1 }}
         startInLoadingState={true}
       />

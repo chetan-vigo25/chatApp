@@ -5,6 +5,7 @@ import { isGroupInactive } from '../utils/inactiveGroups';
 import { setPushToken } from '../Redux/Services/Socket/socket';
 import { CALL_PUSH_EVENTS } from './callEvents';
 import { displayIncomingCallNotifee, isNotifeeCallAvailable } from './callNotifee';
+import { displayGroupedMessage, isMessageGroupingAvailable } from './messageNotification';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -329,6 +330,16 @@ const showLocalNotification = async (remoteMessage) => {
     notification?.tag || (data?.chatId ? `${data.chatId}:${body}` : '')
   );
   if (isDuplicateNotification(dedupeKey)) return;
+
+  // Android: render a WhatsApp-style MessagingStyle notification that ACCUMULATES
+  // the recent messages per chat into one conversation thread (instead of each
+  // message replacing the last). Needs a chatId. Falls through to the plain expo
+  // notification if grouping isn't available or has no chatId.
+  if (isMessageGroupingAvailable() && data?.chatId) {
+    console.log('[FCM][msg] grouping message via MessagingStyle', { chatId: data.chatId });
+    const shown = await displayGroupedMessage({ ...data, senderName: title, body });
+    if (shown) return;
+  }
 
   try {
     await Notifications.scheduleNotificationAsync({
