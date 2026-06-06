@@ -17,9 +17,10 @@ import React, {
 import {
   View, Text, Image, TouchableOpacity, StyleSheet,
   Dimensions, StatusBar, Alert, FlatList, TextInput,
-  KeyboardAvoidingView, Platform, ActionSheetIOS,
-  Modal, ActivityIndicator, Animated, Linking, AppState,
+  Platform, ActionSheetIOS,
+  Modal, ActivityIndicator, Animated, Linking, AppState, Keyboard,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { Video, ResizeMode } from 'expo-av';
 import { useDispatch, useSelector } from 'react-redux';
@@ -107,6 +108,20 @@ export default function StatusViewer({ navigation, route }) {
   const [showReply, setShowReply]         = useState(false);
   const [replyText, setReplyText]         = useState('');
   const [sending, setSending]             = useState(false);
+  const insets = useSafeAreaInsets();
+  // The reply composer lives inside a <Modal>, which on Android renders in a
+  // separate dialog window that does NOT inherit the activity's adjustResize.
+  // So KeyboardAvoidingView can't lift it — we track the keyboard height
+  // ourselves and offset the sheet above the keyboard manually.
+  const [kbHeight, setKbHeight] = useState(0);
+  useEffect(() => {
+    if (!showReply) { setKbHeight(0); return; }
+    const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvt = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+    const sub1 = Keyboard.addListener(showEvt, (e) => setKbHeight(e?.endCoordinates?.height ?? 0));
+    const sub2 = Keyboard.addListener(hideEvt, () => setKbHeight(0));
+    return () => { sub1.remove(); sub2.remove(); };
+  }, [showReply]);
   const [hearts, setHearts]               = useState([]);
   // Mute toggle for video / audio statuses (top-right speaker icon). Default
   // to unmuted; the user can tap to silence — preference persists across
@@ -971,11 +986,8 @@ export default function StatusViewer({ navigation, route }) {
       )}
 
       {/* Reply modal — WhatsApp-style composer pinned above the keyboard */}
-      <Modal visible={showReply} transparent animationType="slide" onRequestClose={() => { setShowReply(false); resume(); }}>
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          style={styles.replyModal}
-        >
+      <Modal visible={showReply} transparent statusBarTranslucent animationType="slide" onRequestClose={() => { setShowReply(false); resume(); }}>
+        <View style={styles.replyModal}>
           {/* Tap anywhere on the dim backdrop to dismiss — status stays
               faintly visible behind it like WhatsApp does. */}
           <TouchableOpacity
@@ -984,7 +996,13 @@ export default function StatusViewer({ navigation, route }) {
             onPress={() => { setShowReply(false); resume(); }}
           />
 
-          <View style={styles.replySheet}>
+          <View
+            style={[
+              styles.replySheet,
+              // Lift above the keyboard when open; otherwise clear the nav bar.
+              { marginBottom: kbHeight, paddingBottom: kbHeight > 0 ? 14 : insets.bottom + 14 },
+            ]}
+          >
             {/* Drag handle hints "swipe to dismiss" */}
             <View style={styles.replyHandle} />
 
@@ -1052,7 +1070,7 @@ export default function StatusViewer({ navigation, route }) {
               </TouchableOpacity>
             </View>
           </View>
-        </KeyboardAvoidingView>
+        </View>
       </Modal>
     </View>
   );
@@ -1249,10 +1267,11 @@ const styles = StyleSheet.create({
 
   // ── Reply modal — WhatsApp composer ──────────────────────────────────────
   replyModal:    { flex: 1, justifyContent: 'flex-end' },
-  // Dim backdrop — status stays faintly visible above it.
+  // Transparent backdrop — only catches taps to dismiss; the status stays
+  // fully visible behind the composer (no dimming).
   replyBackdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.45)',
+    backgroundColor: 'transparent',
   },
   // Floating composer sheet pinned to the bottom edge.
   replySheet: {
@@ -1260,7 +1279,7 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: 18, borderTopRightRadius: 18,
     paddingHorizontal: 12,
     paddingTop: 10,
-    paddingBottom: Platform.OS === 'ios' ? 32 : 14,
+    // paddingBottom is applied inline (keyboard height vs. nav-bar inset).
     borderTopWidth: StyleSheet.hairlineWidth,
     borderTopColor: 'rgba(255,255,255,0.08)',
   },

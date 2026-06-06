@@ -4,6 +4,7 @@ import {
   ActivityIndicator, Platform, StatusBar,
 } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../../calls/useCall';
@@ -124,13 +125,9 @@ export default function NewCallScreen() {
     navigation.goBack();
   }, [startVideoCall, peerObjOf, navigation]);
 
-  const onRefresh = useCallback(() => {
-    refreshContacts?.({ fallbackToSync: true }).catch(() => {});
-    refreshPresence?.().catch(() => {});
-  }, [refreshContacts, refreshPresence]);
-
   const c = theme.colors;
   const isDark = c.background !== '#ffffff';
+  const insets = useSafeAreaInsets();
 
   const renderItem = useCallback(({ item }) => (
     <ContactRow
@@ -147,7 +144,7 @@ export default function NewCallScreen() {
   ), [c.primaryTextColor, c.placeHolderTextColor, c.themeColor, onAudio, onVideo]);
 
   return (
-    <View style={[styles.container, { backgroundColor: c.background }]}>
+    <View style={[styles.container, { backgroundColor: c.background, }]}>
       <StatusBar barStyle={isDark ? 'light-content' : 'dark-content'} backgroundColor={c.background} />
 
       {/* Top bar */}
@@ -161,9 +158,6 @@ export default function NewCallScreen() {
             {isSyncing ? 'Syncing…' : `${data.length} contact${data.length === 1 ? '' : 's'}`}
           </Text>
         </View>
-        <TouchableOpacity onPress={onRefresh} activeOpacity={0.6} hitSlop={styles.hit} style={styles.backBtn}>
-          <Ionicons name="sync-outline" size={21} color={c.primaryTextColor} />
-        </TouchableOpacity>
       </View>
 
       {/* Search */}
@@ -227,7 +221,7 @@ export default function NewCallScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight || 0 : 0 },
+  container: { flex: 1 },
   hit: { top: 10, bottom: 10, left: 10, right: 10 },
 
   topBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, paddingVertical: 8 },

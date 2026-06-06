@@ -30,6 +30,7 @@ import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
 import * as Location from "expo-location";
 import * as Contacts from "expo-contacts";
+import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
@@ -2672,6 +2673,8 @@ export default function ChatScreen({ navigation, route }) {
   }, [mediaOptionPressAnims]);
 
   const handleCameraCapture = useCallback(async () => {
+    // Camera backgrounds the app; suspend the app lock so returning isn't a re-lock.
+    suspendAppLock();
     try {
       const permission = await ImagePicker.requestCameraPermissionsAsync();
       if (permission.status !== 'granted') {
@@ -2701,10 +2704,14 @@ export default function ChatScreen({ navigation, route }) {
     } catch (error) {
       console.error('camera capture error', error);
       Alert.alert('Error', 'Unable to open camera right now.');
+    } finally {
+      resumeAppLock();
     }
   }, [setPendingMedia]);
 
   const handleAudioPick = useCallback(async () => {
+    // Document picker backgrounds the app; suspend the app lock for the round trip.
+    suspendAppLock();
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: ['audio/*'],
@@ -2726,6 +2733,8 @@ export default function ChatScreen({ navigation, route }) {
     } catch (error) {
       console.error('audio picker error', error);
       Alert.alert('Error', 'Unable to pick audio file.');
+    } finally {
+      resumeAppLock();
     }
   }, [setPendingMedia]);
 
@@ -2776,6 +2785,8 @@ export default function ChatScreen({ navigation, route }) {
   }, [isConnected, sendLocationMessage]);
 
   const handleShareDeviceContact = useCallback(async () => {
+    // The contact picker backgrounds the app; suspend the app lock for the round trip.
+    suspendAppLock();
     try {
       if (!isConnected) {
         Alert.alert('Offline', 'Connect to internet to share contact.');
@@ -2862,6 +2873,8 @@ export default function ChatScreen({ navigation, route }) {
     } catch (error) {
       console.error('share contact error', error);
       Alert.alert('Error', 'Unable to share contact right now.');
+    } finally {
+      resumeAppLock();
     }
   }, [isConnected, sendContactMessage]);
 

@@ -9,6 +9,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useDispatch, useSelector } from 'react-redux';
 import { updateGroup, viewGroup } from '../../Redux/Reducer/Group/Group.reducer';
 import * as ImagePicker from 'expo-image-picker';
+import { suspendAppLock, resumeAppLock } from '../../services/appLockGuard';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../../Config/Https';
@@ -55,6 +56,8 @@ export default function EditGroup({ navigation, route }) {
       Alert.alert('Permission needed', 'Camera roll permission is required.');
       return;
     }
+    // The gallery picker backgrounds the app; suspend the app lock for the round trip.
+    suspendAppLock();
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
@@ -68,6 +71,8 @@ export default function EditGroup({ navigation, route }) {
       }
     } catch (e) {
       showToast('Failed to pick image');
+    } finally {
+      resumeAppLock();
     }
   };
 

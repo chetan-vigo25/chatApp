@@ -292,8 +292,7 @@ export default function UserB({ navigation, route }) {
       <StatusBar translucent backgroundColor="transparent" barStyle={scrolledPastHeader && !isDarkMode ? "dark-content" : "light-content"} />
 
       {/* Floating top bar — transparent over the photo, solid once scrolled */}
-      <SafeAreaView
-        edges={['top']}
+      <View
         style={[
           styles.topBarSafe,
           {
@@ -325,14 +324,14 @@ export default function UserB({ navigation, route }) {
             </View>
           )}
 
-          <TouchableOpacity
+          {/* <TouchableOpacity
             style={[styles.topBarBtn, !scrolledPastHeader && styles.topBarBtnFloating]}
             activeOpacity={0.7}
           >
             <MaterialCommunityIcons name="dots-vertical" size={22} color={scrolledPastHeader ? primaryText : '#fff'} />
-          </TouchableOpacity>
+          </TouchableOpacity> */}
         </View>
-      </SafeAreaView>
+      </View>
 
       <ScrollView
         onScroll={onScroll}
@@ -431,7 +430,7 @@ export default function UserB({ navigation, route }) {
         ) : null}
 
         {/* ─── Notifications (Mute toggle) ─── */}
-        {chatId ? (
+        {/* {chatId ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             <View style={styles.card_row}>
               <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
@@ -449,15 +448,15 @@ export default function UserB({ navigation, route }) {
               />
             </View>
           </View>
-        ) : null}
+        ) : null} */}
 
         {/* ─── Encryption hint (informational) ─── */}
-        <View style={styles.encryptionRow}>
+        {/* <View style={styles.encryptionRow}>
           <Ionicons name="lock-closed" size={13} color={subText} style={{ marginTop: 1 }} />
           <Text style={[styles.encryptionText, { color: subText }]}>
             Your personal messages are end-to-end encrypted
           </Text>
-        </View>
+        </View> */}
 
         {/* ─── Save Contact ─── */}
         {!isInDeviceBook && !contactJustSaved && (
@@ -547,7 +546,7 @@ const styles = StyleSheet.create({
   // ── Top bar (transparent over hero, solid when scrolled) ──
   topBarSafe: {
     position: 'absolute',
-    top: 0,
+    top: 20,
     left: 0,
     right: 0,
     zIndex: 100,

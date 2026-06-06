@@ -4,6 +4,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
 import { Platform } from 'react-native';
+import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
 
 const ImageContext = createContext();
 
@@ -12,6 +13,9 @@ export const ImageProvider = ({ children }) => {
 
   // Unified picker: supports 'image', 'video', 'document'
   const pickMedia = async (mediaType = 'image') => {
+    // Opening a system picker backgrounds the app; suspend the app lock so the
+    // return trip is not treated as a re-lock trigger (see services/appLockGuard).
+    suspendAppLock();
     try {
       if (mediaType === 'document') {
         // pick document
@@ -101,6 +105,8 @@ export const ImageProvider = ({ children }) => {
     } catch (error) {
       console.error('Media Picker Error:', error);
       return null;
+    } finally {
+      resumeAppLock();
     }
   };
 

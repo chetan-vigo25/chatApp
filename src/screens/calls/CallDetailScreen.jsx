@@ -4,6 +4,7 @@ import {
   Modal, ActivityIndicator,
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, MaterialIcons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../../calls/useCall';
@@ -255,9 +256,10 @@ export default function CallDetailScreen() {
   }, [calls, navigation]);
 
   const c = theme.colors;
+  const insets = useSafeAreaInsets();
 
   return (
-    <View style={[{ backgroundColor: c.background }]}>
+    <View style={[styles.screen, { backgroundColor: c.background }]}>
       <StatusBar
         barStyle={c.background === '#ffffff' ? 'dark-content' : 'light-content'}
         backgroundColor={c.background}
@@ -278,7 +280,7 @@ export default function CallDetailScreen() {
 
       <ScrollView
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={styles.scrollBody}
+        contentContainerStyle={[styles.scrollBody, { paddingBottom: insets.bottom + 40 }]}
       >
         {/* ── Hero: avatar + name + summary ── */}
         <View style={styles.hero}>
@@ -523,6 +525,7 @@ export default function CallDetailScreen() {
 }
 
 const styles = StyleSheet.create({
+  screen: { flex: 1 },
   container: { flex: 1, paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight || 0 : 0 },
   hit: { top: 10, bottom: 10, left: 10, right: 10 },
 

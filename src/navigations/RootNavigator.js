@@ -144,6 +144,10 @@ export default function RootNavigator() {
               gestureDirection: 'vertical',
               cardOverlayEnabled: false,
               cardStyle: { backgroundColor: 'transparent' },
+              // Keep the screen below (the Updates/Status tab) mounted and
+              // visible behind the transparent sheet. The navigator default is
+              // detachPreviousScreen:true, which would otherwise blank it to gray.
+              detachPreviousScreen: false,
               cardStyleInterpolator: CardStyleInterpolators.forBottomSheetAndroid,
             }}
           />

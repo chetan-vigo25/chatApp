@@ -9,6 +9,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import * as ImagePicker from 'expo-image-picker';
+import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { BACKEND_URL } from '@env';
 import { Feather, FontAwesome5, Ionicons, FontAwesome6 } from '@expo/vector-icons';
@@ -96,6 +97,8 @@ export default function EditProfile({ navigation, route }) {
 
   const pickImage = async () => {
     if (!(await requestPermission())) return;
+    // The gallery picker backgrounds the app; suspend the app lock for the round trip.
+    suspendAppLock();
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
@@ -109,6 +112,8 @@ export default function EditProfile({ navigation, route }) {
     } catch (e) {
       console.error('pickImage', e);
       showToast('Failed to pick image');
+    } finally {
+      resumeAppLock();
     }
   };
 

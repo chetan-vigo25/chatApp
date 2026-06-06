@@ -30,7 +30,12 @@
         "NSPhotoLibraryUsageDescription": "TalksTry needs access to your photo library so you can select and share photos and videos in your chats and status updates.",
         "NSPhotoLibraryAddUsageDescription": "TalksTry needs permission to save photos and videos you receive in chats to your photo library.",
         "NSContactsUsageDescription": "TalksTry uses your contacts only to help you find friends who already use the app. Phone numbers are securely hashed before being checked. You can use TalksTry without granting this permission.",
-        "NSLocationWhenInUseUsageDescription": "TalksTry accesses your location only when you choose to share your current location in a chat. Location is never collected in the background."
+        "NSLocationWhenInUseUsageDescription": "TalksTry accesses your location only when you choose to share your current location in a chat. Location is never collected in the background.",
+        "UIBackgroundModes": [
+          "remote-notification",
+          "audio",
+          "voip"
+        ]
       }
     },
     "android": {

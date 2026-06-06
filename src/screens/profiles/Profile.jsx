@@ -5,6 +5,7 @@ import {
   StyleSheet, ScrollView,
 } from "react-native";
 import * as ImagePicker from 'expo-image-picker';
+import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../../contexts/ThemeContext";
@@ -46,6 +47,8 @@ export default function Profile({ navigation }) {
 
   const pickImage = async () => {
     if (!(await requestPermission())) return;
+    // The gallery picker backgrounds the app; suspend the app lock for the round trip.
+    suspendAppLock();
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.Images,
@@ -60,6 +63,8 @@ export default function Profile({ navigation }) {
       }
     } catch (e) {
       showToast('Failed to pick image');
+    } finally {
+      resumeAppLock();
     }
   };
 
