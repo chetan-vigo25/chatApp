@@ -59,6 +59,11 @@ export default function AppLockGate() {
   const [purgeProgress, setPurgeProgress] = useState({ done: 0, total: 0 });
 
   const appState = useRef(AppState.currentState);
+  // True once the app has actually been to the background since the last
+  // foreground. Lets us tell a genuine "user left the app" trip apart from a
+  // transient `inactive` blip (iOS fires background→inactive→active on the way
+  // back, so we can't rely on the immediately-previous state).
+  const wasBackgrounded = useRef(false);
   const shakeAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(0)).current;
   const progressAnim = useRef(new Animated.Value(0)).current;
@@ -144,20 +149,28 @@ export default function AppLockGate() {
   // a timestamp on every background transition so we can ignore brief blips.
   useEffect(() => {
     const sub = AppState.addEventListener('change', async (next) => {
-      const prev = appState.current;
       appState.current = next;
 
-      // Going to the background (or inactive — iOS sends this during the
-      // app-switcher gesture / control-center pull / Face-ID prompt).
-      // Per the spec, ANY context switch should re-lock on return, so we
-      // stamp the time on inactive too.
-      if (next === 'background' || next === 'inactive') {
+      // Only a GENUINE background arms the re-lock: home button, recents,
+      // screen-off / device lock, switching to another app, or the app being
+      // killed. We deliberately ignore the transient `inactive` state — both
+      // Android and iOS emit it for things that are NOT the user leaving the
+      // app: in-app navigation animations, permission / biometric prompts,
+      // the notification shade, control-center pull and the app-switcher peek.
+      // Treating those as a re-lock is what made the lock screen pop up while
+      // the user was still moving between screens inside the app.
+      if (next === 'background') {
+        wasBackgrounded.current = true;
         try { await AsyncStorage.setItem(LAST_BACKGROUND_KEY, String(Date.now())); } catch {}
         return;
       }
 
-      // Coming back to the foreground.
-      if (next === 'active' && (prev === 'background' || prev === 'inactive')) {
+      // Coming back to the foreground. Only act if we truly went to the
+      // background — a bare `inactive`→`active` round-trip (notification
+      // shade, biometric/permission prompt, navigation animation) never set
+      // the flag, so we leave the app unlocked.
+      if (next === 'active' && wasBackgrounded.current) {
+        wasBackgrounded.current = false;
         // An intentional in-app excursion (image picker, camera, document
         // picker) backgrounds the app. Don't treat the return trip as a
         // re-lock — just refresh the timestamp so a later genuine background
