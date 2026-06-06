@@ -26,7 +26,6 @@ import {
   KeyboardAvoidingView, Platform, TextInput,
   ScrollView, ActivityIndicator, Alert, Dimensions, Pressable,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import { useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { Ionicons, MaterialCommunityIcons, FontAwesome5 } from '@expo/vector-icons';
@@ -60,7 +59,6 @@ export default function StatusCreate({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const initialMode = route?.params?.type || null;
   const { validateMediaList, limits } = useStatusSettings();
-  const insets = useSafeAreaInsets();
   const textInputRef = useRef(null);
 
   const [mode, setMode]       = useState(initialMode);
@@ -242,7 +240,7 @@ export default function StatusCreate({ navigation, route }) {
 
     return (
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <View style={[styles.textScreen, { backgroundColor: bgColor, paddingTop: insets.top }]}>
+        <View style={[styles.textScreen, { backgroundColor: bgColor }]}>
           {/* Header — balanced 3-section layout keeps the title dead-center. */}
           <View style={styles.textHeader}>
             <View style={styles.textHeaderSide}>
@@ -288,7 +286,7 @@ export default function StatusCreate({ navigation, route }) {
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
-            style={[styles.palette, { marginBottom: insets.bottom + 10 }]}
+            style={styles.palette}
             contentContainerStyle={styles.paletteContent}
             keyboardShouldPersistTaps="always"
           >
@@ -419,7 +417,7 @@ const styles = StyleSheet.create({
     textShadowColor: 'rgba(0,0,0,0.18)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 2,
   },
   charCount:     { color: 'rgba(255,255,255,0.7)', fontSize: 12, fontFamily: 'Roboto-Medium', alignSelf: 'flex-end', paddingRight: 22, paddingBottom: 8 },
-  palette:       { flexGrow: 0 },
+  palette:       { flexGrow: 0, marginBottom: 16 },
   paletteContent:{ paddingHorizontal: 16, alignItems: 'center' },
   colorDotWrap:  {
     width: 44, height: 44, borderRadius: 22,
