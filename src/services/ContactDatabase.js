@@ -1,6 +1,6 @@
 import * as SQLite from 'expo-sqlite';
 
-const DB_NAME = 'vibeconnect_contacts.db';
+const DB_NAME = 'TalksTry_contacts.db';
 const DB_VERSION = 1;
 
 let _db = null;

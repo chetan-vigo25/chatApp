@@ -21,7 +21,7 @@ const SAF_URI_KEY = '@backup_saf_directory_uri';
  * After that:  Saves directly — NO picker, NO share sheet, fully automatic
  *
  * Result on device (visible in file manager):
- *   VibeConnect/
+ *   TalksTry/
  *   ├── Databases/
  *   │   ├── msgstore.db.backup
  *   │   └── msgstore-2026-03-24.db.backup
@@ -102,7 +102,7 @@ const saveToAndroid = async (backupJSON, sizeMB, messageCount, chatCount, onProg
     }
   }
 
-  // First time: open folder picker pre-selected at "VibeConnect"
+  // First time: open folder picker pre-selected at "TalksTry"
   // This creates the folder automatically if it doesn't exist
   const suggestedUri = StorageAccessFramework.getUriForDirectoryInRoot(APP_FOLDER_NAME);
 

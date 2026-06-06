@@ -15,7 +15,7 @@ import { useTheme } from '../contexts/ThemeContext';
 
 /**
  * WhatsApp-style banner shown at the top of the message list when chatting
- * with a Vibe Connect user who is NOT saved in device contacts.
+ * with a TalksTry user who is NOT saved in device contacts.
  *
  * Props:
  *   peerName       {string}   Display name of the peer
