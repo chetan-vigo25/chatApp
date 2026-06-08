@@ -421,14 +421,24 @@ export default function WhatsAppBannerHost() {
     // so direct-message banners never showed. Transform the raw message payload
     // into the banner shape here (mirrors groupMessageHandler).
     const directMessageHandler = (payload) => {
-      const data = payload?.data || payload;
+      // Mirror RealtimeChatContext.normalizeMessagePayload: the actual message may
+      // be nested under `message`/`data`, and chatId can arrive as `roomId`/`chat`.
+      // This handler previously read only `data.chatId`, so 1-1 payloads that nested
+      // the message or used a roomId/chat alias were silently dropped (no banner),
+      // while groups still worked because groupId sits at the top level.
+      const source = payload?.data || payload;
+      const data = source?.message || source?.data || source;
+
       // Groups are handled by groupMessageHandler; only treat as group when the
       // message explicitly targets a group (chatType 'group' AND a groupId), so a
       // 1-on-1 message that merely references a groupId isn't dropped.
-      if (data?.chatType === 'group' && data?.groupId) return;
+      if ((data?.chatType === 'group' || source?.chatType === 'group')
+        && (data?.groupId || source?.groupId)) return;
 
-      const chatId = data?.chatId || payload?.chatId;
-      const senderId = data?.senderId || data?.sender?._id || data?.sender?.id || payload?.senderId;
+      const chatId = data?.chatId || data?.roomId || data?.chat
+        || source?.chatId || source?.roomId || source?.chat;
+      const senderId = data?.senderId || data?.sender?._id || data?.sender?.id
+        || source?.senderId || source?.from;
       if (!chatId) return;
 
       // Skip our own messages.
@@ -436,13 +446,13 @@ export default function WhatsAppBannerHost() {
       if (currentUserId && senderId && String(senderId) === String(currentUserId)) return;
 
       const senderName = data?.senderName || data?.sender?.fullName || data?.sender?.name
-        || data?.sender?.username || 'New Message';
+        || data?.sender?.username || source?.senderName || 'New Message';
       const avatar = data?.sender?.profileImage || data?.sender?.profileImageUrl
-        || data?.profileImage || data?.senderImage || null;
+        || data?.profileImage || data?.senderImage || source?.profileImage || null;
 
       // Preview text per message type (WhatsApp-style).
       const messageType = data?.messageType || data?.type || 'text';
-      let bodyText = data?.text || '';
+      let bodyText = data?.text || data?.content || '';
       if (messageType === 'image') bodyText = 'Photo';
       else if (messageType === 'video') bodyText = 'Video';
       else if (messageType === 'audio') bodyText = 'Audio';
