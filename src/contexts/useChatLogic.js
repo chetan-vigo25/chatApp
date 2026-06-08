@@ -185,7 +185,7 @@ export default function useChatLogic({ navigation, route }) {
   const dispatch = useDispatch();
   const { isConnected, networkType } = useNetwork();
   const { pickMedia } = useImage();
-  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, inactiveGroupIds } = useRealtimeChat();
+  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, restoreGroupMembership, inactiveGroupIds } = useRealtimeChat();
   const { currentGroup } = useSelector((s) => s.group || {});
 
   const deferRealtimeUpdate = useCallback((fn) => {
@@ -310,6 +310,31 @@ export default function useChatLogic({ navigation, route }) {
   // every useCallback dependency array.
   const amNotGroupMemberRef = useRef(false);
   amNotGroupMemberRef.current = amNotGroupMember;
+
+  // Reconcile the realtime "inactive group" flag against authoritative server
+  // membership. When an admin re-adds a member who previously left/was removed,
+  // the realtime `group:member:added` event may not reach this client (or arrives
+  // with a non-matching id), so the inactiveGroupIds flag — which gates BOTH
+  // sending and receiving — stays set and the "you're no longer a member" banner
+  // persists. viewGroup (dispatched on open) fetches the real member list with
+  // per-member status, so if it shows us as an active member while the flag is
+  // still set, clear it to re-enable send + receive.
+  useEffect(() => {
+    if (!isGroupChat) return;
+    const gid = _gid || chatData?.groupId || chatData?.chatId;
+    if (!gid || !inactiveGroupIds || !inactiveGroupIds[String(gid)]) return;
+    const cgId = currentGroup?.group?._id || currentGroup?.group?.id;
+    if (!cgId || !sameId(cgId, gid) || !Array.isArray(currentGroup?.members)) return;
+    const me = currentGroup.members.find((m) => {
+      const mid = (typeof m.userId === 'object' && m.userId !== null)
+        ? (m.userId._id || m.userId.id)
+        : (m.userId || m._id || m.id);
+      return sameId(mid, currentUserId);
+    });
+    if (me && me.status !== 'removed' && !me.isDeleted) {
+      restoreGroupMembership(gid);
+    }
+  }, [isGroupChat, _gid, chatData, inactiveGroupIds, currentGroup, currentUserId, restoreGroupMembership]);
 
   // Live participant count for the header — prefer the freshly-fetched
   // currentGroup.members (kept in sync by viewGroup) so the count drops live when

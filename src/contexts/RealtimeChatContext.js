@@ -3540,6 +3540,14 @@ export function RealtimeChatProvider({ children }) {
         type: 'GROUP_MEMBER_JOINED',
         payload: { groupId, userId, username: memberName, timestamp: data?.timestamp },
       });
+      // If the current user is the one being (re-)added, clear the inactive /
+      // removed flags so messaging + receiving are re-enabled. Without this the
+      // "you're no longer a member" banner would persist after an admin re-adds
+      // a member who had previously left or been removed. This mirrors the
+      // membership-ENDED dispatch in `onGroupRemoved`.
+      if (userId === normalizeId(currentUserIdRef.current)) {
+        dispatch({ type: 'GROUP_MEMBERSHIP_RESTORED', payload: { groupId } });
+      }
     };
 
     // Broadcast: member was removed (kicked) from the group
@@ -4405,6 +4413,16 @@ export function RealtimeChatProvider({ children }) {
     emitChatAction('group:leave', { groupId: id });
   }, [emitChatAction, deferDispatch]);
 
+  // Clear the inactive flag for a group once we know the current user is a member
+  // again (e.g. an admin re-added them). Used as a fallback when the realtime
+  // `group:member:added` event doesn't reach us — callers that have authoritative
+  // server membership (viewGroup) invoke this to re-enable send + receive.
+  const restoreGroupMembership = useCallback((groupId) => {
+    const id = normalizeId(groupId);
+    if (!id) return;
+    deferDispatch({ type: 'GROUP_MEMBERSHIP_RESTORED', payload: { groupId: id } });
+  }, [deferDispatch]);
+
   const leaveAllGroups = useCallback(() => {
     emitChatAction('group:leave:all', {});
   }, [emitChatAction]);
@@ -4686,6 +4704,7 @@ export function RealtimeChatProvider({ children }) {
     leaveGroup,
     leaveAllGroups,
     removeChat,
+    restoreGroupMembership,
     // Group member management
     addGroupMembers,
     removeGroupMember,
@@ -4741,6 +4760,7 @@ export function RealtimeChatProvider({ children }) {
     leaveGroup,
     leaveAllGroups,
     removeChat,
+    restoreGroupMembership,
     addGroupMembers,
     removeGroupMember,
     promoteGroupMember,

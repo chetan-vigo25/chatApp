@@ -5,10 +5,12 @@ import { WebView } from 'react-native-webview';
 import { WEB_URL, BACKEND_URL } from '@env';
 import { FontAwesome6 } from '@expo/vector-icons';
 
-const BASE_URL = WEB_URL || (BACKEND_URL ? BACKEND_URL.replace('/api/v2/', '') : '');
 
 export default function Privacy({ navigation }) {
   const { theme } = useTheme();
+
+  // Strip any trailing slash so we never produce a double "//" or a missing "/".
+  const privacyUrl = `${(WEB_URL || '').replace(/\/+$/, '')}/webview/privacy-policy`;
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
@@ -19,8 +21,7 @@ export default function Privacy({ navigation }) {
         <Text style={{ color: theme.colors.primaryTextColor, fontSize:16, fontFamily:'Roboto-Regular' }} >Privacy</Text>
       </View>
       <WebView
-        // source={{ uri: `${BASE_URL}/webview/privacy-policy` }}
-        source={{ uri: "https://whatback.tresting.com/webview/privacy-policy" }}
+        source={{ uri: `${WEB_URL}/webview/privacy-policy` }}
         style={{ flex:1 }}
         startInLoadingState={true}  // shows a loader while loading
       />
