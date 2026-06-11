@@ -6,113 +6,93 @@ import {
   FlatList,
   StyleSheet,
   RefreshControl,
-  ActivityIndicator,
   Animated,
-  Image,
   Platform,
   ToastAndroid,
   Alert,
 } from 'react-native';
-import { FontAwesome6, Entypo } from '@expo/vector-icons';
+import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '../../../contexts/ThemeContext';
 import useDeviceLinking from '../hooks/useDeviceLinking';
 import DeviceListItem from '../components/DeviceListItem';
-import EmptyDevices from '../components/EmptyDevices';
+import DeviceLinkArt from '../components/DeviceLinkArt';
 
 function showToast(message) {
-  if (Platform.OS === 'android') {
-    ToastAndroid.show(message, ToastAndroid.SHORT);
-  } else {
-    Alert.alert('', message);
-  }
+  if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
+  else Alert.alert('', message);
 }
 
-function SkeletonItem({ theme }) {
+function SkeletonRow({ theme }) {
   const opacity = useRef(new Animated.Value(0.3)).current;
-
   useEffect(() => {
-    const animation = Animated.loop(
+    const a = Animated.loop(
       Animated.sequence([
         Animated.timing(opacity, { toValue: 1, duration: 800, useNativeDriver: true }),
         Animated.timing(opacity, { toValue: 0.3, duration: 800, useNativeDriver: true }),
       ])
     );
-    animation.start();
-    return () => animation.stop();
+    a.start();
+    return () => a.stop();
   }, []);
-
   const bg = theme.colors.borderColor;
-
   return (
-    <Animated.View style={[styles.skeletonRow, { opacity }]}>
-      <View style={[styles.skeletonCircle, { backgroundColor: bg }]} />
-      <View style={styles.skeletonLines}>
-        <View style={[styles.skeletonLine, { backgroundColor: bg, width: '60%' }]} />
-        <View style={[styles.skeletonLine, { backgroundColor: bg, width: '80%', height: 10 }]} />
-        <View style={[styles.skeletonLine, { backgroundColor: bg, width: '45%', height: 8 }]} />
+    <Animated.View style={[styles.skelRow, { opacity }]}>
+      <View style={[styles.skelCircle, { backgroundColor: bg }]} />
+      <View style={styles.skelLines}>
+        <View style={[styles.skelLine, { backgroundColor: bg, width: '55%' }]} />
+        <View style={[styles.skelLine, { backgroundColor: bg, width: '72%', height: 10 }]} />
       </View>
     </Animated.View>
   );
 }
 
 export default function LinkedDevicesScreen({ navigation }) {
-  const { theme } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const [initialLoad, setInitialLoad] = useState(true);
 
-  const {
-    linkedDevices,
-    fetchDevices,
-    isFetching,
-    unlinkDevice,
-    error,
-    clearError,
-  } = useDeviceLinking();
+  const { linkedDevices, fetchDevices, isFetching, unlinkDevice, error } = useDeviceLinking();
+
+  const pageBg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  const primaryText = theme.colors.primaryTextColor;
+  const subText = theme.colors.secondaryTextColor;
+  const dividerClr = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(15,30,50,0.08)';
+  const linkBlue = isDarkMode ? '#53BDEB' : '#027EB5';
+  // Brand palette — drives the button, illustration, and accents.
+  const brand = theme.colors.themeColor;
+  const brandDark = isDarkMode ? '#0C8C77' : '#017A68';
 
   useEffect(() => {
-    Animated.timing(fadeAnim, {
-      toValue: 1,
-      duration: 400,
-      useNativeDriver: true,
-    }).start();
+    Animated.timing(fadeAnim, { toValue: 1, duration: 380, useNativeDriver: true }).start();
   }, []);
 
-  // Fetch on mount
   useEffect(() => {
     fetchDevices().finally(() => setInitialLoad(false));
   }, [fetchDevices]);
 
-  // Re-fetch when screen comes back into focus (e.g. after linking a device)
   useFocusEffect(
     useCallback(() => {
-      if (!initialLoad) {
-        fetchDevices();
-      }
+      if (!initialLoad) fetchDevices();
     }, [fetchDevices, initialLoad])
   );
 
   const handleDevicePress = useCallback((device) => {
     const info = device.deviceInfo || device;
-    const name = info.deviceName || device.deviceName || 'Unknown Device';
+    const name = info.deviceName || device.deviceName || 'this device';
     const deviceId = device.deviceId || device._id;
-
     Alert.alert(
-      'Unlink this device?',
-      `This device will no longer have access to your chats. The web session will be terminated immediately.`,
+      name,
+      'Log this device out? It will lose access to your chats immediately.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Unlink',
+          text: 'Log out',
           style: 'destructive',
           onPress: async () => {
-            const success = await unlinkDevice(deviceId);
-            if (success) {
-              showToast('Device unlinked. Web session terminated.');
-              fetchDevices();
-            } else {
-              showToast(error || 'Failed to unlink device');
-            }
+            const ok = await unlinkDevice(deviceId);
+            if (ok) { showToast('Device logged out.'); fetchDevices(); }
+            else showToast(error || 'Failed to log out device');
           },
         },
       ]
@@ -124,166 +104,181 @@ export default function LinkedDevicesScreen({ navigation }) {
   ), [handleDevicePress]);
 
   const keyExtractor = useCallback(
-    (item) => item.deviceId || item._id || item.sessionId || String(Math.random()),
+    (item, i) => item.deviceId || item._id || item.sessionId || `dev-${i}`,
     []
   );
 
-  const renderSkeleton = () => (
+  const count = linkedDevices?.length || 0;
+
+  const ListHeader = (
     <View>
-      {[0, 1, 2].map((i) => (
-        <SkeletonItem key={i} theme={theme} />
-      ))}
+      {/* Illustration */}
+      <View style={styles.heroWrap}>
+        <DeviceLinkArt size={236} accent={brand} accentDark={brandDark} dark={isDarkMode} />
+      </View>
+
+      {/* Caption + Learn more */}
+      <Text style={[styles.caption, { color: subText }]}>
+        You can link other devices to this account.
+      </Text>
+      <TouchableOpacity activeOpacity={0.6} onPress={() => navigation.navigate('Privacy')}>
+        <Text style={[styles.learnMore, { color: linkBlue }]}>Learn more</Text>
+      </TouchableOpacity>
+
+      {/* Link a device button */}
+      <TouchableOpacity
+        onPress={() => navigation.navigate('QRScanner')}
+        activeOpacity={0.85}
+        style={[styles.linkBtn, { backgroundColor: brand }]}
+      >
+        <Text style={[styles.linkBtnText, { color: theme.colors.textWhite }]}>Link a device</Text>
+      </TouchableOpacity>
+
+      {/* Divider */}
+      <View style={[styles.divider, { backgroundColor: dividerClr }]} />
+
+      {/* Section */}
+      <Text style={[styles.sectionLabel, { color: subText }]}>DEVICE STATUS</Text>
+      <Text style={[styles.sectionHint, { color: subText }]}>
+        {count > 0 ? 'Tap a device to log it out.' : 'No devices are currently linked.'}
+      </Text>
+
+      {initialLoad && (
+        <View style={styles.skelGroup}>
+          {[0, 1].map((i) => <SkeletonRow key={i} theme={theme} />)}
+        </View>
+      )}
+    </View>
+  );
+
+  const ListFooter = (
+    <View style={styles.footer}>
+      <Ionicons name="lock-closed" size={15} color={subText} style={styles.footerLock} />
+      <Text style={[styles.footerText, { color: subText }]}>
+        Your personal messages are{' '}
+        <Text style={{ color: brand, fontFamily: 'Roboto-Medium' }}>end-to-end encrypted</Text>
+        {' '}on all your devices.
+      </Text>
     </View>
   );
 
   return (
-    <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: theme.colors.background }]}>
+    <View style={[styles.container, { backgroundColor: pageBg }]}>
       {/* Header */}
-      <View style={[styles.header, { borderBottomColor: theme.colors.borderColor }]}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
-          <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
+      <View style={[styles.header, { borderBottomColor: dividerClr }]}>
+        <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={styles.backBtn}>
+          <FontAwesome6 name="arrow-left" size={20} color={primaryText} />
         </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>
-          Linked Devices
-        </Text>
+        <Text style={[styles.headerTitle, { color: primaryText }]}>Linked devices</Text>
       </View>
 
-      <FlatList
-        data={linkedDevices}
-        renderItem={renderDevice}
-        keyExtractor={keyExtractor}
-        contentContainerStyle={styles.listContent}
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl
-            refreshing={isFetching && !initialLoad}
-            onRefresh={fetchDevices}
-            colors={[theme.colors.themeColor]}
-            tintColor={theme.colors.themeColor}
-          />
-        }
-        ListHeaderComponent={
-          <View>
-            {/* Banner image */}
-            <View style={styles.bannerContainer}>
-              <Image
-                source={require('../../../../assets/images/devicelink.png')}
-                style={styles.bannerImage}
-              />
-            </View>
-
-            {/* Link button */}
-            <TouchableOpacity
-              onPress={() => navigation.navigate('QRScanner')}
-              activeOpacity={0.9}
-              style={[styles.linkBtn, { backgroundColor: theme.colors.themeColor }]}
-            >
-              <Entypo name="plus" size={20} color={theme.colors.textWhite} />
-              <Text style={[styles.linkBtnText, { color: theme.colors.textWhite }]}>
-                Link a New Device
-              </Text>
-            </TouchableOpacity>
-
-            {/* Section label */}
-            <View style={styles.sectionLabel}>
-              <Text style={[styles.sectionTitle, { color: theme.colors.placeHolderTextColor }]}>
-                Linked Devices
-              </Text>
-              <Text style={[styles.sectionSubtitle, { color: theme.colors.placeHolderTextColor }]}>
-                Tap a device to unlink it
-              </Text>
-            </View>
-          </View>
-        }
-        ListEmptyComponent={
-          initialLoad ? renderSkeleton() : <EmptyDevices />
-        }
-      />
-    </Animated.View>
+      <Animated.View style={{ flex: 1, opacity: fadeAnim }}>
+        <FlatList
+          data={initialLoad ? [] : linkedDevices}
+          renderItem={renderDevice}
+          keyExtractor={keyExtractor}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          refreshControl={
+            <RefreshControl
+              refreshing={isFetching && !initialLoad}
+              onRefresh={fetchDevices}
+              colors={[brand]}
+              tintColor={brand}
+            />
+          }
+          ListHeaderComponent={ListHeader}
+          ListFooterComponent={ListFooter}
+        />
+      </Animated.View>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
+  container: { flex: 1 },
+
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 10,
-    gap: 10,
-    borderBottomWidth: 1,
-  },
-  backBtn: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  headerTitle: {
-    fontFamily: 'Roboto-SemiBold',
-    fontSize: 16,
-    textTransform: 'capitalize',
-  },
-  listContent: {
     paddingHorizontal: 14,
-    paddingBottom: 30,
+    paddingTop: 8,
+    paddingBottom: 12,
+    gap: 18,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  bannerContainer: {
-    width: '100%',
-    height: 250,
+  backBtn: { width: 32, height: 36, alignItems: 'flex-start', justifyContent: 'center' },
+  headerTitle: { fontFamily: 'Roboto-Medium', fontSize: 21, letterSpacing: -0.2 },
+
+  listContent: { paddingHorizontal: 22, paddingBottom: 40 },
+
+  heroWrap: { alignItems: 'center', marginTop: 18, marginBottom: 18 },
+
+  caption: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 15.5,
+    textAlign: 'center',
+    lineHeight: 22,
   },
-  bannerImage: {
-    width: '100%',
-    height: '100%',
-    resizeMode: 'contain',
+  learnMore: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 15.5,
+    textAlign: 'center',
+    marginTop: 4,
   },
+
   linkBtn: {
-    width: '100%',
-    height: 48,
-    flexDirection: 'row',
-    gap: 6,
+    marginTop: 26,
+    height: 52,
+    borderRadius: 26,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 40,
-    marginVertical: 10,
   },
   linkBtnText: {
     fontFamily: 'Roboto-Medium',
-    fontSize: 16,
+    fontSize: 16.5,
+    color: '#0B141A',
+    letterSpacing: 0.2,
   },
+
+  divider: {
+    height: StyleSheet.hairlineWidth,
+    marginTop: 28,
+    marginBottom: 22,
+  },
+
   sectionLabel: {
-    marginTop: 10,
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+    letterSpacing: 0.8,
+  },
+  sectionHint: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 15,
+    marginTop: 6,
     marginBottom: 6,
   },
-  sectionTitle: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 14,
-  },
-  sectionSubtitle: {
-    fontFamily: 'Roboto-Regular',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  // Skeleton
-  skeletonRow: {
+
+  footer: {
     flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 12,
-    paddingHorizontal: 4,
-    gap: 12,
+    justifyContent: 'center',
+    alignItems: 'flex-start',
+    marginTop: 26,
+    paddingHorizontal: 8,
   },
-  skeletonCircle: {
-    width: 50,
-    height: 50,
-    borderRadius: 25,
+  footerLock: { marginTop: 2, marginRight: 7 },
+  footerText: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13.5,
+    textAlign: 'center',
+    lineHeight: 20,
+    flexShrink: 1,
   },
-  skeletonLines: {
-    flex: 1,
-    gap: 6,
-  },
-  skeletonLine: {
-    height: 12,
-    borderRadius: 4,
-  },
+
+  // skeleton
+  skelGroup: { marginTop: 6 },
+  skelRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, gap: 18 },
+  skelCircle: { width: 50, height: 50, borderRadius: 25 },
+  skelLines: { flex: 1, gap: 8 },
+  skelLine: { height: 13, borderRadius: 5 },
 });

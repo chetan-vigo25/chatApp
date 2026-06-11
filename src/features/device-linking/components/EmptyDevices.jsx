@@ -1,22 +1,28 @@
 /**
- * Empty state shown when there are no linked devices.
+ * Empty state shown when there are no linked devices — a soft brand halo
+ * around a device glyph with a friendly hint.
  */
 import React from 'react';
-import { View, Text, StyleSheet, Image } from 'react-native';
-import { MaterialIcons } from '@expo/vector-icons';
+import { View, Text, StyleSheet } from 'react-native';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../../contexts/ThemeContext';
 
 export default function EmptyDevices() {
   const { theme } = useTheme();
+  const accent = theme.colors.themeColor;
 
   return (
     <View style={styles.container}>
-      <MaterialIcons name="devices" size={64} color={theme.colors.placeHolderTextColor} />
+      <View style={[styles.haloOuter, { backgroundColor: accent + '0D' }]}>
+        <View style={[styles.haloInner, { backgroundColor: accent + '14' }]}>
+          <MaterialCommunityIcons name="laptop" size={40} color={accent} />
+        </View>
+      </View>
       <Text style={[styles.title, { color: theme.colors.primaryTextColor }]}>
-        No Linked Devices
+        No devices linked yet
       </Text>
-      <Text style={[styles.subtitle, { color: theme.colors.placeHolderTextColor }]}>
-        Link your web or desktop client by scanning the QR code displayed on that device.
+      <Text style={[styles.subtitle, { color: theme.colors.secondaryTextColor }]}>
+        Open the web or desktop app, then scan the QR code to instantly link it here.
       </Text>
     </View>
   );
@@ -26,20 +32,35 @@ const styles = StyleSheet.create({
   container: {
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 40,
-    paddingVertical: 60,
+    paddingHorizontal: 44,
+    paddingVertical: 40,
+  },
+  haloOuter: {
+    width: 116,
+    height: 116,
+    borderRadius: 58,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  haloInner: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   title: {
     fontFamily: 'Roboto-SemiBold',
-    fontSize: 16,
-    marginTop: 16,
+    fontSize: 17,
+    marginTop: 20,
     textAlign: 'center',
+    letterSpacing: -0.3,
   },
   subtitle: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 13,
+    fontSize: 13.5,
     marginTop: 8,
     textAlign: 'center',
-    lineHeight: 19,
+    lineHeight: 20,
   },
 });

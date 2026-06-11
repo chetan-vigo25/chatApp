@@ -120,6 +120,29 @@ export default function Setting({ navigation }) {
     //   ],
     // },
     {
+      title: 'Account',
+      items: [
+        {
+          icon: 'person-circle-outline',
+          label: 'Privacy & Account',
+          subtitle: 'Privacy, devices, delete account',
+          onPress: () => navigation.navigate('PrivacyAccount'),
+        },
+        {
+          icon: 'help-buoy-outline',
+          label: 'Help & Support',
+          subtitle: 'FAQs, contact support, tickets',
+          onPress: () => navigation.navigate('HelpSupport'),
+        },
+        {
+          icon: 'flag-outline',
+          label: 'My Reports',
+          subtitle: 'Reports you have submitted',
+          onPress: () => navigation.navigate('MyReports'),
+        },
+      ],
+    },
+    {
       title: 'About',
       items: [
         {

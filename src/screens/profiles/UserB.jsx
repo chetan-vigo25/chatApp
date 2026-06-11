@@ -23,6 +23,7 @@ import useSaveContact from "../../hooks/useSaveContact";
 import { findInDeviceContacts } from "../../services/SaveContactService";
 import { useCall } from "../../calls/useCall";
 import { SafeAreaView } from 'react-native-safe-area-context';
+import ReportBottomSheet from "../../components/ReportBottomSheet";
 
 const { width } = Dimensions.get('window');
 const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
@@ -45,6 +46,24 @@ function HeroGradient() {
   );
 }
 
+// Dark scrim at the TOP of the hero so the white status-bar icons (time, signal,
+// battery) and the back button stay readable over a bright photo. Without it,
+// light-content status-bar icons vanish on a light image on both iOS & Android.
+const TOP_SCRIM_HEIGHT = STATUS_BAR_HEIGHT + 56;
+function HeroTopScrim() {
+  const bands = 8;
+  const bandH = TOP_SCRIM_HEIGHT / bands;
+  return (
+    <View pointerEvents="none" style={styles.heroTopScrimWrap}>
+      {Array.from({ length: bands }).map((_, i) => {
+        const t = i / (bands - 1); // 0 at top → 1 at bottom
+        const alpha = Math.max(0, 0.5 * (1 - t)); // darkest at the very top, fades to 0
+        return <View key={i} style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
+      })}
+    </View>
+  );
+}
+
 export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
   const { theme, isDarkMode } = useTheme();
@@ -52,6 +71,7 @@ export default function UserB({ navigation, route }) {
   const [peerProfile, setPeerProfile] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [scrolledPastHeader, setScrolledPastHeader] = useState(false);
+  const [reportVisible, setReportVisible] = useState(false);
 
   // Safe access to realtime context
   let muteChat, unmuteChat, chatList;
@@ -349,6 +369,7 @@ export default function UserB({ navigation, route }) {
             </View>
           )}
           <HeroGradient />
+          <HeroTopScrim />
           <View style={styles.heroOverlay}>
             <View style={styles.heroNameRow}>
               <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
@@ -498,7 +519,29 @@ export default function UserB({ navigation, route }) {
             </View>
           </View>
         )}
+
+        {/* ─── Report user ─── */}
+        {peerId ? (
+          <View style={[styles.card, { backgroundColor: cardBg }]}>
+            <TouchableOpacity
+              style={styles.card_row}
+              activeOpacity={0.6}
+              onPress={() => setReportVisible(true)}
+            >
+              <View style={[styles.rowIconWrap, { backgroundColor: '#EF444418' }]}>
+                <Ionicons name="flag-outline" size={19} color="#EF4444" />
+              </View>
+              <Text style={[styles.rowAction, { color: '#EF4444' }]}>Report {peer?.fullName || 'user'}</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
       </ScrollView>
+
+      <ReportBottomSheet
+        visible={reportVisible}
+        onClose={() => setReportVisible(false)}
+        payload={{ reportType: 'user', reportedUserId: peerId, chatId }}
+      />
     </View>
   );
 }
@@ -594,6 +637,12 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     justifyContent: 'flex-end',
+  },
+  heroTopScrimWrap: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
   },
   heroOverlay: {
     position: 'absolute',

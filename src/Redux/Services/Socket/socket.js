@@ -709,6 +709,17 @@ const attachCoreSocketListeners = (navigation) => {
 
   socket.on('user:blocked', (payload) => applyBlockState(true, payload));
   socket.on('user:unblocked', (payload) => applyBlockState(false, payload));
+
+  // Account-deletion lifecycle. When the server tears the account down it
+  // force-logs-out every device — wipe local state and return to auth so the
+  // app behaves like a fresh install (the regular 'logout' handler covers the
+  // base case; these add a clearer, deletion-specific message).
+  socket.on('account:logout:all:devices', (payload) => {
+    handleLogout(navigation, payload?.message || 'You have been logged out from all devices.');
+  });
+  socket.on('account:permanently:deleted', (payload) => {
+    handleLogout(navigation, payload?.message || 'Your account has been permanently deleted.');
+  });
 };
 
 export const getSocketStateSnapshot = () => ({ ...socketState });

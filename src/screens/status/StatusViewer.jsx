@@ -36,6 +36,7 @@ import { getSocket } from '../../Redux/Services/Socket/socket';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import { profileDetail } from '../../Redux/Reducer/Profile/Profile.reducer';
+import ReportBottomSheet from '../../components/ReportBottomSheet';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 const STORY_DURATION = 5000;
@@ -103,6 +104,7 @@ export default function StatusViewer({ navigation, route }) {
   const [paused, setPaused]               = useState(false);
   const [videoDuration, setVideoDuration] = useState(STORY_DURATION);
   const [showViewers, setShowViewers]     = useState(false);
+  const [reportVisible, setReportVisible] = useState(false);
   const [activeTab, setActiveTab]         = useState('views'); // 'views' | 'likes'
   const panelSlide = useRef(new Animated.Value(SH)).current;
   const [showReply, setShowReply]         = useState(false);
@@ -342,22 +344,8 @@ export default function StatusViewer({ navigation, route }) {
 
   const handleReport = useCallback(() => {
     pause();
-    Alert.alert(
-      'Report Status',
-      'Report this status as inappropriate?',
-      [
-        { text: 'Cancel', style: 'cancel', onPress: resume },
-        {
-          text: 'Report', style: 'destructive',
-          onPress: () => {
-            dispatch(reportStatusAction({ statusId: currentStatus._id, reason: 'inappropriate', details: '' }));
-            resume();
-          },
-        },
-      ],
-      { cancelable: false },
-    );
-  }, [currentStatus?._id, dispatch, pause, resume]);
+    setReportVisible(true);
+  }, [pause]);
 
   const handleHide = useCallback(() => {
     dispatch(hideStatusAction(currentStatus._id));
@@ -1072,6 +1060,16 @@ export default function StatusViewer({ navigation, route }) {
           </View>
         </View>
       </Modal>
+
+      <ReportBottomSheet
+        visible={reportVisible}
+        onClose={() => { setReportVisible(false); resume(); }}
+        payload={{
+          reportType: 'status',
+          statusId: currentStatus?._id,
+          reportedUserId: currentStatus?.ownerId || userId,
+        }}
+      />
     </View>
   );
 }

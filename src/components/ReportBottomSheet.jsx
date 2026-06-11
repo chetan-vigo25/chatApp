@@ -12,16 +12,29 @@ import {
   Platform,
   Alert,
 } from 'react-native';
-import { REPORT_REASONS } from '../constant/reportReasons';
+import { REPORT_REASONS, REPORT_REASONS_BY_TYPE, REPORT_TYPE_LABELS } from '../constant/reportReasons';
 import { submitReport } from '../services/ReportService';
 import { useTheme } from '../contexts/ThemeContext';
 
 const REASON_ICONS = {
   spam: '🚫',
   harassment: '😤',
+  abuse: '🤬',
   abusive_language: '🤬',
   scam: '⚠️',
+  violence: '💢',
+  adult_content: '🔞',
   inappropriate_content: '🔞',
+  fake_information: '📰',
+  fake_news: '📰',
+  fake_account: '🪪',
+  fake_profile: '🪪',
+  impersonation: '🎭',
+  hate_speech: '🗯️',
+  threats: '🔪',
+  nudity: '🔞',
+  copyright: '©️',
+  illegal_content: '🚔',
   other: '📝',
 };
 
@@ -39,6 +52,11 @@ export const ReportBottomSheet = ({
   const [description, setDescription] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [blockUser, setBlockUser] = useState(false);
+  const [deleteChat, setDeleteChat] = useState(false);
+
+  const reportType = payload?.reportType || 'user';
+  const reasons = REPORT_REASONS_BY_TYPE[reportType] || REPORT_REASONS;
 
   // Reset everything when modal opens
   React.useEffect(() => {
@@ -47,6 +65,8 @@ export const ReportBottomSheet = ({
       setDescription('');
       setError('');
       setLoading(false);
+      setBlockUser(false);
+      setDeleteChat(false);
       if (analytics?.report_opened) analytics.report_opened();
     }
   }, [visible]);
@@ -67,7 +87,7 @@ export const ReportBottomSheet = ({
       setLoading(false);
       if (res.success) {
         if (analytics?.report_submitted) analytics.report_submitted();
-        if (onSuccess) onSuccess();
+        if (onSuccess) onSuccess({ blockUser, deleteChat });
         onClose();
         setTimeout(() => {
           Alert.alert(
@@ -87,7 +107,7 @@ export const ReportBottomSheet = ({
     }
   };
 
-  const reportTypeLabel = payload?.reportType === 'message' ? 'Message' : 'User';
+  const reportTypeLabel = REPORT_TYPE_LABELS[reportType] || 'User';
 
   const themeColor = colors.themeColor;
 
@@ -197,7 +217,7 @@ export const ReportBottomSheet = ({
           >
             <Text style={[styles.sectionLabel, dynamicStyles.sectionLabel]}>Select a reason</Text>
             <View style={styles.reasonList}>
-              {REPORT_REASONS.map(r => {
+              {reasons.map(r => {
                 const isActive = reason === r.key;
                 return (
                   <TouchableOpacity
@@ -242,6 +262,45 @@ export const ReportBottomSheet = ({
               numberOfLines={3}
               textAlignVertical="top"
             />
+
+            {(payload?.canBlock || payload?.canDeleteChat) ? (
+              <View style={styles.optionList}>
+                {payload?.canBlock ? (
+                  <TouchableOpacity
+                    style={styles.optionRow}
+                    onPress={() => setBlockUser(v => !v)}
+                    disabled={loading}
+                    activeOpacity={0.7}
+                  >
+                    <View style={[
+                      styles.optionCheckbox,
+                      { borderColor: blockUser ? themeColor : (isDarkMode ? '#3A4750' : '#CCC') },
+                      blockUser && { backgroundColor: themeColor },
+                    ]}>
+                      {blockUser ? <Text style={styles.optionCheckMark}>✓</Text> : null}
+                    </View>
+                    <Text style={[styles.optionText, dynamicStyles.reasonText]}>Block user after report</Text>
+                  </TouchableOpacity>
+                ) : null}
+                {payload?.canDeleteChat ? (
+                  <TouchableOpacity
+                    style={styles.optionRow}
+                    onPress={() => setDeleteChat(v => !v)}
+                    disabled={loading}
+                    activeOpacity={0.7}
+                  >
+                    <View style={[
+                      styles.optionCheckbox,
+                      { borderColor: deleteChat ? themeColor : (isDarkMode ? '#3A4750' : '#CCC') },
+                      deleteChat && { backgroundColor: themeColor },
+                    ]}>
+                      {deleteChat ? <Text style={styles.optionCheckMark}>✓</Text> : null}
+                    </View>
+                    <Text style={[styles.optionText, dynamicStyles.reasonText]}>Delete chat after report</Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            ) : null}
 
             {error ? (
               <View style={[styles.errorContainer, dynamicStyles.errorContainer]}>
@@ -401,6 +460,33 @@ const styles = StyleSheet.create({
     fontSize: 14,
     minHeight: 80,
     marginBottom: 14,
+  },
+  optionList: {
+    marginBottom: 14,
+  },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  optionCheckbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  optionCheckMark: {
+    color: '#fff',
+    fontSize: 13,
+    fontFamily: 'Roboto-Bold',
+  },
+  optionText: {
+    fontSize: 14,
+    fontFamily: 'Roboto-Medium',
+    flex: 1,
   },
   errorContainer: {
     flexDirection: 'row',

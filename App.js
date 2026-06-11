@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView, SafeAreaProvider } from 'react-native-safe-area-context';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
 import RootNavigator from './src/navigations/RootNavigator';
 import { useFonts } from 'expo-font';
 import { ThemeProvider, useTheme } from './src/contexts/ThemeContext';
@@ -70,6 +71,7 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
+     <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
        <ThemeProvider>
          <NetworkProvider>
           <PaperProvider>
@@ -96,6 +98,7 @@ export default function App() {
           </PaperProvider>
          </NetworkProvider>
        </ThemeProvider>
+     </KeyboardProvider>
     </SafeAreaProvider>
   );
 }

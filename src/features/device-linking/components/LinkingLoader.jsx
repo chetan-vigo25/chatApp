@@ -64,7 +64,7 @@ export default function LinkingLoader({ visible, success }) {
       >
         {success ? (
           <Animated.View style={{ transform: [{ scale: checkScaleAnim }] }}>
-            <View style={styles.successCircle}>
+            <View style={[styles.successCircle, { backgroundColor: theme.colors.themeColor }]}>
               <MaterialIcons name="check" size={40} color="#fff" />
             </View>
           </Animated.View>

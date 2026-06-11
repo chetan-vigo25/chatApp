@@ -220,9 +220,9 @@ export default function EditProfile({ navigation, route }) {
       {/* Floating back button */}
       <View edges={['top']} style={styles.topBarSafe}>
         <View style={styles.topBarRow}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.floatingBtn} activeOpacity={0.7}>
+          {/* <TouchableOpacity onPress={() => navigation.goBack()} style={styles.floatingBtn} activeOpacity={0.7}>
             <FontAwesome6 name="arrow-left" size={18} color="#fff" />
-          </TouchableOpacity>
+          </TouchableOpacity> */}
           <Text style={styles.topBarTitle}>Edit Profile</Text>
           <View style={{ width: 40 }} />
         </View>

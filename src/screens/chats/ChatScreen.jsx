@@ -47,6 +47,9 @@ import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import Reanimated, { useAnimatedStyle } from 'react-native-reanimated';
+import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
 import { mediaDownloadSigned, toSecureMediaUri } from '../../utils/mediaService';
@@ -1068,7 +1071,15 @@ export default function ChatScreen({ navigation, route }) {
   const { isConnected, networkType } = useNetwork();
   const { width: windowWidth } = useWindowDimensions();
   const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const keyboardAnim = useRef(new Animated.Value(0)).current;
+  // Frame-synced keyboard height from react-native-keyboard-controller. Tracks the
+  // native keyboard 1:1 on iOS + Android (60fps, no jump). `height` is negative
+  // while the keyboard is up; we subtract the bottom inset so the input sits flush
+  // against the keyboard (no nav-bar gap). Clamped at 0 so resting layout is unchanged.
+  const { height: kbHeightSV } = useReanimatedKeyboardAnimation();
+  const insets = useSafeAreaInsets();
+  const rootKeyboardStyle = useAnimatedStyle(() => ({
+    paddingBottom: Math.max(0, Math.abs(kbHeightSV.value) - insets.bottom),
+  }), [insets.bottom]);
   const [isAtTop, setIsAtTop] = useState(false);
   const [isAtLatest, setIsAtLatest] = useState(true);
   const [showSearchBar, setShowSearchBar] = useState(false);
@@ -2953,63 +2964,30 @@ export default function ChatScreen({ navigation, route }) {
     },
   }), [closeMediaPanelAnimated, mediaBackdropAnim, mediaSheetAnim]);
 
-  // Keyboard handling — smooth animated transitions like WhatsApp
-  // iOS: keyboardWillShow fires BEFORE keyboard animates — we match its duration
-  // Android: keyboardDidShow fires AFTER keyboard is visible — set padding instantly
-  const kbHideTimerRef = useRef(null);
+  // The live keyboard movement is driven by react-native-keyboard-controller via
+  // `rootKeyboardStyle`. These listeners only (a) capture the resting keyboard
+  // height so the emoji panel can match it, and (b) keep focus/emoji UI state.
   useEffect(() => {
     const isIOS = Platform.OS === 'ios';
-    const showEvent = isIOS ? 'keyboardWillShow' : 'keyboardDidShow';
+    const showEvent = isIOS ? 'keyboardDidShow' : 'keyboardDidShow';
     const hideEvent = isIOS ? 'keyboardWillHide' : 'keyboardDidHide';
 
     const showSub = Keyboard.addListener(showEvent, (event) => {
-      if (kbHideTimerRef.current) {
-        clearTimeout(kbHideTimerRef.current);
-        kbHideTimerRef.current = null;
-      }
       const nextHeight = event?.endCoordinates?.height || 0;
-      setKeyboardHeight(nextHeight);
+      if (nextHeight > 0) setKeyboardHeight(nextHeight);
       setIsInputFocused(true);
       setShowEmojiPanel(false);
-
-      if (isIOS) {
-        Animated.timing(keyboardAnim, {
-          toValue: nextHeight,
-          duration: event?.duration || 250,
-          useNativeDriver: false,
-        }).start();
-      } else {
-        // Android with edge-to-edge: adjustResize keeps header visible,
-        // but we still need manual padding to push input above keyboard
-        keyboardAnim.setValue(nextHeight);
-      }
     });
 
-    const hideSub = Keyboard.addListener(hideEvent, (event) => {
-      if (isIOS) {
-        kbHideTimerRef.current = setTimeout(() => {
-          kbHideTimerRef.current = null;
-          setKeyboardHeight((prev) => prev);
-          setIsInputFocused(false);
-          Animated.timing(keyboardAnim, {
-            toValue: 0,
-            duration: event?.duration || 250,
-            useNativeDriver: false,
-          }).start();
-        }, 80);
-      } else {
-        // Android: snap padding to 0
-        setIsInputFocused(false);
-        keyboardAnim.setValue(0);
-      }
+    const hideSub = Keyboard.addListener(hideEvent, () => {
+      setIsInputFocused(false);
     });
 
     return () => {
       showSub.remove();
       hideSub.remove();
-      if (kbHideTimerRef.current) clearTimeout(kbHideTimerRef.current);
     };
-  }, [keyboardAnim]);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -4935,7 +4913,7 @@ export default function ChatScreen({ navigation, route }) {
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <Animated.View style={{ flex: 1, paddingBottom: keyboardAnim }}>
+      <Reanimated.View style={[{ flex: 1 }, rootKeyboardStyle]}>
         <ChatWallpaper isDarkMode={isDarkMode} />
         
         {/* Header */}
@@ -6176,7 +6154,7 @@ export default function ChatScreen({ navigation, route }) {
       />
 
       {/* Schedule Time Picker is rendered inside ChatInputBar */}
-      </Animated.View>
+      </Reanimated.View>
     </View>
   );
 }

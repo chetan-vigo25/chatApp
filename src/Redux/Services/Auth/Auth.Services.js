@@ -71,7 +71,7 @@ export async function resendOtpService(fullPhoneNumber) {
         if (response.statusCode === 200) {
           console.log("new OTP",response.data);
           // return response;
-          return { otpMessage: response.message };
+          return { otpMessage: response.message, otpData: response.data };
         } else {
           showToast(response.message)
           return Promise.reject(response.message);

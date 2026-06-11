@@ -23,6 +23,14 @@ import PersonalInfoEdit from "../screens/profiles/PersonalInfoEdit";
 import UserB from "../screens/profiles/UserB";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
 import ChatPrivacy from "../screens/profiles/ChatPrivacy";
+import PrivacyAccount from "../screens/profiles/PrivacyAccount";
+import DeleteAccount from "../screens/profiles/DeleteAccount";
+import HelpSupport from "../screens/support/HelpSupport";
+import SupportFaqs from "../screens/support/SupportFaqs";
+import CreateTicket from "../screens/support/CreateTicket";
+import MyTickets from "../screens/support/MyTickets";
+import TicketChat from "../screens/support/TicketChat";
+import MyReports from "../screens/profiles/MyReports";
 import DeletedChatsPassword from "../screens/profiles/DeletedChatsPassword";
 import TwoStepPassword from "../screens/profiles/TwoStepPassword";
 import DeletedChatsSelector from "../screens/profiles/DeletedChatsSelector";
@@ -113,6 +121,14 @@ export default function RootNavigator() {
           <Stack.Screen name="UserB" component={UserB} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
           <Stack.Screen name="ChatPrivacy" component={ChatPrivacy} />
+          <Stack.Screen name="PrivacyAccount" component={PrivacyAccount} />
+          <Stack.Screen name="DeleteAccount" component={DeleteAccount} />
+          <Stack.Screen name="HelpSupport" component={HelpSupport} />
+          <Stack.Screen name="SupportFaqs" component={SupportFaqs} />
+          <Stack.Screen name="CreateTicket" component={CreateTicket} />
+          <Stack.Screen name="MyTickets" component={MyTickets} />
+          <Stack.Screen name="TicketChat" component={TicketChat} />
+          <Stack.Screen name="MyReports" component={MyReports} />
           <Stack.Screen name="DeletedChatsPassword" component={DeletedChatsPassword} />
           <Stack.Screen name="TwoStepPassword" component={TwoStepPassword} />
           <Stack.Screen

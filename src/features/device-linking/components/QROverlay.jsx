@@ -6,10 +6,11 @@ import React from 'react';
 import { View, StyleSheet, Dimensions, Animated } from 'react-native';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const SCAN_SIZE = SCREEN_WIDTH * 0.7;
-const CORNER_SIZE = 28;
-const CORNER_WIDTH = 3;
-const ACCENT = '#25D366';
+const SCAN_SIZE = SCREEN_WIDTH * 0.72;
+const CORNER_SIZE = 36;
+const CORNER_WIDTH = 4;
+const CORNER_RADIUS = 18;
+const ACCENT = '#00A884';
 
 export default function QROverlay({ scanLineAnim, showScanLine = true }) {
   const translateY = scanLineAnim
@@ -91,6 +92,7 @@ const styles = StyleSheet.create({
     left: 0,
     borderTopWidth: CORNER_WIDTH,
     borderLeftWidth: CORNER_WIDTH,
+    borderTopLeftRadius: CORNER_RADIUS,
     borderColor: ACCENT,
   },
   tr: {
@@ -98,6 +100,7 @@ const styles = StyleSheet.create({
     right: 0,
     borderTopWidth: CORNER_WIDTH,
     borderRightWidth: CORNER_WIDTH,
+    borderTopRightRadius: CORNER_RADIUS,
     borderColor: ACCENT,
   },
   bl: {
@@ -105,6 +108,7 @@ const styles = StyleSheet.create({
     left: 0,
     borderBottomWidth: CORNER_WIDTH,
     borderLeftWidth: CORNER_WIDTH,
+    borderBottomLeftRadius: CORNER_RADIUS,
     borderColor: ACCENT,
   },
   br: {
@@ -112,6 +116,7 @@ const styles = StyleSheet.create({
     right: 0,
     borderBottomWidth: CORNER_WIDTH,
     borderRightWidth: CORNER_WIDTH,
+    borderBottomRightRadius: CORNER_RADIUS,
     borderColor: ACCENT,
   },
   scanLine: {

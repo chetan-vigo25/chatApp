@@ -35,7 +35,7 @@ export const resendOtp = createAsyncThunk(
     try {
       const response = await authServices.resendOtpService(fullPhoneNumber);
       // console.log("resend otp responce",response)
-      return response.otpMessage; // Return the OTP message as the payload
+      return response; // { otpMessage, otpData } — otpData carries the new OTP
     } catch (error) {
       return rejectWithValue(error.message);
     }
@@ -170,7 +170,7 @@ const authSlice = createSlice({
       })
       .addCase(resendOtp.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.otpMessage = action.payload; 
+        state.otpMessage = action.payload?.otpMessage ?? action.payload;
         state.error = null;
       })
       .addCase(resendOtp.rejected, (state, action) => {

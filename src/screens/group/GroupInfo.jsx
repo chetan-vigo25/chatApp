@@ -19,6 +19,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { hashPhoneForMatch, onlyDigits } from '../../utils/savedContactName';
+import ReportBottomSheet from '../../components/ReportBottomSheet';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
@@ -79,9 +80,31 @@ export default function GroupInfo({ navigation, route }) {
     return saved || u.fullName;
   };
   const fadeAnim = useRef(new Animated.Value(0)).current;
+  // Scroll position drives the collapsing header: the solid header bar + title
+  // fade in once the hero has scrolled mostly off, so the back/edit buttons
+  // never hover detached over the white content below.
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const headerSolidOpacity = scrollY.interpolate({
+    inputRange: [HERO_H * 0.3, HERO_H * 0.55],
+    outputRange: [0, 1],
+    extrapolate: 'clamp',
+  });
+  const headerTitleOpacity = scrollY.interpolate({
+    inputRange: [HERO_H * 0.42, HERO_H * 0.62],
+    outputRange: [0, 1],
+    extrapolate: 'clamp',
+  });
+  // Inverse of the solid fade — drives the over-hero (white icon on dark circle)
+  // button layer so it fades OUT as the clean solid-header layer fades in.
+  const headerHeroOpacity = scrollY.interpolate({
+    inputRange: [HERO_H * 0.3, HERO_H * 0.55],
+    outputRange: [1, 0],
+    extrapolate: 'clamp',
+  });
   const membersRef = useRef([]);
 
   const [currentUserId, setCurrentUserId] = useState(null);
+  const [reportVisible, setReportVisible] = useState(false);
   const [memberActionVisible, setMemberActionVisible] = useState(false);
   const [selectedMember, setSelectedMember] = useState(null);
   const [transferModalVisible, setTransferModalVisible] = useState(false);
@@ -355,27 +378,68 @@ export default function GroupInfo({ navigation, route }) {
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
       <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
 
-      {/* ─── Floating header over hero — explicit top inset so the back button
-           always sits below the (translucent) status bar, never under it ─── */}
-      {/* Android: the translucent status bar lets the hero bleed under it, and the
-          root SafeAreaView reports no top inset there — so push the header down by
-          the status-bar height. iOS: the root SafeAreaView already insets the top,
-          so only a small gap is needed (avoids a double-counted notch-height gap). */}
-      <View style={[styles.floatingHeaderSafe, { paddingTop: Platform.OS === 'android' ? Math.max(insets.top, STATUS_H) : 8 }]}>
+      {/* ─── Floating header over hero — a small gap below the system status bar.
+           The root SafeAreaView (RootNavigator) already insets the top on BOTH
+           iOS and Android (edge-to-edge), so we add only a small constant here.
+           Using the full status-bar height on Android double-counted the inset
+           and left a large empty gap above the header. ─── */}
+      <View style={[styles.floatingHeaderSafe, { paddingTop: 8 }]}>
+        {/* Solid header surface — transparent over the hero, fades in on scroll */}
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            StyleSheet.absoluteFill,
+            {
+              backgroundColor: pageBg,
+              opacity: headerSolidOpacity,
+              borderBottomWidth: StyleSheet.hairlineWidth,
+              borderBottomColor: theme.colors.borderColor || 'rgba(0,0,0,0.08)',
+              elevation: 4,
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: 2 },
+              shadowOpacity: 0.08,
+              shadowRadius: 4,
+            },
+          ]}
+        />
         <View style={styles.floatingHeaderRow}>
-          <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.7} style={styles.floatingBtn}>
-            <FontAwesome6 name="arrow-left" size={18} color="#fff" />
+          <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.7} style={styles.floatingBtnTouch}>
+            {/* over the hero: white icon on a dark translucent circle */}
+            <Animated.View style={[styles.floatingBtnLayer, styles.floatingBtnCircle, { opacity: headerHeroOpacity }]}>
+              <FontAwesome6 name="arrow-left" size={18} color="#fff" />
+            </Animated.View>
+            {/* on the solid header: clean dark icon, no circle */}
+            <Animated.View pointerEvents="none" style={[styles.floatingBtnLayer, { opacity: headerSolidOpacity }]}>
+              <FontAwesome6 name="arrow-left" size={20} color={theme.colors.primaryTextColor} />
+            </Animated.View>
           </TouchableOpacity>
-          <View style={{ flex: 1 }} />
-          {canEditGroup && (
-            <TouchableOpacity onPress={() => navigation.navigate('EditGroup', { groupId })} activeOpacity={0.7} style={styles.floatingBtn}>
-              <Ionicons name="create-outline" size={18} color="#fff" />
+          <Animated.Text
+            numberOfLines={1}
+            style={[styles.floatingHeaderTitle, { color: theme.colors.primaryTextColor, opacity: headerTitleOpacity }]}
+          >
+            {groupName}
+          </Animated.Text>
+          {canEditGroup ? (
+            <TouchableOpacity onPress={() => navigation.navigate('EditGroup', { groupId })} activeOpacity={0.7} style={styles.floatingBtnTouch}>
+              <Animated.View style={[styles.floatingBtnLayer, styles.floatingBtnCircle, { opacity: headerHeroOpacity }]}>
+                <Ionicons name="create-outline" size={18} color="#fff" />
+              </Animated.View>
+              <Animated.View pointerEvents="none" style={[styles.floatingBtnLayer, { opacity: headerSolidOpacity }]}>
+                <Ionicons name="create-outline" size={22} color={theme.colors.primaryTextColor} />
+              </Animated.View>
             </TouchableOpacity>
+          ) : (
+            <View style={styles.floatingBtnTouch} />
           )}
         </View>
       </View>
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 100 }}>
+      <Animated.ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: 100 }}
+        scrollEventThrottle={16}
+        onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: true })}
+      >
 
         {/* ═══ TELEGRAM-STYLE GROUP HERO ═══ */}
         <View style={[styles.tgHero, { backgroundColor: groupAvatarUrl ? '#000' : getAvatarColor(groupName) }]}>
@@ -503,6 +567,13 @@ export default function GroupInfo({ navigation, route }) {
             </TouchableOpacity>
           )}
 
+          <TouchableOpacity onPress={() => setReportVisible(true)} activeOpacity={0.6} style={styles.actionRow}>
+            <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
+              <Ionicons name="flag-outline" size={20} color="#E53935" />
+            </View>
+            <Text style={[styles.actionLabel, { color: '#E53935' }]}>Report group</Text>
+          </TouchableOpacity>
+
           <TouchableOpacity onPress={handleExitGroup} activeOpacity={0.6} style={styles.actionRow}>
             <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
               <Ionicons name="exit-outline" size={20} color="#E53935" />
@@ -519,7 +590,13 @@ export default function GroupInfo({ navigation, route }) {
             </TouchableOpacity>
           )}
         </View>
-      </ScrollView>
+      </Animated.ScrollView>
+
+      <ReportBottomSheet
+        visible={reportVisible}
+        onClose={() => setReportVisible(false)}
+        payload={{ reportType: 'group', groupId }}
+      />
 
       {/* ═══ MEMBER ACTION MODAL ═══ */}
       <Modal transparent visible={memberActionVisible} onRequestClose={() => { setMemberActionVisible(false); setSelectedMember(null); }} animationType="fade">
@@ -627,7 +704,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 10,
-    paddingTop: 4,
   },
   floatingBtn: {
     width: 40,
@@ -636,6 +712,31 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.35)',
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  // Cross-fading header button (over-hero ↔ solid-header)
+  floatingBtnTouch: {
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  floatingBtnLayer: {
+    position: 'absolute',
+    width: 40,
+    height: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  floatingBtnCircle: {
+    borderRadius: 20,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+  },
+  floatingHeaderTitle: {
+    flex: 1,
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 17,
+    marginHorizontal: 12,
+    textTransform: 'capitalize',
   },
 
   // Telegram-style hero

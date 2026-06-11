@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { StyleSheet, View, Text, TouchableOpacity, Animated, Alert, Platform, ToastAndroid, ActivityIndicator, Modal } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../contexts/ThemeContext";
@@ -42,31 +42,36 @@ export default function Otp({ navigation, route }) {
     const bannerSlideAnim = useRef(new Animated.Value(-200)).current;
     const bannerOpacity = useRef(new Animated.Value(0)).current;
 
+    // Slide the in-app OTP banner in with a fresh code. Reused on first mount
+    // (initialOtp) and after a successful resend so the new code is shown again.
+    const showOtpBanner = useCallback((code, delay = 300) => {
+      if (!code) return;
+      setBannerOtp(String(code));
+      setOtpBannerVisible(true);
+      bannerSlideAnim.setValue(-200);
+      bannerOpacity.setValue(0);
+      // Small delay so the screen (or toast) renders first
+      setTimeout(() => {
+        Animated.parallel([
+          Animated.spring(bannerSlideAnim, {
+            toValue: 0,
+            useNativeDriver: true,
+            tension: 60,
+            friction: 9,
+          }),
+          Animated.timing(bannerOpacity, {
+            toValue: 1,
+            duration: 300,
+            useNativeDriver: true,
+          }),
+        ]).start();
+      }, delay);
+    }, [bannerSlideAnim, bannerOpacity]);
+
     // Show OTP banner when screen opens with a generated OTP
     useEffect(() => {
-      if (initialOtp) {
-        setBannerOtp(String(initialOtp));
-        setOtpBannerVisible(true);
-        bannerSlideAnim.setValue(-200);
-        bannerOpacity.setValue(0);
-        // Small delay so the screen renders first
-        setTimeout(() => {
-          Animated.parallel([
-            Animated.spring(bannerSlideAnim, {
-              toValue: 0,
-              useNativeDriver: true,
-              tension: 60,
-              friction: 9,
-            }),
-            Animated.timing(bannerOpacity, {
-              toValue: 1,
-              duration: 300,
-              useNativeDriver: true,
-            }),
-          ]).start();
-        }, 300);
-      }
-    }, [initialOtp]);
+      showOtpBanner(initialOtp);
+    }, [initialOtp, showOtpBanner]);
 
     const dismissBanner = () => {
       Animated.parallel([
@@ -241,12 +246,17 @@ export default function Otp({ navigation, route }) {
         
           dispatch(resendOtp({ fullPhoneNumber }))
             .unwrap()
-            .then((otpMessage) => {
+            .then((payload) => {
+              const otpMessage = payload?.otpMessage ?? payload;
+              const data = payload?.otpData;
+              const newOtp = data?.otp || data?.code || data;
               startOtpTimer(60);
               console.log("OTP Resend:", otpMessage);
               showToast(otpMessage);
               otpInputRef.current?.clear();
               setOtp("");
+              // Re-show the in-app banner with the newly generated code
+              showOtpBanner(newOtp);
             })
             .catch((error) => {
               console.error("OTP Resend Failed:", error);

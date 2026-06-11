@@ -31,7 +31,7 @@ export default function AddGroupMembers({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
   const { addGroupMembers } = useRealtimeChat();
-  const { matchedRegistered = [], isSyncing } = useContactSync();
+  const { matchedRegistered = [], isSyncing, refreshContacts } = useContactSync();
 
   const groupId = route.params?.groupId;
   const existingMemberIds = route.params?.existingMemberIds || [];
@@ -72,6 +72,16 @@ export default function AddGroupMembers({ navigation, route }) {
     (userId) => selectedContacts.some((c) => c.userId === userId),
     [selectedContacts]
   );
+
+  // Re-sync contacts from the server so newly-registered contacts appear in the
+  // list. Uses the same refreshContacts() the rest of the app uses; the list
+  // (availableContacts) recomputes automatically when matchedRegistered updates.
+  const handleRefreshContacts = useCallback(() => {
+    if (isSyncing) return;
+    Promise.resolve(refreshContacts?.({ fallbackToSync: true }))
+      .then(() => showToast('Contacts refreshed'))
+      .catch(() => showToast('Could not refresh contacts'));
+  }, [isSyncing, refreshContacts]);
 
   const handleAddMembers = () => {
     if (selectedContacts.length === 0) return;
@@ -167,6 +177,19 @@ export default function AddGroupMembers({ navigation, route }) {
               : `${availableContacts.length} contacts available`}
           </Text>
         </View>
+        <TouchableOpacity
+          onPress={handleRefreshContacts}
+          activeOpacity={0.6}
+          disabled={isSyncing}
+          style={styles.headerBtn}
+          accessibilityLabel="Refresh contacts"
+        >
+          {isSyncing ? (
+            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+          ) : (
+            <Ionicons name="refresh" size={22} color={theme.colors.primaryTextColor} />
+          )}
+        </TouchableOpacity>
       </View>
 
       {/* Selected contacts bar */}

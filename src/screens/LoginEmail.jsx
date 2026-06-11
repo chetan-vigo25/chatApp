@@ -120,13 +120,13 @@ export default function LoginEmail({ navigation }) {
     <View style={[styles.root, { backgroundColor: bg }]}>
       {/* Top bar */}
       <View style={styles.topBar}>
-        <TouchableOpacity
+        {/* <TouchableOpacity
           onPress={() => navigation?.goBack?.()}
           hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
           activeOpacity={0.6}
         >
           <Ionicons name="arrow-back" size={24} color={secondaryText} />
-        </TouchableOpacity>
+        </TouchableOpacity> */}
         <Text style={[styles.topTitle, { color: accent }]} numberOfLines={1}>Sign in</Text>
         <View style={styles.topSpacer} />
       </View>
