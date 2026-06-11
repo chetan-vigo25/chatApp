@@ -51,14 +51,16 @@ function HeroGradient() {
 // light-content status-bar icons vanish on a light image on both iOS & Android.
 const TOP_SCRIM_HEIGHT = STATUS_BAR_HEIGHT + 56;
 function HeroTopScrim() {
-  const bands = 8;
-  const bandH = TOP_SCRIM_HEIGHT / bands;
   return (
     <View pointerEvents="none" style={styles.heroTopScrimWrap}>
-      {Array.from({ length: bands }).map((_, i) => {
-        const t = i / (bands - 1); // 0 at top → 1 at bottom
-        const alpha = Math.max(0, 0.5 * (1 - t)); // darkest at the very top, fades to 0
-        return <View key={i} style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
+      {/* Solid-ish dark band directly behind the status bar icons (time/signal/
+          battery) so white light-content icons stay readable over a busy photo. */}
+      <View style={{ height: STATUS_BAR_HEIGHT + 6, backgroundColor: 'rgba(0,0,0,0.5)' }} />
+      {/* Short fade-out below it so the band blends into the photo. */}
+      {Array.from({ length: 9 }).map((_, i) => {
+        const t = (i + 1) / 9;
+        const alpha = 0.5 * (1 - t);
+        return <View key={i} style={{ height: 6, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
       })}
     </View>
   );
@@ -99,6 +101,17 @@ export default function UserB({ navigation, route }) {
   const [localContact, setLocalContact] = useState(null);
   const [isInDeviceBook, setIsInDeviceBook] = useState(false);
   const [reloadVersion, setReloadVersion] = useState(0);
+
+  // Force the system status bar visible whenever this screen is focused. Some
+  // other screens (e.g. the status viewer) hide it; declarative <StatusBar
+  // hidden={false}> can lose to a leaked entry, so we also assert it
+  // imperatively on focus to guarantee time/signal/battery are shown here.
+  useEffect(() => {
+    const show = () => StatusBar.setHidden(false, 'fade');
+    show();
+    const unsub = navigation.addListener('focus', show);
+    return unsub;
+  }, [navigation]);
 
   // Fetch peer profile into local state (not Redux) to avoid polluting shared profileData
   useEffect(() => {
@@ -309,7 +322,7 @@ export default function UserB({ navigation, route }) {
 
   return (
     <View style={[styles.container, { backgroundColor: pageBg }]}>
-      <StatusBar translucent backgroundColor="transparent" barStyle={scrolledPastHeader && !isDarkMode ? "dark-content" : "light-content"} />
+      <StatusBar hidden={false} translucent backgroundColor="transparent" barStyle={scrolledPastHeader && !isDarkMode ? "dark-content" : "light-content"} />
 
       {/* Floating top bar — transparent over the photo, solid once scrolled */}
       <View

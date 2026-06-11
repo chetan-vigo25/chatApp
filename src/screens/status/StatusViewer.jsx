@@ -116,6 +116,25 @@ export default function StatusViewer({ navigation, route }) {
   // So KeyboardAvoidingView can't lift it — we track the keyboard height
   // ourselves and offset the sheet above the keyboard manually.
   const [kbHeight, setKbHeight] = useState(0);
+  // Hide the system status bar ONLY while this viewer is focused, and always
+  // restore it on blur/unmount. Using the declarative `<StatusBar hidden />`
+  // leaked the hidden state onto the next screen (its prop persisted in RN's
+  // merge stack while this screen stayed mounted underneath), so other screens
+  // — e.g. a contact profile — opened with no time/battery/signal. This
+  // focus-scoped imperative control guarantees the bar comes back.
+  useEffect(() => {
+    const hideBar = () => StatusBar.setHidden(true, 'fade');
+    const showBar = () => StatusBar.setHidden(false, 'fade');
+    hideBar();
+    const focusSub = navigation.addListener('focus', hideBar);
+    const blurSub = navigation.addListener('blur', showBar);
+    return () => {
+      showBar();
+      focusSub();
+      blurSub();
+    };
+  }, [navigation]);
+
   useEffect(() => {
     if (!showReply) { setKbHeight(0); return; }
     const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
@@ -598,7 +617,6 @@ export default function StatusViewer({ navigation, route }) {
 
   return (
     <View style={styles.root}>
-      <StatusBar hidden />
 
       {/* Content */}
       {renderContent()}
