@@ -35,13 +35,16 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
-import { useSelector } from "react-redux";
+import { useSelector, useDispatch } from "react-redux";
+import { unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
+import UserDetailsSheet from "../../components/UserDetailsSheet";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { BlurView } from 'expo-blur';
+import Svg, { Defs, LinearGradient as SvgLinearGradient, Stop, Circle as SvgCircle } from 'react-native-svg';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
@@ -63,6 +66,7 @@ import ReplyBubble from '../../components/ReplyBubble';
 import StatusReplyPreview from '../../components/StatusReplyPreview';
 import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import LocationBubble from '../../components/LocationBubble';
+import AlbumMessage from '../../components/AlbumMessage';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
@@ -87,15 +91,49 @@ const RICH_PARSE_CACHE_LIMIT = 500;
 const MEDIA_PANEL_SHEET_HEIGHT = 360;
 const AUDIO_RECORDING_MAX_MS = 120000;
 
+// WhatsApp-style attachment tiles: solid two-tone gradient discs with a white
+// glyph. `grad` is [topColor, bottomColor] for the vertical gradient fill.
 const MEDIA_PANEL_OPTIONS = [
-  { key: 'gallery', label: 'Photo', icon: 'images', iconFamily: 'Ionicons', color: '#0EA5FF' },
-  { key: 'camera', label: 'Camera', icon: 'camera', iconFamily: 'Ionicons', color: '#F43F5E' },
-  { key: 'video', label: 'Video', icon: 'videocam', iconFamily: 'Ionicons', color: '#22C55E' },
-  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', color: '#8B5CF6' },
-  { key: 'audio', label: 'Audio', icon: 'headset', iconFamily: 'Ionicons', color: '#F97316' },
-  { key: 'contact', label: 'Contact', icon: 'person', iconFamily: 'Ionicons', color: '#06B6D4' },
-  { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', color: '#10B981' },
+  { key: 'gallery', label: 'Gallery', icon: 'images', iconFamily: 'Ionicons', grad: ['#C13BCB', '#8A2BE6'], color: '#A431D8' },
+  { key: 'camera', label: 'Camera', icon: 'camera', iconFamily: 'Ionicons', grad: ['#FF5E7E', '#F0264B'], color: '#F73A5C' },
+  { key: 'video', label: 'Video', icon: 'videocam', iconFamily: 'Ionicons', grad: ['#FF7A59', '#F4452B'], color: '#F75A3A' },
+  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', grad: ['#7E72FF', '#5B43E8'], color: '#6B57F0' },
+  { key: 'audio', label: 'Audio', icon: 'headset', iconFamily: 'Ionicons', grad: ['#FFA836', '#FF7A00'], color: '#FF8A1B' },
+  { key: 'contact', label: 'Contact', icon: 'person', iconFamily: 'Ionicons', grad: ['#37A4FF', '#137FE8'], color: '#1E8FF5' },
+  { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', grad: ['#3BD17A', '#16A34A'], color: '#23B85F' },
 ];
+
+// WhatsApp attachment disc — a true vertical gradient circle (SVG) with a white
+// glyph centred on top. Drop shadow tinted to the disc colour gives the lift.
+function GradientDisc({ id, grad = ['#888', '#666'], color = '#777', icon, size = 54 }) {
+  const gid = `mediaDisc-${id}`;
+  return (
+    <View
+      style={{
+        width: size,
+        height: size,
+        alignItems: 'center',
+        justifyContent: 'center',
+        shadowColor: color,
+        shadowOpacity: 0.4,
+        shadowRadius: 7,
+        shadowOffset: { width: 0, height: 4 },
+        elevation: 5,
+      }}
+    >
+      <Svg width={size} height={size} style={StyleSheet.absoluteFill}>
+        <Defs>
+          <SvgLinearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+            <Stop offset="0" stopColor={grad[0]} />
+            <Stop offset="1" stopColor={grad[1]} />
+          </SvgLinearGradient>
+        </Defs>
+        <SvgCircle cx={size / 2} cy={size / 2} r={size / 2} fill={`url(#${gid})`} />
+      </Svg>
+      <Ionicons name={icon} size={Math.round(size * 0.45)} color="#fff" />
+    </View>
+  );
+}
 
 // Theme-aware chat wallpaper. Rendered as a tiled SVG doodle pattern
 // (WhatsApp-style) — see components/ChatWallpaper. No raster image assets.
@@ -310,19 +348,50 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
             }}
           >
             {pendingMedia ? (
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                <Image source={{ uri: pendingMedia.file.uri }} style={{ width: 34, height: 34, borderRadius: 8 }} />
-                <Text style={{ color: pendingTextColor, flex: 1, fontSize: 13 }} numberOfLines={2}>
-                  {pendingMedia.file.name || 'Media ready to send'}
-                </Text>
-                <TouchableOpacity
-                  onPress={onRemovePendingMedia}
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  accessibilityRole="button"
-                  accessibilityLabel="Remove selected media"
-                >
-                  <Ionicons name="close-circle" size={20} color={iconColor} />
-                </TouchableOpacity>
+              <View style={{ gap: 6 }}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                  {pendingMedia.isAlbum ? (
+                    <>
+                      <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                        {(pendingMedia.files || []).slice(0, 4).map((f, i) => (
+                          <Image
+                            key={`${f.uri}_${i}`}
+                            source={{ uri: f.uri }}
+                            style={{ width: 34, height: 34, borderRadius: 8, marginLeft: i === 0 ? 0 : -10, borderWidth: 1.5, borderColor: '#00000022' }}
+                          />
+                        ))}
+                      </View>
+                      <Text style={{ color: pendingTextColor, flex: 1, fontSize: 13 }} numberOfLines={1}>
+                        {(pendingMedia.files || []).length} items selected
+                      </Text>
+                    </>
+                  ) : (
+                    <>
+                      <Image source={{ uri: pendingMedia.file.uri }} style={{ width: 34, height: 34, borderRadius: 8 }} />
+                      <Text style={{ color: pendingTextColor, flex: 1, fontSize: 13 }} numberOfLines={2}>
+                        {pendingMedia.file.name || 'Media ready to send'}
+                      </Text>
+                    </>
+                  )}
+                  <TouchableOpacity
+                    onPress={onRemovePendingMedia}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityRole="button"
+                    accessibilityLabel="Remove selected media"
+                  >
+                    <Ionicons name="close-circle" size={20} color={iconColor} />
+                  </TouchableOpacity>
+                </View>
+                {pendingMedia.isAlbum ? (
+                  <TextInput
+                    placeholder="Add a caption..."
+                    value={text}
+                    onChangeText={onTextChange}
+                    placeholderTextColor={placeholderColor}
+                    accessibilityLabel="Album caption input"
+                    style={{ fontSize: 14, color: pendingTextColor, paddingVertical: 2 }}
+                  />
+                ) : null}
               </View>
             ) : (
               <TextInput
@@ -1095,6 +1164,8 @@ export default function ChatScreen({ navigation, route }) {
   // Delete-for-everyone confirmation modal (soft-deletes the chat on both sides)
   const [deleteEveryoneModalVisible, setDeleteEveryoneModalVisible] = useState(false);
   const [isDeletingEveryone, setIsDeletingEveryone] = useState(false);
+  // Draggable peer-details bottom sheet (opened by tapping the header avatar)
+  const [userSheetVisible, setUserSheetVisible] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [newMessagesCount, setNewMessagesCount] = useState(0);
   const [inputHeight, setInputHeight] = useState(34);
@@ -1567,6 +1638,7 @@ export default function ChatScreen({ navigation, route }) {
     closeMediaOptions,
     handlePickMedia,
     sendMedia,
+    sendMediaGroup,
     mediaViewer,
     closeMediaViewer,
     handleDownloadMedia,
@@ -1597,6 +1669,17 @@ export default function ChatScreen({ navigation, route }) {
   // A blocked user (set by an admin) can still browse chats but cannot send.
   // The server rejects sends too; this just gives immediate feedback.
   const amBlocked = useSelector((s) => s?.profile?.isBlocked);
+
+  // User-to-user (contact) block state for this 1-1 chat. `iBlockedPeer` hides
+  // the composer with an Unblock CTA; `peerBlockedMe` silently disables sending.
+  const chatPeerId = chatData?.peerUser?._id || chatData?.peerUserId || null;
+  const iBlockedPeer = useSelector((s) =>
+    chatPeerId ? (s?.block?.blockedIds || []).map(String).includes(String(chatPeerId)) : false,
+  );
+  const peerBlockedMe = useSelector((s) =>
+    chatPeerId ? (s?.block?.blockedByIds || []).map(String).includes(String(chatPeerId)) : false,
+  );
+  const blockDispatch = useDispatch();
 
   // Sync chatData to ref for callbacks declared before destructuring (web TDZ fix)
   useEffect(() => { chatDataRef.current = chatData; }, [chatData]);
@@ -2521,6 +2604,17 @@ export default function ChatScreen({ navigation, route }) {
       return;
     }
 
+    // Contact-block: if I blocked this peer, prompt to unblock first. If the peer
+    // blocked ME, do NOT reveal it (WhatsApp parity) — the send proceeds and the
+    // server silently drops it; the message just stays on a single "sent" tick.
+    if (!isGroupChat && iBlockedPeer) {
+      Alert.alert('You blocked this contact', 'Unblock them to send a message.', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Unblock', onPress: handleUnblockFromChat },
+      ]);
+      return;
+    }
+
     // Handle edit mode submission
     if (editingMessage) {
       if (text.trim()) {
@@ -2540,9 +2634,15 @@ export default function ChatScreen({ navigation, route }) {
     }
     if (pendingMedia) {
       const mediaToSend = pendingMedia;
+      const caption = text.trim();
       setPendingMedia(null);
       handleTextChange('');
-      await sendMedia(mediaToSend);
+      if (mediaToSend.isAlbum) {
+        // Multi-select → ONE WhatsApp-style album message (grid bubble)
+        await sendMediaGroup({ files: mediaToSend.files, caption });
+      } else {
+        await sendMedia(mediaToSend);
+      }
       return;
     }
     // Extract mentions before sending (text gets cleared after send)
@@ -3010,8 +3110,8 @@ export default function ChatScreen({ navigation, route }) {
 
     mediaBackdropAnim.setValue(0);
     mediaSheetAnim.setValue(MEDIA_PANEL_SHEET_HEIGHT);
-    // Set all entry anims to 1 immediately — no stagger delay
-    mediaOptionEntryAnims.forEach((anim) => anim.setValue(1));
+    // Tiles start hidden, then pop in with a brief stagger (WhatsApp reveal).
+    mediaOptionEntryAnims.forEach((anim) => anim.setValue(0));
 
     Animated.parallel([
       Animated.timing(mediaBackdropAnim, {
@@ -3027,6 +3127,19 @@ export default function ChatScreen({ navigation, route }) {
         useNativeDriver: true,
       }),
     ]).start();
+
+    Animated.stagger(
+      26,
+      mediaOptionEntryAnims.map((anim) =>
+        Animated.spring(anim, {
+          toValue: 1,
+          damping: 14,
+          stiffness: 240,
+          mass: 0.7,
+          useNativeDriver: true,
+        }),
+      ),
+    ).start();
   }, [showMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaOptionEntryAnims]);
 
   useEffect(() => () => {
@@ -3094,6 +3207,18 @@ export default function ChatScreen({ navigation, route }) {
       });
     } else {
       navigation.navigate('UserB', { item: chatData });
+    }
+  };
+
+  // Tapping the header profile photo opens a draggable bottom sheet with the
+  // peer's complete details + Message/Audio/Video actions. Groups keep the
+  // existing behaviour (open Group Info).
+  const handleOpenUserSheet = () => {
+    const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+    if (isGroupChat) {
+      handleOpenContactInfo();
+    } else {
+      setUserSheetVisible(true);
     }
   };
 
@@ -3468,7 +3593,7 @@ export default function ChatScreen({ navigation, route }) {
     const measuredLineCount = Number(richMessageLineCounts[messageKey] || 0);
     const showReadMore = measuredLineCount > RICH_TEXT_COLLAPSED_LINES;
 
-    const baseColor = isMyMessage ? '#FFFFFF' : theme.colors.primaryTextColor;
+    const baseColor = isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.primaryTextColor);
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
     const mentionColor = isMyMessage ? '#D8ECFF' : '#00A884';
     const msgMentions = msg?.mentions || msg?.payload?.mentions;
@@ -3555,10 +3680,10 @@ export default function ChatScreen({ navigation, route }) {
             position: 'absolute',
             opacity: 0,
             zIndex: -1,
-            fontSize: 14,
+            fontSize: 15,
             color: baseColor,
             fontFamily: 'Roboto-Regular',
-            lineHeight: 18,
+            lineHeight: 20,
           }}
         >
           {renderInlineTokens()}
@@ -3568,10 +3693,10 @@ export default function ChatScreen({ navigation, route }) {
           numberOfLines={!isExpanded && showReadMore ? RICH_TEXT_COLLAPSED_LINES : undefined}
           ellipsizeMode="tail"
           style={{
-            fontSize: 14,
+            fontSize: 15,
             color: baseColor,
             fontFamily: 'Roboto-Regular',
-            lineHeight: 18,
+            lineHeight: 20,
           }}
         >
           {renderInlineTokens()}
@@ -3597,6 +3722,63 @@ export default function ChatScreen({ navigation, route }) {
             </Text>
           </TouchableOpacity>
         )}
+      </View>
+    );
+  };
+
+  // WhatsApp delivery ticks (single/double check, blue on read). Shared by the
+  // inline text-bubble footer and the bottom status row.
+  const renderTicks = (msg, { size = 16 } = {}) => {
+    const c = 'rgba(233,237,239,0.65)';
+    switch (msg?.status) {
+      case 'scheduled':
+      case 'processing':
+      case 'pending':
+        return <Ionicons name="time-outline" size={14} color={c} style={{ marginLeft: 1 }} />;
+      case 'cancelled':
+        return <Ionicons name="close-circle" size={14} color="#FF8A80" style={{ marginLeft: 1 }} />;
+      case 'sending':
+        return <ActivityIndicator size={10} color={c} style={{ marginLeft: 1 }} />;
+      case 'uploaded':
+      case 'sent':
+        return <Ionicons name="checkmark" size={size} color={c} style={{ marginLeft: 1 }} />;
+      case 'delivered':
+        return <Ionicons name="checkmark-done" size={size} color={c} style={{ marginLeft: 1 }} />;
+      case 'seen':
+      case 'read':
+        return <Ionicons name="checkmark-done" size={size} color="#53BDEB" style={{ marginLeft: 1 }} />;
+      case 'failed':
+        return (
+          <TouchableOpacity onPress={() => resendMessage(msg)}>
+            <Ionicons name="alert-circle" size={14} color="#FF5252" style={{ marginLeft: 1 }} />
+          </TouchableOpacity>
+        );
+      default:
+        return null;
+    }
+  };
+
+  // The "edited · 10:56 AM ✓✓" footer. `inline` floats it into the bottom-right
+  // of a text bubble (WhatsApp tucks the meta onto the last line of text).
+  const renderMessageMeta = (msg, isMyMessage, { inline = false } = {}) => {
+    const showEdited = Boolean(msg?.isEdited || msg?.editedAt || msg?.edited);
+    const metaColor = isMyMessage ? 'rgba(233,237,239,0.6)' : theme.colors.placeHolderTextColor;
+    return (
+      <View
+        style={[
+          { flexDirection: 'row', alignItems: 'center', gap: 3 },
+          inline
+            ? { marginLeft: 'auto', paddingLeft: 10, marginBottom: -1 }
+            : { justifyContent: 'flex-end', marginTop: 1 },
+        ]}
+      >
+        {showEdited && (
+          <Text style={{ fontSize: 11, color: metaColor, fontFamily: 'Roboto-Regular', fontStyle: 'italic' }}>
+            edited
+          </Text>
+        )}
+        <Text style={{ fontSize: 11, color: metaColor, fontFamily: 'Roboto-Regular' }}>{msg.time}</Text>
+        {isMyMessage && renderTicks(msg)}
       </View>
     );
   };
@@ -4264,15 +4446,21 @@ export default function ChatScreen({ navigation, route }) {
     const isSystemMessage = (msg?.type === 'system' || msg?.messageType === 'system') && !isDeletedMessage;
     const deletedText = msg?.placeholderText || (isMyMessage ? 'You deleted this message' : 'This message was deleted');
 
-    const isImage = msg.type === 'image' || msg.mediaType === 'image' || msg.type === 'photo';
-    const isVideo = msg.type === 'video' || msg.mediaType === 'video';
+    // WhatsApp-style album: one message bubble carrying N attachments
+    const isAlbum = (msg.type === 'album' || msg.messageType === 'album'
+      || (Array.isArray(msg.mediaItems) && msg.mediaItems.length > 1)) && !isDeletedMessage;
+    const isImage = !isAlbum && (msg.type === 'image' || msg.mediaType === 'image' || msg.type === 'photo');
+    const isVideo = !isAlbum && (msg.type === 'video' || msg.mediaType === 'video');
     const isAudio = msg.type === 'audio' || msg.mediaType === 'audio';
     const isFile = msg.type === 'file' || msg.type === 'document';
     const isLocation = msg.type === 'location' || msg.mediaType === 'location';
     const isContact = msg.type === 'contact' || msg.mediaType === 'contact';
     const isCall = (msg.type === 'call' || msg.messageType === 'call') && !isDeletedMessage;
-    const isMediaMessage = isImage || isVideo || isAudio || isFile || isLocation || isContact;
+    const isMediaMessage = isAlbum || isImage || isVideo || isAudio || isFile || isLocation || isContact;
     const inlineMediaTime = !isDeletedMessage && (isImage || isVideo || isAudio || isLocation || isContact);
+    // Plain text bubbles tuck the time/ticks into the bottom-right of the last
+    // line (WhatsApp footer). Other types keep the separate bottom meta row.
+    const showInlineMeta = msg.type === 'text' && !isDeletedMessage;
 
     const dateBadgeKey = shouldShowDateAbove(msg, index, messages);
 
@@ -4418,22 +4606,28 @@ export default function ChatScreen({ navigation, route }) {
             </TouchableOpacity>
           )}
           <View style={{
+            // WhatsApp bubble geometry: ~7.5px corners with a small tail at the
+            // TOP corner on the sender's side (top-right for me, top-left for them).
             maxWidth: "80%",
-            borderRadius: 18,
+            borderRadius: 8,
+            borderTopRightRadius: isMyMessage ? 3 : 8,
+            borderTopLeftRadius: isMyMessage ? 8 : 3,
             backgroundColor: isDeletedMessage
-              ? theme.colors.menuBackground
-              : (isMyMessage ? chatColor : theme.colors.cardBackground),
-            borderBottomRightRadius: isMyMessage ? 6 : 18,
-            borderBottomLeftRadius: isMyMessage ? 18 : 6,
-            paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 3 : 8,
-            paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 12,
+              ? (isDarkMode ? '#182229' : theme.colors.menuBackground)
+              : (isMyMessage
+                  // Keep a user-customised bubble colour; otherwise WhatsApp's
+                  // dark-mode outgoing green (#005C4B), not the bright accent.
+                  ? ((chatColor && chatColor !== '#00A884') ? chatColor : '#005C4B')
+                  : (isDarkMode ? '#202C33' : theme.colors.cardBackground)),
+            paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 3 : 6,
+            paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 9,
             borderWidth: isHighlighted ? 2 : 0,
             borderColor: '#FFC107',
-            shadowColor: isMyMessage ? (chatColor || '#000') : '#000',
-            shadowOffset: { width: 0, height: 2 },
-            shadowOpacity: isMyMessage ? 0.18 : (isDarkMode ? 0 : 0.06),
-            shadowRadius: isMyMessage ? 6 : 4,
-            elevation: isMyMessage ? 2 : 1,
+            shadowColor: '#000',
+            shadowOffset: { width: 0, height: 1 },
+            shadowOpacity: isDarkMode ? 0.2 : 0.08,
+            shadowRadius: 1,
+            elevation: 1,
           }}>
             
             {/* Sender name for group chats */}
@@ -4441,7 +4635,7 @@ export default function ChatScreen({ navigation, route }) {
               <Text
                 numberOfLines={1}
                 style={{
-                  fontSize: 12,
+                  fontSize: 13,
                   color: getUserColor?.(msg.senderId) || theme.colors.themeColor,
                   fontFamily: "Roboto-SemiBold",
                   marginBottom: 2,
@@ -4595,9 +4789,16 @@ export default function ChatScreen({ navigation, route }) {
               );
             })()}
 
-            {/* TEXT MESSAGES */}
+            {/* TEXT MESSAGES — text flows, time/ticks tuck into the bottom-right
+                (WhatsApp). Short text → meta sits inline; long/multi-line text →
+                meta drops to the bottom-right corner. */}
             {msg.type === "text" && !isDeletedMessage && (
-              renderRichMessageText(msg, isMyMessage, messageKey)
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <View style={{ flexShrink: 1 }}>
+                  {renderRichMessageText(msg, isMyMessage, messageKey)}
+                </View>
+                {renderMessageMeta(msg, isMyMessage, { inline: true })}
+              </View>
             )}
             
             {/* DELETED MESSAGES */}
@@ -4615,6 +4816,39 @@ export default function ChatScreen({ navigation, route }) {
               </View>
             )}
   
+            {/* ALBUM (multiple media in one bubble) */}
+            {isAlbum && (
+              <>
+                <AlbumMessage
+                  message={msg}
+                  isMine={isMyMessage}
+                  onPressItem={(item) => {
+                    if (item?.uploadStatus === 'uploading' || item?.uploadStatus === 'pending') return;
+                    const uri = item?.localUri || item?.mediaUrl || item?.mediaThumbnailUrl;
+                    if (!uri) return;
+                    openMediaViewer(
+                      { ...msg, mediaUrl: item.mediaUrl || uri, mediaThumbnailUrl: item.mediaThumbnailUrl, localUri: item.localUri || null, mediaMeta: item.mediaMeta },
+                      uri,
+                      item.fileCategory === 'video' ? 'video' : 'image'
+                    );
+                  }}
+                />
+                {Boolean(msg.text) && (
+                  <Text style={{
+                    fontSize: 15,
+                    lineHeight: 20,
+                    color: isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.textColor),
+                    fontFamily: 'Roboto-Regular',
+                    marginTop: 5,
+                    paddingHorizontal: 4,
+                    maxWidth: 220,
+                  }}>
+                    {msg.text}
+                  </Text>
+                )}
+              </>
+            )}
+
             {/* MEDIA MESSAGES */}
             {!isDeletedMessage && isImage && renderImageMessage(msg, isMyMessage, progress, messageKey, downloadState)}
             {!isDeletedMessage && isVideo && renderVideoMessage(msg, isMyMessage, progress, messageKey, downloadState)}
@@ -4623,74 +4857,13 @@ export default function ChatScreen({ navigation, route }) {
             {!isDeletedMessage && isLocation && renderLocationMessage(msg, isMyMessage)}
             {!isDeletedMessage && isContact && renderContactMessage(msg, isMyMessage)}
   
-            {/* Message Status and Timestamp */}
-            <View style={{ 
-              flexDirection: "row", 
-              alignItems: "center", 
-              justifyContent: "flex-end", 
-              gap: 4,
-              marginTop: (msg.type !== 'text' && !isDeletedMessage) ? 4 : 2,
-            }}>
-              {!inlineMediaTime && !isDeletedMessage && Boolean(msg?.isEdited || msg?.editedAt || msg?.edited) && (
-                <Text style={{
-                  fontSize: 9,
-                  color: isMyMessage
-                    ? 'rgba(255,255,255,0.55)'
-                    : theme.colors.placeHolderTextColor,
-                  fontFamily: "Roboto-Regular",
-                  fontStyle: 'italic',
-                }}>
-                  edited
-                </Text>
-              )}
-              {!inlineMediaTime && (
-                <Text style={{
-                  fontSize: 9,
-                  color: isMyMessage
-                    ? 'rgba(255,255,255,0.7)'
-                    : theme.colors.placeHolderTextColor,
-                  fontFamily: "Roboto-Medium"
-                }}>
-                  {msg.time}
-                </Text>
-              )}
-              
-              {isMyMessage && !isDeletedMessage && !inlineMediaTime && (
-                <>
-                  {/* scheduled / processing → clock */}
-                  {(msg.status === "scheduled" || msg.status === "processing") && (
-                    <Ionicons name="time-outline" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
-                  )}
-                  {/* pending → clock (queued offline, not yet emitted to server) */}
-                  {msg.status === "pending" && (
-                    <Ionicons name="time-outline" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
-                  )}
-                  {msg.status === "cancelled" && (
-                    <Ionicons name="close-circle" size={12} color="#FF8A80" style={{ marginLeft: 2 }} />
-                  )}
-                  {msg.status === "sending" && (
-                    <ActivityIndicator size={8} color="#8696A0" style={{ marginLeft: 2 }} />
-                  )}
-                  {/* uploaded / sent → single gray tick */}
-                  {(msg.status === "uploaded" || msg.status === "sent") && (
-                    <Ionicons name="checkmark" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
-                  )}
-                  {/* delivered → double gray tick */}
-                  {msg.status === "delivered" && (
-                    <Ionicons name="checkmark-done" size={12} color="#8696A0" style={{ marginLeft: 2 }} />
-                  )}
-                  {/* seen / read → double blue tick — WhatsApp blue #53BDEB */}
-                  {(msg.status === "seen" || msg.status === "read") && (
-                    <Ionicons name="checkmark-done" size={12} color="#53BDEB" style={{ marginLeft: 2 }} />
-                  )}
-                  {msg.status === "failed" && (
-                    <TouchableOpacity onPress={() => resendMessage(msg)}>
-                      <Ionicons name="alert-circle" size={12} color="#FF5252" />
-                    </TouchableOpacity>
-                  )}
-                </>
-              )}
-            </View>
+            {/* Message Status and Timestamp — bottom meta row for non-text,
+                non-overlay bubbles (file, album, deleted). Text uses the inline
+                footer above; image/video/audio/location/contact show the time on
+                the media overlay. */}
+            {!showInlineMeta && !inlineMediaTime && (
+              renderMessageMeta(msg, isMyMessage && !isDeletedMessage, { inline: false })
+            )}
 
           </View>
 
@@ -4910,6 +5083,15 @@ export default function ChatScreen({ navigation, route }) {
     ? 'You are restricted from sending messages'
     : 'Only admins can send messages';
 
+  // Contact-block: when *I* blocked this 1-1 peer, WhatsApp hides the composer
+  // and shows an inline "You blocked this contact / Tap to unblock" bar. (A peer
+  // who blocked ME is not revealed — those sends just fail server-side.)
+  const contactBlockedHide = !isGroupChat && iBlockedPeer;
+  const handleUnblockFromChat = () => {
+    if (!chatPeerId) return;
+    blockDispatch(unblockUser(String(chatPeerId)));
+  };
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
@@ -4924,6 +5106,7 @@ export default function ChatScreen({ navigation, route }) {
           fallbackStatusText={renderStatusText()}
           onBack={() => navigation.goBack()}
           onPressProfile={handleOpenContactInfo}
+          onPressAvatar={handleOpenUserSheet}
           getUserColor={getUserColor}
           isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup)}
           groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
@@ -5548,7 +5731,17 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {(messagingDisabled || amBlocked || amNotGroupMember) ? (
+        {contactBlockedHide ? (
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+              <Ionicons name="ban-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
+              <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>You blocked this contact.</Text>
+            </View>
+            <TouchableOpacity onPress={handleUnblockFromChat} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 14, color: theme.colors.primaryColor || '#03b0a2' }}>Unblock</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (messagingDisabled || amBlocked || amNotGroupMember) ? (
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 14, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
             <Ionicons name="lock-closed-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
             <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>{amNotGroupMember ? "You can't send messages because you're no longer a member of this group." : amBlocked ? "You can't send messages because your account has been blocked." : messagingDisabledText}</Text>
@@ -5881,49 +6074,48 @@ export default function ChatScreen({ navigation, route }) {
                 bottom: Platform.OS === 'ios' ? 14 : 10,
                 alignSelf: 'center',
                 width: mediaPanelWidth,
-                borderRadius: 28,
+                borderRadius: 22,
                 overflow: 'hidden',
-                backgroundColor: isDarkMode ? 'rgba(18, 32, 47, 0.97)' : 'rgba(255, 255, 255, 0.97)',
+                backgroundColor: isDarkMode ? '#233138' : '#FFFFFF',
+                borderWidth: StyleSheet.hairlineWidth,
+                borderColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
                 transform: [{ translateY: mediaSheetAnim }],
-                elevation: 12,
+                shadowColor: '#000',
+                shadowOpacity: isDarkMode ? 0.45 : 0.18,
+                shadowRadius: 18,
+                shadowOffset: { width: 0, height: 8 },
+                elevation: 14,
               }}
             >
-              <View style={{ alignItems: 'center', paddingTop: 8, paddingBottom: 2 }}>
-                <View style={{ width: 44, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? 'rgba(218, 232, 242, 0.35)' : 'rgba(0,0,0,0.15)' }} />
+              {/* Grip handle — tap-outside, swipe-down, or grip all dismiss. */}
+              <View style={{ alignItems: 'center', paddingTop: 9, paddingBottom: 4 }}>
+                <View style={{ width: 38, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? 'rgba(233,237,239,0.28)' : 'rgba(0,0,0,0.16)' }} />
               </View>
-
-              <Text
-                style={{
-                  fontSize: 16,
-                  textAlign: 'center',
-                  color: isDarkMode ? '#EDF6FC' : '#111',
-                  fontFamily: 'Roboto-SemiBold',
-                  marginTop: 6,
-                  marginBottom: 16,
-                }}
-              >
-                Share
-              </Text>
 
               <View
                 style={{
                   flexDirection: 'row',
                   flexWrap: 'wrap',
-                  justifyContent: 'space-evenly',
-                  paddingHorizontal: 10,
-                  paddingBottom: 8,
-                  rowGap: 16,
+                  paddingHorizontal: 6,
+                  paddingTop: 10,
+                  paddingBottom: Platform.OS === 'ios' ? 26 : 20,
+                  rowGap: 20,
                 }}
               >
-                {MEDIA_PANEL_OPTIONS.map((item) => {
+                {MEDIA_PANEL_OPTIONS.map((item, idx) => {
                   const press = mediaOptionPressAnims[item.key];
+                  const entry = mediaOptionEntryAnims[idx];
                   return (
                     <Animated.View
                       key={item.key}
                       style={{
-                        width: 76,
+                        width: '25%',
                         alignItems: 'center',
-                        transform: [{ scale: press }],
+                        opacity: entry,
+                        transform: [
+                          { scale: Animated.multiply(press, entry.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1] })) },
+                          { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) },
+                        ],
                       }}
                     >
                       <Pressable
@@ -5931,25 +6123,16 @@ export default function ChatScreen({ navigation, route }) {
                         onPressOut={() => handleMediaOptionPressOut(item.key)}
                         onPress={() => handleMediaOptionSelect(item.key)}
                         style={{ alignItems: 'center' }}
+                        accessibilityRole="button"
+                        accessibilityLabel={item.label}
                       >
-                        <View
-                          style={{
-                            width: 56,
-                            height: 56,
-                            borderRadius: 28,
-                            backgroundColor: item.color + '18',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                          }}
-                        >
-                          <Ionicons name={item.icon} size={26} color={item.color} />
-                        </View>
+                        <GradientDisc id={item.key} grad={item.grad} color={item.color} icon={item.icon} size={54} />
                         <Text
                           style={{
-                            marginTop: 6,
+                            marginTop: 8,
                             fontSize: 12,
-                            color: isDarkMode ? '#C8D8E4' : '#444',
-                            fontFamily: 'Roboto-Medium',
+                            color: isDarkMode ? '#AEBAC1' : '#54656F',
+                            fontFamily: 'Roboto-Regular',
                             textAlign: 'center',
                           }}
                         >
@@ -5960,21 +6143,6 @@ export default function ChatScreen({ navigation, route }) {
                   );
                 })}
               </View>
-
-              <Pressable
-                onPress={closeMediaPanelAnimated}
-                style={{
-                  alignSelf: 'center',
-                  marginTop: 10,
-                  marginBottom: Platform.OS === 'ios' ? 22 : 18,
-                  paddingVertical: 8,
-                  paddingHorizontal: 20,
-                  borderRadius: 16,
-                  backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
-                }}
-              >
-                <Text style={{ color: '#F97373', fontFamily: 'Roboto-SemiBold', fontSize: 13 }}>Close</Text>
-              </Pressable>
             </Animated.View>
           </View>
         )}
@@ -6151,6 +6319,18 @@ export default function ChatScreen({ navigation, route }) {
         onSuccess={() => clearSelectedMessages()}
         payload={reportPayload}
         analytics={reportAnalytics}
+      />
+
+      {/* Draggable peer-details sheet — opened by tapping the header avatar */}
+      <UserDetailsSheet
+        visible={userSheetVisible}
+        onClose={() => setUserSheetVisible(false)}
+        peerId={chatData?.peerUser?._id || chatData?.peerUserId || null}
+        fallbackName={chatData?.peerUser?.fullName || chatData?.peerUser?.name || 'User'}
+        fallbackImage={chatData?.peerUser?.profileImage || chatData?.peerUser?.profilePicture || null}
+        avatarColor={getUserColor?.(chatData?.peerUser?._id || chatData?.peerUser?.fullName || '') || '#6C5CE7'}
+        onMessage={() => { /* already in this chat — just dismiss */ }}
+        onViewFullInfo={() => navigation.navigate('UserB', { item: chatData })}
       />
 
       {/* Schedule Time Picker is rendered inside ChatInputBar */}

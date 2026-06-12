@@ -184,7 +184,7 @@ const resolveUploadMediaId = (uploadData = {}) => {
 export default function useChatLogic({ navigation, route }) {
   const dispatch = useDispatch();
   const { isConnected, networkType } = useNetwork();
-  const { pickMedia } = useImage();
+  const { pickMedia, pickMediaMultiple } = useImage();
   const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, restoreGroupMembership, inactiveGroupIds } = useRealtimeChat();
   const { currentGroup } = useSelector((s) => s.group || {});
 
@@ -200,7 +200,7 @@ export default function useChatLogic({ navigation, route }) {
   }, []);
   const chatMessagesData = useSelector(state => state.chat?.chatMessagesData || state.chat?.data || state.chat);
   
-  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system', 'call']);
+  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system', 'call', 'album']);
   const MEDIA_MESSAGE_TYPES = new Set(['image', 'photo', 'video', 'audio', 'file', 'document']);
 
   const normalizeOutboundMessageType = (value) => {
@@ -1441,6 +1441,22 @@ export default function useChatLogic({ navigation, route }) {
         ? Promise.resolve(allMessages.length)
         : loadMessagesFromLocal(generatedChatId);
 
+      // Clear the loading state the moment local messages are ready — do NOT
+      // wait for the socket reconnect/join below. On a slow or reconnecting
+      // socket, `checkAndReconnectSocket()` in the parallel block can take
+      // several seconds; gating the spinner on it (the old behavior) made an
+      // already-cached chat appear to "load" for 15s. Messages render from
+      // SQLite immediately; live sync catches up in the background.
+      localLoadPromise
+        .then(() => {
+          setIsLoadingInitial(false);
+          setIsLoadingFromLocal(false);
+        })
+        .catch(() => {
+          setIsLoadingInitial(false);
+          setIsLoadingFromLocal(false);
+        });
+
       // ═══════════════════════════════════════════════════════════
       // STEP 3: BACKGROUND — Socket setup + queued tasks (parallel with step 2)
       // ═══════════════════════════════════════════════════════════
@@ -1531,9 +1547,6 @@ export default function useChatLogic({ navigation, route }) {
         }
       }
 
-      // Clean up any duplicate rows on first load
-      await ChatDatabase.deduplicateChat(chatIdParam).catch(() => {});
-
       // One-time migration: if SQLite is empty, pull from AsyncStorage
       const count = await ChatDatabase.getMessageCount(chatIdParam);
       if (count === 0) {
@@ -1549,10 +1562,23 @@ export default function useChatLogic({ navigation, route }) {
         }
       }
 
-      // Load from SQLite → set UI state, also syncs memory cache
+      // Load from SQLite → set UI state, also syncs memory cache. This is the
+      // step the user actually waits on, so it runs FIRST and renders immediately.
       refreshMessagesFromDB(true);
 
       const finalCount = await ChatDatabase.getMessageCount(chatIdParam);
+
+      // Heavy duplicate cleanup (4 full GROUP BY/correlated-subquery DELETEs)
+      // is MAINTENANCE — it must not block the first render. The displayed list
+      // is already correct: loadMessages does a lightweight temp-row sweep + an
+      // in-memory dedup. Run the deep dedup AFTER render, off the critical path,
+      // then refresh once more to drop anything it removed. Previously this was
+      // awaited BEFORE render on every chat open — a major cause of the multi-
+      // second open delay, made worse by SQLite write-lock contention.
+      ChatDatabase.deduplicateChat(chatIdParam)
+        .then(() => { refreshMessagesFromDB(true); })
+        .catch(() => {});
+
       return finalCount;
     } catch (err) {
       console.error("Error loading from local storage:", err);
@@ -1765,6 +1791,13 @@ export default function useChatLogic({ navigation, route }) {
       mediaUrl: resolvedMediaUrl,
       mediaThumbnailUrl: resolvedMediaThumbnailUrl,
       previewUrl: incomingLocalUri || resolvedMediaThumbnailUrl || resolvedMediaUrl,
+      // Album fields — N attachments in one bubble (WhatsApp media group)
+      mediaGroupId: apiMsg?.mediaGroupId || apiMsg?.payload?.mediaGroupId || null,
+      mediaItems: Array.isArray(apiMsg?.mediaItems) && apiMsg.mediaItems.length
+        ? apiMsg.mediaItems
+        : (Array.isArray(apiMsg?.payload?.mediaItems) && apiMsg.payload.mediaItems.length
+          ? apiMsg.payload.mediaItems
+          : null),
       createdAt,
       timestamp: new Date(createdAt).getTime(),
       synced: true,
@@ -4557,11 +4590,30 @@ export default function useChatLogic({ navigation, route }) {
     };
     registerSocketHandler('group:message:delete:success', onGroupMessageDeleteSuccess);
 
+    // WhatsApp group-tick semantics: a single member's receipt must NOT flip
+    // the bubble — 'delivered' only when ALL recipients have it, blue only
+    // when ALL read. The backend recomputes that aggregate and ships it as
+    // `aggregate` (single receipt) or `aggregateStatuses` (bulk read map:
+    // messageId → status). Per-user receipt maps are still tracked locally for
+    // the message-info breakdown. Without aggregate info the status is left
+    // untouched — never blind-advance off one receipt.
+    const GROUP_TICK_RANK = { sent: 1, delivered: 2, seen: 3, read: 4 };
+    const resolveAggregateStatus = (msg, mid, source) => {
+      const fromBulk = source?.aggregateStatuses?.[String(mid)];
+      const agg = source?.aggregate;
+      const candidate = fromBulk
+        || (agg?.allRead ? 'read' : (agg?.allDelivered ? 'delivered' : null));
+      if (!candidate) return msg.status;
+      const currentRank = GROUP_TICK_RANK[msg.status] || 0;
+      const nextRank = GROUP_TICK_RANK[candidate] || 0;
+      return nextRank > currentRank ? candidate : msg.status;
+    };
+
     const onGroupMessageDelivered = (data) => {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
       const messageIds = source?.messageIds || [source?.messageId].filter(Boolean);
-      const userId = source?.userId;
+      const userId = source?.userId || (typeof source?.deliveredTo === 'string' ? source.deliveredTo : null);
       const deliveredAt = source?.deliveredAt || new Date().toISOString();
       setAllMessages((prev) => {
         let changed = false;
@@ -4571,17 +4623,18 @@ export default function useChatLogic({ navigation, route }) {
           // Skip scheduled/processing/cancelled/failed — not real messages yet
           if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           // Track per-user delivery
+          let rowChanged = false;
           const deliveredTo = { ...(msg.deliveredTo || {}) };
           if (userId && !deliveredTo[userId]) {
             deliveredTo[userId] = deliveredAt;
-            changed = true;
+            rowChanged = true;
           }
-          // Advance status to 'delivered' if not already seen/read
-          const newStatus = (msg.status === 'seen' || msg.status === 'read') ? msg.status : 'delivered';
-          if (newStatus !== msg.status || changed) {
-            return { ...msg, status: newStatus, deliveredTo };
-          }
-          return msg;
+          // Tick advances only on the backend's all-recipients aggregate
+          const newStatus = resolveAggregateStatus(msg, msg.serverMessageId || msg.id, source);
+          if (newStatus !== msg.status) rowChanged = true;
+          if (!rowChanged) return msg;
+          changed = true;
+          return { ...msg, status: newStatus, deliveredTo };
         });
         if (changed) {
           saveMessagesToLocal(updated);
@@ -4598,7 +4651,9 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       if (!isGroupEvent(source)) return;
       const messageIds = source?.messageIds || [source?.messageId].filter(Boolean);
-      const userId = source?.userId;
+      // Per-member room broadcasts carry the reader as `readBy` (scalar),
+      // sender-directed updates carry `userId`.
+      const userId = source?.userId || (typeof source?.readBy === 'string' ? source.readBy : null);
       const readAt = source?.readAt || new Date().toISOString();
       // Ignore our own read events
       if (userId && sameId(userId, currentUserIdRef.current)) return;
@@ -4610,16 +4665,19 @@ export default function useChatLogic({ navigation, route }) {
           // Skip scheduled/processing/cancelled/failed — not real messages yet
           if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           // Track per-user read
+          let rowChanged = false;
           const readBy = { ...(msg.readBy || {}) };
           if (userId && !readBy[userId]) {
             readBy[userId] = readAt;
-            changed = true;
+            rowChanged = true;
           }
-          // Advance status to 'seen'
-          if (msg.status !== 'seen' && msg.status !== 'read') {
-            changed = true;
-          }
-          return changed ? { ...msg, status: 'seen', readBy } : msg;
+          // Tick advances only on the backend's all-recipients aggregate —
+          // one reader must not turn the whole group bubble blue.
+          const newStatus = resolveAggregateStatus(msg, msg.serverMessageId || msg.id, source);
+          if (newStatus !== msg.status) rowChanged = true;
+          if (!rowChanged) return msg;
+          changed = true;
+          return { ...msg, status: newStatus, readBy };
         });
         if (changed) {
           saveMessagesToLocal(updated);
@@ -6024,6 +6082,18 @@ export default function useChatLogic({ navigation, route }) {
       }
     }
 
+    // A real message from the peer means they are no longer typing — clear the
+    // "typing…" indicator the instant the bubble lands instead of waiting up to
+    // TYPING_TIMEOUT for it to auto-expire (otherwise it lingers AFTER the
+    // message is already visible, which reads as "typing when not typing").
+    if (!isSelfMsg) {
+      setIsPeerTyping(false);
+      if (peerTypingTimeoutRef.current) {
+        clearTimeout(peerTypingTimeoutRef.current);
+        peerTypingTimeoutRef.current = null;
+      }
+    }
+
     // Debug: log forwarded message fields from server
     if (msg?.isForwarded || msg?.forwarded || msg?.forwardedFrom || msg?.forwardedMessage) {
       console.log('[FWD_DEBUG] Received forwarded message:', JSON.stringify({
@@ -7157,6 +7227,294 @@ export default function useChatLogic({ navigation, route }) {
     persistMediaUploadQueue,
   ]);
 
+  /* ========== WhatsApp-style media album send ==========
+     One message bubble carries every file picked together:
+       1. Optimistic 'album' row with local previews (per-tile upload state).
+       2. Files upload in parallel (3 at a time, per-file retry + timeout).
+       3. A single message:send / group:message:send goes out with
+          mediaItems[] + mediaGroupId; ack reconciles via tempId as usual.
+     Offline / network failure re-queues the WHOLE album (same queue as
+     single media — flushQueuedMediaUploads branches on `albumObj`). */
+  const ALBUM_UPLOAD_CONCURRENCY = 3;
+
+  const albumFileCategory = (mime) => {
+    const m = String(mime || '').toLowerCase();
+    if (m.startsWith('image/')) return 'image';
+    if (m.startsWith('video/')) return 'video';
+    if (m.startsWith('audio/')) return 'audio';
+    return 'document';
+  };
+
+  const sendMediaGroup = useCallback(async (albumObj, options = {}) => {
+    const files = (albumObj?.files || []).filter((f) => f?.uri);
+    if (!files.length) return { success: false, error: 'invalid album payload' };
+    if (amNotGroupMemberRef.current) return { success: false, error: 'not a group member' };
+
+    const caption = albumObj?.caption || '';
+    const tempId = options?.tempId || `temp_album_${Date.now()}_${Math.random()}`;
+    const timestamp = options?.createdAt || new Date().toISOString();
+    const mediaGroupId = albumObj?.mediaGroupId || `mg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const isGrpMedia = chatData?.chatType === 'group' || chatData?.isGroup;
+    const shouldInsertLocal = !options?.skipLocalInsert;
+
+    const normFiles = files.map((f) => ({ ...f, uri: normalizeUri(f.uri) }));
+    let liveItems = normFiles.map((f) => ({
+      mediaId: null,
+      fileCategory: albumFileCategory(f.type),
+      mediaUrl: null,
+      mediaThumbnailUrl: null,
+      localUri: f.uri,
+      mediaMeta: { fileName: f.name, fileSize: f.size || null, mimeType: f.type },
+      uploadStatus: 'pending',
+      uploadProgress: 0,
+    }));
+
+    const localMsg = {
+      id: tempId,
+      tempId,
+      type: 'album',
+      mediaType: 'album',
+      text: caption,
+      mediaGroupId,
+      mediaItems: liveItems,
+      mediaUrl: '',
+      mediaThumbnailUrl: liveItems[0]?.localUri || '',
+      previewUrl: liveItems[0]?.localUri || '',
+      localUri: liveItems[0]?.localUri || '',
+      time: moment(timestamp).format("hh:mm A"),
+      date: moment(timestamp).format("YYYY-MM-DD"),
+      senderId: currentUserIdRef.current,
+      senderName: currentUserNameRef.current || '',
+      senderType: 'self',
+      receiverId: isGrpMedia ? null : (chatData.peerUser?._id || null),
+      chatType: chatData?.chatType || 'private',
+      status: 'sending',
+      createdAt: timestamp,
+      timestamp: new Date(timestamp).getTime(),
+      payload: {
+        chatId: chatIdRef.current,
+        albumFiles: normFiles,
+        caption,
+        mediaGroupId,
+        tempId,
+        isMediaDownloaded: true,
+        uploadQueued: false,
+      },
+      downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+      isMediaDownloaded: true,
+      synced: false,
+      chatId: chatIdRef.current,
+      ...(isGrpMedia && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
+      useLocalForSender: true,
+    };
+
+    if (shouldInsertLocal) {
+      setAllMessages((prev) => [localMsg, ...prev]);
+      ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
+    }
+
+    const queueAlbumTask = async () => {
+      const queue = [...(queuedMediaUploadsRef.current || [])];
+      const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
+      const task = {
+        tempId,
+        albumObj: { files: normFiles, caption, mediaGroupId },
+        createdAt: timestamp,
+        retries: Number((existingIndex >= 0 ? queue[existingIndex]?.retries : 0) || 0),
+      };
+      if (existingIndex >= 0) queue[existingIndex] = task;
+      else queue.push(task);
+      queuedMediaUploadsRef.current = queue;
+      await persistMediaUploadQueue(queue);
+    };
+
+    if (!isConnected) {
+      await queueAlbumTask();
+      setAllMessages((prev) => prev.map((m) => (
+        m.tempId === tempId
+          ? { ...m, status: 'failed', payload: { ...(m.payload || {}), uploadQueued: true } }
+          : m
+      )));
+      return { success: false, queued: true, error: 'offline queued' };
+    }
+
+    const patchItem = (index, patch) => {
+      liveItems = liveItems.map((item, i) => (i === index ? { ...item, ...patch } : item));
+      const snapshot = liveItems;
+      setAllMessages((prev) => prev.map((m) => (
+        m.tempId === tempId ? { ...m, mediaItems: snapshot } : m
+      )));
+    };
+
+    setUploadProgress((prev) => ({ ...prev, [tempId]: 0.05 }));
+    const refreshOverallProgress = () => {
+      const total = liveItems.length || 1;
+      const done = liveItems.filter((i) => i.uploadStatus === 'done' || i.uploadStatus === 'failed').length;
+      setUploadProgress((prev) => ({ ...prev, [tempId]: Math.max(0.05, Math.min(0.98, done / total)) }));
+    };
+
+    const uploadOne = async (index) => {
+      const file = normFiles[index];
+      const attempt = async () => {
+        const uploadPromise = uploadMediaFile({
+          file,
+          chatId: chatIdRef.current,
+          dispatch,
+          mediaUploadAction: mediaUpload,
+        });
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(`upload timeout after ${MEDIA_UPLOAD_TIMEOUT_MS}ms`)), MEDIA_UPLOAD_TIMEOUT_MS);
+        });
+        const action = await Promise.race([uploadPromise, timeoutPromise]);
+        const payloadData = action?.payload || action;
+        const ok = payloadData && (payloadData.status === true || payloadData.statusCode === 200 || payloadData.success === true);
+        if (!ok) throw new Error(payloadData?.message || 'upload failed');
+        const data = payloadData.data || payloadData;
+        return {
+          mediaId: String(data?.mediaId || ''),
+          fileCategory: data?.fileCategory || albumFileCategory(file.type),
+          mediaUrl: data?.previewUrl || data?.mediaUrl || '',
+          mediaThumbnailUrl: data?.thumbnailUrl || data?.mediaThumbnailUrl || '',
+          mediaMeta: {
+            fileName: file.name,
+            fileSize: data?.sizeAfter || file.size || null,
+            mimeType: file.type,
+            width: data?.width || null,
+            height: data?.height || null,
+            duration: data?.duration || null,
+          },
+        };
+      };
+
+      patchItem(index, { uploadStatus: 'uploading' });
+      for (let tries = 0; tries < 2; tries += 1) {
+        try {
+          const item = await attempt();
+          patchItem(index, { ...item, uploadStatus: 'done', uploadProgress: 100 });
+          refreshOverallProgress();
+          return item;
+        } catch (err) {
+          if (tries === 0) {
+            await new Promise((r) => setTimeout(r, 1000));
+            continue;
+          }
+          patchItem(index, { uploadStatus: 'failed', uploadProgress: 0 });
+          refreshOverallProgress();
+          return { error: String(err?.message || err) };
+        }
+      }
+      return { error: 'upload failed' };
+    };
+
+    try {
+      const results = new Array(normFiles.length);
+      let cursor = 0;
+      const workerCount = Math.min(ALBUM_UPLOAD_CONCURRENCY, normFiles.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (cursor < normFiles.length) {
+          const index = cursor;
+          cursor += 1;
+          results[index] = await uploadOne(index);
+        }
+      }));
+
+      const uploaded = results.filter((r) => r && !r.error);
+      const failedCount = results.length - uploaded.length;
+
+      if (!uploaded.length) {
+        setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
+        setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+        const allNetwork = results.every((r) => /network request failed|timeout|aborted/i.test(String(r?.error || '')));
+        if (allNetwork) await queueAlbumTask();
+        return { success: false, error: 'all uploads failed' };
+      }
+
+      setUploadProgress((prev) => ({ ...prev, [tempId]: 1 }));
+      const deviceId = await getOrCreateDeviceId();
+      const first = uploaded[0];
+      const messagePayload = {
+        chatId: chatIdRef.current,
+        chatType: chatData?.chatType || 'private',
+        senderId: currentUserIdRef.current,
+        senderDeviceId: deviceId,
+        receiverId: isGrpMedia ? null : (chatData.peerUser?._id || null),
+        ...(isGrpMedia && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
+        messageType: uploaded.length > 1 ? 'album' : (first.fileCategory === 'document' ? 'file' : first.fileCategory),
+        text: caption,
+        mediaGroupId,
+        mediaItems: uploaded,
+        // First-item mirrors — pre-album clients still render a thumbnail.
+        mediaId: first.mediaId,
+        mediaUrl: first.mediaUrl,
+        mediaThumbnailUrl: first.mediaThumbnailUrl || first.mediaUrl,
+        mediaMeta: first.mediaMeta,
+        status: 'sent',
+        createdAt: timestamp,
+      };
+
+      // Final attachments keep the local uri so the sender renders instantly.
+      const finalItems = liveItems.map((item, i) => {
+        const server = results[i] && !results[i].error ? results[i] : null;
+        return server ? { ...item, ...server, uploadStatus: 'done' } : item;
+      });
+      liveItems = finalItems;
+
+      setAllMessages((prev) => {
+        const updated = prev.map((m) => (
+          m.tempId === tempId
+            ? {
+                ...m,
+                type: messagePayload.messageType,
+                mediaType: messagePayload.messageType,
+                mediaItems: finalItems,
+                mediaUrl: first.mediaUrl,
+                mediaThumbnailUrl: first.mediaThumbnailUrl || m.mediaThumbnailUrl,
+                mediaId: first.mediaId,
+                status: 'uploaded',
+                payload: { ...(m.payload || {}), mediaItems: finalItems, mediaGroupId, uploadQueued: false },
+              }
+            : m
+        ));
+        saveMessagesToLocal(updated);
+        return updated;
+      });
+
+      await sendMessageViaSocket({ ...messagePayload, tempId }, tempId).catch((err) => {
+        console.warn('album socket ack failed', err?.message || err);
+      });
+
+      const queue = [...(queuedMediaUploadsRef.current || [])].filter((item) => item?.tempId !== tempId);
+      queuedMediaUploadsRef.current = queue;
+      await persistMediaUploadQueue(queue);
+      return { success: true, tempId, failedCount };
+    } catch (err) {
+      const message = String(err?.message || err || 'album send failed');
+      setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
+      setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+      if (/network request failed|timeout|aborted|socket not connected/i.test(message)) {
+        await queueAlbumTask();
+      }
+      return { success: false, error: message };
+    } finally {
+      if (!options?.fromQueue) setPendingMedia(null);
+      setTimeout(() => {
+        setUploadProgress((prev) => {
+          const next = { ...prev };
+          delete next[tempId];
+          return next;
+        });
+      }, 900);
+    }
+  }, [
+    isConnected,
+    dispatch,
+    chatData.peerUser,
+    saveMessagesToLocal,
+    getOrCreateDeviceId,
+    sendMessageViaSocket,
+    persistMediaUploadQueue,
+  ]);
+
   const flushQueuedMediaUploads = useCallback(async () => {
     if (mediaUploadQueueInFlightRef.current) return;
     if (!isConnected) return;
@@ -7174,12 +7532,21 @@ export default function useChatLogic({ navigation, route }) {
           continue;
         }
 
-        const result = await sendMedia(item?.mediaObj, {
-          tempId: item?.tempId,
-          skipLocalInsert: true,
-          fromQueue: true,
-          createdAt: item?.createdAt,
-        });
+        // Album tasks (multi-file) re-send through sendMediaGroup; single
+        // media keeps the legacy path.
+        const result = item?.albumObj
+          ? await sendMediaGroup(item.albumObj, {
+              tempId: item?.tempId,
+              skipLocalInsert: true,
+              fromQueue: true,
+              createdAt: item?.createdAt,
+            })
+          : await sendMedia(item?.mediaObj, {
+              tempId: item?.tempId,
+              skipLocalInsert: true,
+              fromQueue: true,
+              createdAt: item?.createdAt,
+            });
 
         if (result?.success) {
           working = working.filter((q) => q?.tempId !== item?.tempId);
@@ -7199,7 +7566,7 @@ export default function useChatLogic({ navigation, route }) {
     } finally {
       mediaUploadQueueInFlightRef.current = false;
     }
-  }, [isConnected, persistMediaUploadQueue, sendMedia]);
+  }, [isConnected, persistMediaUploadQueue, sendMedia, sendMediaGroup]);
 
   flushQueuedMediaUploadsRef.current = flushQueuedMediaUploads;
 
@@ -7481,13 +7848,26 @@ export default function useChatLogic({ navigation, route }) {
   const handlePickMedia = useCallback(async (type) => {
     try {
       closeMediaOptions();
+      // Gallery / video / document pickers allow WhatsApp-style multi-select.
+      // One file keeps the legacy single-media flow; several files stage an
+      // album (sent as ONE message with a media grid bubble).
+      if (typeof pickMediaMultiple === 'function' && (type === 'image' || type === 'video' || type === 'document')) {
+        const files = await pickMediaMultiple(type);
+        if (!files || !files.length) return;
+        if (files.length === 1) {
+          setPendingMedia({ file: files[0], type });
+        } else {
+          setPendingMedia({ files, type, isAlbum: true });
+        }
+        return;
+      }
       const file = await pickMedia(type);
       if (!file) return;
       setPendingMedia({ file, type });
     } catch (err) {
       console.error("handlePickMedia error", err);
     }
-  }, [pickMedia]);
+  }, [pickMedia, pickMediaMultiple]);
 
   // SQLite is the single source of truth — no in-memory dedup needed.
   // The periodic dedup cleanup runs via ChatDatabase.deduplicateChat() on chat open.
@@ -7807,7 +8187,7 @@ export default function useChatLogic({ navigation, route }) {
     text, setText, handleTextChange, handleSendText,
     scheduleMessage, cancelScheduledMessage,
     sendLocationMessage, sendContactMessage,
-    pendingMedia, setPendingMedia, sendMedia, handlePickMedia, showMediaOptions, openMediaOptions, closeMediaOptions,
+    pendingMedia, setPendingMedia, sendMedia, sendMediaGroup, handlePickMedia, showMediaOptions, openMediaOptions, closeMediaOptions,
     mediaViewer, closeMediaViewer, handleDownloadMedia, downloadedMedia, downloadProgress, uploadProgress, mediaDownloadStates,
     markMediaRemovedLocally,
     retryMediaStatusUpdate, retryAllFailedMediaStatusUpdates,

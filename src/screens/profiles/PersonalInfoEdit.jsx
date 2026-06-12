@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   View, Text, Animated, TouchableOpacity, Alert, Platform, ToastAndroid,
-  ActivityIndicator, TextInput, StyleSheet,
+  ActivityIndicator, TextInput, StyleSheet, KeyboardAvoidingView,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
-import { FontAwesome6, Ionicons } from '@expo/vector-icons';
+import { Ionicons } from '@expo/vector-icons';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -17,7 +18,6 @@ const FIELD_META = {
   fullName: {
     title: 'Name',
     placeholder: 'Your name',
-    icon: 'person-outline',
     keyboard: 'default',
     maxLength: 60,
     helper: 'This name will be visible to your contacts.',
@@ -25,15 +25,13 @@ const FIELD_META = {
   about: {
     title: 'About',
     placeholder: 'Hey there! I am using the app.',
-    icon: 'information-circle-outline',
     keyboard: 'default',
     maxLength: 140,
-    helper: 'Tell others a bit about yourself.',
+    helper: 'Add a few words about yourself.',
   },
   email: {
     title: 'Email',
     placeholder: 'name@example.com',
-    icon: 'mail-outline',
     keyboard: 'email-address',
     maxLength: 80,
     helper: 'We use email for account recovery and security alerts.',
@@ -41,7 +39,6 @@ const FIELD_META = {
   mobile: {
     title: 'Mobile number',
     placeholder: 'Mobile number',
-    icon: 'call-outline',
     keyboard: 'phone-pad',
     maxLength: 15,
     helper: 'Changing your number will require verification.',
@@ -56,6 +53,7 @@ export default function PersonalInfoEdit({ navigation, route }) {
   const meta = FIELD_META[field] || FIELD_META.fullName;
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
+  const inputRef = useRef(null);
   const dispatch = useDispatch();
   const { profileData, isLoading } = useSelector(state => state.profile);
 
@@ -65,7 +63,7 @@ export default function PersonalInfoEdit({ navigation, route }) {
   const charCount = inputValue.length;
 
   useEffect(() => {
-    Animated.timing(fadeAnim, { toValue: 1, duration: 250, useNativeDriver: true }).start();
+    Animated.timing(fadeAnim, { toValue: 1, duration: 220, useNativeDriver: true }).start();
   }, []);
 
   useEffect(() => { setInputValue(value || ""); }, [value]);
@@ -121,135 +119,158 @@ export default function PersonalInfoEdit({ navigation, route }) {
     if (allowed.length <= meta.maxLength) setInputValue(allowed);
   };
 
-  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
-  const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
-  const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
+  // WhatsApp dark/light surfaces, accented by the user's theme colour.
+  const pageBg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  const headerBg = isDarkMode ? '#1F2C33' : theme.colors.themeColor;
+  const onHeader = isDarkMode ? theme.colors.primaryTextColor : '#FFFFFF';
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
   const themeColor = theme.colors.themeColor || '#00A884';
+  const underlineIdle = isDarkMode ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.18)';
   const showCharCount = field !== 'email' && field !== 'mobile';
+  const remaining = meta.maxLength - charCount;
+  const isMultiline = field === 'about';
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
-      {/* Header */}
-      <View style={[styles.header, { backgroundColor: pageBg, borderBottomColor: borderClr }]}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconBtn} activeOpacity={0.6}>
-          <FontAwesome6 name="arrow-left" size={18} color={primaryText} />
-        </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: primaryText }]}>
-          Edit {meta.title}
-        </Text>
-        <TouchableOpacity
-          onPress={handleSave}
-          disabled={!isValid || isLoading}
-          activeOpacity={0.7}
-          style={styles.saveBtn}
-        >
-          {isLoading ? (
-            <ActivityIndicator size="small" color={themeColor} />
-          ) : (
-            <Text style={[styles.saveBtnText, { color: isValid ? themeColor : subText }]}>
-              Save
-            </Text>
-          )}
-        </TouchableOpacity>
-      </View>
+      {/* WhatsApp header — theme-green in light mode, dark surface in dark mode.
+          The header colour fills the status-bar inset (SafeAreaView top edge). */}
+      <SafeAreaView edges={['top']} style={{ backgroundColor: headerBg }}>
+        <View style={[styles.header, { backgroundColor: headerBg }]}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.iconBtn} activeOpacity={0.6} hitSlop={hit}>
+            <Ionicons name="arrow-back" size={23} color={onHeader} />
+          </TouchableOpacity>
+          <Text style={[styles.headerTitle, { color: onHeader }]} numberOfLines={1}>
+            {meta.title}
+          </Text>
+        </View>
+      </SafeAreaView>
 
-      {/* Body */}
-      <View style={{ flex: 1, paddingTop: 18 }}>
-        <View style={[styles.inputCard, { backgroundColor: cardBg }]}>
-          <View style={[styles.iconBubble, { backgroundColor: themeColor + '18' }]}>
-            <Ionicons name={meta.icon} size={20} color={themeColor} />
-          </View>
-          <View style={{ flex: 1 }}>
-            <Text style={[styles.fieldLabel, { color: focused ? themeColor : subText }]}>
-              {meta.title}
-            </Text>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <View style={styles.body}>
+          {/* Underlined input row: text · counter · emoji (WhatsApp). */}
+          <View style={[styles.inputRow, { borderBottomColor: focused ? themeColor : underlineIdle }]}>
             {field === 'mobile' && extra?.code ? (
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                <Text style={[styles.codePrefix, { color: primaryText }]}>{extra.code}</Text>
-                <TextInput
-                  value={inputValue}
-                  onChangeText={handleChange}
-                  onFocus={() => setFocused(true)}
-                  onBlur={() => setFocused(false)}
-                  placeholder={meta.placeholder}
-                  placeholderTextColor={subText}
-                  keyboardType={meta.keyboard}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  style={[styles.input, { color: primaryText, flex: 1 }]}
-                />
-              </View>
-            ) : (
-              <TextInput
-                value={inputValue}
-                onChangeText={handleChange}
-                onFocus={() => setFocused(true)}
-                onBlur={() => setFocused(false)}
-                placeholder={meta.placeholder}
-                placeholderTextColor={subText}
-                keyboardType={meta.keyboard}
-                autoCapitalize={field === 'email' ? 'none' : 'sentences'}
-                autoCorrect={field !== 'email'}
-                style={[styles.input, { color: primaryText }]}
-                autoFocus
-              />
+              <Text style={[styles.codePrefix, { color: primaryText }]}>{extra.code}</Text>
+            ) : null}
+            <TextInput
+              ref={inputRef}
+              value={inputValue}
+              onChangeText={handleChange}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
+              placeholder={meta.placeholder}
+              placeholderTextColor={subText}
+              keyboardType={meta.keyboard}
+              autoCapitalize={field === 'email' ? 'none' : (field === 'mobile' ? 'none' : 'sentences')}
+              autoCorrect={field !== 'email' && field !== 'mobile'}
+              style={[styles.input, { color: primaryText }]}
+              multiline={isMultiline}
+              autoFocus
+              onSubmitEditing={!isMultiline ? handleSave : undefined}
+              returnKeyType={!isMultiline ? 'done' : 'default'}
+            />
+            {showCharCount && (
+              <Text style={[styles.counter, { color: remaining <= 10 ? themeColor : subText }]}>
+                {remaining}
+              </Text>
             )}
+            <TouchableOpacity
+              onPress={() => inputRef.current?.focus()}
+              activeOpacity={0.6}
+              hitSlop={hit}
+              style={styles.emojiBtn}
+            >
+              <Ionicons name="happy-outline" size={22} color={subText} />
+            </TouchableOpacity>
           </View>
+
+          {errorMsg ? (
+            <Text style={styles.errorText}>{errorMsg}</Text>
+          ) : (
+            <Text style={[styles.helperText, { color: subText }]}>{meta.helper}</Text>
+          )}
         </View>
 
-        {showCharCount && (
-          <Text style={[styles.charCount, { color: subText }]}>
-            {charCount}/{meta.maxLength}
-          </Text>
-        )}
-
-        {errorMsg ? (
-          <Text style={styles.errorText}>{errorMsg}</Text>
-        ) : (
-          <Text style={[styles.helperText, { color: subText }]}>{meta.helper}</Text>
-        )}
-      </View>
+        {/* Green circular check FAB — WhatsApp's save affordance. */}
+        <View style={styles.fabWrap} pointerEvents="box-none">
+          <TouchableOpacity
+            onPress={handleSave}
+            disabled={!isValid || isLoading}
+            activeOpacity={0.85}
+            style={[
+              styles.fab,
+              { backgroundColor: themeColor, opacity: (!isValid || isLoading) ? 0.5 : 1, shadowColor: themeColor },
+            ]}
+          >
+            {isLoading ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <Ionicons name="checkmark" size={28} color="#fff" />
+            )}
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
     </Animated.View>
   );
 }
+
+const hit = { top: 8, bottom: 8, left: 8, right: 8 };
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
   header: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 8, paddingVertical: 10,
-    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 6,
+    paddingTop: 8,
+    paddingBottom: 14,
   },
   iconBtn: {
-    width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 20,
+    width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 21,
   },
-  headerTitle: { flex: 1, fontFamily: 'Roboto-SemiBold', fontSize: 17, marginLeft: 4 },
-  saveBtn: { paddingHorizontal: 14, paddingVertical: 8 },
-  saveBtnText: { fontFamily: 'Roboto-SemiBold', fontSize: 15 },
+  headerTitle: { flex: 1, fontFamily: 'Roboto-Medium', fontSize: 19, marginLeft: 6 },
 
-  inputCard: {
-    flexDirection: 'row', alignItems: 'center',
-    marginHorizontal: 12, padding: 14, borderRadius: 14, gap: 12,
+  body: { flex: 1, paddingHorizontal: 22, paddingTop: 26 },
+  inputRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    borderBottomWidth: 2,
+    paddingBottom: 6,
+    gap: 8,
   },
-  iconBubble: {
-    width: 40, height: 40, borderRadius: 20,
-    alignItems: 'center', justifyContent: 'center',
+  input: {
+    flex: 1,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 17,
+    padding: 0,
+    paddingTop: Platform.OS === 'ios' ? 2 : 0,
+    maxHeight: 120,
   },
-  fieldLabel: { fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.4, marginBottom: 2 },
-  input: { fontFamily: 'Roboto-Medium', fontSize: 16, padding: 0, paddingVertical: 4 },
-  codePrefix: { fontFamily: 'Roboto-Medium', fontSize: 16, marginRight: 6 },
-  charCount: {
-    alignSelf: 'flex-end', marginTop: 8, marginRight: 18,
-    fontFamily: 'Roboto-Regular', fontSize: 12,
-  },
+  codePrefix: { fontFamily: 'Roboto-Medium', fontSize: 17, marginRight: 2 },
+  counter: { fontFamily: 'Roboto-Regular', fontSize: 13, marginBottom: 2 },
+  emojiBtn: { paddingLeft: 2, paddingBottom: 1 },
+
   helperText: {
-    fontFamily: 'Roboto-Regular', fontSize: 12,
-    marginTop: 10, marginHorizontal: 22,
+    fontFamily: 'Roboto-Regular', fontSize: 13,
+    marginTop: 14, lineHeight: 18,
   },
   errorText: {
-    color: '#FF3B30', fontFamily: 'Roboto-Regular', fontSize: 12,
-    marginTop: 10, marginHorizontal: 22,
+    color: '#FF3B30', fontFamily: 'Roboto-Regular', fontSize: 13,
+    marginTop: 14,
+  },
+
+  fabWrap: {
+    position: 'absolute', right: 22, bottom: 26,
+  },
+  fab: {
+    width: 58, height: 58, borderRadius: 29,
+    alignItems: 'center', justifyContent: 'center',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    elevation: 6,
   },
 });

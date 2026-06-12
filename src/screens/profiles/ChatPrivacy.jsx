@@ -56,8 +56,8 @@ export default function ChatPrivacy({ navigation }) {
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
-  const pageBg = isDarkMode ? '#0B141A' : '#F4F6F9';
-  const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
+  const pageBg = theme.colors.background;
+  const cardBg = theme.colors.background;
   const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.06)';
 
   const renderHeader = () => (

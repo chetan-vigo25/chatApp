@@ -710,6 +710,27 @@ const attachCoreSocketListeners = (navigation) => {
   socket.on('user:blocked', (payload) => applyBlockState(true, payload));
   socket.on('user:unblocked', (payload) => applyBlockState(false, payload));
 
+  // User-to-user (contact) block realtime sync. Distinct from the admin
+  // account-block above: these keep the `block` slice in step across this
+  // user's devices and reflect when someone blocks/unblocks THIS user.
+  const dispatchBlock = (actionName, payload) => {
+    try {
+      const mod = require('../../Store');
+      const store = mod.store || mod.default || mod;
+      const br = require('../../Reducer/Block/Block.reducer');
+      const action = br[actionName];
+      if (store?.dispatch && action) store.dispatch(action(payload));
+    } catch (e) {}
+  };
+
+  // My device blocked someone → sync to my other devices.
+  socket.on('contact:blocked', (payload) => dispatchBlock('contactBlocked', { userId: String(payload?.userId || '') }));
+  socket.on('contact:unblocked', (payload) => dispatchBlock('contactUnblocked', { userId: String(payload?.userId || '') }));
+  // Someone blocked / unblocked ME → disable my composer toward them.
+  socket.on('block:status:changed', (payload) =>
+    dispatchBlock('blockedByChanged', { byUserId: String(payload?.byUserId || ''), blocked: !!payload?.blocked }),
+  );
+
   // Account-deletion lifecycle. When the server tears the account down it
   // force-logs-out every device — wipe local state and return to auth so the
   // app behaves like a fresh install (the regular 'logout' handler covers the

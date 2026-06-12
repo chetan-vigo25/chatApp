@@ -8,6 +8,46 @@ import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
 
 const ImageContext = createContext();
 
+// WhatsApp caps gallery multi-select at 30 per send; albums beyond this go
+// out as multiple messages.
+export const MEDIA_MULTI_SELECT_LIMIT = 30;
+
+// Normalize one picker asset to the app's { uri, name, type, size } shape,
+// resolving iOS ph:// and Android content:// URIs to readable file:// paths.
+const normalizePickedAsset = async (asset, mediaType) => {
+  const uri = asset?.uri;
+  if (!uri) return null;
+
+  const segments = uri.split('/');
+  const name = asset.fileName || segments[segments.length - 1] || `media_${Date.now()}`;
+  const type = asset.mimeType
+    || (asset.type ? `${asset.type}/${(name.split('.').pop() || 'jpg')}` : (mediaType === 'video' ? 'video/mp4' : 'image/jpeg'));
+
+  let finalUri = uri;
+
+  if (Platform.OS === 'ios' && finalUri.startsWith('ph://')) {
+    try {
+      const assetId = finalUri.replace('ph://', '');
+      const assetInfo = await MediaLibrary.getAssetInfoAsync(assetId);
+      if (assetInfo?.localUri) finalUri = assetInfo.localUri;
+    } catch (err) {
+      console.warn('Failed to resolve ph:// uri, using original', err);
+    }
+  }
+
+  if (Platform.OS === 'android' && finalUri.startsWith('content://')) {
+    try {
+      const dest = `${FileSystem.cacheDirectory}${Date.now()}_${name}`;
+      const downloadRes = await FileSystem.downloadAsync(finalUri, dest);
+      if (downloadRes?.uri) finalUri = downloadRes.uri;
+    } catch (err) {
+      console.warn('Failed to copy content:// uri to cache, using original', err);
+    }
+  }
+
+  return { uri: finalUri, name, type, size: asset.fileSize || asset.size || 0 };
+};
+
 export const ImageProvider = ({ children }) => {
   const [image, setImage] = useState(null); // use null as initial state
 
@@ -115,8 +155,65 @@ export const ImageProvider = ({ children }) => {
     return pickMedia('image');
   };
 
+  // Multi-select picker for WhatsApp-style albums. Returns an ARRAY of
+  // normalized files (possibly length 1), or null when cancelled.
+  const pickMediaMultiple = async (mediaType = 'image', limit = MEDIA_MULTI_SELECT_LIMIT) => {
+    suspendAppLock();
+    try {
+      if (mediaType === 'document') {
+        const result = await DocumentPicker.getDocumentAsync({
+          type: '*/*',
+          copyToCacheDirectory: true,
+          multiple: true,
+        });
+        if (result.canceled) return null;
+        const assets = (result.assets || []).slice(0, limit);
+        const files = [];
+        for (const asset of assets) {
+          const file = await normalizePickedAsset(asset, 'document');
+          if (file) files.push({ ...file, type: asset.mimeType || 'application/octet-stream' });
+        }
+        return files.length ? files : null;
+      }
+
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        alert('Permission to access gallery is required!');
+        return null;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: mediaType === 'video'
+          ? ImagePicker.MediaTypeOptions.Videos
+          : mediaType === 'all'
+            ? ImagePicker.MediaTypeOptions.All
+            : ImagePicker.MediaTypeOptions.Images,
+        quality: 0.8, // light client-side compression; backend re-optimizes
+        allowsEditing: false,
+        allowsMultipleSelection: true,
+        selectionLimit: limit,
+        orderedSelection: true,
+      });
+      const cancelled = result.canceled ?? result.cancelled;
+      if (cancelled) return null;
+
+      const assets = (result.assets || []).slice(0, limit);
+      const files = [];
+      for (const asset of assets) {
+        const file = await normalizePickedAsset(asset, asset.type === 'video' ? 'video' : mediaType);
+        if (file) files.push(file);
+      }
+      return files.length ? files : null;
+    } catch (error) {
+      console.error('Multi Media Picker Error:', error);
+      return null;
+    } finally {
+      resumeAppLock();
+    }
+  };
+
   return (
-    <ImageContext.Provider value={{ image, requestAndPickImage, pickMedia, setImage }}>
+    <ImageContext.Provider value={{ image, requestAndPickImage, pickMedia, pickMediaMultiple, setImage }}>
       {children}
     </ImageContext.Provider>
   );

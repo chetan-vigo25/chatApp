@@ -369,10 +369,12 @@ export default function GroupInfo({ navigation, route }) {
     );
   }
 
-  // WhatsApp grouped palette: solid inset cards on a slightly darker page.
-  const cardBg = isDarkMode ? '#1F2C33' : '#FFFFFF';
-  const dividerBg = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
-  const pageBg = isDarkMode ? '#0B141A' : '#EFF2F5';
+  // Uniform colour: cards/boxes and the page all share the theme `background`
+  // token (matching the contact-info screen), so nothing reads as a different
+  // surface shade. Cards stay delineated only by their dividers/edges.
+  const pageBg = theme.colors.background;
+  const cardBg = theme.colors.background;
+  const dividerBg = theme.colors.borderColor || (isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)');
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
@@ -755,11 +757,11 @@ const styles = StyleSheet.create({
 
   // Quick Actions
   quickActions: { flexDirection: 'row', justifyContent: 'center', paddingHorizontal: 10, gap: 8, paddingTop: 12, paddingBottom: 2 },
-  quickBtn: { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 14, gap: 5 },
+  quickBtn: { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 14, gap: 5, borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(128,128,128,0.18)' },
   quickBtnLabel: { fontFamily: 'Roboto-Medium', fontSize: 12.5, letterSpacing: 0.1 },
 
   // Grouped inset card (WhatsApp)
-  gCard: { marginHorizontal: 10, marginTop: 12, borderRadius: 14, overflow: 'hidden' },
+  gCard: { marginHorizontal: 10, marginTop: 12, borderRadius: 14, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(128,128,128,0.18)' },
   gCardPad: { paddingHorizontal: 16, paddingVertical: 14 },
   gSectionLabel: { fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.8, marginTop: 16, marginBottom: 4, paddingHorizontal: 22 },
   rowDivider: { height: StyleSheet.hairlineWidth, marginLeft: 62 },

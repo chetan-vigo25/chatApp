@@ -39,6 +39,9 @@ class DownloadQueue {
       chatId: item.chatId,
       messageType: item.messageType,
       filename: item.filename,
+      mediaUrl: item.mediaUrl || null,
+      messageId: item.messageId || null,
+      groupId: item.groupId || null,
     });
 
     this.queue.push({ ...item, mediaId });
@@ -53,6 +56,9 @@ class DownloadQueue {
       chatId: item.chatId,
       messageType: item.messageType,
       filename: item.filename,
+      mediaUrl: item.mediaUrl || null,
+      messageId: item.messageId || null,
+      groupId: item.groupId || null,
       retries: Number(item.retries || 0),
     }));
 
@@ -82,6 +88,9 @@ class DownloadQueue {
         chatId: item.chatId,
         messageType: item.messageType,
         filename: item.filename,
+        mediaUrl: item.mediaUrl || null,
+        messageId: item.messageId || null,
+        groupId: item.groupId || null,
         onProgress: async (progress) => {
           this._emit({ type: 'progress', mediaId, progress });
           await localStorageService.updateDownloadQueue(mediaId, { progress, status: 'downloading' });

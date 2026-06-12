@@ -31,9 +31,16 @@ import {
   registerCallSignalListeners,
 } from './services/callSignalService';
 import { subscribeSocketState } from '../Redux/Services/Socket/socket';
-import { CALL_PUSH_EVENTS } from '../firebase/fcmService';
-import { cancelIncomingCallNotifee, consumeInitialNotifeeCall } from '../firebase/callNotifee';
+// Firebase FCM / notifee disabled in Expo Go / dev builds (no native module).
+// import { CALL_PUSH_EVENTS } from '../firebase/fcmService';
+// import { cancelIncomingCallNotifee, consumeInitialNotifeeCall } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
+
+// No-op fallbacks so the call flow keeps working without native push.
+// Restore the imports above (and remove these) when building a dev/EAS client.
+const CALL_PUSH_EVENTS = { INCOMING: 'call:push:incoming', ACCEPT: 'call:push:accept', REJECT: 'call:push:reject' };
+const cancelIncomingCallNotifee = () => {};
+const consumeInitialNotifeeCall = () => {};
 
 export const CallContext = createContext(null);
 export const useCall = () => useContext(CallContext) || {};

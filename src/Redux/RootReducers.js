@@ -17,6 +17,7 @@ import chatSlice from '../Redux/Reducer/Chat/Chat.reducer';
 import profileSlice from '../Redux/Reducer/Profile/Profile.reducer';
 import groupSlice from '../Redux/Reducer/Group/Group.reducer';
 import statusSlice from '../Redux/Reducer/Status/Status.reducer';
+import blockSlice from '../Redux/Reducer/Block/Block.reducer';
 
 const appReducer = combineReducers({
     authentication: authSlice,
@@ -24,6 +25,7 @@ const appReducer = combineReducers({
     profile: profileSlice,
     group: groupSlice,
     status: statusSlice,
+    block: blockSlice,
 });
 
 export const RESET_APP_STATE = 'app/reset_state';

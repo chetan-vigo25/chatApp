@@ -8,6 +8,7 @@ import { useDispatch, useSelector } from "react-redux";
 import { useFocusEffect } from "@react-navigation/native";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { emitLogoutCurrentDevice, clearLocalStorageAndDisconnect } from "../../Redux/Services/Socket/socket";
+import { resetToLogin } from "../../Redux/Services/navigationService";
 import { Ionicons, FontAwesome6, AntDesign } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
@@ -43,13 +44,21 @@ export default function Setting({ navigation }) {
   }
 
   const handleLogout = async () => {
+    // Tell the server this device logged out (best-effort — never block logout).
     try {
       await emitLogoutCurrentDevice();
+    } catch (_e) { /* ignore — proceed with local logout */ }
+
+    // Clear AsyncStorage / SecureStore + SQLite and disconnect the socket.
+    try {
       await clearLocalStorageAndDisconnect();
-      navigation.reset({ index: 0, routes: [{ name: "LoginEmail" }] });
-    } catch (error) {
-      Alert.alert("Error", "An error occurred while logging out. Please try again.");
-    }
+    } catch (_e) { /* ignore — still redirect to login */ }
+
+    // Redirect to the Login screen on the ROOT navigator. This screen lives
+    // inside the bottom-tab navigator, so its own `navigation.reset` can't
+    // reach the root 'Login' route (which is why logout appeared to do
+    // nothing). `resetToLogin` resets via the NavigationContainer ref.
+    resetToLogin();
   };
 
   const confirmLogout = () => {
@@ -81,9 +90,11 @@ export default function Setting({ navigation }) {
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.secondaryTextColor;
   const iconColor = theme.colors.iconColor;
-  const pageBg = isDarkMode ? '#0B141A' : '#F7F8FA';
-  const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
-  const sepClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)';
+  // Uniform colour: the page and every card share the theme `background` token,
+  // so all sections show the same colour. Cards stay delineated by their edges.
+  const pageBg = theme.colors.background;
+  const cardBg = theme.colors.background;
+  const sepClr = theme.colors.borderColor || (isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)');
 
   const avatarBg = AVATAR_COLORS[
     ((profileData?.fullName || '').charCodeAt(0) || 0) % AVATAR_COLORS.length
@@ -227,7 +238,6 @@ export default function Setting({ navigation }) {
 
   const renderSection = (section, sectionIndex) => (
     <View key={sectionIndex} style={styles.sectionWrap}>
-      <Text style={[styles.sectionTitle, { color: subText }]}>{section.title}</Text>
       <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
         {section.items.map((item, i) =>
           renderMenuItem(item, i, i === section.items.length - 1)
@@ -355,14 +365,7 @@ const styles = StyleSheet.create({
   },
 
   // Sections
-  sectionWrap: { marginBottom: 22 },
-  sectionTitle: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 13,
-    letterSpacing: 0.2,
-    marginBottom: 8,
-    marginLeft: 14,
-  },
+  sectionWrap: { marginBottom: 16 },
   sectionCard: {
     borderRadius: 14,
     overflow: 'hidden',

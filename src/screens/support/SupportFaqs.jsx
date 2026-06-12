@@ -15,8 +15,8 @@ export default function SupportFaqs({ navigation }) {
   const accent = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.secondaryTextColor;
-  const pageBg = isDarkMode ? "#0B141A" : "#F7F8FA";
-  const cardBg = isDarkMode ? "#16222C" : "#FFFFFF";
+  const pageBg = theme.colors.background;
+  const cardBg = theme.colors.background;
   const sepClr = isDarkMode ? "rgba(255,255,255,0.07)" : "rgba(15,30,50,0.07)";
 
   const [groups, setGroups] = useState([]);

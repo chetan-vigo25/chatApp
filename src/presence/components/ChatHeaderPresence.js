@@ -14,6 +14,7 @@ export default function ChatHeaderPresence({
   fallbackStatusText,
   onBack,
   onPressProfile,
+  onPressAvatar,
   rightActions,
   getUserColor,
   isGroup,
@@ -130,7 +131,7 @@ export default function ChatHeaderPresence({
       </TouchableOpacity>
 
       <TouchableOpacity
-        onPress={onPressProfile}
+        onPress={onPressAvatar || onPressProfile}
         activeOpacity={0.85}
         style={[styles.avatarRing, { borderColor: ringColor }]}
       >

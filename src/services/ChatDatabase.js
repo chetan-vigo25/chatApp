@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'TalksTry.db';
-const DB_VERSION = 10;
+const DB_VERSION = 12;
 
 let _db = null;
 let _hasReplyColumns = false;
@@ -349,6 +349,43 @@ const runMigrations = async (db) => {
       }
     }
 
+    // V11: WhatsApp-style media albums — one message carries N attachments.
+    //  - `messages.media_group_id` — shared id for the album.
+    //  - `messages.media_items`    — JSON array of attachment descriptors
+    //    [{ mediaId, fileCategory, mediaUrl, mediaThumbnailUrl, localUri,
+    //       mediaMeta, uploadStatus, uploadProgress }].
+    if (currentVersion < 11) {
+      try {
+        await db.execAsync(`ALTER TABLE messages ADD COLUMN media_group_id TEXT;`);
+      } catch {}
+      try {
+        await db.execAsync(`ALTER TABLE messages ADD COLUMN media_items TEXT;`);
+      } catch {}
+      try {
+        await db.execAsync(`CREATE INDEX IF NOT EXISTS idx_messages_media_group ON messages(media_group_id);`);
+      } catch (e) {
+        console.warn('[ChatDB] V11 migration warning:', e?.message);
+      }
+    }
+
+    // V12 — user-to-user blocked contacts cache (offline cold render + sync).
+    if (currentVersion < 12) {
+      try {
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS blocked_contacts (
+            user_id TEXT PRIMARY KEY NOT NULL,
+            full_name TEXT,
+            phone TEXT,
+            profile_image TEXT,
+            blocked_at INTEGER DEFAULT 0
+          );
+        `);
+        await db.execAsync(`CREATE INDEX IF NOT EXISTS idx_blocked_at ON blocked_contacts(blocked_at DESC);`);
+      } catch (e) {
+        console.warn('[ChatDB] V12 migration warning:', e?.message);
+      }
+    }
+
     await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
   } catch (err) {
     console.error('[ChatDB] Migration error:', err);
@@ -432,6 +469,10 @@ const rowToMsg = (row) => {
     previewUrl: row.preview_url,
     localUri: row.local_uri,
     mediaId: row.media_id,
+    // Album (multi-attachment) fields — persisted in payload JSON (same
+    // pattern as mediaMeta); V11 columns kept as fallback for older writers.
+    mediaGroupId: pp?.mediaGroupId || row.media_group_id || null,
+    mediaItems: (Array.isArray(pp?.mediaItems) && pp.mediaItems.length ? pp.mediaItems : parseJSON(row.media_items)) || null,
     reactions: parseJSON(row.reactions),
     deliveredTo: parseJSON(row.delivered_to),
     readBy: parseJSON(row.read_by),
@@ -558,69 +599,72 @@ const cleanBeforeUpsert = async (db, msg) => {
   }
 };
 
+// Single-message upsert. Delegates to the batch path so it runs through the
+// SAME global write mutex (`runExclusive`) + transaction (`withTransactionAsync`)
+// as every other write batch.
+//
+// Why: the old implementation ran its multi-statement DELETE…+INSERT sequence
+// BARE on the shared connection — no mutex, no transaction. When it fired
+// concurrently with a batch (`upsertMessages`, which DOES hold a transaction),
+// the two contended for the single WAL writer lock and rejected with
+// "database is locked" on finalizeAsync. That is exactly the `handleSendText`
+// optimistic-write failure: the user sends a message (single upsert) while an
+// incoming-message sync batch is mid-commit. `_runUpsertBatch` performs the
+// identical 5-step flow (reply-recovery → clean dupes → preserve local state →
+// insert → save reply rows), so delegating is behaviour-preserving and removes
+// the race entirely.
 const upsertMessage = async (msg) => {
   if (!msg) return;
-  const db = await getDB();
+  return upsertMessages([msg]);
+};
 
-  // STEP 1: Read existing reply data BEFORE any cleanup
-  // Recover if replyToMessageId is missing entirely, OR if it's set but preview data is missing
-  let replyData = null;
-  const needsReplyRecovery = !msg.replyToMessageId || (msg.replyToMessageId && !msg.replyPreviewText);
-  if (needsReplyRecovery) {
-    const msgId = msg.serverMessageId || msg.id || msg.tempId;
-    if (msgId) {
-      // Check reply table first (permanent)
-      replyData = await getReplyData(msgId);
-      // Fallback: check message row payload
-      if (!replyData) {
-        try {
-          const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`, { $id: msgId });
-          if (ex?.payload) {
-            const p = JSON.parse(ex.payload);
-            if (p?._replyToMessageId) {
-              replyData = { replyToMessageId: p._replyToMessageId, replyPreviewText: p._replyPreviewText, replyPreviewType: p._replyPreviewType, replySenderName: p._replySenderName, replySenderId: p._replySenderId };
-            }
-          }
-        } catch {}
+// Global write mutex — serializes ALL multi-statement write batches on the
+// single SQLite connection (upsertMessages, saveStatusFeed, saveBroadcasts, …).
+// Two batches running concurrently contend for the WAL writer lock and reject
+// with "database is locked" on finalizeAsync — and parallel BEGIN TRANSACTIONs
+// also throw "cannot start a transaction within a transaction". Chaining every
+// batch onto one promise guarantees serial, conflict-free execution per process.
+let _writeChain = Promise.resolve();
+const runExclusive = (task) => {
+  const next = _writeChain.then(task, task);
+  _writeChain = next.catch(() => {}); // swallow so a failure never breaks the chain
+  return next;
+};
+
+// Run a multi-statement cache write as ONE atomic transaction, retrying on a
+// transient "database is locked".
+//
+// `withExclusiveTransactionAsync` (NOT `withTransactionAsync`) is the key: it
+// runs on a dedicated connection and queues *all* other DB access for the
+// transaction's duration, so the high-frequency single-statement writers
+// (receipts / message-status / unread) can't interleave into our DELETE+INSERT
+// batch. The retry then absorbs the brief window where one of those writers
+// already holds the WAL writer lock when our transaction starts. The task
+// MUST use the handle it is passed (`tx`), never the outer `db`.
+const _runCacheWrite = async (label, task, attempts = 4) => {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const db = await getDB();
+      if (!db) return;
+      if (typeof db.withExclusiveTransactionAsync === 'function') {
+        await db.withExclusiveTransactionAsync(async (tx) => { await task(tx); });
+      } else if (typeof db.withTransactionAsync === 'function') {
+        await db.withTransactionAsync(async () => { await task(db); });
+      } else {
+        await task(db);
       }
-    }
-  }
-
-  // Merge: incoming msg fields take priority, but fill in missing reply preview from recovered data
-  const finalMsg = replyData
-    ? {
-        ...msg,
-        replyToMessageId: msg.replyToMessageId || replyData.replyToMessageId,
-        replyPreviewText: msg.replyPreviewText || replyData.replyPreviewText,
-        replyPreviewType: msg.replyPreviewType || replyData.replyPreviewType,
-        replySenderName: msg.replySenderName || replyData.replySenderName,
-        replySenderId: msg.replySenderId || replyData.replySenderId,
+      return;
+    } catch (e) {
+      const m = String(e?.message || '').toLowerCase();
+      if (m.includes('locked') && i < attempts) {
+        await new Promise((r) => setTimeout(r, 60 * i));
+        continue;
       }
-    : msg;
-
-  // STEP 2: Clean duplicates
-  await cleanBeforeUpsert(db, finalMsg);
-
-  // STEP 3: Preserve edits/deletes/reactions
-  const merged = await _preserveLocalState(db, finalMsg);
-  const writeMsg = merged || finalMsg;
-
-  // STEP 4: Write to messages table
-  await _runInsert(db, writeMsg);
-
-  // STEP 5: Save reply data to permanent table under ALL possible IDs
-  if (writeMsg.replyToMessageId) {
-    const ids = [writeMsg.serverMessageId, writeMsg.id, writeMsg.tempId].filter(Boolean);
-    for (const rid of ids) {
-      try { await saveReplyData(rid, writeMsg, db); } catch {}
+      console.warn(`[ChatDB] ${label} failed:`, e?.message);
+      return;
     }
   }
 };
-
-// Serializes upsertMessages calls so two parallel batches don't both issue
-// BEGIN TRANSACTION on the same SQLite connection ("cannot start a transaction
-// within a transaction"). Each batch waits for the previous one to finish.
-let _upsertMessagesChain = Promise.resolve();
 
 const upsertMessages = async (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) return;
@@ -653,10 +697,9 @@ const upsertMessages = async (messages) => {
     }
   };
 
-  // Chain onto the previous run — guarantees serial execution per process.
-  const next = _upsertMessagesChain.then(run, run);
-  _upsertMessagesChain = next.catch(() => {}); // swallow so chain doesn't break
-  return next;
+  // Serialize against every other write batch (status feed, broadcasts, …) too,
+  // not just other upsertMessages calls.
+  return runExclusive(run);
 };
 
 const _runUpsertBatch = async (db, messages) => {
@@ -760,6 +803,10 @@ const _runInsert = async (db, msg, _retried = false) => {
     ...(msg.payload && typeof msg.payload === 'object' ? msg.payload : {}),
     // Preserve mediaMeta (location, contact data) in payload so it survives SQLite round-trip
     ...(msg.mediaMeta && typeof msg.mediaMeta === 'object' && !msg.payload?.mediaMeta ? { mediaMeta: msg.mediaMeta } : {}),
+    // WhatsApp-style album: persist the attachments array + group id so the
+    // grid bubble survives the SQLite round-trip.
+    ...(Array.isArray(msg.mediaItems) && msg.mediaItems.length ? { mediaItems: msg.mediaItems } : {}),
+    ...(msg.mediaGroupId ? { mediaGroupId: String(msg.mediaGroupId) } : {}),
     // Preserve forwarded flag in payload so it survives SQLite round-trip
     ...(msg.isForwarded ? { isForwarded: true, _isForwarded: true } : {}),
     ...(msg.forwardedFrom ? { forwardedFrom: msg.forwardedFrom, _forwardedFrom: msg.forwardedFrom } : {}),
@@ -1397,20 +1444,26 @@ const getLatestSeq = async (chatId) => {
 
 const deduplicateChat = async (chatId) => {
   if (!chatId) return;
-  const db = await getDB();
-  // 1. Remove exact primary key duplicates (shouldn't happen but safety net)
-  await db.runAsync(`DELETE FROM messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM messages WHERE chat_id = $c GROUP BY id) AND chat_id = $c`, { $c: chatId });
-  // 2. Remove temp rows that have a server-confirmed version (by temp_id link)
-  await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND server_message_id IS NULL AND temp_id IS NOT NULL AND temp_id IN (SELECT temp_id FROM messages WHERE chat_id = $c AND server_message_id IS NOT NULL)`, { $c: chatId });
-  // 3. Remove temp rows with a content-matching server row (30s window)
-  await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND id LIKE 'temp_%' AND EXISTS (SELECT 1 FROM messages s WHERE s.chat_id = $c AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000)`, { $c: chatId });
-  // 4. Remove any remaining content duplicates (same sender + text within 30s), keep newest
-  await db.runAsync(`
-    DELETE FROM messages WHERE chat_id = $c AND rowid NOT IN (
-      SELECT MAX(rowid) FROM messages WHERE chat_id = $c
-      GROUP BY sender_id, text, CAST(timestamp / 30000 AS INTEGER)
-    )
-  `, { $c: chatId });
+  // Serialize the 4 maintenance DELETEs through the global write mutex + a
+  // transaction so they neither interleave with a concurrent send/sync batch
+  // (→ "database is locked") nor leave the chat half-deduped if interrupted.
+  return runExclusive(() =>
+    _runCacheWrite('deduplicateChat', async (db) => {
+      // 1. Remove exact primary key duplicates (shouldn't happen but safety net)
+      await db.runAsync(`DELETE FROM messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM messages WHERE chat_id = $c GROUP BY id) AND chat_id = $c`, { $c: chatId });
+      // 2. Remove temp rows that have a server-confirmed version (by temp_id link)
+      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND server_message_id IS NULL AND temp_id IS NOT NULL AND temp_id IN (SELECT temp_id FROM messages WHERE chat_id = $c AND server_message_id IS NOT NULL)`, { $c: chatId });
+      // 3. Remove temp rows with a content-matching server row (30s window)
+      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND id LIKE 'temp_%' AND EXISTS (SELECT 1 FROM messages s WHERE s.chat_id = $c AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000)`, { $c: chatId });
+      // 4. Remove any remaining content duplicates (same sender + text within 30s), keep newest
+      await db.runAsync(`
+        DELETE FROM messages WHERE chat_id = $c AND rowid NOT IN (
+          SELECT MAX(rowid) FROM messages WHERE chat_id = $c
+          GROUP BY sender_id, text, CAST(timestamp / 30000 AS INTEGER)
+        )
+      `, { $c: chatId });
+    }),
+  );
 };
 
 const bulkUpdateStatus = async (chatId, newStatus, opts = {}) => {
@@ -1904,15 +1957,15 @@ const clearSyncData = async () => {
 // ── Broadcast status cache (official application updates) ─────────────────────
 
 /** Replace the cached broadcast set with the latest live list. */
-const saveBroadcasts = async (broadcasts = []) => {
-  try {
-    const db = await getDB();
+const saveBroadcasts = async (broadcasts = []) => runExclusive(() =>
+  // Snapshot is small (<=50) and fully authoritative — clear then insert as one
+  // exclusive, atomic transaction (`h` is the transaction handle).
+  _runCacheWrite('saveBroadcasts', async (h) => {
     const now = Date.now();
-    // Snapshot is small (<=50) and fully authoritative — clear then insert.
-    await db.runAsync('DELETE FROM broadcasts;');
+    await h.runAsync('DELETE FROM broadcasts;');
     for (const b of broadcasts) {
       if (!b || !b._id) continue;
-      await db.runAsync(
+      await h.runAsync(
         'INSERT OR REPLACE INTO broadcasts (id, data, published_at, expires_at, updated_at) VALUES (?, ?, ?, ?, ?);',
         [
           String(b._id),
@@ -1923,10 +1976,8 @@ const saveBroadcasts = async (broadcasts = []) => {
         ],
       );
     }
-  } catch (e) {
-    console.warn('[ChatDB] saveBroadcasts failed:', e?.message);
-  }
-};
+  }),
+);
 
 /** Load cached, non-expired broadcasts (newest first) for offline cold-render. */
 const loadBroadcasts = async () => {
@@ -1960,15 +2011,17 @@ const removeBroadcast = async (statusId) => {
 // authoritative snapshot replaces the cache on every successful fetch.
 
 /** Replace the cached contact status feed with the latest grouped list. */
-const saveStatusFeed = async (groups = []) => {
-  try {
-    const db = await getDB();
+const saveStatusFeed = async (groups = []) => runExclusive(() =>
+  // Authoritative snapshot — clear + insert as one exclusive, atomic
+  // transaction so concurrent receipt / message writes can't interleave and
+  // lock it (`h` is the transaction handle).
+  _runCacheWrite('saveStatusFeed', async (h) => {
     const now = Date.now();
-    await db.runAsync('DELETE FROM status_feed;');
+    await h.runAsync('DELETE FROM status_feed;');
     for (const g of groups) {
       const uid = String(g?.userId || g?._id || '');
       if (!uid || !(g.statuses && g.statuses.length)) continue;
-      await db.runAsync(
+      await h.runAsync(
         'INSERT OR REPLACE INTO status_feed (user_id, data, latest_at, has_unseen, updated_at) VALUES (?, ?, ?, ?, ?);',
         [
           uid,
@@ -1979,10 +2032,8 @@ const saveStatusFeed = async (groups = []) => {
         ],
       );
     }
-  } catch (e) {
-    console.warn('[ChatDB] saveStatusFeed failed:', e?.message);
-  }
-};
+  }),
+);
 
 /** Load the cached contact status feed (unseen-first, newest-first) for cold render. */
 const loadStatusFeed = async () => {
@@ -1994,6 +2045,40 @@ const loadStatusFeed = async () => {
     return (rows || []).map((r) => { try { return JSON.parse(r.data); } catch { return null; } }).filter(Boolean);
   } catch (e) {
     console.warn('[ChatDB] loadStatusFeed failed:', e?.message);
+    return [];
+  }
+};
+
+// ── Blocked contacts cache (V12) ─────────────────────────────────────────────
+const saveBlockedContacts = async (contacts = []) => {
+  try {
+    const db = await getDB();
+    await db.execAsync('DELETE FROM blocked_contacts;');
+    for (const c of contacts) {
+      const blockedAt = c.blockedAt ? new Date(c.blockedAt).getTime() : Date.now();
+      await db.runAsync(
+        'INSERT OR REPLACE INTO blocked_contacts (user_id, full_name, phone, profile_image, blocked_at) VALUES (?, ?, ?, ?, ?);',
+        [String(c.userId), c.fullName || null, c.phone || null, c.profileImage || null, blockedAt],
+      );
+    }
+  } catch (e) {
+    console.warn('[ChatDB] saveBlockedContacts failed:', e?.message);
+  }
+};
+
+const loadBlockedContacts = async () => {
+  try {
+    const db = await getDB();
+    const rows = await db.getAllAsync('SELECT * FROM blocked_contacts ORDER BY blocked_at DESC;');
+    return (rows || []).map((r) => ({
+      userId: r.user_id,
+      fullName: r.full_name,
+      phone: r.phone,
+      profileImage: r.profile_image,
+      blockedAt: r.blocked_at,
+    }));
+  } catch (e) {
+    console.warn('[ChatDB] loadBlockedContacts failed:', e?.message);
     return [];
   }
 };
@@ -2024,4 +2109,6 @@ export default {
   saveBroadcasts, loadBroadcasts, removeBroadcast,
   // Contact status-feed cache (V10)
   saveStatusFeed, loadStatusFeed,
+  // Blocked contacts cache (V12)
+  saveBlockedContacts, loadBlockedContacts,
 };

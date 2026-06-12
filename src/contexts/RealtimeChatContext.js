@@ -6,7 +6,8 @@ import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
-import { clearMessageNotification } from '../firebase/messageNotification';
+// Firebase/notifee message notifications disabled in Expo Go / dev builds.
+// import { clearMessageNotification } from '../firebase/messageNotification';
 import OutboxWorker from '../services/OutboxWorker';
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
@@ -61,6 +62,7 @@ const MESSAGE_TYPE_ICON_MAP = {
   contact: '👤',
   sticker: '✨',
   gif: '🎞️',
+  album: '🖼️',
 };
 
 const initialState = {
@@ -210,6 +212,7 @@ const getMessageTypeDisplayText = (messageType, text, metadata = {}) => {
   if (type === 'contact') return 'Contact';
   if (type === 'sticker') return 'Sticker';
   if (type === 'gif') return 'GIF';
+  if (type === 'album') return normalizedText || 'Album';
 
   return normalizedText || 'No messages yet';
 };
@@ -2417,6 +2420,7 @@ export function RealtimeChatProvider({ children }) {
         else if (grpMessageType === 'file') previewText = 'Document';
         else if (grpMessageType === 'location') previewText = 'Location';
         else if (grpMessageType === 'contact') previewText = 'Contact';
+        else if (grpMessageType === 'album') previewText = grpText || 'Album';
 
         const fullPreview = isSystem ? previewText : (grpSenderName ? `${grpSenderName}: ${previewText}` : previewText);
 
@@ -2511,6 +2515,12 @@ export function RealtimeChatProvider({ children }) {
           synced: 1,
           mediaUrl: source?.mediaUrl || null,
           mediaType: source?.mediaType || null,
+          previewUrl: source?.mediaThumbnailUrl || source?.previewUrl || null,
+          mediaId: source?.mediaId || null,
+          mediaMeta: source?.mediaMeta || null,
+          // Album fields — survive the SQLite round-trip via payload JSON
+          mediaGroupId: source?.mediaGroupId || null,
+          mediaItems: Array.isArray(source?.mediaItems) ? source.mediaItems : null,
           replyToMessageId: replyToMsgId,
           replyPreviewText,
           replyPreviewType,
@@ -3002,6 +3012,7 @@ export function RealtimeChatProvider({ children }) {
         else if (messageType === 'file') previewText = 'Document';
         else if (messageType === 'location') previewText = 'Location';
         else if (messageType === 'contact') previewText = 'Contact';
+        else if (messageType === 'album') previewText = text || 'Album';
         dispatch({
           type: 'INCOMING_GROUP_MESSAGE',
           payload: {
@@ -3244,6 +3255,7 @@ export function RealtimeChatProvider({ children }) {
       else if (messageType === 'file') previewText = 'Document';
       else if (messageType === 'location') previewText = 'Location';
       else if (messageType === 'contact') previewText = 'Contact';
+      else if (messageType === 'album') previewText = text || 'Album';
 
       // System messages show as-is (no sender prefix)
       const fullPreview = isSystemMsg ? previewText : (senderName ? `${senderName}: ${previewText}` : previewText);
@@ -3329,6 +3341,12 @@ export function RealtimeChatProvider({ children }) {
           synced: 1,
           mediaUrl: data?.mediaUrl || null,
           mediaType: data?.mediaType || null,
+          previewUrl: data?.mediaThumbnailUrl || data?.previewUrl || null,
+          mediaId: data?.mediaId || null,
+          mediaMeta: data?.mediaMeta || null,
+          // Album fields — survive the SQLite round-trip via payload JSON
+          mediaGroupId: data?.mediaGroupId || null,
+          mediaItems: Array.isArray(data?.mediaItems) ? data.mediaItems : null,
           replyToMessageId: replyToMessageId || null,
           replyPreviewText: replyPreviewText || null,
           replyPreviewType: replyPreviewType || null,
@@ -4201,7 +4219,7 @@ export function RealtimeChatProvider({ children }) {
     if (chatId) {
       // Opening a chat → clear its WhatsApp-style grouped message notification +
       // accumulated thread so already-read messages don't linger in the shade.
-      clearMessageNotification(chatId);
+      // clearMessageNotification(chatId);
       const socket = getSocket();
       if (socket && isSocketConnected()) {
         // Group chat IDs are raw ObjectIds; private chat IDs are `u_<a>_<b>`.

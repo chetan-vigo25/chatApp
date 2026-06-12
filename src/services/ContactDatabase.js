@@ -410,6 +410,42 @@ const getContactByUserId = async (userId) => {
   });
 };
 
+// Resolve the display identity for a sender as THIS DEVICE knows them —
+// saved-contact name first (by userId, then by phone digits), nothing else.
+// Used by the notification layer so the banner name always matches the chat
+// list (which resolves through the same contacts table). Returns
+// { fullName, profileImage } or null when the sender isn't a saved contact.
+const getContactDisplay = async ({ userId = null, phone = null } = {}) => {
+  if (!userId && !phone) return null;
+  return withDB(async (db) => {
+    let row = null;
+    if (userId) {
+      row = await db.getFirstAsync(
+        "SELECT full_name, profile_image FROM contacts WHERE user_id = $u AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
+        { $u: String(userId) }
+      );
+    }
+    if (!row && phone) {
+      const digits = String(phone).replace(/\D/g, '');
+      if (digits) {
+        row = await db.getFirstAsync(
+          "SELECT full_name, profile_image FROM contacts WHERE phone_normalized = $p AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
+          { $p: digits }
+        );
+        // Country-code variance fallback — match on the last 10 digits.
+        if (!row && digits.length >= 10) {
+          row = await db.getFirstAsync(
+            "SELECT full_name, profile_image FROM contacts WHERE phone_normalized LIKE $p AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
+            { $p: `%${digits.slice(-10)}` }
+          );
+        }
+      }
+    }
+    if (!row) return null;
+    return { fullName: row.full_name?.trim() || null, profileImage: row.profile_image || null };
+  });
+};
+
 const removeContacts = async (hashes) => {
   if (!Array.isArray(hashes) || hashes.length === 0) return;
   return withDB(async (db) => {
@@ -510,6 +546,7 @@ export default {
   getContactCount,
   getContactByHash,
   getContactByUserId,
+  getContactDisplay,
   removeContacts,
   getExistingHashes,
   clearAllContacts,

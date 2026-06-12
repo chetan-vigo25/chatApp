@@ -95,7 +95,7 @@ const CountryCodeSelector = ({
           styles.countryItem,
           {
             backgroundColor: isSelected
-              ? (isDarkMode ? 'rgba(52,183,241,0.12)' : 'rgba(52,183,241,0.08)')
+              ? (theme.colors.themeColor + (isDarkMode ? '22' : '14'))
               : 'transparent',
           },
         ]}
@@ -106,7 +106,10 @@ const CountryCodeSelector = ({
           <Text
             style={[
               styles.countryName,
-              { color: theme.colors.primaryTextColor },
+              {
+                color: isSelected ? theme.colors.themeColor : theme.colors.primaryTextColor,
+                fontFamily: isSelected ? 'Roboto-Medium' : 'Roboto-Regular',
+              },
             ]}
             numberOfLines={1}
           >
@@ -115,7 +118,7 @@ const CountryCodeSelector = ({
           <Text
             style={[
               styles.countryCode,
-              { color: theme.colors.placeHolderTextColor },
+              { color: isSelected ? theme.colors.themeColor : theme.colors.placeHolderTextColor },
             ]}
           >
             {item.code}
@@ -210,7 +213,7 @@ const CountryCodeSelector = ({
             {/* Header */}
             <View style={styles.modalHeader}>
               <Text style={[styles.modalTitle, { color: theme.colors.primaryTextColor }]}>
-                Select Country
+                Choose a country
               </Text>
               <TouchableOpacity onPress={closeModal} activeOpacity={0.7} style={[styles.closeBtn, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.06)' }]}>
                 <Ionicons name="close" size={18} color={theme.colors.primaryTextColor} />

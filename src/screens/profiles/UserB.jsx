@@ -12,10 +12,13 @@ import {
   Linking,
   ScrollView,
   Switch,
+  Alert,
 } from "react-native";
+import { useDispatch, useSelector } from "react-redux";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useRealtimeChat } from "../../contexts/RealtimeChatContext";
 import { profileServices } from "../../Redux/Services/Profile/Profile.Services";
+import { blockUser, unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import { getSocket } from "../../Redux/Services/Socket/socket";
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import ContactDatabase from "../../services/ContactDatabase";
@@ -70,10 +73,12 @@ export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
   const { theme, isDarkMode } = useTheme();
   const { startAudioCall, startVideoCall } = useCall();
+  const dispatch = useDispatch();
   const [peerProfile, setPeerProfile] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [scrolledPastHeader, setScrolledPastHeader] = useState(false);
   const [reportVisible, setReportVisible] = useState(false);
+  const [blockBusy, setBlockBusy] = useState(false);
 
   // Safe access to realtime context
   let muteChat, unmuteChat, chatList;
@@ -296,6 +301,65 @@ export default function UserB({ navigation, route }) {
     }
   }, [peerId, startVideoCall, displayName, peerProfileImage, peerImage]);
 
+  // ─── Block / Unblock (WhatsApp parity) ───
+  const blockedIds = useSelector((s) => s?.block?.blockedIds || []);
+  // Prefer live Redux; fall back to the server's profile-view flag on first load.
+  const isPeerBlocked = peerId
+    ? blockedIds.includes(String(peerId)) || !!peerProfile?.isBlocked
+    : false;
+
+  const handleToggleBlock = useCallback(() => {
+    if (!peerId) return;
+    if (isPeerBlocked) {
+      Alert.alert(
+        `Unblock ${displayName}?`,
+        "They will be able to call you and send you messages.",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Unblock",
+            style: "default",
+            onPress: async () => {
+              setBlockBusy(true);
+              const res = await dispatch(unblockUser(String(peerId)));
+              setBlockBusy(false);
+              if (!unblockUser.fulfilled.match(res)) {
+                Alert.alert("Couldn't unblock", res.payload || "Please try again.");
+              }
+            },
+          },
+        ],
+      );
+    } else {
+      Alert.alert(
+        `Block ${displayName}?`,
+        "Blocked contacts will no longer be able to:\n\n• Send you messages.\n• Call you.\n• See your profile updates.\n• See your online status.\n• See your last seen.\n• See your status updates.",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Block",
+            style: "destructive",
+            onPress: async () => {
+              setBlockBusy(true);
+              const res = await dispatch(
+                blockUser({
+                  userId: String(peerId),
+                  fullName: displayName,
+                  phone: displayPhone,
+                  profileImage: peerProfileImage || peerImage || null,
+                }),
+              );
+              setBlockBusy(false);
+              if (!blockUser.fulfilled.match(res)) {
+                Alert.alert("Couldn't block", res.payload || "Please try again.");
+              }
+            },
+          },
+        ],
+      );
+    }
+  }, [peerId, isPeerBlocked, displayName, displayPhone, peerProfileImage, peerImage, dispatch]);
+
   const onScroll = useCallback((e) => {
     const y = e.nativeEvent.contentOffset.y;
     setScrolledPastHeader(y > HERO_HEIGHT - 90);
@@ -309,13 +373,22 @@ export default function UserB({ navigation, route }) {
     );
   }
 
-  // WhatsApp grouped palette: page sits a shade behind the inset cards.
-  const pageBg = isDarkMode ? '#0B141A' : '#EFF2F5';
-  const cardBg = isDarkMode ? '#1F2C33' : '#FFFFFF';
-  const dividerClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
-  const headerBg = isDarkMode ? '#1F2C33' : '#FFFFFF';
+  // Theme-driven grouped palette. The page uses the app's actual background
+  // token (so this screen matches the chat list / settings / rest of the app in
+  // any theme), and the inset cards sit on the elevated `surface` token a shade
+  // in front of it. All values come from ThemeContext — no hardcoded colors —
+  // so light / dark (and any future theme) stay consistent automatically.
+  // The entire screen uses ONE uniform colour: cards/boxes and the collapsed
+  // top bar all share the page `background` token, so nothing reads as a
+  // different-shade surface. Cards stay delineated only by their hairline edge.
+  const pageBg = theme.colors.background;
+  const cardBg = theme.colors.background;
+  const dividerClr = theme.colors.borderColor;
+  const headerBg = theme.colors.background;
   const primaryText = theme.colors.primaryTextColor;
-  const subText = theme.colors.placeHolderTextColor;
+  // WhatsApp's row sub-labels use the dedicated secondary text token
+  // (#667781 / #8696a0) — not the lighter placeholder grey.
+  const subText = theme.colors.secondaryTextColor || theme.colors.placeHolderTextColor;
   const themeColor = theme.colors.themeColor;
   const isOnline = Boolean(peerProfile?.isOnline || peer?.isOnline);
   const statusLine = isOnline ? 'online' : (lastSeen ? `last seen ${lastSeen}` : '');
@@ -396,11 +469,13 @@ export default function UserB({ navigation, route }) {
           </View>
         </View>
 
-        {/* ─── Action buttons (Message · Audio · Video) ─── */}
-        <View style={styles.actionsRow}>
-          <ActionButton icon="chatbubble" label="Message" color={themeColor} cardBg={cardBg} onPress={handleMessage} />
-          <ActionButton icon="call" label="Audio" color={themeColor} cardBg={cardBg} onPress={handleCall} />
-          <ActionButton icon="videocam" label="Video" color={themeColor} cardBg={cardBg} onPress={handleVideoCall} />
+        {/* ─── Action buttons (Message · Audio · Video) — WhatsApp grouped card ─── */}
+        <View style={[styles.actionsCard, { backgroundColor: cardBg }]}>
+          <ActionColumn icon="chatbubble" label="Message" color={themeColor} onPress={handleMessage} />
+          <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
+          <ActionColumn icon="call" label="Audio" color={themeColor} onPress={handleCall} />
+          <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
+          <ActionColumn icon="videocam" label="Video" color={themeColor} onPress={handleVideoCall} />
         </View>
 
         {/* ─── About ─── */}
@@ -421,15 +496,6 @@ export default function UserB({ navigation, route }) {
                 <Text style={[styles.phoneValue, { color: primaryText }]} selectable numberOfLines={1}>{displayPhone}</Text>
                 <Text style={[styles.fieldLabel, { color: subText }]}>Mobile</Text>
               </View>
-              <TouchableOpacity style={styles.miniAction} onPress={handleMessage} activeOpacity={0.6} hitSlop={miniHit}>
-                <Ionicons name="chatbubble-outline" size={20} color={themeColor} />
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.miniAction} onPress={handleCall} activeOpacity={0.6} hitSlop={miniHit}>
-                <Ionicons name="call-outline" size={20} color={themeColor} />
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.miniAction} onPress={handleVideoCall} activeOpacity={0.6} hitSlop={miniHit}>
-                <Ionicons name="videocam-outline" size={21} color={themeColor} />
-              </TouchableOpacity>
             </View>
           </View>
         ) : null}
@@ -464,7 +530,7 @@ export default function UserB({ navigation, route }) {
         ) : null}
 
         {/* ─── Notifications (Mute toggle) ─── */}
-        {/* {chatId ? (
+        {chatId ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             <View style={styles.card_row}>
               <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
@@ -472,6 +538,9 @@ export default function UserB({ navigation, route }) {
               </View>
               <View style={{ flex: 1 }}>
                 <Text style={[styles.rowValue, { color: primaryText }]}>Mute notifications</Text>
+                <Text style={[styles.fieldLabel, { color: subText }]}>
+                  {isMuted ? 'On' : 'Off'}
+                </Text>
               </View>
               <Switch
                 value={isMuted}
@@ -482,14 +551,21 @@ export default function UserB({ navigation, route }) {
               />
             </View>
           </View>
-        ) : null} */}
+        ) : null}
 
-        {/* ─── Encryption hint (informational) ─── */}
-        {/* <View style={styles.encryptionRow}>
-          <Ionicons name="lock-closed" size={13} color={subText} style={{ marginTop: 1 }} />
-          <Text style={[styles.encryptionText, { color: subText }]}>
-            Your personal messages are end-to-end encrypted
-          </Text>
+        {/* ─── Encryption (informational, WhatsApp parity — not navigable) ─── */}
+        {/* <View style={[styles.card, { backgroundColor: cardBg }]}>
+          <View style={styles.card_row}>
+            <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
+              <Ionicons name="lock-closed-outline" size={18} color={themeColor} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.rowValue, { color: primaryText }]}>Encryption</Text>
+              <Text style={[styles.fieldLabel, { color: subText }]}>
+                Messages and calls are end-to-end encrypted.
+              </Text>
+            </View>
+          </View>
         </View> */}
 
         {/* ─── Save Contact ─── */}
@@ -533,9 +609,31 @@ export default function UserB({ navigation, route }) {
           </View>
         )}
 
-        {/* ─── Report user ─── */}
+        {/* ─── Block / Unblock + Report user ─── */}
         {peerId ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
+            <TouchableOpacity
+              style={styles.card_row}
+              activeOpacity={0.6}
+              onPress={handleToggleBlock}
+              disabled={blockBusy}
+            >
+              <View style={[styles.rowIconWrap, { backgroundColor: '#EF444418' }]}>
+                {blockBusy ? (
+                  <ActivityIndicator size="small" color="#EF4444" />
+                ) : (
+                  <MaterialCommunityIcons
+                    name={isPeerBlocked ? "account-check-outline" : "account-cancel-outline"}
+                    size={20}
+                    color="#EF4444"
+                  />
+                )}
+              </View>
+              <Text style={[styles.rowAction, { color: '#EF4444' }]}>
+                {isPeerBlocked ? `Unblock ${peer?.fullName || 'user'}` : `Block ${peer?.fullName || 'user'}`}
+              </Text>
+            </TouchableOpacity>
+            <View style={[styles.separator, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)' }]} />
             <TouchableOpacity
               style={styles.card_row}
               activeOpacity={0.6}
@@ -565,11 +663,11 @@ export default function UserB({ navigation, route }) {
 
 const miniHit = { top: 8, bottom: 8, left: 6, right: 6 };
 
-function ActionButton({ icon, label, color, cardBg, onPress }) {
+function ActionColumn({ icon, label, color, onPress }) {
   return (
-    <TouchableOpacity style={[styles.actionBtn, { backgroundColor: cardBg }]} onPress={onPress} activeOpacity={0.7}>
-      <Ionicons name={icon} size={23} color={color} />
-      <Text style={[styles.actionBtnLabel, { color }]} numberOfLines={1}>{label}</Text>
+    <TouchableOpacity style={styles.actionCol} onPress={onPress} activeOpacity={0.6}>
+      <Ionicons name={icon} size={24} color={color} />
+      <Text style={[styles.actionColLabel, { color }]} numberOfLines={1}>{label}</Text>
     </TouchableOpacity>
   );
 }
@@ -635,6 +733,9 @@ const styles = StyleSheet.create({
     height: HERO_HEIGHT,
     position: 'relative',
     overflow: 'hidden',
+    // Rounded bottom so the hero photo tucks into the themed page background.
+    borderBottomLeftRadius: 24,
+    borderBottomRightRadius: 24,
   },
   heroImage: { width: '100%', height: '100%' },
   heroFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
@@ -692,25 +793,32 @@ const styles = StyleSheet.create({
     textShadowRadius: 3,
   },
 
-  // ── Action buttons row ──
-  actionsRow: {
+  // ── Action buttons — single grouped card, WhatsApp style ──
+  actionsCard: {
     flexDirection: 'row',
-    paddingHorizontal: 10,
-    paddingTop: 12,
-    paddingBottom: 4,
-    gap: 8,
-  },
-  actionBtn: {
-    flex: 1,
+    alignItems: 'center',
+    marginHorizontal: 10,
+    marginTop: 12,
     borderRadius: 14,
-    paddingVertical: 13,
+    overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(128,128,128,0.18)',
+  },
+  actionCol: {
+    flex: 1,
+    paddingVertical: 14,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
+    gap: 6,
   },
-  actionBtnLabel: {
+  actionDivider: {
+    width: StyleSheet.hairlineWidth,
+    alignSelf: 'stretch',
+    marginVertical: 12,
+  },
+  actionColLabel: {
     fontFamily: 'Roboto-Medium',
-    fontSize: 12.5,
+    fontSize: 13,
     letterSpacing: 0.1,
   },
 
@@ -720,6 +828,10 @@ const styles = StyleSheet.create({
     marginTop: 12,
     borderRadius: 14,
     overflow: 'hidden',
+    // Neutral hairline edge so cards stay delineated from the page in BOTH
+    // themes (in light mode `surface` and `background` are close in value).
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(128,128,128,0.18)',
   },
   card_row: {
     flexDirection: 'row',
@@ -736,17 +848,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   rowValue: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 15.5,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 16.5,
   },
   rowAction: {
     fontFamily: 'Roboto-Medium',
-    fontSize: 15,
+    fontSize: 15.5,
     flex: 1,
+  },
+  separator: {
+    height: StyleSheet.hairlineWidth,
+    marginLeft: 64,
   },
   fieldLabel: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 12.5,
+    fontSize: 13.5,
     marginTop: 3,
   },
 
@@ -757,8 +873,8 @@ const styles = StyleSheet.create({
   },
   aboutText: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 15.5,
-    lineHeight: 21,
+    fontSize: 16.5,
+    lineHeight: 23,
   },
 
   // Phone
@@ -770,8 +886,8 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   phoneValue: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 16,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 16.5,
   },
   miniAction: {
     width: 38,

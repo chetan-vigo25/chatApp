@@ -57,10 +57,10 @@ export default function useMediaDownload(mediaId) {
     };
   }, [mediaId]);
 
-  const requestDownload = useCallback(async ({ chatId, messageType, filename }) => {
+  const requestDownload = useCallback(async ({ chatId, messageType, filename, mediaUrl, messageId, groupId } = {}) => {
     if (!mediaId) return;
     setError(null);
-    await downloadQueue.add({ mediaId, chatId, messageType, filename });
+    await downloadQueue.add({ mediaId, chatId, messageType, filename, mediaUrl, messageId, groupId });
   }, [mediaId]);
 
   const cancelDownload = useCallback(() => {
