@@ -63,6 +63,8 @@ export default function DeviceListItem({ device, onPress }) {
     ? 'Active now'
     : lastActiveLabel(device.lastActive || device.lastActivity) || 'Last active recently';
 
+  const unlinkRed = '#EF4444';
+
   return (
     <TouchableOpacity onPress={onPress} activeOpacity={0.6} style={styles.row}>
       <View style={[styles.iconCircle, { backgroundColor: theme.colors.menuBackground }]}>
@@ -76,6 +78,16 @@ export default function DeviceListItem({ device, onPress }) {
           {subtitle}
         </Text>
       </View>
+
+      {/* Trailing unlink icon — tap it (or the row) to log this device out. */}
+      <TouchableOpacity
+        onPress={onPress}
+        activeOpacity={0.6}
+        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        style={[styles.unlinkBtn, { backgroundColor: unlinkRed + '14' }]}
+      >
+        <FontAwesome6 name="link-slash" size={15} color={unlinkRed} />
+      </TouchableOpacity>
     </TouchableOpacity>
   );
 }
@@ -97,4 +109,11 @@ const styles = StyleSheet.create({
   textCol: { flex: 1 },
   name: { fontFamily: 'Roboto-Regular', fontSize: 17, letterSpacing: -0.2 },
   sub: { fontFamily: 'Roboto-Regular', fontSize: 13.5, marginTop: 3 },
+  unlinkBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });

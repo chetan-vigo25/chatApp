@@ -23,8 +23,12 @@ const CallEngineWebView = forwardRef(function CallEngineWebView({ onEvent, style
       allowsInlineMediaPlayback
       mediaPlaybackRequiresUserAction={false}
       allowsAirPlayForMediaPlayback
-      // Camera/mic capture grant (iOS 15+). Android grants via app permissions.
-      mediaCapturePermissionGrantType="grantIfSameHostElsePrompt"
+      // Camera/mic capture grant (iOS 15+). This WebView only ever loads our own
+      // first-party call engine, so grant getUserMedia outright — the app already
+      // holds (and prompts for) the OS mic/camera permission, and "grant" avoids
+      // host-matching edge cases that silently DENY capture on iOS (leaving the
+      // call with no audio/video). Android grants via the app's runtime permissions.
+      mediaCapturePermissionGrantType="grant"
       // Android: allow protected/mixed content so SDK assets + media load.
       allowsProtectedMedia
       mixedContentMode="always"

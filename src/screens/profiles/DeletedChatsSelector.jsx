@@ -108,7 +108,13 @@ export default function DeletedChatsSelector({ navigation, route }) {
         [{ text: 'Done', onPress: () => navigation.goBack() }]
       );
     } catch (e) {
-      Alert.alert('Could not save', typeof e === 'string' ? e : 'Please try again.');
+      // Surface the server's message (e.g. "This password is already in use as
+      // your 2-step password.") instead of a generic retry prompt — the error is
+      // an object { statusCode, message, data }, not a plain string.
+      const msg = typeof e === 'string'
+        ? e
+        : (e?.message || e?.data?.message || 'Please try again.');
+      Alert.alert('Could not save', msg);
     } finally {
       setSaving(false);
     }

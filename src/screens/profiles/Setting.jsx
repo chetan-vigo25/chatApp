@@ -94,7 +94,6 @@ export default function Setting({ navigation }) {
   // so all sections show the same colour. Cards stay delineated by their edges.
   const pageBg = theme.colors.background;
   const cardBg = theme.colors.background;
-  const sepClr = theme.colors.borderColor || (isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)');
 
   const avatarBg = AVATAR_COLORS[
     ((profileData?.fullName || '').charCodeAt(0) || 0) % AVATAR_COLORS.length
@@ -202,48 +201,36 @@ export default function Setting({ navigation }) {
     </TouchableOpacity>
   );
 
-  const renderMenuItem = (item, index, isLast) => (
-    <View key={item.label}>
-      <TouchableOpacity
-        onPress={item.onPress}
-        disabled={item.isLoading}
-        activeOpacity={0.6}
-        style={styles.menuItem}
-      >
-        <View style={styles.menuIconWrap}>
-          {item.isLoading ? (
-            <ActivityIndicator size="small" color={accent} />
-          ) : (
-            <Ionicons name={item.icon} size={23} color={iconColor} />
-          )}
-        </View>
-        <View style={styles.menuTextWrap}>
-          <Text style={[styles.menuLabel, { color: primaryText }]}>{item.label}</Text>
-          {item.subtitle ? (
-            <Text
-              numberOfLines={1}
-              style={[styles.menuSubtitle, { color: item.isLoading ? accent : subText }]}
-            >
-              {item.subtitle}
-            </Text>
-          ) : null}
-        </View>
-        {!item.isLoading && (
-          <Ionicons name="chevron-forward" size={18} color={subText} />
-        )}
-      </TouchableOpacity>
-      {!isLast && <View style={[styles.separator, { backgroundColor: sepClr }]} />}
-    </View>
-  );
-
-  const renderSection = (section, sectionIndex) => (
-    <View key={sectionIndex} style={styles.sectionWrap}>
-      <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
-        {section.items.map((item, i) =>
-          renderMenuItem(item, i, i === section.items.length - 1)
+  const renderMenuItem = (item) => (
+    <TouchableOpacity
+      key={item.label}
+      onPress={item.onPress}
+      disabled={item.isLoading}
+      activeOpacity={0.6}
+      style={styles.menuItem}
+    >
+      <View style={styles.menuIconWrap}>
+        {item.isLoading ? (
+          <ActivityIndicator size="small" color={accent} />
+        ) : (
+          <Ionicons name={item.icon} size={23} color={iconColor} />
         )}
       </View>
-    </View>
+      <View style={styles.menuTextWrap}>
+        <Text style={[styles.menuLabel, { color: primaryText }]}>{item.label}</Text>
+        {item.subtitle ? (
+          <Text
+            numberOfLines={1}
+            style={[styles.menuSubtitle, { color: item.isLoading ? accent : subText }]}
+          >
+            {item.subtitle}
+          </Text>
+        ) : null}
+      </View>
+      {!item.isLoading && (
+        <Ionicons name="chevron-forward" size={18} color={subText} />
+      )}
+    </TouchableOpacity>
   );
 
   const renderLogout = () => (
@@ -286,7 +273,11 @@ export default function Setting({ navigation }) {
         >
           {renderProfileCard()}
 
-          {menuSections.map((section, i) => renderSection(section, i))}
+          {/* All menu rows in one continuous list with equal spacing (WhatsApp
+              style) — no per-section grouping gaps, no row dividers. */}
+          <View style={styles.menuList}>
+            {menuSections.flatMap((s) => s.items).map((item) => renderMenuItem(item))}
+          </View>
 
           {renderLogout()}
         </ScrollView>
@@ -364,11 +355,9 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
 
-  // Sections
-  sectionWrap: { marginBottom: 16 },
-  sectionCard: {
-    borderRadius: 14,
-    overflow: 'hidden',
+  // Menu list (continuous, equal-gap rows — no dividers)
+  menuList: {
+    marginBottom: 10,
   },
 
   // Menu items
@@ -396,11 +385,6 @@ const styles = StyleSheet.create({
     marginTop: 2,
     lineHeight: 17,
   },
-  separator: {
-    height: StyleSheet.hairlineWidth,
-    marginLeft: 56,
-  },
-
   // Logout
   logoutWrap: {
     marginTop: 4,

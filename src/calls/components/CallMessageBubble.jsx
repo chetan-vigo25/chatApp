@@ -23,7 +23,7 @@ const fmtDuration = (sec) => {
 };
 
 export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
-  const { theme, isDarkMode } = useTheme();
+  const { theme, isDarkMode, chatColor } = useTheme();
   const { startAudioCall, startVideoCall } = useCall();
 
   const payload = msg?.payload || {};
@@ -62,10 +62,12 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
   else if (outcome === 'cancelled' && isOutgoing) label = 'Cancelled call';
   else label = isVideo ? 'Video call' : 'Voice call';
 
-  // WhatsApp bubble surfaces: sent = brand green (white content), received =
-  // card surface (themed text). Mirrors the audio/text bubbles.
+  // WhatsApp bubble surfaces: sent = the user's chosen chat accent (white
+  // content), received = card surface (themed text). Mirrors the audio/text
+  // bubbles in ChatScreen so a custom Appearance accent applies here too —
+  // when no custom accent is set, fall back to WhatsApp's outgoing green.
   const bubbleColor = isOutgoing
-    ? theme.colors.themeColor
+    ? ((chatColor && chatColor !== '#00A884') ? chatColor : '#005C4B')
     : (isDarkMode ? theme.colors.cardBackground : '#ffffff');
   const onBubble = isOutgoing ? '#ffffff' : theme.colors.primaryTextColor;
   const onBubbleSoft = isOutgoing ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;

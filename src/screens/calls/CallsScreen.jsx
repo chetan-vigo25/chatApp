@@ -14,6 +14,7 @@ import { listCalls, deleteCalls, clearCalls } from '../../calls/services/callLog
 import { registerCallLogListeners } from '../../calls/services/callLogSyncService';
 import { subscribeSocketState } from '../../Redux/Services/Socket/socket';
 import CallAvatar from '../../calls/components/CallAvatar';
+import CallsEmptyState from './CallsEmptyState';
 
 const PAGE_SIZE = 30;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -532,17 +533,12 @@ export default function CallsScreen({ navigation }) {
       );
     }
     return (
-      <View style={styles.emptyContainer}>
-        <View style={[styles.emptyIcon, { backgroundColor: `${theme.colors.themeColor}1F` }]}>
-          <Ionicons name="call-outline" size={40} color={theme.colors.themeColor} />
-        </View>
-        <Text style={[styles.emptyTitle, { color: theme.colors.primaryTextColor }]}>
-          No calls yet
-        </Text>
-        <Text style={[styles.emptySubText, { color: theme.colors.placeHolderTextColor }]}>
-          Your voice and video calls will appear here. Tap the button below to start one.
-        </Text>
-      </View>
+      <CallsEmptyState
+        theme={theme}
+        icon="call"
+        title="No calls yet"
+        subtitle="Your voice and video calls will appear here. Tap the button below to start one."
+      />
     );
   };
 

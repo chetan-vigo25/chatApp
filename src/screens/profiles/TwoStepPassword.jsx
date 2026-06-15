@@ -11,6 +11,10 @@ import {
   getUserSettings,
   updateUserSettings,
 } from '../../Redux/Services/Profile/Settings.Services';
+import {
+  clearDeletedChatConfig,
+  markDeletedPasswordSet,
+} from '../../utils/deletedChatConfig';
 
 // AsyncStorage key the top-level AppLockGate reads to decide whether to
 // re-lock on app foreground. Keep in sync with AppLockGate.js.
@@ -24,6 +28,10 @@ export default function TwoStepPassword({ navigation }) {
   const [loading, setLoading] = useState(true);
   const [enabled, setEnabled] = useState(false);
   const [hasPassword, setHasPassword] = useState(false);
+  // Mirrors whether a deleted-chats password is currently set. That password
+  // depends on this 2-step password (the panic flow promotes the entered
+  // password into the 2-step password), so clearing 2-step must also clear it.
+  const [hasDeletedPassword, setHasDeletedPassword] = useState(false);
   const [pwd, setPwd] = useState('');
   const [confirmPwd, setConfirmPwd] = useState('');
   const [showPwd, setShowPwd] = useState(false);
@@ -43,9 +51,15 @@ export default function TwoStepPassword({ navigation }) {
       try {
         const settings = await getUserSettings();
         if (!alive) return;
-        const two = settings?.chat?.twoStep || {};
+        const chat = settings?.chat || {};
+        const two = chat.twoStep || {};
         setEnabled(!!two.enabled);
         setHasPassword(!!two.hasPassword);
+        setHasDeletedPassword(
+          typeof chat.hasDeletedPassword === 'boolean'
+            ? chat.hasDeletedPassword
+            : !!chat.deletedPassword
+        );
         // Mirror state into AsyncStorage so AppLockGate reads the freshest value
         // on next app launch even before the API call resolves.
         await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, two.enabled ? '1' : '0');
@@ -71,6 +85,22 @@ export default function TwoStepPassword({ navigation }) {
     if (success) setSuccess('');
   };
 
+  // Clearing the 2-step password orphans the deleted-chats password (it relies
+  // on this password to arm the panic flow). So whenever 2-step is reset or
+  // disabled, also clear a previously-set deleted-chats password + its local
+  // armed selection. No-op when no deleted-chats password was set.
+  const clearDeletedPasswordIfSet = async () => {
+    if (!hasDeletedPassword) return;
+    try {
+      await updateUserSettings({ chat: { deletedPassword: null } });
+      await clearDeletedChatConfig();
+      await markDeletedPasswordSet(false);
+      setHasDeletedPassword(false);
+    } catch {
+      /* best-effort — don't block the 2-step reset on this */
+    }
+  };
+
   // Toggle handler — flipping ON without a password just stages the intent;
   // the user still has to set a password below to actually arm the lock.
   // Flipping OFF immediately calls the API and clears the password.
@@ -94,6 +124,8 @@ export default function TwoStepPassword({ navigation }) {
                 await updateUserSettings({
                   chat: { twoStep: { enabled: false, password: null } },
                 });
+                // Disabling 2-step orphans the deleted-chats password — clear it too.
+                await clearDeletedPasswordIfSet();
                 setEnabled(false);
                 setHasPassword(false);
                 await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '0');
@@ -146,7 +178,13 @@ export default function TwoStepPassword({ navigation }) {
       await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '1');
       setSuccess(hasPassword ? 'Password updated.' : '2-step password set.');
     } catch (e) {
-      setError(typeof e === 'string' ? e : 'Could not save password. Try again.');
+      // Surface the server message (e.g. "This password is already in use as
+      // your deleted-chats password.") — the rejected error is an object, not a
+      // plain string, so the previous typeof check always fell back to generic.
+      const msg = typeof e === 'string'
+        ? e
+        : (e?.message || e?.data?.message || 'Could not save password. Try again.');
+      setError(msg);
     } finally {
       setSubmitting(false);
     }
@@ -156,7 +194,9 @@ export default function TwoStepPassword({ navigation }) {
     if (!hasPassword) return;
     Alert.alert(
       'Reset password?',
-      'Your current 2-step password will be cleared. You can set a new one below — 2-step will stay enabled.',
+      hasDeletedPassword
+        ? 'Your current 2-step password will be cleared. Your deleted-chats password depends on it, so it will be cleared too. You can set new ones afterwards — 2-step will stay enabled.'
+        : 'Your current 2-step password will be cleared. You can set a new one below — 2-step will stay enabled.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -165,14 +205,21 @@ export default function TwoStepPassword({ navigation }) {
           onPress: async () => {
             clearMessages();
             setBusy(true);
+            const deletedWasSet = hasDeletedPassword;
             try {
               await updateUserSettings({
                 chat: { twoStep: { enabled: true, password: null } },
               });
+              // Reset the deleted-chats password too — it depended on this one.
+              await clearDeletedPasswordIfSet();
               setHasPassword(false);
               setPwd('');
               setConfirmPwd('');
-              setSuccess('Password reset. Set a new one to keep 2-step active.');
+              setSuccess(
+                deletedWasSet
+                  ? 'Password reset. Your deleted-chats password was also cleared. Set a new one to keep 2-step active.'
+                  : 'Password reset. Set a new one to keep 2-step active.'
+              );
             } catch (e) {
               setError(typeof e === 'string' ? e : 'Could not reset password.');
             } finally {

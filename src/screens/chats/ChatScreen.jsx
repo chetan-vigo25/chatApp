@@ -4522,7 +4522,38 @@ export default function ChatScreen({ navigation, route }) {
     // Group chats only: show the SENDER's avatar beside RECEIVED messages.
     // Tapping it opens that member's profile. Own messages get no avatar.
     const isGroupChatRow = chatData?.chatType === 'group' || chatData?.isGroup;
-    const showSenderAvatar = !isMyMessage && isGroupChatRow && !isSystemMessage;
+    const isGroupReceived = !isMyMessage && isGroupChatRow && !isSystemMessage;
+
+    // WhatsApp-style consecutive grouping: only the FIRST message in a run from
+    // the same sender carries the avatar + name. In this inverted list the
+    // message shown directly ABOVE (chronologically older) sits at index + 1.
+    // A run restarts when the sender changes, a date divider splits the two, or
+    // a significant time gap passes between them.
+    const CONSECUTIVE_GROUP_GAP_MS = 5 * 60 * 1000; // 5 min restarts the run
+    const olderMsg = index < messages.length - 1 ? messages[index + 1] : null;
+    const olderIsSystemLike = !!olderMsg && (
+      olderMsg?.type === 'system' || olderMsg?.messageType === 'system' ||
+      olderMsg?.type === 'call' || olderMsg?.messageType === 'call'
+    );
+    const msgTsMs = (m) => {
+      const raw = m?.timestamp || m?.createdAt || m?.updatedAt || m?.date || null;
+      const t = raw ? new Date(raw).getTime() : NaN;
+      return Number.isFinite(t) ? t : null;
+    };
+    const curTsMs = msgTsMs(msg);
+    const olderTsMs = msgTsMs(olderMsg);
+    const withinGroupGap = (curTsMs != null && olderTsMs != null)
+      ? (curTsMs - olderTsMs) <= CONSECUTIVE_GROUP_GAP_MS
+      : true;
+    const continuesRun = isGroupReceived
+      && !!olderMsg
+      && !olderIsSystemLike
+      && sameId(olderMsg.senderId, msg.senderId)
+      && !dateBadgeKey
+      && withinGroupGap;
+    // First message of a run → show avatar + name. Follow-ups → bubble only.
+    const showSenderAvatar = isGroupReceived && !continuesRun;
+    const showSenderName = showSenderAvatar;
     const senderMeta = showSenderAvatar ? (groupMembersMap?.[msg.senderId] || {}) : {};
     const senderAvatarUri = senderMeta.profileImage ? toSecureMediaUri(senderMeta.profileImage) : null;
     // Always prefer the device's saved contact name for this user (registered
@@ -4581,8 +4612,8 @@ export default function ChatScreen({ navigation, route }) {
           }}
           delayLongPress={300}
           style={{
-            flexDirection: showSenderAvatar ? "row" : "column",
-            alignItems: showSenderAvatar ? "flex-start" : (isMyMessage ? "flex-end" : "flex-start"),
+            flexDirection: isGroupReceived ? "row" : "column",
+            alignItems: isGroupReceived ? "flex-start" : (isMyMessage ? "flex-end" : "flex-start"),
             paddingVertical: 2,
             paddingHorizontal: 12,
             backgroundColor: isSelected
@@ -4592,7 +4623,7 @@ export default function ChatScreen({ navigation, route }) {
                 : "transparent",
           }}
         >
-          {showSenderAvatar && (
+          {showSenderAvatar ? (
             <TouchableOpacity onPress={openSenderProfile} activeOpacity={0.7} style={{ marginRight: 6, marginTop: 2 }}>
               {senderAvatarUri ? (
                 <Image source={{ uri: senderAvatarUri }} style={{ width: 30, height: 30, borderRadius: 15 }} />
@@ -4604,7 +4635,11 @@ export default function ChatScreen({ navigation, route }) {
                 </View>
               )}
             </TouchableOpacity>
-          )}
+          ) : isGroupReceived ? (
+            // Consecutive same-sender message: reserve the avatar's footprint so
+            // the bubble stays left-aligned under the run's first bubble.
+            <View style={{ width: 30, marginRight: 6 }} />
+          ) : null}
           <View style={{
             // WhatsApp bubble geometry: ~7.5px corners with a small tail at the
             // TOP corner on the sender's side (top-right for me, top-left for them).
@@ -4630,8 +4665,8 @@ export default function ChatScreen({ navigation, route }) {
             elevation: 1,
           }}>
             
-            {/* Sender name for group chats */}
-            {!isMyMessage && (chatData?.chatType === 'group' || chatData?.isGroup) && (
+            {/* Sender name — only on the first message of a consecutive run */}
+            {showSenderName && (
               <Text
                 numberOfLines={1}
                 style={{

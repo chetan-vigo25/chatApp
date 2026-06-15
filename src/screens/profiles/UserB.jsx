@@ -554,7 +554,7 @@ export default function UserB({ navigation, route }) {
         ) : null}
 
         {/* ─── Encryption (informational, WhatsApp parity — not navigable) ─── */}
-        {/* <View style={[styles.card, { backgroundColor: cardBg }]}>
+        <View style={[styles.card, { backgroundColor: cardBg }]}>
           <View style={styles.card_row}>
             <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
               <Ionicons name="lock-closed-outline" size={18} color={themeColor} />
@@ -566,7 +566,7 @@ export default function UserB({ navigation, route }) {
               </Text>
             </View>
           </View>
-        </View> */}
+        </View>
 
         {/* ─── Save Contact ─── */}
         {!isInDeviceBook && !contactJustSaved && (

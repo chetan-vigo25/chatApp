@@ -3,7 +3,7 @@ import React, {
 } from 'react';
 import {
   Vibration, Alert, StyleSheet, View, DeviceEventEmitter, Linking, Platform,
-  Animated, Pressable, TouchableOpacity, AppState,
+  Animated, Pressable, TouchableOpacity, AppState, Keyboard,
 } from 'react-native';
 import Constants from 'expo-constants';
 import { Audio } from 'expo-av';
@@ -131,6 +131,15 @@ export const CallProvider = ({ children }) => {
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
 
+  // Close the soft keyboard the moment a call leaves IDLE (incoming ring,
+  // outgoing dial, or active). Otherwise an open keyboard from the chat input
+  // stays up underneath the call banner / full-screen call UI.
+  useEffect(() => {
+    if (state.status && state.status !== CALL_STATUS.IDLE && state.status !== CALL_STATUS.ENDED) {
+      Keyboard.dismiss();
+    }
+  }, [state.status]);
+
   // ---- low-level command sender ----
   const sendCmd = useCallback((msg) => {
     const w = webRef.current;
@@ -178,10 +187,47 @@ export const CallProvider = ({ children }) => {
     }
   }, []);
 
-  // Restore the default loudspeaker route when a call ends — ONLY if the user
-  // toggled Speaker during it — so an earpiece choice never leaks into the next
-  // call or other app audio.
+  // ---- iOS audio session (the "no sound on iOS" fix) ----
+  // iOS has ONE process-global AVAudioSession that also governs the WKWebView's
+  // WebRTC audio. If we never put it into play-and-record with playsInSilentModeIOS,
+  // an iPhone whose physical SILENT SWITCH is on has NO call audio at all (the
+  // single most common "calls work on Android but are silent on iOS" bug), and the
+  // audio stops the moment the app backgrounds. Configure it at call start (caller
+  // + callee) and tear it down on end. No-op on Android — its routing is handled by
+  // applyAudioRoute on an explicit Speaker tap. Requires UIBackgroundModes 'audio'
+  // in app.json (added) for staysActiveInBackground.
+  const configureIOSAudioSession = useCallback(async () => {
+    if (Platform.OS !== 'ios') return;
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: true,
+        shouldDuckAndroid: false,
+      });
+      if (__DEV__) console.log('[CALL][APP][audio] iOS AVAudioSession → play+record, silent-mode play ON');
+    } catch (e) {
+      if (__DEV__) console.log('[CALL][APP][audio] iOS audio session setup failed', e?.message);
+    }
+  }, []);
+
+  // Restore the default audio route/session when a call ends. On Android this only
+  // reverts the loudspeaker/earpiece route IF the user toggled Speaker during the
+  // call (so an earpiece choice never leaks into the next call or other app audio);
+  // on iOS it releases the call's play-and-record session so music/other audio
+  // resumes normal behaviour.
   const resetAudioRoute = useCallback(async () => {
+    if (Platform.OS === 'ios') {
+      try {
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: false,
+          playsInSilentModeIOS: false,
+          staysActiveInBackground: false,
+          shouldDuckAndroid: true,
+        });
+      } catch (_) {}
+      return;
+    }
     if (Platform.OS !== 'android' || !audioRouteAppliedRef.current) return;
     audioRouteAppliedRef.current = false;
     try {
@@ -242,13 +288,16 @@ export const CallProvider = ({ children }) => {
 
   // ---- connect lifecycle ----
   // Mint a fresh calling-service token (GET /call/token) and connect the engine.
-  // Connect is EAGER: it fires the moment the engine WebView HTML loads (see the
-  // 'engine html loaded' log case below) and the SDK stays connected. This is
-  // REQUIRED — the calling service only routes a call's WebRTC media to peers
-  // ALREADY registered on it, so a lazily-connected callee is unreachable when
-  // the caller dials (rings over the app socket but no audio). Do not make this
-  // lazy again. If a connect is attempted before the HTML is ready it is queued
-  // in pendingConnectRef and flushed the instant the HTML signals ready.
+  // Connect is LAZY: the token is minted + the engine connected only AT CALL TIME
+  // — the caller via startCall→ensureConnected, the callee via
+  // onSignalIncoming→ensureConnected (the app-socket ring wakes the engine). We no
+  // longer pre-connect at login, so no token is minted for a user who never calls.
+  // The historical reason to connect eagerly was that the calling service drops a
+  // callee who isn't registered when the caller dials; that hole is now closed on
+  // the SERVER — whatsapp-call re-delivers `call:incoming` to a callee that
+  // registers after the dial, within the ring window (see signaling.js connection
+  // handler). If a connect is attempted before the engine HTML is ready it is
+  // queued in pendingConnectRef and flushed the instant the HTML signals ready.
   const doConnect = useCallback(async () => {
     if (IS_EXPO_GO) return;
     if (connectingRef.current || engineReadyRef.current) return;
@@ -521,19 +570,16 @@ export const CallProvider = ({ children }) => {
         // media path (connect → startCall/accept → localstream → remote stream →
         // audio playing) is traceable end-to-end.
         if (__DEV__ && payload?.message) console.log('[CALL][engine]', payload.message);
-        // The engine WebView finished loading. Connect to the calling service NOW
-        // (at login), and keep it connected — the SDK only routes a call's WebRTC
-        // media to peers that are ALREADY registered on the service, so both the
-        // caller and callee must be connected BEFORE a call starts. This mirrors
-        // the working reference (call/frontend/app.js connects in login()). A lazy
-        // connect leaves the callee unregistered when the caller dials, so the
-        // call rings over the app socket but never transfers audio.
+        // The engine WebView finished loading. We DO NOT connect here anymore —
+        // the token is minted + the engine connected only at call time (see
+        // doConnect). We just mark the HTML ready and flush any connect that was
+        // requested before it loaded (e.g. a call placed right at startup, where
+        // ensureConnected ran while htmlReady was still false and queued it).
         if (String(payload?.message || '').includes('engine html loaded')) {
           htmlReadyRef.current = true;
           const pending = pendingConnectRef.current;
           pendingConnectRef.current = null;
           if (pending) sendCmd({ cmd: CMD.CONNECT, token: pending.token, url: pending.url });
-          else doConnect();
         }
         break;
       }
@@ -780,6 +826,10 @@ export const CallProvider = ({ children }) => {
     // ensureMediaPermissions; just abort the call if it wasn't granted.
     if (!permOk) return;
 
+    // iOS: arm the play-and-record audio session BEFORE the SDK captures media, so
+    // call audio is heard even with the silent switch on (no-op on Android).
+    await configureIOSAudioSession();
+
     const ready = await ensureConnected();
     if (__DEV__) console.log('[CALL][APP][startCall] STEP 3 ensureConnected (engine ready?)', { ready });
     if (!ready) {
@@ -867,7 +917,7 @@ export const CallProvider = ({ children }) => {
     peers.forEach((p) => {
       notifyIncomingCall({ peerId: p.id, media, callId: signalId });
     });
-  }, [ensureConnected, ensureMediaPermissions, myId, sendCmd, startRinging, stopRinging, armRingTimeout, armMediaWatchdog]);
+  }, [ensureConnected, ensureMediaPermissions, configureIOSAudioSession, myId, sendCmd, startRinging, stopRinging, armRingTimeout, armMediaWatchdog]);
 
   const startAudioCall = useCallback((peer, chatId) => startCall(peer, 'audio', { chatId }), [startCall]);
   const startVideoCall = useCallback((peer, chatId) => startCall(peer, 'video', { chatId }), [startCall]);
@@ -887,6 +937,9 @@ export const CallProvider = ({ children }) => {
     // ensureMediaPermissions already showed the prompt / Settings guidance; if
     // it wasn't granted, decline the incoming call cleanly.
     if (!permOk) { finalizeEnd('rejected', 'Permission denied'); return; }
+    // iOS: arm the play-and-record audio session before answering so the callee
+    // hears the call even with the silent switch on (no-op on Android).
+    await configureIOSAudioSession();
     clearRingTimeout();
     stopRinging();
     // Answering on the in-app screen → dismiss the OS call notification too, so
@@ -938,7 +991,7 @@ export const CallProvider = ({ children }) => {
       if (__DEV__) console.log('[CALL][APP][accept] STEP 5b callId NOT yet known → set pendingAccept, waiting for WebRTC incoming to reconcile (connect watchdog armed)');
       dispatch({ type: ACT.SET_FLAG, key: 'pendingAccept', value: true });
     }
-  }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, finalizeEnd, armMediaWatchdog, armConnectWatchdog]);
+  }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, finalizeEnd, armMediaWatchdog, armConnectWatchdog]);
 
   const reject = useCallback(() => {
     const snap = stateRef.current;

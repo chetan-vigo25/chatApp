@@ -603,6 +603,14 @@ const attachCoreSocketListeners = (navigation) => {
   });
 
   socket.on('reconnect_attempt', (attemptNumber) => {
+    // Refresh the handshake auth token before each reconnect. socket.io reuses the
+    // token set at init for auto-reconnects, so after a long background (common on
+    // iOS, which suspends sockets aggressively) the old token may have expired and
+    // the handshake would fail — delaying or dropping incoming-call delivery. Using
+    // the freshest cached access token keeps the reconnect handshake valid.
+    if (socket && accessTokenCache) {
+      socket.auth = { ...(socket.auth || {}), token: accessTokenCache };
+    }
     updateSocketState({ status: 'reconnecting', connected: false, reconnectAttempts: attemptNumber || 0 });
   });
 

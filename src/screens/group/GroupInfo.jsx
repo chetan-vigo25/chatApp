@@ -114,7 +114,23 @@ export default function GroupInfo({ navigation, route }) {
 
   useEffect(() => {
     Animated.timing(fadeAnim, { toValue: 1, duration: 250, useNativeDriver: true }).start();
-    if (groupId) dispatch(viewGroup({ groupId }));
+    if (groupId) {
+      // Self-heal: if the backend says we're not a member, this is a stale local
+      // chat row for a group we already left / were removed from. Drop the row and
+      // back out instead of stranding the user on an un-loadable screen.
+      dispatch(viewGroup({ groupId }))
+        .unwrap()
+        .catch((err) => {
+          const msg = String(err?.message || err || '');
+          if (/not a member|NOT_GROUP_MEMBER/i.test(msg)) {
+            removeChat(groupId);
+            const altId = routeItem?.chatId || routeItem?._id;
+            if (altId && altId !== groupId) removeChat(altId);
+            showToast('You are no longer a member of this group');
+            navigation.goBack();
+          }
+        });
+    }
     (async () => {
       const raw = await AsyncStorage.getItem('userInfo');
       const user = raw ? JSON.parse(raw) : null;
@@ -152,37 +168,45 @@ export default function GroupInfo({ navigation, route }) {
       });
       if (isMember) dispatch(viewGroup({ groupId }));
     };
+    const handlers = {
+      'group:name:updated': onGroupProfileChanged,
+      'group:avatar:updated': onGroupProfileChanged,
+      'group:description:updated': onGroupProfileChanged,
+      'contact:updated': onContactUpdated,
+      'group:member:left': onGroupMembershipChanged,
+      'group:member:removed': onGroupMembershipChanged,
+      'group:member:remove:success': onGroupMembershipChanged,
+      'group:member:added': onGroupMembershipChanged,
+      'group:member:add:success': onGroupMembershipChanged,
+      'group:member:joined': onGroupMembershipChanged,
+    };
+    // Track the socket we actually attached to so we can detach from it. The old
+    // code re-attached every 2s forever and, if the socket instance was ever
+    // replaced (re-auth), leaked the previous instance's listeners.
+    const detach = () => {
+      if (!socket) return;
+      for (const evt of Object.keys(handlers)) socket.off(evt, handlers[evt]);
+      socket = null;
+    };
     const attach = () => {
       const s = getSocket?.();
-      if (!s || socket === s) return;
+      if (!s || s === socket) return;
+      detach(); // moving to a fresh socket instance — clean the old one first
+      for (const evt of Object.keys(handlers)) s.on(evt, handlers[evt]);
       socket = s;
-      s.on('group:name:updated', onGroupProfileChanged);
-      s.on('group:avatar:updated', onGroupProfileChanged);
-      s.on('group:description:updated', onGroupProfileChanged);
-      s.on('contact:updated', onContactUpdated);
-      s.on('group:member:left', onGroupMembershipChanged);
-      s.on('group:member:removed', onGroupMembershipChanged);
-      s.on('group:member:remove:success', onGroupMembershipChanged);
-      s.on('group:member:added', onGroupMembershipChanged);
-      s.on('group:member:add:success', onGroupMembershipChanged);
-      s.on('group:member:joined', onGroupMembershipChanged);
     };
     attach();
-    const interval = setInterval(attach, 2000);
+    // The socket may not be ready on first mount. Retry briefly, then stop —
+    // the socket.io instance is stable across reconnects, so once we're attached
+    // there is nothing to re-poll for.
+    let tries = 0;
+    const interval = setInterval(() => {
+      attach();
+      if (socket || ++tries > 15) clearInterval(interval);
+    }, 800);
     return () => {
       clearInterval(interval);
-      if (socket) {
-        socket.off('group:name:updated', onGroupProfileChanged);
-        socket.off('group:avatar:updated', onGroupProfileChanged);
-        socket.off('group:description:updated', onGroupProfileChanged);
-        socket.off('contact:updated', onContactUpdated);
-        socket.off('group:member:left', onGroupMembershipChanged);
-        socket.off('group:member:removed', onGroupMembershipChanged);
-        socket.off('group:member:remove:success', onGroupMembershipChanged);
-        socket.off('group:member:added', onGroupMembershipChanged);
-        socket.off('group:member:add:success', onGroupMembershipChanged);
-        socket.off('group:member:joined', onGroupMembershipChanged);
-      }
+      detach();
     };
   }, [groupId, dispatch]);
 

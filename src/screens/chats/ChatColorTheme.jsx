@@ -9,17 +9,23 @@ import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { updateUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 
 const { width: SCREEN_W } = Dimensions.get('window');
-const SWATCH_GAP = 14;
-const SWATCHES_PER_ROW = 6;
-const SWATCH_SIZE = (SCREEN_W - 32 - 28 - SWATCH_GAP * (SWATCHES_PER_ROW - 1)) / SWATCHES_PER_ROW;
+// Swipeable accent-colour cards
+const COLOR_CARD_W = 88;
+const COLOR_CARD_GAP = 12;
 
 // Curated, cohesive palette. #00A884 (the WhatsApp brand green) leads as the
 // default so the out-of-the-box selection always resolves to a swatch.
+// Row 1-2: bold/vivid accents. Row 3: soft, muted tones (gentler accents that
+// still keep white text legible on sent bubbles & buttons).
 const DEFAULT_ACCENT = '#00A884';
 const ACCENT_COLORS = [
+  // Bold
   '#00A884', '#128C7E', '#075E54', '#25D366',
   '#0099A8', '#34B7F1', '#0084FF', '#6C5CE7',
   '#9B59B6', '#E84393', '#FF6B6B', '#F2994A',
+  // Soft / muted
+  '#4DB6AC', '#64B5F6', '#7986CB', '#9575CD',
+  '#F06292', '#FF8A65',
 ];
 
 const THEME_OPTIONS = [
@@ -144,18 +150,6 @@ export default function ChatColorTheme({ navigation }) {
             </View>
           </View>
 
-          {/* End-to-end encryption notice (WhatsApp's pale chip) */}
-          <View style={styles.previewCenterRow}>
-            <View style={[styles.previewEncPill, {
-              backgroundColor: isDarkMode ? 'rgba(31,44,51,0.92)' : 'rgba(255,243,197,0.95)',
-            }]}>
-              <Ionicons name="lock-closed" size={9} color={isDarkMode ? '#8696a0' : '#8a7b3a'} />
-              <Text style={[styles.previewEncText, { color: isDarkMode ? '#8696a0' : '#8a7b3a' }]}>
-                Messages are end-to-end encrypted
-              </Text>
-            </View>
-          </View>
-
           <View style={styles.previewRowLeft}>
             <View style={[styles.bubbleReceived, { backgroundColor: bubbleRecvBg }]}>
               <Text style={[styles.bubbleText, { color: primaryText }]}>Hey! How's the new design coming along?</Text>
@@ -165,18 +159,11 @@ export default function ChatColorTheme({ navigation }) {
 
           <View style={styles.previewRowRight}>
             <View style={[styles.bubbleSent, { backgroundColor: accent }]}>
-              <Text style={styles.bubbleSentText}>Almost done — looks great in {isDarkMode ? 'dark' : 'light'} mode ✨</Text>
+              <Text style={styles.bubbleSentText}>Almost done — looks great ✨</Text>
               <View style={styles.bubbleSentMeta}>
                 <Text style={styles.bubbleSentTime}>10:31 AM</Text>
                 <Ionicons name="checkmark-done" size={14} color="rgba(255,255,255,0.9)" style={styles.gap4} />
               </View>
-            </View>
-          </View>
-
-          <View style={styles.previewRowLeft}>
-            <View style={[styles.bubbleReceived, { backgroundColor: bubbleRecvBg }]}>
-              <Text style={[styles.bubbleText, { color: primaryText }]}>Can't wait to see it 🎉</Text>
-              <Text style={[styles.bubbleTime, { color: subText }]}>10:32 AM</Text>
             </View>
           </View>
         </View>
@@ -194,102 +181,102 @@ export default function ChatColorTheme({ navigation }) {
     </View>
   );
 
-  // ─── Theme picker (WhatsApp radio list) ───
+  // ─── Theme picker — single row of 3 selectable cards ───
   const renderThemePicker = () => (
     <View style={styles.section}>
       <Text style={[styles.sectionTitle, { color: subText }]}>Theme</Text>
-      <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
-        {THEME_OPTIONS.map((opt, i) => {
+      <View style={styles.themeRowWrap}>
+        {THEME_OPTIONS.map((opt) => {
           const active = activeThemeKey === opt.key;
-          const isLast = i === THEME_OPTIONS.length - 1;
           return (
-            <View key={opt.key}>
-              <TouchableOpacity
-                activeOpacity={0.6}
-                onPress={() => handleThemeSelect(opt.key)}
-                style={styles.themeRow}
+            <TouchableOpacity
+              key={opt.key}
+              activeOpacity={0.75}
+              onPress={() => handleThemeSelect(opt.key)}
+              style={[
+                styles.themeCard,
+                {
+                  backgroundColor: active ? accent + '14' : cardBg,
+                  borderColor: active ? accent : (isDarkMode ? '#2A3942' : '#E2E7EC'),
+                },
+              ]}
+            >
+              <Ionicons name={opt.icon} size={22} color={active ? accent : iconColor} />
+              <Text
+                style={[styles.themeCardLabel, { color: active ? accent : primaryText }]}
+                numberOfLines={1}
               >
-                <View style={styles.themeIconWrap}>
-                  <Ionicons name={opt.icon} size={23} color={active ? accent : iconColor} />
+                {opt.key === 'system' ? 'System' : opt.label}
+              </Text>
+              {active && (
+                <View style={[styles.themeCheck, { backgroundColor: accent }]}>
+                  <Ionicons name="checkmark" size={11} color="#fff" />
                 </View>
-                <View style={styles.flex}>
-                  <Text style={[styles.themeLabel, { color: primaryText }]}>{opt.label}</Text>
-                  <Text style={[styles.themeDesc, { color: subText }]}>{opt.description}</Text>
-                </View>
-                <View style={[
-                  styles.radioOuter,
-                  { borderColor: active ? accent : (isDarkMode ? '#3A4A56' : '#C8CFD8') },
-                ]}>
-                  {active && <View style={[styles.radioInner, { backgroundColor: accent }]} />}
-                </View>
-              </TouchableOpacity>
-              {!isLast && <View style={[styles.separator, { backgroundColor: sepClr }]} />}
-            </View>
+              )}
+            </TouchableOpacity>
           );
         })}
       </View>
     </View>
   );
 
-  // ─── Accent color picker ───
-  const renderColorGrid = () => {
+  // ─── Accent color picker — swipeable cards ───
+  const renderColorCards = () => {
     const current = (selectedColor || accent || '').toUpperCase();
     const isDefault = current === DEFAULT_ACCENT.toUpperCase();
     return (
       <View style={styles.section}>
-        <Text style={[styles.sectionTitle, { color: subText }]}>Chat accent</Text>
-        <View style={[styles.sectionCard, { backgroundColor: cardBg }]}>
-          {/* Current selection summary */}
-          <View style={styles.accentHeader}>
-            <View style={[styles.accentCurrentDot, { backgroundColor: accent }]}>
-              <Ionicons name="color-palette-outline" size={18} color="#fff" />
-            </View>
-            <View style={styles.flex}>
-              <Text style={[styles.accentCurrentLabel, { color: primaryText }]}>
-                {isDefault ? 'Default theme' : 'Custom color'}
-              </Text>
-              <Text style={[styles.accentCurrentSub, { color: subText }]}>{current}</Text>
-            </View>
-            {!isDefault && (
-              <TouchableOpacity
-                activeOpacity={0.7}
-                onPress={() => handleColorSelect(DEFAULT_ACCENT)}
-                style={[styles.resetBtn, { borderColor: theme.colors.border }]}
-              >
-                <Ionicons name="refresh" size={13} color={accent} />
-                <Text style={[styles.resetBtnText, { color: accent }]}>Reset</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-
-          <View style={[styles.separator, { backgroundColor: sepClr, marginLeft: 16 }]} />
-
-          {/* Swatch grid */}
-          <View style={styles.colorGrid}>
-            {ACCENT_COLORS.map((color) => {
-              const isSel = (selectedColor || '').toUpperCase() === color.toUpperCase();
-              return (
-                <Animated.View
-                  key={color}
-                  style={[styles.swatchOuter, { transform: [{ scale: scaleAnims[color] }] }]}
-                >
-                  <TouchableOpacity
-                    activeOpacity={0.8}
-                    onPress={() => handleColorSelect(color)}
-                    style={[styles.swatchRing, { borderColor: isSel ? color : 'transparent' }]}
-                  >
-                    <View style={[styles.swatchBtn, { backgroundColor: color }]}>
-                      {isSel && <Ionicons name="checkmark" size={18} color="#fff" />}
-                    </View>
-                  </TouchableOpacity>
-                </Animated.View>
-              );
-            })}
-          </View>
+        <View style={styles.colorHeaderRow}>
+          <Text style={[styles.sectionTitleInline, { color: subText }]}>Chat accent</Text>
+          {!isDefault && (
+            <TouchableOpacity
+              activeOpacity={0.7}
+              onPress={() => handleColorSelect(DEFAULT_ACCENT)}
+              style={styles.resetInline}
+            >
+              <Ionicons name="refresh" size={13} color={accent} />
+              <Text style={[styles.resetBtnText, { color: accent }]}>Reset</Text>
+            </TouchableOpacity>
+          )}
         </View>
 
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          decelerationRate="fast"
+          snapToInterval={COLOR_CARD_W + COLOR_CARD_GAP}
+          snapToAlignment="start"
+          contentContainerStyle={styles.colorCardsRow}
+        >
+          {ACCENT_COLORS.map((color) => {
+            const isSel = (selectedColor || '').toUpperCase() === color.toUpperCase();
+            return (
+              <Animated.View key={color} style={{ transform: [{ scale: scaleAnims[color] }] }}>
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => handleColorSelect(color)}
+                  style={[
+                    styles.colorCard,
+                    { borderColor: isSel ? color : (isDarkMode ? '#2A3942' : '#E6EBEF') },
+                  ]}
+                >
+                  <View style={[styles.colorCardSwatch, { backgroundColor: color }]}>
+                    {isSel && <Ionicons name="checkmark" size={24} color="#fff" />}
+                  </View>
+                  <Text
+                    style={[styles.colorCardHex, { color: isSel ? color : subText }]}
+                    numberOfLines={1}
+                  >
+                    {color.toUpperCase()}
+                  </Text>
+                </TouchableOpacity>
+              </Animated.View>
+            );
+          })}
+        </ScrollView>
+
         <Text style={[styles.footerHint, { color: subText }]}>
-          Accent applies to your sent messages, buttons, and highlights.
+          Swipe and tap a card to apply the accent to your sent messages, buttons, and highlights.
         </Text>
       </View>
     );
@@ -319,7 +306,7 @@ export default function ChatColorTheme({ navigation }) {
         >
           {renderPreview()}
           {renderThemePicker()}
-          {renderColorGrid()}
+          {renderColorCards()}
         </ScrollView>
       </Animated.View>
     </View>
@@ -359,8 +346,8 @@ const styles = StyleSheet.create({
 
   // Preview
   previewWrap: {
-    marginTop: 4,
-    marginBottom: 24,
+    marginTop: 2,
+    marginBottom: 18,
   },
   previewCard: {
     borderRadius: 18,
@@ -403,7 +390,7 @@ const styles = StyleSheet.create({
   previewChat: {
     gap: 8,
     paddingHorizontal: 12,
-    paddingVertical: 16,
+    paddingVertical: 12,
   },
   previewCenterRow: {
     alignItems: 'center',
@@ -528,6 +515,84 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     overflow: 'hidden',
   },
+  sectionTitleInline: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+    letterSpacing: 0.2,
+  },
+
+  // Theme — single row of cards
+  themeRowWrap: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  themeCard: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    paddingVertical: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+  },
+  themeCardLabel: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13.5,
+  },
+  themeCheck: {
+    position: 'absolute',
+    top: 7,
+    right: 7,
+    width: 16,
+    height: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  // Accent — swipeable cards
+  colorHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginLeft: 14,
+    marginRight: 8,
+    marginBottom: 12,
+  },
+  resetInline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  colorCardsRow: {
+    paddingHorizontal: 14,
+    gap: COLOR_CARD_GAP,
+    paddingVertical: 2,
+  },
+  colorCard: {
+    width: COLOR_CARD_W,
+    borderRadius: 16,
+    borderWidth: 2.5,
+    paddingHorizontal: 6,
+    paddingTop: 6,
+    paddingBottom: 9,
+    alignItems: 'center',
+    gap: 8,
+  },
+  colorCardSwatch: {
+    width: '100%',
+    height: COLOR_CARD_W - 22,
+    borderRadius: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  colorCardHex: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 11,
+    letterSpacing: 0.4,
+  },
 
   // Theme rows
   themeRow: {
@@ -599,34 +664,6 @@ const styles = StyleSheet.create({
   resetBtnText: {
     fontFamily: 'Roboto-Medium',
     fontSize: 13,
-  },
-
-  // Color grid
-  colorGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: SWATCH_GAP,
-    rowGap: SWATCH_GAP + 2,
-    padding: 16,
-  },
-  swatchOuter: {
-    width: SWATCH_SIZE,
-    height: SWATCH_SIZE,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  swatchRing: {
-    width: SWATCH_SIZE,
-    height: SWATCH_SIZE,
-    borderRadius: SWATCH_SIZE / 2,
-    borderWidth: 2,
-    padding: 3,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  swatchBtn: {
-    flex: 1,
-    width: '100%',
-    borderRadius: (SWATCH_SIZE - 10) / 2,
-    alignItems: 'center', justifyContent: 'center',
   },
 
   footerHint: {

@@ -9,6 +9,7 @@ import { useTheme } from '../../contexts/ThemeContext';
 import {
   getUserSettings,
   updateUserSettings,
+  verifyTwoStepPassword,
 } from '../../Redux/Services/Profile/Settings.Services';
 import { getDeletedChatConfig, clearDeletedChatConfig, markDeletedPasswordSet } from '../../utils/deletedChatConfig';
 
@@ -19,6 +20,10 @@ export default function DeletedChatsPassword({ navigation }) {
 
   const [loading, setLoading] = useState(true);
   const [hasPassword, setHasPassword] = useState(false);
+  // The deleted-chats password can only be configured once the 2-step
+  // verification password exists — the panic flow promotes the entered
+  // password into the 2-step password, so 2-step must be set up first.
+  const [twoStepSet, setTwoStepSet] = useState(false);
   const [armedConfig, setArmedConfig] = useState(null);
   const [pwd, setPwd] = useState('');
   const [confirmPwd, setConfirmPwd] = useState('');
@@ -48,7 +53,9 @@ export default function DeletedChatsPassword({ navigation }) {
           typeof chat.hasDeletedPassword === 'boolean'
             ? chat.hasDeletedPassword
             : !!chat.deletedPassword;
+        const two = chat.twoStep || {};
         setHasPassword(flag);
+        setTwoStepSet(!!(two.enabled && two.hasPassword));
         setArmedConfig(config);
       } catch {
         /* leave defaults */
@@ -78,8 +85,27 @@ export default function DeletedChatsPassword({ navigation }) {
   // The password is NOT persisted here — it is committed together with the
   // chosen chats + delete type on the selector's "Set password & arm" action,
   // so the lock is never left half-configured.
-  const handleSave = () => {
+  const [checking, setChecking] = useState(false);
+
+  const handleSave = async () => {
     clearMessages();
+    // Gate: the deleted-chats password requires an existing 2-step password.
+    // Warn and offer to set it up instead of proceeding half-configured.
+    if (!twoStepSet) {
+      setError('Set up your two-step verification password first.');
+      Alert.alert(
+        'Set two-step password first',
+        'The deleted-chats password needs two-step verification to be enabled first. Set up your two-step verification password, then come back to configure this.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Set up two-step',
+            onPress: () => navigation.navigate('TwoStepPassword'),
+          },
+        ]
+      );
+      return;
+    }
     const trimmed = pwd.trim();
     if (trimmed.length < 4) {
       setError('Password must be at least 4 characters.');
@@ -91,6 +117,28 @@ export default function DeletedChatsPassword({ navigation }) {
     }
     if (trimmed !== confirmPwd.trim()) {
       setError('Passwords do not match.');
+      return;
+    }
+    // The deleted-chats (panic) password must differ from the 2-step password —
+    // at the lock screen the two are indistinguishable, so reusing the same
+    // value would make one of them unreachable. Catch it here (the backend
+    // rejects it too) and warn clearly instead of letting the user proceed to
+    // the chat picker only to fail on save with a vague message.
+    setChecking(true);
+    let clashesWithTwoStep = false;
+    try {
+      clashesWithTwoStep = await verifyTwoStepPassword(trimmed);
+    } catch {
+      clashesWithTwoStep = false;
+    }
+    setChecking(false);
+    if (clashesWithTwoStep) {
+      setError('This password is already your two-step password. Choose a different one.');
+      Alert.alert(
+        'Use a different password',
+        'Your deleted-chats password must be different from your two-step verification password. Please choose a different password.',
+        [{ text: 'OK' }]
+      );
       return;
     }
     setPwd('');
@@ -230,6 +278,23 @@ export default function DeletedChatsPassword({ navigation }) {
         {hasPassword ? 'UPDATE PASSWORD' : 'SET PASSWORD'}
       </Text>
       <View style={[styles.formCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
+        {!loading && !twoStepSet && (
+          <TouchableOpacity
+            activeOpacity={0.8}
+            onPress={() => navigation.navigate('TwoStepPassword')}
+            style={styles.warnBanner}
+          >
+            <Ionicons name="warning-outline" size={18} color="#C97B00" />
+            <View style={styles.flex}>
+              <Text style={styles.warnTitle}>Two-step password required</Text>
+              <Text style={styles.warnBody}>
+                Set up your two-step verification password before you can create
+                a deleted-chats password. Tap to set it up.
+              </Text>
+            </View>
+            <Ionicons name="chevron-forward" size={16} color="#C97B00" />
+          </TouchableOpacity>
+        )}
         <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
           <Ionicons name="key-outline" size={18} color={subText} />
           <TextInput
@@ -286,13 +351,17 @@ export default function DeletedChatsPassword({ navigation }) {
         <TouchableOpacity
           activeOpacity={0.85}
           onPress={handleSave}
-          disabled={resetting || loading}
+          disabled={resetting || loading || checking}
           style={[styles.primaryBtn, {
             backgroundColor: themeColor,
-            opacity: (resetting || loading) ? 0.7 : 1,
+            opacity: (resetting || loading || checking) ? 0.7 : 1,
           }]}
         >
-          <Ionicons name="arrow-forward-circle-outline" size={18} color="#fff" />
+          {checking ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Ionicons name="arrow-forward-circle-outline" size={18} color="#fff" />
+          )}
           <Text style={styles.primaryBtnText}>
             {hasPassword ? 'Update password & chats' : 'Next: choose chats'}
           </Text>
@@ -565,6 +634,29 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 4 },
     shadowRadius: 10,
     elevation: 2,
+  },
+  warnBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#FFA50018',
+    borderWidth: 1,
+    borderColor: '#FFA50055',
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 14,
+  },
+  warnTitle: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 13,
+    color: '#C97B00',
+    marginBottom: 2,
+  },
+  warnBody: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    lineHeight: 17,
+    color: '#C97B00',
   },
   inputWrap: {
     flexDirection: 'row',

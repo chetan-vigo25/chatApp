@@ -54,7 +54,8 @@ export default function LinkedDevicesScreen({ navigation }) {
 
   const { linkedDevices, fetchDevices, isFetching, unlinkDevice, error } = useDeviceLinking();
 
-  const pageBg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  // Theme-aware uniform page colour (matches the rest of the settings flow).
+  const pageBg = theme.colors.background;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.secondaryTextColor;
   const dividerClr = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(15,30,50,0.08)';
@@ -140,7 +141,7 @@ export default function LinkedDevicesScreen({ navigation }) {
       {/* Section */}
       <Text style={[styles.sectionLabel, { color: subText }]}>DEVICE STATUS</Text>
       <Text style={[styles.sectionHint, { color: subText }]}>
-        {count > 0 ? 'Tap a device to log it out.' : 'No devices are currently linked.'}
+        {count > 0 ? 'Tap a device or the unlink icon to log it out.' : 'No devices are currently linked.'}
       </Text>
 
       {initialLoad && (

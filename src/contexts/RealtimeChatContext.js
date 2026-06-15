@@ -3837,9 +3837,11 @@ export function RealtimeChatProvider({ children }) {
     };
 
     socket.on('group:invitation:received', onGroupInvitationReceived);
-    socket.on('group:invite:send:success', () => {});
-    socket.on('group:invite:accept:success', () => {});
-    socket.on('group:invite:reject:success', () => {});
+    // NOTE: the invite send/accept/reject confirmations are intentionally not
+    // bound here. They previously used inline no-op handlers that could never be
+    // detached (anonymous fns absent from the unsubscriber list), so they
+    // accumulated on every re-attach. The acting client already handles these
+    // via the emit's ack callback; no passive listener is needed.
     socket.on('group:invite:list:response', onGroupInviteListResponse);
 
     // ─── GROUP STATS & ACTIVITY LISTENERS ───
