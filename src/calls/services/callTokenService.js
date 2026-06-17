@@ -24,7 +24,26 @@ export const getCallToken = async ({ force = false } = {}) => {
     return cached;
   }
   if (__DEV__) console.log('[CALL][APP][token] → GET user/call/token', { force });
-  const res = await apiCall('get', 'user/call/token', {}, { silent: true });
+  let res;
+  try {
+    res = await apiCall('get', 'user/call/token', {}, { silent: true });
+  } catch (err) {
+    // The token GET failed at the network layer (no HTTP response → status is
+    // undefined). Surface the REAL axios diagnostics so we can tell apart an
+    // ATS/cleartext block, a connection refusal, a timeout, and an auth (401)
+    // failure — the generic [API:silent] log only prints the (undefined) status.
+    if (__DEV__) {
+      console.log('[CALL][APP][token] ✗ request FAILED', {
+        code: err?.code,
+        name: err?.name,
+        message: err?.message,
+        status: err?.response?.status,
+        hasResponse: !!err?.response,
+        hasRequest: !!err?.request,
+      });
+    }
+    throw err;
+  }
   const data = res?.data || {};
   if (!data.token) {
     if (__DEV__) console.log('[CALL][APP][token] ✗ no token in response', res);

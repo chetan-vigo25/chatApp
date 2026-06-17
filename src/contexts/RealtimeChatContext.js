@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
+import { DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
@@ -2526,6 +2527,14 @@ export function RealtimeChatProvider({ children }) {
           replyPreviewType,
           replySenderName,
           replySenderId,
+        }).then(() => {
+          // Bridge to an OPEN chat screen: the chat screen (useChatLogic) has its
+          // OWN message:new listener but filters by the active chatId and can miss
+          // a message (chatId-format mismatch, handler race) — yet THIS context
+          // still persisted it, so it appears in the chat LIST but not the open
+          // SCREEN. Emitting after the write lands lets the open screen reconcile
+          // straight from SQLite, guaranteeing it shows what was persisted.
+          DeviceEventEmitter.emit('chat:thread:update', { chatId: normalized.chatId });
         }).catch(() => {});
 
         // Save reply data to permanent reply table
@@ -3049,7 +3058,16 @@ export function RealtimeChatProvider({ children }) {
     // and appear instantly on reopen).
     const onConnectCatchup = async () => {
       try {
-        const knownChatIds = Object.keys(state.chatMap || {});
+        // Source the chat list from BOTH the persistent DB and the live in-memory
+        // map (via stateRef — NOT the stale `state` captured when this effect was
+        // set up, which is empty/partial on a cold reopen). The DB list is
+        // available immediately on cold start, before the in-memory chatMap has
+        // finished loading, closing the race that left some chats un-synced — the
+        // "missed messages sometimes don't appear on reopen" bug.
+        let dbChatIds = [];
+        try { dbChatIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
+        const memChatIds = Object.keys(stateRef.current?.chatMap || {});
+        const knownChatIds = Array.from(new Set([...dbChatIds, ...memChatIds]));
         if (knownChatIds.length === 0) return;
 
         // Gather { chatId, lastSeq } per chat.

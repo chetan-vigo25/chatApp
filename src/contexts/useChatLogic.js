@@ -2376,13 +2376,22 @@ export default function useChatLogic({ navigation, route }) {
             if (m.tempId) dbIdSet.add(m.tempId);
           }
 
-          // Find optimistic temp messages not yet in DB (scheduled msgs are in separate state)
+          // Find locally-originated messages not yet reflected in the DB load and
+          // preserve them so a just-sent message never blinks out of the thread.
           const optimistic = prev.filter(m => {
             const id = m.id || m.tempId;
             if (!id) return false;
             const inDB = dbIdSet.has(m.id) || dbIdSet.has(m.tempId) || dbIdSet.has(m.serverMessageId);
-            // Keep temp messages not in DB
-            if (String(id).startsWith('temp_') && !inDB) return true;
+            if (inDB) return false;
+            // Keep ANY message we created locally (it carries a tempId) that the DB
+            // load doesn't yet contain. This covers BOTH a pre-ack temp row AND a
+            // just-acked row whose `id` was already swapped to the serverMessageId
+            // before its DB write landed — the latter no longer starts with
+            // 'temp_', so the old `id`-prefix check dropped it and the sent
+            // message disappeared. A locally-created row is only kept while it's
+            // absent from the DB; the moment its write lands it's in dbIdSet and
+            // renders from the DB instead (no duplicate, no resurrection).
+            if (m.tempId || String(id).startsWith('temp_')) return true;
             return false;
           });
 
@@ -2434,6 +2443,24 @@ export default function useChatLogic({ navigation, route }) {
       const cid = payload?.chatId;
       if (cid && chatIdRef.current && String(cid) === String(chatIdRef.current)) {
         refreshMessagesFromDB(true);
+      }
+    });
+    return () => sub.remove();
+  }, [refreshMessagesFromDB]);
+
+  // Safety-net bridge: RealtimeChatContext persists EVERY incoming message to
+  // SQLite (it powers the chat list, and is not gated on the active chat). The
+  // open chat screen has its own message:new listener, but that can drop a
+  // message via the active-chatId filter or a handler race — leaving it visible
+  // in the chat LIST but missing from the open SCREEN. When the context signals a
+  // message landed in this chat's thread, re-read from the DB so the open screen
+  // always reflects what was actually persisted. Debounced refresh coalesces
+  // bursts and dedupes, so a message the screen already rendered is a no-op.
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('chat:thread:update', (payload) => {
+      const cid = payload?.chatId;
+      if (cid && chatIdRef.current && String(cid) === String(chatIdRef.current)) {
+        refreshMessagesFromDB();
       }
     });
     return () => sub.remove();
@@ -5398,16 +5425,6 @@ export default function useChatLogic({ navigation, route }) {
   const sendMessageViaSocket = useCallback((payload, tempId) => {
     return new Promise(async (resolve, reject) => {
       try {
-        const socket = socketRef.current || getSocket();
-        if (!socket || !isSocketConnected()) {
-          console.warn("⚠️ sendMessageViaSocket: socket not connected");
-          updateMessageStatus(tempId, 'failed');
-          return reject(new Error('socket not connected'));
-        }
-
-        // Immediately mark as sent for instant UI feedback (WhatsApp behavior)
-        updateMessageStatus(tempId, 'sent');
-
         const isGroupPayload = payload?.chatType === 'group' || payload?.groupId;
         const isReplyPayload = Boolean(payload?.replyToMessageId);
         const isQuotePayload = Boolean(payload?.quotedMessageId && payload?.quotedText);
@@ -5448,11 +5465,9 @@ export default function useChatLogic({ navigation, route }) {
           ChatDatabase.acknowledgeMessage(targetTempId, serverMessageId).catch(() => {});
         };
 
-        // Emit the message — clientMessageId is the explicit idempotency
-        // key the server stores on the doc and echoes back. `tempId` is
-        // kept as a legacy alias.
-        const emitPayload = { ...payload, clientMessageId: tempId, tempId };
-        socket.emit(sendEvent, emitPayload, (response) => {
+        // Shared ack handler — runs for both the live emit and the queued
+        // (offline) replay that flushPendingEmitQueue fires on reconnect.
+        const onAck = (response) => {
           if (response && (response.status === true || response.success === true || response.data)) {
             reconcile(response);
             return resolve(response);
@@ -5465,9 +5480,32 @@ export default function useChatLogic({ navigation, route }) {
             if (serverMessageId) return resolve(response);
             return resolve({ status: true, noAck: true });
           }
-        });
+        };
 
-        // Resolve immediately since we marked as sent above
+        // clientMessageId is the explicit idempotency key the server stores on the
+        // doc and echoes back. `tempId` is kept as a legacy alias. Because it
+        // dedupes server-side, replaying a queued message after reconnect can
+        // never create a duplicate.
+        const emitPayload = { ...payload, clientMessageId: tempId, tempId };
+
+        const socket = socketRef.current || getSocket();
+        if (!socket || !isSocketConnected()) {
+          // OFFLINE — do NOT drop the message (the old behaviour: it was marked
+          // 'failed' and lost, the root cause of "messages I sent never reached
+          // the other device"). Instead QUEUE it: emitSocketEvent buffers it in
+          // pendingEmitQueue and replays it — WITH this same ack — the instant the
+          // socket reconnects. Keep it visibly 'sending' (clock); it flips to
+          // 'sent' once the queued emit flushes and the ack returns.
+          console.warn('⚠️ sendMessageViaSocket: socket offline → queued for reconnect');
+          updateMessageStatus(tempId, 'sending');
+          emitSocketEvent(sendEvent, emitPayload, onAck);
+          return resolve({ status: true, queued: true });
+        }
+
+        // ONLINE — immediate optimistic 'sent' for instant UI feedback, then emit.
+        updateMessageStatus(tempId, 'sent');
+        socket.emit(sendEvent, emitPayload, onAck);
+        // Resolve immediately since we marked as sent above.
         resolve({ status: true, optimistic: true });
       } catch (err) {
         console.error("❌ sendMessageViaSocket error:", err);

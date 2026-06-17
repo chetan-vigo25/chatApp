@@ -830,13 +830,32 @@ export const initSocket = async (deviceInfo, navigation) => {
 
 export const setupAppStateListener = (navigation) => {
   const handleAppStateChange = async (nextAppState) => {
-    if (appState.match(/inactive|background/) && nextAppState === 'active') {
+    const goingBackground = nextAppState.match(/inactive|background/);
+    const goingForeground = appState.match(/inactive|background/) && nextAppState === 'active';
+
+    if (goingForeground) {
       if (!socket || !socket.connected) {
         await reconnectSocket(navigation);
       } else if (accessTokenCache) {
         socket.emit('token:validate', { token: accessTokenCache });
       }
+      // Back in the foreground → mark this user online again. The socket may have
+      // reconnected above, so queue it (emitSocketEvent) to fire the moment the
+      // connection is live rather than dropping it on a transient disconnect.
+      emitSocketEvent('app:state', { state: 'foreground' });
+      emitSocketEvent('presence:update', { status: 'online' });
+    } else if (goingBackground && appState === 'active') {
+      // App minimized / removed from the recents / closing → tell the server the
+      // user is offline immediately. The socket can stay connected for a while in
+      // the background, so without this explicit signal the user keeps showing
+      // "online". Emit directly (no offline queue) since a backgrounded socket
+      // that has already dropped can't deliver an offline event anyway.
+      if (socket && socket.connected) {
+        socket.emit('app:state', { state: 'background' });
+        socket.emit('presence:update', { status: 'offline' });
+      }
     }
+
     appState = nextAppState;
   };
 

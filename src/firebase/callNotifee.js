@@ -191,13 +191,21 @@ export const registerNotifeeForeground = () => {
 
 // ===== background events (killed/backgrounded) =====
 export const registerNotifeeBackground = () => {
-  // CallStyle backend handles background actions natively (BroadcastReceiver) —
-  // nothing to register in JS.
-  if (isCallUi()) return;
+  // notifee REQUIRES a background event handler to be registered at the top level
+  // whenever the library is in the build — otherwise it logs "no background event
+  // handler has been set" the first time ANY notifee notification (incl. the
+  // grouped MessagingStyle message notifications) raises a background event. So we
+  // register unconditionally when notifee is present, even when the native
+  // CallStyle (ExpoCallUi) backend handles call actions itself via a
+  // BroadcastReceiver: in that case the call branch below simply never matches and
+  // the handler is a harmless no-op for calls while still satisfying notifee.
   const notifee = getNotifee();
   if (!notifee) return;
   try {
     notifee.onBackgroundEvent(async ({ type, detail }) => {
+      // CallStyle handles its own Answer/Decline natively; only route call
+      // actions here when notifee is the active call backend.
+      if (isCallUi()) return;
       const action = routeNotifeeEvent(type, detail);
       if (action === 'decline' || action === 'accept') {
         await cancelIncomingCallNotifee(detail?.notification?.data?.callId);

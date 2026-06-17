@@ -18,6 +18,7 @@ import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
 import {  getFCMToken, initializeNotifications, setupNotificationCategory, setupCallNotificationCategory } from './src/firebase/fcmService';
 import { registerNotifeeForeground, ensureCallChannel } from './src/firebase/callNotifee';
+import { setPushToken } from './src/Redux/Services/Socket/socket';
 import 'react-native-get-random-values';
 import NoInternet from './src/screens/NoInternet';
 import { CallProvider } from './src/calls/CallProvider';
@@ -46,6 +47,13 @@ export default function App() {
           if (token) {
             await AsyncStorage.setItem('fcmToken', token);
             console.log('FCM token stored', token);
+            // Register the CURRENT token with the backend session on every boot.
+            // A rebuild/reinstall (or any FCM rotation) changes the token, but the
+            // backend otherwise only learns it at login — so it keeps pushing to a
+            // dead token and call/message pushes report `sent: 0` while the device
+            // is backgrounded/locked. setPushToken stores it + (re)registers over
+            // the socket (idempotent; fires on connect if not yet connected).
+            setPushToken(token);
           }
 
           // Setup foreground listeners (background handler is in index.js)

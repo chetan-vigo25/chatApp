@@ -624,6 +624,16 @@ const upsertMessage = async (msg) => {
 // with "database is locked" on finalizeAsync — and parallel BEGIN TRANSACTIONs
 // also throw "cannot start a transaction within a transaction". Chaining every
 // batch onto one promise guarantees serial, conflict-free execution per process.
+// True for the transient SQLite contention errors that resolve once the
+// contending writer drains its statement: a plain "database is locked"/"busy",
+// OR the generic expo-sqlite "NativeStatement.finalizeAsync has been rejected →
+// Error code" that a WAL writer-lock conflict surfaces as (no "locked" text).
+// These are safe to retry/skip — the row is re-upserted on the next sync/ack.
+const isTransientLockError = (err) => {
+  const m = String(err?.message || '').toLowerCase();
+  return m.includes('locked') || m.includes('busy') || m.includes('finalizeasync');
+};
+
 let _writeChain = Promise.resolve();
 const runExclusive = (task) => {
   const next = _writeChain.then(task, task);
@@ -672,9 +682,33 @@ const upsertMessages = async (messages) => {
   const run = async () => {
     const db = await getDB();
 
-    // Use expo-sqlite's built-in transaction wrapper when available — it
-    // correctly handles BEGIN/COMMIT/ROLLBACK and serializes against other
-    // transactions on the same handle.
+    // Prefer the EXCLUSIVE transaction wrapper: it runs on a dedicated connection
+    // and queues all other DB access for the transaction's duration, so the
+    // high-frequency single-statement writers (delivery receipts / message-status
+    // / unread — now app-wide) can't interleave into this batch and reject a
+    // statement with "NativeStatement.finalizeAsync … Error code" (a WAL
+    // writer-lock conflict). Retry a few times to absorb the brief window where
+    // one of those writers already holds the writer lock when we start. Falls back
+    // to the plain transaction wrapper, then manual BEGIN/COMMIT, on older SDKs.
+    if (typeof db.withExclusiveTransactionAsync === 'function') {
+      for (let i = 1; i <= 4; i++) {
+        try {
+          await db.withExclusiveTransactionAsync(async (tx) => {
+            await _runUpsertBatch(tx, messages);
+          });
+          return;
+        } catch (err) {
+          if (isTransientLockError(err) && i < 4) {
+            await new Promise((r) => setTimeout(r, 60 * i));
+            continue;
+          }
+          console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
+          return;
+        }
+      }
+      return;
+    }
+
     if (typeof db.withTransactionAsync === 'function') {
       try {
         await db.withTransactionAsync(async () => {
@@ -746,12 +780,11 @@ const _runUpsertBatch = async (db, messages) => {
           }
         }
     } catch (err) {
-      const msg = String(err?.message || '').toLowerCase();
-      // "database is locked" mid-transaction is recoverable on the next
-      // iteration once busy_timeout drains the contending statement; downgrade
-      // to a quiet log so it stops surfacing as a red warning, and skip the
-      // row (the message will be re-upserted on the next sync/ack anyway).
-      if (msg.includes('database is locked')) {
+      // A transient lock/busy/finalize rejection mid-transaction is recoverable
+      // once the contending statement drains; downgrade to a quiet yield-and-skip
+      // so it stops surfacing as a red warning (the message is re-upserted on the
+      // next sync/ack anyway). Only genuinely unexpected errors are warned.
+      if (isTransientLockError(err)) {
         // brief yield gives the busy writer time to finalize before we move on
         await new Promise((r) => setTimeout(r, 25));
         continue;
@@ -1442,6 +1475,24 @@ const getLatestSeq = async (chatId) => {
   return Number(r?.max_seq || 0);
 };
 
+// Every distinct chat_id this device has any local message for. Used by the
+// reconnect catch-up to ask the server for missed messages PER chat: it reads
+// from the persistent DB (available immediately on cold start) rather than the
+// in-memory chat list, which loads asynchronously and is often empty/partial at
+// the moment the socket first connects — the gap that left some missed messages
+// unfetched on reopen.
+const getAllChatIds = async () => {
+  try {
+    const db = await getDB();
+    const rows = await db.getAllAsync(
+      `SELECT DISTINCT chat_id FROM messages WHERE chat_id IS NOT NULL AND chat_id != ''`
+    );
+    return (rows || []).map((r) => r.chat_id).filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+};
+
 const deduplicateChat = async (chatId) => {
   if (!chatId) return;
   // Serialize the 4 maintenance DELETEs through the global write mutex + a
@@ -2090,7 +2141,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getMessageCount, searchMessages, getClearedAt,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
   markMessageDeleted, deleteMessageForMe, clearChat, deduplicateChat,
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,

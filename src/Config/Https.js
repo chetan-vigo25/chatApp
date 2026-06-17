@@ -223,18 +223,34 @@ export const apiCall = async (method, endpoint, data = {}, config = {}) => {
       return Promise.reject(new Error(msg));
     }
 
+    // Bodyless methods (GET/HEAD) must NOT carry a request body. Sending one
+    // (axios serializes `data` even on GET) makes iOS NSURLSession reject the
+    // response with CFNetwork -1103 "resource exceeds maximum size" → surfaces
+    // as ERR_NETWORK. curl/Safari work because they send GETs with no body.
+    const m = String(method || 'get').toLowerCase();
+    const hasBody = m !== 'get' && m !== 'head';
+
     const response = await api({
       method,
       url,
-      data,
+      ...(hasBody ? { data } : {}),
       ...restConfig,
       _retryOnNetwork: retryOnNetwork,
     });
     return response.data;
   } catch (error) {
     if (silent) {
-      // Log but don't toast — caller handles the error
-      console.log('[API:silent]', error?.response?.status, endpoint);
+      // Log but don't toast — caller handles the error. Include the FULLY
+      // BUILT url + axios error code so a network failure (ERR_NETWORK / no
+      // response) is distinguishable from an HTTP status error, and we can
+      // see the exact host the request actually targeted.
+      console.log('[API:silent]', {
+        status: error?.response?.status,
+        code: error?.code,
+        message: error?.message,
+        url: buildUrl(endpoint),
+        baseURL: BACKEND_URL,
+      });
       return Promise.reject(error?.response?.data || error);
     }
     return handleApiError(error);
