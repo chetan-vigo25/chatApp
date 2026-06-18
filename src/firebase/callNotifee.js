@@ -24,6 +24,13 @@ import { CALL_PUSH_EVENTS } from './callEvents';
 const CALL_CHANNEL_ID = 'calls_fullscreen';
 const notifId = (callId) => `call-${callId || 'incoming'}`;
 
+// Ids we've ACTUALLY displayed a call notification for. The call state later
+// settles on a WebRTC id that can differ from the signaling id the notification
+// was posted with, so cancelling by the live state id can miss. Tracking the
+// shown id lets us dismiss reliably on answer/end. Only one incoming call exists
+// at a time, so clearing the whole set is safe.
+const shownCallIds = new Set();
+
 // ---- backend 1: ExpoCallUi (native CallStyle) ----
 let _callUi;
 let _callUiResolved = false;
@@ -109,6 +116,7 @@ export const displayIncomingCallNotifee = async (data) => {
     callType: (data?.callType || data?.media) === 'video' ? 'video' : 'audio',
   };
   if (!call.callId) return;
+  shownCallIds.add(String(call.callId));
 
   // Preferred: native CallStyle (green Answer / red Decline).
   if (isCallUi()) {
@@ -124,15 +132,23 @@ export const displayIncomingCallNotifee = async (data) => {
     const channelId = await ensureCallChannel();
     const { AndroidImportance, AndroidVisibility, AndroidCategory } = _consts;
     const isVideo = call.callType === 'video';
+    // WhatsApp-style heads-up: round caller avatar + brand-green accent. The
+    // true CallStyle layout (split green Answer / red Decline) is only available
+    // via the native ExpoCallUi backend above; notifee can't render CallStyle, so
+    // this is the closest visual the library allows. Coloured emoji prefixes give
+    // the plain action buttons a green/red affordance across OEM skins.
     await notifee.displayNotification({
       id: notifId(call.callId),
       title: call.callerName || 'Incoming call',
-      body: isVideo ? 'Incoming video call' : 'Incoming voice call',
+      body: isVideo ? '📹 Incoming video call' : '📞 Incoming voice call',
       data: { ...(data || {}), type: 'call' },
       android: {
         channelId,
         smallIcon: 'notification_icon',
         color: '#00A884',
+        // Round caller photo, like WhatsApp. Falls back to no avatar when the
+        // sender has no image — notifee ignores an undefined largeIcon.
+        ...(call.callerImage ? { largeIcon: call.callerImage, circularLargeIcon: true } : {}),
         category: AndroidCategory.CALL,
         importance: AndroidImportance.HIGH,
         visibility: AndroidVisibility.PUBLIC,
@@ -143,8 +159,8 @@ export const displayIncomingCallNotifee = async (data) => {
         fullScreenAction: { id: 'default', launchActivity: 'default' },
         pressAction: { id: 'default', launchActivity: 'default' },
         actions: [
-          { title: 'Decline', pressAction: { id: 'decline' } },
-          { title: 'Accept', pressAction: { id: 'accept', launchActivity: 'default' } },
+          { title: '❌ Decline', pressAction: { id: 'decline' } },
+          { title: '📞 Accept', pressAction: { id: 'accept', launchActivity: 'default' } },
         ],
       },
     });
@@ -155,12 +171,37 @@ export const displayIncomingCallNotifee = async (data) => {
 
 export const cancelIncomingCallNotifee = async (callId) => {
   if (!callId) return; // never cancel-all — would clear chat notifications too
+  shownCallIds.delete(String(callId));
   if (isCallUi()) {
     try { getCallUi().cancelIncomingCall(String(callId)); } catch (_) { /* */ }
   }
   const notifee = getNotifee();
   if (notifee) {
     try { await notifee.cancelNotification(notifId(callId)); } catch (_) { /* best-effort */ }
+  }
+};
+
+/**
+ * Dismiss EVERY incoming-call notification we've shown. Use this on answer/end —
+ * it doesn't depend on the live call state's id matching the id the notification
+ * was posted with, so the heads-up never lingers over the active-call screen.
+ * Scoped to call notifications only (tracked ids / native call channel), so chat
+ * notifications are untouched.
+ */
+export const cancelAllIncomingCallNotifee = async () => {
+  if (isCallUi()) {
+    try { getCallUi().cancelAllIncomingCalls?.(); } catch (_) { /* */ }
+  }
+  const ids = Array.from(shownCallIds);
+  shownCallIds.clear();
+  const notifee = getNotifee();
+  for (const id of ids) {
+    if (isCallUi()) {
+      try { getCallUi().cancelIncomingCall(String(id)); } catch (_) { /* */ }
+    }
+    if (notifee) {
+      try { await notifee.cancelNotification(notifId(id)); } catch (_) { /* best-effort */ }
+    }
   }
 };
 
@@ -203,6 +244,13 @@ export const registerNotifeeBackground = () => {
   if (!notifee) return;
   try {
     notifee.onBackgroundEvent(async ({ type, detail }) => {
+      // Message-notification taps must navigate regardless of the call backend,
+      // so route them BEFORE the CallStyle early-return below.
+      const data = detail?.notification?.data || {};
+      if (data?.type !== 'call') {
+        routeNotifeeEvent(type, detail);
+        return;
+      }
       // CallStyle handles its own Answer/Decline natively; only route call
       // actions here when notifee is the active call backend.
       if (isCallUi()) return;
@@ -251,6 +299,16 @@ const routeNotifeeEvent = (eventType, detail, { launched } = {}) => {
   if (!_consts) return null;
   const { EventType } = _consts;
   const data = detail?.notification?.data || {};
+
+  // Message notification tapped (body press) → open the chat thread. Covers
+  // foreground, background, and cold-start (launched) for Android notifee
+  // MessagingStyle notifications. Lazy require avoids an import cycle.
+  if (data?.type !== 'call' && (data?.chatId || data?.groupId)
+      && (eventType === EventType.PRESS || launched)) {
+    try { require('../Redux/Services/navigationService').navigateToChat(data); } catch (_) { /* */ }
+    return 'message-press';
+  }
+
   if (data?.type !== 'call') return null;
   const actionId = detail?.pressAction?.id;
   if (eventType === EventType.ACTION_PRESS && actionId === 'decline') {

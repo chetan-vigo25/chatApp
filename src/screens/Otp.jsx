@@ -216,10 +216,14 @@ export default function Otp({ navigation, route }) {
                 routes: [{ name: "EditProfile", params:{ selectedCountry, phoneNumber }}],
               });
             } else {
-              console.log("Existing user, going to ChatList");
+              // Returning user: route through SyncScreen so their existing chats
+              // + messages are restored into the local DB on first login (it
+              // self-gates via isInitialSyncDone and exits instantly if there's
+              // nothing to sync). Matches the email-login flow.
+              console.log("Existing user, going to SyncScreen");
               navigation.reset({
                 index: 0,
-                routes: [{ name: "ChatList" }],
+                routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }],
               });
             }
             otpInputRef.current?.clear();

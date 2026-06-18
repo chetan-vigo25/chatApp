@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View,
   Text,
+  Image,
   Animated,
   StyleSheet,
   ActivityIndicator,
@@ -9,6 +10,10 @@ import {
 } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
 import { APP_TAG_NAME } from '@env';
+
+// Brand logo (same asset the Splash screen uses) — keeps launch → sync branding
+// consistent. WhatsApp-style restore screen: logo centered with the progress.
+const BRAND_LOGO = require('../../assets/icon0.png');
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { chatServices } from '../Redux/Services/Chat/Chat.Services';
@@ -94,10 +99,11 @@ export default function SyncScreen({ navigation, route }) {
       if (!mountedRef.current) return;
 
       if (chatList.length === 0) {
-        // No chats — mark sync done and proceed
+        // Nothing to restore (brand-new account or no chat history/backup) —
+        // this screen is only meaningful when there ARE chats to sync, so mark
+        // sync done and leave immediately instead of flashing a progress bar.
         await ChatDatabase.setSyncMeta('INITIAL_SYNC_COMPLETE', userId);
-        updateProgress(100, 'Ready!');
-        setTimeout(navigateAway, 300);
+        navigateAway();
         return;
       }
 
@@ -231,17 +237,21 @@ export default function SyncScreen({ navigation, route }) {
 
   return (
     <Animated.View style={[styles.container, { backgroundColor: theme.colors.background, opacity: fadeAnim }]}>
-      {/* App name */}
-      <View style={styles.header}>
+      {/* Top spacer keeps the brand block optically centered above the footer */}
+      <View style={styles.flex} />
+
+      {/* ── Brand block (logo + name) — WhatsApp-style centered identity ── */}
+      <View style={styles.brand}>
+        <Image source={BRAND_LOGO} resizeMode="contain" style={styles.logo} />
         <Text style={[styles.appName, { color: theme.colors.themeColor }]}>
           <Text style={{ fontFamily: 'Roboto-SemiBold' }}>{name.slice(0, 4)}</Text>
           <Text style={{ fontFamily: 'Roboto-Regular' }}>{name.slice(4)}</Text>
         </Text>
       </View>
 
-      {/* Center content */}
+      {/* ── Progress block ── */}
       <View style={styles.center}>
-        <ActivityIndicator size="large" color={theme.colors.themeColor} style={{ marginBottom: 24 }} />
+        <ActivityIndicator size="small" color={theme.colors.themeColor} style={{ marginBottom: 20 }} />
 
         {/* Progress bar */}
         <View style={[styles.progressTrack, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)' }]}>
@@ -260,7 +270,9 @@ export default function SyncScreen({ navigation, route }) {
         )}
       </View>
 
-      {/* Footer */}
+      <View style={styles.flex} />
+
+      {/* ── Footer ── */}
       <View style={styles.footer}>
         <Text style={[styles.footerText, { color: theme.colors.placeHolderTextColor }]}>
           Setting up your chats
@@ -276,21 +288,29 @@ export default function SyncScreen({ navigation, route }) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    justifyContent: 'space-between',
     alignItems: 'center',
-    paddingVertical: 60,
+    paddingVertical: 56,
   },
-  header: {
+  flex: {
+    flex: 1,
+  },
+  brand: {
     alignItems: 'center',
-    paddingTop: 20,
+  },
+  logo: {
+    width: 88,
+    height: 88,
+    marginBottom: 18,
   },
   appName: {
-    fontSize: 24,
+    fontSize: 26,
+    letterSpacing: 0.3,
   },
   center: {
     alignItems: 'center',
     width: '100%',
     paddingHorizontal: 40,
+    marginTop: 56,
   },
   progressTrack: {
     width: '100%',

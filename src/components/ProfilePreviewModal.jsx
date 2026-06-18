@@ -48,6 +48,9 @@ export default function ProfilePreviewModal({
   image = null,
   avatarColor = '#6C5CE7',
   isGroup = false,
+  isBroadcast = false,
+  isVerified = false,
+  subtitle = null,
   onMessage,
   onCall,
   onVideo,
@@ -116,7 +119,9 @@ export default function ProfilePreviewModal({
                 </TouchableOpacity>
               ) : (
                 <View style={styles.fallback}>
-                  {isGroup ? (
+                  {isBroadcast ? (
+                    <Ionicons name="megaphone" size={88} color="rgba(255,255,255,0.95)" />
+                  ) : isGroup ? (
                     <Ionicons name="people" size={92} color="rgba(255,255,255,0.95)" />
                   ) : (
                     <Text style={styles.fallbackText}>{initial}</Text>
@@ -134,7 +139,15 @@ export default function ProfilePreviewModal({
 
               {/* Name on the photo, with a soft drop shadow */}
               <View style={styles.nameOverlay} pointerEvents="none">
-                <Text style={styles.nameText} numberOfLines={1}>{name}</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={[styles.nameText, { flexShrink: 1 }]} numberOfLines={1}>{name}</Text>
+                  {isBroadcast && isVerified && (
+                    <Ionicons name="checkmark-circle" size={18} color="#fff" style={{ marginLeft: 6 }} />
+                  )}
+                </View>
+                {subtitle ? (
+                  <Text style={styles.subtitleText} numberOfLines={1}>{subtitle}</Text>
+                ) : null}
               </View>
             </View>
 
@@ -235,6 +248,15 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto-Medium',
     fontSize: 16,
     letterSpacing: 0.1,
+    textShadowColor: 'rgba(0,0,0,0.75)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 6,
+  },
+  subtitleText: {
+    color: 'rgba(255,255,255,0.92)',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12.5,
+    marginTop: 2,
     textShadowColor: 'rgba(0,0,0,0.75)',
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 6,

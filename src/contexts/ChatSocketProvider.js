@@ -13,6 +13,29 @@ import {
 const deliveredAckSet = new Set();
 const MAX_DELIVERED_ACK_SIZE = 500;
 
+// Coalesce delivery acks: a burst of incoming messages reports delivery in ONE
+// `message:delivered:bulk` per (chat, sender) instead of N `message:delivered`
+// events — so the SENDER's client writes far fewer status rows. Falls back to a
+// single `message:delivered` when only one id is buffered (older-server safe).
+const _deliveredBatches = new Map(); // `${chatId}|${senderId}` -> { socket, chatId, senderId, ids:Set, timer }
+const DELIVERED_BATCH_MS = 250;
+
+const flushDeliveredBatch = (key) => {
+  const b = _deliveredBatches.get(key);
+  if (!b) return;
+  _deliveredBatches.delete(key);
+  if (b.timer) clearTimeout(b.timer);
+  const ids = Array.from(b.ids);
+  if (!ids.length || !b.socket) return;
+  try {
+    if (ids.length === 1) {
+      b.socket.emit('message:delivered', { messageId: ids[0], chatId: b.chatId, senderId: b.senderId });
+    } else {
+      b.socket.emit('message:delivered:bulk', { messageIds: ids, chatId: b.chatId, senderId: b.senderId });
+    }
+  } catch {}
+};
+
 const emitDelivered = (socket, { messageId, chatId, senderId }) => {
   if (!socket || !messageId || !chatId || !senderId) return;
   if (deliveredAckSet.has(messageId)) return;
@@ -24,7 +47,13 @@ const emitDelivered = (socket, { messageId, chatId, senderId }) => {
     deliveredAckSet.delete(first);
   }
 
-  socket.emit('message:delivered', { messageId, chatId, senderId });
+  const key = `${chatId}|${senderId}`;
+  let b = _deliveredBatches.get(key);
+  if (!b) { b = { socket, chatId, senderId, ids: new Set(), timer: null }; _deliveredBatches.set(key, b); }
+  b.socket = socket;
+  b.ids.add(messageId);
+  if (b.ids.size >= 50) { flushDeliveredBatch(key); return; } // big burst → flush now
+  if (!b.timer) b.timer = setTimeout(() => flushDeliveredBatch(key), DELIVERED_BATCH_MS);
 };
 
 const deduplicateMessages = (messagesArray) => {
@@ -421,6 +450,19 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       }
     };
 
+    // 1-1: peer bulk-delivered messages of mine (mirror of onReadBulkAck)
+    const onDeliveredBulkAck = async (payload) => {
+      const source = payload?.data || payload || {};
+      const { messageIds, chatId, receiverId } = source;
+      if (!chatId || !Array.isArray(messageIds)) return;
+      for (const mid of messageIds) {
+        await advanceLocalStatus(chatId, mid, 'delivered', {
+          _appendDelivered: receiverId ? { userId: receiverId, deliveredAt: new Date().toISOString() } : undefined,
+          forceMerge: !!receiverId,
+        });
+      }
+    };
+
     // Group: a member delivered a message
     const onGroupDeliveredReceipt = async (payload) => {
       const source = payload?.data || payload || {};
@@ -614,6 +656,7 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:read', onMessageRead);
       socket.off('message:delivered', onMessageDelivered);
       socket.off('message:read:bulk:ack', onReadBulkAck);
+      socket.off('message:delivered:bulk:ack', onDeliveredBulkAck);
       socket.off('group:message:delivered:receipt', onGroupDeliveredReceipt);
       socket.off('group:message:read', onGroupRead);
 
@@ -633,6 +676,7 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.on('message:read', onMessageRead);
       socket.on('message:delivered', onMessageDelivered);
       socket.on('message:read:bulk:ack', onReadBulkAck);
+      socket.on('message:delivered:bulk:ack', onDeliveredBulkAck);
       socket.on('group:message:delivered:receipt', onGroupDeliveredReceipt);
       socket.on('group:message:read', onGroupRead);
     };
@@ -655,6 +699,7 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:read', onMessageRead);
       socket.off('message:delivered', onMessageDelivered);
       socket.off('message:read:bulk:ack', onReadBulkAck);
+      socket.off('message:delivered:bulk:ack', onDeliveredBulkAck);
       socket.off('group:message:delivered:receipt', onGroupDeliveredReceipt);
       socket.off('group:message:read', onGroupRead);
     };

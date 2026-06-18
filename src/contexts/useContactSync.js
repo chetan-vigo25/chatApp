@@ -12,6 +12,9 @@ const STORAGE_KEYS = {
   DEVICE_ID: '@device_id',
   PENDING_REFRESH: '@pending_contact_refresh',
   HASHED_CONTACTS: '@hashed_contacts',
+  // Persistent phone -> hashed-record cache so re-syncs don't re-run SHA256+AES
+  // over the entire phonebook. Keyed by normalized phone (hash is deterministic).
+  HASH_CACHE: '@contact_hash_cache',
 };
 
 const UPDATE_HIGHLIGHT_MS = 24 * 60 * 60 * 1000;
@@ -235,10 +238,69 @@ export const useContactSync = () => {
     const freshContacts = await readFreshDeviceContacts();
     if (freshContacts.length === 0) return [];
 
-    const hashed = contactHasher.hashContactList(freshContacts);
-    const valid = hashed.filter(contact => contactHasher.validateHashedContact(contact));
+    // Load the persistent hash cache. The hash is a pure function of the
+    // normalized phone + fixed salt, so a number that hasn't changed never
+    // needs to be re-hashed — we only pay the SHA256+AES cost for new numbers.
+    let cache = {};
+    try {
+      const raw = await AsyncStorage.getItem(STORAGE_KEYS.HASH_CACHE);
+      if (raw) cache = JSON.parse(raw) || {};
+    } catch {
+      cache = {};
+    }
+
+    const nextCache = {};
+    let cacheMisses = 0;
+    const valid = [];
+
+    for (const contact of freshContacts) {
+      const phoneNumber = contact.phoneNumbers?.[0]?.number || contact.phoneNumber;
+      if (!phoneNumber) continue;
+
+      let normalized;
+      try {
+        normalized = contactHasher.normalizePhoneNumber(phoneNumber);
+      } catch {
+        continue;
+      }
+      if (!normalized) continue;
+
+      let core = cache[normalized];
+      if (!core) {
+        // Cache miss — hash this number once (the only expensive path).
+        try {
+          const h = contactHasher.hashPhoneNumber(phoneNumber);
+          core = {
+            hash: h.hash,
+            salt: h.salt,
+            algorithm: h.algorithm,
+            normalizedPhone: h.normalized,
+            encryptNumber: h.encryptNumber || null,
+          };
+          cacheMisses += 1;
+        } catch {
+          continue;
+        }
+      }
+      // Keep only entries for numbers still on the device so the cache can't
+      // grow unbounded across SIM/contact churn.
+      nextCache[normalized] = core;
+
+      const record = {
+        id: contact.id || `${normalized}`,
+        fullName: contact.name || '',
+        ...core,
+        originalPhone: phoneNumber,
+      };
+      if (contactHasher.validateHashedContact(record)) valid.push(record);
+    }
+
     if (mountedRef.current) setHashedContacts(valid);
     await AsyncStorage.setItem(STORAGE_KEYS.HASHED_CONTACTS, JSON.stringify(valid));
+    // Persist the pruned cache only when it actually changed.
+    if (cacheMisses > 0 || Object.keys(nextCache).length !== Object.keys(cache).length) {
+      await AsyncStorage.setItem(STORAGE_KEYS.HASH_CACHE, JSON.stringify(nextCache));
+    }
     return valid;
   }, [readFreshDeviceContacts]);
 
@@ -334,11 +396,8 @@ export const useContactSync = () => {
           hash: contact.hash,
           salt: contact.salt,
           algorithm: contact.algorithm,
-          encryptNumber: contact.encryptNumber || (
-            contact.normalizedPhone && contact.salt
-              ? contactHasher.encryptContent(contact.normalizedPhone + contact.salt)
-              : null
-          )
+          // Already computed during hashing (cached) — no per-contact re-encrypt.
+          encryptNumber: contact.encryptNumber || null,
         })),
         clientInfo,
         syncOptions: { fullSync: true, overwrite: false },

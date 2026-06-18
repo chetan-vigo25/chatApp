@@ -2,7 +2,7 @@
   "expo": {
     "name": "TalksTry",
     "slug": "baatCheet",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "orientation": "portrait",
     "scheme": "talkstry",
     "userInterfaceStyle": "automatic",
@@ -120,7 +120,9 @@
       ],
       "expo-sqlite",
       "./plugins/withCallFullScreen",
-      "./plugins/withNotifeeMavenRepo"
+      "./plugins/withNotifeeMavenRepo",
+      "./plugins/withFirebaseNotificationMeta",
+      "./plugins/withNotificationServiceExtension"
     ],
     "extra": {
       "eas": {

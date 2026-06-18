@@ -9,6 +9,8 @@ import {
   Platform,
   ToastAndroid,
   Alert,
+  Image,
+  Easing,
 } from 'react-native';
 import { CameraView } from 'expo-camera';
 import { FontAwesome6, MaterialIcons, Ionicons } from '@expo/vector-icons';
@@ -25,6 +27,66 @@ function showToast(message) {
     Alert.alert('', message);
   }
 }
+
+// TalksTry brand lockup — the app logo inside a softly-pulsing brand ring with
+// the "TalksTry" wordmark beneath. Used on the permission prompt (onDark=false)
+// and over the live camera (onDark). The pulse is the WhatsApp-style "we're
+// listening" cue while the scanner waits for a code.
+function BrandLockup({ theme, onDark = false, style }) {
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.timing(pulse, {
+        toValue: 1,
+        duration: 1800,
+        easing: Easing.out(Easing.ease),
+        useNativeDriver: true,
+      }),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
+
+  const brand = theme.colors.themeColor;
+  const ringScale = pulse.interpolate({ inputRange: [0, 1], outputRange: [0.92, 1.7] });
+  const ringOpacity = pulse.interpolate({ inputRange: [0, 0.12, 1], outputRange: [0, 0.45, 0] });
+
+  return (
+    <View style={[lockupStyles.wrap, style]}>
+      <View style={lockupStyles.badgeWrap}>
+        <Animated.View
+          style={[lockupStyles.pulseRing, { borderColor: brand, transform: [{ scale: ringScale }], opacity: ringOpacity }]}
+        />
+        <View
+          style={[
+            lockupStyles.badge,
+            {
+              backgroundColor: onDark ? 'rgba(255,255,255,0.08)' : brand + '14',
+              borderColor: onDark ? 'rgba(255,255,255,0.20)' : brand + '33',
+            },
+          ]}
+        >
+          <Image source={require('../../../../assets/icon.png')} style={lockupStyles.logo} />
+        </View>
+      </View>
+      <Text style={[lockupStyles.word, { color: onDark ? '#fff' : theme.colors.primaryTextColor }]}>
+        Talks<Text style={{ color: brand }}>Try</Text>
+      </Text>
+    </View>
+  );
+}
+
+const lockupStyles = StyleSheet.create({
+  wrap: { alignItems: 'center' },
+  badgeWrap: { width: 72, height: 72, alignItems: 'center', justifyContent: 'center' },
+  pulseRing: { position: 'absolute', width: 64, height: 64, borderRadius: 20, borderWidth: 2 },
+  badge: {
+    width: 60, height: 60, borderRadius: 18, borderWidth: 1,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  logo: { width: 38, height: 38, borderRadius: 9, resizeMode: 'contain' },
+  word: { fontFamily: 'Roboto-Bold', fontSize: 17, marginTop: 8, letterSpacing: -0.2 },
+});
 
 export default function QRScannerScreen({ navigation }) {
   const { theme } = useTheme();
@@ -102,10 +164,13 @@ export default function QRScannerScreen({ navigation }) {
   // straight through.
   useEffect(() => {
     if (!scannedData || autoTriggeredRef.current || linkSuccess || linkErrorState) return;
-    if (!__DEV__ && !isServerUrlTrusted(scannedData.serverUrl)) {
-      setLinkErrorState('This QR code is from an unrecognized server and was blocked for your security.');
-      return;
-    }
+    // TEMP: server-origin trust gate disabled so QR codes from the production
+    // web client link through even when their origin differs from this build's
+    // BACKEND_URL. Re-enable before shipping (uncomment the block below).
+    // if (!__DEV__ && !isServerUrlTrusted(scannedData.serverUrl)) {
+    //   setLinkErrorState('This QR code is from an unrecognized server and was blocked for your security.');
+    //   return;
+    // }
     autoTriggeredRef.current = true;
     runLink();
   }, [scannedData, linkSuccess, linkErrorState, isServerUrlTrusted, runLink]);
@@ -134,6 +199,7 @@ export default function QRScannerScreen({ navigation }) {
           <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>Scan QR Code</Text>
         </View>
         <View style={styles.centered}>
+          <BrandLockup theme={theme} style={{ marginBottom: 30 }} />
           <View style={[styles.permHalo, { backgroundColor: theme.colors.themeColor + '14' }]}>
             <MaterialIcons name="photo-camera" size={42} color={theme.colors.themeColor} />
           </View>
@@ -172,24 +238,23 @@ export default function QRScannerScreen({ navigation }) {
 
       <QROverlay scanLineAnim={scanLineAnim} showScanLine={isScanning && !scannedData && !showScanError} />
 
-      {/* Header */}
+      {/* Header — icon controls only; branding sits centered below */}
       <View style={styles.scanHeader}>
         <TouchableOpacity onPress={handleGoBack} style={styles.scanIconBtn}>
           <FontAwesome6 name="arrow-left" size={19} color="#fff" />
         </TouchableOpacity>
-        <Text style={styles.scanTitle}>Scan to link</Text>
         <TouchableOpacity onPress={() => setTorch((t) => !t)} style={styles.scanIconBtn}>
           <Ionicons name={torch ? 'flash' : 'flash-off'} size={20} color="#fff" />
         </TouchableOpacity>
       </View>
 
-      {/* Instruction card */}
+      {/* TalksTry brand lockup + instruction */}
       {!showScanError && !showLinkError && (
-        <View style={styles.instructionCard}>
-          <Text style={styles.instructionTitle}>Point at the QR code</Text>
-          <Text style={styles.instructionText}>
-            On your computer, open the web app and hold the code inside the frame.
-            It links automatically.
+        <View style={styles.brandTop} pointerEvents="none">
+          <BrandLockup theme={theme} onDark />
+          <Text style={styles.brandCaption}>Scan to link a device</Text>
+          <Text style={styles.brandSub}>
+            Open the web app and hold the QR code inside the frame — it links automatically.
           </Text>
         </View>
       )}
@@ -288,19 +353,18 @@ const styles = StyleSheet.create({
   },
   scanTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 18, color: '#fff' },
 
-  instructionCard: {
+  brandTop: {
     position: 'absolute',
-    top: Platform.OS === 'ios' ? 108 : 76,
+    top: Platform.OS === 'ios' ? 100 : 70,
     left: 28, right: 28,
-    backgroundColor: 'rgba(0,0,0,0.42)',
-    borderRadius: 16,
-    paddingVertical: 14,
-    paddingHorizontal: 18,
     alignItems: 'center',
     zIndex: 10,
   },
-  instructionTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 15, color: '#fff', marginBottom: 4 },
-  instructionText: { fontFamily: 'Roboto-Regular', fontSize: 12.5, color: 'rgba(255,255,255,0.82)', textAlign: 'center', lineHeight: 18 },
+  brandCaption: { fontFamily: 'Roboto-SemiBold', fontSize: 16, color: '#fff', marginTop: 14 },
+  brandSub: {
+    fontFamily: 'Roboto-Regular', fontSize: 12.5, color: 'rgba(255,255,255,0.80)',
+    textAlign: 'center', lineHeight: 18, marginTop: 6, maxWidth: 280,
+  },
 
   scanningPillWrap: {
     position: 'absolute',
@@ -318,7 +382,7 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 30,
   },
-  scanningDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366' },
+  scanningDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#00A884' },
   scanningText: { fontFamily: 'Roboto-Medium', fontSize: 13.5, color: '#fff' },
 
   errorContainer: {

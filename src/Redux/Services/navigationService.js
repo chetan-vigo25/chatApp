@@ -74,6 +74,62 @@ export function subscribeNavigationSnapshot(listener) {
   };
 }
 
+// Navigate to a chat from a tapped push notification. The push `data` carries
+// { chatId, chatType, groupId, senderId, senderName, profileImage, senderMobile,
+// groupName }. On a COLD launch the nav container isn't mounted yet, so retry
+// until it's ready (best-effort, ~8s) instead of dropping the intent.
+export function navigateToChat(data = {}, attempt = 0) {
+  const chatId = normalizeId(data?.chatId || data?.groupId);
+  if (!chatId) return false;
+
+  if (!navigationRef.isReady()) {
+    if (attempt < 40) setTimeout(() => navigateToChat(data, attempt + 1), 200);
+    return false;
+  }
+
+  const isBroadcast = data?.chatType === 'broadcast' || !!data?.isBroadcast || data?.kind === 'broadcast';
+  const isGroup = data?.chatType === 'group' || !!data?.groupId;
+  const item = isBroadcast
+    ? {
+        chatId,
+        chatType: 'broadcast',
+        isBroadcast: true,
+        readOnly: true,
+        broadcastChannelId: normalizeId(data?.channelId || chatId),
+        chatName: data?.chatName || data?.senderName || '',
+        chatAvatar: data?.chatAvatar || '',
+        isVerified: data?.isVerified === true || data?.isVerified === 'true',
+      }
+    : isGroup
+    ? {
+        chatId,
+        chatType: 'group',
+        isGroup: true,
+        groupId: normalizeId(data?.groupId || chatId),
+        chatName: data?.groupName || '',
+        group: { _id: normalizeId(data?.groupId || chatId), name: data?.groupName || '', avatar: '' },
+      }
+    : {
+        chatId,
+        chatType: 'private',
+        // peerUser = the message SENDER (the other party in the receiver's view),
+        // so the chat header resolves a real name instead of "Unknown User".
+        peerUser: {
+          _id: normalizeId(data?.senderId),
+          fullName: data?.senderName || '',
+          profileImage: data?.profileImage || '',
+          mobileNumber: data?.senderMobile || '',
+        },
+      };
+
+  try {
+    navigationRef.navigate('ChatScreen', { chatId, item });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function resetToLogin() {
   if (navigationRef.isReady()) {
     navigationRef.reset({

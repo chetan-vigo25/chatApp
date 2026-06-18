@@ -18,6 +18,7 @@ import ContactDatabase from '../services/ContactDatabase';
 import { hashPhoneForMatch, onlyDigits } from '../utils/savedContactName';
 import ChatCache from '../services/ChatCache';
 import { isInForwardWindow, clearForwardTimestamp } from '../utils/forwardState';
+import { shouldEmitReadAll } from '../utils/readAllThrottle';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
 import { apiCall } from '../Config/Https';
 import {
@@ -37,6 +38,16 @@ import SqliteWriter from "../services/SqliteWriter";
 /* Constants */
 const MAX_LOCAL_SAVE = 300;
 const MAX_RECONNECT_ATTEMPTS = 5;
+// Once the fast attempts are exhausted we keep retrying silently at this
+// interval (never surfacing an error) so the socket self-heals after a
+// screen-off suspend or a Wi-Fi/data drop the moment the host is reachable.
+const MAX_RECONNECT_BACKOFF_MS = 15000;
+
+// Debug switch for tracing WHERE chat-thread messages come from (SQLite vs the
+// socket sync). Flip to false to silence. The chat thread always renders from
+// SQLite first; the socket sync only fills gaps — these logs make that visible.
+const DEBUG_CHAT_SOURCE = true;
+const cslog = (...args) => { if (DEBUG_CHAT_SOURCE) console.log('[CHAT-SOURCE]', ...args); };
 const TYPING_TIMEOUT = 3000; // 3 seconds
 const PRESENCE_HEARTBEAT_INTERVAL = 30000;
 const PRESENCE_POLL_INTERVAL = 45000;
@@ -259,7 +270,21 @@ export default function useChatLogic({ navigation, route }) {
     : null;
   // Preserve chatType + group fields from the route item
   const isGroupChat = item?.chatType === 'group' || item?.isGroup || Boolean(item?.group);
-  const chatTypeField = item?.chatType || (isGroupChat ? 'group' : 'private');
+  // Broadcast channel: a one-way, read-only chat. It has no peer and no group —
+  // its branding (name/logo/verified) rides on the chat-list item, so carry it
+  // onto chatData explicitly (otherwise the header falls back to "Group").
+  const isBroadcastChat = item?.chatType === 'broadcast' || Boolean(item?.isBroadcast);
+  const chatTypeField = item?.chatType || (isGroupChat ? 'group' : (isBroadcastChat ? 'broadcast' : 'private'));
+  const broadcastFields = isBroadcastChat ? {
+    isBroadcast: true,
+    readOnly: true,
+    broadcastChannelId: item.broadcastChannelId || item.chatId || item._id || null,
+    chatName: item.chatName || item.broadcastChannel?.name || null,
+    chatAvatar: item.chatAvatar || item.broadcastChannel?.avatarUrl || null,
+    groupName: item.chatName || null,
+    groupAvatar: item.chatAvatar || null,
+    isVerified: item.isVerified ?? item.broadcastChannel?.isVerified ?? false,
+  } : {};
   // Live group metadata overlay — updated in realtime when an admin/owner
   // changes the group name/avatar/description while this chat is open, so the
   // header reflects it instantly. Keyed by groupId so it never leaks to another chat.
@@ -292,11 +317,13 @@ export default function useChatLogic({ navigation, route }) {
   // render — which shows up as old messages "blinking"/refreshing repeatedly.
   // All inputs below are pure functions of [item, user, routeChatId, liveGroupMeta].
   const chatData = useMemo(() => (
-    isGroupChat
-      ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
-      : (item && normalizedPeerUser)
-        ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
-        : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' })
+    isBroadcastChat
+      ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'broadcast', ...broadcastFields }
+      : isGroupChat
+        ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
+        : (item && normalizedPeerUser)
+          ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
+          : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' })
   ), [item, user, routeChatId, liveGroupMeta]);
 
   // True when this is a group chat the current user has left or been removed
@@ -433,6 +460,9 @@ export default function useChatLogic({ navigation, route }) {
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMoreMessages, setHasMoreMessages] = useState(true);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
+  // True ONLY while an older-history page is being fetched from the server
+  // (network), never during local SQLite reads — drives the top-of-list spinner.
+  const [isBackfilling, setIsBackfilling] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isManualReloading, setIsManualReloading] = useState(false);
   const [isLoadingFromLocal, setIsLoadingFromLocal] = useState(true);
@@ -1181,9 +1211,10 @@ export default function useChatLogic({ navigation, route }) {
 
   // Initialize chat on mount or when peer user / group changes
   const isGroupInit = chatData.chatType === 'group' || chatData.isGroup || Boolean(chatData.group);
+  const isBroadcastInit = chatData.chatType === 'broadcast' || Boolean(chatData.isBroadcast);
   useEffect(() => {
-    if (chatData.peerUser || isGroupInit) {
-      console.log('🔄 Initializing chat:', isGroupInit ? `group:${chatData.groupId || chatData.chatId}` : `user:${chatData.peerUser?._id}`);
+    if (chatData.peerUser || isGroupInit || isBroadcastInit) {
+      console.log('🔄 Initializing chat:', isBroadcastInit ? `broadcast:${chatData.chatId}` : isGroupInit ? `group:${chatData.groupId || chatData.chatId}` : `user:${chatData.peerUser?._id}`);
       
       setMessages([]);
       setAllMessages([]);
@@ -1292,28 +1323,28 @@ export default function useChatLogic({ navigation, route }) {
       initialLoadDoneRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatData.peerUser?._id, isGroupInit && chatData.chatId]);
+  }, [chatData.peerUser?._id, isGroupInit && chatData.chatId, isBroadcastInit && chatData.chatId]);
 
   /* ========== Socket connection & reconnection logic ========== */
   const checkAndReconnectSocket = useCallback(async () => {
     if (reconnectTimeoutRef.current) return;
     const socket = getSocket();
     if (!socket || !isSocketConnected()) {
-      if (reconnectAttempts.current >= MAX_RECONNECT_ATTEMPTS) {
-        Alert.alert(
-          "Connection Error",
-          "Unable to connect to server. Please check your internet connection and try again.",
-          [
-            { text: "Retry", onPress: () => { reconnectAttempts.current = 0; checkAndReconnectSocket(); } },
-            { text: "Cancel", style: "cancel" }
-          ]
-        );
-        return;
+      // We never block the user with a "Connection Error" dialog. The socket is
+      // expected to drop on a screen-off suspend or a Wi-Fi/data toggle, so we
+      // just keep retrying quietly until the host is reachable again. Past the
+      // fast-retry budget we pin the counter (so the backoff stays capped at
+      // MAX_RECONNECT_BACKOFF_MS) and keep going instead of giving up. NetInfo
+      // and AppState-foreground also reset the counter to re-kick the fast loop.
+      const exhaustedFastRetries = reconnectAttempts.current >= MAX_RECONNECT_ATTEMPTS;
+      if (!exhaustedFastRetries) {
+        reconnectAttempts.current += 1;
       }
-      reconnectAttempts.current += 1;
       try {
         await reconnectSocket(navigation);
-        const backoffDelay = Math.min(1000 * Math.pow(2, reconnectAttempts.current - 1), 10000);
+        const backoffDelay = exhaustedFastRetries
+          ? MAX_RECONNECT_BACKOFF_MS
+          : Math.min(1000 * Math.pow(2, reconnectAttempts.current - 1), 10000);
         reconnectTimeoutRef.current = setTimeout(() => {
           reconnectTimeoutRef.current = null;
           const newSocket = getSocket();
@@ -1487,10 +1518,14 @@ export default function useChatLogic({ navigation, route }) {
             // Group chat IDs are raw ObjectIds; the private `message:read:all`
             // handler validates membership via `u_a_b` parsing and rejects
             // group ids with NOT_IN_CHAT. Route groups to the group handler.
-            if (isGrpInit) {
-              socket.emit('group:message:read:all', { groupId: generatedChatId });
-            } else {
-              socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
+            // Throttled: setActiveChat also emits read:all on open; collapse the
+            // duplicate so the backend isn't hit with two read:all per open.
+            if (shouldEmitReadAll(generatedChatId)) {
+              if (isGrpInit) {
+                socket.emit('group:message:read:all', { groupId: generatedChatId });
+              } else {
+                socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
+              }
             }
             markUserOnline("chat-init");
             startHeartbeat();
@@ -1512,8 +1547,15 @@ export default function useChatLogic({ navigation, route }) {
       // STEP 4: BACKGROUND SYNC — fetch only new messages from server
       // ═══════════════════════════════════════════════════════════
       if (localCount === 0) {
+        cslog('🌐 SQLite empty for this chat → FULL fetch over SOCKET (message:sync/fetch)', {
+          chatId: generatedChatId,
+        });
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
       } else {
+        cslog('🔄 SQLite had messages → DELTA sync only over SOCKET (fills gaps, not a reload)', {
+          chatId: generatedChatId,
+          sqliteRecordCount: localCount,
+        });
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
       }
       scheduleMarkVisibleUnreadAsRead();
@@ -1547,26 +1589,57 @@ export default function useChatLogic({ navigation, route }) {
         }
       }
 
-      // One-time migration: if SQLite is empty, pull from AsyncStorage
-      const count = await ChatDatabase.getMessageCount(chatIdParam);
-      if (count === 0) {
-        const localKey = getChatMessagesKey(chatIdParam);
-        if (localKey) {
-          const savedMessages = await AsyncStorage.getItem(localKey);
-          if (savedMessages) {
-            const parsed = JSON.parse(savedMessages);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              await ChatDatabase.upsertMessages(parsed.map(m => ({ ...m, chatId: m.chatId || chatIdParam })));
-            }
-          }
-        }
-      }
-
-      // Load from SQLite → set UI state, also syncs memory cache. This is the
-      // step the user actually waits on, so it runs FIRST and renders immediately.
+      // Paint whatever SQLite already has, immediately — the user waits on this.
       refreshMessagesFromDB(true);
 
+      // Restore PREVIOUS messages that exist only in the AsyncStorage backup
+      // (the legacy/pre-SQLite per-chat store, or history SQLite somehow lost)
+      // back INTO SQLite. Two fixes vs. the old migration: (1) it ran ONLY when
+      // SQLite was completely empty (count===0), so once any row existed the
+      // older backed-up messages were never reloaded — now it restores whenever
+      // the backup holds MORE than SQLite; (2) it did one bulk upsert that held
+      // the writer lock — now it writes in small AWAITED BATCHES with a yield
+      // between, in the BACKGROUND, so it never blocks the first paint nor
+      // contends with live writers. Idempotent + monotonic upsert dedups against
+      // rows already present, so re-running is always safe.
+      (async () => {
+        try {
+          const localKey = getChatMessagesKey(chatIdParam);
+          if (!localKey) return;
+          const saved = await AsyncStorage.getItem(localKey);
+          if (!saved) return;
+          let parsed = null;
+          try { parsed = JSON.parse(saved); } catch { return; }
+          if (!Array.isArray(parsed) || parsed.length === 0) return;
+
+          const sqliteCount = await ChatDatabase.getMessageCount(chatIdParam);
+          if (sqliteCount >= parsed.length) return; // nothing missing to restore
+
+          // Newest-first so the most recent history lands (and paints) first.
+          const rows = parsed
+            .map((m) => ({ ...m, chatId: m.chatId || chatIdParam }))
+            .sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+
+          const CHUNK = 25;
+          for (let i = 0; i < rows.length; i += CHUNK) {
+            await SqliteWriter.enqueue('upsertMessages', rows.slice(i, i + CHUNK));
+            await new Promise((r) => setTimeout(r, 0)); // yield → live writers interleave
+            // Surface the newest batch quickly; full reconcile happens at the end.
+            if (i === 0 && chatIdRef.current === chatIdParam) refreshMessagesFromDB(true);
+          }
+          if (chatIdRef.current === chatIdParam) refreshMessagesFromDB(true);
+        } catch (e) {
+          console.warn('[restorePreviousMessages] failed:', e?.message);
+        }
+      })();
+
       const finalCount = await ChatDatabase.getMessageCount(chatIdParam);
+      cslog('📂 MESSAGES rendered from SQLite', {
+        chatId: chatIdParam,
+        sqliteRecordCount: finalCount,
+        memoryCacheHit: ChatCache.hasMessages(chatIdParam),
+        source: 'SQLite (on-device DB) — NOT a REST API call',
+      });
 
       // Heavy duplicate cleanup (4 full GROUP BY/correlated-subquery DELETEs)
       // is MAINTENANCE — it must not block the first render. The displayed list
@@ -2218,14 +2291,30 @@ export default function useChatLogic({ navigation, route }) {
       try {
         const cid = chatIdRef.current;
         if (!cid) return;
-        // Wait for any pending SqliteWriter ops to drain so we don't read
-        // before the realtime handlers' upserts have landed. In practice this
-        // is sub-50ms — the writer is single-FIFO and never deep.
-        try { await SqliteWriter.awaitDrain(); } catch {}
+        // COLD-START FIX: never block the FIRST paint on the writer queue. On a
+        // cold restart the SqliteWriter queue is loaded with the reconnect
+        // catch-up write storm (plus history backfill), so awaiting a full drain
+        // here — together with the inline cleanup WRITE inside loadMessages — was
+        // the 5–7s blank chat screen. WAL readers never block on the writer, so
+        // we read the already-persisted messages immediately and paint them;
+        // messages still being written are additive (they arrived while the app
+        // was killed) and land via the follow-up refresh each incoming write
+        // triggers. Subsequent refreshes keep the drain so a just-landed realtime
+        // upsert is included (the queue is shallow by then).
+        const isFirstRender = !initialLoadDoneRef.current;
+        if (!isFirstRender) {
+          try { await SqliteWriter.awaitDrain(); } catch {}
+        }
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
-        // skipCleanup on subsequent refreshes — cleanup only runs on initial load
-        const isSubsequent = initialLoadDoneRef.current;
-        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, { limit: 100, afterTimestamp: clearedAt, skipCleanup: isSubsequent });
+        const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, {
+          limit: 100,
+          afterTimestamp: clearedAt,
+          // Always skip the inline temp-row cleanup WRITE on the read path — it
+          // queues behind the cold-start storm and stalls the first paint. The
+          // deferred deduplicateChat() in loadMessagesFromLocal performs the
+          // equivalent (broader) maintenance after the screen is on-screen.
+          skipCleanup: true,
+        });
 
         const currentUser = currentUserIdRef.current;
 
@@ -2900,6 +2989,13 @@ export default function useChatLogic({ navigation, route }) {
     const syncOnly = options?.syncOnly === true;
 
     const isGrpSync = chatData?.chatType === 'group' || chatData?.isGroup;
+
+    cslog('📡 message sync via SOCKET', {
+      chatId: chatIdParam,
+      mode: force ? 'force-full' : syncOnly ? 'delta-syncOnly' : 'full-fetch',
+      isGroup: isGrpSync,
+      transport: 'socket.io (server) — refreshes/fills SQLite, then UI re-reads SQLite',
+    });
 
     if (force) {
       forceReloadPendingRef.current = true;
@@ -5486,7 +5582,17 @@ export default function useChatLogic({ navigation, route }) {
         // doc and echoes back. `tempId` is kept as a legacy alias. Because it
         // dedupes server-side, replaying a queued message after reconnect can
         // never create a duplicate.
-        const emitPayload = { ...payload, clientMessageId: tempId, tempId };
+        const emitPayload = {
+          ...payload,
+          clientMessageId: tempId,
+          tempId,
+          // Local-first contract aliases (additive, non-breaking). The backend
+          // accepts either spelling; emitting both keeps the wire self-describing
+          // across all three packages. See repo-root MESSAGING_CONTRACT.md.
+          clientId: tempId,
+          content: payload?.text ?? '',
+          type: payload?.messageType,
+        };
 
         const socket = socketRef.current || getSocket();
         if (!socket || !isSocketConnected()) {
@@ -7783,6 +7889,47 @@ export default function useChatLogic({ navigation, route }) {
     setMuteUntil(nextMuteUntil);
   }, [isChatMuted, muteUntil]);
 
+  // One-shot request/response for a single older-history page. The server's
+  // wrapHandler replies on the `message:history:response` EVENT (not an ack
+  // callback), carrying the result under `.data`. Resolves { ok, messages,
+  // hasMore, oldestCursor }; ok=false on offline/timeout so the caller does NOT
+  // mark the chat fully loaded on a mere network failure.
+  const requestHistoryPage = useCallback(({ chatId, beforeSeq, limit, afterClearedAt }) => {
+    return new Promise((resolve) => {
+      const socket = getSocket();
+      if (!socket || !isSocketConnected()) {
+        resolve({ ok: false, messages: [], hasMore: false, oldestCursor: beforeSeq });
+        return;
+      }
+      let settled = false;
+      const cleanup = () => { socket.off('message:history:response', onResp); clearTimeout(timer); };
+      const onResp = (response) => {
+        const payload = response?.data || response || {};
+        if (String(payload.chatId || '') !== String(chatId)) return; // not our chat
+        if (settled) return;
+        settled = true; cleanup();
+        resolve({
+          ok: true,
+          messages: Array.isArray(payload.messages) ? payload.messages : [],
+          hasMore: Boolean(payload.hasMore),
+          oldestCursor: payload.oldestCursor != null ? payload.oldestCursor : beforeSeq,
+        });
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true; cleanup();
+        resolve({ ok: false, messages: [], hasMore: false, oldestCursor: beforeSeq, timedOut: true });
+      }, 12000);
+      socket.on('message:history:response', onResp);
+      socket.emit('message:history', {
+        chatId,
+        beforeSeq: beforeSeq || null,
+        limit: limit || SOCKET_FETCH_LIMIT,
+        afterClearedAt: afterClearedAt || null,
+      });
+    });
+  }, []);
+
   const loadMoreMessages = useCallback(async () => {
     if (isLoadingMore || loadMoreInFlightRef.current) return;
     if (!hasMoreMessages) return;
@@ -7802,16 +7949,12 @@ export default function useChatLogic({ navigation, route }) {
     setIsLoadingMore(true);
 
     try {
-      // SQLite-first: try loading older messages from local DB
       const cid = chatIdRef.current;
-      const olderLocal = await ChatDatabase.loadMessages(cid, {
-        limit: SOCKET_FETCH_LIMIT,
-        offset: messages.length,
-        skipCleanup: true,
-      });
 
-      if (olderLocal.length > 0) {
-        // Found older messages in SQLite — merge into state
+      // Merge a page of older rows (from SQLite) into the displayed list,
+      // de-duping by id and re-sorting newest-first.
+      const mergeOlderRows = (olderRows) => {
+        if (!olderRows || olderRows.length === 0) return;
         setAllMessages(prev => {
           const seenIds = new Set();
           for (const m of prev) {
@@ -7819,7 +7962,7 @@ export default function useChatLogic({ navigation, route }) {
             if (m.serverMessageId) seenIds.add(m.serverMessageId);
             if (m.tempId) seenIds.add(m.tempId);
           }
-          const newOnes = olderLocal.filter(m => {
+          const newOnes = olderRows.filter(m => {
             const ids = [m.id, m.serverMessageId, m.tempId].filter(Boolean);
             return !ids.some(id => seenIds.has(id));
           }).map(m => ({
@@ -7831,27 +7974,95 @@ export default function useChatLogic({ navigation, route }) {
           merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
           return merged;
         });
+      };
 
-        if (olderLocal.length < SOCKET_FETCH_LIMIT) {
-          setHasMoreMessages(false);
-        }
-      } else {
-        // No more local messages — fallback to API/socket for older history
-        const nextPage = currentPage + 1;
-        setCurrentPage(nextPage);
-        fetchAndSyncMessagesViaSocket(cid, {
-          before: oldest,
+      // STEP 1 — LOCAL-FIRST: page older rows straight from SQLite (timestamp
+      // keyset cursor; immune to displayed-vs-DB count drift). No network, no
+      // top spinner. A SHORT local page does NOT stop pagination — the server
+      // may still have older history; the next scroll falls through to STEP 2.
+      const olderLocal = await ChatDatabase.loadMessages(cid, {
+        limit: SOCKET_FETCH_LIMIT,
+        beforeTimestamp: oldest,
+        skipCleanup: true,
+      });
+      if (olderLocal.length > 0) {
+        mergeOlderRows(olderLocal);
+        return;
+      }
+
+      // STEP 2 — LOCAL EXHAUSTED: backfill exactly ONE older page from MongoDB,
+      // persist it in small serialized chunks, then re-read it locally.
+      if (await ChatDatabase.isHistoryFullyLoaded(cid)) {
+        setHasMoreMessages(false);
+        return;
+      }
+
+      setIsBackfilling(true); // network fetch in progress → top-of-list spinner
+      try {
+        // MIN(seq) locally; 0 → "no cursor" so the server returns the NEWEST page
+        // (bootstraps a chat that has nothing seq'd locally). clearedAt bounds the
+        // backfill so a cleared chat's history is never resurrected.
+        const beforeSeq = await ChatDatabase.getOldestSeq(cid);
+        const clearedAt = await ChatDatabase.getClearedAt(cid);
+        const resp = await requestHistoryPage({
+          chatId: cid,
+          beforeSeq,
           limit: SOCKET_FETCH_LIMIT,
+          afterClearedAt: clearedAt || 0,
         });
-        dispatch(chatMessage({ chatId: cid, search: '', page: nextPage, limit: 50 }));
+
+        if (resp.messages.length > 0) {
+          // Map raw Mongo docs → client shape, PRESERVING seq (the generic
+          // normalizer drops it) so the backfill cursor advances and the same
+          // page is never refetched. Idempotent + monotonic upsert handles any
+          // overlap with a message that also arrived live.
+          const normalized = resp.messages.map(m => ({
+            ...normalizeIncomingMessage(m),
+            seq: (m.seq != null && !Number.isNaN(Number(m.seq))) ? Number(m.seq) : null,
+            synced: true,
+          }));
+          // Persist NEWEST-seq FIRST so the derived oldest cursor (MIN(seq))
+          // only ever descends one chunk at a time. If the app is killed
+          // mid-page, the next backfill (seq < MIN) resumes exactly at the gap
+          // — persisting oldest-first would jump MIN to the floor and skip the
+          // un-persisted middle of the page.
+          normalized.sort((a, b) => (Number(b.seq) || 0) - (Number(a.seq) || 0));
+          // Persist in SHORT chunks through the existing serialized writer,
+          // AWAITED, yielding a macrotask between chunks so live message/receipt
+          // writers win the writer lock — never one long/bulk transaction.
+          const CHUNK = 25;
+          for (let i = 0; i < normalized.length; i += CHUNK) {
+            await SqliteWriter.enqueue('upsertMessages', normalized.slice(i, i + CHUNK));
+            await new Promise(r => setTimeout(r, 0));
+          }
+          // The just-persisted older rows now satisfy the local timestamp cursor.
+          const olderNow = await ChatDatabase.loadMessages(cid, {
+            limit: SOCKET_FETCH_LIMIT,
+            beforeTimestamp: oldest,
+            skipCleanup: true,
+          });
+          mergeOlderRows(olderNow);
+        }
+
+        if (resp.ok && !resp.hasMore) {
+          // Reached the first message — stop asking the server for this chat.
+          await ChatDatabase.setHistoryFullyLoaded(cid);
+          setHasMoreMessages(false);
+        } else if (!resp.ok) {
+          // Network failure/timeout — let a later scroll retry the same cursor.
+          fetchOlderCursorRef.current = null;
+        }
+      } finally {
+        setIsBackfilling(false);
       }
     } catch (err) {
       console.warn('[loadMoreMessages] error:', err);
+      fetchOlderCursorRef.current = null;
     } finally {
       setIsLoadingMore(false);
       loadMoreInFlightRef.current = false;
     }
-  }, [isLoadingMore, hasMoreMessages, currentPage, dispatch, messages, fetchAndSyncMessagesViaSocket]);
+  }, [isLoadingMore, hasMoreMessages, messages, requestHistoryPage, normalizeIncomingMessage]);
 
   /* ========== FIXED: Render status helper ========== */
   const renderStatusText = useCallback(() => {
@@ -8229,7 +8440,7 @@ export default function useChatLogic({ navigation, route }) {
     mediaViewer, closeMediaViewer, handleDownloadMedia, downloadedMedia, downloadProgress, uploadProgress, mediaDownloadStates,
     markMediaRemovedLocally,
     retryMediaStatusUpdate, retryAllFailedMediaStatusUpdates,
-    onRefresh, loadMoreMessages, isLoadingMore, hasMoreMessages,
+    onRefresh, loadMoreMessages, isLoadingMore, isBackfilling, hasMoreMessages,
     manualReloadMessages,
     refreshMessagesFromLocal,
     isChatMuted, muteUntil, toggleChatMute,

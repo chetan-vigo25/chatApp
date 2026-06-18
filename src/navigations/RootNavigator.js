@@ -21,6 +21,7 @@ import LinkDevice from "../screens/ActiveDevice/LinkDevice";
 import EditProfile from "../screens/profiles/EditProfile";
 import PersonalInfoEdit from "../screens/profiles/PersonalInfoEdit";
 import UserB from "../screens/profiles/UserB";
+import ChannelInfo from "../screens/chats/ChannelInfo";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
 import ChatPrivacy from "../screens/profiles/ChatPrivacy";
 import PrivacyAccount from "../screens/profiles/PrivacyAccount";
@@ -120,6 +121,7 @@ export default function RootNavigator() {
           <Stack.Screen name="EditProfile" component={EditProfile} />
           <Stack.Screen name="PersonalInfoEdit" component={PersonalInfoEdit} />
           <Stack.Screen name="UserB" component={UserB} />
+          <Stack.Screen name="ChannelInfo" component={ChannelInfo} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
           <Stack.Screen name="ChatPrivacy" component={ChatPrivacy} />
           <Stack.Screen name="PrivacyAccount" component={PrivacyAccount} />

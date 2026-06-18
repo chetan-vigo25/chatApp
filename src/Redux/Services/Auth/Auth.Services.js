@@ -19,20 +19,25 @@ async function generateOtp(phoneNumber) {
         });
         if (response && response.message && typeof response.message === 'string') {
             if (response.statusCode === 200) {
-                console.log("test responce",response.data);
                 showToast(response.message);
                 return { otpMessage: response.message, otpData: response.data };
             } else {
                 showToast(response.message)
-                console.error("Unexpected response message:", response.message);
+                console.error("[OTP:SEND] Unexpected response message:", response.message);
                 return Promise.reject(response.message);
             }
         } else {
-            console.error("Response is not a valid JSON or does not have expected structure:", response);
             return Promise.reject("Invalid JSON response or missing message");
         }
     } catch (error) {
-        console.error("OTP Generation error:", error);
+        // Surface the most useful fields so we can tell "never sent" (network)
+        // from "server rejected" (has status/message).
+        console.error("[OTP:SEND] FAILED", {
+            code: error?.code,
+            status: error?.response?.status,
+            url: error?.url || error?.config?.url,
+            message: error?.message || error,
+        });
         return Promise.reject(error);
     }
 }

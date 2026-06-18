@@ -32,7 +32,7 @@ export async function chatListData(search) {
         return Promise.reject("Invalid response or missing message");
       }
     } catch (error) {
-      console.error("sessions-terminate:", error);
+      console.log("sessions-terminate:", error);
       return Promise.reject(new Error(error.message || "Error user-chat-list api"));
     }
 }

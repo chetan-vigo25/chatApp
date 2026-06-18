@@ -3,6 +3,45 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SOCKET_URL } from '@env';
 import { Alert, AppState, Platform } from 'react-native';
 import { performSessionReset, saveAuthSession } from '../../../services/sessionManager';
+import ChatDatabase from '../../../services/ChatDatabase';
+
+// Presence heartbeat: while the app is foregrounded we refresh the server's
+// liveness key on this cadence. Stopped on background/disconnect so a suspended
+// app stops being counted as live (the server's conn-key TTL then expires).
+const PRESENCE_HEARTBEAT_MS = 15000;
+let presenceHeartbeatTimer = null;
+
+const startPresenceHeartbeat = () => {
+  if (presenceHeartbeatTimer) return;
+  const tick = () => {
+    if (socket && socket.connected) socket.emit('presence:heartbeat');
+  };
+  tick();
+  presenceHeartbeatTimer = setInterval(tick, PRESENCE_HEARTBEAT_MS);
+};
+
+const stopPresenceHeartbeat = () => {
+  if (presenceHeartbeatTimer) {
+    clearInterval(presenceHeartbeatTimer);
+    presenceHeartbeatTimer = null;
+  }
+};
+
+// Mirror inbound presence into SQLite so the UI can cold-render last-known state.
+const persistPresenceEvent = (raw) => {
+  try {
+    const data = raw?.data || raw || {};
+    const userId = data.userId || data?.presence?.userId;
+    if (!userId) return;
+    const presence = data.presence || data;
+    ChatDatabase.upsertPresenceCache(String(userId), {
+      status: presence.status,
+      lastSeen: presence.lastSeen,
+    });
+  } catch {
+    // best-effort cache write
+  }
+};
 
 const STORAGE_KEYS = {
   ACCESS_TOKEN: 'accessToken',
@@ -286,7 +325,8 @@ const reconnectSocketWithFreshToken = async ({ accessToken, deviceId }) => {
     };
 
     const onError = (error) => {
-      console.error('❌ socket reconnect after refresh failed:', error?.message || error);
+      // Transient network failure — log-level so LogBox stays quiet; we retry.
+      console.log('🔁 socket reconnect after refresh failed (will retry):', error?.message || error);
       finalize();
     };
 
@@ -461,7 +501,7 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
           socketRef.once('connect_error', onConnectError);
 
           timeoutHandle = setTimeout(() => {
-            console.error('⏱️ reauthentication timeout occurred', {
+            console.log('⏱️ reauthentication timeout occurred (will retry)', {
               timeoutMs: REAUTH_TIMEOUT_MS,
               attempt,
               socketConnected: socketRef.connected,
@@ -476,7 +516,7 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
 
           // Separate timeout for the connection phase
           connectTimeoutHandle = setTimeout(() => {
-            console.error('⏱️ reauthentication connect timeout', {
+            console.log('⏱️ reauthentication connect timeout (will retry)', {
               timeoutMs: REAUTH_CONNECT_TIMEOUT_MS,
               attempt,
             });
@@ -522,8 +562,9 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
     flushPendingEmitQueue();
   })()
     .catch(async (error) => {
-      console.error('❌ socket reauthentication failed:', error?.message || error);
-      console.log('❌ reauthenticated failure');
+      // Handled gracefully below (temporary failure → retry/await; auth reject →
+      // logout). Log-level keeps LogBox from flagging a routine reauth miss.
+      console.log('❌ socket reauthentication failed:', error?.message || error);
 
       if (error?.isAuthRejected || error?.code === 'REAUTH_REJECTED' || error?.message === 'Missing refresh credentials') {
         await handleLogout(navigation);
@@ -574,10 +615,18 @@ const attachCoreSocketListeners = (navigation) => {
       emitDeviceEvents();
       flushPendingEmitQueue();
     }
+
+    // We're live and (re)authenticating → announce active + start heartbeat. Only
+    // do so when foregrounded; a background reconnect should not resurrect us.
+    if (AppState.currentState === 'active') {
+      socket.emit('presence:active');
+      startPresenceHeartbeat();
+    }
   });
 
   socket.on('disconnect', (reason) => {
     console.log('🔌 socket disconnected', { reason });
+    stopPresenceHeartbeat();
     updateSocketState({
       status: 'disconnected',
       connected: false,
@@ -589,8 +638,20 @@ const attachCoreSocketListeners = (navigation) => {
     }
   });
 
+  // Persist presence broadcasts to SQLite for instant cold-render.
+  socket.on('presence:update', persistPresenceEvent);
+  socket.on('presence:subscribed:update', persistPresenceEvent);
+  socket.on('presence:bulk', (raw) => {
+    const entries = raw?.data?.entries || raw?.entries || [];
+    entries.forEach((e) => persistPresenceEvent({ data: e }));
+  });
+
   socket.on('connect_error', (error) => {
-    console.error('❌ socket connect_error:', error?.message || error);
+    // Routine: fires whenever the network drops or the OS suspends the socket
+    // (screen off, Wi-Fi/data toggle). Logged at log-level — NOT console.error —
+    // so React Native's LogBox doesn't surface a red "websocket error" overlay
+    // for an expected, self-healing event. The reconnect logic recovers silently.
+    console.log('🔌 socket connect_error (will retry):', error?.message || error);
     updateSocketState({
       status: 'connect_error',
       connected: false,
@@ -839,20 +900,22 @@ export const setupAppStateListener = (navigation) => {
       } else if (accessTokenCache) {
         socket.emit('token:validate', { token: accessTokenCache });
       }
-      // Back in the foreground → mark this user online again. The socket may have
-      // reconnected above, so queue it (emitSocketEvent) to fire the moment the
-      // connection is live rather than dropping it on a transient disconnect.
+      // Back in the foreground → mark active again + resume heartbeat. The socket
+      // may have reconnected above, so queue presence:active (emitSocketEvent) to
+      // fire the moment the connection is live rather than dropping it.
       emitSocketEvent('app:state', { state: 'foreground' });
-      emitSocketEvent('presence:update', { status: 'online' });
+      emitSocketEvent('presence:active');
+      startPresenceHeartbeat();
     } else if (goingBackground && appState === 'active') {
-      // App minimized / removed from the recents / closing → tell the server the
-      // user is offline immediately. The socket can stay connected for a while in
-      // the background, so without this explicit signal the user keeps showing
-      // "online". Emit directly (no offline queue) since a backgrounded socket
-      // that has already dropped can't deliver an offline event anyway.
+      // App minimized / removed from recents → announce "away" and stop the
+      // heartbeat. The OS suspends background sockets, so once the conn-key TTL
+      // lapses (no more heartbeats) the server's grace+sweeper finalizes offline.
+      // We send "away" rather than "offline" so a brief app-switch (or another
+      // active device) doesn't flap the user straight to offline.
+      stopPresenceHeartbeat();
       if (socket && socket.connected) {
         socket.emit('app:state', { state: 'background' });
-        socket.emit('presence:update', { status: 'offline' });
+        socket.emit('presence:away', {});
       }
     }
 

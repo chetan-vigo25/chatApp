@@ -1,7 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'TalksTry.db';
-const DB_VERSION = 12;
+const DB_VERSION = 13;
 
 let _db = null;
 let _hasReplyColumns = false;
@@ -386,6 +386,24 @@ const runMigrations = async (db) => {
       }
     }
 
+    if (currentVersion < 13) {
+      try {
+        // V13: presence cache — last-known online/away/offline + lastSeen per user
+        // so the UI can render presence instantly (incl. while offline) and
+        // reconcile once the socket reconnects. Mirrors backend presence:update.
+        await db.execAsync(`
+          CREATE TABLE IF NOT EXISTS presence_cache (
+            user_id TEXT PRIMARY KEY NOT NULL,
+            status TEXT,
+            last_seen INTEGER,
+            updated_at INTEGER NOT NULL
+          );
+        `);
+      } catch (e) {
+        console.warn('[ChatDB] V13 migration warning:', e?.message);
+      }
+    }
+
     await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
   } catch (err) {
     console.error('[ChatDB] Migration error:', err);
@@ -427,7 +445,10 @@ const formatDate = (ts, ca) => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 };
 
-const STATUS_PRIORITY = { scheduled: 0, cancelled: 0, processing: 0, sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
+// `queued` is the local-first contract's name for the optimistic pre-ack state
+// (MESSAGING_CONTRACT.md §3); it is an alias of `sending` and shares its rank so
+// it never beats an acked status and is never downgraded onto an in-flight row.
+const STATUS_PRIORITY = { scheduled: 0, cancelled: 0, processing: 0, queued: 1, sending: 1, uploaded: 2, sent: 3, delivered: 4, seen: 5, read: 5 };
 
 const parseJSON = (val) => {
   if (!val) return null;
@@ -442,6 +463,7 @@ const rowToMsg = (row) => {
 
   const msg = {
     id: row.id,
+    seq: row.seq != null ? Number(row.seq) : null,
     serverMessageId: row.server_message_id,
     tempId: row.temp_id,
     chatId: row.chat_id,
@@ -635,11 +657,35 @@ const isTransientLockError = (err) => {
 };
 
 let _writeChain = Promise.resolve();
+// Global write mutex — STRICT FIFO. Every write (single-statement AND batch)
+// chains here, so no two writes ever overlap on EITHER connection: the shared
+// main connection used by single statements, or the dedicated BEGIN EXCLUSIVE
+// connection that `withExclusiveTransactionAsync` opens for batches.
+//
+// WHY NOT re-entrant/inline: a previous version returned
+// `Promise.resolve().then(task)` whenever another write was mid-flight, so a
+// re-entrant write would run inline instead of deadlocking. But that let a
+// single-statement write (e.g. upsertPresenceCache) run OUTSIDE chain order —
+// the inlined write could still be executing on the MAIN connection when the
+// NEXT batch grabbed BEGIN EXCLUSIVE on the DEDICATED connection, and the two
+// connections then collided → recurring "database is locked" (SQLITE_BUSY) on
+// finalizeAsync. Strict serialization removes that entire class.
+//
+// Trade-off: a writer must NEVER be called from INSIDE another writer's task
+// (that would deadlock) — batch internals write through the passed tx/db handle
+// instead (as _runUpsertBatch / saveReplyData already do). No such nested call
+// exists in this module, so strict FIFO is safe here.
 const runExclusive = (task) => {
   const next = _writeChain.then(task, task);
   _writeChain = next.catch(() => {}); // swallow so a failure never breaks the chain
   return next;
 };
+
+// Heavy DEDICATED-CONNECTION batch writers (upsertMessages, saveStatusFeed,
+// saveBroadcasts, deduplicateChat, clearSyncData, saveBlockedContacts — all via
+// `withExclusiveTransactionAsync`) share the SAME chain. Now identical to
+// runExclusive; kept as a named alias for call-site clarity.
+const runExclusiveBatch = runExclusive;
 
 // Run a multi-statement cache write as ONE atomic transaction, retrying on a
 // transient "database is locked".
@@ -732,8 +778,10 @@ const upsertMessages = async (messages) => {
   };
 
   // Serialize against every other write batch (status feed, broadcasts, …) too,
-  // not just other upsertMessages calls.
-  return runExclusive(run);
+  // not just other upsertMessages calls. Uses the dedicated-connection batch
+  // path so no single-statement writer can inline onto the main connection while
+  // this exclusive transaction holds the writer lock.
+  return runExclusiveBatch(run);
 };
 
 const _runUpsertBatch = async (db, messages) => {
@@ -870,6 +918,11 @@ const _runInsert = async (db, msg, _retried = false) => {
 
   const baseParams = {
     $id: id,
+    // Server-allocated monotonic per-chat seq. Persisting it is what makes the
+    // reconnect catch-up (`message:sync:catchup` keyed on getLatestSeq) actually
+    // work — without it getLatestSeq is always 0 and messages that arrived while
+    // the app was killed are never backfilled into the thread.
+    $seq: (msg.seq != null && !Number.isNaN(Number(msg.seq))) ? Number(msg.seq) : null,
     $server_message_id: msg.serverMessageId || null,
     $temp_id: msg.tempId || null,
     $chat_id: msg.chatId || null,
@@ -906,7 +959,7 @@ const _runInsert = async (db, msg, _retried = false) => {
   if (_hasReplyColumns) {
     // Use full SQL with reply columns
     await db.runAsync(`INSERT INTO messages (
-      id, server_message_id, temp_id, chat_id, group_id,
+      id, seq, server_message_id, temp_id, chat_id, group_id,
       sender_id, sender_name, sender_type, receiver_id,
       text, type, status, timestamp, created_at, synced,
       is_deleted, deleted_for, deleted_by, placeholder_text,
@@ -914,7 +967,7 @@ const _runInsert = async (db, msg, _retried = false) => {
       local_uri, media_id, reactions, delivered_to, read_by, payload, extra,
       reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id
     ) VALUES (
-      $id, $server_message_id, $temp_id, $chat_id, $group_id,
+      $id, $seq, $server_message_id, $temp_id, $chat_id, $group_id,
       $sender_id, $sender_name, $sender_type, $receiver_id,
       $text, $type, $status, $timestamp, $created_at, $synced,
       $is_deleted, $deleted_for, $deleted_by, $placeholder_text,
@@ -922,6 +975,7 @@ const _runInsert = async (db, msg, _retried = false) => {
       $local_uri, $media_id, $reactions, $delivered_to, $read_by, $payload, $extra,
       $reply_to_message_id, $reply_preview_text, $reply_preview_type, $reply_sender_name, $reply_sender_id
     ) ON CONFLICT(id) DO UPDATE SET
+      seq = COALESCE($seq, seq),
       server_message_id = COALESCE($server_message_id, server_message_id),
       temp_id = COALESCE($temp_id, temp_id),
       chat_id = COALESCE($chat_id, chat_id),
@@ -971,20 +1025,21 @@ const _runInsert = async (db, msg, _retried = false) => {
   } else {
     // Fallback: reply data only in payload JSON
     await db.runAsync(`INSERT INTO messages (
-      id, server_message_id, temp_id, chat_id, group_id,
+      id, seq, server_message_id, temp_id, chat_id, group_id,
       sender_id, sender_name, sender_type, receiver_id,
       text, type, status, timestamp, created_at, synced,
       is_deleted, deleted_for, deleted_by, placeholder_text,
       is_edited, edited_at, media_url, media_type, preview_url,
       local_uri, media_id, reactions, delivered_to, read_by, payload, extra
     ) VALUES (
-      $id, $server_message_id, $temp_id, $chat_id, $group_id,
+      $id, $seq, $server_message_id, $temp_id, $chat_id, $group_id,
       $sender_id, $sender_name, $sender_type, $receiver_id,
       $text, $type, $status, $timestamp, $created_at, $synced,
       $is_deleted, $deleted_for, $deleted_by, $placeholder_text,
       $is_edited, $edited_at, $media_url, $media_type, $preview_url,
       $local_uri, $media_id, $reactions, $delivered_to, $read_by, $payload, $extra
     ) ON CONFLICT(id) DO UPDATE SET
+      seq = COALESCE($seq, seq),
       server_message_id = COALESCE($server_message_id, server_message_id),
       temp_id = COALESCE($temp_id, temp_id),
       chat_id = COALESCE($chat_id, chat_id),
@@ -1102,28 +1157,47 @@ const _preserveLocalState = async (db, msg) => {
 const loadMessages = async (chatId, opts = {}) => {
   if (!chatId) return [];
   const db = await getDB();
-  const { limit = 50, offset = 0, afterTimestamp = 0, skipCleanup = false } = opts;
+  const { limit = 50, offset = 0, afterTimestamp = 0, beforeTimestamp = 0, skipCleanup = false } = opts;
 
   // ── STEP 1: Lightweight cleanup — only run on first load (not every refresh) ──
+  // This is a WRITE on the read path; route it through the write mutex so it can't
+  // race the exclusive-transaction batch writers (was a silent SQLITE_BUSY source).
   if (!skipCleanup) {
     try {
-      await db.runAsync(
-        `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND server_message_id IS NOT NULL`,
-        { $cid: chatId }
-      );
+      await runExclusive(async () => {
+        const wdb = await getDB();
+        await wdb.runAsync(
+          `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND server_message_id IS NOT NULL`,
+          { $cid: chatId }
+        );
+      });
     } catch {}
   }
 
   // ── STEP 2: Load raw rows using indexed query ──
-  const rows = afterTimestamp > 0
-    ? await db.getAllAsync(
-        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
-        { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
-      )
-    : await db.getAllAsync(
-        `SELECT * FROM messages WHERE chat_id = $cid ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
-        { $cid: chatId, $lim: limit, $off: offset }
-      );
+  // `beforeTimestamp` is the OLDER-history pagination cursor: it loads the page of
+  // messages strictly older than the oldest one currently shown. Cursor-based
+  // paging is immune to the offset drift that happens when the displayed list
+  // count (after dedup + optimistic/scheduled rows) diverges from the SQLite row
+  // count — the old `offset` paging could skip rows or get stuck and never reveal
+  // older history on a cold-start scroll-up.
+  let rows;
+  if (beforeTimestamp > 0) {
+    rows = await db.getAllAsync(
+      `SELECT * FROM messages WHERE chat_id = $cid AND timestamp < $bts ORDER BY timestamp DESC LIMIT $lim`,
+      { $cid: chatId, $bts: beforeTimestamp, $lim: limit }
+    );
+  } else if (afterTimestamp > 0) {
+    rows = await db.getAllAsync(
+      `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+      { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
+    );
+  } else {
+    rows = await db.getAllAsync(
+      `SELECT * FROM messages WHERE chat_id = $cid ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+      { $cid: chatId, $lim: limit, $off: offset }
+    );
+  }
 
   if (rows.length === 0) return [];
 
@@ -1218,6 +1292,7 @@ const messageExists = async (messageId) => {
 
 const acknowledgeMessage = async (tempId, serverMessageId) => {
   if (!tempId || !serverMessageId) return;
+  return runExclusive(async () => {
   const db = await getDB();
 
   const serverRow = await db.getFirstAsync(`SELECT id, is_edited, status FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`, { $s: serverMessageId });
@@ -1297,20 +1372,109 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
       );
     }
   } catch {}
+  });
 };
 
+// ── Coalesced message-status writer ──────────────────────────────────────
+// Delivery/read receipts arrive PER-MESSAGE in bursts; writing each as its own
+// UPDATE was the dominant SQLITE_BUSY source (each raced the exclusive-transaction
+// batch writers for the WAL lock). We buffer status changes for a short window and
+// flush them as ONE multi-row UPDATE per target status — through `runExclusive`, so
+// they serialize with every other writer. Monotonic by construction: a row is only
+// advanced from a strictly-lower standard status (priority > 0 and < target), so
+// out-of-order/replayed events never downgrade, and protected statuses
+// (scheduled/cancelled/processing/failed = priority 0) are never overwritten.
+const STATUS_COALESCE_MS = 150;
+let _statusBuffer = new Map();      // messageId -> highest-rank target status
+let _statusFlushTimer = null;
+let _statusFlushPromise = null;
+let _statusFlushResolve = null;
+
+const _flushStatusBuffer = async () => {
+  _statusFlushTimer = null;
+  const resolveFlush = _statusFlushResolve;
+  _statusFlushResolve = null;
+  _statusFlushPromise = null;
+  if (_statusBuffer.size === 0) { if (resolveFlush) resolveFlush(); return; }
+
+  const buf = _statusBuffer;
+  _statusBuffer = new Map();
+
+  // Group ids by target status so each status is one UPDATE … WHERE id IN (…).
+  const byStatus = new Map();
+  for (const [id, status] of buf) {
+    if (!byStatus.has(status)) byStatus.set(status, []);
+    byStatus.get(status).push(String(id));
+  }
+
+  try {
+    await runExclusive(async () => {
+      const db = await getDB();
+      for (const [status, ids] of byStatus) {
+        const tp = STATUS_PRIORITY[status] || 0;
+        // Only standard statuses strictly below the target (excludes the
+        // priority-0 protected set automatically).
+        const lower = Object.entries(STATUS_PRIORITY)
+          .filter(([, p]) => p > 0 && p < tp)
+          .map(([s]) => s);
+        if (!lower.length) continue;
+        const CHUNK = 200; // keep bound SQLite variable count sane
+        for (let i = 0; i < ids.length; i += CHUNK) {
+          const slice = ids.slice(i, i + CHUNK);
+          const idPh = slice.map(() => '?').join(',');
+          const stPh = lower.map(() => '?').join(',');
+          await db.runAsync(
+            `UPDATE messages SET status = ?
+             WHERE (id IN (${idPh}) OR server_message_id IN (${idPh}) OR temp_id IN (${idPh}))
+               AND status IN (${stPh})`,
+            [status, ...slice, ...slice, ...slice, ...lower]
+          );
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('[ChatDB] status flush error:', err?.message);
+  } finally {
+    if (resolveFlush) resolveFlush();
+  }
+};
+
+// Public API unchanged: callers still call updateMessageStatus(id, status) and may
+// await the returned promise (resolves when the coalesced flush lands).
 const updateMessageStatus = async (messageId, newStatus) => {
   if (!messageId || !newStatus) return false;
-  const db = await getDB();
   const np = STATUS_PRIORITY[newStatus] || 0;
-  const cur = await db.getFirstAsync(`SELECT status FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`, { $id: messageId });
-  if (!cur) return false;
-  // Protect scheduled/cancelled/failed from being overwritten by delivery/read/seen events
-  // Only clearScheduleData() should transition these statuses
-  const PROTECTED = new Set(['scheduled', 'processing', 'cancelled', 'failed']);
-  if (PROTECTED.has(cur.status) && !PROTECTED.has(newStatus)) return false;
-  if (np <= (STATUS_PRIORITY[cur.status] || 0)) return false;
-  await db.runAsync(`UPDATE messages SET status = $s WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $s: newStatus, $id: messageId });
+
+  // Protected / unknown target (scheduled/cancelled/processing/failed → priority 0):
+  // not part of the monotonic forward chain, so write it directly (serialized),
+  // bypassing the coalescer. Rare path (e.g. marking a send failed).
+  if (np <= 0) {
+    return runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync(
+        `UPDATE messages SET status = $s WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+        { $s: newStatus, $id: String(messageId) }
+      );
+      return true;
+    }).catch((err) => { console.warn('[ChatDB] updateMessageStatus(direct) error:', err?.message); return false; });
+  }
+
+  const key = String(messageId);
+  const prev = _statusBuffer.get(key);
+  if (!prev || (STATUS_PRIORITY[prev] || 0) < np) {
+    _statusBuffer.set(key, newStatus); // keep only the highest-rank target
+  }
+  // Big burst → flush now rather than waiting out the window.
+  if (_statusBuffer.size >= 200) {
+    if (_statusFlushTimer) { clearTimeout(_statusFlushTimer); _statusFlushTimer = null; }
+    _flushStatusBuffer().catch(() => {});
+  } else if (!_statusFlushTimer) {
+    _statusFlushTimer = setTimeout(() => { _flushStatusBuffer().catch(() => {}); }, STATUS_COALESCE_MS);
+  }
+  // Resolve immediately: callers are fire-and-forget and the UI reads live state
+  // from Redux, not this cache. The buffered row lands within the coalesce window.
+  // (Returning the flush promise here would block SqliteWriter._drain ~150ms per
+  // op and defeat coalescing.)
   return true;
 };
 
@@ -1318,17 +1482,24 @@ const updateMessageStatus = async (messageId, newStatus) => {
 // Called when the peer reads everything — e.g. message:read:all:ack arrives.
 const updateAllSentMessagesInChatToSeen = async (chatId, myUserId) => {
   if (!chatId || !myUserId) return 0;
-  const db = await getDB();
+  // Serialize through the global write mutex. This is a high-frequency single
+  // statement writer (fires on every message:read:all:ack); run bare it raced the
+  // exclusive-transaction batch writers (upsertMessages / status feed / presence)
+  // for the WAL writer lock and threw "database is locked". runExclusive queues it
+  // behind any in-flight batch instead of competing for the lock.
   try {
-    const result = await db.runAsync(
-      `UPDATE messages SET status = 'seen'
-       WHERE chat_id = $cid
-         AND sender_id = $uid
-         AND status IN ('sent', 'delivered')
-         AND (is_deleted = 0 OR is_deleted IS NULL)`,
-      { $cid: chatId, $uid: myUserId }
-    );
-    return result?.changes || 0;
+    return await runExclusive(async () => {
+      const db = await getDB();
+      const result = await db.runAsync(
+        `UPDATE messages SET status = 'seen'
+         WHERE chat_id = $cid
+           AND sender_id = $uid
+           AND status IN ('sent', 'delivered')
+           AND (is_deleted = 0 OR is_deleted IS NULL)`,
+        { $cid: chatId, $uid: myUserId }
+      );
+      return result?.changes || 0;
+    });
   } catch (err) {
     console.warn('[ChatDB] updateAllSentMessagesInChatToSeen error:', err?.message);
     return 0;
@@ -1338,12 +1509,14 @@ const updateAllSentMessagesInChatToSeen = async (chatId, myUserId) => {
 // Update the last_message_status column in the chats table (chat list tick)
 const updateChatLastMessageStatus = async (chatId, newStatus) => {
   if (!chatId || !newStatus) return;
-  const db = await getDB();
   try {
-    await db.runAsync(
-      `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $id`,
-      { $s: newStatus, $n: Date.now(), $id: chatId }
-    );
+    await runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync(
+        `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $id`,
+        { $s: newStatus, $n: Date.now(), $id: chatId }
+      );
+    });
   } catch (err) {
     console.warn('[ChatDB] updateChatLastMessageStatus error:', err?.message);
   }
@@ -1352,29 +1525,31 @@ const updateChatLastMessageStatus = async (chatId, newStatus) => {
 // Clear schedule data from payload when a scheduled message is delivered
 const clearScheduleData = async (messageId, newStatus = 'sent') => {
   if (!messageId) return;
-  const db = await getDB();
   try {
-    const row = await db.getFirstAsync(
-      `SELECT id, payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
-      { $id: messageId }
-    );
-    if (!row) return;
-    const payload = parseJSON(row.payload);
-    if (payload) {
-      delete payload.isScheduled;
-      delete payload.scheduleTime;
-      // Keep scheduleTimeLabel for visual indicator on delivered scheduled messages
-      payload.wasScheduled = true;
-      await db.runAsync(
-        `UPDATE messages SET status = $s, payload = $p WHERE id = $rid`,
-        { $s: newStatus, $p: JSON.stringify(payload), $rid: row.id }
+    await runExclusive(async () => {
+      const db = await getDB();
+      const row = await db.getFirstAsync(
+        `SELECT id, payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+        { $id: messageId }
       );
-    } else {
-      await db.runAsync(
-        `UPDATE messages SET status = $s WHERE id = $rid`,
-        { $s: newStatus, $rid: row.id }
-      );
-    }
+      if (!row) return;
+      const payload = parseJSON(row.payload);
+      if (payload) {
+        delete payload.isScheduled;
+        delete payload.scheduleTime;
+        // Keep scheduleTimeLabel for visual indicator on delivered scheduled messages
+        payload.wasScheduled = true;
+        await db.runAsync(
+          `UPDATE messages SET status = $s, payload = $p WHERE id = $rid`,
+          { $s: newStatus, $p: JSON.stringify(payload), $rid: row.id }
+        );
+      } else {
+        await db.runAsync(
+          `UPDATE messages SET status = $s WHERE id = $rid`,
+          { $s: newStatus, $rid: row.id }
+        );
+      }
+    });
   } catch (err) {
     console.warn('[ChatDB] clearScheduleData error:', err);
   }
@@ -1382,42 +1557,52 @@ const clearScheduleData = async (messageId, newStatus = 'sent') => {
 
 const markMessageDeleted = async (messageId, deletedBy, placeholderText) => {
   if (!messageId) return;
-  const db = await getDB();
-  await db.runAsync(
-    `UPDATE messages SET is_deleted = 1, deleted_for = 'everyone', deleted_by = $by, placeholder_text = $ph, text = $ph, type = 'system', media_url = NULL, media_type = NULL, preview_url = NULL, local_uri = NULL WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
-    { $id: messageId, $by: deletedBy || null, $ph: placeholderText || 'This message was deleted' }
-  );
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(
+      `UPDATE messages SET is_deleted = 1, deleted_for = 'everyone', deleted_by = $by, placeholder_text = $ph, text = $ph, type = 'system', media_url = NULL, media_type = NULL, preview_url = NULL, local_uri = NULL WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+      { $id: messageId, $by: deletedBy || null, $ph: placeholderText || 'This message was deleted' }
+    );
+  });
 };
 
 const deleteMessageForMe = async (messageId) => {
   if (!messageId) return;
-  const db = await getDB();
-  await db.runAsync(`DELETE FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`DELETE FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId });
+  });
 };
 
 const updateReactions = async (messageId, reactions) => {
   if (!messageId) return;
-  const db = await getDB();
-  await db.runAsync(`UPDATE messages SET reactions = $r WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId, $r: reactions ? JSON.stringify(reactions) : null });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE messages SET reactions = $r WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId, $r: reactions ? JSON.stringify(reactions) : null });
+  });
 };
 
 const updateMessageEdit = async (messageId, newText, editedAt) => {
   if (!messageId || !newText) return;
-  const db = await getDB();
   try {
-    await db.runAsync(`UPDATE messages SET text = $t, is_edited = 1, edited_at = $e WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId, $t: newText, $e: editedAt || new Date().toISOString() });
+    await runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync(`UPDATE messages SET text = $t, is_edited = 1, edited_at = $e WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId, $t: newText, $e: editedAt || new Date().toISOString() });
+    });
   } catch (err) { console.warn('[ChatDB] updateMessageEdit error:', err); }
 };
 
 const clearChat = async (chatId, clearedAt = null) => {
   if (!chatId) return;
-  const db = await getDB();
-  if (clearedAt) {
-    await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND timestamp <= $t`, { $c: chatId, $t: clearedAt });
-  } else {
-    await db.runAsync(`DELETE FROM messages WHERE chat_id = $c`, { $c: chatId });
-  }
-  await db.runAsync(`INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at) VALUES ($c, $t, $n)`, { $c: chatId, $t: clearedAt || Date.now(), $n: Date.now() });
+  await runExclusive(async () => {
+    const db = await getDB();
+    if (clearedAt) {
+      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND timestamp <= $t`, { $c: chatId, $t: clearedAt });
+    } else {
+      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c`, { $c: chatId });
+    }
+    await db.runAsync(`INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at) VALUES ($c, $t, $n)`, { $c: chatId, $t: clearedAt || Date.now(), $n: Date.now() });
+  });
 };
 
 const getClearedAt = async (chatId) => {
@@ -1436,12 +1621,14 @@ const getMessageCount = async (chatId) => {
 
 const updateGroupMessageTracking = async (messageId, { deliveredTo, readBy } = {}) => {
   if (!messageId) return;
-  const db = await getDB();
   const u = []; const p = { $id: messageId };
   if (deliveredTo) { u.push('delivered_to = $dt'); p.$dt = JSON.stringify(deliveredTo); }
   if (readBy) { u.push('read_by = $rb'); p.$rb = JSON.stringify(readBy); }
   if (u.length === 0) return;
-  await db.runAsync(`UPDATE messages SET ${u.join(', ')} WHERE id = $id OR server_message_id = $id OR temp_id = $id`, p);
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE messages SET ${u.join(', ')} WHERE id = $id OR server_message_id = $id OR temp_id = $id`, p);
+  });
 };
 
 const searchMessages = async (chatId, query, limit = 50) => {
@@ -1475,6 +1662,40 @@ const getLatestSeq = async (chatId) => {
   return Number(r?.max_seq || 0);
 };
 
+/**
+ * Lowest server-assigned `seq` known locally for a chat — the OLDER-history
+ * backfill cursor. The client asks the server for messages with seq < this.
+ * Derived live (MIN(seq)) rather than stored, so it always reflects exactly
+ * what is persisted: after each backfilled chunk lands the floor moves down on
+ * its own, which makes a kill-mid-backfill resume automatic (no progress column
+ * to keep in sync). Returns 0 when the chat has no seq'd messages locally, which
+ * the caller sends as "no cursor" → the server returns the NEWEST page.
+ */
+const getOldestSeq = async (chatId) => {
+  if (!chatId) return 0;
+  const db = await getDB();
+  const r = await db.getFirstAsync(
+    `SELECT MIN(seq) as min_seq FROM messages WHERE chat_id = $c AND seq IS NOT NULL`,
+    { $c: chatId }
+  );
+  return Number(r?.min_seq || 0);
+};
+
+// Per-chat "reached the first message — stop asking the server" flag. Stored in
+// sync_meta (serialized KV) so no schema migration is needed. Set once the
+// history endpoint reports hasMore=false; checked before every network backfill.
+const _historyDoneKey = (chatId) => `hist_done:${chatId}`;
+const isHistoryFullyLoaded = async (chatId) => {
+  if (!chatId) return false;
+  try { return (await getSyncMeta(_historyDoneKey(chatId))) === '1'; }
+  catch { return false; }
+};
+const setHistoryFullyLoaded = async (chatId, done = true) => {
+  if (!chatId) return;
+  try { await setSyncMeta(_historyDoneKey(chatId), done ? '1' : '0'); }
+  catch (e) { console.warn('[ChatDB] setHistoryFullyLoaded failed:', e?.message); }
+};
+
 // Every distinct chat_id this device has any local message for. Used by the
 // reconnect catch-up to ask the server for missed messages PER chat: it reads
 // from the persistent DB (available immediately on cold start) rather than the
@@ -1498,7 +1719,7 @@ const deduplicateChat = async (chatId) => {
   // Serialize the 4 maintenance DELETEs through the global write mutex + a
   // transaction so they neither interleave with a concurrent send/sync batch
   // (→ "database is locked") nor leave the chat half-deduped if interrupted.
-  return runExclusive(() =>
+  return runExclusiveBatch(() =>
     _runCacheWrite('deduplicateChat', async (db) => {
       // 1. Remove exact primary key duplicates (shouldn't happen but safety net)
       await db.runAsync(`DELETE FROM messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM messages WHERE chat_id = $c GROUP BY id) AND chat_id = $c`, { $c: chatId });
@@ -1519,14 +1740,18 @@ const deduplicateChat = async (chatId) => {
 
 const bulkUpdateStatus = async (chatId, newStatus, opts = {}) => {
   if (!chatId || !newStatus) return;
-  const db = await getDB();
-  if (opts.senderIdNot) {
-    const cs = Object.entries(STATUS_PRIORITY).filter(([, p]) => p < (STATUS_PRIORITY[newStatus] || 0)).map(([s]) => `'${s}'`).join(',');
-    if (!cs) return;
-    await db.runAsync(`UPDATE messages SET status = $s WHERE chat_id = $c AND sender_id != $sid AND status IN (${cs})`, { $s: newStatus, $c: chatId, $sid: opts.senderIdNot });
-  } else {
-    await db.runAsync(`UPDATE messages SET status = $s WHERE chat_id = $c`, { $s: newStatus, $c: chatId });
-  }
+  await runExclusive(async () => {
+    const db = await getDB();
+    if (opts.senderIdNot) {
+      // Only advance from a strictly-lower standard status (priority > 0), so
+      // protected statuses (scheduled/cancelled/processing, priority 0) survive.
+      const cs = Object.entries(STATUS_PRIORITY).filter(([, p]) => p > 0 && p < (STATUS_PRIORITY[newStatus] || 0)).map(([s]) => `'${s}'`).join(',');
+      if (!cs) return;
+      await db.runAsync(`UPDATE messages SET status = $s WHERE chat_id = $c AND sender_id != $sid AND status IN (${cs})`, { $s: newStatus, $c: chatId, $sid: opts.senderIdNot });
+    } else {
+      await db.runAsync(`UPDATE messages SET status = $s WHERE chat_id = $c`, { $s: newStatus, $c: chatId });
+    }
+  });
 };
 
 const closeDB = async () => {
@@ -1661,18 +1886,22 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
 const upsertChat = async (chat) => {
   const params = _chatToRow(chat);
   if (!params) return;
-  const db = await getDB();
-  await db.runAsync(UPSERT_CHAT_SQL, params);
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(UPSERT_CHAT_SQL, params);
+  });
 };
 
 const upsertChats = async (chats) => {
   if (!Array.isArray(chats) || chats.length === 0) return;
-  const db = await getDB();
-  for (const chat of chats) {
-    const params = _chatToRow(chat);
-    if (!params) continue;
-    try { await db.runAsync(UPSERT_CHAT_SQL, params); } catch {}
-  }
+  await runExclusive(async () => {
+    const db = await getDB();
+    for (const chat of chats) {
+      const params = _chatToRow(chat);
+      if (!params) continue;
+      try { await db.runAsync(UPSERT_CHAT_SQL, params); } catch {}
+    }
+  });
 };
 
 const loadChatList = async (opts = {}) => {
@@ -1704,6 +1933,7 @@ const CHAT_STATUS_PRIORITY = { sent: 1, delivered: 2, seen: 3, read: 3 };
 
 const updateChatLastMessage = async (chatId, lm, opts = {}) => {
   if (!chatId || !lm) return;
+  return runExclusive(async () => {
   const db = await getDB();
   const now = Date.now();
 
@@ -1767,6 +1997,7 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
       $now: now,
     }
   );
+  });
 };
 
 // Bump only the status column for a chat's last message — used by delivered/read
@@ -1774,50 +2005,62 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
 // message can't overwrite the current last-message's status.
 const updateChatLastMessageStatusById = async (chatId, messageId, newStatus) => {
   if (!chatId || !messageId || !newStatus) return false;
-  const db = await getDB();
-  const row = await db.getFirstAsync(
-    `SELECT last_message_id, last_message_status FROM chats WHERE chat_id = $cid LIMIT 1`,
-    { $cid: chatId }
-  );
-  if (!row || String(row.last_message_id) !== String(messageId)) return false;
-  const cur = CHAT_STATUS_PRIORITY[row.last_message_status] || 0;
-  const nxt = CHAT_STATUS_PRIORITY[newStatus] || 0;
-  if (nxt <= cur) return false;
-  await db.runAsync(
-    `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $cid`,
-    { $s: newStatus, $n: Date.now(), $cid: chatId }
-  );
-  return true;
+  return runExclusive(async () => {
+    const db = await getDB();
+    const row = await db.getFirstAsync(
+      `SELECT last_message_id, last_message_status FROM chats WHERE chat_id = $cid LIMIT 1`,
+      { $cid: chatId }
+    );
+    if (!row || String(row.last_message_id) !== String(messageId)) return false;
+    const cur = CHAT_STATUS_PRIORITY[row.last_message_status] || 0;
+    const nxt = CHAT_STATUS_PRIORITY[newStatus] || 0;
+    if (nxt <= cur) return false;
+    await db.runAsync(
+      `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $cid`,
+      { $s: newStatus, $n: Date.now(), $cid: chatId }
+    );
+    return true;
+  });
 };
 
 const updateChatUnread = async (chatId, count) => {
   if (!chatId) return;
-  const db = await getDB();
-  await db.runAsync(`UPDATE chats SET unread_count = $c, updated_at = $n WHERE chat_id = $id`, { $c: count, $n: Date.now(), $id: chatId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE chats SET unread_count = $c, updated_at = $n WHERE chat_id = $id`, { $c: count, $n: Date.now(), $id: chatId });
+  });
 };
 
 const incrementChatUnread = async (chatId) => {
   if (!chatId) return;
-  const db = await getDB();
-  await db.runAsync(`UPDATE chats SET unread_count = unread_count + 1, updated_at = $n WHERE chat_id = $id`, { $n: Date.now(), $id: chatId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE chats SET unread_count = unread_count + 1, updated_at = $n WHERE chat_id = $id`, { $n: Date.now(), $id: chatId });
+  });
 };
 
 const updateChatPin = async (chatId, isPinned, pinnedAt) => {
   if (!chatId) return;
-  const db = await getDB();
-  await db.runAsync(`UPDATE chats SET is_pinned = $p, pinned_at = $at, updated_at = $n WHERE chat_id = $id`, { $p: isPinned ? 1 : 0, $at: pinnedAt || null, $n: Date.now(), $id: chatId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE chats SET is_pinned = $p, pinned_at = $at, updated_at = $n WHERE chat_id = $id`, { $p: isPinned ? 1 : 0, $at: pinnedAt || null, $n: Date.now(), $id: chatId });
+  });
 };
 
 const updateChatMute = async (chatId, isMuted, muteUntil) => {
   if (!chatId) return;
-  const db = await getDB();
-  await db.runAsync(`UPDATE chats SET is_muted = $m, mute_until = $u, updated_at = $n WHERE chat_id = $id`, { $m: isMuted ? 1 : 0, $u: muteUntil || null, $n: Date.now(), $id: chatId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE chats SET is_muted = $m, mute_until = $u, updated_at = $n WHERE chat_id = $id`, { $m: isMuted ? 1 : 0, $u: muteUntil || null, $n: Date.now(), $id: chatId });
+  });
 };
 
 const updateChatArchive = async (chatId, isArchived) => {
   if (!chatId) return;
-  const db = await getDB();
-  await db.runAsync(`UPDATE chats SET is_archived = $a, updated_at = $n WHERE chat_id = $id`, { $a: isArchived ? 1 : 0, $n: Date.now(), $id: chatId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`UPDATE chats SET is_archived = $a, updated_at = $n WHERE chat_id = $id`, { $a: isArchived ? 1 : 0, $n: Date.now(), $id: chatId });
+  });
 };
 
 // Targeted update of a group chat's name / avatar / description without
@@ -1827,37 +2070,41 @@ const updateChatArchive = async (chatId, isArchived) => {
 // and survive an app restart.
 const updateChatGroupMeta = async (chatId, { name, avatar, description } = {}) => {
   if (!chatId) return;
-  const db = await getDB();
-  const existing = await db.getFirstAsync(
-    `SELECT group_data FROM chats WHERE chat_id = $id LIMIT 1`, { $id: chatId }
-  );
-  if (!existing) return; // only patch an existing row
-  let group = {};
-  try { group = existing.group_data ? (JSON.parse(existing.group_data) || {}) : {}; } catch { group = {}; }
-  if (name != null) group.name = name;
-  if (avatar != null) group.avatar = avatar;
-  if (description != null) group.description = description;
-  await db.runAsync(
-    `UPDATE chats SET
-       chat_name = COALESCE($name, chat_name),
-       chat_avatar = COALESCE($avatar, chat_avatar),
-       group_data = $group,
-       updated_at = $n
-     WHERE chat_id = $id`,
-    {
-      $name: name != null ? name : null,
-      $avatar: avatar != null ? avatar : null,
-      $group: JSON.stringify(group),
-      $n: Date.now(),
-      $id: chatId,
-    }
-  );
+  await runExclusive(async () => {
+    const db = await getDB();
+    const existing = await db.getFirstAsync(
+      `SELECT group_data FROM chats WHERE chat_id = $id LIMIT 1`, { $id: chatId }
+    );
+    if (!existing) return; // only patch an existing row
+    let group = {};
+    try { group = existing.group_data ? (JSON.parse(existing.group_data) || {}) : {}; } catch { group = {}; }
+    if (name != null) group.name = name;
+    if (avatar != null) group.avatar = avatar;
+    if (description != null) group.description = description;
+    await db.runAsync(
+      `UPDATE chats SET
+         chat_name = COALESCE($name, chat_name),
+         chat_avatar = COALESCE($avatar, chat_avatar),
+         group_data = $group,
+         updated_at = $n
+       WHERE chat_id = $id`,
+      {
+        $name: name != null ? name : null,
+        $avatar: avatar != null ? avatar : null,
+        $group: JSON.stringify(group),
+        $n: Date.now(),
+        $id: chatId,
+      }
+    );
+  });
 };
 
 const deleteChatRow = async (chatId) => {
   if (!chatId) return;
-  const db = await getDB();
-  await db.runAsync(`DELETE FROM chats WHERE chat_id = $id`, { $id: chatId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`DELETE FROM chats WHERE chat_id = $id`, { $id: chatId });
+  });
 };
 
 const getChatCount = async () => {
@@ -1873,47 +2120,54 @@ const getChatCount = async () => {
 
 const outboxEnqueue = async ({ clientMessageId, chatId, payload }) => {
   if (!clientMessageId || !chatId) return;
-  const db = await getDB();
-  const now = Date.now();
-  await db.runAsync(
-    `INSERT OR REPLACE INTO outbox
-       (client_message_id, chat_id, payload, attempts, next_retry_at, created_at, updated_at)
-     VALUES ($c, $cid, $p, 0, 0, $n, $n)`,
-    { $c: clientMessageId, $cid: chatId, $p: JSON.stringify(payload), $n: now }
-  );
+  await runExclusive(async () => {
+    const db = await getDB();
+    const now = Date.now();
+    await db.runAsync(
+      `INSERT OR REPLACE INTO outbox
+         (client_message_id, chat_id, payload, attempts, next_retry_at, created_at, updated_at)
+       VALUES ($c, $cid, $p, 0, 0, $n, $n)`,
+      { $c: clientMessageId, $cid: chatId, $p: JSON.stringify(payload), $n: now }
+    );
+  });
 };
 
 const outboxRemove = async (clientMessageId) => {
   if (!clientMessageId) return;
-  const db = await getDB();
-  await db.runAsync(`DELETE FROM outbox WHERE client_message_id = $c`, { $c: clientMessageId });
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`DELETE FROM outbox WHERE client_message_id = $c`, { $c: clientMessageId });
+  });
 };
 
 const outboxRecordFailure = async (clientMessageId, errMessage) => {
   if (!clientMessageId) return;
-  const db = await getDB();
-  // Exponential backoff: 2s, 8s, 32s, 2m, 8m, 30m — capped.
-  const row = await db.getFirstAsync(
-    `SELECT attempts, max_attempts FROM outbox WHERE client_message_id = $c`,
-    { $c: clientMessageId }
-  );
-  const attempts = (row?.attempts || 0) + 1;
-  const max = row?.max_attempts || 6;
-  const delays = [2_000, 8_000, 32_000, 120_000, 480_000, 1_800_000];
-  const delay = delays[Math.min(attempts - 1, delays.length - 1)];
-  await db.runAsync(
-    `UPDATE outbox
-       SET attempts = $a, last_error = $e, next_retry_at = $r, updated_at = $n
-     WHERE client_message_id = $c`,
-    {
-      $a: attempts,
-      $e: String(errMessage || '').slice(0, 500),
-      $r: Date.now() + delay,
-      $n: Date.now(),
-      $c: clientMessageId,
-    }
-  );
-  return { attempts, exhausted: attempts >= max };
+  // Read-modify-write under the mutex so a concurrent retry can't lose an attempt.
+  return runExclusive(async () => {
+    const db = await getDB();
+    // Exponential backoff: 2s, 8s, 32s, 2m, 8m, 30m — capped.
+    const row = await db.getFirstAsync(
+      `SELECT attempts, max_attempts FROM outbox WHERE client_message_id = $c`,
+      { $c: clientMessageId }
+    );
+    const attempts = (row?.attempts || 0) + 1;
+    const max = row?.max_attempts || 6;
+    const delays = [2_000, 8_000, 32_000, 120_000, 480_000, 1_800_000];
+    const delay = delays[Math.min(attempts - 1, delays.length - 1)];
+    await db.runAsync(
+      `UPDATE outbox
+         SET attempts = $a, last_error = $e, next_retry_at = $r, updated_at = $n
+       WHERE client_message_id = $c`,
+      {
+        $a: attempts,
+        $e: String(errMessage || '').slice(0, 500),
+        $r: Date.now() + delay,
+        $n: Date.now(),
+        $c: clientMessageId,
+      }
+    );
+    return { attempts, exhausted: attempts >= max };
+  });
 };
 
 const outboxDrainDue = async (limit = 20) => {
@@ -1940,21 +2194,23 @@ const outboxCount = async () => {
 
 const setPeerReadWatermark = async (chatId, readUpToSeq, deliveredUpToSeq) => {
   if (!chatId) return;
-  const db = await getDB();
-  // Use MAX to never regress the watermark.
-  await db.runAsync(
-    `UPDATE chats
-       SET read_up_to_seq      = MAX(COALESCE(read_up_to_seq, 0),      COALESCE($r, 0)),
-           delivered_up_to_seq = MAX(COALESCE(delivered_up_to_seq, 0), COALESCE($d, 0)),
-           updated_at = $n
-     WHERE chat_id = $cid`,
-    {
-      $r:  typeof readUpToSeq === 'number'      ? readUpToSeq      : 0,
-      $d:  typeof deliveredUpToSeq === 'number' ? deliveredUpToSeq : 0,
-      $n:  Date.now(),
-      $cid: chatId,
-    }
-  );
+  await runExclusive(async () => {
+    const db = await getDB();
+    // Use MAX to never regress the watermark.
+    await db.runAsync(
+      `UPDATE chats
+         SET read_up_to_seq      = MAX(COALESCE(read_up_to_seq, 0),      COALESCE($r, 0)),
+             delivered_up_to_seq = MAX(COALESCE(delivered_up_to_seq, 0), COALESCE($d, 0)),
+             updated_at = $n
+       WHERE chat_id = $cid`,
+      {
+        $r:  typeof readUpToSeq === 'number'      ? readUpToSeq      : 0,
+        $d:  typeof deliveredUpToSeq === 'number' ? deliveredUpToSeq : 0,
+        $n:  Date.now(),
+        $cid: chatId,
+      }
+    );
+  });
 };
 
 const getPeerReadWatermark = async (chatId) => {
@@ -1981,11 +2237,15 @@ const getSyncMeta = async (key) => {
 
 const setSyncMeta = async (key, value) => {
   if (!key) return;
-  const db = await getDB();
-  await db.runAsync(
-    `INSERT INTO sync_meta (key, value, updated_at) VALUES ($k, $v, $n) ON CONFLICT(key) DO UPDATE SET value = $v, updated_at = $n`,
-    { $k: key, $v: String(value), $n: Date.now() }
-  );
+  // Fires during the initial-sync batch storm — serialize so it can't race the
+  // exclusive-transaction sync batches for the writer lock.
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(
+      `INSERT INTO sync_meta (key, value, updated_at) VALUES ($k, $v, $n) ON CONFLICT(key) DO UPDATE SET value = $v, updated_at = $n`,
+      { $k: key, $v: String(value), $n: Date.now() }
+    );
+  });
 };
 
 const isInitialSyncDone = async (userId) => {
@@ -1995,20 +2255,26 @@ const isInitialSyncDone = async (userId) => {
 };
 
 const clearSyncData = async () => {
-  const db = await getDB();
-  await db.runAsync(`DELETE FROM chats`);
-  await db.runAsync(`DELETE FROM messages`);
-  await db.runAsync(`DELETE FROM message_status`);
-  await db.runAsync(`DELETE FROM reactions`);
-  await db.runAsync(`DELETE FROM chat_meta`);
-  await db.runAsync(`DELETE FROM message_replies`);
-  await db.runAsync(`DELETE FROM sync_meta`);
+  // Full wipe — run as one exclusive, atomic transaction on the batch path so it
+  // neither interleaves with a concurrent send/sync batch nor leaves the cache
+  // half-cleared if interrupted.
+  return runExclusiveBatch(() =>
+    _runCacheWrite('clearSyncData', async (db) => {
+      await db.runAsync(`DELETE FROM chats`);
+      await db.runAsync(`DELETE FROM messages`);
+      await db.runAsync(`DELETE FROM message_status`);
+      await db.runAsync(`DELETE FROM reactions`);
+      await db.runAsync(`DELETE FROM chat_meta`);
+      await db.runAsync(`DELETE FROM message_replies`);
+      await db.runAsync(`DELETE FROM sync_meta`);
+    }),
+  );
 };
 
 // ── Broadcast status cache (official application updates) ─────────────────────
 
 /** Replace the cached broadcast set with the latest live list. */
-const saveBroadcasts = async (broadcasts = []) => runExclusive(() =>
+const saveBroadcasts = async (broadcasts = []) => runExclusiveBatch(() =>
   // Snapshot is small (<=50) and fully authoritative — clear then insert as one
   // exclusive, atomic transaction (`h` is the transaction handle).
   _runCacheWrite('saveBroadcasts', async (h) => {
@@ -2049,8 +2315,10 @@ const loadBroadcasts = async () => {
 /** Remove a single broadcast from cache (expired / deleted). */
 const removeBroadcast = async (statusId) => {
   try {
-    const db = await getDB();
-    await db.runAsync('DELETE FROM broadcasts WHERE id = ?;', [String(statusId)]);
+    await runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync('DELETE FROM broadcasts WHERE id = ?;', [String(statusId)]);
+    });
   } catch (e) {
     console.warn('[ChatDB] removeBroadcast failed:', e?.message);
   }
@@ -2062,7 +2330,7 @@ const removeBroadcast = async (statusId) => {
 // authoritative snapshot replaces the cache on every successful fetch.
 
 /** Replace the cached contact status feed with the latest grouped list. */
-const saveStatusFeed = async (groups = []) => runExclusive(() =>
+const saveStatusFeed = async (groups = []) => runExclusiveBatch(() =>
   // Authoritative snapshot — clear + insert as one exclusive, atomic
   // transaction so concurrent receipt / message writes can't interleave and
   // lock it (`h` is the transaction handle).
@@ -2102,19 +2370,21 @@ const loadStatusFeed = async () => {
 
 // ── Blocked contacts cache (V12) ─────────────────────────────────────────────
 const saveBlockedContacts = async (contacts = []) => {
-  try {
-    const db = await getDB();
-    await db.execAsync('DELETE FROM blocked_contacts;');
-    for (const c of contacts) {
-      const blockedAt = c.blockedAt ? new Date(c.blockedAt).getTime() : Date.now();
-      await db.runAsync(
-        'INSERT OR REPLACE INTO blocked_contacts (user_id, full_name, phone, profile_image, blocked_at) VALUES (?, ?, ?, ?, ?);',
-        [String(c.userId), c.fullName || null, c.phone || null, c.profileImage || null, blockedAt],
-      );
-    }
-  } catch (e) {
-    console.warn('[ChatDB] saveBlockedContacts failed:', e?.message);
-  }
+  // Authoritative snapshot — clear + insert as one exclusive, atomic transaction
+  // so concurrent receipt / message writes can't interleave and lock it
+  // (`h` is the transaction handle).
+  return runExclusiveBatch(() =>
+    _runCacheWrite('saveBlockedContacts', async (h) => {
+      await h.runAsync('DELETE FROM blocked_contacts;');
+      for (const c of contacts) {
+        const blockedAt = c.blockedAt ? new Date(c.blockedAt).getTime() : Date.now();
+        await h.runAsync(
+          'INSERT OR REPLACE INTO blocked_contacts (user_id, full_name, phone, profile_image, blocked_at) VALUES (?, ?, ?, ?, ?);',
+          [String(c.userId), c.fullName || null, c.phone || null, c.profileImage || null, blockedAt],
+        );
+      }
+    }),
+  );
 };
 
 const loadBlockedContacts = async () => {
@@ -2134,6 +2404,60 @@ const loadBlockedContacts = async () => {
   }
 };
 
+// ─── PRESENCE CACHE (V13) ──────────────────────────────────────
+// Last-known presence per user. Written on every presence:update so the UI can
+// cold-render online/last-seen instantly and reconcile on reconnect.
+const upsertPresenceCache = async (userId, { status, lastSeen } = {}) => {
+  if (!userId) return;
+  // Serialize through the global write mutex like every other writer — presence
+  // updates arrive at high frequency and were racing batch writes, throwing
+  // "database is locked" under WAL contention.
+  try {
+    await runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync(
+        'INSERT OR REPLACE INTO presence_cache (user_id, status, last_seen, updated_at) VALUES (?, ?, ?, ?);',
+        [String(userId), status || null, lastSeen ? Number(lastSeen) : null, Date.now()],
+      );
+    });
+  } catch (e) {
+    console.warn('[ChatDB] upsertPresenceCache failed:', e?.message);
+  }
+};
+
+const getPresenceCache = async (userId) => {
+  if (!userId) return null;
+  try {
+    const db = await getDB();
+    const r = await db.getFirstAsync('SELECT * FROM presence_cache WHERE user_id = ?;', [String(userId)]);
+    if (!r) return null;
+    return { userId: r.user_id, status: r.status, lastSeen: r.last_seen, updatedAt: r.updated_at };
+  } catch (e) {
+    console.warn('[ChatDB] getPresenceCache failed:', e?.message);
+    return null;
+  }
+};
+
+const getPresenceCacheMany = async (userIds = []) => {
+  const ids = (userIds || []).map(String).filter(Boolean);
+  if (!ids.length) return {};
+  try {
+    const db = await getDB();
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = await db.getAllAsync(
+      `SELECT * FROM presence_cache WHERE user_id IN (${placeholders});`,
+      ids,
+    );
+    return (rows || []).reduce((acc, r) => {
+      acc[r.user_id] = { userId: r.user_id, status: r.status, lastSeen: r.last_seen, updatedAt: r.updated_at };
+      return acc;
+    }, {});
+  } catch (e) {
+    console.warn('[ChatDB] getPresenceCacheMany failed:', e?.message);
+    return {};
+  }
+};
+
 // Legacy aliases
 const saveMessageSync = upsertMessage;
 const saveMessages = upsertMessages;
@@ -2141,7 +2465,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
   markMessageDeleted, deleteMessageForMe, clearChat, deduplicateChat,
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
@@ -2162,4 +2486,6 @@ export default {
   saveStatusFeed, loadStatusFeed,
   // Blocked contacts cache (V12)
   saveBlockedContacts, loadBlockedContacts,
+  // Presence cache (V13)
+  upsertPresenceCache, getPresenceCache, getPresenceCacheMany,
 };

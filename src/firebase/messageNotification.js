@@ -26,6 +26,12 @@ const STORE_PREFIX = '@msgnotif/';
 const MAX_LINES = 6;            // most recent N messages kept per chat
 const STALE_MS = 6 * 60 * 60 * 1000; // drop accumulated lines older than 6h
 
+// Android multi-chat grouping: every per-chat MessagingStyle notification joins
+// this group so the tray coalesces them under ONE summary (WhatsApp-style),
+// instead of N loose notifications. The summary is a separate notification.
+const ANDROID_GROUP_KEY = 'baatcheet.messages';
+const GROUP_SUMMARY_ID = 'msg-summary';
+
 let _notifee = null;
 let _consts = null;
 let _resolved = false;
@@ -55,17 +61,22 @@ const saveMessages = async (chatId, msgs) => {
   try { await AsyncStorage.setItem(STORE_PREFIX + chatId, JSON.stringify(msgs.slice(-MAX_LINES))); } catch (_) { /* */ }
 };
 
-// `data` = the message FCM data: { chatId, senderId, senderName, body, chatType,
-// groupId, groupName, timestamp, messageId }.
+// `data` = the canonical model from notificationModel.buildNotificationModel:
+// { chatId, senderId, senderName, lineBody, body, isGroup, groupId, groupName,
+//   timestamp, messageId }. Older raw-FCM keys are still tolerated as fallbacks.
 export const displayGroupedMessage = async (data) => {
   const notifee = getNotifee();
   if (!notifee) return false;
   const chatId = data?.chatId;
   if (!chatId) return false;
 
-  const isGroup = data?.chatType === 'group' || !!data?.groupId;
+  const isGroup = typeof data?.isGroup === 'boolean'
+    ? data.isGroup
+    : (data?.chatType === 'group' || !!data?.groupId);
   const senderName = data?.senderName || data?.senderFullName || data?.name || data?.title || 'New message';
-  const text = data?.body || data?.message || data?.text || data?.content || '';
+  // Prefer the un-prefixed per-line preview (`lineBody`); MessagingStyle attaches
+  // the sender to each line itself, so the "Sender: " prefix must not be doubled.
+  const text = data?.lineBody || data?.body || data?.message || data?.text || data?.content || '';
   if (!text) return false;
   const timestamp = Number(data?.timestamp || data?.sentAt || Date.now()) || Date.now();
   const senderId = String(data?.senderId || senderName);
@@ -101,6 +112,8 @@ export const displayGroupedMessage = async (data) => {
         importance: AndroidImportance.HIGH,
         visibility: AndroidVisibility.PRIVATE,
         pressAction: { id: 'default', launchActivity: 'default' },
+        // Join the shared group so multiple chats collapse under one summary.
+        groupId: ANDROID_GROUP_KEY,
         style: {
           type: AndroidStyle.MESSAGING,
           person: { name: 'You' }, // the receiver (this device)
@@ -115,11 +128,36 @@ export const displayGroupedMessage = async (data) => {
         },
       },
     });
+    await ensureGroupSummary(notifee, AndroidImportance, AndroidVisibility);
     return true;
   } catch (err) {
     console.warn('[msgNotif] MessagingStyle display failed:', err?.message);
     return false;
   }
+};
+
+// Post (or refresh) the group summary that anchors the per-chat notifications.
+// Android only renders the summary once 2+ notifications share the group, so a
+// single chat still shows its own MessagingStyle notification — exactly like
+// WhatsApp, which only shows the "N chats" summary when several chats are unread.
+const ensureGroupSummary = async (notifee, AndroidImportance, AndroidVisibility) => {
+  try {
+    await notifee.displayNotification({
+      id: GROUP_SUMMARY_ID,
+      title: 'New messages',
+      body: 'You have new messages',
+      android: {
+        channelId: CHANNEL_ID,
+        smallIcon: 'notification_icon',
+        color: '#00A884',
+        importance: AndroidImportance.HIGH,
+        visibility: AndroidVisibility.PRIVATE,
+        groupId: ANDROID_GROUP_KEY,
+        groupSummary: true,
+        pressAction: { id: 'default', launchActivity: 'default' },
+      },
+    });
+  } catch (_) { /* summary is best-effort; per-chat notifications still show */ }
 };
 
 // Call when the user opens/reads a chat → clear its notification + accumulated
@@ -129,4 +167,15 @@ export const clearMessageNotification = async (chatId) => {
   const notifee = getNotifee();
   try { if (notifee) await notifee.cancelNotification(`msg-${chatId}`); } catch (_) { /* */ }
   try { await AsyncStorage.removeItem(STORE_PREFIX + chatId); } catch (_) { /* */ }
+  // If no per-chat message notifications remain, drop the group summary so an
+  // empty "New messages" header doesn't linger in the tray.
+  try {
+    if (notifee) {
+      const displayed = await notifee.getDisplayedNotifications();
+      const stillHasChat = (displayed || []).some(
+        (n) => typeof n?.id === 'string' && n.id.startsWith('msg-') && n.id !== GROUP_SUMMARY_ID,
+      );
+      if (!stillHasChat) await notifee.cancelNotification(GROUP_SUMMARY_ID);
+    }
+  } catch (_) { /* best-effort */ }
 };

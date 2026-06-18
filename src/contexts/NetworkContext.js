@@ -1,6 +1,5 @@
-import React, { createContext, useState, useEffect, useContext, useRef } from 'react';
+import React, { createContext, useState, useEffect, useContext } from 'react';
 import NetInfo from '@react-native-community/netinfo';
-import { Alert } from 'react-native';
 
 export const NetworkContext = createContext();
 
@@ -8,7 +7,6 @@ export const NetworkProvider = ({ children }) => {
   const [isConnected, setIsConnected] = useState(true);
   const [isInternetReachable, setIsInternetReachable] = useState(true);
   const [networkType, setNetworkType] = useState('unknown');
-  const previousConnectedRef = useRef(true);
 
   useEffect(() => {
     const unsubscribe = NetInfo.addEventListener(state => {
@@ -19,15 +17,11 @@ export const NetworkProvider = ({ children }) => {
       setIsInternetReachable(internetReachable);
       setNetworkType(state.type || 'unknown');
 
-      if (!currentlyConnected && previousConnectedRef.current) {
-        Alert.alert('No Internet', 'You have lost connection.');
-      }
-
-      if (currentlyConnected && !previousConnectedRef.current) {
-        Alert.alert('Connected', 'Internet connection restored.');
-      }
-
-      previousConnectedRef.current = currentlyConnected;
+      // Connectivity transitions are handled silently — no blocking "No
+      // Internet" / "Connected" dialogs. Losing/regaining the network (screen
+      // off, Wi-Fi/data toggle) is routine; the socket layer reconnects on its
+      // own and any UI can subscribe to `isConnected` for a subtle inline
+      // banner instead of interrupting the user with an alert.
     });
 
     return () => unsubscribe();

@@ -3,9 +3,16 @@ import { Platform, PermissionsAndroid, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { isGroupInactive } from '../utils/inactiveGroups';
 import { setPushToken } from '../Redux/Services/Socket/socket';
+import { navigateToChat } from '../Redux/Services/navigationService';
 import { CALL_PUSH_EVENTS } from './callEvents';
 import { displayIncomingCallNotifee, isNotifeeCallAvailable } from './callNotifee';
-import { displayGroupedMessage, isMessageGroupingAvailable } from './messageNotification';
+import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
+import { buildNotificationModel } from './notificationModel';
+import { claimNotification } from './notificationDedupe';
+// Guarantees the Firebase [DEFAULT] app exists before any messaging() call.
+// Without this, a build whose native auto-init didn't run throws
+// "No Firebase App '[DEFAULT]' has been created" on the first messaging() use.
+import { ensureFirebaseApp } from './config';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -27,6 +34,9 @@ const getMessaging = () => {
   if (_messagingResolved) return _messaging;
   _messagingResolved = true;
   try {
+    // Make sure the [DEFAULT] app is initialized BEFORE messaging() is resolved
+    // — messaging() reaches into the default app and throws if it doesn't exist.
+    ensureFirebaseApp();
     // eslint-disable-next-line global-require
     const mod = require('@react-native-firebase/messaging');
     const factory = mod && (mod.default || mod);
@@ -87,7 +97,7 @@ const setupNotificationChannel = async () => {
       showBadge: true,
     });
 
-    console.log(`Notification channel "${CHANNEL_ID}" created with sound: ${CUSTOM_SOUND_ANDROID}`);
+    // console.log(`Notification channel "${CHANNEL_ID}" created with sound: ${CUSTOM_SOUND_ANDROID}`);
 
     // Dedicated high-importance channel for incoming calls. Must match the
     // backend call push `android.notification.channelId` ('calls'). MAX
@@ -189,13 +199,13 @@ const presentIncomingCallNotification = async (data) => {
 // Request permission for notifications
 export const requestNotificationPermission = async () => {
   try {
-    console.log('[FCM] requestNotificationPermission start, platform:', Platform.OS, 'version:', Platform.Version);
+    // console.log('[FCM] requestNotificationPermission start, platform:', Platform.OS, 'version:', Platform.Version);
 
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       const granted = await PermissionsAndroid.request(
         PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
       );
-      console.log('[FCM] POST_NOTIFICATIONS result:', granted);
+      // console.log('[FCM] POST_NOTIFICATIONS result:', granted);
       if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
         console.warn('[FCM] POST_NOTIFICATIONS permission denied');
         return false;
@@ -208,7 +218,7 @@ export const requestNotificationPermission = async () => {
       return false;
     }
     const authStatus = await m().requestPermission();
-    console.log('[FCM] messaging.requestPermission authStatus:', authStatus);
+    // console.log('[FCM] messaging.requestPermission authStatus:', authStatus);
     const enabled =
       authStatus === m.AuthorizationStatus.AUTHORIZED ||
       authStatus === m.AuthorizationStatus.PROVISIONAL;
@@ -226,31 +236,31 @@ export const requestNotificationPermission = async () => {
 
 // Get FCM token
 export const getFCMToken = async () => {
-  console.log('[FCM] getFCMToken called');
+  // console.log('[FCM] getFCMToken called');
   const m = getMessaging();
   if (!m) {
     console.warn('[FCM] getFCMToken skipped — native module unavailable');
     return null;
   }
   const hasPermission = await requestNotificationPermission();
-  console.log('[FCM] hasPermission:', hasPermission);
+  // console.log('[FCM] hasPermission:', hasPermission);
   if (!hasPermission) return null;
 
   try {
     if (Platform.OS === 'ios') {
       const isRegistered = m().isDeviceRegisteredForRemoteMessages;
-      console.log('[FCM] iOS isDeviceRegisteredForRemoteMessages:', isRegistered);
+      // console.log('[FCM] iOS isDeviceRegisteredForRemoteMessages:', isRegistered);
       if (!isRegistered) {
         await m().registerDeviceForRemoteMessages();
-        console.log('[FCM] iOS registerDeviceForRemoteMessages done');
+        // console.log('[FCM] iOS registerDeviceForRemoteMessages done');
       }
       const apns = await m().getAPNSToken();
-      console.log('[FCM] APNs token:', apns);
+      // console.log('[FCM] APNs token:', apns);
     }
 
-    console.log('[FCM] calling messaging().getToken()...');
+    // console.log('[FCM] calling messaging().getToken()...');
     const token = await m().getToken();
-    console.log('[FCM] Token:', token);
+    // console.log('[FCM] Token:', token);
 
     // A rotated token (new install, app data clear, FCM refresh) must be pushed
     // to the backend or call/message notifications go to a dead token and never
@@ -258,7 +268,7 @@ export const getFCMToken = async () => {
     // ALSO rotates the token — the most common reason background calls stop
     // notifying after `expo run:android` until the device re-registers/relogs.)
     m().onTokenRefresh((newToken) => {
-      console.log('[FCM] Token refreshed → re-registering:', newToken);
+      // console.log('[FCM] Token refreshed → re-registering:', newToken);
       try { setPushToken(newToken); } catch (_) {}
       AsyncStorage.setItem('fcmToken', newToken).catch(() => {});
     });
@@ -271,22 +281,10 @@ export const getFCMToken = async () => {
 };
 
 // ─── DE-DUPLICATION ───
-// The same chat message can reach us twice: e.g. a notification+data message
-// the OS renders itself plus a data twin, or a listener firing more than once.
-// Track recently-shown message keys and drop repeats within a short window.
-const recentlyShownNotifications = new Map();
-const NOTIF_DEDUPE_WINDOW_MS = 10000;
-
-const isDuplicateNotification = (key) => {
-  if (!key) return false;
-  const now = Date.now();
-  for (const [k, ts] of recentlyShownNotifications) {
-    if (now - ts > NOTIF_DEDUPE_WINDOW_MS) recentlyShownNotifications.delete(k);
-  }
-  if (recentlyShownNotifications.has(key)) return true;
-  recentlyShownNotifications.set(key, now);
-  return false;
-};
+// Dedupe is now CROSS-PATH (shared with the in-app banner) and keyed on
+// messageId — see firebase/notificationDedupe.js. The old per-file 10s map only
+// deduped this OS path against itself, so a message that arrived as BOTH a socket
+// banner and a push double-notified. `claimNotification` is the shared guard.
 
 // ─── SHOW LOCAL NOTIFICATION ───
 // Used for foreground messages and data-only background messages
@@ -309,51 +307,78 @@ const showLocalNotification = async (remoteMessage) => {
   const notifGroupId = data?.groupId || (data?.chatType === 'group' ? data?.chatId : null);
   if (notifGroupId && (await isGroupInactive(notifGroupId))) return;
 
-  // Resolve real content: notification payload first, then the common data keys
-  // the backend may use. Without this, a content-bearing data message renders as
-  // a generic "New Message".
-  const title =
-    notification?.title || data?.title || data?.senderName ||
-    data?.senderFullName || data?.fullName || data?.name || data?.chatName || '';
-  const body =
-    notification?.body || data?.body || data?.message || data?.text ||
-    data?.messageText || data?.content || '';
+  // Resolve content through the SHARED notification builder so the OS push and
+  // the in-app banner derive title/body/preview from one source (identical text).
+  const model = buildNotificationModel(remoteMessage);
 
-  // Contentless payloads (routing-only data) must NOT produce a notification —
-  // that is the spurious generic "New Message" duplicate. The real message is
-  // shown either by the OS (notification payload) or by a content-bearing one.
-  if (!title && !body) return;
+  // Contentless / routing-only payloads (no chat to attribute, or no preview)
+  // must NOT produce a notification — that is the spurious generic "New Message"
+  // duplicate. The real message is shown either by the OS (notification payload)
+  // or by a content-bearing one.
+  if (!model || (!model.title && !model.body)) return;
 
-  // Drop duplicates of the same message.
+  // Drop duplicates of the same message — SHARED with the in-app banner, so a
+  // message delivered over both the socket and a push notifies the user once.
+  // Prefer the stable messageId; fall back to a content key only when absent.
   const dedupeKey = String(
-    data?.messageId || data?._id || data?.serverMessageId ||
-    notification?.tag || (data?.chatId ? `${data.chatId}:${body}` : '')
+    model.messageId || data?.serverMessageId ||
+    notification?.tag || (model.chatId ? `${model.chatId}:${model.body}` : '')
   );
-  if (isDuplicateNotification(dedupeKey)) return;
+  if (!claimNotification(dedupeKey)) return;
 
   // Android: render a WhatsApp-style MessagingStyle notification that ACCUMULATES
   // the recent messages per chat into one conversation thread (instead of each
   // message replacing the last). Needs a chatId. Falls through to the plain expo
   // notification if grouping isn't available or has no chatId.
-  if (isMessageGroupingAvailable() && data?.chatId) {
-    console.log('[FCM][msg] grouping message via MessagingStyle', { chatId: data.chatId });
-    const shown = await displayGroupedMessage({ ...data, senderName: title, body });
+  if (isMessageGroupingAvailable() && model.chatId) {
+    // console.log('[FCM][msg] grouping message via MessagingStyle', { chatId: model.chatId });
+    const shown = await displayGroupedMessage(model);
     if (shown) return;
   }
 
   try {
     await Notifications.scheduleNotificationAsync({
       content: {
-        title: title || 'New Message',
-        body,
+        title: model.title || 'New Message',
+        body: model.body,
         data: data || {},
         sound: Platform.OS === 'ios' ? CUSTOM_SOUND_IOS : true,
+        // iOS: group this chat's notifications in the tray (WhatsApp-style). The
+        // backend sets the same `thread-id` on the APNs alert for background/
+        // killed pushes; this covers the foreground/expo-rendered path.
+        ...(Platform.OS === 'ios' && model.threadId
+          ? { threadIdentifier: String(model.threadId) }
+          : {}),
         ...(Platform.OS === 'android' && { channelId: CHANNEL_ID }),
       },
       trigger: null, // show immediately
     });
   } catch (err) {
     console.error('Error showing local notification:', err);
+  }
+};
+
+// ─── CLEAR A CHAT'S NOTIFICATIONS ON READ ───
+// Called when the user opens/reads a chat so its notifications disappear from the
+// shade (WhatsApp-style). Android: cancel the per-chat MessagingStyle notification
+// + its accumulated thread (and the group summary if it was the last one). iOS:
+// dismiss any presented notifications belonging to this chat (matched by data
+// chatId or the per-chat threadIdentifier).
+export const clearChatNotifications = async (chatId) => {
+  if (!chatId) return;
+  try { await clearMessageNotification(chatId); } catch (_) { /* */ }
+  if (Platform.OS === 'ios') {
+    try {
+      const presented = await Notifications.getPresentedNotificationsAsync();
+      for (const n of presented || []) {
+        const content = n?.request?.content || {};
+        const d = content?.data || {};
+        const tid = content?.threadIdentifier;
+        if (String(d.chatId || '') === String(chatId) || String(tid || '') === String(chatId)) {
+          await Notifications.dismissNotificationAsync(n.request.identifier).catch(() => {});
+        }
+      }
+    } catch (_) { /* */ }
   }
 };
 
@@ -366,7 +391,7 @@ export const registerBackgroundHandler = () => {
   if (!m) return;
   try {
     m().setBackgroundMessageHandler(async (remoteMessage) => {
-      console.log('Background message received:', JSON.stringify(remoteMessage));
+      // console.log('Background message received:', JSON.stringify(remoteMessage));
 
       // Incoming call (data-only, high priority). On Android show a notifee
       // FULL-SCREEN-INTENT notification → launches the app's full-screen call UI
@@ -375,7 +400,7 @@ export const registerBackgroundHandler = () => {
       // notifee path errors for any reason, fall back to the proven expo heads-up
       // so the user ALWAYS gets a ringing notification.
       if (remoteMessage?.data?.type === 'call') {
-        console.log('[FCM][bg] incoming-call push received', JSON.stringify(remoteMessage.data));
+        // console.log('[FCM][bg] incoming-call push received', JSON.stringify(remoteMessage.data));
         try {
           if (isNotifeeCallAvailable()) {
             await displayIncomingCallNotifee(remoteMessage.data);
@@ -408,12 +433,13 @@ export const initializeNotifications = () => {
   let unsubscribeOnMessage = () => {};
   let unsubscribeOnOpen = () => {};
   let responseListener = { remove: () => {} };
+  let notifeeForegroundUnsub = () => {};
   const m = getMessaging();
   try {
   if (!m) throw new Error('native module unavailable');
   // Foreground messages — system won't show these automatically, so we do it
   unsubscribeOnMessage = m().onMessage(async (remoteMessage) => {
-    console.log('Foreground message received:', JSON.stringify(remoteMessage));
+    // console.log('Foreground message received:', JSON.stringify(remoteMessage));
     // A call push in the foreground → drive the live ringing overlay directly
     // (the always-connected app socket usually beats it; this is the wake-up
     // fallback). Never render a banner for it.
@@ -426,9 +452,13 @@ export const initializeNotifications = () => {
 
   // App opened from a background notification tap (FCM-displayed, e.g. iOS alert)
   unsubscribeOnOpen = m().onNotificationOpenedApp((remoteMessage) => {
-    console.log('Notification opened app from background:', remoteMessage?.data);
-    if (remoteMessage?.data?.type === 'call') {
-      DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, remoteMessage.data);
+    // console.log('Notification opened app from background:', remoteMessage?.data);
+    const data = remoteMessage?.data || {};
+    if (data.type === 'call') {
+      DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, data);
+    } else if (data.chatId || data.groupId) {
+      // Message notification tapped → open that chat's thread.
+      navigateToChat(data);
     }
   });
 
@@ -437,10 +467,15 @@ export const initializeNotifications = () => {
     .getInitialNotification()
     .then((remoteMessage) => {
       if (remoteMessage) {
-        console.log('App opened from quit state by notification:', remoteMessage?.data);
-        if (remoteMessage?.data?.type === 'call') {
+        // console.log('App opened from quit state by notification:', remoteMessage?.data);
+        const data = remoteMessage?.data || {};
+        if (data.type === 'call') {
           // Give the providers a beat to mount before showing the ring.
-          setTimeout(() => DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, remoteMessage.data), 400);
+          setTimeout(() => DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, data), 400);
+        } else if (data.chatId || data.groupId) {
+          // Cold launch from a message-notification tap → open the chat once the
+          // nav container is ready (navigateToChat retries until then).
+          navigateToChat(data);
         }
       }
     });
@@ -464,10 +499,40 @@ export const initializeNotifications = () => {
         return;
       }
       if (action === 'reply') {
-        console.log('Reply tapped!', data);
+        // console.log('Reply tapped!', data);
+        return;
+      }
+      // Any other tap (the default body tap) on a message notification → open
+      // the chat thread.
+      if (data?.chatId || data?.groupId) {
+        navigateToChat(data);
       }
     }
   );
+
+  // Android notifee MessagingStyle taps: FOREGROUND + COLD-START. (Background
+  // taps go through callNotifee's single onBackgroundEvent.) These are needed
+  // because notifee-displayed notifications report via notifee's own event +
+  // getInitialNotification, NOT the expo/FCM listeners above.
+  try {
+    const notifeeMod = require('@notifee/react-native');
+    const notifee = notifeeMod.default || notifeeMod;
+    const EventType = notifeeMod.EventType;
+    if (notifee && EventType) {
+      notifeeForegroundUnsub = notifee.onForegroundEvent(({ type, detail }) => {
+        const d = detail?.notification?.data || {};
+        if (type === EventType.PRESS && d.type !== 'call' && (d.chatId || d.groupId)) {
+          navigateToChat(d);
+        }
+      });
+      // Cold launch from a notifee message notification (data-only push → FCM's
+      // getInitialNotification won't carry it; notifee's does).
+      notifee.getInitialNotification().then((initial) => {
+        const d = initial?.notification?.data || {};
+        if (d && d.type !== 'call' && (d.chatId || d.groupId)) navigateToChat(d);
+      }).catch(() => {});
+    }
+  } catch (_) { /* notifee not in build */ }
   } catch (err) {
     console.warn('[FCM] initializeNotifications skipped:', err?.message);
   }
@@ -476,5 +541,6 @@ export const initializeNotifications = () => {
     try { unsubscribeOnMessage(); } catch (_) {}
     try { unsubscribeOnOpen(); } catch (_) {}
     try { responseListener.remove(); } catch (_) {}
+    try { notifeeForegroundUnsub(); } catch (_) {}
   };
 };

@@ -1,6 +1,8 @@
 import React, { createContext, useState, useContext, useEffect, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
+import * as Device from 'expo-device';
+import * as Application from 'expo-application';
 import { initSocket, disconnectSocket, setupAppStateListener } from '../Redux/Services/Socket/socket';
 
 const AuthContext = createContext({});
@@ -16,12 +18,14 @@ export const AuthProvider = ({ children }) => {
 
   const getDeviceInfo = async () => {
     try {
-      const [osName, appVersion, brand] = await Promise.all([
-        DeviceInfo.getSystemName(),
-        DeviceInfo.getVersion(),
-        DeviceInfo.getBrand(),
-      ]);
-      return { osName, appVersion, brand };
+      // This app uses expo-device / expo-application (NOT react-native-device-info,
+      // which was never installed — the old `DeviceInfo.*` calls threw
+      // "Property 'DeviceInfo' doesn't exist" on every launch + foreground).
+      return {
+        osName: Device.osName || (Platform.OS === 'ios' ? 'iOS' : 'Android'),
+        appVersion: Application.nativeApplicationVersion || '1.0.0',
+        brand: Device.brand || Device.manufacturer || 'unknown',
+      };
     } catch (error) {
       console.log('Error getting device info:', error);
       return { osName: 'unknown', appVersion: '1.0.0', brand: 'unknown' };

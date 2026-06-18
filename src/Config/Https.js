@@ -32,6 +32,11 @@ function showToast(message) {
   }
 }
 
+// One-time visibility into how the app was configured at build time.
+// react-native-dotenv INLINES @env at bundle time, so if this logs `undefined`
+// the .env wasn't picked up — restart Metro with `npx expo start -c`.
+console.log('[API:CONFIG] BACKEND_URL =', BACKEND_URL || '(undefined — .env not loaded; restart Metro with -c)');
+
 const api = axios.create({
   baseURL: BACKEND_URL,
   timeout: 15000,
@@ -218,10 +223,12 @@ export const apiCall = async (method, endpoint, data = {}, config = {}) => {
     const url = buildUrl(endpoint);
     if (!url) {
       const msg = 'BACKEND_URL is not configured. Set BACKEND_URL in your .env';
-      console.error(msg);
+      console.error('[API:REQ:ABORT]', msg, '| endpoint =', endpoint, '| BACKEND_URL =', BACKEND_URL);
       if (!silent) showToast(msg);
       return Promise.reject(new Error(msg));
     }
+
+    console.log('[API:REQ]', String(method).toUpperCase(), url);
 
     // Bodyless methods (GET/HEAD) must NOT carry a request body. Sending one
     // (axios serializes `data` even on GET) makes iOS NSURLSession reject the
@@ -237,6 +244,7 @@ export const apiCall = async (method, endpoint, data = {}, config = {}) => {
       ...restConfig,
       _retryOnNetwork: retryOnNetwork,
     });
+    console.log('[API:RES]', String(method).toUpperCase(), url, '→', response?.status, response?.data?.statusCode ?? '');
     return response.data;
   } catch (error) {
     if (silent) {

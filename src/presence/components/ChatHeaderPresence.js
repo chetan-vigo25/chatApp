@@ -18,6 +18,8 @@ export default function ChatHeaderPresence({
   rightActions,
   getUserColor,
   isGroup,
+  isBroadcast,
+  isVerified,
   groupName,
   groupAvatar,
   memberCount,
@@ -94,7 +96,9 @@ export default function ChatHeaderPresence({
     ? 'typing...'
     : (memberCount ? `${memberCount} members` : 'tap here for group info');
 
-  const statusText = isGroup ? groupStatusText : peerStatusText;
+  const statusText = isBroadcast
+    ? 'tap here for channel info'
+    : isGroup ? groupStatusText : peerStatusText;
   const peerDisplayName =
     localContact?.fullName ||
     user?.fullName ||
@@ -140,7 +144,7 @@ export default function ChatHeaderPresence({
             <Image source={{ uri: groupAvatar }} style={styles.avatarImg} />
           ) : (
             <View style={[styles.avatarFallback, { backgroundColor: getUserColor?.(groupName || 'Group') || '#6C5CE7' }]}>
-              <Ionicons name="people" size={20} color="#fff" />
+              <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={20} color="#fff" />
             </View>
           )
         ) : peerAvatar ? (
@@ -158,12 +162,17 @@ export default function ChatHeaderPresence({
       </TouchableOpacity>
 
       <TouchableOpacity onPress={onPressProfile} activeOpacity={0.7} style={styles.textWrap}>
-        <Text
-          numberOfLines={1}
-          style={[styles.nameText, { color: primaryText }]}
-        >
-          {displayName}
-        </Text>
+        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Text
+            numberOfLines={1}
+            style={[styles.nameText, { color: primaryText, flexShrink: 1 }]}
+          >
+            {displayName}
+          </Text>
+          {isBroadcast && isVerified && (
+            <Ionicons name="checkmark-circle" size={15} color={themeColor} style={{ marginLeft: 4 }} />
+          )}
+        </View>
         <View style={styles.statusRow}>
           {isTyping && <View style={[styles.typingDot, { backgroundColor: themeColor }]} />}
           <Text

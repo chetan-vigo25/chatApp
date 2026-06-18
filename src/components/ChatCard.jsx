@@ -35,11 +35,16 @@ const ChatCard = ({
   const hasUnread = Number(item?.unreadCount || 0) > 0;
   const isTyping = item?.realtime?.typing?.isTyping;
   const isLastMsgDeleted = item?.lastMessageDisplay?.isDeleted || item?.lastMessage?.isDeleted;
+  const isBroadcast = Boolean(item?.chatType === 'broadcast' || item?.isBroadcast);
   const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
-  const peerName = isGroup
-    ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
-    : (item?.peerUser?.fullName || 'Unknown');
-  const groupAvatarUri = isGroup
+  const isVerified = Boolean(item?.isVerified);
+  const peerName = isBroadcast
+    ? (item?.chatName || item?.broadcastChannel?.name || 'Channel')
+    : isGroup
+      ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
+      : (item?.peerUser?.fullName || 'Unknown');
+  // Broadcast channels render their logo just like a group avatar.
+  const groupAvatarUri = isGroup || isBroadcast
     ? (item?.chatAvatar || item?.group?.avatar || item?.groupAvatar)
     : null;
   // WhatsApp-style status ring: only for 1-1 chats whose peer has live statuses.
@@ -76,12 +81,12 @@ const ChatCard = ({
             )}
 
             <View style={styles.avatarInner}>
-              {isGroup ? (
+              {(isGroup || isBroadcast) ? (
                 groupAvatarUri ? (
                   <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={styles.avatarImage} />
                 ) : (
                   <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName) }]}>
-                    <Ionicons name="people" size={22} color="#fff" />
+                    <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={22} color="#fff" />
                   </View>
                 )
               ) : item?.peerUser?.profileImage ? (
@@ -102,8 +107,8 @@ const ChatCard = ({
                   </Text>
                 </View>
               )}
-              {/* Online indicator (not for groups) */}
-              {!isGroup && item?.peerUser?.isOnline && (
+              {/* Online indicator (not for groups / channels) */}
+              {!isGroup && !isBroadcast && item?.peerUser?.isOnline && (
                 <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
               )}
             </View>
@@ -113,12 +118,22 @@ const ChatCard = ({
           <View style={styles.contentWrap}>
             {/* Row 1: Name + Time */}
             <View style={styles.topRow}>
-              <Text
-                numberOfLines={1}
-                style={[styles.nameText, { color: theme.colors.primaryTextColor }]}
-              >
-                {peerName}
-              </Text>
+              <View style={styles.nameWrap}>
+                <Text
+                  numberOfLines={1}
+                  style={[styles.nameText, { color: theme.colors.primaryTextColor }]}
+                >
+                  {peerName}
+                </Text>
+                {isVerified && (
+                  <Ionicons
+                    name="checkmark-circle"
+                    size={15}
+                    color={theme.colors.themeColor}
+                    style={styles.verifiedBadge}
+                  />
+                )}
+              </View>
               <Text style={[
                 styles.timeText,
                 { color: hasUnread ? theme.colors.themeColor : theme.colors.placeHolderTextColor }
@@ -250,13 +265,21 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 3,
   },
+  nameWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginRight: 10,
+  },
   nameText: {
     fontSize: 16.5,
     fontFamily: 'Roboto-Medium',
     textTransform: 'capitalize',
-    flex: 1,
-    marginRight: 10,
+    flexShrink: 1,
     letterSpacing: 0,
+  },
+  verifiedBadge: {
+    marginLeft: 4,
   },
   timeText: {
     fontSize: 12,

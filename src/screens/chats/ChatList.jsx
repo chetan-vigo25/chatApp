@@ -37,6 +37,13 @@ import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
+// Debug switch for tracing WHERE the chat list comes from (SQLite cache vs the
+// REST API). The list renders from SQLite (via the realtime context); the API
+// is only hit when SQLite is empty (first login), on pull-to-refresh, or to
+// hydrate a brand-new chat missing its name/avatar. Flip to false to silence.
+const DEBUG_CHAT_SOURCE = true;
+const cllog = (...args) => { if (DEBUG_CHAT_SOURCE) console.log('[CHAT-SOURCE]', ...args); };
+
 const MUTE_OPTIONS = [
   { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
   { key: '1w', label: '1 week', icon: 'calendar-week', duration: 7 * 24 * 60 * 60 * 1000 },
@@ -315,7 +322,8 @@ export default function ChatList({ navigation }) {
     const query = searchQuery.toLowerCase().trim();
     return chats.filter((item) => {
       const isGroupItem = item?.chatType === 'group' || item?.isGroup;
-      const chatDisplayName = isGroupItem
+      const isBroadcastItem = item?.chatType === 'broadcast' || item?.isBroadcast;
+      const chatDisplayName = (isGroupItem || isBroadcastItem)
         ? (item?.chatName || item?.group?.name || '').toLowerCase()
         : (item?.peerUser?.fullName || '').toLowerCase();
       const lastMessage = getLastMessageText(item).toLowerCase();
@@ -379,7 +387,13 @@ export default function ChatList({ navigation }) {
       initialSyncDone.current = true;
       // Only fetch from API if realtime chatlist is empty (no SQLite data loaded yet)
       if (!realtimeChatList || realtimeChatList.length === 0) {
+        cllog('🌐 CHAT LIST: SQLite empty → fetching from REST API (chatListData)');
         dispatch(chatListData(''));
+      } else {
+        cllog('📂 CHAT LIST rendered from SQLite cache (no API call)', {
+          rows: realtimeChatList.length,
+          source: 'SQLite via RealtimeChatContext — NOT a REST API call',
+        });
       }
     }, [dispatch, realtimeChatList])
   );
@@ -403,11 +417,15 @@ export default function ChatList({ navigation }) {
       knownChatIdsRef.current.add(id);
 
       // A private row with no resolved peer name still renders "Unknown".
+      // Groups and broadcast channels are named server-side (chatName) and must
+      // NOT trigger peer hydration (they have no peerUser to resolve).
       const isGroupItem = c?.chatType === 'group' || c?.isGroup;
-      const hasName = isGroupItem
+      const isBroadcastItem = c?.chatType === 'broadcast' || c?.isBroadcast;
+      const isNamedNonPrivate = isGroupItem || isBroadcastItem;
+      const hasName = isNamedNonPrivate
         ? Boolean(c?.chatName || c?.group?.name || c?.groupName)
         : Boolean(c?.peerUser?.fullName);
-      if (isNew && !isGroupItem && !hasName) needsHydration = true;
+      if (isNew && !isNamedNonPrivate && !hasName) needsHydration = true;
     });
 
     if (!needsHydration) return;
@@ -415,6 +433,7 @@ export default function ChatList({ navigation }) {
     // Debounce: bursts of incoming events should trigger a single refetch
     if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
     newChatRefetchTimerRef.current = setTimeout(() => {
+      cllog('🌐 CHAT LIST: new chat missing identity → REST API refetch to hydrate name/avatar');
       dispatch(chatListData(''));
       newChatRefetchTimerRef.current = null;
     }, 400);
@@ -428,6 +447,7 @@ export default function ChatList({ navigation }) {
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
+      cllog('🌐 CHAT LIST: pull-to-refresh → REST API call (chatListData)');
       await dispatch(chatListData(''));
     } catch (err) {
       console.warn('Failed to refresh chats:', err);
@@ -604,8 +624,14 @@ export default function ChatList({ navigation }) {
 
   const openPreviewInfo = useCallback(() => {
     const isGroup = selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup;
+    const isBroadcast = selectedChatItem?.chatType === 'broadcast' || selectedChatItem?.isBroadcast;
     if (selectedChatItem) {
-      if (isGroup) {
+      if (isBroadcast) {
+        navigation.navigate('ChannelInfo', {
+          channelId: selectedChatItem?.broadcastChannelId || selectedChatItem?.chatId || selectedChatItem?._id,
+          item: selectedChatItem,
+        });
+      } else if (isGroup) {
         navigation.navigate('GroupInfo', {
           groupId: selectedChatItem?.groupId || selectedChatItem?.group?._id || selectedChatItem?.chatId,
           item: selectedChatItem,
@@ -945,10 +971,13 @@ export default function ChatList({ navigation }) {
   // ─── PREVIEW DATA ───
 
   const isPreviewGroup = Boolean(selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup);
-  const previewName = isPreviewGroup
-    ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
-    : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
-  const previewImage = isPreviewGroup
+  const isPreviewBroadcast = Boolean(selectedChatItem?.chatType === 'broadcast' || selectedChatItem?.isBroadcast);
+  const previewName = isPreviewBroadcast
+    ? (selectedChatItem?.chatName || 'Channel')
+    : isPreviewGroup
+      ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
+      : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
+  const previewImage = (isPreviewGroup || isPreviewBroadcast)
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;
   const previewAvatarColor = getAvatarColor(previewName);
@@ -1533,10 +1562,13 @@ export default function ChatList({ navigation }) {
         name={previewName}
         image={previewImage}
         avatarColor={previewAvatarColor}
-        isGroup={isPreviewGroup}
+        isGroup={isPreviewGroup || isPreviewBroadcast}
+        isBroadcast={isPreviewBroadcast}
+        isVerified={Boolean(selectedChatItem?.isVerified)}
+        subtitle={isPreviewBroadcast ? 'Broadcast channel' : undefined}
         onMessage={() => { if (selectedChatItem) openChat(selectedChatItem); closeProfilePreview(); }}
-        onCall={isPreviewGroup ? undefined : () => startPreviewCall('audio')}
-        onVideo={isPreviewGroup ? undefined : () => startPreviewCall('video')}
+        onCall={(isPreviewGroup || isPreviewBroadcast) ? undefined : () => startPreviewCall('audio')}
+        onVideo={(isPreviewGroup || isPreviewBroadcast) ? undefined : () => startPreviewCall('video')}
         onInfo={openPreviewInfo}
         onViewPhoto={previewImage ? () => {
           closeProfilePreview();

@@ -7,6 +7,7 @@ import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
+import { shouldEmitReadAll } from '../utils/readAllThrottle';
 // Firebase/notifee message notifications disabled in Expo Go / dev builds.
 // import { clearMessageNotification } from '../firebase/messageNotification';
 import OutboxWorker from '../services/OutboxWorker';
@@ -18,6 +19,12 @@ const CHAT_HIGHLIGHT_TTL = 2000;
 const CHAT_UPDATE_BATCH_WINDOW = 90;
 const CHAT_LIST_CACHE_KEY = 'CHAT_LIST_CACHE';
 const CHAT_LIST_SAVE_DEBOUNCE_MS = 300;
+
+// Debug switch for the incoming-message → SQLite-store pipeline. Flip to false
+// (or remove the logs) once the storage path is verified. Kept here so all the
+// message-store debugging can be toggled from one place.
+const DEBUG_MSG_STORE = true;
+const dlog = (...args) => { if (DEBUG_MSG_STORE) console.log('[MSG-STORE]', ...args); };
 
 const REASON_TYPE_MAP = {
   'kafka.message.created': 'new_message',
@@ -52,6 +59,10 @@ const REASON_TYPE_MAP = {
   'presence.changed': 'presence_update',
   'presence.update': 'presence_update',
 };
+
+// Far-future sentinel for an "Always" mute (mirrors shared/muteContract.ts
+// ALWAYS_MUTED_MS). The lazy `mutedUntil > now` check treats it as never-expiring.
+const ALWAYS_MUTED_MS = 253370764800000;
 
 const MESSAGE_TYPE_ICON_MAP = {
   text: null,
@@ -1234,12 +1245,27 @@ const reducer = (state, action) => {
 
       const existing = state.chatMap[chatId] || { _id: chatId, chatId };
       const lastMsg = payload.lastMessage || existing.lastMessage || { text: 'No messages yet', type: 'text' };
+      // Broadcast-channel branding: when the live payload carries it (fan-out
+      // emits name/avatar/verified), persist it so a FIRST broadcast row created
+      // off this event renders the channel — not an "Unknown" placeholder —
+      // without waiting for the next chat-list refetch.
+      const isBroadcast = payload.chatType === 'broadcast' || payload.isBroadcast || existing.chatType === 'broadcast' || existing.isBroadcast;
       const nextMap = {
         ...state.chatMap,
         [chatId]: {
           ...existing,
           chatId,
           _id: normalizeId(existing._id) || chatId,
+          ...(payload.chatType ? { chatType: payload.chatType } : {}),
+          ...(isBroadcast ? {
+            chatType: 'broadcast',
+            isBroadcast: true,
+            readOnly: true,
+            chatName: payload.chatName || existing.chatName || null,
+            chatAvatar: payload.chatAvatar ?? existing.chatAvatar ?? null,
+            isVerified: payload.isVerified ?? existing.isVerified ?? false,
+            broadcastChannelId: payload.broadcastChannelId || existing.broadcastChannelId || null,
+          } : {}),
           lastMessage: lastMsg,
           lastMessageType: payload.lastMessageType || lastMsg?.type || existing.lastMessageType || 'text',
           lastMessageSender: payload.lastMessageSender ?? lastMsg?.senderId ?? existing.lastMessageSender ?? null,
@@ -2035,6 +2061,61 @@ const reducer = (state, action) => {
       };
     }
 
+    // ─── BROADCAST CHANNEL: branding update or (de)activation ───
+    // Admin updated a broadcast channel. If it went INACTIVE, drop it from the
+    // chat list (but do NOT add to removedChatIds — reactivation must let it
+    // re-hydrate from getChatList). If it stays active, refresh its branding on
+    // the existing row.
+    case 'UPDATE_BROADCAST_CHANNEL': {
+      const { channelId, isActive, chatName, chatAvatar, isVerified } = action.payload || {};
+      const id = normalizeId(channelId);
+      if (!id) return state;
+      const nextMap = { ...state.chatMap };
+      const key = nextMap[id]
+        ? id
+        : Object.keys(nextMap).find((k) => normalizeId(nextMap[k]?.chatId) === id);
+
+      if (isActive === false) {
+        if (!key) return state;
+        delete nextMap[key];
+        const unreadByChat = { ...state.unreadByChat };
+        delete unreadByChat[key];
+        const sections = buildOrderedSections(nextMap);
+        return {
+          ...state,
+          chatMap: nextMap,
+          sortedChatIds: sections.sortedChatIds,
+          pinnedChatIds: sections.pinnedChatIds,
+          regularChatIds: sections.regularChatIds,
+          archivedChatIds: sections.archivedChatIds,
+          unreadByChat,
+          totalUnread: recomputeTotalUnread(unreadByChat),
+        };
+      }
+
+      // Active → refresh branding on the existing row (no-op if not present yet;
+      // it'll arrive branded via getChatList / the next broadcast).
+      if (!key) return state;
+      nextMap[key] = {
+        ...nextMap[key],
+        chatType: 'broadcast',
+        isBroadcast: true,
+        readOnly: true,
+        ...(chatName != null ? { chatName } : {}),
+        ...(chatAvatar !== undefined ? { chatAvatar } : {}),
+        ...(isVerified !== undefined ? { isVerified } : {}),
+      };
+      const sections = buildOrderedSections(nextMap);
+      return {
+        ...state,
+        chatMap: nextMap,
+        sortedChatIds: sections.sortedChatIds,
+        pinnedChatIds: sections.pinnedChatIds,
+        regularChatIds: sections.regularChatIds,
+        archivedChatIds: sections.archivedChatIds,
+      };
+    }
+
     // ─── GROUP: Current user left or was removed from a group ───
     // Marks the group inactive so sending is disabled and incoming messages
     // are ignored (see INCOMING_GROUP_MESSAGE guard).
@@ -2363,6 +2444,17 @@ export function RealtimeChatProvider({ children }) {
 
     const onMessage = (payload) => {
       const source = unwrapPayload(payload);
+      // [1] New message received from the server — log the raw payload + the
+      // unwrapped schema (keys) so we can see exactly what the backend sent.
+      dlog('⬇️ new message from server', {
+        rawPayload: payload,
+        sourceKeys: source && typeof source === 'object' ? Object.keys(source) : typeof source,
+        messageId: source?.messageId || source?._id || source?.data?.messageId || source?.data?._id,
+        chatId: source?.chatId || source?.data?.chatId,
+        senderId: source?.senderId || source?.data?.senderId,
+        type: source?.messageType || source?.type || source?.data?.messageType,
+        text: source?.text || source?.data?.text,
+      });
       // Handle group messages — forward to INCOMING_GROUP_MESSAGE for proper unread count tracking.
       // Only treat as group if chatType is explicitly 'group' AND the message has a groupId target.
       // Don't treat forwarded/replied 1-on-1 messages that merely reference a groupId from their origin.
@@ -2502,8 +2594,21 @@ export function RealtimeChatProvider({ children }) {
         const replySenderName = source?.replySenderName || source?.quotedSender
           || (srcReplyIsObj ? (srcReplyTo.senderName || srcReplyTo.sender?.fullName) : null) || null;
 
+        // [2] About to persist this message to SQLite.
+        dlog('💾 storing message in SQLite', {
+          id: msgId,
+          chatId: normalized.chatId,
+          senderId: normalized.senderId,
+          type: source?.messageType || source?.type || 'text',
+          text: normalized.text || '',
+          seq: source?.seq ?? normalized?.seq ?? null,
+        });
+
         ChatDatabase.upsertMessage({
           id: msgId,
+          // Persist the server seq so getLatestSeq() advances and reconnect
+          // catch-up only fetches the true delta (not from 0).
+          seq: (source?.seq != null && !Number.isNaN(Number(source.seq))) ? Number(source.seq) : (normalized?.seq ?? null),
           serverMessageId: msgId,
           tempId: normalized.tempId || null,
           chatId: normalized.chatId,
@@ -2527,7 +2632,16 @@ export function RealtimeChatProvider({ children }) {
           replyPreviewType,
           replySenderName,
           replySenderId,
-        }).then(() => {
+        }).then(async () => {
+          // [3] Write landed — report how many rows this chatId now holds in SQLite.
+          if (DEBUG_MSG_STORE) {
+            try {
+              const count = await ChatDatabase.getMessageCount(normalized.chatId);
+              dlog('✅ stored. SQLite record count for chatId', normalized.chatId, '=', count);
+            } catch (e) {
+              dlog('⚠️ getMessageCount failed for chatId', normalized.chatId, e?.message);
+            }
+          }
           // Bridge to an OPEN chat screen: the chat screen (useChatLogic) has its
           // OWN message:new listener but filters by the active chatId and can miss
           // a message (chatId-format mismatch, handler race) — yet THIS context
@@ -2816,6 +2930,44 @@ export function RealtimeChatProvider({ children }) {
       });
     };
 
+    // ── Canonical mute contract (shared/muteContract.ts) ──────────────────
+    // mute:updated arrives on this user's OTHER devices when a mute is set/cleared
+    // anywhere; mute:sync:response answers our mute:sync on (re)connect. Both feed
+    // the SAME reducer path as the legacy chat:mute responses, so the chat-row
+    // mute icon + the local banner gate (AppBannerHost) stay in sync. mutedUntil
+    // is epoch ms; null = unmuted.
+    const applyCanonicalMute = (chatId, mutedUntil, notifyOnMention) => {
+      const cid = normalizeId(chatId);
+      if (!cid) return;
+      if (mutedUntil == null) {
+        onChatListUpdate({ type: 'chat_unmuted', reason: 'mute:updated', chatId: cid, item: { chatId: cid, isMuted: false, muteUntil: null, notifyOnMention: false } });
+      } else {
+        onChatListUpdate({ type: 'chat_muted', reason: 'mute:updated', chatId: cid, item: { chatId: cid, isMuted: true, muteUntil: mutedUntil, notifyOnMention: Boolean(notifyOnMention) } });
+      }
+    };
+
+    const onMuteUpdated = (payload) => {
+      const source = unwrapPayload(payload);
+      const data = source?.data || source || {};
+      applyCanonicalMute(data.chatId, data.mutedUntil, data.notifyOnMention);
+    };
+
+    const onMuteSyncResponse = (payload) => {
+      const source = unwrapPayload(payload);
+      const settings = source?.data?.settings || source?.settings || [];
+      if (!Array.isArray(settings)) return;
+      // Reconcile: any chat NOT in the active-mute list is treated as unmuted
+      // (covers remote unmute + lazily-expired timed mutes).
+      const mutedIds = new Set(settings.map((s) => normalizeId(s?.chatId)).filter(Boolean));
+      const currentMap = stateRef.current?.chatMap || {};
+      Object.keys(currentMap).forEach((cid) => {
+        if (currentMap[cid]?.isMuted && !mutedIds.has(normalizeId(cid))) {
+          applyCanonicalMute(cid, null, false);
+        }
+      });
+      settings.forEach((s) => applyCanonicalMute(s?.chatId, s?.mutedUntil, s?.notifyOnMention));
+    };
+
     const onChatArchiveResponse = (payload) => {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.data?.chatId);
@@ -3088,17 +3240,30 @@ export function RealtimeChatProvider({ children }) {
 
             // Persist through the writer queue — serialized, never races.
             if (newMessages.length > 0) {
+              // Catch-up rows are RAW Mongo docs (messageId/_id/messageType), not
+              // the client message shape. Normalize so upsert derives id/
+              // serverMessageId correctly (otherwise it inserts `unknown_*` rows
+              // and the thread stays empty) and preserves `seq` + media type.
+              const normalizedNew = newMessages.map((m) => {
+                const n = normalizeMessagePayload({ ...m, chatId: m.chatId || entry.chatId });
+                return {
+                  ...n,
+                  type: m.messageType || m.type || n.type || 'text',
+                  mediaUrl: m.mediaUrl || null,
+                  mediaType: m.mediaType || null,
+                  previewUrl: m.mediaThumbnailUrl || m.previewUrl || null,
+                  mediaId: m.mediaId || null,
+                  synced: 1,
+                };
+              });
               try {
                 const { default: SqliteWriter } = await import('../services/SqliteWriter');
-                SqliteWriter.enqueue('upsertMessages', newMessages.map((m) => ({
-                  ...m,
-                  chatId: m.chatId || entry.chatId,
-                }))).catch(() => {});
+                SqliteWriter.enqueue('upsertMessages', normalizedNew).catch(() => {});
               } catch {}
               // Dispatch realtime updates so any open chat screen renders the
               // new tail immediately.
-              newMessages.forEach((m) => {
-                dispatch({ type: 'INCOMING_MESSAGE', payload: { ...m, chatId: m.chatId || entry.chatId } });
+              normalizedNew.forEach((m) => {
+                dispatch({ type: 'INCOMING_MESSAGE', payload: m });
               });
             }
 
@@ -3125,6 +3290,11 @@ export function RealtimeChatProvider({ children }) {
     };
     socket.on('connect', onConnectCatchup);
     if (socket.connected) onConnectCatchup();
+    // Hydrate mutes from the server on (re)connect — mute is a server-owned
+    // per-user setting; mute:sync:response reconciles the local chat rows.
+    const onConnectMuteSync = () => { try { socket.emit('mute:sync'); } catch { /* non-fatal */ } };
+    socket.on('connect', onConnectMuteSync);
+    if (socket.connected) onConnectMuteSync();
     socket.on('message:delivered', onMessageDelivered);
     socket.on('message:delivered:response', onMessageDeliveredResponse);
     socket.on('message:seen', onMessageSeen);
@@ -3154,6 +3324,25 @@ export function RealtimeChatProvider({ children }) {
     socket.on('group:typing:start', onGroupTypingStarted);
     socket.on('group:typing:stop', onGroupTypingStopped);
     socket.on('chat:list:update', onChatListUpdate);
+
+    // Admin (de)activated or rebranded a broadcast channel. Inactive → drop it
+    // from the chat list + SQLite (it must not be shown); active → refresh its
+    // name/avatar/verified badge live.
+    const onBroadcastChannelUpdated = (payload) => {
+      const data = payload?.data || payload || {};
+      const ch = data.channel || {};
+      const channelId = normalizeId(ch.channelId || ch.chatId || ch._id || data.channelId);
+      if (!channelId) return;
+      const isActive = data.isActive;
+      dispatch({
+        type: 'UPDATE_BROADCAST_CHANNEL',
+        payload: { channelId, isActive, chatName: ch.name, chatAvatar: ch.avatarUrl, isVerified: ch.isVerified },
+      });
+      if (isActive === false) {
+        try { ChatDatabase.deleteChatRow(channelId); } catch (e) { /* best-effort */ }
+      }
+    };
+    socket.on('broadcast:channel_updated', onBroadcastChannelUpdated);
 
     // Peer's read watermark — drives the sender-side tick from gray → blue
     // without N per-message events. Body: { chatId, readerId, readUpToSeq,
@@ -3186,6 +3375,8 @@ export function RealtimeChatProvider({ children }) {
     socket.on('chat:unpin:response', onChatUnpinResponse);
     socket.on('chat:mute:response', onChatMuteResponse);
     socket.on('chat:unmute:response', onChatUnmuteResponse);
+    socket.on('mute:updated', onMuteUpdated);
+    socket.on('mute:sync:response', onMuteSyncResponse);
     socket.on('chat:archive:response', onChatArchiveResponse);
     socket.on('chat:unarchive:response', onChatUnarchiveResponse);
     socket.on('chat:cleared:me', onChatCleared);
@@ -3896,6 +4087,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
       () => socket.off('connect', onConnectCatchup),
+      () => socket.off('connect', onConnectMuteSync),
       () => socket.off('message:delivered', onMessageDelivered),
       () => socket.off('message:seen', onMessageSeen),
       () => socket.off('message:read', onMessageRead),
@@ -3920,6 +4112,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('group:typing:start', onGroupTypingStarted),
       () => socket.off('group:typing:stop', onGroupTypingStopped),
       () => socket.off('chat:list:update', onChatListUpdate),
+      () => socket.off('broadcast:channel_updated', onBroadcastChannelUpdated),
       () => socket.off('message:read:upto', onPeerReadWatermark),
       () => socket.off('message:edit:response', onMessageEditedForChatList),
       () => socket.off('message:edited', onMessageEditedForChatList),
@@ -3928,6 +4121,8 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:unpin:response', onChatUnpinResponse),
       () => socket.off('chat:mute:response', onChatMuteResponse),
       () => socket.off('chat:unmute:response', onChatUnmuteResponse),
+      () => socket.off('mute:updated', onMuteUpdated),
+      () => socket.off('mute:sync:response', onMuteSyncResponse),
       () => socket.off('chat:archive:response', onChatArchiveResponse),
       () => socket.off('chat:unarchive:response', onChatUnarchiveResponse),
       () => socket.off('chat:cleared:me', onChatCleared),
@@ -4239,7 +4434,9 @@ export function RealtimeChatProvider({ children }) {
     if (chatId) {
       // Opening a chat → clear its WhatsApp-style grouped message notification +
       // accumulated thread so already-read messages don't linger in the shade.
-      // clearMessageNotification(chatId);
+      // Lazy require avoids pulling the firebase/notifee modules into this
+      // context's import graph at module-eval time.
+      try { require('../firebase/fcmService').clearChatNotifications(chatId); } catch (_) { /* */ }
       const socket = getSocket();
       if (socket && isSocketConnected()) {
         // Group chat IDs are raw ObjectIds; private chat IDs are `u_<a>_<b>`.
@@ -4247,21 +4444,25 @@ export function RealtimeChatProvider({ children }) {
         // membership by parsing `u_a_b`, so sending a group id there fails with
         // NOT_IN_CHAT. Route groups to the dedicated group read-all handler.
         const isGroupChat = !String(chatId).startsWith('u_');
-        try {
-          if (isGroupChat) {
-            socket.emit('group:message:read:all', { groupId: chatId });
-          } else {
-            const raw = await AsyncStorage.getItem('userInfo');
-            const user = raw ? JSON.parse(raw) : null;
-            const senderId = user?._id || user?.id;
-            if (senderId) {
-              // Use message:read:all to mark all messages in this chat as read
-              socket.emit('message:read:all', { chatId, senderId });
+        // Throttle: chat-init (useChatLogic) also emits read:all on open, and
+        // re-renders re-trigger this — collapse the duplicates (idempotent).
+        if (shouldEmitReadAll(chatId)) {
+          try {
+            if (isGroupChat) {
+              socket.emit('group:message:read:all', { groupId: chatId });
+            } else {
+              const raw = await AsyncStorage.getItem('userInfo');
+              const user = raw ? JSON.parse(raw) : null;
+              const senderId = user?._id || user?.id;
+              if (senderId) {
+                // Use message:read:all to mark all messages in this chat as read
+                socket.emit('message:read:all', { chatId, senderId });
+              }
             }
+          } catch (e) {
+            // Fallback without senderId (private chats only)
+            if (!isGroupChat) socket.emit('message:read', { chatId });
           }
-        } catch (e) {
-          // Fallback without senderId (private chats only)
-          if (!isGroupChat) socket.emit('message:read', { chatId });
         }
 
         // ── Advance the read watermark immediately ───────────────────────
@@ -4359,21 +4560,25 @@ export function RealtimeChatProvider({ children }) {
     emitChatAction('chat:unpin', { chatId: normalizedChatId, chatType: chatType || 'private' });
   }, [applyOptimisticAction, emitChatAction]);
 
-  const muteChat = useCallback((chatId, duration, chatType) => {
+  // `duration` is a span in ms (0 = "Always"). Emits the canonical mute:set with
+  // a concrete mutedUntil (epoch ms) — the server routes 1:1 vs group itself and
+  // fans out mute:updated to this user's other devices. (The legacy chat:mute
+  // path treated `duration` as MINUTES; mute:set sidesteps that mismatch.)
+  const muteChat = useCallback((chatId, duration, chatType, notifyOnMention = false) => {
     const normalizedChatId = normalizeId(chatId);
     if (!normalizedChatId) return;
 
     const durationMs = Number(duration || 0);
-    const muteUntil = durationMs > 0 ? new Date(Date.now() + durationMs).toISOString() : null;
+    const mutedUntil = durationMs > 0 ? Date.now() + durationMs : ALWAYS_MUTED_MS;
     applyOptimisticAction(normalizedChatId, {
       isMuted: true,
-      muteUntil,
+      muteUntil: mutedUntil,
+      notifyOnMention: Boolean(notifyOnMention),
     });
-    emitChatAction('chat:mute', {
+    emitChatAction('mute:set', {
       chatId: normalizedChatId,
-      chatType: chatType || 'private',
-      duration: durationMs > 0 ? durationMs : undefined,
-      muteUntil,
+      mutedUntil,
+      notifyOnMention: Boolean(notifyOnMention),
     });
   }, [applyOptimisticAction, emitChatAction]);
 
@@ -4383,8 +4588,9 @@ export function RealtimeChatProvider({ children }) {
     applyOptimisticAction(normalizedChatId, {
       isMuted: false,
       muteUntil: null,
+      notifyOnMention: false,
     });
-    emitChatAction('chat:unmute', { chatId: normalizedChatId, chatType: chatType || 'private' });
+    emitChatAction('mute:clear', { chatId: normalizedChatId });
   }, [applyOptimisticAction, emitChatAction]);
 
   const archiveChat = useCallback((chatId, chatType) => {

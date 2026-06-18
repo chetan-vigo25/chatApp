@@ -1,5 +1,6 @@
 export { default as useMyPresence } from './useMyPresence';
 export { default as useUserPresence } from './useUserPresence';
+export { default as usePresence } from './usePresence';
 export { default as useContactsPresence } from './useContactsPresence';
 export { default as useTypingIndicator } from './useTypingIndicator';
 export { default as useGroupTypingIndicator } from './useGroupTypingIndicator';

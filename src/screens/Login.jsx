@@ -47,17 +47,21 @@ export default function Login({ navigation }) {
 
   const handleGenerateOtp = async () => {
     if (!isValid) {
+      console.log('[LOGIN] invalid number, not sending request', { code: selectedCountry?.code, len: phoneNumber.length });
       showToast(`Enter a valid ${selectedCountry?.name || ''} number (${phoneLengthHint(selectedCountry?.code)})`.replace('  ', ' '));
       return;
     }
     const fullPhoneNumber = `${selectedCountry.code}${phoneNumber}`;
+    console.log('[LOGIN] generate OTP tapped →', fullPhoneNumber);
     const result = await dispatch(generateOtpAction(fullPhoneNumber));
     if (generateOtpAction.fulfilled.match(result)) {
+      console.log('[LOGIN] OTP request succeeded');
       const data = result.payload?.otpData;
       const otp = data?.otp || data?.code || data;
       navigation.navigate('Otp', { selectedCountry, phoneNumber, generatedOtp: otp });
       setPhoneNumber('');
     } else {
+      console.log('[LOGIN] OTP request failed →', result?.error?.message || result?.payload);
       showToast('Failed to generate OTP. Please try again.');
     }
   };

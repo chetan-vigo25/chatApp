@@ -1651,6 +1651,7 @@ export default function ChatScreen({ navigation, route }) {
     isPeerTyping,
     renderStatusText,
     isLoadingMore,
+    isBackfilling,
     hasMoreMessages,
     onRefresh,
     loadMoreMessages,
@@ -3200,7 +3201,13 @@ export default function ChatScreen({ navigation, route }) {
   const handleOpenContactInfo = () => {
     setShowMenu(false);
     const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
-    if (isGroupChat) {
+    const isBroadcast = Boolean(chatData?.chatType === 'broadcast' || chatData?.isBroadcast);
+    if (isBroadcast) {
+      navigation.navigate('ChannelInfo', {
+        channelId: chatData?.broadcastChannelId || chatData?.chatId || chatData?._id || route?.params?.chatId,
+        item: chatData,
+      });
+    } else if (isGroupChat) {
       navigation.navigate('GroupInfo', {
         groupId: chatData?.groupId || chatData?.group?._id || chatData?.chatId || chatData?._id || route?.params?.chatId,
         item: chatData,
@@ -4986,12 +4993,15 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   const renderFooter = () => {
-    if (isLoadingMore) {
+    // Inverted list → footer renders at the visual TOP. Show the spinner only
+    // while an older-history page is being fetched over the NETWORK
+    // (isBackfilling); local SQLite paging is instant and shows nothing.
+    if (isBackfilling) {
       return (
         <View style={{ paddingVertical: 20, alignItems: "center" }}>
           <ActivityIndicator size="small" color={theme.colors.themeColor} />
           <Text style={{ marginTop: 8, fontSize: 11, color: theme.colors.placeHolderTextColor }}>
-            Loading more messages...
+            Loading older messages...
           </Text>
         </View>
       );
@@ -5052,7 +5062,8 @@ export default function ChatScreen({ navigation, route }) {
     );
   }
 
-  if (!chatData || (!chatData.peerUser && !chatData.isGroup)) {
+  const isBroadcastChat = Boolean(chatData?.chatType === 'broadcast' || chatData?.isBroadcast);
+  if (!chatData || (!chatData.peerUser && !chatData.isGroup && !isBroadcastChat)) {
     return (
       <View style={{ 
         flex: 1, 
@@ -5140,13 +5151,18 @@ export default function ChatScreen({ navigation, route }) {
           isPeerTyping={isPeerTyping}
           fallbackStatusText={renderStatusText()}
           onBack={() => navigation.goBack()}
+          // Broadcast: tapping the header/avatar opens the channel info page.
           onPressProfile={handleOpenContactInfo}
-          onPressAvatar={handleOpenUserSheet}
+          onPressAvatar={isBroadcastChat ? handleOpenContactInfo : handleOpenUserSheet}
           getUserColor={getUserColor}
-          isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup)}
+          // Render the channel via the group-like header path (name + logo, no
+          // peer presence). isBroadcast lets the header suppress "last seen".
+          isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup || isBroadcastChat)}
+          isBroadcast={isBroadcastChat}
+          isVerified={Boolean(chatData?.isVerified)}
           groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
           groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
-          memberCount={liveMemberCount ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount)}
+          memberCount={isBroadcastChat ? undefined : (liveMemberCount ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount))}
           rightActions={selectedMessage.length > 0 ? (() => {
             const selMsg = selectedMessage.length === 1
               ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))
@@ -5296,7 +5312,7 @@ export default function ChatScreen({ navigation, route }) {
             );
           })() : (
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              {!isGroupChat ? (
+              {isBroadcastChat ? null : !isGroupChat ? (
                 <CallButtons
                   peer={chatData.peerUser}
                   chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
@@ -5766,7 +5782,13 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {contactBlockedHide ? (
+        {isBroadcastChat ? (
+          // Read-only broadcast channel: no composer — users can only read.
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 14, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
+            <Ionicons name="megaphone-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
+            <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>Only the admin can post in this channel.</Text>
+          </View>
+        ) : contactBlockedHide ? (
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
               <Ionicons name="ban-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />

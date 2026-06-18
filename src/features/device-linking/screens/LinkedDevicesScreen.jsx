@@ -10,6 +10,7 @@ import {
   Platform,
   ToastAndroid,
   Alert,
+  Image,
 } from 'react-native';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
@@ -170,7 +171,11 @@ export default function LinkedDevicesScreen({ navigation }) {
         <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={styles.backBtn}>
           <FontAwesome6 name="arrow-left" size={20} color={primaryText} />
         </TouchableOpacity>
-        <Text style={[styles.headerTitle, { color: primaryText }]}>Linked devices</Text>
+        <Image source={require('../../../../assets/icon.png')} style={styles.headerLogo} />
+        <Text style={[styles.headerTitle, { color: primaryText }]}>
+          Talks<Text style={{ color: brand }}>Try</Text>
+          <Text style={{ color: subText }}>  ·  Linked devices</Text>
+        </Text>
       </View>
 
       <Animated.View style={{ flex: 1, opacity: fadeAnim }}>
@@ -205,11 +210,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 8,
     paddingBottom: 12,
-    gap: 18,
+    gap: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  backBtn: { width: 32, height: 36, alignItems: 'flex-start', justifyContent: 'center' },
-  headerTitle: { fontFamily: 'Roboto-Medium', fontSize: 21, letterSpacing: -0.2 },
+  backBtn: { width: 28, height: 36, alignItems: 'flex-start', justifyContent: 'center' },
+  headerLogo: { width: 30, height: 30, borderRadius: 8, resizeMode: 'contain' },
+  headerTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 18, letterSpacing: -0.2 },
 
   listContent: { paddingHorizontal: 22, paddingBottom: 40 },
 

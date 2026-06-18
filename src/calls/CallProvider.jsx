@@ -31,16 +31,16 @@ import {
   registerCallSignalListeners,
 } from './services/callSignalService';
 import { subscribeSocketState } from '../Redux/Services/Socket/socket';
-// Firebase FCM / notifee disabled in Expo Go / dev builds (no native module).
-// import { CALL_PUSH_EVENTS } from '../firebase/fcmService';
-// import { cancelIncomingCallNotifee, consumeInitialNotifeeCall } from '../firebase/callNotifee';
+// CALL_PUSH_EVENTS lives in its own dep-free module; callNotifee resolves its
+// native backends lazily (requireOptionalNativeModule + try/catch require), so
+// these imports are safe even in Expo Go — the functions simply no-op when no
+// native call-UI / notifee module is present. They become live in a dev/EAS
+// build (required for the ExpoCallUi CallStyle notification anyway), enabling
+// cold-start Answer replay (consumeInitialNotifeeCall) and dismissing the
+// incoming-call notification once answered/ended (cancelIncomingCallNotifee).
+import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
+import { cancelAllIncomingCallNotifee, consumeInitialNotifeeCall } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
-
-// No-op fallbacks so the call flow keeps working without native push.
-// Restore the imports above (and remove these) when building a dev/EAS client.
-const CALL_PUSH_EVENTS = { INCOMING: 'call:push:incoming', ACCEPT: 'call:push:accept', REJECT: 'call:push:reject' };
-const cancelIncomingCallNotifee = () => {};
-const consumeInitialNotifeeCall = () => {};
 
 export const CallContext = createContext(null);
 export const useCall = () => useContext(CallContext) || {};
@@ -421,8 +421,9 @@ export const CallProvider = ({ children }) => {
     // Dismiss the native call UI (no-op unless CallKeep is installed).
     if (snap.callId) nativeCall.endCall(snap.callId);
     // Dismiss the OS full-screen incoming-call notification (notifee), keyed on
-    // the signaling id that the push/notification used as its callId.
-    cancelIncomingCallNotifee(snap.signalId);
+    // the signaling id that the push/notification used as its callId. Cancel ALL
+    // shown call notifications so none lingers regardless of id drift.
+    cancelAllIncomingCallNotifee();
 
     // Release the server-side busy lock + notify the peer over the app socket,
     // keyed on the signaling id. Only when this call used the signaling path
@@ -943,9 +944,11 @@ export const CallProvider = ({ children }) => {
     clearRingTimeout();
     stopRinging();
     // Answering on the in-app screen → dismiss the OS call notification too, so
-    // the pop-up/heads-up doesn't linger in the shade once the call is connecting.
-    // (Tapping Accept/Decline on the notification itself is dismissed natively.)
-    cancelIncomingCallNotifee(snap.signalId);
+    // the heads-up doesn't linger over the active-call screen. Cancel ALL shown
+    // call notifications (not just snap.signalId): the notification was posted
+    // with the signaling id, which may differ from the live WebRTC id, so a
+    // by-id cancel can miss. Only one incoming call exists at a time.
+    cancelAllIncomingCallNotifee();
     dispatch({ type: ACT.ACCEPT, nowMs: Date.now() });
     // The ring timeout is now cleared, so from here a stalled connect would hang
     // forever — arm the connect watchdog to fail cleanly if we never reach ACTIVE
@@ -1127,9 +1130,12 @@ export const CallProvider = ({ children }) => {
     if (shouldExpand) {
       dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
     }
-    // The in-app ring (ringtone + UI) is now up — dismiss the OS full-screen
-    // notification so its looping ringtone doesn't double with ours.
-    cancelIncomingCallNotifee(payload?.callId);
+    // The in-app ring (ringtone + UI) is now up — dismiss EVERY OS call
+    // notification so its looping ringtone doesn't double with ours and the
+    // heads-up doesn't sit on top of the in-app ringing screen (one UI at a
+    // time). cancel-all avoids missing it when the posted id differs from the
+    // live state id.
+    cancelAllIncomingCallNotifee();
     nativeCall.displayIncomingCall(
       payload?.callId, callerId,
       isGroup ? (payload?.groupName || 'Group call') : peer.name,
@@ -1265,6 +1271,22 @@ export const CallProvider = ({ children }) => {
       accept();
     }
   }, [state.status, state.accepted, accept]);
+
+  // Enforce "one incoming-call UI at a time" (FCM heads-up OR in-app banner — not
+  // both). While the app is foreground the in-app ringing screen is the single
+  // UI, so dismiss the OS call notification. Re-checks on every foreground so a
+  // notification shown while backgrounded is cleared the moment the user opens
+  // the app (or the full-screen intent launches it) mid-ring. Backgrounded rings
+  // keep their notification (this effect only fires while status is INCOMING and
+  // the app is active).
+  useEffect(() => {
+    if (state.status !== CALL_STATUS.INCOMING) return undefined;
+    if (AppState.currentState === 'active') cancelAllIncomingCallNotifee();
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') cancelAllIncomingCallNotifee();
+    });
+    return () => { try { sub.remove(); } catch (_) { /* */ } };
+  }, [state.status]);
 
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = { accept, reject, hangup, toggleMic };

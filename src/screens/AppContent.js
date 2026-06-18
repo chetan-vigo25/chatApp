@@ -1,4 +1,3 @@
-// src/AppContent.js
 import React, { useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { StatusBar } from 'expo-status-bar';
@@ -8,10 +7,6 @@ import { useFonts } from 'expo-font';
 import { useTheme } from '../contexts/ThemeContext';
 import { useNetwork } from '../contexts/NetworkContext';
 import { useAuth } from '../contexts/AuthContext';
-// Firebase FCM disabled in Expo Go / dev builds (no native Firebase module).
-// Re-enable when building a dev/EAS client with Firebase configured.
-// import { getFCMToken } from '../firebase/fcmService';
-// import { setPushToken } from '../Redux/Services/Socket/socket';
 import NoInternet from '../screens/NoInternet';
 import AppBannerHost from '../../src/components/AppBannerHost';
 
@@ -19,21 +14,6 @@ export default function AppContent() {
   const { theme, isDarkMode } = useTheme();
   const { isConnected } = useNetwork();
   const { isAuthenticated } = useAuth();
-
-  // Push token acquisition disabled in Expo Go / dev mode (no native Firebase).
-  // useEffect(() => {
-  //   if (!isAuthenticated) return;
-  //   let cancelled = false;
-  //   (async () => {
-  //     try {
-  //       const token = await getFCMToken();
-  //       if (cancelled || !token) return;
-  //       setPushToken(token);
-  //       AsyncStorage.setItem('fcmToken', token).catch(() => {});
-  //     } catch (_) { /* best-effort; push is non-blocking */ }
-  //   })();
-  //   return () => { cancelled = true; };
-  // }, [isAuthenticated]);
 
   const [fontsLoaded] = useFonts({
     'Roboto-Black': require('../../assets/fonts/Roboto-Black.ttf'),

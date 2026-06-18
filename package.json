@@ -8,7 +8,7 @@
     "ios": "expo run:ios",
     "web": "expo start --web"
   },
-  "dependencies": {
+ "dependencies": {
     "@likashefqet/react-native-image-zoom": "^4.3.0",
     "@notifee/react-native": "^9.1.8",
     "@react-native-async-storage/async-storage": "2.2.0",

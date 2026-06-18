@@ -5,6 +5,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio } from 'expo-av';
 import { useTheme } from '../contexts/ThemeContext';
 import { useRealtimeChat } from '../contexts/RealtimeChatContext';
+import ChatDatabase from '../services/ChatDatabase';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import {
   getActiveChatFromRoute,
@@ -13,6 +14,8 @@ import {
   subscribeNavigationSnapshot,
 } from '../Redux/Services/navigationService';
 import { subscribeSessionReset } from '../services/sessionEvents';
+import { previewFor } from '../firebase/notificationModel';
+import { claimNotification } from '../firebase/notificationDedupe';
 
 // Preload the notification sound once at module level
 const MESSAGE_SOUND = require('../../assets/sounds/message-sound-001.mp3');
@@ -259,6 +262,40 @@ export default function WhatsAppBannerHost() {
     });
   }, [clearAutoDismiss, dragY, showNext, translateY]);
 
+  // Is this chat currently muted FOR THIS USER? Checks the in-memory chatMap
+  // first (cheap, kept fresh by mute:updated), then falls back to SQLite. A null
+  // mute_until on a muted row = indefinite ("Always"); a past value has expired.
+  const isMutedNow = useCallback(async (item) => {
+    // muteUntil may be a number (live chatMap) or a string (SQLite TEXT) holding
+    // either epoch ms ("253370764800000") or an ISO date. Coerce both robustly.
+    const toMs = (v) => {
+      if (v == null) return null;
+      if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+      const s = String(v).trim();
+      if (/^\d+$/.test(s)) return Number(s);
+      const t = new Date(s).getTime();
+      return Number.isFinite(t) ? t : null;
+    };
+    const isActive = (isMuted, muteUntil) => {
+      if (!isMuted) return false;
+      const until = toMs(muteUntil);
+      return until == null || until > Date.now();
+    };
+    const id = item?.chatId || item?.groupId;
+    if (!id) return false;
+    const entry = realtimeStateRef.current?.chatMap?.[String(id)]
+      || (item?.groupId ? realtimeStateRef.current?.chatMap?.[String(item.groupId)] : null);
+    if (entry && entry.isMuted != null) {
+      return isActive(entry.isMuted, entry.muteUntil);
+    }
+    try {
+      const row = await ChatDatabase.getChatById(String(id));
+      return row ? isActive(row.isMuted, row.muteUntil) : false;
+    } catch {
+      return false;
+    }
+  }, []);
+
   const enqueueBanner = useCallback(async (rawPayload) => {
     if (appStateRef.current !== 'active') return;
 
@@ -271,9 +308,26 @@ export default function WhatsAppBannerHost() {
     if (seenRef.current.has(item.id)) return;
     seenRef.current.add(item.id);
 
+    // Cross-path dedupe: if a push already notified this messageId (common across
+    // a background→foreground transition where the OS showed the push and the
+    // socket then re-flushes the same message), suppress the banner. Keyed on
+    // messageId so it matches what the OS push path claims; payloads without a
+    // messageId fall back to the in-session seenRef guard above.
+    if (item.messageId && !claimNotification(item.messageId)) return;
+
     if (shouldSuppressForActiveRoute(item)) {
       return;
     }
+
+    // ── Mute gate ──────────────────────────────────────────────────
+    // WhatsApp-style mute suppresses the ALERT only (in-app banner + sound) for
+    // THIS chat — the message has already been persisted + unread-bumped by the
+    // realtime pipeline; we only withhold the notification here. Source of truth
+    // is the local mute mirror (SQLite is_muted/mute_until), hydrated by
+    // mute:sync / mute:updated. Lazy expiry: a timed mute that has passed no
+    // longer suppresses. getChatById matches on chat_id OR group_id, so one
+    // lookup covers both 1:1 and group banners.
+    if (await isMutedNow(item)) return;
 
     // Play notification sound for every new banner
     playNotificationSound();
@@ -293,7 +347,7 @@ export default function WhatsAppBannerHost() {
     }
 
     showNext();
-  }, [shouldRespectDnd, shouldSuppressForActiveRoute, showNext, startAutoDismiss, playNotificationSound]);
+  }, [shouldRespectDnd, shouldSuppressForActiveRoute, showNext, startAutoDismiss, playNotificationSound, isMutedNow]);
 
   const handleBannerPress = useCallback(() => {
     const current = currentRef.current;
@@ -450,15 +504,10 @@ export default function WhatsAppBannerHost() {
       const avatar = data?.sender?.profileImage || data?.sender?.profileImageUrl
         || data?.profileImage || data?.senderImage || source?.profileImage || null;
 
-      // Preview text per message type (WhatsApp-style).
+      // Preview text per message type (WhatsApp-style) — shared with the OS push
+      // path so the banner and the notification show identical text.
       const messageType = data?.messageType || data?.type || 'text';
-      let bodyText = data?.text || data?.content || '';
-      if (messageType === 'image') bodyText = 'Photo';
-      else if (messageType === 'video') bodyText = 'Video';
-      else if (messageType === 'audio') bodyText = 'Audio';
-      else if (messageType === 'file') bodyText = 'Document';
-      else if (messageType === 'location') bodyText = 'Location';
-      else if (messageType === 'contact') bodyText = 'Contact';
+      const bodyText = previewFor(messageType, data?.text || data?.content || '');
 
       enqueueBanner({
         messageId: data?.messageId || data?._id,
@@ -508,15 +557,10 @@ export default function WhatsAppBannerHost() {
         senderName = member?.fullName || member?.username || member?.name || '';
       }
 
-      // Build preview text based on message type
+      // Build preview text based on message type — shared with the OS push path
+      // so the banner and the notification show identical text.
       const messageType = data?.messageType || 'text';
-      let bodyText = data?.text || '';
-      if (messageType === 'image') bodyText = 'Photo';
-      else if (messageType === 'video') bodyText = 'Video';
-      else if (messageType === 'audio') bodyText = 'Audio';
-      else if (messageType === 'file') bodyText = 'Document';
-      else if (messageType === 'location') bodyText = 'Location';
-      else if (messageType === 'contact') bodyText = 'Contact';
+      const bodyText = previewFor(messageType, data?.text || '');
 
       const senderPrefix = senderName ? `${senderName}: ` : '';
 
