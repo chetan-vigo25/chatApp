@@ -145,31 +145,67 @@ export const CallProvider = ({ children }) => {
   }, [state.status]);
 
   // ---- active-call ongoing foreground service (Android) ----
-  // While a call is CONNECTED, run the WhatsApp-style persistent notification
-  // (caller name + live duration + Hang up) backed by a foreground service so the
-  // OS keeps the call's mic/camera alive when the app is backgrounded. Starts when
-  // the call goes ACTIVE (remote media joined) and stops on any non-active state.
-  // No-op off Android / without the native module (the orchestrator gates it).
+  // While a call is ANSWERED and still live, run the WhatsApp-style persistent
+  // notification (caller name + live duration + Hang up) backed by a foreground
+  // service so the OS keeps the call's mic/camera alive when the app is
+  // backgrounded. No-op off Android / without the native module (the orchestrator
+  // gates it).
+  //
+  // CRITICAL — start at ANSWER, not at ACTIVE. Android 12+ forbids STARTING a
+  // microphone/camera foreground service from the background but lets one keep
+  // running once started in the foreground. The CALLER is always foregrounded when
+  // the call connects, so starting at ACTIVE worked for them. The CALLEE, accepting
+  // from a push / lock screen, frequently only reaches ACTIVE *after* the app has
+  // backgrounded — so the deferred start was rejected (CallForegroundService swallows
+  // ForegroundServiceStartNotAllowedException) and no notification/duration ever
+  // showed. `answeredAt` is stamped by ACT.ACCEPT (callee) / onSignalAccepted
+  // (caller) while we're still foregrounded, so gating on it starts the service in
+  // the allowed window; it then survives backgrounding like the caller's does.
+  const buildOngoingPayload = useCallback(() => {
+    const s = stateRef.current;
+    const label = s.isGroup
+      ? (s.groupName || 'Group call')
+      : (s.peer?.name || 'Ongoing call');
+    return {
+      callId: s.signalId || s.callId,
+      callerName: label,
+      callerImage: s.isGroup ? null : (s.peer?.avatar || null),
+      callType: s.media === 'video' ? 'video' : 'audio',
+      startedAt: s.answeredAt || Date.now(),
+    };
+  }, []);
+
+  const showOngoingNotif = !!state.answeredAt
+    && state.status !== CALL_STATUS.IDLE
+    && state.status !== CALL_STATUS.ENDED;
+
   useEffect(() => {
-    if (state.status === CALL_STATUS.ACTIVE) {
-      const label = state.isGroup
-        ? (state.groupName || 'Group call')
-        : (state.peer?.name || 'Ongoing call');
-      startOngoingCallNotification({
-        callId: state.signalId || state.callId,
-        callerName: label,
-        callerImage: state.isGroup ? null : (state.peer?.avatar || null),
-        callType: state.media === 'video' ? 'video' : 'audio',
-        startedAt: state.answeredAt || Date.now(),
-      });
+    if (showOngoingNotif) {
+      startOngoingCallNotification(buildOngoingPayload());
     } else {
-      // OUTGOING/INCOMING/ENDED/IDLE → ensure no stale ongoing notification.
+      // OUTGOING-ringing / INCOMING-ringing / ENDED / IDLE → no ongoing notification.
       stopOngoingCallNotification();
     }
   }, [
-    state.status, state.signalId, state.callId, state.isGroup,
+    showOngoingNotif, buildOngoingPayload,
+    state.signalId, state.callId, state.isGroup,
     state.groupName, state.peer, state.media, state.answeredAt,
   ]);
+
+  // Self-heal: if the FGS start was rejected because the call only reached us while
+  // backgrounded (e.g. a cold-start accept over the lock screen, where media lands
+  // before the activity is fully resumed), retry the moment the app returns to the
+  // foreground — a foreground start is always allowed. Idempotent: a re-start just
+  // refreshes the already-running service's notification.
+  useEffect(() => {
+    if (!showOngoingNotif) return undefined;
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active' && stateRef.current.answeredAt) {
+        startOngoingCallNotification(buildOngoingPayload());
+      }
+    });
+    return () => sub.remove();
+  }, [showOngoingNotif, buildOngoingPayload]);
 
   // ---- low-level command sender ----
   const sendCmd = useCallback((msg) => {
