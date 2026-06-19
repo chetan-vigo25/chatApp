@@ -26,6 +26,7 @@ import { recordCall } from './services/callLogService';
 import { uploadRecordingChunk, finalizeRecording } from './services/callRecordingService';
 import { playRingtone, playRingback, stopRingtone } from './services/ringtoneService';
 import nativeCall from './services/nativeCallService';
+import { registerVoipPush } from './services/voipPushService';
 import {
   ringCall, cancelCall, acceptCallSignal, rejectCallSignal, endCallSignal,
   registerCallSignalListeners,
@@ -39,7 +40,10 @@ import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // cold-start Answer replay (consumeInitialNotifeeCall) and dismissing the
 // incoming-call notification once answered/ended (cancelIncomingCallNotifee).
 import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
-import { cancelAllIncomingCallNotifee, consumeInitialNotifeeCall } from '../firebase/callNotifee';
+import {
+  cancelAllIncomingCallNotifee, consumeInitialNotifeeCall,
+  startOngoingCallNotification, stopOngoingCallNotification,
+} from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
 
 export const CallContext = createContext(null);
@@ -139,6 +143,33 @@ export const CallProvider = ({ children }) => {
       Keyboard.dismiss();
     }
   }, [state.status]);
+
+  // ---- active-call ongoing foreground service (Android) ----
+  // While a call is CONNECTED, run the WhatsApp-style persistent notification
+  // (caller name + live duration + Hang up) backed by a foreground service so the
+  // OS keeps the call's mic/camera alive when the app is backgrounded. Starts when
+  // the call goes ACTIVE (remote media joined) and stops on any non-active state.
+  // No-op off Android / without the native module (the orchestrator gates it).
+  useEffect(() => {
+    if (state.status === CALL_STATUS.ACTIVE) {
+      const label = state.isGroup
+        ? (state.groupName || 'Group call')
+        : (state.peer?.name || 'Ongoing call');
+      startOngoingCallNotification({
+        callId: state.signalId || state.callId,
+        callerName: label,
+        callerImage: state.isGroup ? null : (state.peer?.avatar || null),
+        callType: state.media === 'video' ? 'video' : 'audio',
+        startedAt: state.answeredAt || Date.now(),
+      });
+    } else {
+      // OUTGOING/INCOMING/ENDED/IDLE → ensure no stale ongoing notification.
+      stopOngoingCallNotification();
+    }
+  }, [
+    state.status, state.signalId, state.callId, state.isGroup,
+    state.groupName, state.peer, state.media, state.answeredAt,
+  ]);
 
   // ---- low-level command sender ----
   const sendCmd = useCallback((msg) => {
@@ -424,6 +455,8 @@ export const CallProvider = ({ children }) => {
     // the signaling id that the push/notification used as its callId. Cancel ALL
     // shown call notifications so none lingers regardless of id drift.
     cancelAllIncomingCallNotifee();
+    // Tear down the active-call ongoing foreground service / notification (Android).
+    stopOngoingCallNotification();
 
     // Release the server-side busy lock + notify the peer over the app socket,
     // keyed on the signaling id. Only when this call used the signaling path
@@ -508,12 +541,14 @@ export const CallProvider = ({ children }) => {
       });
     }
 
-    // return to chat shortly after showing the end state
+    // Return to chat quickly after the brief end state. Kept short so that a call
+    // answered over the lock screen drops straight back to the chat list on
+    // hang-up instead of lingering on the "Call ended" / lock screen.
     if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
     resetTimerRef.current = setTimeout(() => {
       endedRef.current = false;
       dispatch({ type: ACT.RESET });
-    }, 1200);
+    }, 500);
   }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, resetAudioRoute]);
 
   // Arm the unanswered-call timeout. Fires once after the configured ring window
@@ -1136,11 +1171,17 @@ export const CallProvider = ({ children }) => {
     // time). cancel-all avoids missing it when the posted id differs from the
     // live state id.
     cancelAllIncomingCallNotifee();
-    nativeCall.displayIncomingCall(
-      payload?.callId, callerId,
-      isGroup ? (payload?.groupName || 'Group call') : peer.name,
-      (payload?.media || 'audio') === 'video',
-    );
+    // iOS CallKit: report the incoming call so the native call screen rings (also
+    // when foreground). Skipped when a VoIP push already reported it (opts.skip
+    // NativeUi) to avoid a duplicate CallKit call. No-op on Android (CallKeep is
+    // iOS-gated; Android rings via expo-call-ui CallStyle instead).
+    if (!opts.skipNativeUi) {
+      nativeCall.displayIncomingCall(
+        payload?.callId, callerId,
+        isGroup ? (payload?.groupName || 'Group call') : peer.name,
+        (payload?.media || 'audio') === 'video',
+      );
+    }
   }, [myId, startRinging, armRingTimeout, ensureConnected]);
 
   // Match an inbound lifecycle signal to the current call (by signalId if known).
@@ -1228,7 +1269,9 @@ export const CallProvider = ({ children }) => {
     // A push-driven ring means the app wasn't foreground (or it's a full-screen
     // intent launch) → bring up the full-screen incoming screen.
     const expand = !!data?._fullScreen || AppState.currentState !== 'active';
-    onSignalIncoming(mapPushToIncoming(data), { expand });
+    // A VoIP push (iOS) is already reported to CallKit by the AppDelegate; don't
+    // report it a second time from JS.
+    onSignalIncoming(mapPushToIncoming(data), { expand, skipNativeUi: !!data?._voip });
   }, [onSignalIncoming, mapPushToIncoming]);
 
   // Accept tapped on the notification (or a plain tap): make sure the ringing
@@ -1247,12 +1290,29 @@ export const CallProvider = ({ children }) => {
     rejectCallSignal({ callId: data?.callId || null, callerId: data?.callerId || null });
   }, [reject]);
 
+  // End tapped on the active-call ongoing notification → hang up the live call.
+  const onPushHangup = useCallback(() => {
+    const snap = stateRef.current;
+    if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    if (snap.status === CALL_STATUS.INCOMING) reject(); else hangup();
+  }, [reject, hangup]);
+
+  // Body tap on the active-call ongoing notification → bring the call forward
+  // (un-minimize so CallOverlay shows full-screen once the app is foregrounded).
+  const onPushResume = useCallback(() => {
+    const snap = stateRef.current;
+    if (snap.status === CALL_STATUS.IDLE) return;
+    maximize();
+  }, [maximize]);
+
   useEffect(() => {
     if (!isAuthenticated) return undefined;
     const subs = [
       DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.INCOMING, onPushIncoming),
       DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.ACCEPT, onPushAccept),
       DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.REJECT, onPushReject),
+      DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.HANGUP, onPushHangup),
+      DeviceEventEmitter.addListener(CALL_PUSH_EVENTS.RESUME, onPushResume),
     ];
     // Cold start: replay the notification that launched the app (Accept tap /
     // full-screen / body) ONLY now that these listeners are attached and the user
@@ -1261,7 +1321,7 @@ export const CallProvider = ({ children }) => {
     // the single source of truth for the initial action (App.js no longer does it).
     consumeInitialNotifeeCall();
     return () => subs.forEach((s) => { try { s.remove(); } catch (_) {} });
-  }, [isAuthenticated, onPushIncoming, onPushAccept, onPushReject]);
+  }, [isAuthenticated, onPushIncoming, onPushAccept, onPushReject, onPushHangup, onPushResume]);
 
   // Fire the deferred Accept (from a call-push Accept tap) the moment the ringing
   // state is committed — accept() itself no-ops unless status is INCOMING.
@@ -1330,7 +1390,10 @@ export const CallProvider = ({ children }) => {
         if (snap.micOn === muted) actionsRef.current.toggleMic && actionsRef.current.toggleMic();
       },
     });
-    return unsub;
+    // iOS PushKit: register the VoIP token + listen for incoming VoIP pushes so a
+    // terminated/locked app rings via CallKit. No-op on Android / Expo Go.
+    const unsubVoip = registerVoipPush();
+    return () => { unsub(); unsubVoip(); };
   }, [isAuthenticated]);
 
   const value = {

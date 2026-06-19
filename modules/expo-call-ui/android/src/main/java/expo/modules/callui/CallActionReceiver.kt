@@ -16,15 +16,25 @@ import androidx.core.app.NotificationManagerCompat
  */
 class CallActionReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
-    if (intent.action != ACTION_DECLINE) return
     val callId = intent.getStringExtra(EXTRA_CALL_ID) ?: return
-    NotificationManagerCompat.from(context).cancel(callId.hashCode())
-    CallUiBus.dispatch(
-      mapOf(
-        "action" to "decline",
-        "callId" to callId,
-        "callerId" to intent.getStringExtra(EXTRA_CALLER_ID)
-      )
-    )
+    when (intent.action) {
+      ACTION_DECLINE -> {
+        NotificationManagerCompat.from(context).cancel(callId.hashCode())
+        CallUiBus.dispatch(
+          mapOf(
+            "action" to "decline",
+            "callId" to callId,
+            "callerId" to intent.getStringExtra(EXTRA_CALLER_ID)
+          )
+        )
+      }
+      // Hang up from the active-call ongoing notification: stop the foreground
+      // service immediately (so the OS tears down the persistent notification even
+      // if JS is slow/killed) and signal 'hangup' into the call flow.
+      ACTION_HANGUP -> {
+        CallForegroundService.stop(context)
+        CallUiBus.dispatch(mapOf("action" to "hangup", "callId" to callId))
+      }
+    }
   }
 }

@@ -81,9 +81,38 @@ const emitCallAction = (action, data) => {
   } else if (action === 'accept') {
     DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, payload);
     DeviceEventEmitter.emit(CALL_PUSH_EVENTS.ACCEPT, payload);
-  } else { // 'incoming' (full-screen / body tap)
+  } else if (action === 'hangup') { // End on the active-call ongoing notification
+    DeviceEventEmitter.emit(CALL_PUSH_EVENTS.HANGUP, payload);
+  } else if (action === 'ongoing') { // body tap on the active-call notification
+    DeviceEventEmitter.emit(CALL_PUSH_EVENTS.RESUME, payload);
+  } else { // 'incoming' (full-screen / body tap on the ringing notification)
     DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, payload);
   }
+};
+
+// ===== active-call ongoing foreground service (Android, CallStyle backend) =====
+// A persistent call notification with a live duration timer + Hang up action,
+// shown for the whole CONNECTED call. CallStyle.forOngoingCall is only available
+// via the native ExpoCallUi backend; notifee can't render it, so this no-ops when
+// the native module is absent (the in-app CallOverlay still shows everything).
+export const startOngoingCallNotification = (call) => {
+  if (!isCallUi() || !call?.callId) return;
+  try {
+    getCallUi().startOngoingCall({
+      callId: String(call.callId),
+      callerName: call.callerName || 'Ongoing call',
+      callerImage: call.callerImage || null,
+      callType: call.callType === 'video' ? 'video' : 'audio',
+      startedAt: call.startedAt || 0,
+    });
+  } catch (err) {
+    console.warn('[callNotif] startOngoingCall failed:', err?.message);
+  }
+};
+
+export const stopOngoingCallNotification = () => {
+  if (!isCallUi()) return;
+  try { getCallUi().stopOngoingCall(); } catch (_) { /* best-effort */ }
 };
 
 // ===== notifee channel (only used by the notifee fallback) =====
@@ -271,7 +300,11 @@ export const consumeInitialNotifeeCall = async () => {
     try {
       const action = getCallUi().getInitialCallAction();
       if (action?.action) {
-        setTimeout(() => emitCallAction(action.action, action), 800);
+        // Fire on the next tick (not +800ms). CallProvider only calls this once
+        // its listeners are attached and auth is restored, so the long defer just
+        // made the full-screen call UI appear 1-2s LATE (chat list flashed first
+        // on a killed/locked launch). 0ms = as instant as a cold start allows.
+        setTimeout(() => emitCallAction(action.action, action), 0);
       }
     } catch (err) {
       console.warn('[callNotif] CallUi initial action skipped:', err?.message);
@@ -288,7 +321,7 @@ export const consumeInitialNotifeeCall = async () => {
     const actionId = initial?.pressAction?.id;
     const detail = { notification: initial.notification, pressAction: initial.pressAction };
     const type = actionId && actionId !== 'default' ? EventType.ACTION_PRESS : EventType.PRESS;
-    setTimeout(() => routeNotifeeEvent(type, detail, { launched: true }), 800);
+    setTimeout(() => routeNotifeeEvent(type, detail, { launched: true }), 0);
   } catch (err) {
     console.warn('[callNotif] consume initial notification skipped:', err?.message);
   }

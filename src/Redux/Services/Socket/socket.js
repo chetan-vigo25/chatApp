@@ -72,6 +72,10 @@ let currentDeviceInfo = null;
 // notifications (new messages AND incoming-call wake pushes). Without this the
 // session has no token and `sendPushToUser` reaches 0 devices.
 let pushToken = '';
+// iOS PushKit (VoIP) token — used to wake a terminated/locked app for incoming
+// calls and report them to CallKit. Separate from the APNs/FCM `pushToken` used
+// for message/data notifications.
+let voipToken = '';
 
 const socketStateSubscribers = new Set();
 const pendingEmitQueue = [];
@@ -257,6 +261,9 @@ const emitDeviceRegister = () => {
     deviceId,
     pushToken,
     pushProvider: Platform.OS === 'ios' ? 'apns' : 'fcm',
+    // iOS-only PushKit token for incoming-call VoIP pushes (CallKit). Omitted on
+    // Android, where call pushes ride the existing FCM data-message path.
+    ...(voipToken ? { voipToken } : {}),
     deviceInfo: getDeviceInfoPayload(currentDeviceInfo),
   }, (response) => {
     if (response) {
@@ -288,6 +295,15 @@ export const setPushToken = (token) => {
   const next = token ? String(token) : '';
   if (next === pushToken) return;
   pushToken = next;
+  emitDeviceRegister();
+};
+
+// Register the iOS PushKit (VoIP) token. Re-registers the device so the backend
+// can target incoming-call VoIP pushes at this device. Safe to call repeatedly.
+export const setVoipToken = (token) => {
+  const next = token ? String(token) : '';
+  if (next === voipToken) return;
+  voipToken = next;
   emitDeviceRegister();
 };
 
@@ -1067,4 +1083,5 @@ export default {
   reconnectSocket,
   reauthenticateSocket,
   setPushToken,
+  setVoipToken,
 };

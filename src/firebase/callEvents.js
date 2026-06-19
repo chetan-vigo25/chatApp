@@ -7,6 +7,8 @@ export const CALL_PUSH_EVENTS = {
   INCOMING: 'call:push:incoming', // show the ringing UI (foreground / tap / wake)
   ACCEPT: 'call:push:accept',     // Accept action / tap → answer
   REJECT: 'call:push:reject',     // Decline action → reject
+  HANGUP: 'call:push:hangup',     // End tapped on the active-call ongoing notif → hangup
+  RESUME: 'call:push:resume',     // Body tap on the active-call ongoing notif → restore/open
 };
 
 export default CALL_PUSH_EVENTS;

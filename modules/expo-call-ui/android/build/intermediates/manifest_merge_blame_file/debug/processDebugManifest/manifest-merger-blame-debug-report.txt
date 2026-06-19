@@ -3,20 +3,47 @@
 3    package="expo.modules.callui" >
 4
 5    <uses-sdk android:minSdkVersion="24" />
-6
-7    <application>
-7-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:2:3-8:17
-8
-9        <!--
-10         Receives the Answer / Decline taps from the CallStyle notification.
-11         Runs natively even when the JS app is killed.
-12        -->
-13        <receiver
-13-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:5:5-7:34
-14            android:name="expo.modules.callui.CallActionReceiver"
-14-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:6:7-41
-15            android:exported="false" />
-15-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:7:7-31
-16    </application>
+6    <!--
+7       Foreground service for the active-call ongoing notification. Declared here
+8       in the module manifest (merged into the app manifest at build time) rather
+9       than via a config plugin, so the permission + <service> ship with the
+10       module that uses them. microphone/camera FGS types match the WebRTC call's
+11       actual mic/camera capture and need no extra runtime role (unlike the
+12       phoneCall type, which requires MANAGE_OWN_CALLS / self-managed Telecom).
+13    -->
+14    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+14-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:8:3-75
+14-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:8:20-72
+15    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+15-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:9:3-86
+15-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:9:20-83
+16    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:3-82
+16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:20-79
 17
-18</manifest>
+18    <application>
+18-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:12:3-24:17
+19
+20        <!--
+21         Receives the Decline / Hang-up taps from the CallStyle notifications.
+22         Runs natively even when the JS app is killed.
+23        -->
+24        <receiver
+24-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:15:5-17:34
+25            android:name="expo.modules.callui.CallActionReceiver"
+25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:16:7-41
+26            android:exported="false" />
+26-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:7-31
+27
+28        <!-- Persistent active-call notification (duration timer + Hang up). -->
+29        <service
+29-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:20:5-23:59
+30            android:name="expo.modules.callui.CallForegroundService"
+30-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:21:7-44
+31            android:exported="false"
+31-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:22:7-31
+32            android:foregroundServiceType="microphone|camera" />
+32-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:23:7-56
+33    </application>
+34
+35</manifest>

@@ -3,16 +3,33 @@
     package="expo.modules.callui" >
 
     <uses-sdk android:minSdkVersion="24" />
+    <!--
+       Foreground service for the active-call ongoing notification. Declared here
+       in the module manifest (merged into the app manifest at build time) rather
+       than via a config plugin, so the permission + <service> ship with the
+       module that uses them. microphone/camera FGS types match the WebRTC call's
+       actual mic/camera capture and need no extra runtime role (unlike the
+       phoneCall type, which requires MANAGE_OWN_CALLS / self-managed Telecom).
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 
     <application>
 
         <!--
-         Receives the Answer / Decline taps from the CallStyle notification.
+         Receives the Decline / Hang-up taps from the CallStyle notifications.
          Runs natively even when the JS app is killed.
         -->
         <receiver
             android:name="expo.modules.callui.CallActionReceiver"
             android:exported="false" />
+
+        <!-- Persistent active-call notification (duration timer + Hang up). -->
+        <service
+            android:name="expo.modules.callui.CallForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|camera" />
     </application>
 
 </manifest>

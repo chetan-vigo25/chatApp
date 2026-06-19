@@ -38,7 +38,21 @@ const uuidv4 = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c)
   return v.toString(16);
 });
 
-export const isAvailable = () => !!RNCallKeep;
+// MASTER SWITCH for the in-app CallKit call-flow integration (outgoing/active/end
+// + the answer/end event listeners). Currently OFF: wiring CallKit into the live
+// call flow let CallKit's `endCall` (fired during the connecting phase) terminate
+// the WebRTC call right after the callee answered — a call dropping "after ~2
+// rings". With this off, calls run on the proven WebRTC path exactly as before.
+//
+// NOTE: this does NOT disable the PushKit→CallKit incoming path in AppDelegate
+// (that only acts on a real VoIP push, which the backend isn't sending yet, so
+// it stays inert). Flip to true to re-enable + debug CallKit on a PHYSICAL device.
+const IOS_CALLKIT_ENABLED = false;
+
+// iOS-ONLY even when enabled. Android keeps its own incoming UI (expo-call-ui
+// CallStyle) + the active-call foreground service, so we must NOT let
+// react-native-callkeep's Android ConnectionService UI activate and double up.
+export const isAvailable = () => IOS_CALLKIT_ENABLED && !!RNCallKeep && Platform.OS === 'ios';
 
 export const uuidForCall = (callId) => {
   const key = String(callId || '');
@@ -61,7 +75,7 @@ const forget = (callId) => {
 };
 
 export const setup = async () => {
-  if (!RNCallKeep || setupDone) return isAvailable();
+  if (!isAvailable() || setupDone) return isAvailable();
   try {
     await RNCallKeep.setup({
       ios: {
@@ -93,31 +107,31 @@ export const setup = async () => {
 };
 
 export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
-  if (!RNCallKeep) return;
+  if (!isAvailable()) return;
   try {
     RNCallKeep.displayIncomingCall(uuidForCall(callId), String(handle || name || 'call'), name || 'Incoming call', 'generic', !!hasVideo);
   } catch (_) { /* no-op */ }
 };
 
 export const startOutgoingCall = (callId, handle, name, hasVideo = false) => {
-  if (!RNCallKeep) return;
+  if (!isAvailable()) return;
   try {
     RNCallKeep.startCall(uuidForCall(callId), String(handle || name || 'call'), name || 'Call', 'generic', !!hasVideo);
   } catch (_) { /* no-op */ }
 };
 
 export const setCurrentCallActive = (callId) => {
-  if (!RNCallKeep) return;
+  if (!isAvailable()) return;
   try { RNCallKeep.setCurrentCallActive(uuidForCall(callId)); } catch (_) { /* no-op */ }
 };
 
 export const setMuted = (callId, muted) => {
-  if (!RNCallKeep) return;
+  if (!isAvailable()) return;
   try { RNCallKeep.setMutedCall(uuidForCall(callId), !!muted); } catch (_) { /* no-op */ }
 };
 
 export const endCall = (callId) => {
-  if (!RNCallKeep) return;
+  if (!isAvailable()) return;
   try { RNCallKeep.endCall(uuidForCall(callId)); } catch (_) { /* no-op */ }
   forget(callId);
 };
@@ -128,7 +142,7 @@ export const endCall = (callId) => {
  * Returns an unsubscribe function. Safe no-op when the native module is absent.
  */
 export const registerEvents = (handlers = {}) => {
-  if (!RNCallKeep) return () => {};
+  if (!isAvailable()) return () => {};
   const answer = ({ callUUID }) => handlers.onAnswer && handlers.onAnswer(callIdForUuid(callUUID));
   const end = ({ callUUID }) => handlers.onEnd && handlers.onEnd(callIdForUuid(callUUID));
   const mute = ({ callUUID, muted }) => handlers.onToggleMute && handlers.onToggleMute(callIdForUuid(callUUID), muted);

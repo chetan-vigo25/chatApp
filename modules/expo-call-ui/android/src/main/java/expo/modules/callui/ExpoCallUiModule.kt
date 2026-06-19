@@ -17,6 +17,7 @@ const val EVENT_NAME = "onCallAction"
 
 const val ACTION_ANSWER = "expo.modules.callui.ANSWER"
 const val ACTION_DECLINE = "expo.modules.callui.DECLINE"
+const val ACTION_HANGUP = "expo.modules.callui.HANGUP"
 
 const val EXTRA_CALL_ACTION = "callAction"
 const val EXTRA_CALL_ID = "callId"
@@ -24,6 +25,7 @@ const val EXTRA_CALLER_ID = "callerId"
 const val EXTRA_CALLER_NAME = "callerName"
 const val EXTRA_CALLER_IMAGE = "callerImage"
 const val EXTRA_CALL_TYPE = "callType"
+const val EXTRA_STARTED_AT = "startedAt"
 
 // Process-wide bridge from the (static) BroadcastReceiver to the live JS module.
 // When JS isn't running yet (cold start from a killed app), the action is queued
@@ -53,6 +55,21 @@ class ExpoCallUiModule : Module() {
       appContext.reactContext?.let {
         NotificationManagerCompat.from(it).cancel(callId.hashCode())
       }
+    }
+
+    // ---- active-call ongoing foreground service (CallStyle.forOngoingCall) ----
+    Function("startOngoingCall") { options: Map<String, Any?> ->
+      val ctx = appContext.reactContext ?: return@Function
+      val callId = (options["callId"] as? String)?.takeIf { it.isNotBlank() } ?: return@Function
+      val name = options["callerName"] as? String
+      val image = options["callerImage"] as? String
+      val type = options["callType"] as? String ?: "audio"
+      val startedAtMs = (options["startedAt"] as? Number)?.toLong() ?: 0L
+      CallForegroundService.start(ctx, callId, name, image, type, startedAtMs)
+    }
+
+    Function("stopOngoingCall") {
+      appContext.reactContext?.let { CallForegroundService.stop(it) }
     }
 
     Function("getInitialCallAction") {

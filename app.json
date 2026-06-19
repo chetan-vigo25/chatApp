@@ -122,7 +122,8 @@
       "./plugins/withCallFullScreen",
       "./plugins/withNotifeeMavenRepo",
       "./plugins/withFirebaseNotificationMeta",
-      "./plugins/withNotificationServiceExtension"
+      "./plugins/withNotificationServiceExtension",
+      "./plugins/withIosVoip"
     ],
     "extra": {
       "eas": {

@@ -66,10 +66,100 @@ receive the socket `call:incoming`, so this push is the ONLY way to ring it.
   runs (no full-screen, no Accept/Decline). Put the fields under `data`.
 - **Priority high** (Android) / `apns-priority 10` so it wakes a dozing device.
 
-## Client status (already implemented — no app change needed)
+---
 
-- Android: notifee **full-screen intent** → launches the app's full-screen call
-  UI over the lock screen (`src/firebase/callNotifee.js`).
-- iOS: expo-notifications heads-up with Accept/Decline.
-- Background/foreground/cold-launch handlers + token re-registration are wired.
-  Requires the app rebuilt with the notifee native module.
+# iOS incoming call — PushKit (VoIP) + CallKit  ⟵ NEW
+
+Android uses the FCM data push above. **iOS must use a separate APNs VoIP
+(PushKit) push** to ring a backgrounded/terminated/locked device with the native
+CallKit screen. A normal APNs alert push **cannot** show a call screen or run
+code on a killed app; only a VoIP push can, and iOS 13+ **requires** the app to
+report the call to CallKit in the same run loop (the app already does this
+natively — see client status).
+
+## Device token registration (already wired client-side)
+
+On iOS the app registers a **PushKit VoIP token** (distinct from the APNs/FCM
+token) via the existing `notification:device:register` socket event, now with an
+extra field:
+
+```jsonc
+{
+  "deviceId": "...",
+  "pushToken": "<APNs token>",      // existing — alerts / data
+  "pushProvider": "apns",
+  "voipToken": "<PushKit VoIP token>", // NEW — iOS call pushes go here
+  "deviceInfo": { ... }
+}
+```
+
+Backend must **persist `voipToken`** per device and target it for call pushes on
+iOS. (Android devices send no `voipToken`; keep using their FCM token.)
+
+## Sending the iOS VoIP push
+
+Send to APNs with these headers (HTTP/2 APNs or a provider SDK):
+
+- `apns-push-type: voip`  (REQUIRED)
+- `apns-topic: com.chat.baatCheet.voip`  ⟵ the **bundle id + `.voip`** suffix
+- `apns-priority: 10`
+- Auth: your APNs key/cert for the app.
+
+Payload (no `aps.alert`; CallKit renders the UI from these fields):
+
+```jsonc
+{
+  "uuid": "<RFC4122 UUID for this call>",   // CallKit call id — generate per call
+  "callId": "<app-socket signalId>",         // same id as the Android push / call:* events
+  "callerId": "<caller user _id>",
+  "callerName": "<caller display name>",
+  "callerImage": "<caller avatar url>",      // optional
+  "callType": "audio"                         // "audio" | "video"
+}
+```
+
+| key | Req | Used for |
+|---|---|---|
+| `uuid` | ✅ | The CallKit call UUID (RFC4122). If omitted the client falls back to `callId`, which must then itself be a UUID. |
+| `callId` | ✅ | App signaling id — stored as `signalId`; ties CallKit accept → WebRTC reconcile + caller notify. |
+| `callerId` | ✅ | Without it the client ignores the push. |
+| `callerName` | ✅ | Shown on the CallKit screen. |
+| `callType` | ✅ | Audio/video CallKit call. |
+| `callerImage` | – | Optional. |
+
+## Critical iOS notes
+
+- **`apns-topic` MUST be `<bundleId>.voip`** (here `com.chat.baatCheet.voip`),
+  not the plain bundle id — a VoIP push to the wrong topic is silently dropped.
+- **Every VoIP push must result in a reported call.** Don't send a VoIP push for
+  anything except a real incoming call (Apple throttles / can disable VoIP pushes
+  for an app that receives them without reporting a call). For call **cancel**,
+  use the socket `call:cancel` / the Android-style data push — NOT another VoIP
+  push.
+- Use **`apns-priority: 10`** and the **`voip` push type**.
+- The VoIP token rotates; always push to the latest `voipToken` the device
+  registered (same freshness rule as the FCM token).
+
+## Recommended ring flow (both platforms)
+
+On `call:ring`, for each offline/background callee, branch by device platform:
+- **iOS device** → send the **VoIP push** above to its `voipToken`.
+- **Android device** → send the **FCM data push** (top of this doc) to its FCM token.
+Both carry the same `callId` so foreground socket + push de-dupe on it.
+
+---
+
+## Client status
+
+**Android (already implemented):**
+- notifee / native `CallStyle` **full-screen intent** → app's full-screen call UI
+  over the lock screen (`src/firebase/callNotifee.js`, `modules/expo-call-ui`).
+- **Active-call ongoing foreground service** (duration timer + Hang up) — NEW.
+
+**iOS (implemented this change — requires a dev/EAS rebuild):**
+- `react-native-callkeep` (CallKit) + `react-native-voip-push-notification`
+  (PushKit) wired via `plugins/withIosVoip.js` (entitlement + AppDelegate) and
+  `src/calls/services/{nativeCallService,voipPushService}.js`.
+- The AppDelegate PushKit handler reports the call to CallKit synchronously, then
+  forwards to JS to wake the WebRTC (WebView) engine.
+- **Does nothing in Expo Go** — native modules require a custom dev/EAS build.
