@@ -115,6 +115,21 @@ export const stopOngoingCallNotification = () => {
   try { getCallUi().stopOngoingCall(); } catch (_) { /* best-effort */ }
 };
 
+// ===== lock-screen security (Android) =====
+// Is the device locked right now? Recorded when a call arrives so we only apply
+// locked-call restrictions to calls that began on a locked device.
+export const isDeviceLockedNow = () => {
+  if (!isCallUi()) return false;
+  try { return !!getCallUi().isDeviceLocked(); } catch (_) { return false; }
+};
+
+// Send the app behind the keyguard (revoke show-when-locked + move task to back)
+// so the system lock screen reasserts. No-op off Android / without the module.
+export const returnToLockScreen = () => {
+  if (!isCallUi()) return;
+  try { getCallUi().returnToLockScreen(); } catch (_) { /* best-effort */ }
+};
+
 // ===== notifee channel (only used by the notifee fallback) =====
 export const ensureCallChannel = async () => {
   if (isCallUi()) return CALL_CHANNEL_ID; // native module creates its own channel

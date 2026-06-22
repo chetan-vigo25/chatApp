@@ -384,6 +384,23 @@ export const clearChatNotifications = async (chatId) => {
 
 // ─── BACKGROUND MESSAGE HANDLER ───
 // MUST be called at top-level (index.js), NOT inside a React component
+// True only when a user session exists in storage. Logout runs AsyncStorage.clear()
+// (removing accessToken + deviceId), so this flips to false the instant the user
+// logs out — letting the push handlers DROP any call/message push that still
+// arrives (e.g. before the backend deregisters this device's token), so a
+// logged-out device never rings for a call or shows a chat notification.
+const hasActiveSession = async () => {
+  try {
+    const [accessToken, deviceId] = await Promise.all([
+      AsyncStorage.getItem('accessToken'),
+      AsyncStorage.getItem('deviceId'),
+    ]);
+    return !!(accessToken && deviceId);
+  } catch (_) {
+    return false;
+  }
+};
+
 export const registerBackgroundHandler = () => {
   // Guard: this runs at app boot. If the native Firebase module isn't available
   // (e.g. older dev build / Expo Go), never let it crash startup.
@@ -392,6 +409,10 @@ export const registerBackgroundHandler = () => {
   try {
     m().setBackgroundMessageHandler(async (remoteMessage) => {
       // console.log('Background message received:', JSON.stringify(remoteMessage));
+
+      // Logged out → never ring or notify. Drops calls + messages that arrive
+      // before the backend deregisters this device's push/voip token.
+      if (!(await hasActiveSession())) return;
 
       // Incoming call (data-only, high priority). On Android show a notifee
       // FULL-SCREEN-INTENT notification → launches the app's full-screen call UI
@@ -440,6 +461,8 @@ export const initializeNotifications = () => {
   // Foreground messages — system won't show these automatically, so we do it
   unsubscribeOnMessage = m().onMessage(async (remoteMessage) => {
     // console.log('Foreground message received:', JSON.stringify(remoteMessage));
+    // Logged out → ignore any push that still lands (calls + messages).
+    if (!(await hasActiveSession())) return;
     // A call push in the foreground → drive the live ringing overlay directly
     // (the always-connected app socket usually beats it; this is the wake-up
     // fallback). Never render a banner for it.

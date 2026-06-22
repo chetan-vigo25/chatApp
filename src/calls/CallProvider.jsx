@@ -43,6 +43,7 @@ import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
 import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall,
   startOngoingCallNotification, stopOngoingCallNotification,
+  isDeviceLockedNow, returnToLockScreen,
 } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
 
@@ -130,6 +131,11 @@ export const CallProvider = ({ children }) => {
   // the recorded callId to the app signaling id so it persists across the state
   // reset at hang-up, and guard against double-start.
   const recordingOnRef = useRef(false);
+  // Lock-screen security: true when the current call ARRIVED while the device was
+  // locked. Such a call shows over the keyguard but the app behind it must stay
+  // protected — back/end returns to the lock screen instead of revealing the app.
+  const lockedCallRef = useRef(false);
+  const [lockedCall, setLockedCall] = useState(false);
   const recordingCallIdRef = useRef(null);
 
   useEffect(() => { stateRef.current = state; }, [state]);
@@ -583,6 +589,14 @@ export const CallProvider = ({ children }) => {
     if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
     resetTimerRef.current = setTimeout(() => {
       endedRef.current = false;
+      // If this call began on a locked device, drop the app BEHIND the keyguard
+      // now that it's over — the user lands on the system lock screen, never the
+      // app. Cleared so a later (unlocked) call behaves normally.
+      if (lockedCallRef.current) {
+        returnToLockScreen();
+        lockedCallRef.current = false;
+        setLockedCall(false);
+      }
       dispatch({ type: ACT.RESET });
     }, 500);
   }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, resetAudioRoute]);
@@ -1130,6 +1144,14 @@ export const CallProvider = ({ children }) => {
     dispatch({ type: ACT.SET_FLAG, key: 'minimized', value: false });
   }, []);
 
+  // Leave the call UI while the device is locked → return to the system lock
+  // screen (NOT the app). Used by the call screen's back handler when this call
+  // arrived on a locked device; the call keeps running in the background (the
+  // ongoing-call notification brings it back) but the app stays protected.
+  const leaveToLock = useCallback(() => {
+    returnToLockScreen();
+  }, []);
+
   // Promote the compact incoming-call heads-up banner to the full-screen ring
   // screen (tap the banner). Until this fires, an unanswered incoming call rings
   // only as the top banner so the user can keep using the app (WhatsApp-style).
@@ -1189,6 +1211,12 @@ export const CallProvider = ({ children }) => {
     });
     startRinging('incoming');
     armRingTimeout();
+    // Record whether the device was locked when this call arrived. If so, the
+    // call shows over the keyguard but the rest of the app must stay protected:
+    // back / end returns to the lock screen instead of revealing the app.
+    const locked = isDeviceLockedNow();
+    lockedCallRef.current = locked;
+    setLockedCall(locked);
     ensureConnected(); // wake the WebRTC engine so its `incoming` can land
     // Show the WhatsApp-style FULL-SCREEN incoming screen (rather than the
     // compact top banner) when the ring comes up while the app isn't in the
@@ -1455,6 +1483,8 @@ export const CallProvider = ({ children }) => {
     maximize,
     expandIncoming,
     queryPresence,
+    lockedCall,
+    leaveToLock,
   };
 
   const showEngine = isAuthenticated && !IS_EXPO_GO;

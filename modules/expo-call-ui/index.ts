@@ -53,6 +53,22 @@ export const stopOngoingCall = (): void => {
   Native?.stopOngoingCall();
 };
 
+// ---- lock-screen security ----
+// True when the device is currently locked (keyguard showing). Android only;
+// false on iOS / Expo Go (no native module).
+export const isDeviceLocked = (): boolean => !!Native?.isDeviceLocked?.();
+
+// Runtime override of show-when-locked on the current activity.
+export const setShowWhenLocked = (show: boolean): void => {
+  Native?.setShowWhenLocked?.(show);
+};
+
+// Revoke show-when-locked + move the app behind the keyguard so the system lock
+// screen reasserts (used when a locked-device call ends / the user leaves it).
+export const returnToLockScreen = (): void => {
+  Native?.returnToLockScreen?.();
+};
+
 // On cold start, returns the action the launching notification carried (Answer
 // tap / full-screen / body tap), or null. Consumed once.
 export const getInitialCallAction = (): CallAction | null =>
