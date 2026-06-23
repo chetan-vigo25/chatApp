@@ -390,9 +390,11 @@ export const useContactSync = () => {
         contacts: hashed.map(contact => ({
           id: contact.id,
           originalId: contact.id,
-          // Privacy: do NOT upload the device contact name. Matching is done
-          // purely by hashed phone; the display name is resolved locally from
-          // the device. (The backend `fullName` field is optional.)
+          // Upload the device-saved contact name so the backend can persist it
+          // (Mongo ContactSync + Redis cache) and other surfaces resolve the same
+          // name. Matching is still done purely by hashed phone; the name is just
+          // the label the user has saved for this number.
+          fullName: contact.fullName || null,
           hash: contact.hash,
           salt: contact.salt,
           algorithm: contact.algorithm,

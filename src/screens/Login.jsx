@@ -56,9 +56,9 @@ export default function Login({ navigation }) {
     const result = await dispatch(generateOtpAction(fullPhoneNumber));
     if (generateOtpAction.fulfilled.match(result)) {
       console.log('[LOGIN] OTP request succeeded');
-      const data = result.payload?.otpData;
-      const otp = data?.otp || data?.code || data;
-      navigation.navigate('Otp', { selectedCountry, phoneNumber, generatedOtp: otp });
+      // The OTP is delivered only via SMS — it is never returned in the response,
+      // so we navigate without any code (no in-app banner).
+      navigation.navigate('Otp', { selectedCountry, phoneNumber });
       setPhoneNumber('');
     } else {
       console.log('[LOGIN] OTP request failed →', result?.error?.message || result?.payload);
@@ -159,7 +159,7 @@ export default function Login({ navigation }) {
             style={styles.altRow}
           >
             <Text style={[styles.altText, { color: secondaryText }]}>or </Text>
-            <Text style={[styles.altLink, { color: link }]}>sign in with email</Text>
+            <Text style={[styles.altLink, { color: link }]}>sign in with UserName</Text>
           </TouchableOpacity>
 
           <TouchableOpacity

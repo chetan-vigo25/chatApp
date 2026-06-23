@@ -18,8 +18,179 @@ import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { chatServices } from '../Redux/Services/Chat/Chat.Services';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { subscribeSessionReset } from '../services/sessionEvents';
+import { waitWhilePaused } from '../services/syncPriority';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
+
+// ── First-time restore dedupe (module scope) ────────────────────────────────
+// The initial chatlist+messages restore must run exactly ONCE. Two guards:
+//   • _initialSyncDoneFor — userId that finished restoring in THIS app session,
+//     so a SyncScreen remount (navigation reset / Fast Refresh) skips instantly
+//     even before the persisted INITIAL_SYNC_COMPLETE flag is read back.
+//   • _initialSyncPromise — the in-flight restore; concurrent mounts ride on the
+//     same promise instead of each kicking off their own parallel restore.
+// Across launches the persisted ChatDatabase.isInitialSyncDone(userId) flag is
+// the source of truth; these only dedupe within a single running session.
+let _initialSyncPromise = null;
+let _initialSyncDoneFor = null;
+
+// Set true when the background message warm should stop (logout / user-switch).
+let _warmAbort = false;
+
+// A session reset (logout / user-switch / token-refresh failure) wipes SQLite
+// via performSessionReset, so the in-memory "already restored" memory must be
+// cleared too — otherwise a same-session re-login of the SAME user would short-
+// circuit the restore and land on an empty chat list. We also abort any in-flight
+// background message warm so it can't write the previous user's messages back
+// into a freshly-wiped DB.
+subscribeSessionReset(() => {
+  _initialSyncPromise = null;
+  _initialSyncDoneFor = null;
+  _warmAbort = true;
+});
+
+const MSG_WARM_LIMIT = 25;        // recent messages to pre-cache per chat
+const MSG_WARM_CONCURRENCY = 4;   // parallel chat fetches (was a batch of 3)
+const MSG_WARM_WRITE_GAP_MS = 60; // breathing room between writes so chat-open reads slip in
+
+const _normalizeMessage = (msg, chat, chatId) => ({
+  id: msg._id || msg.messageId,
+  serverMessageId: msg._id || msg.messageId,
+  chatId,
+  groupId: chat.groupId || (chat.chatType === 'group' ? chatId : null),
+  senderId: msg.senderId || null,
+  senderName: msg.senderName || null,
+  text: msg.text || '',
+  type: msg.messageType || msg.type || 'text',
+  status: msg.status || 'sent',
+  timestamp: msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now(),
+  createdAt: msg.createdAt || new Date().toISOString(),
+  synced: 1,
+  mediaUrl: msg.mediaUrl || null,
+  mediaType: msg.mediaType || null,
+  replyToMessageId: msg.replyToMessageId || (typeof msg.replyTo === 'string' ? msg.replyTo : msg.replyTo?._id) || null,
+  replyPreviewText: msg.replyPreviewText || msg.replyTo?.text || null,
+  replyPreviewType: msg.replyPreviewType || msg.replyTo?.messageType || null,
+  replySenderId: msg.replySenderId || msg.replyTo?.senderId || null,
+  replySenderName: msg.replySenderName || msg.replyTo?.senderName || null,
+});
+
+// Background, fire-and-forget warm of recent messages per chat. NOT awaited by
+// the restore — the user is already in the app. Uses a bounded worker pool
+// (MSG_WARM_CONCURRENCY) instead of the old sequential batches-of-3, and pulls
+// fewer messages (older history loads lazily on chat open via message:sync /
+// history backfill). Aborts immediately on logout.
+const _warmRecentMessages = (chats) => {
+  _warmAbort = false;
+  const queue = [...chats];
+  const worker = async () => {
+    while (queue.length) {
+      if (_warmAbort) return;
+      // Never fire authenticated message fetches without a token (e.g. mid
+      // logout/session reset) — that just spams 401 "No token provided".
+      const token = await AsyncStorage.getItem('accessToken');
+      if (!token) { _warmAbort = true; return; }
+      const chat = queue.shift();
+      const chatId = chat.chatId || chat._id;
+      if (!chatId) continue;
+      try {
+        const msgResponse = await chatServices.chatMessageList({ chatId, page: 1, limit: MSG_WARM_LIMIT });
+        if (_warmAbort) return;
+        const messages = msgResponse?.data?.docs || [];
+        if (messages.length > 0) {
+          // Yield to the UI before writing: upsertMessages takes a BEGIN
+          // EXCLUSIVE lock that blocks reads, so if the user is opening a chat
+          // we wait out the pause window first — keeping chat-open instant.
+          await waitWhilePaused();
+          if (_warmAbort) return;
+          await ChatDatabase.upsertMessages(messages.map((m) => _normalizeMessage(m, chat, chatId)));
+          // Brief gap so back-to-back warm writes can't monopolize the writer.
+          await new Promise((r) => setTimeout(r, MSG_WARM_WRITE_GAP_MS));
+        }
+      } catch (err) {
+        console.warn('[Sync] bg messages fetch failed for', chatId, err?.message);
+      }
+    }
+  };
+  // Detach: failures here must never bubble into navigation.
+  Promise.all(Array.from({ length: MSG_WARM_CONCURRENCY }, worker))
+    .then(() => { if (!_warmAbort) console.log('[Sync] background message warm complete'); })
+    .catch(() => {});
+};
+
+// Restore that GATES entry to the app on the chatlist only. The chat list renders
+// entirely from the chatlist payload (names, avatars, last-message previews), so
+// once it's persisted we mark sync complete and let the user in — per-chat message
+// history is warmed in the background (and lazily on chat open). This is what
+// turns the old 1–2 min "Syncing messages…" wait into a couple of seconds.
+// Module-level so it's decoupled from the screen instance.
+const _performInitialRestore = async (userId, onProgress) => {
+  // Don't attempt an authenticated restore without a token (session not fully
+  // saved yet / mid-reset) — it would 401 with "No token provided".
+  const token = await AsyncStorage.getItem('accessToken');
+  if (!token) {
+    console.warn('[Sync] no access token yet — skipping restore');
+    return false;
+  }
+
+  // ── Step 1: Fetch chatlist (the ONLY thing gating entry to the app) ──
+  onProgress(15, 'Fetching chats...');
+  let chatList = [];
+  try {
+    const response = await chatServices.chatListData('');
+    chatList = response?.data?.docs || [];
+  } catch (err) {
+    console.warn('[Sync] chatlist fetch failed:', err?.message);
+  }
+
+  if (chatList.length === 0) {
+    // Nothing to restore (brand-new account or no history) — mark done so we
+    // never route through this screen again for this user.
+    await ChatDatabase.setSyncMeta('INITIAL_SYNC_COMPLETE', userId);
+    return true;
+  }
+
+  // ── Step 2: Persist chatlist to SQLite (renders the whole chat list) ──
+  onProgress(60, `Syncing ${chatList.length} chats...`);
+
+  const normalizedChats = chatList.map((chat) => {
+    const isGroup = chat.chatType === 'group';
+    return {
+      ...chat,
+      isArchived: Boolean(chat.archived),
+      ...((!isGroup && !chat.peerUser && chat.peerUserId) ? {
+        peerUser: {
+          _id: chat.peerUserId,
+          fullName: chat.chatName || '',
+          profileImage: chat.chatAvatar || null,
+        },
+      } : {}),
+      ...((isGroup && !chat.group) ? {
+        isGroup: true,
+        groupId: chat.groupId || chat.chatId,
+        group: {
+          _id: chat.groupId || chat.chatId,
+          name: chat.chatName || '',
+          avatar: chat.chatAvatar || null,
+        },
+        groupName: chat.chatName || '',
+        groupAvatar: chat.chatAvatar || null,
+        memberCount: chat.groupMembersCount || 0,
+      } : {}),
+    };
+  });
+
+  await ChatDatabase.upsertChats(normalizedChats);
+  ChatCache.setChats(normalizedChats);
+
+  // ── Step 3: Mark complete + let the user in NOW. Message history is warmed
+  // in the background (not awaited) and lazily on chat open. ──
+  await ChatDatabase.setSyncMeta('INITIAL_SYNC_COMPLETE', userId);
+  onProgress(100, 'Ready!');
+  _warmRecentMessages(normalizedChats);
+  return true;
+};
 
 export default function SyncScreen({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
@@ -75,136 +246,35 @@ export default function SyncScreen({ navigation, route }) {
         return;
       }
 
-      // Check if initial sync already done for this user
-      try {
-        const alreadySynced = await ChatDatabase.isInitialSyncDone(userId);
-        if (alreadySynced) {
-          navigateAway();
-          return;
-        }
-      } catch {
-        // DB not ready — proceed with sync anyway
-      }
-
-      // ── Step 1: Fetch chatlist from API ──
-      updateProgress(10, 'Fetching chats...');
-      let chatList = [];
-      try {
-        const response = await chatServices.chatListData('');
-        chatList = response?.data?.docs || [];
-      } catch (err) {
-        console.warn('[Sync] chatlist fetch failed:', err?.message);
-      }
-
-      if (!mountedRef.current) return;
-
-      if (chatList.length === 0) {
-        // Nothing to restore (brand-new account or no chat history/backup) —
-        // this screen is only meaningful when there ARE chats to sync, so mark
-        // sync done and leave immediately instead of flashing a progress bar.
-        await ChatDatabase.setSyncMeta('INITIAL_SYNC_COMPLETE', userId);
+      // Already restored this session — skip straight through (cheapest guard).
+      if (_initialSyncDoneFor === userId) {
         navigateAway();
         return;
       }
 
-      // ── Step 2: Save chatlist to SQLite ──
-      updateProgress(20, `Syncing ${chatList.length} chats...`);
-
-      // Normalize flat API format before saving
-      const normalizedChats = chatList.map((chat) => {
-        const isGroup = chat.chatType === 'group';
-        return {
-          ...chat,
-          isArchived: Boolean(chat.archived),
-          ...((!isGroup && !chat.peerUser && chat.peerUserId) ? {
-            peerUser: {
-              _id: chat.peerUserId,
-              fullName: chat.chatName || '',
-              profileImage: chat.chatAvatar || null,
-            },
-          } : {}),
-          ...((isGroup && !chat.group) ? {
-            isGroup: true,
-            groupId: chat.groupId || chat.chatId,
-            group: {
-              _id: chat.groupId || chat.chatId,
-              name: chat.chatName || '',
-              avatar: chat.chatAvatar || null,
-            },
-            groupName: chat.chatName || '',
-            groupAvatar: chat.chatAvatar || null,
-            memberCount: chat.groupMembersCount || 0,
-          } : {}),
-        };
-      });
-
-      await ChatDatabase.upsertChats(normalizedChats);
-      ChatCache.setChats(normalizedChats);
-
-      if (!mountedRef.current) return;
-
-      // ── Step 3: Fetch latest 50 messages for each chat ──
-      const totalChats = normalizedChats.length;
-      let synced = 0;
-
-      // Process chats in batches of 3 for speed without overwhelming the server
-      const BATCH_SIZE = 3;
-      for (let i = 0; i < totalChats; i += BATCH_SIZE) {
-        if (!mountedRef.current) return;
-
-        const batch = normalizedChats.slice(i, i + BATCH_SIZE);
-        const promises = batch.map(async (chat) => {
-          const chatId = chat.chatId || chat._id;
-          if (!chatId) return;
-
-          try {
-            const msgResponse = await chatServices.chatMessageList({
-              chatId,
-              page: 1,
-              limit: 50,
-            });
-            const messages = msgResponse?.data?.docs || [];
-            if (messages.length > 0) {
-              // Normalize messages for SQLite
-              const normalizedMsgs = messages.map((msg) => ({
-                id: msg._id || msg.messageId,
-                serverMessageId: msg._id || msg.messageId,
-                chatId,
-                groupId: chat.groupId || (chat.chatType === 'group' ? chatId : null),
-                senderId: msg.senderId || null,
-                senderName: msg.senderName || null,
-                text: msg.text || '',
-                type: msg.messageType || msg.type || 'text',
-                status: msg.status || 'sent',
-                timestamp: msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now(),
-                createdAt: msg.createdAt || new Date().toISOString(),
-                synced: 1,
-                mediaUrl: msg.mediaUrl || null,
-                mediaType: msg.mediaType || null,
-                replyToMessageId: msg.replyToMessageId || (typeof msg.replyTo === 'string' ? msg.replyTo : msg.replyTo?._id) || null,
-                replyPreviewText: msg.replyPreviewText || msg.replyTo?.text || null,
-                replyPreviewType: msg.replyPreviewType || msg.replyTo?.messageType || null,
-                replySenderId: msg.replySenderId || msg.replyTo?.senderId || null,
-                replySenderName: msg.replySenderName || msg.replyTo?.senderName || null,
-              }));
-              await ChatDatabase.upsertMessages(normalizedMsgs);
-            }
-          } catch (err) {
-            // Skip failed chats — non-blocking
-            console.warn('[Sync] messages fetch failed for', chatId, err?.message);
-          }
-        });
-
-        await Promise.all(promises);
-        synced += batch.length;
-
-        if (!mountedRef.current) return;
-        const percent = 30 + Math.round((synced / totalChats) * 65);
-        updateProgress(percent, `Syncing messages... ${synced}/${totalChats}`);
+      // Persisted cross-launch guard: restored on a previous launch?
+      try {
+        if (await ChatDatabase.isInitialSyncDone(userId)) {
+          _initialSyncDoneFor = userId;
+          navigateAway();
+          return;
+        }
+      } catch {
+        // DB not ready — fall through and (de-duped) attempt the restore.
       }
 
-      // ── Step 4: Mark sync complete ──
-      await ChatDatabase.setSyncMeta('INITIAL_SYNC_COMPLETE', userId);
+      // Dedupe concurrent runs: if a restore is already in flight (e.g. another
+      // SyncScreen mount), ride on the SAME promise instead of starting a second
+      // parallel restore. Only the first caller creates it.
+      if (!_initialSyncPromise) {
+        _initialSyncPromise = _performInitialRestore(userId, updateProgress)
+          // Only remember "restored this session" when it actually completed; a
+          // no-token bail returns false so it retries on the next mount/launch.
+          .then((done) => { if (done) _initialSyncDoneFor = userId; })
+          .finally(() => { _initialSyncPromise = null; });
+      }
+      await _initialSyncPromise;
+
       updateProgress(100, 'Ready!');
       setTimeout(navigateAway, 400);
 

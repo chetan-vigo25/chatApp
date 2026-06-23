@@ -34,6 +34,7 @@ import {
   uploadMediaFile,
 } from "../utils/mediaService";
 import SqliteWriter from "../services/SqliteWriter";
+import { pauseBackgroundSyncFor } from "../services/syncPriority";
 
 /* Constants */
 const MAX_LOCAL_SAVE = 300;
@@ -1442,6 +1443,11 @@ export default function useChatLogic({ navigation, route }) {
       // STEP 1: INSTANT RENDER — Load messages from cache/SQLite FIRST
       // This MUST happen before any awaits so the screen renders immediately
       // ═══════════════════════════════════════════════════════════
+      // Tell the post-login background message-warm to back off for a moment so
+      // its BEGIN EXCLUSIVE writes don't block this chat's SQLite read. Keeps
+      // chat-open instant even mid-warm; auto-expires so warming resumes after.
+      pauseBackgroundSyncFor(1500);
+
       if (!isSameChat) {
         // Try memory cache first (synchronous — zero delay)
         const cached = ChatCache.hasMessages(generatedChatId)

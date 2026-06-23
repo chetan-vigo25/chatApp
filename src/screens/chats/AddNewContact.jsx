@@ -7,17 +7,28 @@ import { useTheme } from "../../contexts/ThemeContext";
 import countryCodes from '../../jsonFile/countryCodes.json';
 import CountryCodeContact from "../../components/CountryCodeContact";
 import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
+import { getStoredSession } from "../../services/sessionManager";
 import { getPhoneRule, isPhoneValid, phoneLengthHint } from "../../utils/phoneValidation";
 import { APP_TAG_NAME } from '@env';
 import { Ionicons } from '@expo/vector-icons';
 
 const DEBOUNCE_DELAY = 500;
+// Minimum characters before we search by username (system-generated, e.g. "ballu1").
+const MIN_USERNAME_LENGTH = 3;
 
 export default function AddNewContact({ navigation }) {
     const { theme, isDarkMode } = useTheme();
     const fadeAnim = useRef(new Animated.Value(0)).current;
+    // 'mobile' (default) or 'username' — which search field is active.
+    const [searchMode, setSearchMode] = useState('mobile');
+    // Search is locked to how the current user signed in: mobile-login users can
+    // only search by mobile, username-login users only by username. null until
+    // the stored login method is read (or unknown → both allowed).
+    const [allowedMode, setAllowedMode] = useState(null);
     const [phoneNumber, setPhoneNumber] = useState('');
     const [phoneFocused, setPhoneFocused] = useState(false);
+    const [username, setUsername] = useState('');
+    const [usernameFocused, setUsernameFocused] = useState(false);
     const [selectedCountry, setSelectedCountry] = useState(countryCodes[0]);
     const [isSearching, setIsSearching] = useState(false);
     const [searchResult, setSearchResult] = useState(null);
@@ -39,6 +50,22 @@ export default function AddNewContact({ navigation }) {
         Animated.timing(fadeAnim, { toValue: 1, duration: 400, useNativeDriver: true }).start();
       }, 400);
       return () => clearTimeout(timer);
+    }, []);
+
+    // Lock the search mode to how the current user logged in.
+    useEffect(() => {
+      let mounted = true;
+      getStoredSession()
+        .then((session) => {
+          if (!mounted) return;
+          const method = session?.loginMethod;
+          if (method === 'username' || method === 'mobile') {
+            setAllowedMode(method);
+            setSearchMode(method);
+          }
+        })
+        .catch(() => {});
+      return () => { mounted = false; };
     }, []);
 
     const handleCountrySelect = (country) => {
@@ -105,7 +132,10 @@ export default function AddNewContact({ navigation }) {
           }
         };
         socketHandlersRef.current.onSearchResponse = onSearchResponse;
+        // Both mobile and username searches return the same response shape, so
+        // they share one handler.
         socket.on('user:search:mobile:response', onSearchResponse);
+        socket.on('user:search:username:response', onSearchResponse);
 
         const onChatCreateResponse = (response) => {
           if (response.status && response.data) {
@@ -160,6 +190,7 @@ export default function AddNewContact({ navigation }) {
         if (!isSocketListenerActive.current || !socket) return;
         if (socketHandlersRef.current.onSearchResponse) {
           socket.off('user:search:mobile:response', socketHandlersRef.current.onSearchResponse);
+          socket.off('user:search:username:response', socketHandlersRef.current.onSearchResponse);
         }
         if (socketHandlersRef.current.onChatCreateResponse) {
           socket.off('chat:create:response', socketHandlersRef.current.onChatCreateResponse);
@@ -202,6 +233,78 @@ export default function AddNewContact({ navigation }) {
         setIsSearching(false);
         setSearchResult({ found: false, message: 'Search failed. Please try again.' });
       }
+    };
+
+    const searchUserByUsername = async (uname) => {
+      const query = String(uname || '').trim().toLowerCase();
+      if (query.length < MIN_USERNAME_LENGTH) {
+        setSearchResult(null);
+        pendingUserDataRef.current = null;
+        setIsSearching(false);
+        return;
+      }
+      setIsSearching(true);
+      try {
+        if (!isSocketConnected()) {
+          await reconnectSocket(navigation);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          if (!isSocketConnected()) {
+            setIsSearching(false);
+            setSearchResult({ found: false, message: 'Connection error. Please try again.' });
+            return;
+          }
+        }
+        const socket = getSocket();
+        if (!socket) {
+          setIsSearching(false);
+          setSearchResult({ found: false, message: 'Connection error. Please try again.' });
+          return;
+        }
+        if (!isSocketListenerActive.current) setupSocketListeners(socket);
+        socket.emit('user:search:username', { userName: query }, () => {});
+      } catch (error) {
+        setIsSearching(false);
+        setSearchResult({ found: false, message: 'Search failed. Please try again.' });
+      }
+    };
+
+    const handleUsernameChange = (text) => {
+      // Usernames are lowercase alphanumerics/._ — strip spaces and uppercase.
+      const cleaned = text.replace(/\s+/g, '').toLowerCase();
+      setUsername(cleaned);
+
+      if (searchResult !== null) {
+        setSearchResult(null);
+        pendingUserDataRef.current = null;
+      }
+      if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
+
+      if (cleaned.trim().length >= MIN_USERNAME_LENGTH) {
+        searchTimeoutRef.current = setTimeout(() => { searchUserByUsername(cleaned); }, DEBOUNCE_DELAY);
+      } else {
+        setIsSearching(false);
+        setSearchResult(null);
+        pendingUserDataRef.current = null;
+      }
+    };
+
+    const handleClearUsername = () => {
+      setUsername('');
+      setSearchResult(null);
+      pendingUserDataRef.current = null;
+      setIsSearching(false);
+      if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
+      if (socketRef.current) removeSocketListeners(socketRef.current);
+    };
+
+    // Switch between phone-number and username search; reset any in-flight state.
+    const switchMode = (mode) => {
+      if (mode === searchMode) return;
+      if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
+      setSearchResult(null);
+      pendingUserDataRef.current = null;
+      setIsSearching(false);
+      setSearchMode(mode);
     };
 
     const handleCreateChat = async (userId) => {
@@ -308,14 +411,20 @@ export default function AddNewContact({ navigation }) {
     const cardBg = isDarkMode ? '#1F2C33' : '#F7F8FA';
     const errorColor = '#E5484D';
 
-    const hasInput = phoneNumber.length > 0;
-    const showLengthError = hasInput && !isCompleteNumber;
-    const userFound = !!(searchResult && searchResult.found && isCompleteNumber && !isSearching);
-    const userNotFound = !!(searchResult && !searchResult.found && isCompleteNumber && !isSearching);
+    const isUsernameMode = searchMode === 'username';
+    const usernameValid = username.trim().length >= MIN_USERNAME_LENGTH;
+    // Whether the current query is "complete enough" to trust the search result.
+    const queryComplete = isUsernameMode ? usernameValid : isCompleteNumber;
+
+    const hasInput = isUsernameMode ? username.length > 0 : phoneNumber.length > 0;
+    const showLengthError = !isUsernameMode && hasInput && !isCompleteNumber;
+    const userFound = !!(searchResult && searchResult.found && queryComplete && !isSearching);
+    const userNotFound = !!(searchResult && !searchResult.found && queryComplete && !isSearching);
     const userDisplayName = searchResult?.user?.fullName || searchResult?.user?.name || 'User';
     const userAvatar = searchResult?.user?.profileImage || searchResult?.user?.profilePicture;
 
     const phoneUnderline = showLengthError ? errorColor : (phoneFocused ? accent : underlineIdle);
+    const usernameUnderline = usernameFocused ? accent : underlineIdle;
 
     return (
       <Animated.View style={[styles.root, { opacity: fadeAnim, backgroundColor: bg }]}>
@@ -332,7 +441,7 @@ export default function AddNewContact({ navigation }) {
           <View style={styles.headerTitleWrap}>
             <Text style={[styles.headerTitle, { color: primaryText }]}>New contact</Text>
             <Text style={[styles.headerSubtitle, { color: secondaryText }]}>
-              {selectedCountry?.name || 'Search by phone number'}
+              {searchMode === 'username' ? 'Search by username' : (selectedCountry?.name || 'Search by phone number')}
             </Text>
           </View>
         </View>
@@ -354,57 +463,122 @@ export default function AddNewContact({ navigation }) {
               </View>
               <Text style={[styles.illTitle, { color: primaryText }]}>Add a new contact</Text>
               <Text style={[styles.illSubtitle, { color: secondaryText }]}>
-                Enter their phone number to start chatting on {String(APP_TAG_NAME || 'the app')}.
+                {isUsernameMode
+                  ? `Enter their username to start chatting on ${String(APP_TAG_NAME || 'the app')}.`
+                  : `Enter their phone number to start chatting on ${String(APP_TAG_NAME || 'the app')}.`}
               </Text>
             </View>
 
-            {/* Phone row — code chip + number, WhatsApp underline */}
-            <View style={[styles.phoneRow, { borderBottomColor: phoneUnderline }]}>
-              <View style={[styles.codeChip, { backgroundColor: cardBg }]}>
-                <CountryCodeContact
-                  selectedCountry={selectedCountry}
-                  onCountrySelect={handleCountrySelect}
-                  showFlag={true}
-                  showCode={true}
-                  showName={false}
-                />
-                <Ionicons name="chevron-down" size={14} color={secondaryText} style={styles.codeChevron} />
+            {/* Segmented toggle — only when the search mode isn't locked to the
+                user's login method (mobile-login → mobile, username-login → username). */}
+            {allowedMode === null && (
+              <View style={[styles.segment, { backgroundColor: cardBg }]}>
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => switchMode('mobile')}
+                  style={[styles.segmentBtn, !isUsernameMode && { backgroundColor: accent }]}
+                >
+                  <Ionicons name="call-outline" size={16} color={!isUsernameMode ? '#fff' : secondaryText} />
+                  <Text style={[styles.segmentText, { color: !isUsernameMode ? '#fff' : secondaryText }]}>
+                    Phone number
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  activeOpacity={0.85}
+                  onPress={() => switchMode('username')}
+                  style={[styles.segmentBtn, isUsernameMode && { backgroundColor: accent }]}
+                >
+                  <Ionicons name="at-outline" size={16} color={isUsernameMode ? '#fff' : secondaryText} />
+                  <Text style={[styles.segmentText, { color: isUsernameMode ? '#fff' : secondaryText }]}>
+                    Username
+                  </Text>
+                </TouchableOpacity>
               </View>
+            )}
 
-              <TextInput
-                style={[styles.phoneInput, { color: primaryText }]}
-                placeholder="phone number"
-                placeholderTextColor={placeholderText}
-                value={phoneNumber}
-                onChangeText={handlePhoneNumberChange}
-                keyboardType="phone-pad"
-                maxLength={maxLen}
-                onFocus={() => setPhoneFocused(true)}
-                onBlur={() => setPhoneFocused(false)}
-              />
+            {isUsernameMode ? (
+              <>
+                {/* Username row */}
+                <View style={[styles.phoneRow, { borderBottomColor: usernameUnderline }]}>
+                  <Ionicons name="at" size={20} color={usernameFocused ? accent : placeholderText} style={styles.usernameIcon} />
+                  <TextInput
+                    style={[styles.phoneInput, { color: primaryText }]}
+                    placeholder="username"
+                    placeholderTextColor={placeholderText}
+                    value={username}
+                    onChangeText={handleUsernameChange}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    onFocus={() => setUsernameFocused(true)}
+                    onBlur={() => setUsernameFocused(false)}
+                  />
 
-              {/* Trailing status icon */}
-              {isSearching ? (
-                <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
-              ) : userFound ? (
-                <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
-              ) : userNotFound ? (
-                <TouchableOpacity onPress={handleClearPhoneNumber} style={styles.trailIcon}>
-                  <Ionicons name="close-circle" size={22} color={errorColor} />
-                </TouchableOpacity>
-              ) : hasInput ? (
-                <TouchableOpacity onPress={handleClearPhoneNumber} style={styles.trailIcon}>
-                  <Ionicons name="close-circle" size={20} color={secondaryText} />
-                </TouchableOpacity>
-              ) : null}
-            </View>
+                  {isSearching ? (
+                    <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
+                  ) : userFound ? (
+                    <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
+                  ) : username.length > 0 ? (
+                    <TouchableOpacity onPress={handleClearUsername} style={styles.trailIcon}>
+                      <Ionicons name="close-circle" size={20} color={userNotFound ? errorColor : secondaryText} />
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
 
-            {/* Validation / helper line (country-aware) */}
-            <Text style={[styles.helperText, { color: showLengthError ? errorColor : secondaryText }]}>
-              {showLengthError
-                ? `${selectedCountry?.name || 'This country'} numbers are ${phoneLengthHint(selectedCountry?.code)}`
-                : `Enter a ${phoneLengthHint(selectedCountry?.code)} ${selectedCountry?.name || ''} number`.trimEnd()}
-            </Text>
+                <Text style={[styles.helperText, { color: secondaryText }]}>
+                  Enter at least {MIN_USERNAME_LENGTH} characters of their username.
+                </Text>
+              </>
+            ) : (
+              <>
+                {/* Phone row — code chip + number, WhatsApp underline */}
+                <View style={[styles.phoneRow, { borderBottomColor: phoneUnderline }]}>
+                  <View style={[styles.codeChip, { backgroundColor: cardBg }]}>
+                    <CountryCodeContact
+                      selectedCountry={selectedCountry}
+                      onCountrySelect={handleCountrySelect}
+                      showFlag={true}
+                      showCode={true}
+                      showName={false}
+                    />
+                    <Ionicons name="chevron-down" size={14} color={secondaryText} style={styles.codeChevron} />
+                  </View>
+
+                  <TextInput
+                    style={[styles.phoneInput, { color: primaryText }]}
+                    placeholder="phone number"
+                    placeholderTextColor={placeholderText}
+                    value={phoneNumber}
+                    onChangeText={handlePhoneNumberChange}
+                    keyboardType="phone-pad"
+                    maxLength={maxLen}
+                    onFocus={() => setPhoneFocused(true)}
+                    onBlur={() => setPhoneFocused(false)}
+                  />
+
+                  {/* Trailing status icon */}
+                  {isSearching ? (
+                    <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
+                  ) : userFound ? (
+                    <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
+                  ) : userNotFound ? (
+                    <TouchableOpacity onPress={handleClearPhoneNumber} style={styles.trailIcon}>
+                      <Ionicons name="close-circle" size={22} color={errorColor} />
+                    </TouchableOpacity>
+                  ) : hasInput ? (
+                    <TouchableOpacity onPress={handleClearPhoneNumber} style={styles.trailIcon}>
+                      <Ionicons name="close-circle" size={20} color={secondaryText} />
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+
+                {/* Validation / helper line (country-aware) */}
+                <Text style={[styles.helperText, { color: showLengthError ? errorColor : secondaryText }]}>
+                  {showLengthError
+                    ? `${selectedCountry?.name || 'This country'} numbers are ${phoneLengthHint(selectedCountry?.code)}`
+                    : `Enter a ${phoneLengthHint(selectedCountry?.code)} ${selectedCountry?.name || ''} number`.trimEnd()}
+                </Text>
+              </>
+            )}
 
             {/* User found card */}
             {userFound && (
@@ -437,7 +611,9 @@ export default function AddNewContact({ navigation }) {
                       {userDisplayName}
                     </Text>
                     <Text style={[styles.userPhone, { color: secondaryText }]} numberOfLines={1}>
-                      {selectedCountry.code} {phoneNumber}
+                      {isUsernameMode
+                        ? `@${searchResult?.user?.userName || username.trim()}`
+                        : `${selectedCountry.code} ${phoneNumber}`}
                     </Text>
                   </View>
                   <View style={[styles.userCta, { backgroundColor: accent }]}>
@@ -458,10 +634,12 @@ export default function AddNewContact({ navigation }) {
                   <Ionicons name="person-remove-outline" size={26} color={errorColor} />
                 </View>
                 <Text style={[styles.notFoundTitle, { color: primaryText }]}>
-                  Not on {String(APP_TAG_NAME || 'the app')}
+                  {isUsernameMode ? 'No match found' : `Not on ${String(APP_TAG_NAME || 'the app')}`}
                 </Text>
                 <Text style={[styles.notFoundSubtitle, { color: secondaryText }]}>
-                  This number isn't registered yet. Double-check the country code and number, or invite them later.
+                  {isUsernameMode
+                    ? "No account matches that username. Double-check the spelling and try again."
+                    : "This number isn't registered yet. Double-check the country code and number, or invite them later."}
                 </Text>
               </View>
             )}
@@ -523,6 +701,29 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     lineHeight: 19,
   },
+
+  // Search-mode segmented toggle
+  segment: {
+    flexDirection: 'row',
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 22,
+    gap: 4,
+  },
+  segmentBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    height: 38,
+    borderRadius: 9,
+  },
+  segmentText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+  },
+  usernameIcon: { marginRight: 10 },
 
   // Phone row
   phoneRow: {

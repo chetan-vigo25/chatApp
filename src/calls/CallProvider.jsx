@@ -1,5 +1,5 @@
 import React, {
-  createContext, useContext, useReducer, useRef, useCallback, useEffect, useState,
+  useContext, useReducer, useRef, useCallback, useEffect, useState,
 } from 'react';
 import {
   Vibration, Alert, StyleSheet, View, DeviceEventEmitter, Linking, Platform,
@@ -11,6 +11,7 @@ import { useCameraPermissions } from 'expo-camera';
 import { MaterialIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../contexts/AuthContext';
+import { CallContext } from './CallContext';
 import CallEngineWebView from './engine/CallEngineWebView';
 import CallOverlay from './screens/CallOverlay';
 import IncomingCallBanner from './components/IncomingCallBanner';
@@ -47,7 +48,9 @@ import {
 } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
 
-export const CallContext = createContext(null);
+// CallContext now lives in its own leaf module (./CallContext) to break the
+// useCall ↔ CallProvider require cycle. Re-exported here for backward compat.
+export { CallContext };
 export const useCall = () => useContext(CallContext) || {};
 
 // Expo Go cannot do getUserMedia inside a WebView — needs a dev/EAS build.
@@ -131,12 +134,12 @@ export const CallProvider = ({ children }) => {
   // the recorded callId to the app signaling id so it persists across the state
   // reset at hang-up, and guard against double-start.
   const recordingOnRef = useRef(false);
+  const recordingCallIdRef = useRef(null);
   // Lock-screen security: true when the current call ARRIVED while the device was
   // locked. Such a call shows over the keyguard but the app behind it must stay
   // protected — back/end returns to the lock screen instead of revealing the app.
   const lockedCallRef = useRef(false);
   const [lockedCall, setLockedCall] = useState(false);
-  const recordingCallIdRef = useRef(null);
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
@@ -590,8 +593,7 @@ export const CallProvider = ({ children }) => {
     resetTimerRef.current = setTimeout(() => {
       endedRef.current = false;
       // If this call began on a locked device, drop the app BEHIND the keyguard
-      // now that it's over — the user lands on the system lock screen, never the
-      // app. Cleared so a later (unlocked) call behaves normally.
+      // now that it's over — the user lands on the lock screen, never the app.
       if (lockedCallRef.current) {
         returnToLockScreen();
         lockedCallRef.current = false;
@@ -815,6 +817,15 @@ export const CallProvider = ({ children }) => {
       case 'peerfacing': break;
       case 'needsUnmuteGesture': {
         dispatch({ type: ACT.NEEDS_UNMUTE, value: true });
+        break;
+      }
+      // Remote audio actually started playing → drop the "Tap to enable audio"
+      // prompt if it was up. Clears a stale banner when audio recovers on its
+      // own (e.g. after a transient play() rejection) without a user tap.
+      case 'audioResumed': {
+        if (stateRef.current.needsUnmuteGesture) {
+          dispatch({ type: ACT.NEEDS_UNMUTE, value: false });
+        }
         break;
       }
       case 'presence': {
@@ -1145,9 +1156,8 @@ export const CallProvider = ({ children }) => {
   }, []);
 
   // Leave the call UI while the device is locked → return to the system lock
-  // screen (NOT the app). Used by the call screen's back handler when this call
-  // arrived on a locked device; the call keeps running in the background (the
-  // ongoing-call notification brings it back) but the app stays protected.
+  // screen (NOT the app). The call keeps running in the background (the ongoing-
+  // call notification brings it back) but the app stays protected.
   const leaveToLock = useCallback(() => {
     returnToLockScreen();
   }, []);
@@ -1467,6 +1477,11 @@ export const CallProvider = ({ children }) => {
     presenceMap,
     audioRouteSupported,
     maxParticipants: MAX_PARTICIPANTS,
+    // True while ANY call is in flight (dialing out, ringing in, connecting, or
+    // active) — used to disable the audio/video call buttons everywhere so a
+    // second call can't be started over a live one. ENDED is included because
+    // the call is still tearing down and the start path is still blocked.
+    callBusy: state.status !== CALL_STATUS.IDLE,
     startAudioCall,
     startVideoCall,
     startGroupAudioCall,

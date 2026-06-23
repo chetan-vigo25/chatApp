@@ -11,7 +11,7 @@ import { useCall } from '../useCall';
  */
 export default function CallButtons({ peer, chatId }) {
   const { theme } = useTheme();
-  const { startAudioCall, startVideoCall } = useCall();
+  const { startAudioCall, startVideoCall, callBusy } = useCall();
 
   const peerObj = peer ? {
     id: String(peer._id || peer.userId || peer.id || ''),
@@ -28,14 +28,28 @@ export default function CallButtons({ peer, chatId }) {
   }, [peerObj, chatId, startVideoCall]);
 
   if (!peerObj?.id) return null;
-  const color = theme.colors.primaryTextColor;
+  // Dim + disable both buttons while another call is in progress so a second
+  // call can't be started over a live/ringing one.
+  const color = callBusy ? theme.colors.secondaryTextColor : theme.colors.primaryTextColor;
 
   return (
     <View style={styles.row}>
-      <TouchableOpacity onPress={onVideo} activeOpacity={0.7} style={styles.btn} hitSlop={styles.hit}>
+      <TouchableOpacity
+        onPress={onVideo}
+        disabled={callBusy}
+        activeOpacity={0.7}
+        style={[styles.btn, callBusy && styles.disabled]}
+        hitSlop={styles.hit}
+      >
         <Ionicons name="videocam-outline" size={23} color={color} />
       </TouchableOpacity>
-      <TouchableOpacity onPress={onAudio} activeOpacity={0.7} style={styles.btn} hitSlop={styles.hit}>
+      <TouchableOpacity
+        onPress={onAudio}
+        disabled={callBusy}
+        activeOpacity={0.7}
+        style={[styles.btn, callBusy && styles.disabled]}
+        hitSlop={styles.hit}
+      >
         <Ionicons name="call-outline" size={21} color={color} />
       </TouchableOpacity>
     </View>
@@ -45,5 +59,6 @@ export default function CallButtons({ peer, chatId }) {
 const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center' },
   btn: { paddingHorizontal: 9, paddingVertical: 6 },
+  disabled: { opacity: 0.4 },
   hit: { top: 8, bottom: 8, left: 8, right: 8 },
 });

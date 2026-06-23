@@ -10,6 +10,7 @@ import UserAgree from "../screens/UserAgree";
 import Login from "../screens/Login";
 import LoginEmail from "../screens/LoginEmail";
 import Otp from "../screens/Otp";
+import AccountStatus from "../screens/AccountStatus";
 import ChatScreen from "../screens/chats/ChatScreen";
 import Test from "../screens/Test";
 import Term from "../screens/Term";
@@ -108,6 +109,7 @@ export default function RootNavigator() {
           <Stack.Screen name="Login" component={Login} />
           <Stack.Screen name="LoginEmail" component={LoginEmail} />
           <Stack.Screen name="Otp" component={Otp} />
+          <Stack.Screen name="AccountStatus" component={AccountStatus} options={{ gestureEnabled: false }} />
           <Stack.Screen name="SyncScreen" component={SyncScreen} />
           <Stack.Screen name="ChatList" component={BottomTabNavigator} />
           <Stack.Screen name="ChatScreen" component={ChatScreen} />

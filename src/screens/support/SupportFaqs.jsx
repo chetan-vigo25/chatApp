@@ -6,7 +6,13 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import { getFaqs } from "../../Redux/Services/Support/Support.Services";
 
-if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
+// Only needed on the OLD architecture — under the New Architecture (Fabric)
+// this method is a no-op and logs a warning, so skip it when Fabric is present.
+if (
+  Platform.OS === "android" &&
+  !global?.nativeFabricUIManager &&
+  UIManager.setLayoutAnimationEnabledExperimental
+) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
 }
 

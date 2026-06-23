@@ -125,6 +125,25 @@ api.interceptors.response.use(
       return Promise.reject(error);
     }
 
+    // A failed LOGIN returns 401 for bad credentials — that's NOT an expired
+    // session. Never refresh/reset/redirect for it; surface the server's real
+    // message ("Invalid username or password") straight to the caller.
+    if (/\/auth\/login\b/.test(originalRequest.url || '')) {
+      return Promise.reject(error);
+    }
+
+    // A 401 when there's no stored session at all (e.g. any pre-auth request)
+    // also can't be a token-expiry case — don't attempt a refresh that would
+    // throw a confusing "missing refresh token" error and wipe navigation.
+    try {
+      const hasSession = await AsyncStorage.getItem('accessToken');
+      if (!hasSession) {
+        return Promise.reject(error);
+      }
+    } catch (_) {
+      return Promise.reject(error);
+    }
+
     if (isRefreshing) {
       return new Promise((resolve, reject) => {
         failedQueue.push({ resolve, reject });

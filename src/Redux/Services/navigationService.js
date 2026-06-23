@@ -130,11 +130,47 @@ export function navigateToChat(data = {}, attempt = 0) {
   }
 }
 
-export function resetToLogin() {
+// Reset the ROOT navigator to the Login screen. Used on logout (manual from
+// Settings, or forced by a server session-terminate). The nav container can be
+// momentarily NOT ready right when logout fires — the session reset clears
+// storage + dispatches a Redux reset, which can briefly re-render the tree. The
+// old version silently did nothing in that window, leaving the user stranded on
+// the Settings screen. Retry until the container is ready (best-effort, ~8s),
+// mirroring navigateToChat, so the redirect always lands.
+export function resetToLogin(attempt = 0) {
   if (navigationRef.isReady()) {
-    navigationRef.reset({
-      index: 0,
-      routes: [{ name: 'Login' }],
-    });
+    try {
+      navigationRef.reset({
+        index: 0,
+        routes: [{ name: 'Login' }],
+      });
+      return;
+    } catch {
+      // Fall through to retry — a reset issued mid-transition can throw.
+    }
+  }
+  if (attempt < 40) {
+    setTimeout(() => resetToLogin(attempt + 1), 200);
+  }
+}
+
+// Reset the ROOT navigator to the dedicated account-state screen (blocked /
+// inactive / deleted). Mirrors resetToLogin's retry-until-ready so the redirect
+// always lands even when the session reset is re-rendering the tree. `state` is
+// one of 'blocked' | 'inactive' | 'deleted'; `message` is the server copy.
+export function resetToAccountStatus(state, message, attempt = 0) {
+  if (navigationRef.isReady()) {
+    try {
+      navigationRef.reset({
+        index: 0,
+        routes: [{ name: 'AccountStatus', params: { state, message } }],
+      });
+      return;
+    } catch {
+      // Fall through to retry.
+    }
+  }
+  if (attempt < 40) {
+    setTimeout(() => resetToAccountStatus(state, message, attempt + 1), 200);
   }
 }

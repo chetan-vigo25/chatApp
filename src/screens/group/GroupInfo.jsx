@@ -61,7 +61,7 @@ export default function GroupInfo({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const insets = useSafeAreaInsets();
   const dispatch = useDispatch();
-  const { startGroupAudioCall, startGroupVideoCall } = useCall();
+  const { startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
   const { currentGroup, isLoading } = useSelector((s) => s.group);
   const { leaveGroup, removeChat, removeGroupMember: socketRemoveMember, promoteGroupMember, demoteGroupMember } = useRealtimeChat();
   // Device contact directory (local SQLite only) for device-name-first display.
@@ -499,16 +499,18 @@ export default function GroupInfo({ navigation, route }) {
           </TouchableOpacity>
           <TouchableOpacity
             onPress={() => startGroupCall('audio')}
+            disabled={callBusy}
             activeOpacity={0.7}
-            style={[styles.quickBtn, { backgroundColor: cardBg }]}
+            style={[styles.quickBtn, { backgroundColor: cardBg }, callBusy && styles.quickBtnDisabled]}
           >
             <Ionicons name="call" size={21} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Audio</Text>
           </TouchableOpacity>
           <TouchableOpacity
             onPress={() => startGroupCall('video')}
+            disabled={callBusy}
             activeOpacity={0.7}
-            style={[styles.quickBtn, { backgroundColor: cardBg }]}
+            style={[styles.quickBtn, { backgroundColor: cardBg }, callBusy && styles.quickBtnDisabled]}
           >
             <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Video</Text>
@@ -782,6 +784,7 @@ const styles = StyleSheet.create({
   // Quick Actions
   quickActions: { flexDirection: 'row', justifyContent: 'center', paddingHorizontal: 10, gap: 8, paddingTop: 12, paddingBottom: 2 },
   quickBtn: { flex: 1, alignItems: 'center', paddingVertical: 13, borderRadius: 14, gap: 5, borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(128,128,128,0.18)' },
+  quickBtnDisabled: { opacity: 0.4 },
   quickBtnLabel: { fontFamily: 'Roboto-Medium', fontSize: 12.5, letterSpacing: 0.1 },
 
   // Grouped inset card (WhatsApp)

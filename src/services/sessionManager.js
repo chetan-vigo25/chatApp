@@ -1,8 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import axios from 'axios';
 import { BACKEND_URL } from '@env';
-import store from '../Redux/Store';
-import { resetAppState } from '../Redux/RootReducers';
 import { resetToLogin } from '../Redux/Services/navigationService';
 import { emitSessionReset, emitUserChanged } from './sessionEvents';
 import ChatDatabase from './ChatDatabase';
@@ -14,6 +12,8 @@ export const AUTH_KEYS = {
   userInfo: 'userInfo',
   deviceId: 'deviceId',
   sessionId: 'sessionId',
+  // How the current user signed in: 'mobile' (OTP) or 'username' (password).
+  loginMethod: 'loginMethod',
 };
 
 const REFRESH_ENDPOINTS = [
@@ -110,13 +110,14 @@ const extractTokens = (responseData = {}) => {
 };
 
 export const getStoredSession = async () => {
-  const [accessToken, refreshTokenHash, refreshTokenLegacy, userRaw, deviceId, sessionId] = await Promise.all([
+  const [accessToken, refreshTokenHash, refreshTokenLegacy, userRaw, deviceId, sessionId, loginMethod] = await Promise.all([
     AsyncStorage.getItem(AUTH_KEYS.accessToken),
     AsyncStorage.getItem(AUTH_KEYS.refreshTokenHash),
     AsyncStorage.getItem(AUTH_KEYS.refreshToken),
     AsyncStorage.getItem(AUTH_KEYS.userInfo),
     AsyncStorage.getItem(AUTH_KEYS.deviceId),
     AsyncStorage.getItem(AUTH_KEYS.sessionId),
+    AsyncStorage.getItem(AUTH_KEYS.loginMethod),
   ]);
 
   const userInfo = parseJSONSafely(userRaw, null);
@@ -130,6 +131,7 @@ export const getStoredSession = async () => {
     userId: userId ? String(userId) : null,
     deviceId,
     sessionId,
+    loginMethod,
   };
 };
 
@@ -140,15 +142,11 @@ export const isTokenExpired = (token, skewSeconds = 30) => {
   return payload.exp <= nowSec + skewSeconds;
 };
 
-export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, refreshTokenHash, deviceId, sessionId }) => {
+export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, refreshTokenHash, deviceId, sessionId, loginMethod }) => {
   const writes = [];
   const resolvedRefreshToken = refreshTokenHash || refreshToken;
 
-  if (userInfo) {
-    writes.push(AsyncStorage.setItem(AUTH_KEYS.userInfo, JSON.stringify(userInfo)));
-    emitUserChanged({ userId: String(userInfo?._id || userInfo?.id || '') || null, userInfo });
-  }
-
+  if (userInfo) writes.push(AsyncStorage.setItem(AUTH_KEYS.userInfo, JSON.stringify(userInfo)));
   if (accessToken) writes.push(AsyncStorage.setItem(AUTH_KEYS.accessToken, String(accessToken)));
   if (resolvedRefreshToken) {
     writes.push(AsyncStorage.setItem(AUTH_KEYS.refreshToken, String(resolvedRefreshToken)));
@@ -156,8 +154,17 @@ export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, ref
   }
   if (deviceId) writes.push(AsyncStorage.setItem(AUTH_KEYS.deviceId, String(deviceId)));
   if (sessionId) writes.push(AsyncStorage.setItem(AUTH_KEYS.sessionId, String(sessionId)));
-  
+  if (loginMethod) writes.push(AsyncStorage.setItem(AUTH_KEYS.loginMethod, String(loginMethod)));
+
+  // Persist EVERYTHING (token included) BEFORE announcing the user change.
+  // Listeners that react to user-changed often fire authenticated requests, and
+  // emitting first would let them race ahead of the token write → the request
+  // goes out tokenless and the server replies 401 "No token provided".
   await Promise.all(writes);
+
+  if (userInfo) {
+    emitUserChanged({ userId: String(userInfo?._id || userInfo?.id || '') || null, userInfo });
+  }
 };
 
 export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
@@ -184,6 +191,13 @@ export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
 };
 
 export const resetRuntimeState = () => {
+  // Lazy require to break the static require cycle:
+  //   sessionManager → Store → RootReducers → Auth.reducer → Auth.Services
+  //   → Https → sessionManager
+  // By the time this runs (a logout/session reset), all modules are fully
+  // initialized, so the require returns the ready store + action.
+  const store = require('../Redux/Store').default;
+  const { resetAppState } = require('../Redux/RootReducers');
   store.dispatch(resetAppState());
   emitSessionReset({ reason: 'runtime_reset' });
 };

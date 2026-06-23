@@ -54,8 +54,7 @@ export const stopOngoingCall = (): void => {
 };
 
 // ---- lock-screen security ----
-// True when the device is currently locked (keyguard showing). Android only;
-// false on iOS / Expo Go (no native module).
+// True when the device is currently locked. Android only; false on iOS / Expo Go.
 export const isDeviceLocked = (): boolean => !!Native?.isDeviceLocked?.();
 
 // Runtime override of show-when-locked on the current activity.

@@ -64,25 +64,26 @@ export default function UserAgree({ navigation }) {
           </Text>
         </TouchableOpacity>
 
-        {/* Login buttons */}
+        {/* Primary login — mobile number */}
         <View style={styles.buttonGroup}>
-          <TouchableOpacity activeOpacity={0.8} disabled={!isAgreed} onPress={() => navigation.navigate('LoginEmail')}
-            style={[ styles.button, { backgroundColor: isAgreed ? colors.themeColor : colors.borderColor, }, ]}>
-            <Ionicons name="mail-outline" size={20} color={isAgreed ? '#fff' : '#999'} style={styles.buttonIcon}/>
-            <Text style={[ styles.buttonText, { color: isAgreed ? colors.textWhite : '#999' },]} >
-              Login with Email
-            </Text>
-          </TouchableOpacity>
-
           <TouchableOpacity activeOpacity={0.8} disabled={!isAgreed} onPress={() => navigation.navigate('Login')}
-            style={[ styles.buttonOutline, { borderColor: isAgreed ? colors.themeColor : colors.borderColor, }, ]} >
-            <Ionicons name="call-outline" size={20} color={isAgreed ? colors.themeColor : '#999'} style={styles.buttonIcon} />
-            <Text style={[styles.buttonText,
-                { color: isAgreed ? colors.themeColor : '#999' } ]} >
-              Login with Number
+            style={[ styles.button, { backgroundColor: isAgreed ? colors.themeColor : colors.borderColor, }, ]}>
+            <Ionicons name="call-outline" size={20} color={isAgreed ? '#fff' : '#999'} style={styles.buttonIcon} />
+            <Text style={[ styles.buttonText, { color: isAgreed ? colors.textWhite : '#999' },]} >
+              Continue with Phone Number
             </Text>
           </TouchableOpacity>
         </View>
+
+        {/* Secondary login — email, demoted to a small footer link */}
+        <TouchableOpacity activeOpacity={0.7} disabled={!isAgreed} onPress={() => navigation.navigate('LoginEmail')} style={styles.footerLinkRow} >
+          <Text style={[styles.footerLinkText, { color: colors.placeHolderTextColor }]}>
+            Have a username?{' '}
+            <Text style={[styles.footerLinkAction, { color: isAgreed ? colors.themeColor : colors.borderColor }]}>
+              Login with Username
+            </Text>
+          </Text>
+        </TouchableOpacity>
       </View>
     </Animated.View>
   );
@@ -166,20 +167,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  buttonOutline: {
-    height: 50,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'transparent',
-  },
   buttonIcon: {
     marginRight: 8,
   },
   buttonText: {
     fontFamily: 'Roboto-SemiBold',
     fontSize: 15,
+  },
+  footerLinkRow: {
+    marginTop: 18,
+    alignItems: 'center',
+  },
+  footerLinkText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 13,
+    textAlign: 'center',
+  },
+  footerLinkAction: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 13,
   },
 });

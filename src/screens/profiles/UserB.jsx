@@ -72,7 +72,7 @@ function HeroTopScrim() {
 export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
   const { theme, isDarkMode } = useTheme();
-  const { startAudioCall, startVideoCall } = useCall();
+  const { startAudioCall, startVideoCall, callBusy } = useCall();
   const dispatch = useDispatch();
   const [peerProfile, setPeerProfile] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -473,9 +473,9 @@ export default function UserB({ navigation, route }) {
         <View style={[styles.actionsCard, { backgroundColor: cardBg }]}>
           <ActionColumn icon="chatbubble" label="Message" color={themeColor} onPress={handleMessage} />
           <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
-          <ActionColumn icon="call" label="Audio" color={themeColor} onPress={handleCall} />
+          <ActionColumn icon="call" label="Audio" color={themeColor} onPress={handleCall} disabled={callBusy} />
           <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
-          <ActionColumn icon="videocam" label="Video" color={themeColor} onPress={handleVideoCall} />
+          <ActionColumn icon="videocam" label="Video" color={themeColor} onPress={handleVideoCall} disabled={callBusy} />
         </View>
 
         {/* ─── About ─── */}
@@ -663,9 +663,14 @@ export default function UserB({ navigation, route }) {
 
 const miniHit = { top: 8, bottom: 8, left: 6, right: 6 };
 
-function ActionColumn({ icon, label, color, onPress }) {
+function ActionColumn({ icon, label, color, onPress, disabled }) {
   return (
-    <TouchableOpacity style={styles.actionCol} onPress={onPress} activeOpacity={0.6}>
+    <TouchableOpacity
+      style={[styles.actionCol, disabled && styles.actionColDisabled]}
+      onPress={onPress}
+      disabled={disabled}
+      activeOpacity={0.6}
+    >
       <Ionicons name={icon} size={24} color={color} />
       <Text style={[styles.actionColLabel, { color }]} numberOfLines={1}>{label}</Text>
     </TouchableOpacity>
@@ -811,6 +816,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 6,
   },
+  actionColDisabled: { opacity: 0.4 },
   actionDivider: {
     width: StyleSheet.hairlineWidth,
     alignSelf: 'stretch',

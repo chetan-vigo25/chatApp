@@ -10,12 +10,13 @@ import { useDeviceInfo } from "../contexts/DeviceInfoContext";
 import { useDeviceLocation } from "../contexts/DeviceLoc";
 import { useDispatch, useSelector } from "react-redux";
 import { emailLogin } from "../Redux/Reducer/Auth/Auth.reducer";
-import { initSocket } from "../Redux/Services/Socket/socket";
+import { initSocket, emitLogoutCurrentDevice } from "../Redux/Services/Socket/socket";
 import { performSessionReset, saveAuthSession } from "../services/sessionManager";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { APP_TAG_NAME } from '@env';
 
-const EMAIL_REGEX = /^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$/;
+// Minimum length for the system-generated username (e.g. "ballu1").
+const MIN_USERNAME_LENGTH = 3;
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -32,11 +33,11 @@ export default function LoginEmail({ navigation }) {
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(14)).current;
 
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [emailTouched, setEmailTouched] = useState(false);
-  const [emailFocused, setEmailFocused] = useState(false);
+  const [usernameTouched, setUsernameTouched] = useState(false);
+  const [usernameFocused, setUsernameFocused] = useState(false);
   const [passwordFocused, setPasswordFocused] = useState(false);
   const [fcmToken, setFcmToken] = useState(null);
   const isSubmitting = isLoading;
@@ -49,14 +50,14 @@ export default function LoginEmail({ navigation }) {
     ]).start();
   }, []);
 
-  const isEmailValid = EMAIL_REGEX.test(email.trim());
-  const showEmailError = emailTouched && email.length > 0 && !isEmailValid;
-  const isFormValid = isEmailValid && password.length >= 1;
+  const isUsernameValid = username.trim().length >= MIN_USERNAME_LENGTH;
+  const showUsernameError = usernameTouched && username.length > 0 && !isUsernameValid;
+  const isFormValid = isUsernameValid && password.length >= 1;
 
   const handleSubmit = async () => {
     if (!isFormValid || isLoading) return;
     const payload = {
-      userName: email.trim(),
+      userName: username.trim().toLowerCase(),
       password,
       isLoginByUsername: true,
       device: {
@@ -82,17 +83,21 @@ export default function LoginEmail({ navigation }) {
 
     try {
       const loginData = await dispatch(emailLogin(payload)).unwrap();
+      // M6 — single-account: force-logout the previous account server-side
+      // (best-effort) before wiping local state and switching.
+      try { await emitLogoutCurrentDevice(); } catch (_) {}
       await performSessionReset({ reason: "user_switch_login", resetNavigation: false, clearAllStorage: true });
       await saveAuthSession({
         userInfo: loginData.data,
         accessToken: loginData?.token?.accessToken,
         refreshToken: loginData?.token?.refreshToken,
         deviceId: loginData?.data?.deviceId,
+        loginMethod: 'username',
       });
       showToast(loginData.message);
       if (deviceInfo) initSocket(deviceInfo, navigation);
       if (loginData?.data?.isNewUser) {
-        navigation.reset({ index: 0, routes: [{ name: "EditProfile", params: { email: email.trim() } }] });
+        navigation.reset({ index: 0, routes: [{ name: "EditProfile", params: { username: username.trim().toLowerCase() } }] });
       } else {
         navigation.reset({ index: 0, routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }] });
       }
@@ -113,7 +118,7 @@ export default function LoginEmail({ navigation }) {
   const disabledBtn = isDarkMode ? '#1F2C33' : '#D8DEE2';
   const disabledTxt = isDarkMode ? '#54656F' : '#9AA6AE';
 
-  const emailUnderline = showEmailError ? errorColor : (emailFocused ? accent : underlineIdle);
+  const usernameUnderline = showUsernameError ? errorColor : (usernameFocused ? accent : underlineIdle);
   const passwordUnderline = passwordFocused ? accent : underlineIdle;
 
   return (
@@ -138,33 +143,32 @@ export default function LoginEmail({ navigation }) {
               Sign in to {String(APP_TAG_NAME || 'continue')}
             </Text>
             <Text style={[styles.blurb, { color: secondaryText }]}>
-              Use your email and password to access your conversations.
+              Enter the username and password provided to you to access your conversations.
             </Text>
 
-            {/* Email */}
-            <Text style={[styles.label, { color: secondaryText }]}>EMAIL</Text>
-            <View style={[styles.inputRow, { borderBottomColor: emailUnderline }]}>
-              <Ionicons name="mail-outline" size={20} color={showEmailError ? errorColor : (emailFocused ? accent : placeholderText)} style={styles.inputIcon} />
+            {/* Username */}
+            <Text style={[styles.label, { color: secondaryText }]}>USERNAME</Text>
+            <View style={[styles.inputRow, { borderBottomColor: usernameUnderline }]}>
+              <Ionicons name="person-outline" size={20} color={showUsernameError ? errorColor : (usernameFocused ? accent : placeholderText)} style={styles.inputIcon} />
               <TextInput
                 style={[styles.input, { color: primaryText }]}
-                placeholder="you@example.com"
+                placeholder="UserName"
                 placeholderTextColor={placeholderText}
-                value={email}
-                onChangeText={setEmail}
-                onFocus={() => setEmailFocused(true)}
-                onBlur={() => { setEmailTouched(true); setEmailFocused(false); }}
-                keyboardType="email-address"
+                value={username}
+                onChangeText={setUsername}
+                onFocus={() => setUsernameFocused(true)}
+                onBlur={() => { setUsernameTouched(true); setUsernameFocused(false); }}
                 autoCapitalize="none"
                 autoCorrect={false}
-                autoComplete="email"
-                textContentType="emailAddress"
+                autoComplete="username"
+                textContentType="username"
                 returnKeyType="next"
               />
             </View>
-            {showEmailError ? (
+            {showUsernameError ? (
               <View style={styles.errorRow}>
                 <Ionicons name="alert-circle" size={14} color={errorColor} />
-                <Text style={styles.errorText}>Please enter a valid email address</Text>
+                <Text style={styles.errorText}>Username must be at least {MIN_USERNAME_LENGTH} characters</Text>
               </View>
             ) : null}
 

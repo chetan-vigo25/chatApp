@@ -1,42 +1,53 @@
-import React, { useCallback, useEffect, useMemo, useState, memo } from 'react';
+import React, { useCallback, useMemo, useState, memo } from 'react';
 import {
   View, Text, FlatList, TextInput, TouchableOpacity, StyleSheet, Image,
   ActivityIndicator, Platform, StatusBar,
 } from 'react-native';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../../calls/useCall';
-import useContactSync from '../../contexts/useContactSync';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import useContactsPresence from '../../presence/hooks/useContactsPresence';
 import { toSecureMediaUri } from '../../utils/mediaService';
+import ContactDatabase from '../../services/ContactDatabase';
 import CallAvatar from '../../calls/components/CallAvatar';
+import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 
 const ROW_HEIGHT = 72;
+
+// Stable letter-avatar color (matches the chat-list / preview palette).
+const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#0984E3', '#E17055', '#E84393', '#FDCB6E', '#00CEC9', '#A29BFE'];
+const getAvatarColor = (name = '') => {
+  let h = 0;
+  for (let i = 0; i < name.length; i += 1) h = name.charCodeAt(i) + ((h << 5) - h);
+  return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+};
 
 // ─── one contact row (memoized — only re-renders when its primitives change) ──
 const ContactRow = memo(function ContactRow({
   name, avatarUri, peerId, subText,
-  textColor, subColor, themeColor, onAudio, onVideo,
+  textColor, subColor, themeColor, onAudio, onVideo, onPressName, onPressAvatar,
 }) {
   return (
     <View style={[styles.row, { height: ROW_HEIGHT }]}>
-      <View>
+      {/* Avatar → opens the WhatsApp-style profile preview modal. */}
+      <TouchableOpacity onPress={onPressAvatar} activeOpacity={0.7}>
         {avatarUri ? (
           <Image source={{ uri: avatarUri }} style={styles.avatar} fadeDuration={0} />
         ) : (
           <CallAvatar uri={null} name={name} id={peerId} size={48} />
         )}
-      </View>
+      </TouchableOpacity>
 
-      <View style={styles.rowText}>
+      {/* Name + number → opens the chat thread. */}
+      <TouchableOpacity style={styles.rowText} activeOpacity={0.6} onPress={onPressName}>
         <Text style={[styles.rowName, { color: textColor }]} numberOfLines={1}>{name}</Text>
         <Text style={[styles.rowSub, { color: subColor }]} numberOfLines={1}>
           {subText}
         </Text>
-      </View>
+      </TouchableOpacity>
 
       <View style={styles.rowActions}>
         <TouchableOpacity onPress={onAudio} activeOpacity={0.6} hitSlop={styles.hit} style={styles.actionBtn}>
@@ -59,58 +70,77 @@ export default function NewCallScreen() {
   const navigation = useNavigation();
   const { startAudioCall, startVideoCall } = useCall();
   const { resolveName } = useContactDirectory();
-  const {
-    matchedRegistered = [], matchedContacts = [], loadContacts, refreshContacts, isSyncing,
-  } = useContactSync();
   const { refresh: refreshPresence } = useContactsPresence();
 
   const [query, setQuery] = useState('');
+  const [registered, setRegistered] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  // Registered (callable) contacts only — never show "Unknown User" rows.
-  const registered = useMemo(() => {
-    const src = (matchedRegistered && matchedRegistered.length)
-      ? matchedRegistered
-      : (matchedContacts || []).filter((c) => !!c.userId);
-    return src.filter((c) => !!c.userId);
-  }, [matchedRegistered, matchedContacts]);
+  // Fast path: read ONLY the registered (callable) contacts straight from SQLite
+  // — a single targeted, indexed query (registered-only, ~the rows we render)
+  // instead of routing through the contact-sync hook, which loads the ENTIRE
+  // phonebook (`SELECT *`, registered + unregistered) plus three metadata reads
+  // before any row can paint. Filtering by userId keeps out "Unknown User" rows.
+  const loadRegistered = useCallback(async () => {
+    try {
+      const rows = await ContactDatabase.loadRegisteredContacts();
+      setRegistered((rows || []).filter((c) => !!c.userId));
+    } catch {
+      // leave whatever we had; never block the screen on a DB hiccup
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        await loadContacts?.();
-        refreshPresence?.().catch(() => {});
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
-    return () => { alive = false; };
-  }, [loadContacts, refreshPresence]);
+  // Reload every time the screen gains focus so a contact that joined the app
+  // (synced from elsewhere) shows up — but it's just one cheap SQLite read.
+  useFocusEffect(useCallback(() => {
+    loadRegistered();
+    refreshPresence?.().catch(() => {});
+  }, [loadRegistered, refreshPresence]));
+
+  // Map registered → display rows ONCE (name resolution + secure avatar URI are
+  // the per-row cost). Kept separate from the query filter so typing in search
+  // never re-resolves names or re-builds URIs for the whole list.
+  const rows = useMemo(() => {
+    const mapped = registered.map((c) => {
+      const peerId = String(c.userId);
+      const name = resolveName(peerId, c.fullName || c.name || 'Unknown', c.originalPhone || c.normalizedPhone);
+      const profileImageRaw = c.profileImage || c.profilePicture || null;
+      const avatarUri = toSecureMediaUri(profileImageRaw) || null;
+      const phone = c.mobileFormatted || c.originalPhone || c.normalizedPhone || '';
+      return { peerId, name, avatarUri, profileImageRaw, phone };
+    });
+    // De-dup by peerId + sort by name once (search keeps this order).
+    const seen = new Set();
+    return mapped
+      .filter((r) => (seen.has(r.peerId) ? false : seen.add(r.peerId)))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [registered, resolveName]);
 
   const data = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const rows = registered.map((c) => {
-      const peerId = String(c.userId);
-      const name = resolveName(peerId, c.fullName || c.name || 'Unknown', c.originalPhone || c.normalizedPhone);
-      const avatarUri = toSecureMediaUri(c.profileImage || c.profilePicture) || null;
-      const phone = c.mobileFormatted || c.originalPhone || c.normalizedPhone || '';
-      return { peerId, name, avatarUri, phone, raw: c };
-    });
-    const filtered = q
-      ? rows.filter((r) => r.name.toLowerCase().includes(q) || (r.phone || '').includes(query.trim()))
-      : rows;
-    // De-dup by peerId and sort by name (no duplicate/broken rows).
-    const seen = new Set();
-    return filtered
-      .filter((r) => (seen.has(r.peerId) ? false : seen.add(r.peerId)))
-      .sort((a, b) => a.name.localeCompare(b.name));
-  }, [registered, query, resolveName]);
+    if (!q) return rows;
+    const rawQ = query.trim();
+    return rows.filter((r) => r.name.toLowerCase().includes(q) || (r.phone || '').includes(rawQ));
+  }, [rows, query]);
 
   const peerObjOf = useCallback((r) => ({
     id: r.peerId,
     name: r.name,
     avatar: r.avatarUri,
+  }), []);
+
+  // Full peerUser shape ChatScreen / UserB expect. With only `user` passed and no
+  // chatId, ChatScreen builds the deterministic private chatId itself (opening an
+  // existing thread or starting a fresh one).
+  const peerUserOf = useCallback((r) => ({
+    _id: r.peerId,
+    userId: r.peerId,
+    fullName: r.name,
+    name: r.name,
+    profileImage: r.profileImageRaw || null,
+    mobile: { number: r.phone || null },
   }), []);
 
   // Start the call, then drop back to the previous screen so the call overlay
@@ -124,6 +154,45 @@ export default function NewCallScreen() {
     startVideoCall?.(peerObjOf(r));
     navigation.goBack();
   }, [startVideoCall, peerObjOf, navigation]);
+
+  // Tap the name/number → open the 1:1 chat thread.
+  const openChat = useCallback((r) => {
+    if (!r?.peerId) return;
+    navigation.navigate('ChatScreen', { user: peerUserOf(r) });
+  }, [navigation, peerUserOf]);
+
+  // ─── Profile preview modal (avatar tap) ───
+  const [selected, setSelected] = useState(null);
+  const [profileVisible, setProfileVisible] = useState(false);
+
+  const openProfile = useCallback((r) => {
+    setSelected(r);
+    setProfileVisible(true);
+  }, []);
+  const closeProfile = useCallback(() => setProfileVisible(false), []);
+
+  // Let the modal dismiss before the call engine / next screen takes over.
+  const previewCall = useCallback((media) => {
+    const r = selected;
+    closeProfile();
+    if (!r) return;
+    setTimeout(() => {
+      if (media === 'video') startVideoCall?.(peerObjOf(r));
+      else startAudioCall?.(peerObjOf(r));
+    }, 220);
+  }, [selected, closeProfile, startVideoCall, startAudioCall, peerObjOf]);
+
+  const previewMessage = useCallback(() => {
+    const r = selected;
+    closeProfile();
+    if (r) openChat(r);
+  }, [selected, closeProfile, openChat]);
+
+  const previewInfo = useCallback(() => {
+    const r = selected;
+    closeProfile();
+    if (r) navigation.navigate('UserB', { item: { peerUser: peerUserOf(r), chatType: 'private' } });
+  }, [selected, closeProfile, navigation, peerUserOf]);
 
   const c = theme.colors;
   const isDark = c.background !== '#ffffff';
@@ -140,8 +209,10 @@ export default function NewCallScreen() {
       themeColor={c.themeColor}
       onAudio={() => onAudio(item)}
       onVideo={() => onVideo(item)}
+      onPressName={() => openChat(item)}
+      onPressAvatar={() => openProfile(item)}
     />
-  ), [c.primaryTextColor, c.placeHolderTextColor, c.themeColor, onAudio, onVideo]);
+  ), [c.primaryTextColor, c.placeHolderTextColor, c.themeColor, onAudio, onVideo, openChat, openProfile]);
 
   return (
     <View style={[styles.container, { backgroundColor: c.background, }]}>
@@ -155,7 +226,7 @@ export default function NewCallScreen() {
         <View style={styles.topTitleWrap}>
           <Text style={[styles.topTitle, { color: c.primaryTextColor }]}>New call</Text>
           <Text style={[styles.topSub, { color: c.placeHolderTextColor }]}>
-            {isSyncing ? 'Syncing…' : `${data.length} contact${data.length === 1 ? '' : 's'}`}
+            {loading && !data.length ? 'Loading…' : `${data.length} contact${data.length === 1 ? '' : 's'}`}
           </Text>
         </View>
       </View>
@@ -180,7 +251,7 @@ export default function NewCallScreen() {
         </View>
       </View>
 
-      {loading ? (
+      {loading && !data.length ? (
         <View style={styles.centerFill}>
           <ActivityIndicator color={c.themeColor} />
         </View>
@@ -216,6 +287,20 @@ export default function NewCallScreen() {
           )}
         />
       )}
+
+      {/* WhatsApp-style profile preview (avatar tap) — same modal as the chat list. */}
+      <ProfilePreviewModal
+        visible={profileVisible}
+        onClose={closeProfile}
+        name={selected?.name || 'Unknown'}
+        image={selected?.avatarUri || null}
+        avatarColor={getAvatarColor(selected?.name || '')}
+        isGroup={false}
+        onMessage={previewMessage}
+        onCall={() => previewCall('audio')}
+        onVideo={() => previewCall('video')}
+        onInfo={previewInfo}
+      />
     </View>
   );
 }

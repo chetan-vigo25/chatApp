@@ -49,7 +49,7 @@ export default function UserDetailsSheet({
 }) {
   const { theme, isDarkMode } = useTheme();
   const insets = useSafeAreaInsets();
-  const { startAudioCall, startVideoCall } = useCall();
+  const { startAudioCall, startVideoCall, callBusy } = useCall();
 
   const translateY = useRef(new Animated.Value(SCREEN_H)).current;
   const backdrop = useRef(new Animated.Value(0)).current;
@@ -194,9 +194,9 @@ export default function UserDetailsSheet({
           <View style={[styles.actionsCard, { borderColor: dividerClr }]}>
             <ActionCol icon="chatbubble" label="Message" color={themeColor} onPress={handleMessage} />
             <View style={[styles.vDivider, { backgroundColor: dividerClr }]} />
-            <ActionCol icon="call" label="Audio" color={themeColor} onPress={handleAudio} />
+            <ActionCol icon="call" label="Audio" color={themeColor} onPress={handleAudio} disabled={callBusy} />
             <View style={[styles.vDivider, { backgroundColor: dividerClr }]} />
-            <ActionCol icon="videocam" label="Video" color={themeColor} onPress={handleVideo} />
+            <ActionCol icon="videocam" label="Video" color={themeColor} onPress={handleVideo} disabled={callBusy} />
           </View>
 
           {/* About */}
@@ -235,9 +235,14 @@ export default function UserDetailsSheet({
   );
 }
 
-function ActionCol({ icon, label, color, onPress }) {
+function ActionCol({ icon, label, color, onPress, disabled }) {
   return (
-    <TouchableOpacity style={styles.actionCol} onPress={onPress} activeOpacity={0.6}>
+    <TouchableOpacity
+      style={[styles.actionCol, disabled && styles.actionColDisabled]}
+      onPress={onPress}
+      disabled={disabled}
+      activeOpacity={0.6}
+    >
       <Ionicons name={icon} size={24} color={color} />
       <Text style={[styles.actionColLabel, { color }]} numberOfLines={1}>{label}</Text>
     </TouchableOpacity>
@@ -334,6 +339,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 6,
   },
+  actionColDisabled: { opacity: 0.4 },
   vDivider: {
     width: StyleSheet.hairlineWidth,
     alignSelf: 'stretch',

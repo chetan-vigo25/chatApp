@@ -42,42 +42,62 @@ const _safeClose = async () => {
   _db = null;
 };
 
+const MAX_INIT_ATTEMPTS = 5;
+
+// Open a fresh native handle. Native expo-sqlite on Android intermittently
+// returns a half-initialized handle from openDatabaseAsync whose internal
+// pointer is null — every subsequent prepareAsync/execAsync then rejects with a
+// bare NullPointerException ("has been rejected … java.lang.NullPointerException").
+// This is most likely right after a close→reopen (performSessionReset closes the
+// DB, a getDB caller immediately reopens the same file). The synchronous opener
+// does not hit this race, so we fall back to it after the first async attempt.
+const _openHandle = async (attempt) => {
+  if (attempt >= 2 && typeof SQLite.openDatabaseSync === 'function') {
+    return SQLite.openDatabaseSync(DB_NAME);
+  }
+  return await SQLite.openDatabaseAsync(DB_NAME);
+};
+
 const _initDB = async () => {
-  // Native expo-sqlite on Android occasionally rejects the first execAsync after
-  // a fresh openDatabaseAsync with a bare NullPointerException. PRAGMA calls are
-  // optimizations, not correctness — wrap them so a failing PRAGMA never blocks
-  // init. Each attempt opens a fresh handle and closes the previous one cleanly.
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // Each attempt opens a FRESH handle (closing the previous one) and PROBES it
+  // with a trivial query before doing any real work. The Android NPE surfaces on
+  // that probe for a dead handle, so it retries with a new (eventually sync)
+  // handle instead of limping into runMigrations and failing there.
+  for (let attempt = 1; attempt <= MAX_INIT_ATTEMPTS; attempt++) {
     try {
       await _safeClose();
-      _db = await SQLite.openDatabaseAsync(DB_NAME);
+      _db = await _openHandle(attempt);
 
-      // Small tick gives the native side time to finish wiring up the handle —
-      // without this, Android sometimes throws NullPointerException on the very
-      // first execAsync immediately after openDatabaseAsync resolves.
-      await new Promise((r) => setTimeout(r, 50));
+      // Small tick lets the native side finish wiring up the handle before the
+      // first call; a touch longer on retries.
+      await new Promise((r) => setTimeout(r, attempt === 1 ? 50 : 150));
 
-      // PRAGMAs are best-effort — log and continue on failure rather than
-      // tearing down the connection.
-      try { await _db.execAsync('PRAGMA journal_mode = WAL;'); }
-      catch (e) { console.warn('[ChatDB] PRAGMA journal_mode failed (non-fatal):', e?.message); }
-      try { await _db.execAsync('PRAGMA synchronous = NORMAL;'); }
-      catch (e) { console.warn('[ChatDB] PRAGMA synchronous failed (non-fatal):', e?.message); }
-      try { await _db.execAsync('PRAGMA foreign_keys = ON;'); }
-      catch (e) { console.warn('[ChatDB] PRAGMA foreign_keys failed (non-fatal):', e?.message); }
-      // busy_timeout makes SQLite block for up to 5s waiting for a write lock
-      // instead of failing immediately with "database is locked". Critical for
-      // the upsertMessages path where many batches + fire-and-forget reply
-      // writes contend on the same WAL writer.
-      try { await _db.execAsync('PRAGMA busy_timeout = 5000;'); }
-      catch (e) { console.warn('[ChatDB] PRAGMA busy_timeout failed (non-fatal):', e?.message); }
+      // Probe FIRST: if the handle is dead this throws the NPE and drops us into
+      // the catch → retry, rather than silently warning through every PRAGMA and
+      // only blowing up inside runMigrations.
+      await _db.getFirstAsync('SELECT 1');
+
+      // PRAGMAs are best-effort optimizations — log and continue on failure
+      // rather than tearing down a handle that already passed the probe.
+      for (const pragma of [
+        'PRAGMA journal_mode = WAL;',
+        'PRAGMA synchronous = NORMAL;',
+        'PRAGMA foreign_keys = ON;',
+        // busy_timeout makes SQLite block up to 5s for a write lock instead of
+        // failing immediately with "database is locked" — critical for the
+        // upsertMessages path where many batches contend on the WAL writer.
+        'PRAGMA busy_timeout = 5000;',
+      ]) {
+        try { await _db.execAsync(pragma); }
+        catch (e) { console.warn(`[ChatDB] ${pragma} failed (non-fatal):`, e?.message); }
+      }
 
       await runMigrations(_db);
       return _db;
     } catch (err) {
-      console.warn(`[ChatDB] getDB attempt ${attempt} failed: ${err?.message}; will retry`);
+      console.warn(`[ChatDB] init attempt ${attempt}/${MAX_INIT_ATTEMPTS} failed: ${err?.message}; will retry`);
       await _safeClose();
-      if (attempt < 3) await new Promise(r => setTimeout(r, 200 * attempt));
+      if (attempt < MAX_INIT_ATTEMPTS) await new Promise(r => setTimeout(r, 250 * attempt));
     }
   }
   console.error('[ChatDB] All DB init attempts failed');

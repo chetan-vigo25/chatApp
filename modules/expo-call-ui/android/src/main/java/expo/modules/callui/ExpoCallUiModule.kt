@@ -75,7 +75,7 @@ class ExpoCallUiModule : Module() {
 
     // ---- lock-screen security (WhatsApp-style isolation) ----
     // True when the device is currently locked (keyguard showing). Recorded at
-    // call arrival so we only apply locked-call restrictions for calls that began
+    // call arrival so we only apply locked-call restrictions to calls that began
     // on a locked device.
     Function("isDeviceLocked") {
       val ctx = appContext.reactContext ?: return@Function false
@@ -83,10 +83,9 @@ class ExpoCallUiModule : Module() {
       km?.isKeyguardLocked ?: false
     }
 
-    // Runtime override of the manifest android:showWhenLocked. We keep the
-    // manifest flag true so the call reliably appears OVER the keyguard on launch,
-    // then revoke it at runtime (show=false) the moment the user leaves the call,
-    // so the rest of the app can never be drawn over the lock screen.
+    // Runtime override of the manifest android:showWhenLocked. We keep the manifest
+    // flag true so the call reliably appears OVER the keyguard on launch, then
+    // revoke it at runtime (show=false) the moment the user leaves the call.
     Function("setShowWhenLocked") { show: Boolean ->
       val activity = appContext.currentActivity
       activity?.runOnUiThread {
@@ -98,10 +97,9 @@ class ExpoCallUiModule : Module() {
       Unit
     }
 
-    // Send the app BEHIND the keyguard: revoke show-when-locked, then move the
-    // task to the back so the system lock screen reasserts. Called when a call
-    // that started on a locked device ends or the user backs out of it — so the
-    // user lands on the lock screen, NOT inside the app.
+    // Send the app BEHIND the keyguard: revoke show-when-locked, then move the task
+    // to back so the system lock screen reasserts. Called when a call that started
+    // on a locked device ends or the user backs out of it.
     Function("returnToLockScreen") {
       val activity = appContext.currentActivity
       activity?.runOnUiThread {
@@ -162,6 +160,20 @@ class ExpoCallUiModule : Module() {
     val callerImage = options["callerImage"] as? String
     val callType = options["callType"] as? String ?: "audio"
     val isVideo = callType == "video"
+
+    // Re-arm show-when-locked TRUE on the (possibly backgrounded) activity. A prior
+    // locked call's returnToLockScreen() set it FALSE to re-protect the app; without
+    // resetting it here, the full-screen intent for THIS new call would light the
+    // screen but the call UI couldn't draw over the keyguard ("screen on, no UI").
+    // When the app is killed there's no activity → the manifest flag handles it.
+    appContext.currentActivity?.let { act ->
+      act.runOnUiThread {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+          act.setShowWhenLocked(true)
+          act.setTurnScreenOn(true)
+        }
+      }
+    }
 
     ensureChannel(ctx)
 

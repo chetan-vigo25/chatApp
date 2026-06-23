@@ -16,7 +16,7 @@ import { AuthProvider } from './src/contexts/AuthContext';
 import { PresenceProvider } from './src/presence/store/PresenceContext';
 import { RealtimeChatProvider } from './src/contexts/RealtimeChatContext';
 import AppContent from './src/screens/AppContent';
-import {  getFCMToken, initializeNotifications, setupNotificationCategory, setupCallNotificationCategory } from './src/firebase/fcmService';
+import { getFCMToken, initializeNotifications, setupNotificationCategory, setupCallNotificationCategory } from './src/firebase/fcmService';
 import { registerNotifeeForeground, ensureCallChannel } from './src/firebase/callNotifee';
 import { setPushToken } from './src/Redux/Services/Socket/socket';
 import 'react-native-get-random-values';

@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SOCKET_URL } from '@env';
 import { Alert, AppState, Platform } from 'react-native';
 import { performSessionReset, saveAuthSession } from '../../../services/sessionManager';
+import { resetToLogin, resetToAccountStatus } from '../navigationService';
 import ChatDatabase from '../../../services/ChatDatabase';
 
 // Presence heartbeat: while the app is foregrounded we refresh the server's
@@ -122,8 +123,16 @@ const flushPendingEmitQueue = () => {
   }
 };
 
+const AUTH_TOKEN_ERROR_CODES = new Set(['AUTH_TOKEN_EXPIRED', 'AUTH_TOKEN_INVALID']);
+
 const isTokenErrorPayload = (payload = {}) => {
   const message = String(payload?.message || payload?.error || payload?.reason || '');
+  // The backend now tags auth failures with an explicit code (and `expired`),
+  // which is more reliable than message-sniffing. Honour both.
+  const code = String(payload?.code || payload?.data?.code || '');
+  if (AUTH_TOKEN_ERROR_CODES.has(code)) return true;
+  if (payload?.expired === true || payload?.data?.expired === true) return true;
+  if (payload?.data?.valid === false) return true;
   return TOKEN_ERROR_REGEX.test(message);
 };
 
@@ -231,25 +240,29 @@ const handleLogout = async (navigation = currentNavigation, alertMessage = null)
     accessTokenCache = '';
     pendingEmitQueue.length = 0;
 
-    await performSessionReset({
-      reason: 'socket_logout',
-      resetNavigation: false,
-      clearAllStorage: true,
-    });
-
-    if (navigation) {
-      navigation.reset({
-        index: 0,
-        routes: [{ name: 'Login' }],
+    // Teardown is best-effort — it must NEVER block the redirect to Login.
+    try {
+      await performSessionReset({
+        reason: 'socket_logout',
+        resetNavigation: false,
+        clearAllStorage: true,
       });
+    } catch (e) {
+      console.error('❌ session reset failed during logout (continuing):', e?.message);
     }
+  } catch (error) {
+    console.error('❌ Error during logout:', error);
+  } finally {
+    // ALWAYS redirect via the ROOT navigation container ref (retries until
+    // ready). The passed `navigation` prop can be stale/null or scoped to a
+    // nested navigator, which is why a forced logout sometimes failed to leave
+    // the current screen.
+    resetToLogin();
 
     // Surface why the user was logged out (e.g. admin deactivated the account).
     if (alertMessage) {
       Alert.alert('Logged out', alertMessage);
     }
-  } catch (error) {
-    console.error('❌ Error during logout:', error);
   }
 };
 
@@ -722,7 +735,11 @@ const attachCoreSocketListeners = (navigation) => {
   });
 
   socket.on('token:validation:result', (response) => {
-    if (response?.status === false && isTokenErrorPayload(response)) {
+    // The result can come back as a failure envelope (status:false) OR as a
+    // success envelope carrying { valid:false, expired } — treat both as a
+    // signal to silently refresh rather than waiting for a hard disconnect.
+    const invalid = response?.status === false || response?.data?.valid === false;
+    if (invalid && isTokenErrorPayload(response)) {
       requestSocketReauthentication('token_validation_result', navigation).catch(() => {});
     }
   });
@@ -769,26 +786,38 @@ const attachCoreSocketListeners = (navigation) => {
     );
   });
 
-  // Admin blocked/unblocked this account. Unlike logout, the session stays
-  // alive — the user can still browse, but the server rejects any send. We
-  // flip the Redux flag (so the composer can lock) and inform the user.
+  // SM2 — typed account-state denial on the 'error' channel (server emits this
+  // then disconnects when a blocked/inactive/deleted account tries to use or
+  // (re)open a socket). Route to the AccountStatus screen + wipe. Other 'error'
+  // payloads (category !== 'account') are left to the existing token/connect
+  // handlers, so this is purely additive.
+  socket.on('error', (payload) => {
+    const info = payload?.data || payload || {};
+    const state = ACCOUNT_STATE_BY_CODE[info.code];
+    if (info.category === 'account' || state) {
+      handleAccountStateError(state || 'blocked', info.message).catch(() => {});
+    }
+  });
+
+  // Admin blocked this account. Block is now authoritative (the server revokes
+  // all sessions + force-closes sockets), so route to the blocked screen and
+  // wipe rather than keeping a half-alive browse-only session. Unblock simply
+  // clears the Redux flag for any session that's still around.
   const applyBlockState = (blocked, payload) => {
+    if (blocked) {
+      handleAccountStateError('blocked', payload?.message).catch(() => {});
+      return;
+    }
     try {
       const mod = require('../../Store');
       const store = mod.store || mod.default || mod;
       const pr = require('../../Reducer/Profile/Profile.reducer');
       const setBlocked = pr.setBlocked || (pr.actions && pr.actions.setBlocked);
-      if (store?.dispatch && setBlocked) store.dispatch(setBlocked(blocked));
+      if (store?.dispatch && setBlocked) store.dispatch(setBlocked(false));
     } catch (e) {}
     try {
       const { Alert } = require('react-native');
-      Alert.alert(
-        blocked ? 'Account blocked' : 'Account unblocked',
-        payload?.message ||
-          (blocked
-            ? 'An admin has blocked your account. You can view your chats but cannot send messages.'
-            : 'Your account has been unblocked. You can send messages again.'),
-      );
+      Alert.alert('Account unblocked', payload?.message || 'Your account has been unblocked.');
     } catch (e) {}
   };
 
@@ -826,6 +855,35 @@ const attachCoreSocketListeners = (navigation) => {
   socket.on('account:permanently:deleted', (payload) => {
     handleLogout(navigation, payload?.message || 'Your account has been permanently deleted.');
   });
+};
+
+// Map the backend's typed account-state error codes (SM2) to the AccountStatus
+// screen `state` param. These are NOT recoverable by a token refresh — the
+// account itself is blocked/inactive/deleted — so we wipe the local session and
+// route to the dedicated explainer screen instead of looping on reauth.
+const ACCOUNT_STATE_BY_CODE = {
+  ACCOUNT_BLOCKED: 'blocked',
+  ACCOUNT_INACTIVE: 'inactive',
+  ACCOUNT_DELETED: 'deleted',
+  ACCOUNT_NOT_FOUND: 'deleted',
+};
+
+const handleAccountStateError = async (state, message) => {
+  try {
+    safeDisconnectSocket();
+    updateSocketState({ status: 'logged_out', connected: false, lastDisconnectedAt: Date.now() });
+    sessionId = '';
+    deviceId = '';
+    accessTokenCache = '';
+    pendingEmitQueue.length = 0;
+    try {
+      await performSessionReset({ reason: `account_${state}`, resetNavigation: false, clearAllStorage: true });
+    } catch (e) {
+      console.error('❌ session reset failed during account-state handling (continuing):', e?.message);
+    }
+  } finally {
+    resetToAccountStatus(state, message || null);
+  }
 };
 
 export const getSocketStateSnapshot = () => ({ ...socketState });
@@ -951,6 +1009,25 @@ export const emitLogoutCurrentDevice = async () => {
     };
 
     if (socket && socket.connected) {
+      // Explicitly deregister this device's FCM push token BEFORE logout so push
+      // stops immediately (G2). The backend also nulls the token when it
+      // terminates the session, but emitting this first closes the window where a
+      // message/call push could still fire between logout and session cleanup.
+      // Best-effort: if it doesn't reach the server, session termination + the
+      // FCM dead-token feedback path still clear the token.
+      try {
+        socket.emit('notification:device:unregister', { deviceId: payload.deviceId });
+      } catch (e) {
+        console.warn('device unregister emit failed (non-fatal):', e?.message);
+      }
+      // Final authoritative presence-offline + last-seen BEFORE we tear the
+      // socket down (O1). Without this the user lingers "online" until the
+      // server's heartbeat sweeper catches up.
+      try {
+        socket.emit('presence:offline', {});
+      } catch (e) {
+        console.warn('presence:offline emit failed (non-fatal):', e?.message);
+      }
       socket.emit('logout', payload);
       console.log('📤 Emitted logout event:', payload);
     }

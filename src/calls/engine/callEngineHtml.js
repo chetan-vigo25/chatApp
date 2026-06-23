@@ -364,6 +364,9 @@ export const buildCallEngineHtml = () => `<!doctype html>
       wrap.className = 'rtile';
       var v = document.createElement('video');
       v.autoplay = true; v.playsInline = true; v.muted = false;
+      // The moment the element actually starts playing audible media, tell RN to
+      // drop any "Tap to enable audio" prompt — audio is live, no gesture needed.
+      v.addEventListener('playing', function () { if (!v.muted) post('audioResumed', {}); });
       wrap.appendChild(v);
       remotes.appendChild(wrap);
       tiles[id] = { wrap: wrap, video: v };
@@ -408,8 +411,24 @@ export const buildCallEngineHtml = () => `<!doctype html>
         v.volume = 1.0;
         var p = v.play();
         if (p && p.then) {
-          p.then(function () { logToRN('remote audio playing'); })
-           .catch(function (e) { logToRN('autoplay blocked (' + (e && e.name) + ') — needs gesture'); post('needsUnmuteGesture', {}); });
+          p.then(function () { logToRN('remote audio playing'); post('audioResumed', {}); })
+           .catch(function (e) {
+             var name = e && e.name;
+             // ONLY a genuine autoplay-policy block needs a user gesture. Other
+             // rejections (most commonly AbortError when the stream re-attaches
+             // mid-negotiation) are transient — retry shortly instead of showing
+             // a stale "Tap to enable audio" prompt over audio that's fine.
+             if (name === 'NotAllowedError' || name === 'SecurityError') {
+               logToRN('autoplay blocked (' + name + ') — needs gesture');
+               post('needsUnmuteGesture', {});
+             } else {
+               logToRN('play() rejected (' + name + ') — retrying');
+               setTimeout(function () {
+                 try { v.play().then(function () { post('audioResumed', {}); }).catch(function () {}); }
+                 catch (e2) {}
+               }, 300);
+             }
+           });
         }
       } catch (e) { logToRN('play() threw: ' + (e && e.message)); post('needsUnmuteGesture', {}); }
     }

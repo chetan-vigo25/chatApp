@@ -38,6 +38,7 @@ import {
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
+import { useCall } from '../calls/useCall';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -58,6 +59,8 @@ export default function ProfilePreviewModal({
   onViewPhoto,
 }) {
   const { theme, isDarkMode } = useTheme();
+  // Disable the call/video actions while another call is in progress.
+  const { callBusy } = useCall();
   const scale = useRef(new Animated.Value(0)).current;
   const opacity = useRef(new Animated.Value(0)).current;
   // Keep the modal mounted through the exit animation.
@@ -160,12 +163,12 @@ export default function ProfilePreviewModal({
                   </TouchableOpacity>
                 )}
                 {showCall && (
-                  <TouchableOpacity onPress={onCall} activeOpacity={0.6} style={styles.actionBtn} hitSlop={hit}>
+                  <TouchableOpacity onPress={onCall} disabled={callBusy} activeOpacity={0.6} style={[styles.actionBtn, callBusy && styles.actionBtnDisabled]} hitSlop={hit}>
                     <Ionicons name="call" size={19} color={actionGreen} />
                   </TouchableOpacity>
                 )}
                 {showVideo && (
-                  <TouchableOpacity onPress={onVideo} activeOpacity={0.6} style={styles.actionBtn} hitSlop={hit}>
+                  <TouchableOpacity onPress={onVideo} disabled={callBusy} activeOpacity={0.6} style={[styles.actionBtn, callBusy && styles.actionBtnDisabled]} hitSlop={hit}>
                     <Ionicons name="videocam" size={21} color={actionGreen} />
                   </TouchableOpacity>
                 )}
@@ -275,4 +278,5 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  actionBtnDisabled: { opacity: 0.4 },
 });

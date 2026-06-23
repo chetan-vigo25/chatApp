@@ -391,13 +391,17 @@ export const clearChatNotifications = async (chatId) => {
 // logged-out device never rings for a call or shows a chat notification.
 const hasActiveSession = async () => {
   try {
-    const [accessToken, deviceId] = await Promise.all([
-      AsyncStorage.getItem('accessToken'),
-      AsyncStorage.getItem('deviceId'),
-    ]);
-    return !!(accessToken && deviceId);
+    // accessToken is the single source of truth for "logged in" (AuthContext keys
+    // its `isAuthenticated` off it, and logout's AsyncStorage.clear() removes it).
+    // Do NOT also require deviceId — the backend login response doesn't always
+    // include one, so requiring it would wrongly drop real calls/messages while
+    // logged in (screen wakes from the push but no call UI shows).
+    const accessToken = await AsyncStorage.getItem('accessToken');
+    return !!accessToken;
   } catch (_) {
-    return false;
+    // On a read error, fail OPEN for calls/messages — better to show a call than
+    // to silently miss one. (Logout still blocks via the cleared token above.)
+    return true;
   }
 };
 
