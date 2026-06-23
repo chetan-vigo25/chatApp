@@ -130,6 +130,14 @@ export const returnToLockScreen = () => {
   try { getCallUi().returnToLockScreen(); } catch (_) { /* best-effort */ }
 };
 
+// Runtime override of MainActivity's show-when-locked flag. Used to PROTECT normal
+// app content: revoke (false) when the app backgrounds without a call so the
+// device keyguard hides the app; calls re-arm it (true) via the native display().
+export const setShowWhenLockedNative = (show) => {
+  if (!isCallUi()) return;
+  try { getCallUi().setShowWhenLocked(!!show); } catch (_) { /* best-effort */ }
+};
+
 // ===== notifee channel (only used by the notifee fallback) =====
 export const ensureCallChannel = async () => {
   if (isCallUi()) return CALL_CHANNEL_ID; // native module creates its own channel

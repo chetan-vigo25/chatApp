@@ -44,7 +44,7 @@ import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
 import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall,
   startOngoingCallNotification, stopOngoingCallNotification,
-  isDeviceLockedNow, returnToLockScreen,
+  isDeviceLockedNow, returnToLockScreen, setShowWhenLockedNative,
 } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
 
@@ -346,6 +346,29 @@ export const CallProvider = ({ children }) => {
     if (!ringing) stopRinging();
   }, [state.status, state.accepted, state.remoteJoined, stopRinging]);
 
+  // ---- device-lock content protection (Android) ----
+  // MainActivity carries android:showWhenLocked (so a COLD-START incoming call can
+  // appear over the keyguard). Left static, that flag also draws normal app CONTENT
+  // (chats, profile, settings) over the lock screen — i.e. the app stays visible
+  // and interactive after the device is locked. SECURITY BUG.
+  // Fix: whenever the app leaves the foreground (lock / home / app-switch) and there
+  // is NO call that legitimately needs to show over the keyguard, REVOKE
+  // show-when-locked → the system keyguard hides the app until the device is
+  // unlocked (WhatsApp behaviour: device unlock required to see chats). Calls re-arm
+  // it via the native incoming-call display(); it's cleared again when a call ends.
+  // No-op on iOS (the OS already hides a locked app) / Expo Go.
+  useEffect(() => {
+    const onAppStateChange = (next) => {
+      if (next === 'active') return; // unlocked & in use → nothing to protect
+      // Keep showing over the keyguard ONLY while a call is in progress.
+      if (stateRef.current.status === CALL_STATUS.IDLE) {
+        setShowWhenLockedNative(false);
+      }
+    };
+    const sub = AppState.addEventListener('change', onAppStateChange);
+    return () => sub.remove();
+  }, []);
+
   // ---- ring timeout (auto-end an unanswered call after the configured window) ----
   const clearRingTimeout = useCallback(() => {
     if (ringTimeoutRef.current) {
@@ -614,6 +637,10 @@ export const CallProvider = ({ children }) => {
         returnToLockScreen();
         lockedCallRef.current = false;
         setLockedCall(false);
+      } else {
+        // Call ended while unlocked: the incoming-call display() armed
+        // show-when-locked; clear it now so a later device lock protects content.
+        setShowWhenLockedNative(false);
       }
       dispatch({ type: ACT.RESET });
     }, 500);
