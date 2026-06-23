@@ -7,8 +7,8 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import { useFocusEffect } from "@react-navigation/native";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
-import { emitLogoutCurrentDevice, clearLocalStorageAndDisconnect } from "../../Redux/Services/Socket/socket";
 import { resetToLogin } from "../../Redux/Services/navigationService";
+import { useAuth } from "../../contexts/AuthContext";
 import { Ionicons, FontAwesome6, AntDesign } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
@@ -17,6 +17,7 @@ const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
 export default function Setting({ navigation }) {
   const { theme, isDarkMode } = useTheme();
+  const { logout } = useAuth();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(14)).current;
   const dispatch = useDispatch();
@@ -44,14 +45,13 @@ export default function Setting({ navigation }) {
   }
 
   const handleLogout = async () => {
-    // Tell the server this device logged out (best-effort — never block logout).
+    // Funnel through the single AuthContext.logout() so the teardown is consistent:
+    // server notify (deactivate push token) + clear storage + disconnect socket +
+    // setIsAuthenticated(false). The last step is what makes every call/message
+    // listener unmount — previously this screen called the socket helpers directly
+    // and left isAuthenticated=true, so the user kept receiving calls after logout.
     try {
-      await emitLogoutCurrentDevice();
-    } catch (_e) { /* ignore — proceed with local logout */ }
-
-    // Clear AsyncStorage / SecureStore + SQLite and disconnect the socket.
-    try {
-      await clearLocalStorageAndDisconnect();
+      await logout();
     } catch (_e) { /* ignore — still redirect to login */ }
 
     // Redirect to the Login screen on the ROOT navigator. This screen lives

@@ -332,6 +332,20 @@ export const CallProvider = ({ children }) => {
     stopRingtone();
   }, []);
 
+  // ---- ring ownership (anti-ghost-ring) ----
+  // The ringtone/ringback may ONLY exist while the call is genuinely ringing:
+  // an unanswered INCOMING, or an OUTGOING whose peer hasn't joined. In EVERY
+  // other state — answered, ACTIVE, ENDED, IDLE — the ring is stopped here.
+  // This makes "no ringing after answer/reject/end" a STRUCTURAL guarantee rather
+  // than something each terminal path must remember; a missed/edge transition can
+  // no longer leave a ghost ring. It only ever STOPS (never starts), so it can't
+  // conflict with the imperative startRinging() calls.
+  useEffect(() => {
+    const ringing = (state.status === CALL_STATUS.INCOMING && !state.accepted)
+      || (state.status === CALL_STATUS.OUTGOING && !state.remoteJoined);
+    if (!ringing) stopRinging();
+  }, [state.status, state.accepted, state.remoteJoined, stopRinging]);
+
   // ---- ring timeout (auto-end an unanswered call after the configured window) ----
   const clearRingTimeout = useCallback(() => {
     if (ringTimeoutRef.current) {
@@ -592,9 +606,11 @@ export const CallProvider = ({ children }) => {
     if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
     resetTimerRef.current = setTimeout(() => {
       endedRef.current = false;
-      // If this call began on a locked device, drop the app BEHIND the keyguard
-      // now that it's over — the user lands on the lock screen, never the app.
-      if (lockedCallRef.current) {
+      // Drop the app BEHIND the keyguard now that the call is over, if the device
+      // is locked. Checks the LIVE lock state (not just whether it began locked),
+      // so an OUTGOING/caller call — or any call where the screen locked mid-call —
+      // also returns to the lock screen instead of exposing the app.
+      if (lockedCallRef.current || isDeviceLockedNow()) {
         returnToLockScreen();
         lockedCallRef.current = false;
         setLockedCall(false);
@@ -1149,6 +1165,11 @@ export const CallProvider = ({ children }) => {
   // usable; the call (audio + video media) keeps running because the engine
   // WebView and CallProvider live at the app root, independent of navigation.
   const minimize = useCallback(() => {
+    // Never minimize into a LOCKED device — that would expose the app behind the
+    // call over the keyguard. Return to the lock screen instead. Uses the LIVE
+    // lock state, so this protects outgoing/caller calls and mid-call locks too,
+    // not just calls that arrived while the device was already locked.
+    if (isDeviceLockedNow()) { returnToLockScreen(); return; }
     dispatch({ type: ACT.SET_FLAG, key: 'minimized', value: true });
   }, []);
   const maximize = useCallback(() => {
@@ -1262,8 +1283,15 @@ export const CallProvider = ({ children }) => {
   const matchesCurrent = (payload) => {
     const snap = stateRef.current;
     if (snap.status === CALL_STATUS.IDLE) return false;
-    if (snap.signalId && payload?.callId && String(snap.signalId) !== String(payload.callId)) return false;
-    return true;
+    const pid = payload?.callId ? String(payload.callId) : null;
+    if (!pid) return true; // no id on the event → assume it targets the current call
+    // The signaling id (signalId) and the WebRTC call id (callId) can differ and
+    // reconcile late. A terminal event (call:ended/rejected/cancelled) keyed on
+    // EITHER must be honoured — dropping it on a signalId-only mismatch was a cause
+    // of one-sided ending / ghost ringing on the peer.
+    const ids = [snap.signalId, snap.callId].filter(Boolean).map(String);
+    if (ids.length === 0) return true; // no confirmed id yet → don't drop a terminal
+    return ids.includes(pid);
   };
   const onSignalCancelled = useCallback((payload) => {
     if (!matchesCurrent(payload)) return;

@@ -5,6 +5,24 @@ app, or killed**, the backend must send a **high-priority FCM data message** to
 the callee's CURRENT device token(s) the moment a call rings. A closed app cannot
 receive the socket `call:incoming`, so this push is the ONLY way to ring it.
 
+> ## ⚠️ Deregister tokens on logout (REQUIRED — prevents "logged-out device still rings")
+>
+> When this device logs out, the client emits **`logout { deviceId, logoutAll:false }`**
+> over the socket (see `AuthContext.logout` → `emitLogoutCurrentDevice`). On that
+> event the backend **MUST deactivate/remove this device's `pushToken` AND
+> `voipToken`** so it stops receiving call/message pushes immediately.
+>
+> - Without this, a logged-out (or even reinstalled) device keeps getting call
+>   pushes because the backend still holds its token. The client has a backstop
+>   (`hasActiveSession` drops pushes when no `accessToken` is stored), but the
+>   backend should not be sending them at all — it wastes pushes and is the true
+>   root cause of "logged out but still receives calls".
+> - Re-activate the token only when the SAME device logs back in and re-registers
+>   via `notification:device:register` (the client does this on every login/boot).
+> - On iOS, also stop sending **VoIP** pushes to a logged-out `voipToken` — a VoIP
+>   push is handled natively before any JS auth check, so the client cannot
+>   suppress it.
+
 ## Two trigger points (handle at least one; both is fine — de-dupe on `callId`)
 
 1. **Server-side on `call:ring`** (socket) — the handler that already receives the

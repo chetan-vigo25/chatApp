@@ -3,7 +3,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState, Platform } from 'react-native';
 import * as Device from 'expo-device';
 import * as Application from 'expo-application';
-import { initSocket, disconnectSocket, setupAppStateListener } from '../Redux/Services/Socket/socket';
+import {
+  initSocket, disconnectSocket, setupAppStateListener,
+  emitLogoutCurrentDevice, clearLocalStorageAndDisconnect,
+} from '../Redux/Services/Socket/socket';
 
 const AuthContext = createContext({});
 export const useAuth = () => useContext(AuthContext);
@@ -15,6 +18,11 @@ export const AuthProvider = ({ children }) => {
 
   const appState = useRef(AppState.currentState);
   const navigationRef = useRef(null);
+  // Holds the unsubscribe for setupAppStateListener so it can be torn down on
+  // logout and re-registered exactly ONCE. Previously its cleanup was discarded
+  // and checkLoginStatus could run repeatedly (mount + every foreground), stacking
+  // duplicate AppState listeners that each tried to reconnect the socket.
+  const appStateCleanupRef = useRef(null);
 
   const getDeviceInfo = async () => {
     try {
@@ -49,7 +57,10 @@ export const AuthProvider = ({ children }) => {
 
         const deviceInfo = await getDeviceInfo();
         await initSocket(deviceInfo, navigationRef.current);
-        setupAppStateListener(navigationRef.current);
+        // Register the app-state listener exactly once: tear down any previous one
+        // first so re-running checkLoginStatus can't stack duplicate listeners.
+        if (appStateCleanupRef.current) appStateCleanupRef.current();
+        appStateCleanupRef.current = setupAppStateListener(navigationRef.current);
       } else {
         setUser(null);
         setIsAuthenticated(false);
@@ -84,21 +95,33 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
+  // SINGLE source of truth for logout. Every logout entry point (Settings button,
+  // forced logout, account deletion) must funnel through here so the teardown is
+  // consistent — otherwise `isAuthenticated` can stay true and call/message
+  // listeners keep running after logout (the cause of "logged out but still gets
+  // calls").
   const logout = async () => {
     try {
-      await AsyncStorage.multiRemove([
-        'userData',
-        'accessToken',
-        'refreshToken',
-        'deviceId',
-      ]);
-
-      disconnectSocket();
-
-      setUser(null);
-      setIsAuthenticated(false);
+      // 1) Tell the server this device logged out so it deactivates this device's
+      //    push token (FCM + iOS VoIP) + session and stops sending call/message
+      //    pushes. Best-effort — never block logout if the socket is down.
+      try { await emitLogoutCurrentDevice(); } catch (_) { /* ignore */ }
+      // 2) Stop the app-state listener so it can't reconnect the socket post-logout.
+      if (appStateCleanupRef.current) {
+        try { appStateCleanupRef.current(); } catch (_) { /* ignore */ }
+        appStateCleanupRef.current = null;
+      }
+      // 3) Clear ALL local storage (accessToken/deviceId/etc.) + disconnect the
+      //    socket. Without a token, initSocket() can no longer re-auth this device.
+      await clearLocalStorageAndDisconnect();
     } catch (error) {
       console.log('Logout error:', error);
+    } finally {
+      // 4) ALWAYS clear React auth state, even if the steps above threw — so EVERY
+      //    isAuthenticated-gated subscription (call signaling, push handlers,
+      //    realtime chat) unmounts and the user can never receive call events.
+      setUser(null);
+      setIsAuthenticated(false);
     }
   };
 
