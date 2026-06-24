@@ -31,6 +31,7 @@ import * as DocumentPicker from "expo-document-picker";
 import * as Location from "expo-location";
 import * as Contacts from "expo-contacts";
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
+import useDelayedVisible from "../../hooks/useDelayedVisible";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
@@ -1666,6 +1667,20 @@ export default function ChatScreen({ navigation, route }) {
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
+
+  // ── First-paint loading UX (local-first + spinner) ────────────────────────
+  // Messages render from SQLite instantly. A small spinner appears ONLY if
+  // that local read is slow (>200ms) and, once shown, stays ≥300ms so it never
+  // flickers (useDelayedVisible). A long stall with nothing loaded surfaces a
+  // retry. Sub-threshold loads fall straight through to the list — no flash.
+  const initialLoading = isLoadingInitial && messages.length === 0;
+  const showSkeleton = useDelayedVisible(initialLoading, { delay: 200, minVisible: 300 });
+  const [loadTimedOut, setLoadTimedOut] = useState(false);
+  useEffect(() => {
+    if (!initialLoading) { setLoadTimedOut(false); return undefined; }
+    const t = setTimeout(() => setLoadTimedOut(true), 12000);
+    return () => clearTimeout(t);
+  }, [initialLoading]);
 
   // A blocked user (set by an admin) can still browse chats but cannot send.
   // The server rejects sends too; this just gives immediate feedback.
@@ -5047,20 +5062,10 @@ export default function ChatScreen({ navigation, route }) {
     return null;
   };
 
-  // Only show loading if no messages at all (no cache, no SQLite data yet)
-  // If we have ANY messages, render them immediately while loading more in background
-  if (isLoadingInitial && messages.length === 0) {
-    return (
-      <View style={{
-        flex: 1,
-        backgroundColor: theme.colors.background,
-        justifyContent: "center",
-        alignItems: "center"
-      }}>
-        <ActivityIndicator size="small" color={theme.colors.themeColor} />
-      </View>
-    );
-  }
+  // NOTE: first-paint loading UI (skeleton / error / blank) is rendered INSIDE
+  // the messages region of the main layout (below) — NOT as a full-screen early
+  // return — so the header, input bar and footer stay visible while messages
+  // load. See the "Messages List" block.
 
   const isBroadcastChat = Boolean(chatData?.chatType === 'broadcast' || chatData?.isBroadcast);
   if (!chatData || (!chatData.peerUser && !chatData.isGroup && !isBroadcastChat)) {
@@ -5446,13 +5451,40 @@ export default function ChatScreen({ navigation, route }) {
           />
         )} */}
 
-        {/* Messages List */}
-        {isSearching && messages.length === 0 ? (
+        {/* Messages List — first-paint loading states render HERE (inside the
+            messages region only) so the header above and the input bar/footer
+            below stay visible. Priority: error > skeleton > sub-threshold blank
+            > search-empty > the real list. */}
+        {(initialLoading && loadTimedOut) ? (
+          // error state — local read never produced anything; offer a retry.
+          <View style={{ flex: 1, backgroundColor: theme.colors.background, justifyContent: "center", alignItems: "center", padding: 24 }}>
+            <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 14, marginBottom: 14, textAlign: "center" }}>
+              Couldn't load messages. Check your connection and try again.
+            </Text>
+            <TouchableOpacity
+              onPress={() => { setLoadTimedOut(false); onRefresh && onRefresh(); }}
+              style={{ paddingHorizontal: 22, paddingVertical: 10, borderRadius: 22, backgroundColor: theme.colors.themeColor }}
+            >
+              <Text style={{ color: "#fff", fontSize: 14, fontFamily: "Roboto-Medium" }}>Retry</Text>
+            </TouchableOpacity>
+          </View>
+        ) : showSkeleton ? (
+          // small spinner — only past the ~200ms threshold, kept ≥300ms so it
+          // never flickers; centered in just the message area. Transparent
+          // background so the chat wallpaper shows through (header + chat bar
+          // also remain visible).
+          <View style={{ flex: 1, backgroundColor: "transparent", justifyContent: "center", alignItems: "center" }}>
+            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+          </View>
+        ) : initialLoading ? (
+          // sub-threshold beat: plain themed message area, no spinner/flash.
+          <View style={{ flex: 1, backgroundColor: theme.colors.background }} />
+        ) : isSearching && messages.length === 0 ? (
           <View style={{ flex: 1, justifyContent: "center", alignItems: "center", paddingHorizontal: 32 }}>
             <Ionicons name="search-outline" size={64} color={theme.colors.placeHolderTextColor} />
-            <Text style={{ 
-              marginTop: 16, 
-              fontSize: 15, 
+            <Text style={{
+              marginTop: 16,
+              fontSize: 15,
               color: theme.colors.placeHolderTextColor,
               textAlign: 'center',
               fontFamily: "Roboto-Regular",

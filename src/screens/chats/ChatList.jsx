@@ -30,6 +30,7 @@ import { useCall } from '../../calls/useCall';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import ContactDatabase from '../../services/ContactDatabase';
+import { subscribeSessionReset } from '../../services/sessionEvents';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { APP_TAG_NAME } from '@env';
@@ -163,6 +164,35 @@ const dedupeChatsByPeer = (list, currentUserId, contactMap) => {
   return result;
 };
 
+// Module-level warm cache for the saved-contact name map (userId ->
+// { fullName, profileImage }). It lives OUTSIDE the component so it survives the
+// ChatList unmount/remount that `detachInactiveScreens` triggers on tab switches.
+// Re-entering the Chats tab seeds names synchronously from this cache — no
+// "Unknown" name flash, and no blocking ContactDatabase read on the render path.
+// A non-blocking background refresh on focus still keeps it fresh, and it is
+// cleared on session reset so contact names never leak across account switches.
+let _contactMapCache = null;
+subscribeSessionReset(() => {
+  _contactMapCache = null;
+});
+
+// Shallow content equality so a background refresh that produced an identical
+// map does not create a new reference (which would needlessly re-run the
+// dedupe/derivation memo on the warm chat list).
+const isSameContactMap = (a, b) => {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    const av = a[k];
+    const bv = b[k];
+    if (!bv || av.fullName !== bv.fullName || av.profileImage !== bv.profileImage) return false;
+  }
+  return true;
+};
+
 export default function ChatList({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -193,7 +223,7 @@ export default function ChatList({ navigation }) {
   // Used to force each chat row's name to the saved-contact name (the same name
   // shown in the contact list). Refreshed whenever the screen regains focus, so
   // a contact saved/renamed elsewhere is reflected on return.
-  const [contactMap, setContactMap] = useState(null);
+  const [contactMap, setContactMap] = useState(_contactMapCache);
 
   // Multi-select state (WhatsApp-style "delete for me" of multiple chats)
   const [selectionMode, setSelectionMode] = useState(false);
@@ -353,8 +383,12 @@ export default function ChatList({ navigation }) {
   }, [fadeAnim, effectiveChatList]);
 
   // Build the saved-contact name map from the locally-synced registered
-  // contacts (ContactDatabase). Reloaded on every focus so a contact saved or
-  // renamed while away is reflected the moment the user returns to the list.
+  // contacts (ContactDatabase). The current map is already seeded synchronously
+  // from `_contactMapCache` (so a tab re-entry shows names instantly with no DB
+  // read on the render path); this focus effect only does a NON-BLOCKING
+  // background refresh so a contact saved or renamed while away is reflected on
+  // return. The warm cache is updated and state is set only when the map content
+  // actually changed, avoiding a needless re-derivation of the chat list.
   useFocusEffect(
     useCallback(() => {
       let active = true;
@@ -369,9 +403,11 @@ export default function ChatList({ navigation }) {
             if (!fullName) continue;
             map[String(c.userId)] = { fullName, profileImage: c.profileImage || c.profilePicture || null };
           }
+          if (isSameContactMap(_contactMapCache, map)) return;
+          _contactMapCache = map;
           setContactMap(map);
         } catch (err) {
-          if (active) setContactMap((prev) => prev || {});
+          if (active && !_contactMapCache) setContactMap({});
         }
       })();
       return () => { active = false; };

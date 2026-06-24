@@ -1,10 +1,32 @@
 import * as SQLite from 'expo-sqlite';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as FileSystem from 'expo-file-system/legacy';
 
 const DB_NAME = 'TalksTry.db';
 const DB_VERSION = 13;
 
+// Where the destructive recreate stashes pending unsent messages, and where the
+// last init outcome is recorded for telemetry. See _deleteCorruptDB / _recordOutcome.
+const OUTBOX_BACKUP_KEY = '@chatdb/outboxBackup';
+const DB_OUTCOME_KEY = '@chatdb/lastInitOutcome';
+
 let _db = null;
 let _hasReplyColumns = false;
+
+// Dedicated READ-ONLY connection. The single shared `_db` connection serialized
+// every read behind the writer's cold-start/post-login catch-up storm (BEGIN
+// EXCLUSIVE batches), so a chat-open's first-paint SELECT waited for the storm
+// to drain — WAL's "1 writer + N concurrent readers" only applies across
+// SEPARATE connections. Routing the hot read path (loadMessages / counts /
+// clearedAt) through this second connection lets first paint read the last
+// committed snapshot immediately while writes keep draining on `_db`. It is a
+// pure optimization: any failure falls back to `_db` (prior behavior).
+let _readDb = null;
+let _readDbInitPromise = null;
+// Set if a dedicated reader connection can't be opened on this device/build, so
+// we stop re-attempting on every read and just use the primary connection. Reset
+// on a full DB teardown (_closeReadDB) so a later recreate gets a fresh try.
+let _readerUnavailable = false;
 
 // ─── DATABASE INIT ──────────────────────────────────────
 let _dbInitPromise = null;
@@ -19,6 +41,8 @@ const getDB = async () => {
       try { await _db.closeAsync(); } catch {}
       _db = null;
       _dbInitPromise = null;
+      // Primary handle died → drop the reader too so it re-opens cleanly.
+      await _closeReadDB();
     }
   }
   // Prevent concurrent init attempts
@@ -36,22 +60,213 @@ const getDB = async () => {
   }
 };
 
+const _closeReadDB = async () => {
+  const r = _readDb;
+  _readDb = null;
+  _readDbInitPromise = null;
+  _readerUnavailable = false;
+  if (r) { try { await r.closeAsync(); } catch {} }
+};
+
 const _safeClose = async () => {
+  // The reader points at the same file; tear it down with the primary so a
+  // recreate/recovery never leaves a stale reader handle on a deleted DB.
+  await _closeReadDB();
   if (!_db) return;
   try { await _db.closeAsync(); } catch {}
   _db = null;
 };
 
-const MAX_INIT_ATTEMPTS = 5;
+// Open (once) a second connection to the same DB file for read-only queries.
+// `getDB()` runs first so the file + schema/migrations already exist, then we
+// open an independent handle. Defensive throughout: on ANY failure we resolve to
+// the primary connection so reads always work.
+const getReadDB = async () => {
+  if (_readDb) return _readDb;
+  if (_readerUnavailable) return getDB(); // already known to be unsupported here
+  if (_readDbInitPromise) return _readDbInitPromise;
+  _readDbInitPromise = (async () => {
+    const primary = await getDB(); // ensures file exists + migrations have run
+    try {
+      const handle = typeof SQLite.openDatabaseSync === 'function'
+        ? SQLite.openDatabaseSync(DB_NAME)
+        : await SQLite.openDatabaseAsync(DB_NAME);
+      // Probe + best-effort pragmas. query_only hard-guards against accidental
+      // writes on this connection; busy_timeout mirrors the writer.
+      await handle.getFirstAsync('SELECT 1');
+      try { await handle.execAsync('PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;'); } catch {}
+      _readDb = handle;
+      return handle;
+    } catch (e) {
+      // Could not open a dedicated reader (e.g. native handle issue) — fall back
+      // to the shared primary connection. Reads still work, just without the
+      // concurrency win. Mark unavailable so we don't re-attempt on every read.
+      _readDb = null;
+      _readerUnavailable = true;
+      return primary;
+    } finally {
+      _readDbInitPromise = null;
+    }
+  })();
+  return _readDbInitPromise;
+};
 
-// Open a fresh native handle. Native expo-sqlite on Android intermittently
-// returns a half-initialized handle from openDatabaseAsync whose internal
-// pointer is null — every subsequent prepareAsync/execAsync then rejects with a
-// bare NullPointerException ("has been rejected … java.lang.NullPointerException").
-// This is most likely right after a close→reopen (performSessionReset closes the
-// DB, a getDB caller immediately reopens the same file). The synchronous opener
-// does not hit this race, so we fall back to it after the first async attempt.
+// Run a read-only query through the dedicated reader. If the reader handle is
+// dead/missing, reset it and transparently retry on the primary connection.
+const _readQuery = async (fn) => {
+  try {
+    const rdb = await getReadDB();
+    return await fn(rdb);
+  } catch (e) {
+    await _closeReadDB();
+    const db = await getDB();
+    return await fn(db);
+  }
+};
+
+const MAX_INIT_ATTEMPTS = 6;
+
+// Fire-and-forget telemetry: record the outcome of EACH init so recurrence of
+// the corruption/native-mismatch failure is visible (queryable from AsyncStorage
+// / a debug screen) instead of guessed. Intentionally NOT awaited — it must never
+// gate or slow the init hot path.
+const _recordOutcome = (outcome, extra = {}) => {
+  AsyncStorage.setItem(
+    DB_OUTCOME_KEY,
+    JSON.stringify({ outcome, at: Date.now(), ...extra }),
+  ).catch(() => {});
+};
+
+// Build a file:// URI for a DB sidecar (-wal / -shm) in SQLite's own directory.
+const _sidecarUri = (suffix) => {
+  let dir = SQLite.defaultDatabaseDirectory || '';
+  if (!dir) return null;
+  if (!dir.startsWith('file://')) dir = `file://${dir}`;
+  if (!dir.endsWith('/')) dir += '/';
+  return `${dir}${DB_NAME}${suffix}`;
+};
+
+// `deleteDatabaseAsync` SHOULD remove the -wal/-shm sidecars too, but that is not
+// contractually guaranteed across expo-sqlite versions/platforms — and a
+// truncated/leftover WAL is ITSELF a primary cause of the corrupt-open NPE. So we
+// also unlink the sidecars explicitly (idempotent: missing files don't throw) to
+// guarantee the recreate starts from a truly clean slate.
+const _deleteSidecars = async () => {
+  for (const suffix of ['-wal', '-shm']) {
+    const uri = _sidecarUri(suffix);
+    if (!uri) continue;
+    try { await FileSystem.deleteAsync(uri, { idempotent: true }); } catch {}
+  }
+};
+
+// Best-effort: read the durable `outbox` (pending, not-yet-acked outbound
+// messages) BEFORE the wipe and stash it in AsyncStorage. The local DB is a
+// re-syncable cache for RECEIVED messages, but the outbox is the ONLY record of
+// locally-composed sends the server hasn't confirmed — deleting it loses real
+// user messages. If the file is too corrupt to read the outbox, we cannot save
+// it; warn loudly so the loss is visible in telemetry, never silent.
+const _backupOutboxBeforeNuke = async () => {
+  let probeDb = null;
+  try {
+    probeDb = SQLite.openDatabaseSync(DB_NAME);
+    await probeDb.getFirstAsync('SELECT 1');
+    const rows = await probeDb.getAllAsync('SELECT * FROM outbox');
+    if (Array.isArray(rows) && rows.length) {
+      await AsyncStorage.setItem(OUTBOX_BACKUP_KEY, JSON.stringify(rows));
+      console.warn(`[ChatDB] preserved ${rows.length} pending outbox message(s) before DB wipe; restoring after recreate`);
+    }
+  } catch (e) {
+    const m = String(e?.message || '').toLowerCase();
+    // "no such table: outbox" → pre-V8 DB with nothing to preserve (not a loss).
+    if (!m.includes('no such table')) {
+      console.warn('[ChatDB] could not preserve outbox before DB wipe — pending unsent messages may be lost:', e?.message);
+      _recordOutcome('outbox_preserve_failed', { error: e?.message });
+    }
+  } finally {
+    if (probeDb) { try { await probeDb.closeAsync(); } catch {} }
+  }
+};
+
+// Re-insert any outbox rows preserved before the wipe into the freshly recreated
+// (migrated) DB, set next_retry_at=0 so the worker drains them immediately, then
+// clear the backup. Behaviour-preserving: mirrors the columns outboxEnqueue uses.
+const _restoreOutboxBackup = async (db) => {
+  let raw = null;
+  try { raw = await AsyncStorage.getItem(OUTBOX_BACKUP_KEY); } catch {}
+  if (!raw) return;
+  let rows = [];
+  try { rows = JSON.parse(raw) || []; } catch { rows = []; }
+  let restored = 0;
+  for (const r of rows) {
+    if (!r?.client_message_id || !r?.chat_id) continue;
+    try {
+      await db.runAsync(
+        `INSERT OR REPLACE INTO outbox
+           (client_message_id, chat_id, payload, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at)
+         VALUES ($c,$cid,$p,$a,$m,0,$e,$ca,$ua)`,
+        {
+          $c: r.client_message_id,
+          $cid: r.chat_id,
+          $p: typeof r.payload === 'string' ? r.payload : JSON.stringify(r.payload || {}),
+          $a: r.attempts || 0,
+          $m: r.max_attempts || 6,
+          $e: r.last_error || null,
+          $ca: r.created_at || Date.now(),
+          $ua: Date.now(),
+        },
+      );
+      restored++;
+    } catch {}
+  }
+  try { await AsyncStorage.removeItem(OUTBOX_BACKUP_KEY); } catch {}
+  if (restored) console.warn(`[ChatDB] restored ${restored} pending outbox message(s); they will retry on next drain`);
+};
+
+// Delete the on-disk database (and its -wal/-shm sidecars) as a LAST-RESORT
+// recovery. A corrupted or locked DB file makes the native open return a
+// half-initialized handle whose internal pointer is null, so EVERY subsequent
+// prepareAsync rejects with a bare NullPointerException no matter how we reopen
+// the SAME file — the plain retry loop can never escape that. The local DB is a
+// cache (the backend is the sync source of truth: messages re-sync on next
+// connect), so recreating it empty is far better than a permanently dead chat —
+// EXCEPT the outbox, which we preserve first (see _backupOutboxBeforeNuke).
+let _didNukeThisRun = false;        // sticky across the process (drives the final cause-A log)
+let _deletedThisSequence = false;   // reset per _initDB run (prevents re-nuking attempts 5/6)
+const _deleteCorruptDB = async () => {
+  await _safeClose();
+  // 1. Save pending sends BEFORE anything is destroyed.
+  await _backupOutboxBeforeNuke();
+  // 2. Delete the main DB file...
+  try {
+    if (typeof SQLite.deleteDatabaseAsync === 'function') {
+      await SQLite.deleteDatabaseAsync(DB_NAME);
+    } else if (typeof SQLite.deleteDatabaseSync === 'function') {
+      SQLite.deleteDatabaseSync(DB_NAME);
+    }
+  } catch (e) {
+    console.warn('[ChatDB] could not delete corrupt database (non-fatal):', e?.message);
+  }
+  // 3. ...and its WAL/SHM sidecars, so the recreate is from a truly clean slate.
+  await _deleteSidecars();
+  _didNukeThisRun = true;
+  _deletedThisSequence = true;
+  console.warn('[ChatDB] deleted corrupt database + WAL/SHM sidecars; recreating empty (received messages re-sync from server)');
+};
+
+// Open a fresh native handle. The strategy ESCALATES per attempt:
+//   1      → async open                      (fast path)
+//   2, 3   → sync open                       (dodges the async close→reopen race;
+//                                             the sync opener doesn't hit it)
+//   4, 5, 6→ DELETE the file, then sync open  (self-heal a corrupt/locked DB —
+//                                             the only thing that breaks the
+//                                             "reopen the same dead file" loop)
+// Anti-loop guard: the destructive delete runs AT MOST ONCE per init sequence
+// (_deletedThisSequence). Attempts 5/6 then just reopen the already-recreated
+// empty file — re-deleting would clobber the outbox backup with the empty DB.
 const _openHandle = async (attempt) => {
+  if (attempt >= 4 && !_deletedThisSequence) {
+    await _deleteCorruptDB();
+  }
   if (attempt >= 2 && typeof SQLite.openDatabaseSync === 'function') {
     return SQLite.openDatabaseSync(DB_NAME);
   }
@@ -59,6 +274,9 @@ const _openHandle = async (attempt) => {
 };
 
 const _initDB = async () => {
+  // Reset the per-sequence delete guard so THIS init run can self-heal once if
+  // needed (without re-nuking on attempts 5/6). _didNukeThisRun stays sticky.
+  _deletedThisSequence = false;
   // Each attempt opens a FRESH handle (closing the previous one) and PROBES it
   // with a trivial query before doing any real work. The Android NPE surfaces on
   // that probe for a dead handle, so it retries with a new (eventually sync)
@@ -93,6 +311,15 @@ const _initDB = async () => {
       }
 
       await runMigrations(_db);
+      // Recreated this run → restore any preserved pending sends, then record the
+      // healed outcome (cause B). A clean open just records success.
+      if (_deletedThisSequence) {
+        await _restoreOutboxBackup(_db);
+        _recordOutcome('recovered_via_recreate', { attempt });
+        console.warn('[ChatDB] recovered via delete-and-recreate (cause B: corrupt/locked DB, healed)');
+      } else {
+        _recordOutcome(attempt === 1 ? 'ok' : 'recovered_after_retry', { attempt });
+      }
       return _db;
     } catch (err) {
       console.warn(`[ChatDB] init attempt ${attempt}/${MAX_INIT_ATTEMPTS} failed: ${err?.message}; will retry`);
@@ -100,7 +327,23 @@ const _initDB = async () => {
       if (attempt < MAX_INIT_ATTEMPTS) await new Promise(r => setTimeout(r, 250 * attempt));
     }
   }
-  console.error('[ChatDB] All DB init attempts failed');
+  // If we got here we even tried DELETING and recreating the file and it STILL
+  // can't prepare a statement. That is no longer a corrupt-file problem — the
+  // native expo-sqlite module is returning null handles, which almost always
+  // means the installed native build is out of sync with JS expo-sqlite
+  // (New Architecture enabled / deps bumped without a clean prebuild). No JS
+  // retry can fix that — the app must be rebuilt:
+  //   npx expo install expo-sqlite
+  //   npx expo prebuild --clean -p android
+  //   npx expo run:android        (or rebuild the dev client / EAS build)
+  _recordOutcome(
+    _didNukeThisRun ? 'failed_after_recreate_native_rebuild_required' : 'failed_all_attempts',
+  );
+  console.error(
+    _didNukeThisRun
+      ? '[ChatDB] All DB init attempts failed AFTER deleting the file → native expo-sqlite build is stale/mismatched (cause A). Rebuild the app: `npx expo install expo-sqlite` then `npx expo prebuild --clean -p android` then `npx expo run:android`.'
+      : '[ChatDB] All DB init attempts failed.'
+  );
   return null;
 };
 
@@ -1176,7 +1419,6 @@ const _preserveLocalState = async (db, msg) => {
 
 const loadMessages = async (chatId, opts = {}) => {
   if (!chatId) return [];
-  const db = await getDB();
   const { limit = 50, offset = 0, afterTimestamp = 0, beforeTimestamp = 0, skipCleanup = false } = opts;
 
   // ── STEP 1: Lightweight cleanup — only run on first load (not every refresh) ──
@@ -1201,23 +1443,28 @@ const loadMessages = async (chatId, opts = {}) => {
   // count (after dedup + optimistic/scheduled rows) diverges from the SQLite row
   // count — the old `offset` paging could skip rows or get stuck and never reveal
   // older history on a cold-start scroll-up.
-  let rows;
-  if (beforeTimestamp > 0) {
-    rows = await db.getAllAsync(
-      `SELECT * FROM messages WHERE chat_id = $cid AND timestamp < $bts ORDER BY timestamp DESC LIMIT $lim`,
-      { $cid: chatId, $bts: beforeTimestamp, $lim: limit }
-    );
-  } else if (afterTimestamp > 0) {
-    rows = await db.getAllAsync(
-      `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
-      { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
-    );
-  } else {
-    rows = await db.getAllAsync(
+  //
+  // Run on the dedicated READER connection so this first-paint query reads the
+  // last committed snapshot immediately instead of queueing behind the writer
+  // storm on the shared connection.
+  const rows = await _readQuery(async (db) => {
+    if (beforeTimestamp > 0) {
+      return db.getAllAsync(
+        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp < $bts ORDER BY timestamp DESC LIMIT $lim`,
+        { $cid: chatId, $bts: beforeTimestamp, $lim: limit }
+      );
+    }
+    if (afterTimestamp > 0) {
+      return db.getAllAsync(
+        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+        { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
+      );
+    }
+    return db.getAllAsync(
       `SELECT * FROM messages WHERE chat_id = $cid ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
       { $cid: chatId, $lim: limit, $off: offset }
     );
-  }
+  });
 
   if (rows.length === 0) return [];
 
@@ -1235,7 +1482,7 @@ const loadMessages = async (chatId, opts = {}) => {
       for (let i = 0; i < allIds.length; i += BATCH) {
         const batch = allIds.slice(i, i + BATCH);
         const ph = batch.map(() => '?').join(',');
-        const replyRows = await db.getAllAsync(`SELECT * FROM message_replies WHERE message_id IN (${ph})`, batch);
+        const replyRows = await _readQuery((db) => db.getAllAsync(`SELECT * FROM message_replies WHERE message_id IN (${ph})`, batch));
         for (const r of replyRows) {
           replyMap[r.message_id] = {
             replyToMessageId: r.reply_to_message_id,
@@ -1627,15 +1874,13 @@ const clearChat = async (chatId, clearedAt = null) => {
 
 const getClearedAt = async (chatId) => {
   if (!chatId) return 0;
-  const db = await getDB();
-  const r = await db.getFirstAsync(`SELECT cleared_at FROM chat_meta WHERE chat_id = $c`, { $c: chatId });
+  const r = await _readQuery((db) => db.getFirstAsync(`SELECT cleared_at FROM chat_meta WHERE chat_id = $c`, { $c: chatId }));
   return r?.cleared_at || 0;
 };
 
 const getMessageCount = async (chatId) => {
   if (!chatId) return 0;
-  const db = await getDB();
-  const r = await db.getFirstAsync(`SELECT COUNT(*) as count FROM messages WHERE chat_id = $c`, { $c: chatId });
+  const r = await _readQuery((db) => db.getFirstAsync(`SELECT COUNT(*) as count FROM messages WHERE chat_id = $c`, { $c: chatId }));
   return r?.count || 0;
 };
 
@@ -1776,10 +2021,29 @@ const bulkUpdateStatus = async (chatId, newStatus, opts = {}) => {
 
 const closeDB = async () => {
   _dbInitPromise = null;
+  await _closeReadDB();
   if (_db) {
     try { await _db.closeAsync(); } catch {}
     _db = null;
   }
+};
+
+// Clean-close path. We open in WAL mode intentionally (PRAGMA journal_mode = WAL
+// in _initDB) for concurrent read/write throughput, but a process kill mid-write
+// can leave a partial WAL that bricks the next open (the cause-B corruption that
+// the delete-and-recreate self-heal exists to recover from). Checkpointing the
+// WAL back into the main DB and TRUNCATEing it on a graceful exit makes that far
+// less likely. Call from an AppState 'background'/'inactive' handler and on
+// logout/session-reset. Best-effort: never throws.
+const closeCleanly = async () => {
+  _dbInitPromise = null;
+  // Close the reader first so the checkpoint/truncate on the primary isn't held
+  // back by an open read connection on the same WAL.
+  await _closeReadDB();
+  if (!_db) return;
+  try { await _db.execAsync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch {}
+  try { await _db.closeAsync(); } catch {}
+  _db = null;
 };
 
 // ─── CHATLIST (chats table) ──────────────────────────────
@@ -2489,7 +2753,7 @@ export default {
   markMessageDeleted, deleteMessageForMe, clearChat, deduplicateChat,
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
-  closeDB, saveMessageSync, saveMessages,
+  closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
   updateChatLastMessage, updateChatLastMessageStatusById, updateChatUnread, incrementChatUnread,

@@ -725,6 +725,18 @@ const attachCoreSocketListeners = (navigation) => {
       if (sessionId) {
         AsyncStorage.setItem(STORAGE_KEYS.SESSION_ID, sessionId).catch(() => {});
       }
+      // Sync admin-block state on EVERY connect so the composer locks even when
+      // the user was blocked while offline and just relaunched (the live
+      // user:blocked event only fires while connected). Silent — no Alert here;
+      // applyBlockState handles the interactive block/unblock transitions.
+      try {
+        const isBlocked = !!response?.data?.isBlocked;
+        const mod = require('../../Store');
+        const store = mod.store || mod.default || mod;
+        const pr = require('../../Reducer/Profile/Profile.reducer');
+        const setBlocked = pr.setBlocked || (pr.actions && pr.actions.setBlocked);
+        if (store?.dispatch && setBlocked) store.dispatch(setBlocked(isBlocked));
+      } catch (e) {}
       emitDeviceEvents();
       return;
     }
@@ -786,6 +798,17 @@ const attachCoreSocketListeners = (navigation) => {
     );
   });
 
+  // Single-device login: this device's session was hard-deleted because the same
+  // account just logged in on another device. The server kicks our socket with
+  // `force_logout` — wipe the local session and return to the login screen
+  // immediately (don't wait for the next REST 401).
+  socket.on('force_logout', (payload) => {
+    handleLogout(
+      navigation,
+      payload?.message || 'You have been logged out because your account was used on another device.',
+    );
+  });
+
   // SM2 — typed account-state denial on the 'error' channel (server emits this
   // then disconnects when a blocked/inactive/deleted account tries to use or
   // (re)open a socket). Route to the AccountStatus screen + wipe. Other 'error'
@@ -799,25 +822,27 @@ const attachCoreSocketListeners = (navigation) => {
     }
   });
 
-  // Admin blocked this account. Block is now authoritative (the server revokes
-  // all sessions + force-closes sockets), so route to the blocked screen and
-  // wipe rather than keeping a half-alive browse-only session. Unblock simply
-  // clears the Redux flag for any session that's still around.
+  // Admin blocked/unblocked this account. A blocked user is NOT logged out —
+  // the session stays alive and they can still browse and receive, but the
+  // server rejects any send (1:1 / group message / status). We flip the Redux
+  // flag so the composer locks, and inform the user.
   const applyBlockState = (blocked, payload) => {
-    if (blocked) {
-      handleAccountStateError('blocked', payload?.message).catch(() => {});
-      return;
-    }
     try {
       const mod = require('../../Store');
       const store = mod.store || mod.default || mod;
       const pr = require('../../Reducer/Profile/Profile.reducer');
       const setBlocked = pr.setBlocked || (pr.actions && pr.actions.setBlocked);
-      if (store?.dispatch && setBlocked) store.dispatch(setBlocked(false));
+      if (store?.dispatch && setBlocked) store.dispatch(setBlocked(blocked));
     } catch (e) {}
     try {
       const { Alert } = require('react-native');
-      Alert.alert('Account unblocked', payload?.message || 'Your account has been unblocked.');
+      Alert.alert(
+        blocked ? 'Account blocked' : 'Account unblocked',
+        payload?.message ||
+          (blocked
+            ? 'An admin has blocked your account. You can view your chats but cannot send messages.'
+            : 'Your account has been unblocked. You can send messages again.'),
+      );
     } catch (e) {}
   };
 
@@ -861,8 +886,10 @@ const attachCoreSocketListeners = (navigation) => {
 // screen `state` param. These are NOT recoverable by a token refresh — the
 // account itself is blocked/inactive/deleted — so we wipe the local session and
 // route to the dedicated explainer screen instead of looping on reauth.
+// Admin BLOCK is intentionally absent — a blocked user is NOT logged out (they
+// stay logged in with a locked composer; see applyBlockState). Only deactivate
+// and delete route to the account-state screen + wipe.
 const ACCOUNT_STATE_BY_CODE = {
-  ACCOUNT_BLOCKED: 'blocked',
   ACCOUNT_INACTIVE: 'inactive',
   ACCOUNT_DELETED: 'deleted',
   ACCOUNT_NOT_FOUND: 'deleted',

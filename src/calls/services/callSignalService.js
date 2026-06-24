@@ -71,6 +71,10 @@ export const registerCallSignalListeners = (handlers = {}) => {
     'call:accepted': wrap('call:accepted', handlers.onAccepted),
     'call:rejected': wrap('call:rejected', handlers.onRejected),
     'call:ended': wrap('call:ended', handlers.onEnded),
+    // Caller-only: the server refused to ring an unreachable callee (logged out /
+    // deactivated / deleted / blocked / no active session). Carries a human
+    // `message` for the call screen.
+    'call:unavailable': wrap('call:unavailable', handlers.onUnavailable),
   };
   if (__DEV__) console.log('[CALL][APP][signal] registered call:* listeners on socket', socket.id || '(no id yet)');
   Object.keys(map).forEach((evt) => socket.on(evt, map[evt]));

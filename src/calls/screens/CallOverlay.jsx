@@ -80,9 +80,9 @@ export default function CallOverlay() {
   // The minimize affordance shows once a call is connecting/active or dialing
   // out (same gate as the controls) — NOT on an unanswered incoming ring, which
   // stays full-screen with Accept/Decline like WhatsApp.
-  // Minimizing reveals the app behind the call — forbidden when the call arrived
-  // on a LOCKED device (it would expose the app over the keyguard). In that case
-  // there is no minimize affordance; leaving the call returns to the lock screen.
+  // Minimizing reveals the app behind the call — forbidden when the call arrived on
+  // a LOCKED device (it would expose the app over the keyguard). No minimize then;
+  // leaving the call returns to the lock screen.
   const canMinimize = (status === CALL_STATUS.ACTIVE || accepted || status === CALL_STATUS.OUTGOING)
     && !lockedCall;
 
@@ -111,8 +111,7 @@ export default function CallOverlay() {
     if (!visible || minimized || incomingCollapsed) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       // Call arrived on a locked device → back returns to the system lock screen,
-      // never the app. The call keeps running (ongoing notification brings it
-      // back); the device stays protected until the user unlocks.
+      // never the app (the call keeps running; the ongoing notification brings it back).
       if (lockedCall) { leaveToLock(); return true; }
       if (canMinimize) minimize();
       // else: unanswered incoming ring (expanded) — consume back, keep ringing.
@@ -153,7 +152,9 @@ export default function CallOverlay() {
     if (status === CALL_STATUS.ACTIVE && isGroup) {
       return `${joined + 1} in call`;
     }
-    if (status === CALL_STATUS.ENDED) return END_TEXT[call?.endReason] || 'Call ended';
+    // A specific server/engine message (e.g. "User is unavailable right now.")
+    // wins over the generic per-reason label.
+    if (status === CALL_STATUS.ENDED) return call?.errorMessage || END_TEXT[call?.endReason] || 'Call ended';
     return null;
   })();
 

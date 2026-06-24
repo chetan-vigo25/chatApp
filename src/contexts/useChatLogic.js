@@ -35,6 +35,28 @@ import {
 } from "../utils/mediaService";
 import SqliteWriter from "../services/SqliteWriter";
 import { pauseBackgroundSyncFor } from "../services/syncPriority";
+import { subscribeSessionReset, subscribeUserChanged } from "../services/sessionEvents";
+
+// Module-level cache of the logged-in user (id + display name). `initializeChat`
+// used to `await AsyncStorage.getItem("userInfo")` on EVERY chat open before it
+// could paint the cached/SQLite messages — an async I/O hop on the first-paint
+// critical path. The value never changes within a session, so we read it once
+// and reuse it synchronously on every later open. Cleared on session reset or
+// account switch so the next open re-reads the new account.
+let _cachedUserInfo = null;
+subscribeSessionReset(() => { _cachedUserInfo = null; });
+subscribeUserChanged(() => { _cachedUserInfo = null; });
+const getCachedUserInfo = async () => {
+  if (_cachedUserInfo) return _cachedUserInfo;
+  try {
+    const raw = await AsyncStorage.getItem("userInfo");
+    if (!raw) return null;
+    _cachedUserInfo = JSON.parse(raw);
+    return _cachedUserInfo;
+  } catch {
+    return null;
+  }
+};
 
 /* Constants */
 const MAX_LOCAL_SAVE = 300;
@@ -1390,13 +1412,15 @@ export default function useChatLogic({ navigation, route }) {
     }
     
     try {
-      const userInfo = await AsyncStorage.getItem("userInfo");
-      if (!userInfo) {
+      // Read the logged-in user from the module cache (synchronous after the
+      // first open) instead of hitting AsyncStorage on every chat open — that
+      // read sat on the first-paint critical path before any messages rendered.
+      const user = await getCachedUserInfo();
+      if (!user) {
         setIsLoadingInitial(false);
         setIsLoadingFromLocal(false);
         return;
       }
-      const user = JSON.parse(userInfo);
       const userId = user._id || user.id;
       const userName = user.fullName || user.name || user.username || '';
       setCurrentUserId(userId);
@@ -2313,7 +2337,10 @@ export default function useChatLogic({ navigation, route }) {
         }
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
         const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, {
-          limit: 100,
+          // First page is intentionally small (~one screenful) for the fastest
+          // possible first paint; scroll-up paging + background sync fill the
+          // rest. Older pages still use the larger network/local page size.
+          limit: 40,
           afterTimestamp: clearedAt,
           // Always skip the inline temp-row cleanup WRITE on the read path — it
           // queues behind the cold-start storm and stalls the first paint. The

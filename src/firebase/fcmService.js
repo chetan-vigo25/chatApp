@@ -246,6 +246,22 @@ export const getFCMToken = async () => {
   // console.log('[FCM] hasPermission:', hasPermission);
   if (!hasPermission) return null;
 
+  // Register the refresh listener UP FRONT — before the (retryable) getToken
+  // call. A rotated token (new install, app data clear, FCM refresh) must be
+  // pushed to the backend or call/message notifications go to a dead token and
+  // never arrive. Wiring it here (not after getToken succeeds) means that even if
+  // the initial getToken fails transiently, the moment Play Services recovers and
+  // FCM hands us a token via refresh, we still capture + re-register it.
+  // (A fresh build install ALSO rotates the token — the most common reason
+  // background calls stop notifying after `expo run:android` until re-register.)
+  try {
+    m().onTokenRefresh((newToken) => {
+      // console.log('[FCM] Token refreshed → re-registering:', newToken);
+      try { setPushToken(newToken); } catch (_) {}
+      AsyncStorage.setItem('fcmToken', newToken).catch(() => {});
+    });
+  } catch (_) {}
+
   try {
     if (Platform.OS === 'ios') {
       const isRegistered = m().isDeviceRegisteredForRemoteMessages;
@@ -258,26 +274,52 @@ export const getFCMToken = async () => {
       // console.log('[FCM] APNs token:', apns);
     }
 
-    // console.log('[FCM] calling messaging().getToken()...');
-    const token = await m().getToken();
+    // getToken() commonly throws a TRANSIENT `SERVICE_NOT_AVAILABLE` /
+    // `messaging/unknown` IOException right after a fresh install or on a flaky
+    // network (esp. MIUI/Xiaomi, where Play Services takes a moment to register
+    // the new app with FCM). It succeeds on a short retry. Without this loop the
+    // first failure returned null → push stayed dead until the next login.
+    const token = await _getTokenWithRetry(m);
     // console.log('[FCM] Token:', token);
-
-    // A rotated token (new install, app data clear, FCM refresh) must be pushed
-    // to the backend or call/message notifications go to a dead token and never
-    // arrive. Re-register it over the socket + persist it. (A fresh build install
-    // ALSO rotates the token — the most common reason background calls stop
-    // notifying after `expo run:android` until the device re-registers/relogs.)
-    m().onTokenRefresh((newToken) => {
-      // console.log('[FCM] Token refreshed → re-registering:', newToken);
-      try { setPushToken(newToken); } catch (_) {}
-      AsyncStorage.setItem('fcmToken', newToken).catch(() => {});
-    });
-
     return token;
   } catch (error) {
     console.error('[FCM] Error getting FCM token:', error?.message, error?.code, error);
     return null;
   }
+};
+
+// Transient FCM backend errors that clear on retry. `messaging/unknown` wraps a
+// java IOException (SERVICE_NOT_AVAILABLE / TIMEOUT) from Play Services; a bare
+// AUTHENTICATION_FAILED is NOT transient, so it's deliberately excluded.
+const _isTransientFcmError = (err) => {
+  const s = `${err?.code || ''} ${err?.message || ''}`.toUpperCase();
+  return (
+    s.includes('SERVICE_NOT_AVAILABLE') ||
+    s.includes('MESSAGING/UNKNOWN') ||
+    s.includes('TIMEOUT') ||
+    s.includes('IOEXCEPTION') ||
+    s.includes('UNAVAILABLE')
+  );
+};
+
+const _getTokenWithRetry = async (m, attempts = 4) => {
+  let lastErr = null;
+  // Backoff: ~1s, 3s, 7s — gives Play Services time to come up after a fresh install.
+  const delays = [1000, 3000, 7000];
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await m().getToken();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1 && _isTransientFcmError(err)) {
+        console.warn(`[FCM] getToken transient failure (${err?.code || err?.message}); retry ${i + 1}/${attempts - 1}`);
+        await new Promise((r) => setTimeout(r, delays[Math.min(i, delays.length - 1)]));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
 };
 
 // ─── DE-DUPLICATION ───
@@ -391,16 +433,14 @@ export const clearChatNotifications = async (chatId) => {
 // logged-out device never rings for a call or shows a chat notification.
 const hasActiveSession = async () => {
   try {
-    // accessToken is the single source of truth for "logged in" (AuthContext keys
-    // its `isAuthenticated` off it, and logout's AsyncStorage.clear() removes it).
-    // Do NOT also require deviceId — the backend login response doesn't always
-    // include one, so requiring it would wrongly drop real calls/messages while
-    // logged in (screen wakes from the push but no call UI shows).
+    // accessToken is the single source of truth for "logged in" (logout's
+    // AsyncStorage.clear() removes it). Do NOT also require deviceId — the backend
+    // login response doesn't always store one, so requiring it would wrongly drop
+    // real calls/messages while logged in (screen wakes but no call UI shows).
     const accessToken = await AsyncStorage.getItem('accessToken');
     return !!accessToken;
   } catch (_) {
-    // On a read error, fail OPEN for calls/messages — better to show a call than
-    // to silently miss one. (Logout still blocks via the cleared token above.)
+    // Fail OPEN for calls/messages — better to show a call than to miss one.
     return true;
   }
 };

@@ -590,6 +590,14 @@ export const buildCallEngineHtml = () => `<!doctype html>
       call.on('error', function (err) {
         post('error', { message: (err && err.message) ? err.message : 'call error' });
       });
+      // Temporary WebRTC diagnostics — only fires when the SDK was built with
+      // debug:true (passed on 'connect'). Surfaces PC/ICE/DTLS transitions,
+      // candidate-type counts and periodic getStats to the RN log stream.
+      call.on('debug', function (d) {
+        if (!d) return;
+        logToRN('[RTC] ' + d.tag + ' ' + (d.data ? JSON.stringify(d.data) : ''));
+        post('rtcDebug', d);
+      });
     }
 
     function resetTiles() {
@@ -633,7 +641,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
               return;
             }
             logToRN('connecting to ' + (msg.url || '${SDK_ORIGIN}'));
-            call = new CallingSDK({ url: msg.url || '${SDK_ORIGIN}', token: msg.token });
+            call = new CallingSDK({ url: msg.url || '${SDK_ORIGIN}', token: msg.token, debug: !!msg.debug });
             wireEvents();
             Promise.resolve(call.connect()).then(function () {
               logToRN('engine connected — SDK ready');

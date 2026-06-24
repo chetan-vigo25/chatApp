@@ -48,7 +48,50 @@ automatically. This is an Android-only issue (the `showWhenLocked` flag).
 
 ---
 
-## 2. The fix — make `showWhenLocked` DYNAMIC
+## ⚠️ UPDATE — use the privacy-mask approach (NOT the showWhenLocked toggle below)
+
+The original fix (§2) toggled `showWhenLocked` off on background. **That breaks
+incoming-call display on a backgrounded/locked device**: the call's `display()`
+re-arms the flag via `currentActivity`, which is **null** for a backgrounded app —
+so the call UI can't draw over the keyguard ("screen wakes, no call UI"). 
+
+**Correct approach: never toggle `showWhenLocked`; mask content with an opaque
+overlay instead.** Keep the manifest flag constant so calls always show over lock,
+and cover chats with a privacy overlay whenever the app is backgrounded/locked with
+no call. Implemented in `src/calls/CallProvider.jsx`:
+
+```jsx
+const [privacyMask, setPrivacyMask] = useState(false);
+
+useEffect(() => {                       // drive the mask off AppState
+  const onAppStateChange = (next) => {
+    const inCall = stateRef.current.status !== CALL_STATUS.IDLE;
+    setPrivacyMask(next !== 'active' && !inCall);
+  };
+  onAppStateChange(AppState.currentState);
+  const sub = AppState.addEventListener('change', onAppStateChange);
+  return () => sub.remove();
+}, []);
+
+// …in render, last child of the provider:
+{privacyMask && state.status === CALL_STATUS.IDLE && Platform.OS === 'android' ? (
+  <View pointerEvents="auto" style={{
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: '#0B141A', zIndex: 99999, elevation: 99999,
+  }} />
+) : null}
+```
+
+- Hides chats over the keyguard AND in the recent-apps preview.
+- `status === IDLE` gate → the mask never covers the call UI.
+- No `showWhenLocked` toggling → incoming calls over the lock screen keep working.
+
+The section below is kept for history; **do not re-implement the `setShowWhenLocked
+(false)` toggle** — it's superseded by the mask above.
+
+---
+
+## 2. (SUPERSEDED) The fix — make `showWhenLocked` DYNAMIC
 
 Keep the manifest flag (a **cold-start** incoming call still needs to appear over
 the keyguard — and a killed app has no content to expose, it boots straight into

@@ -6,6 +6,7 @@ import { Audio } from 'expo-av';
 import { useTheme } from '../contexts/ThemeContext';
 import { useRealtimeChat } from '../contexts/RealtimeChatContext';
 import ChatDatabase from '../services/ChatDatabase';
+import ContactDatabase from '../services/ContactDatabase';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import {
   getActiveChatFromRoute,
@@ -14,7 +15,8 @@ import {
   subscribeNavigationSnapshot,
 } from '../Redux/Services/navigationService';
 import { subscribeSessionReset } from '../services/sessionEvents';
-import { previewFor } from '../firebase/notificationModel';
+import { previewFor, buildNotificationModel } from '../firebase/notificationModel';
+import { onlyDigits } from '../utils/savedContactName';
 import { claimNotification } from '../firebase/notificationDedupe';
 
 // Preload the notification sound once at module level
@@ -56,48 +58,55 @@ const formatClock = (timestamp) => {
 };
 
 const buildBannerModel = (payload = {}) => {
+  // Route the banner CONTENT through the SAME canonical model the OS push uses
+  // (firebase/notificationModel.buildNotificationModel) so the foreground in-app
+  // banner and the background/killed push render identically — same title/body,
+  // same media-preview text, same avatar and group rules. Before this the banner
+  // had its own divergent copy of that logic.
+  const model = buildNotificationModel(payload);
+
+  // Legacy fallbacks for the few fields the canonical model doesn't carry, and
+  // for routing-only payloads where it returns null.
   const notification = payload?.notificationData?.notification || {};
   const data = payload?.notificationData?.data || {};
-  const avtar = data?.profileImage || payload?.profileImage || null;
 
-  const isGroup = String(data?.isGroup || payload?.isGroup || data?.chatType === 'group' || payload?.chatType === 'group' || 'false').toLowerCase() === 'true'
-    || data?.chatType === 'group' || payload?.chatType === 'group';
+  const chatId = model?.chatId
+    || normalizeId(payload?.chatId)
+    || normalizeId(data?.groupId || payload?.groupId);
+  if (!chatId) return null;
 
-  const senderName =
-    data?.senderName ||
-    notification?.title ||
-    payload?.senderName ||
-    'New Message';
+  const isGroup = !!model?.isGroup;
+  const groupId = model?.groupId || normalizeId(data?.groupId || payload?.groupId);
 
-  // For group chats: extract group metadata
-  const groupId = normalizeId(data?.groupId || payload?.groupId);
-  const groupName = data?.groupName || payload?.groupName || data?.chatName || payload?.chatName || notification?.title || '';
-  const groupAvatar = data?.groupAvatar || payload?.groupAvatar || data?.chatAvatar || payload?.chatAvatar || null;
-
-  // For group banners: title = group name, body = "SenderName: message"
-  const title = isGroup
-    ? (groupName || notification?.title || senderName)
-    : (notification?.title || senderName);
-  const body = isGroup
-    ? (notification?.body || (senderName !== 'New Message' ? `${senderName}: ${data?.text || payload?.text || ''}` : (data?.text || payload?.text || '')))
-    : (notification?.body || '');
+  // Bare preview WITHOUT the "Sender: " prefix — kept so a group banner's sender
+  // prefix can be re-resolved against this device's own contacts in enqueueBanner.
+  const lineBody = model?.lineBody
+    || notification?.body || data?.text || payload?.text || '';
 
   return {
-    id: String(payload?.notificationId || payload?.messageId || `${payload?.chatId || 'chat'}_${payload?.timestamp || Date.now()}`),
+    id: String(payload?.notificationId || model?.messageId || payload?.messageId
+      || `${chatId}_${payload?.timestamp || model?.timestamp || Date.now()}`),
     notificationId: payload?.notificationId || null,
-    messageId: payload?.messageId || null,
-    chatId: normalizeId(payload?.chatId) || groupId,
+    messageId: model?.messageId || payload?.messageId || null,
+    chatId,
     groupId,
-    senderId: normalizeId(payload?.senderId),
-    senderName,
-    groupName,
-    groupAvatar,
-    title,
-    body,
-    avatarUrl: isGroup ? (groupAvatar || avtar) : avtar,
-    timestamp: Number(payload?.timestamp || payload?.sentAt || Date.now()),
+    senderId: model?.senderId || normalizeId(payload?.senderId),
+    senderName: model?.senderName || data?.senderName || notification?.title
+      || payload?.senderName || 'New Message',
+    // Sender's number so this device can resolve its OWN saved-contact name and
+    // fall back to the number when the sender isn't saved (matches the push).
+    senderMobile: model?.senderMobile || data?.senderMobile || payload?.senderMobile || null,
+    groupName: model?.groupName || data?.groupName || payload?.groupName
+      || data?.chatName || payload?.chatName || '',
+    groupAvatar: model?.groupAvatar || data?.groupAvatar || payload?.groupAvatar
+      || data?.chatAvatar || payload?.chatAvatar || null,
+    title: model?.title || notification?.title || 'New Message',
+    body: model?.body || notification?.body || lineBody || '',
+    lineBody,
+    avatarUrl: model?.avatar || data?.profileImage || payload?.profileImage || null,
+    timestamp: Number(payload?.timestamp || payload?.sentAt || model?.timestamp || Date.now()),
     isGroup,
-    chatType: isGroup ? 'group' : 'private',
+    chatType: model?.chatType || (isGroup ? 'group' : 'private'),
     metadata: payload?.metadata || {},
     raw: payload,
   };
@@ -329,6 +338,45 @@ export default function WhatsAppBannerHost() {
     // lookup covers both 1:1 and group banners.
     if (await isMutedNow(item)) return;
 
+    // ── Display-name resolution (matches the chat list AND the OS push) ─────
+    // The sender is shown exactly as THIS DEVICE knows them, applying the
+    // product rule:
+    //   • saved / registered contact   → show the saved name
+    //   • unsaved sender               → show the mobile number
+    //   • mobile number missing        → fall back to whatever name we have
+    // The device-saved contact name is authoritative (the chat list reads the
+    // same contacts table) so the banner stays correct even when the server's
+    // contact sync is stale. Best-effort: any failure keeps the canonical name.
+    try {
+      const local = (item.senderId || item.senderMobile)
+        ? await ContactDatabase.getContactDisplay({ userId: item.senderId, phone: item.senderMobile })
+        : null;
+      const localName = local?.fullName || null;
+
+      const mobile = item.senderMobile ? String(item.senderMobile) : null;
+      const rawName = (item.senderName && item.senderName !== 'New Message') ? item.senderName : null;
+      // The server name can itself BE the mobile number (the backend uses it for
+      // unsaved senders) — don't treat a bare number as a "registered" name.
+      const serverRealName = rawName && (!mobile || onlyDigits(rawName) !== onlyDigits(mobile))
+        ? rawName : null;
+
+      const resolvedName = localName || serverRealName || mobile || item.senderName || 'New Message';
+
+      if (item.isGroup) {
+        // Group: the title stays the group name — only the "Sender: " body
+        // prefix uses the resolved sender name.
+        if (resolvedName && resolvedName !== 'New Message') {
+          item.body = `${resolvedName}: ${item.lineBody || ''}`.trim();
+        }
+      } else {
+        item.senderName = resolvedName;
+        item.title = resolvedName;
+      }
+      if (!item.avatarUrl && local?.profileImage) item.avatarUrl = local.profileImage;
+    } catch {
+      // keep whatever buildNotificationModel resolved
+    }
+
     // Play notification sound for every new banner
     playNotificationSound();
 
@@ -501,8 +549,12 @@ export default function WhatsAppBannerHost() {
 
       const senderName = data?.senderName || data?.sender?.fullName || data?.sender?.name
         || data?.sender?.username || source?.senderName || 'New Message';
+      // Backend attaches the receiver-resolved number on the receiver-bound emit
+      // as `senderMobile` so this device can show it for an unsaved sender.
+      const senderMobile = data?.senderMobile || source?.senderMobile || null;
       const avatar = data?.sender?.profileImage || data?.sender?.profileImageUrl
-        || data?.profileImage || data?.senderImage || source?.profileImage || null;
+        || data?.profileImage || data?.senderProfileImage || data?.senderImage
+        || source?.profileImage || null;
 
       // Preview text per message type (WhatsApp-style) — shared with the OS push
       // path so the banner and the notification show identical text.
@@ -514,6 +566,7 @@ export default function WhatsAppBannerHost() {
         chatId,
         senderId,
         senderName,
+        senderMobile,
         chatType: 'private',
         isGroup: false,
         text: bodyText,
@@ -521,7 +574,7 @@ export default function WhatsAppBannerHost() {
         timestamp: data?.timestamp || data?.sentAt || data?.createdAt || Date.now(),
         notificationData: {
           notification: { title: senderName, body: bodyText },
-          data: { ...data, chatType: 'private', senderName },
+          data: { ...data, chatType: 'private', senderName, senderMobile, profileImage: avatar },
         },
       });
     };

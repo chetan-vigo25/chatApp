@@ -45,19 +45,17 @@ export default function Setting({ navigation }) {
   }
 
   const handleLogout = async () => {
-    // Funnel through the single AuthContext.logout() so the teardown is consistent:
-    // server notify (deactivate push token) + clear storage + disconnect socket +
-    // setIsAuthenticated(false). The last step is what makes every call/message
-    // listener unmount — previously this screen called the socket helpers directly
-    // and left isAuthenticated=true, so the user kept receiving calls after logout.
+    // Funnel through the single AuthContext.logout(): server notify (deactivate push
+    // token) + clear storage + disconnect + setIsAuthenticated(false). That last step
+    // unmounts every call/message listener — calling the socket helpers directly left
+    // isAuthenticated=true, so the user kept receiving calls after logout.
     try {
       await logout();
     } catch (_e) { /* ignore — still redirect to login */ }
 
     // Redirect to the Login screen on the ROOT navigator. This screen lives
     // inside the bottom-tab navigator, so its own `navigation.reset` can't
-    // reach the root 'Login' route (which is why logout appeared to do
-    // nothing). `resetToLogin` resets via the NavigationContainer ref.
+    // reach the root 'Login' route. `resetToLogin` resets via the NavigationContainer ref.
     resetToLogin();
   };
 

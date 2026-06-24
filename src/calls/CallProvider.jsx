@@ -44,7 +44,7 @@ import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
 import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall,
   startOngoingCallNotification, stopOngoingCallNotification,
-  isDeviceLockedNow, returnToLockScreen, setShowWhenLockedNative,
+  isDeviceLockedNow, returnToLockScreen,
 } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
 
@@ -135,11 +135,13 @@ export const CallProvider = ({ children }) => {
   // reset at hang-up, and guard against double-start.
   const recordingOnRef = useRef(false);
   const recordingCallIdRef = useRef(null);
-  // Lock-screen security: true when the current call ARRIVED while the device was
-  // locked. Such a call shows over the keyguard but the app behind it must stay
-  // protected — back/end returns to the lock screen instead of revealing the app.
+  // Lock-screen security: true when the current call ARRIVED / is being exited on
+  // a locked device → back/end returns to the lock screen instead of exposing app.
   const lockedCallRef = useRef(false);
   const [lockedCall, setLockedCall] = useState(false);
+  // Opaque privacy overlay shown when the app is backgrounded/locked with no call,
+  // so chat content is never visible over the lock screen / in the app switcher.
+  const [privacyMask, setPrivacyMask] = useState(false);
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
@@ -333,38 +335,28 @@ export const CallProvider = ({ children }) => {
   }, []);
 
   // ---- ring ownership (anti-ghost-ring) ----
-  // The ringtone/ringback may ONLY exist while the call is genuinely ringing:
-  // an unanswered INCOMING, or an OUTGOING whose peer hasn't joined. In EVERY
-  // other state — answered, ACTIVE, ENDED, IDLE — the ring is stopped here.
-  // This makes "no ringing after answer/reject/end" a STRUCTURAL guarantee rather
-  // than something each terminal path must remember; a missed/edge transition can
-  // no longer leave a ghost ring. It only ever STOPS (never starts), so it can't
-  // conflict with the imperative startRinging() calls.
+  // The ring may ONLY exist while genuinely ringing (unanswered INCOMING, or an
+  // OUTGOING whose peer hasn't joined). EVERY other state stops it — making "no
+  // ringing after answer/reject/end" structural. Only ever STOPS (never starts).
   useEffect(() => {
     const ringing = (state.status === CALL_STATUS.INCOMING && !state.accepted)
       || (state.status === CALL_STATUS.OUTGOING && !state.remoteJoined);
     if (!ringing) stopRinging();
   }, [state.status, state.accepted, state.remoteJoined, stopRinging]);
 
-  // ---- device-lock content protection (Android) ----
-  // MainActivity carries android:showWhenLocked (so a COLD-START incoming call can
-  // appear over the keyguard). Left static, that flag also draws normal app CONTENT
-  // (chats, profile, settings) over the lock screen — i.e. the app stays visible
-  // and interactive after the device is locked. SECURITY BUG.
-  // Fix: whenever the app leaves the foreground (lock / home / app-switch) and there
-  // is NO call that legitimately needs to show over the keyguard, REVOKE
-  // show-when-locked → the system keyguard hides the app until the device is
-  // unlocked (WhatsApp behaviour: device unlock required to see chats). Calls re-arm
-  // it via the native incoming-call display(); it's cleared again when a call ends.
-  // No-op on iOS (the OS already hides a locked app) / Expo Go.
+  // ---- device-lock content protection (privacy mask) ----
+  // MainActivity carries android:showWhenLocked (so a call can show over the
+  // keyguard). That also lets normal CONTENT draw over the lock screen. Rather than
+  // toggle showWhenLocked (unreliable for a backgrounded app — currentActivity is
+  // null, so the call could never re-arm it), we MASK content with an opaque
+  // overlay whenever the app is not foreground and there is no call in progress.
+  // No-op on iOS (the OS already hides a locked app).
   useEffect(() => {
     const onAppStateChange = (next) => {
-      if (next === 'active') return; // unlocked & in use → nothing to protect
-      // Keep showing over the keyguard ONLY while a call is in progress.
-      if (stateRef.current.status === CALL_STATUS.IDLE) {
-        setShowWhenLockedNative(false);
-      }
+      const inCall = stateRef.current.status !== CALL_STATUS.IDLE;
+      setPrivacyMask(next !== 'active' && !inCall);
     };
+    onAppStateChange(AppState.currentState);
     const sub = AppState.addEventListener('change', onAppStateChange);
     return () => sub.remove();
   }, []);
@@ -629,18 +621,13 @@ export const CallProvider = ({ children }) => {
     if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
     resetTimerRef.current = setTimeout(() => {
       endedRef.current = false;
-      // Drop the app BEHIND the keyguard now that the call is over, if the device
-      // is locked. Checks the LIVE lock state (not just whether it began locked),
-      // so an OUTGOING/caller call — or any call where the screen locked mid-call —
-      // also returns to the lock screen instead of exposing the app.
+      // If the device is locked when the call ends (it began locked OR the screen
+      // locked mid-call, caller or callee), drop the app BEHIND the keyguard so the
+      // user lands on the lock screen, never the app.
       if (lockedCallRef.current || isDeviceLockedNow()) {
         returnToLockScreen();
         lockedCallRef.current = false;
         setLockedCall(false);
-      } else {
-        // Call ended while unlocked: the incoming-call display() armed
-        // show-when-locked; clear it now so a later device lock protects content.
-        setShowWhenLockedNative(false);
       }
       dispatch({ type: ACT.RESET });
     }, 500);
@@ -1030,6 +1017,28 @@ export const CallProvider = ({ children }) => {
       return;
     }
 
+    // Callee can't be rung at all (logged out / deactivated / deleted / blocked /
+    // no active mobile session). The server short-circuits the ring and tells us
+    // synchronously in the ack — abort BEFORE the WebRTC dial so we never ring
+    // into the void, and show the server's reason on the call screen.
+    if (ack && ack.unavailable) {
+      if (__DEV__) console.log('[CALL][APP][startCall] callee unavailable — aborting', { code: ack.unavailableCode, message: ack.unavailableMessage });
+      // Claim the end synchronously so a late `call:unavailable` event can't
+      // double-finalize (finalizeEnd no-ops once endedRef is set; the reset
+      // timer below clears it).
+      endedRef.current = true;
+      stopRinging();
+      dispatch({
+        type: ACT.ENDED,
+        reason: 'failed',
+        nowMs: Date.now(),
+        message: ack.unavailableMessage || (isGroup ? 'No one could be reached.' : 'User is unavailable right now.'),
+      });
+      if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = setTimeout(() => { endedRef.current = false; dispatch({ type: ACT.RESET }); }, 2200);
+      return;
+    }
+
     const startPayload = {
       cmd: CMD.START_CALL,
       to: peerIds,
@@ -1192,22 +1201,19 @@ export const CallProvider = ({ children }) => {
   // usable; the call (audio + video media) keeps running because the engine
   // WebView and CallProvider live at the app root, independent of navigation.
   const minimize = useCallback(() => {
-    // Never minimize into a LOCKED device — that would expose the app behind the
-    // call over the keyguard. Return to the lock screen instead. Uses the LIVE
-    // lock state, so this protects outgoing/caller calls and mid-call locks too,
-    // not just calls that arrived while the device was already locked.
+    // Never minimize into a LOCKED device — that would expose the app over the
+    // keyguard. Return to the lock screen instead (covers outgoing/caller calls and
+    // mid-call locks, via the LIVE lock check).
     if (isDeviceLockedNow()) { returnToLockScreen(); return; }
     dispatch({ type: ACT.SET_FLAG, key: 'minimized', value: true });
   }, []);
-  const maximize = useCallback(() => {
-    dispatch({ type: ACT.SET_FLAG, key: 'minimized', value: false });
-  }, []);
 
-  // Leave the call UI while the device is locked → return to the system lock
-  // screen (NOT the app). The call keeps running in the background (the ongoing-
-  // call notification brings it back) but the app stays protected.
+  // Leave the call UI while locked → return to the system lock screen (not the app).
   const leaveToLock = useCallback(() => {
     returnToLockScreen();
+  }, []);
+  const maximize = useCallback(() => {
+    dispatch({ type: ACT.SET_FLAG, key: 'minimized', value: false });
   }, []);
 
   // Promote the compact incoming-call heads-up banner to the full-screen ring
@@ -1269,9 +1275,8 @@ export const CallProvider = ({ children }) => {
     });
     startRinging('incoming');
     armRingTimeout();
-    // Record whether the device was locked when this call arrived. If so, the
-    // call shows over the keyguard but the rest of the app must stay protected:
-    // back / end returns to the lock screen instead of revealing the app.
+    // Record whether the device was locked when this call arrived → back/end will
+    // return to the lock screen instead of exposing the app.
     const locked = isDeviceLockedNow();
     lockedCallRef.current = locked;
     setLockedCall(locked);
@@ -1312,12 +1317,11 @@ export const CallProvider = ({ children }) => {
     if (snap.status === CALL_STATUS.IDLE) return false;
     const pid = payload?.callId ? String(payload.callId) : null;
     if (!pid) return true; // no id on the event → assume it targets the current call
-    // The signaling id (signalId) and the WebRTC call id (callId) can differ and
-    // reconcile late. A terminal event (call:ended/rejected/cancelled) keyed on
-    // EITHER must be honoured — dropping it on a signalId-only mismatch was a cause
-    // of one-sided ending / ghost ringing on the peer.
+    // signalId and the WebRTC callId can differ + reconcile late. A terminal event
+    // keyed on EITHER must be honoured — dropping it on a signalId-only mismatch was
+    // a cause of one-sided ending / ghost ringing.
     const ids = [snap.signalId, snap.callId].filter(Boolean).map(String);
-    if (ids.length === 0) return true; // no confirmed id yet → don't drop a terminal
+    if (ids.length === 0) return true;
     return ids.includes(pid);
   };
   const onSignalCancelled = useCallback((payload) => {
@@ -1331,6 +1335,15 @@ export const CallProvider = ({ children }) => {
   const onSignalEnded = useCallback((payload) => {
     if (!matchesCurrent(payload)) return;
     finalizeEnd('completed');
+  }, [finalizeEnd]);
+  // Caller-only safety net: the server says the callee is unreachable (logged
+  // out / deactivated / deleted / blocked / no active session). The ring ack
+  // usually catches this first; this covers the case where the event lands after
+  // the dial already started. Ends the outgoing call with the server's message.
+  const onSignalUnavailable = useCallback((payload) => {
+    if (!matchesCurrent(payload)) return;
+    if (stateRef.current.direction !== 'outgoing') return;
+    finalizeEnd('failed', payload?.message || 'User is unavailable right now.');
   }, [finalizeEnd]);
   // Only the CALLER receives this: the callee answered over the app socket.
   // Stop the "no answer" ring timeout so a slow WebRTC media stream can't trip a
@@ -1361,6 +1374,7 @@ export const CallProvider = ({ children }) => {
       onAccepted: onSignalAccepted,
       onRejected: onSignalRejected,
       onEnded: onSignalEnded,
+      onUnavailable: onSignalUnavailable,
     };
     let unsub = () => {};
     let wasConnected = false;
@@ -1373,7 +1387,7 @@ export const CallProvider = ({ children }) => {
       wasConnected = connected;
     });
     return () => { unsub(); unsubState(); };
-  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded]);
+  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable]);
 
   // ---- incoming call from an FCM PUSH (callee offline / app backgrounded) ----
   // The push wakes the device; we reuse onSignalIncoming (which shows the ring +
@@ -1609,6 +1623,18 @@ export const CallProvider = ({ children }) => {
       )}
       <CallOverlay />
       <IncomingCallBanner />
+      {privacyMask && state.status === CALL_STATUS.IDLE && Platform.OS === 'android' ? (
+        // Opaque mask over all content when the app is backgrounded/locked with no
+        // call — hides chats over the keyguard + in the recents preview. Never shown
+        // while a call is in progress, so the call UI over the lock screen is visible.
+        <View
+          pointerEvents="auto"
+          style={{
+            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+            backgroundColor: '#0B141A', zIndex: 99999, elevation: 99999,
+          }}
+        />
+      ) : null}
     </CallContext.Provider>
   );
 };
