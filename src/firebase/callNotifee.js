@@ -22,7 +22,17 @@ import { CALL_PUSH_EVENTS } from './callEvents';
  */
 
 const CALL_CHANNEL_ID = 'calls_fullscreen';
+const MISSED_CALL_CHANNEL_ID = 'missed_calls';
 const notifId = (callId) => `call-${callId || 'incoming'}`;
+const missedNotifId = (callId) => `missed-${callId || 'call'}`;
+
+// Call ids we've ALREADY posted a "missed call" notification for. Two independent
+// sources can try to post the same missed-call notification — the live app
+// (CallProvider.finalizeEnd, when the call rang then went unanswered) AND a
+// backend `type:'call-missed'` FCM push (the source of truth when the app was
+// killed/offline). When the app is alive both run in the same JS runtime, so this
+// set de-dupes them to ONE notification (WhatsApp shows exactly one).
+const missedShownIds = new Set();
 
 // Ids we've ACTUALLY displayed a call notification for. The call state later
 // settles on a WebRTC id that can differ from the signaling id the notification
@@ -59,6 +69,16 @@ const getNotifee = () => {
     _notifee = null;
   }
   return _notifee;
+};
+
+// ---- expo-notifications (iOS missed-call + Android fallback when notifee absent) ----
+let _expoNotifications = null;
+let _expoResolved = false;
+const getExpoNotifications = () => {
+  if (_expoResolved) return _expoNotifications;
+  _expoResolved = true;
+  try { _expoNotifications = require('expo-notifications'); } catch (_) { _expoNotifications = null; }
+  return _expoNotifications;
 };
 
 // A full-screen call notifier exists on Android if EITHER backend is present.
@@ -254,6 +274,114 @@ export const cancelAllIncomingCallNotifee = async () => {
       try { await notifee.cancelNotification(notifId(id)); } catch (_) { /* best-effort */ }
     }
   }
+};
+
+// ===== missed-call notification (WhatsApp-style "Missed voice/video call") =====
+// A normal, DISMISSIBLE notification (not CallStyle / not full-screen) left in the
+// tray when an incoming call is never answered — ring timeout, caller cancelled,
+// or the device was offline/killed. Tapping it opens the caller's chat (routed by
+// the existing `type !== 'call'` + chatId branch in routeNotifeeEvent / fcmService).
+const ensureMissedCallChannel = async () => {
+  const notifee = getNotifee();
+  if (!notifee || Platform.OS !== 'android' || !_consts) return MISSED_CALL_CHANNEL_ID;
+  const { AndroidImportance, AndroidVisibility } = _consts;
+  await notifee.createChannel({
+    id: MISSED_CALL_CHANNEL_ID,
+    name: 'Missed Calls',
+    description: 'Missed voice and video calls',
+    importance: AndroidImportance.DEFAULT, // dismissible; NOT a ringing channel
+    visibility: AndroidVisibility.PUBLIC,
+    vibration: true,
+  });
+  return MISSED_CALL_CHANNEL_ID;
+};
+
+/**
+ * Show ONE "Missed {voice|video} call from {name}" notification. Cross-platform:
+ * notifee on Android (round caller avatar + dedicated channel), expo-notifications
+ * on iOS / when notifee isn't in the build. De-duped per call id so the live-app
+ * path and the backend `call-missed` push never produce two.
+ *
+ * `data` accepts the same FCM call shape used elsewhere: { callId|signalId,
+ * callerId, callerName, callerImage, callType|media, chatId, senderId, senderName,
+ * groupId, groupName, isGroup }.
+ */
+export const displayMissedCallNotification = async (data = {}) => {
+  const callId = data.callId || data.signalId || null;
+  if (callId) {
+    const key = String(callId);
+    if (missedShownIds.has(key)) return; // already posted for this call
+    missedShownIds.add(key);
+  }
+  const isGroup = !!(data.isGroup || data.groupId);
+  const name = isGroup
+    ? (data.groupName || data.callerName || 'Group call')
+    : (data.callerName || data.senderName || data.title || 'Someone');
+  const isVideo = (data.callType || data.media) === 'video';
+  const title = name;
+  const body = isVideo ? 'Missed video call' : 'Missed voice call';
+  // Tap payload → open the caller's / group's chat thread. type:'call-missed' so
+  // it's never mistaken for a live incoming-call push by the routers.
+  const tapData = {
+    ...data,
+    type: 'call-missed',
+    chatId: data.chatId || (isGroup ? data.groupId : null) || null,
+    senderId: data.senderId || data.callerId || null,
+    senderName: data.senderName || (isGroup ? null : name) || null,
+  };
+
+  // Android: notifee (richer — avatar + dedicated dismissible channel).
+  if (Platform.OS === 'android' && getNotifee() && _consts) {
+    try {
+      const notifee = getNotifee();
+      const channelId = await ensureMissedCallChannel();
+      const { AndroidImportance, AndroidVisibility } = _consts;
+      await notifee.displayNotification({
+        id: missedNotifId(callId),
+        title,
+        body,
+        data: tapData,
+        android: {
+          channelId,
+          smallIcon: 'notification_icon',
+          color: '#00A884',
+          ...(data.callerImage ? { largeIcon: data.callerImage, circularLargeIcon: true } : {}),
+          importance: AndroidImportance.DEFAULT,
+          visibility: AndroidVisibility.PUBLIC,
+          autoCancel: true,
+          showTimestamp: true,
+          pressAction: { id: 'default', launchActivity: 'default' },
+        },
+      });
+      return;
+    } catch (err) {
+      console.warn('[callNotif] missed-call notifee failed, trying expo:', err?.message);
+    }
+  }
+
+  // iOS / fallback: expo-notifications.
+  const Notifications = getExpoNotifications();
+  if (!Notifications) return;
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title,
+        body,
+        data: tapData,
+        sound: Platform.OS === 'ios' ? 'default' : true,
+        ...(Platform.OS === 'android' && { channelId: MISSED_CALL_CHANNEL_ID }),
+      },
+      trigger: null,
+    });
+  } catch (err) {
+    console.warn('[callNotif] missed-call expo display failed:', err?.message);
+  }
+};
+
+// Forget a call id so a later genuine missed-call for the SAME id can notify again
+// (call ids are unique per call, so this is mostly hygiene / long-running sessions).
+export const forgetMissedCall = (callId) => {
+  if (callId) missedShownIds.delete(String(callId));
 };
 
 // ===== foreground events (app open) =====

@@ -5,7 +5,7 @@ import { isGroupInactive } from '../utils/inactiveGroups';
 import { setPushToken } from '../Redux/Services/Socket/socket';
 import { navigateToChat } from '../Redux/Services/navigationService';
 import { CALL_PUSH_EVENTS } from './callEvents';
-import { displayIncomingCallNotifee, isNotifeeCallAvailable } from './callNotifee';
+import { displayIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
 import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
 import { buildNotificationModel } from './notificationModel';
 import { claimNotification } from './notificationDedupe';
@@ -64,6 +64,7 @@ const CHANNEL_ID = `chat_messages_v${CHANNEL_VERSION}`;
 
 // Incoming-call channel — kept stable ('calls') to match the backend push.
 const CALL_CHANNEL_ID = 'calls';
+const MISSED_CALL_CHANNEL_ID = 'missed_calls';
 
 // All previous channel IDs that should be cleaned up
 const OLD_CHANNEL_IDS = [
@@ -113,6 +114,20 @@ const setupNotificationChannel = async () => {
       enableVibrate: true,
       showBadge: false,
       bypassDnd: true,
+    });
+
+    // Dismissible "Missed call" channel (DEFAULT importance — informational, not a
+    // ringing channel). Used by the expo fallback path of displayMissedCallNotification
+    // and must match the backend `call-missed` push channelId ('missed_calls').
+    await Notifications.setNotificationChannelAsync(MISSED_CALL_CHANNEL_ID, {
+      name: 'Missed Calls',
+      description: 'Missed voice and video calls',
+      importance: Notifications.AndroidImportance.DEFAULT,
+      vibrationPattern: [0, 250],
+      lightColor: '#00A884',
+      enableLights: true,
+      enableVibrate: true,
+      showBadge: true,
     });
   }
 };
@@ -479,6 +494,15 @@ export const registerBackgroundHandler = () => {
         return;
       }
 
+      // Missed-call push (server source-of-truth: caller cancelled / ring timed out
+      // / callee offline-or-killed). Leave a dismissible "Missed call" notification.
+      // De-duped per call id inside displayMissedCallNotification, so if the live app
+      // already posted one (call rang then went unanswered), this is a no-op.
+      if (remoteMessage?.data?.type === 'call-missed') {
+        try { await displayMissedCallNotification(remoteMessage.data); } catch (_) {}
+        return;
+      }
+
       // If the message is data-only (no "notification" key), we must show it manually
       if (remoteMessage.data && !remoteMessage.notification) {
         await showLocalNotification(remoteMessage);
@@ -512,6 +536,13 @@ export const initializeNotifications = () => {
     // fallback). Never render a banner for it.
     if (remoteMessage?.data?.type === 'call') {
       DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, remoteMessage.data);
+      return;
+    }
+    // Missed-call push while the app is foreground. The live call layer usually
+    // already classified + notified locally (deduped), but if this call never rang
+    // on this device the push is the only signal — surface the missed notification.
+    if (remoteMessage?.data?.type === 'call-missed') {
+      await displayMissedCallNotification(remoteMessage.data);
       return;
     }
     await showLocalNotification(remoteMessage);

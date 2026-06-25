@@ -44,7 +44,7 @@ import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
 import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall,
   startOngoingCallNotification, stopOngoingCallNotification,
-  isDeviceLockedNow, returnToLockScreen,
+  isDeviceLockedNow, returnToLockScreen, displayMissedCallNotification,
 } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
 
@@ -531,6 +531,30 @@ export const CallProvider = ({ children }) => {
     cancelAllIncomingCallNotifee();
     // Tear down the active-call ongoing foreground service / notification (Android).
     stopOngoingCallNotification();
+
+    // WhatsApp-style "Missed call" tray notification. Only for an INCOMING call
+    // that was never answered (ring timeout, or the caller cancelled before we
+    // picked up). The dismissed ringing notification above leaves nothing behind,
+    // so without this the missed call would be invisible in the tray. De-duped by
+    // call id inside displayMissedCallNotification, so a backend `call-missed` push
+    // for the same call won't double-post. Skipped if the call was answered.
+    if (outcome === 'missed' && snap.direction === 'incoming' && !snap.answeredAt && snap.peer?.id) {
+      const isGroup = !!snap.isGroup;
+      displayMissedCallNotification({
+        callId: snap.signalId || snap.callId,
+        callerId: snap.peer.id,
+        callerName: snap.peer.name,
+        callerImage: snap.peer.avatar,
+        callType: snap.media === 'video' ? 'video' : 'audio',
+        media: snap.media,
+        chatId: isGroup ? (snap.groupId || null) : (snap.chatId || deriveChatId(myId, snap.peer.id)),
+        senderId: snap.peer.id,
+        senderName: snap.peer.name,
+        isGroup,
+        groupId: snap.groupId || null,
+        groupName: snap.groupName || null,
+      });
+    }
 
     // Release the server-side busy lock + notify the peer over the app socket,
     // keyed on the signaling id. Only when this call used the signaling path
