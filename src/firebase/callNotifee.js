@@ -194,6 +194,13 @@ export const peekInitialCallLaunch = () => {
   try { return getCallUi().peekInitialCallLaunch?.() || null; } catch (_) { return null; }
 };
 
+// Remove the NATIVE instant-call cover (drawn over MainActivity the moment it was
+// launched/resumed for a call) once the real React-Native call overlay is up.
+export const hideCallLaunchCover = () => {
+  if (!isCallUi()) return;
+  try { getCallUi().hideCallLaunchCover?.(); } catch (_) { /* best-effort */ }
+};
+
 // ===== notifee channel (only used by the notifee fallback) =====
 export const ensureCallChannel = async () => {
   if (isCallUi()) return CALL_CHANNEL_ID; // native module creates its own channel

@@ -219,6 +219,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
     }
     var localFacing = 'user';
     var localStream = null;    // our captured local MediaStream (for direct track control)
+    var micWanted = true;      // the user's mic on/off choice (for interruption recovery)
     var currentMedia = 'audio';// 'audio' | 'video' for the active call
     var tiles = {};            // peerId -> { wrap, video }
     var remoteStreams = {};    // peerId -> remote MediaStream (for the recording mix)
@@ -735,6 +736,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
           case 'stopRecording': { stopRecording(); break; }
           case 'hangup': { stopRecording(); if (call) call.hangup(); resetTiles(); break; }
           case 'toggleMic': {
+            micWanted = !!msg.on; // remember the choice so recovery doesn't un-mute
             if (call) { try { call.toggleMic(!!msg.on); } catch (e) {} }
             // Also set the track directly so mute/unmute is reliable regardless of
             // the SDK's internal handling.
@@ -778,6 +780,45 @@ export const buildCallEngineHtml = () => `<!doctype html>
     document.addEventListener('pointerdown', function () {
       playAllRemotes();
     }, { passive: true });
+
+    // ---- audio-interruption auto-recovery (WhatsApp parity) ----
+    // An incoming phone / WhatsApp / other VoIP call grabs the OS audio hardware
+    // mid-call: the OS PAUSES our remote <video> elements and DISABLES our captured
+    // mic track. When that other call ends nothing restarts our audio on its own —
+    // both sides go silent ("awaz nahi aati / nahi jati"). Owning native audio focus
+    // would fight the WebView's own WebRTC focus, so instead this watchdog re-plays
+    // any paused remote stream and re-asserts the mic a few times a second, so audio
+    // returns automatically the instant the interruption is over — with NO AppState
+    // change required. Idempotent: play() on a playing element and enabling an
+    // already-enabled track are no-ops, so this is cheap and safe to run always.
+    setInterval(function () {
+      try {
+        // 1) Remote (incoming) audio — re-play any paused remote tile.
+        var ids = Object.keys(tiles);
+        for (var i = 0; i < ids.length; i++) {
+          var t = tiles[ids[i]];
+          var v = t && t.video;
+          if (v && v.srcObject && v.paused) { try { v.play().catch(function () {}); } catch (e) {} }
+        }
+        // 2) Local (outgoing) mic — an interruption can leave the captured track
+        //    disabled even though the user wants it ON; re-enable it (only while the
+        //    track is still live — a fully released mic needs re-capture, not this).
+        if (micWanted && localStream && localStream.getAudioTracks) {
+          (localStream.getAudioTracks() || []).forEach(function (a) {
+            if (a && a.readyState === 'live' && a.enabled === false) a.enabled = true;
+          });
+        }
+        // 3) The recording-mix AudioContext (if any) can be left suspended.
+        if (recCtx && recCtx.state === 'suspended' && recCtx.resume) {
+          try { recCtx.resume().catch(function () {}); } catch (e) {}
+        }
+      } catch (e) { /* never let recovery throw */ }
+    }, 1200);
+
+    // Returning to the webview (interruption ended / app foregrounded) → re-play.
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) { try { playAllRemotes(); } catch (e) {} }
+    });
 
     // Tap the video stage to swap the full-screen / PiP feeds (WhatsApp style).
     // Taps on the native RN controls never reach here (the overlay captures them),

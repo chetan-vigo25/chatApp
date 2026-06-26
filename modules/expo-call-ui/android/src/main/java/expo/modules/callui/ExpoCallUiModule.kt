@@ -8,8 +8,17 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Color
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -61,6 +70,16 @@ class ExpoCallUiModule : Module() {
   // at runtime, which is why this lives in the module rather than a static
   // <receiver>.
   private var lockReceiver: BroadcastReceiver? = null
+
+  // Native full-screen "incoming call" cover. Drawn over the activity content the
+  // instant MainActivity is launched/resumed for a call — BEFORE React Native
+  // renders its first frame (the Splash route / last screen). This is the only way
+  // to get WhatsApp-style INSTANT call UI: a JS cover can't paint over the native
+  // resume flash of a backgrounded-but-alive app. Removed when JS signals the real
+  // call overlay is up (hideCallLaunchCover), or by a safety timeout.
+  private var callLaunchCover: View? = null
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private var coverTimeout: Runnable? = null
 
   override fun definition() = ModuleDefinition {
     Name("ExpoCallUi")
@@ -192,6 +211,10 @@ class ExpoCallUiModule : Module() {
       readCallIntent(intent)?.let { emit(it) }
     }
 
+    // No-op kept for JS compatibility (the native caller-name cover was removed in
+    // favour of showing the real React-Native call UI directly).
+    Function("hideCallLaunchCover") { hideCallLaunchCover() }
+
     // ---- KEYGUARD BACKSTOP (deterministic lock-screen security) ----
     // MainActivity carries a static android:showWhenLocked (so a call's full-screen
     // intent can draw over the lock screen). The side effect is that ANY launch of
@@ -228,6 +251,69 @@ class ExpoCallUiModule : Module() {
   fun emit(payload: Map<String, Any?>) = sendEvent(EVENT_NAME, payload)
 
   private fun emitLock(locked: Boolean) = sendEvent(LOCK_EVENT, mapOf("locked" to locked))
+
+  // Draw a full-screen native "incoming call" cover over the activity content the
+  // instant the app is launched/resumed for a call — so the user sees the call, not
+  // the last screen or the JS Splash. Removed by hideCallLaunchCover() once the RN
+  // call overlay is up, or by a safety timeout.
+  private fun showCallLaunchCoverFor(intent: Intent?) {
+    if (intent?.hasExtra(EXTRA_CALL_ACTION) != true) return
+    val activity = appContext.currentActivity ?: return
+    val name = intent.getStringExtra(EXTRA_CALLER_NAME)?.takeIf { it.isNotBlank() } ?: "Incoming call"
+    val isVideo = (intent.getStringExtra(EXTRA_CALL_TYPE) ?: "audio") == "video"
+    activity.runOnUiThread {
+      if (callLaunchCover != null) return@runOnUiThread
+      val root = (activity.findViewById<View>(android.R.id.content) as? ViewGroup) ?: return@runOnUiThread
+      val column = LinearLayout(activity).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER
+      }
+      column.addView(TextView(activity).apply {
+        text = name
+        setTextColor(Color.WHITE)
+        textSize = 26f
+        gravity = Gravity.CENTER
+      })
+      column.addView(TextView(activity).apply {
+        text = if (isVideo) "Incoming video call" else "Incoming voice call"
+        setTextColor(Color.parseColor("#8AA0AB"))
+        textSize = 15f
+        gravity = Gravity.CENTER
+      })
+      val cover = FrameLayout(activity).apply {
+        setBackgroundColor(Color.parseColor("#0B141A"))
+        isClickable = true   // swallow touches so the app behind can't be used
+        isFocusable = true
+        addView(
+          column,
+          FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
+          ).apply { gravity = Gravity.CENTER }
+        )
+      }
+      root.addView(
+        cover,
+        ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+      )
+      callLaunchCover = cover
+      // Never let the cover get stuck if JS never mounts the call UI (stale launch,
+      // call already cancelled, etc.).
+      coverTimeout?.let { mainHandler.removeCallbacks(it) }
+      val r = Runnable { hideCallLaunchCover() }
+      coverTimeout = r
+      mainHandler.postDelayed(r, 8000)
+    }
+  }
+
+  private fun hideCallLaunchCover() {
+    mainHandler.post {
+      coverTimeout?.let { mainHandler.removeCallbacks(it) }
+      coverTimeout = null
+      val c = callLaunchCover ?: return@post
+      (c.parent as? ViewGroup)?.removeView(c)
+      callLaunchCover = null
+    }
+  }
 
   private fun registerLockReceiver() {
     val ctx = appContext.reactContext ?: return

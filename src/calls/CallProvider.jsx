@@ -50,9 +50,7 @@ import {
   startOngoingCallNotification, stopOngoingCallNotification,
   isDeviceLockedNow, returnToLockScreen, addDeviceLockListener,
   setShowWhenLockedNative, displayMissedCallNotification, setCallActiveNative,
-  peekInitialCallLaunch,
 } from '../firebase/callNotifee';
-import ColdStartCallCover from './components/ColdStartCallCover';
 import { notifyIncomingCall } from './services/callNotifyService';
 
 // CallContext now lives in its own leaf module (./CallContext) to break the
@@ -183,16 +181,6 @@ export const CallProvider = ({ children }) => {
   // native module isn't present, so a normal unlocked launch never flashes it.
   const [privacyMask, setPrivacyMask] = useState(
     () => Platform.OS === 'android' && isDeviceLockedNow(),
-  );
-
-  // Instant cold-start call cover. Read the launch intent SYNCHRONOUSLY at the very
-  // first render (non-consuming native peek) so that when the app was cold-started
-  // by a call full-screen intent we paint the full-screen incoming-call cover from
-  // frame 1 — before Splash/ChatList can flash. The real interactive CallOverlay
-  // (driven by the auth-gated consumeInitialNotifeeCall replay) replaces it the
-  // moment the live call state mounts; see the effect below that clears it.
-  const [coldStartCall, setColdStartCall] = useState(
-    () => (Platform.OS === 'android' ? peekInitialCallLaunch() : null),
   );
 
   useEffect(() => { stateRef.current = state; }, [state]);
@@ -461,15 +449,6 @@ export const CallProvider = ({ children }) => {
   // is off/locked, so the mask reasserts the instant it returns to idle.
   useEffect(() => { recomputePrivacyMask(); }, [state.status, recomputePrivacyMask]);
 
-  // Dismiss the instant cold-start cover once the real call UI takes over (status
-  // left IDLE), or after a safety window if the replay never produced a call (e.g.
-  // the caller already cancelled / a stale launch) — so the cover can never stick.
-  useEffect(() => {
-    if (!coldStartCall) return undefined;
-    if (state.status !== CALL_STATUS.IDLE) { setColdStartCall(null); return undefined; }
-    const t = setTimeout(() => setColdStartCall(null), 12000);
-    return () => clearTimeout(t);
-  }, [coldStartCall, state.status]);
 
   // Show-over-the-keyguard ONLY during a call. Idle → off, so locking the phone
   // drops the app behind the keyguard and the user sees the system lock screen
@@ -1471,8 +1450,22 @@ export const CallProvider = ({ children }) => {
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 0 call:incoming signal (app socket) ═════', { callerId, currentStatus: snap.status, payload });
     if (!callerId) return;
     if (snap.status === CALL_STATUS.INCOMING) {
-      // Already ringing (e.g. WebRTC arrived first) → just record the signal id.
+      // Already ringing (e.g. WebRTC arrived first, or it rang notification-only in
+      // the background) → record the signal id.
       if (!snap.signalId && payload?.callId) dispatch({ type: ACT.SET_SIGNAL, signalId: payload.callId });
+      // A full-screen RE-ENTRY (the user tapped the notification / a full-screen
+      // intent launched us / fromAccept) must PROMOTE a notification-only ring to the
+      // full-screen CallOverlay — otherwise the call UI never replaces the launch
+      // cover and the user is stuck on a caller-name screen. Also mark it locked if
+      // the device is locked so back/end returns to the lock screen.
+      if (opts.fromAccept || opts.fullScreen) {
+        if (snap.notificationOnly) dispatch({ type: ACT.SET_FLAG, key: 'notificationOnly', value: false });
+        dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
+        if (isDeviceLockedNow() || deviceLockedRef.current) {
+          lockedCallRef.current = true;
+          setLockedCall(true);
+        }
+      }
       return;
     }
     if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) return; // busy
@@ -1562,9 +1555,13 @@ export const CallProvider = ({ children }) => {
     // foreground — i.e. woken from background / over the lock screen. When the
     // app is actively in use, keep the non-intrusive banner. Callers may force
     // this via opts.expand (e.g. a full-screen-intent launch).
-    const shouldExpand = opts.expand !== undefined
-      ? opts.expand
-      : AppState.currentState !== 'active';
+    // iOS: ALWAYS take over full-screen for an incoming call, even when the app is
+    // foreground on another screen — iOS has no native call UI, so an incoming call
+    // must cover whatever screen the user is on (WhatsApp behaviour), not just show
+    // a top banner.
+    const shouldExpand = Platform.OS === 'ios'
+      ? true
+      : (opts.expand !== undefined ? opts.expand : AppState.currentState !== 'active');
     if (shouldExpand) {
       dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
     }
@@ -1942,13 +1939,6 @@ export const CallProvider = ({ children }) => {
         // Suppressed while a call is in progress so the call UI may legitimately
         // show over the lock screen (LK6).
         <PrivacyOverlay />
-      ) : null}
-      {/* Instant cold-start call cover — painted from frame 1 on a killed/locked
-          call launch so the user sees the incoming call immediately, never the
-          Splash/ChatList boot. Replaced by the real CallOverlay once the live call
-          state mounts (status leaves IDLE). */}
-      {coldStartCall && state.status === CALL_STATUS.IDLE ? (
-        <ColdStartCallCover call={coldStartCall} />
       ) : null}
     </CallContext.Provider>
   );
