@@ -1505,8 +1505,14 @@ export const CallProvider = ({ children }) => {
     // notification-only and the app showed ChatList instead of the call (the
     // regression vs the old code, which had no notification-only path). The
     // _fullScreen marker on the push/notification action is the reliable signal.
+    // notification-only is an ANDROID-only product choice (present the call via the
+    // native CallStyle OS notification instead of the in-app banner). On iOS there
+    // is NO native call notification UI and isDeviceLockedNow() is always false
+    // (no keyguard module), so this path must NEVER suppress the in-app call UI —
+    // otherwise an iOS call (foreground OR tapped from the banner) shows nothing.
     const fullScreenLaunch = !!opts.fullScreen;
-    const notificationOnly = !opts.fromAccept && !fullScreenLaunch
+    const notificationOnly = Platform.OS === 'android'
+      && !opts.fromAccept && !fullScreenLaunch
       && !(AppState.currentState === 'active' && isDeviceLockedNow());
     dispatch({
       type: ACT.INCOMING,

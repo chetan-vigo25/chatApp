@@ -717,7 +717,7 @@ export const initializeNotifications = () => {
     // console.log('Notification opened app from background:', remoteMessage?.data);
     const data = remoteMessage?.data || {};
     if (data.type === 'call') {
-      DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, data);
+      DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, { ...data, _fullScreen: true });
     } else if (data.chatId || data.groupId) {
       // Message notification tapped → open that chat's thread.
       navigateToChat(data);
@@ -733,7 +733,7 @@ export const initializeNotifications = () => {
         const data = remoteMessage?.data || {};
         if (data.type === 'call') {
           // Give the providers a beat to mount before showing the ring.
-          setTimeout(() => DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, data), 400);
+          setTimeout(() => DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, { ...data, _fullScreen: true }), 400);
         } else if (data.chatId || data.groupId) {
           // Cold launch from a message-notification tap → open the chat once the
           // nav container is ready (navigateToChat retries until then).
@@ -753,9 +753,15 @@ export const initializeNotifications = () => {
       if (data?.type === 'call') {
         if (action === 'decline') {
           DeviceEventEmitter.emit(CALL_PUSH_EVENTS.REJECT, data);
-        } else {
-          // 'accept' button OR a plain tap on the notification → answer/show.
+        } else if (action === 'accept') {
+          // Explicit Accept button → answer.
           DeviceEventEmitter.emit(CALL_PUSH_EVENTS.ACCEPT, data);
+        } else {
+          // Plain body tap (iOS heads-up) → OPEN the app to the full-screen
+          // incoming-call (ringing) screen so the user Accepts/Declines THERE. A
+          // plain tap must NOT auto-answer (that raced the connect path and showed
+          // nothing). `_fullScreen` forces the in-app call UI.
+          DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, { ...data, _fullScreen: true });
         }
         Notifications.dismissNotificationAsync(response.notification.request.identifier).catch(() => {});
         return;
