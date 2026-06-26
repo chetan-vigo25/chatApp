@@ -872,6 +872,31 @@ const attachCoreSocketListeners = (navigation) => {
     dispatchBlock('blockedByChanged', { byUserId: String(payload?.byUserId || ''), blocked: !!payload?.blocked }),
   );
 
+  // INITIAL block-list load for this session. Without it `block.blockedIds` is empty
+  // on a cold start, so a blocked 1-1 chat wrongly shows the composer (instead of
+  // "You blocked this contact") AND the outgoing-call block guard (getBlockRelation)
+  // never fires — both read this list. Hydrate from the on-device SQLite cache for
+  // INSTANT correct state, then refresh from the server. Mirrors the Blocked
+  // Contacts screen's load; runs once per socket setup (i.e. per login/app start).
+  (async () => {
+    try {
+      const mod = require('../../Store');
+      const store = mod.store || mod.default || mod;
+      if (!store?.dispatch) return;
+      const br = require('../../Reducer/Block/Block.reducer');
+      let ChatDB = null;
+      try { const cm = require('../../../services/ChatDatabase'); ChatDB = cm.default || cm; } catch (e) {}
+      try {
+        const cached = ChatDB ? await ChatDB.loadBlockedContacts() : null;
+        if (cached && cached.length) store.dispatch(br.hydrateBlocked(cached));
+      } catch (e) {}
+      const res = await store.dispatch(br.fetchBlockedContacts({ search: '', page: 1, limit: 100 }));
+      if (br.fetchBlockedContacts.fulfilled.match(res) && ChatDB) {
+        try { await ChatDB.saveBlockedContacts(res.payload?.items || []); } catch (e) {}
+      }
+    } catch (e) { /* best-effort — never block socket setup */ }
+  })();
+
   // Account-deletion lifecycle. When the server tears the account down it
   // force-logs-out every device — wipe local state and return to auth so the
   // app behaves like a fresh install (the regular 'logout' handler covers the

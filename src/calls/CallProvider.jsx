@@ -1449,6 +1449,17 @@ export const CallProvider = ({ children }) => {
     const callerId = payload?.from?.id ? String(payload.from.id) : null;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 0 call:incoming signal (app socket) ═════', { callerId, currentStatus: snap.status, payload });
     if (!callerId) return;
+    // Blocked relationship → never ring (I blocked them, or they blocked me). The
+    // backend should drop these, but enforce client-side too so a blocked contact
+    // can never reach me even if a stray push/signal arrives. Silent (no reject) so
+    // block status isn't revealed to the caller — their call just times out.
+    if (!snap.isGroup && !payload?.isGroup) {
+      const rel = getBlockRelation(callerId);
+      if (rel.iBlocked || rel.blockedMe) {
+        if (__DEV__) console.log('[CALL][APP] incoming ignored — blocked contact', { callerId, rel });
+        return;
+      }
+    }
     if (snap.status === CALL_STATUS.INCOMING) {
       // Already ringing (e.g. WebRTC arrived first, or it rang notification-only in
       // the background) → record the signal id.
