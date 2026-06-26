@@ -156,6 +156,18 @@ const toTimestamp = (value) => {
   return Number.isNaN(t) ? 0 : t;
 };
 
+// ── Chat-list realtime instrumentation (debug-only) ──────────────────────────
+// Flip to true (or wire to an env/config flag) to trace which events mutated the
+// list, the sort-key transition per chat, and whether the visible order changed.
+// Used to diagnose intermittent "row didn't move / summary stale" reports.
+const REALTIME_DEBUG = false;
+const rtlog = (...args) => {
+  if (REALTIME_DEBUG) {
+    // eslint-disable-next-line no-console
+    console.log('[chatlist]', ...args);
+  }
+};
+
 const formatRelativeTime = (value) => {
   const ts = toTimestamp(value);
   if (!ts) return '';
@@ -319,7 +331,11 @@ const sortByActivity = (chatMap, ids) => {
     const chatB = chatMap[b] || {};
     const tsA = getChatTimestampValue(chatA);
     const tsB = getChatTimestampValue(chatB);
-    return tsB - tsA;
+    if (tsB !== tsA) return tsB - tsA;
+    // Deterministic tie-break for identical activity timestamps (two messages in
+    // the same millisecond). JS Array.sort stability is not guaranteed across the
+    // engines we ship on (Hermes), so without this a re-sort could flip equal rows.
+    return String(a).localeCompare(String(b));
   });
 };
 
@@ -486,12 +502,18 @@ const normalizeStatus = (status) => {
 };
 
 const getChatTimestampValue = (chat = {}) => {
-  return toTimestamp(
-    chat?.timestamp ||
-    chat?.lastMessageAt ||
-    chat?.lastMessage?.createdAt ||
-    chat?.updatedAt ||
-    0
+  // Sort key = the most recent of EVERY activity field. This used to return the
+  // first truthy field (`timestamp`), which made re-sort intermittently fail:
+  // an incoming `message:new` advances `lastMessageAt` but NOT `timestamp`, so a
+  // row whose `timestamp` was set by an earlier hydrate/chat:list:update kept its
+  // stale sort position and never bubbled to the top — the row only moved when a
+  // separate chat:list:update happened to refresh `timestamp`. Taking the max
+  // makes ordering deterministic regardless of which path last touched the row.
+  return Math.max(
+    toTimestamp(chat?.timestamp),
+    toTimestamp(chat?.lastMessageAt),
+    toTimestamp(chat?.lastMessage?.createdAt),
+    toTimestamp(chat?.updatedAt),
   );
 };
 
@@ -1107,6 +1129,10 @@ const reducer = (state, action) => {
           ...(seededPeerUser ? { peerUser: seededPeerUser } : {}),
           lastMessage,
           lastMessageAt,
+          // Keep the sort key (`timestamp`) in lockstep with the new activity so
+          // the row reorders on `message:new` alone — without depending on a
+          // follow-up chat:list:update. (The group path already does this.)
+          timestamp: preserveDelete ? (existing.timestamp || existing.lastMessageAt || lastMessageAt) : lastMessageAt,
           lastMessageType: preserveDelete ? (existing.lastMessageType || existingLastMsg?.type || 'text') : incomingType,
           lastMessageSender: preserveDelete ? existing.lastMessageSender : (message.senderId || existing.lastMessageSender || null),
           unreadCount: Number(unreadByChat[chatId] ?? existing.unreadCount ?? 0),
@@ -1119,6 +1145,20 @@ const reducer = (state, action) => {
       }
 
       const sections = buildOrderedSections(nextMap);
+
+      if (REALTIME_DEBUG) {
+        const prevIdx = state.sortedChatIds.indexOf(chatId);
+        const nextIdx = sections.sortedChatIds.indexOf(chatId);
+        rtlog('INCOMING_MESSAGE', {
+          chatId,
+          sortKey: getChatTimestampValue(nextMap[chatId]),
+          lastMessageAt,
+          posBefore: prevIdx,
+          posAfter: nextIdx,
+          reordered: prevIdx !== nextIdx,
+          unread: Number(unreadByChat[chatId] || 0),
+        });
+      }
 
       Object.keys(nextMap).forEach((id) => {
         nextMap[id] = {
@@ -1349,8 +1389,10 @@ const reducer = (state, action) => {
       const currentStatus = normalizeMessageDeliveryStatus(existing?.lastMessageStatus || existingLastMessage?.status);
       const nextStatus = pickHighestMessageStatus(currentStatus, normalizedIncomingStatus);
       if (!nextStatus || nextStatus === currentStatus) {
+        rtlog('UPDATE_LAST_MESSAGE_STATUS noop', { chatId, currentStatus, incoming: normalizedIncomingStatus });
         return state;
       }
+      rtlog('UPDATE_LAST_MESSAGE_STATUS', { chatId, from: currentStatus, to: nextStatus });
 
       if (existingLastMessage) {
         chatMap[chatId] = {
@@ -2314,6 +2356,28 @@ export function RealtimeChatProvider({ children }) {
   useEffect(() => {
     OutboxWorker.start();
     return () => OutboxWorker.stop();
+  }, []);
+
+  // Reconcile sends that the OutboxWorker delivered via REST (i.e. the socket
+  // fast-path didn't settle them — offline send drained after reconnect, or a
+  // resume after app kill). Swap the optimistic temp row for the canonical
+  // server id in SQLite and flip its status to 'sent'; subsequent
+  // delivered/read receipts then match on the server id. On terminal failure,
+  // mark the row 'failed' so the UI can surface a retry affordance.
+  useEffect(() => {
+    const offAck = OutboxWorker.onAck(({ clientMessageId, ack }) => {
+      if (!clientMessageId) return;
+      const serverMessageId = ack?.messageId || ack?._id || null;
+      if (serverMessageId && serverMessageId !== clientMessageId) {
+        ChatDatabase.acknowledgeMessage(clientMessageId, serverMessageId).catch(() => {});
+      }
+      ChatDatabase.updateMessageStatus(serverMessageId || clientMessageId, 'sent').catch(() => {});
+    });
+    const offFailure = OutboxWorker.onFailure(({ clientMessageId }) => {
+      if (!clientMessageId) return;
+      ChatDatabase.updateMessageStatus(clientMessageId, 'failed').catch(() => {});
+    });
+    return () => { offAck(); offFailure(); };
   }, []);
 
   // Stream realtime location + device telemetry to the backend once the user
@@ -3719,22 +3783,13 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
-      const memberName = data?.username || data?.fullName || data?.name || '';
+      // Membership-only update (member list / count). The "X left" chat-thread +
+      // chat-list line is delivered by the server as a durable, seq-ordered system
+      // message on `group:message:received`, so we do NOT inject an ephemeral one
+      // here (it would duplicate the persisted line and vanish on reload).
       dispatch({
         type: 'GROUP_MEMBER_LEFT',
         payload: { groupId, userId },
-      });
-      dispatch({
-        type: 'INCOMING_GROUP_MESSAGE',
-        payload: {
-          chatId: groupId,
-          groupId,
-          senderId: null,
-          senderName: null,
-          text: memberName ? `${memberName} left` : 'A member left',
-          messageType: 'system',
-          createdAt: data?.timestamp || new Date().toISOString(),
-        },
       });
     };
 
@@ -3783,17 +3838,10 @@ export function RealtimeChatProvider({ children }) {
       const groupId = normalizeId(data?.groupId);
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
-      const memberName = data?.username || data?.fullName || data?.name || '';
+      // Membership-only update. The "X removed Y" line is delivered by the server
+      // as a durable, seq-ordered system message on `group:message:received`, so we
+      // do NOT inject an ephemeral one here (it would duplicate + vanish on reload).
       dispatch({ type: 'GROUP_MEMBER_REMOVED', payload: { groupId, userId } });
-      dispatch({
-        type: 'INCOMING_GROUP_MESSAGE',
-        payload: {
-          chatId: groupId, groupId, senderId: null, senderName: null,
-          text: memberName ? `${memberName} was removed` : 'A member was removed',
-          messageType: 'system',
-          createdAt: data?.timestamp || new Date().toISOString(),
-        },
-      });
     };
 
     // Personal: you were removed from a group

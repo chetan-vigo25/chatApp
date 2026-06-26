@@ -27,11 +27,11 @@ const notifId = (callId) => `call-${callId || 'incoming'}`;
 const missedNotifId = (callId) => `missed-${callId || 'call'}`;
 
 // Call ids we've ALREADY posted a "missed call" notification for. Two independent
-// sources can try to post the same missed-call notification — the live app
-// (CallProvider.finalizeEnd, when the call rang then went unanswered) AND a
-// backend `type:'call-missed'` FCM push (the source of truth when the app was
-// killed/offline). When the app is alive both run in the same JS runtime, so this
-// set de-dupes them to ONE notification (WhatsApp shows exactly one).
+// sources can try to post the same one — the live app (CallProvider.finalizeEnd,
+// when the call rang then went unanswered) AND a backend `type:'call-missed'` FCM
+// push (the source of truth when the app was killed/offline). When the app is
+// alive both run in the same JS runtime, so this set de-dupes them to ONE
+// notification (WhatsApp shows exactly one).
 const missedShownIds = new Set();
 
 // Ids we've ACTUALLY displayed a call notification for. The call state later
@@ -99,7 +99,11 @@ const emitCallAction = (action, data) => {
   if (action === 'decline') {
     DeviceEventEmitter.emit(CALL_PUSH_EVENTS.REJECT, payload);
   } else if (action === 'accept') {
-    DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, payload);
+    // ONLY ACCEPT — do NOT also emit INCOMING. onPushAccept builds the ringing
+    // state itself (fromAccept → full connect path, NOT notification-only). The
+    // old extra INCOMING raced ahead and, on a foreground cold-start (app killed,
+    // tapped Answer), created a notification-only state that swallowed the accept
+    // — the call never connected and the call screen didn't open.
     DeviceEventEmitter.emit(CALL_PUSH_EVENTS.ACCEPT, payload);
   } else if (action === 'hangup') { // End on the active-call ongoing notification
     DeviceEventEmitter.emit(CALL_PUSH_EVENTS.HANGUP, payload);
@@ -143,6 +147,22 @@ export const isDeviceLockedNow = () => {
   try { return !!getCallUi().isDeviceLocked(); } catch (_) { return false; }
 };
 
+// Subscribe to native keyguard lock/unlock transitions. `cb(locked: boolean)`
+// fires on screen-off (locked), screen-on-while-locked (locked) and user-present
+// (unlocked). This is the only reliable lock signal: because MainActivity has
+// showWhenLocked, waking a locked device resumes the app and AppState reports
+// 'active' while the keyguard is still up — so the privacy overlay must key off
+// THIS, not AppState alone. Returns an unsubscribe fn; no-op off Android.
+export const addDeviceLockListener = (cb) => {
+  if (!isCallUi()) return () => {};
+  try {
+    const sub = getCallUi().addListener('onLockStateChange', (e) => cb(!!e?.locked));
+    return () => { try { sub?.remove(); } catch (_) { /* */ } };
+  } catch (_) {
+    return () => {};
+  }
+};
+
 // Send the app behind the keyguard (revoke show-when-locked + move task to back)
 // so the system lock screen reasserts. No-op off Android / without the module.
 export const returnToLockScreen = () => {
@@ -155,6 +175,23 @@ export const returnToLockScreen = () => {
 export const setShowWhenLockedNative = (show) => {
   if (!isCallUi()) return;
   try { getCallUi().setShowWhenLocked(!!show); } catch (_) { /* best-effort */ }
+};
+
+// Tell the native keyguard backstop a call is ringing/connecting/active (true) or
+// fully idle (false). While active, the app is allowed to show over the lock screen
+// (the call UI); while idle, any foreground-over-keyguard is bounced behind it.
+export const setCallActiveNative = (active) => {
+  if (!isCallUi()) return;
+  try { getCallUi().setCallActive(!!active); } catch (_) { /* best-effort */ }
+};
+
+// Synchronous, NON-consuming peek: was the app cold-started by a call full-screen
+// intent? Returns { action, callId, callerId, callerName, callerImage, callType } or
+// null. Lets the UI paint the full-screen call screen from the first frame (no
+// Splash/ChatList flash). null on iOS / no module / normal launch.
+export const peekInitialCallLaunch = () => {
+  if (!isCallUi()) return null;
+  try { return getCallUi().peekInitialCallLaunch?.() || null; } catch (_) { return null; }
 };
 
 // ===== notifee channel (only used by the notifee fallback) =====
@@ -186,19 +223,21 @@ export const displayIncomingCallNotifee = async (data) => {
     callerImage: data?.callerImage || null,
     callType: (data?.callType || data?.media) === 'video' ? 'video' : 'audio',
   };
-  if (!call.callId) return;
+  if (!call.callId) return false;
   shownCallIds.add(String(call.callId));
 
   // Preferred: native CallStyle (green Answer / red Decline).
   if (isCallUi()) {
-    try { getCallUi().displayIncomingCall(call); return; } catch (err) {
+    try { getCallUi().displayIncomingCall(call); return true; } catch (err) {
       console.warn('[callNotif] CallStyle display failed, trying notifee:', err?.message);
     }
   }
 
-  // Fallback: notifee full-screen intent.
+  // Fallback: notifee full-screen intent. Returns false so the FCM handler can
+  // fall back again to the expo-notifications heads-up — a killed-app call must
+  // NEVER end up showing nothing because one backend silently failed.
   const notifee = getNotifee();
-  if (!notifee) return;
+  if (!notifee) return false;
   try {
     const channelId = await ensureCallChannel();
     const { AndroidImportance, AndroidVisibility, AndroidCategory } = _consts;
@@ -235,8 +274,10 @@ export const displayIncomingCallNotifee = async (data) => {
         ],
       },
     });
+    return true;
   } catch (err) {
     console.warn('[callNotif] notifee display failed:', err?.message);
+    return false;
   }
 };
 
@@ -302,9 +343,8 @@ const ensureMissedCallChannel = async () => {
  * on iOS / when notifee isn't in the build. De-duped per call id so the live-app
  * path and the backend `call-missed` push never produce two.
  *
- * `data` accepts the same FCM call shape used elsewhere: { callId|signalId,
- * callerId, callerName, callerImage, callType|media, chatId, senderId, senderName,
- * groupId, groupName, isGroup }.
+ * `data`: { callId|signalId, callerId, callerName, callerImage, callType|media,
+ * chatId, senderId, senderName, groupId, groupName, isGroup }.
  */
 export const displayMissedCallNotification = async (data = {}) => {
   const callId = data.callId || data.signalId || null;
@@ -320,8 +360,8 @@ export const displayMissedCallNotification = async (data = {}) => {
   const isVideo = (data.callType || data.media) === 'video';
   const title = name;
   const body = isVideo ? 'Missed video call' : 'Missed voice call';
-  // Tap payload → open the caller's / group's chat thread. type:'call-missed' so
-  // it's never mistaken for a live incoming-call push by the routers.
+  // Tap payload → open the caller's / group's chat. type:'call-missed' so it's
+  // never mistaken for a live incoming-call push by the routers.
   const tapData = {
     ...data,
     type: 'call-missed',
@@ -378,8 +418,7 @@ export const displayMissedCallNotification = async (data = {}) => {
   }
 };
 
-// Forget a call id so a later genuine missed-call for the SAME id can notify again
-// (call ids are unique per call, so this is mostly hygiene / long-running sessions).
+// Forget a call id so a later genuine missed-call for the SAME id can notify again.
 export const forgetMissedCall = (callId) => {
   if (callId) missedShownIds.delete(String(callId));
 };

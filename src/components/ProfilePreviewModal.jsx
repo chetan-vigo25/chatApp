@@ -37,6 +37,7 @@ import {
   View,
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { useSelector } from 'react-redux';
 import { useTheme } from '../contexts/ThemeContext';
 import { useCall } from '../calls/useCall';
 
@@ -52,6 +53,7 @@ export default function ProfilePreviewModal({
   isBroadcast = false,
   isVerified = false,
   subtitle = null,
+  peerId = null,
   onMessage,
   onCall,
   onVideo,
@@ -61,6 +63,15 @@ export default function ProfilePreviewModal({
   const { theme, isDarkMode } = useTheme();
   // Disable the call/video actions while another call is in progress.
   const { callBusy } = useCall();
+  // Contact-block: when a peerId is supplied, disable calls in BOTH directions of
+  // a block (I blocked them, or they me). The CallProvider gate enforces it too.
+  const callBlocked = useSelector((s) => {
+    const id = peerId ? String(peerId) : '';
+    if (!id) return false;
+    return (s?.block?.blockedIds || []).map(String).includes(id)
+      || (s?.block?.blockedByIds || []).map(String).includes(id);
+  });
+  const callDisabled = callBusy || callBlocked;
   const scale = useRef(new Animated.Value(0)).current;
   const opacity = useRef(new Animated.Value(0)).current;
   // Keep the modal mounted through the exit animation.
@@ -163,12 +174,12 @@ export default function ProfilePreviewModal({
                   </TouchableOpacity>
                 )}
                 {showCall && (
-                  <TouchableOpacity onPress={onCall} disabled={callBusy} activeOpacity={0.6} style={[styles.actionBtn, callBusy && styles.actionBtnDisabled]} hitSlop={hit}>
+                  <TouchableOpacity onPress={onCall} disabled={callDisabled} activeOpacity={0.6} style={[styles.actionBtn, callDisabled && styles.actionBtnDisabled]} hitSlop={hit}>
                     <Ionicons name="call" size={19} color={actionGreen} />
                   </TouchableOpacity>
                 )}
                 {showVideo && (
-                  <TouchableOpacity onPress={onVideo} disabled={callBusy} activeOpacity={0.6} style={[styles.actionBtn, callBusy && styles.actionBtnDisabled]} hitSlop={hit}>
+                  <TouchableOpacity onPress={onVideo} disabled={callDisabled} activeOpacity={0.6} style={[styles.actionBtn, callDisabled && styles.actionBtnDisabled]} hitSlop={hit}>
                     <Ionicons name="videocam" size={21} color={actionGreen} />
                   </TouchableOpacity>
                 )}

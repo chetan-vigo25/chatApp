@@ -40,9 +40,13 @@ export default function IncomingCallBanner() {
 
   const status = call?.status || CALL_STATUS.IDLE;
   const accepted = !!call?.accepted;
+  // A foreground call is presented ONLY via the OS push notification, so the
+  // in-app banner stays hidden for it (notificationOnly).
+  const notificationOnly = !!call?.notificationOnly;
   // Only ring as a banner: an unanswered incoming call that hasn't been expanded
   // to the full-screen ring screen.
-  const visible = status === CALL_STATUS.INCOMING && !accepted && !call?.incomingExpanded;
+  const visible = status === CALL_STATUS.INCOMING && !accepted
+    && !call?.incomingExpanded && !notificationOnly;
 
   const translateY = useRef(new Animated.Value(-220)).current;
   useEffect(() => {
@@ -56,8 +60,9 @@ export default function IncomingCallBanner() {
 
   // Stay mounted for the whole INCOMING phase so `visible` can slide the card
   // off-screen (on accept / expand) instead of popping; unmount once the call
-  // leaves the ringing state entirely.
-  if (status !== CALL_STATUS.INCOMING) return null;
+  // leaves the ringing state entirely. A notification-only (foreground) call
+  // never shows the banner at all.
+  if (status !== CALL_STATUS.INCOMING || notificationOnly) return null;
 
   const peer = call?.peer || {};
   const isVideo = call?.media === 'video';

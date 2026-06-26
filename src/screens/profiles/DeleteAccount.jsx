@@ -59,8 +59,9 @@ export default function DeleteAccount({ navigation }) {
     try {
       await deleteAccount({ reason: finalReason, customReason: isOther ? customReason.trim() : "" });
 
-      // Complete local-device cleanup + socket disconnect.
-      await clearLocalStorageAndDisconnect();
+      // Complete local-device cleanup + socket disconnect. Force-wipe the local
+      // SQLite cache too — a deleted account's messages must not survive locally.
+      await clearLocalStorageAndDisconnect({ wipeLocalDB: true });
 
       navigation.reset({ index: 0, routes: [{ name: "LoginEmail" }] });
       Alert.alert(

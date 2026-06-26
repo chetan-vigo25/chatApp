@@ -991,6 +991,7 @@ export default function AddUser({ navigation }) {
             image={cImg}
             avatarColor={getAvatarColor(cName)}
             isGroup={false}
+            peerId={peerId || null}
             onMessage={isReg ? () => { closeModal(); handleContactPress(c); } : undefined}
             onCall={canCall ? () => { closeModal(); setTimeout(() => startAudioCall?.(peerObj), 220); } : undefined}
             onVideo={canCall ? () => { closeModal(); setTimeout(() => startVideoCall?.(peerObj), 220); } : undefined}

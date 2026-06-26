@@ -162,9 +162,33 @@ export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, ref
   // goes out tokenless and the server replies 401 "No token provided".
   await Promise.all(writes);
 
-  if (userInfo) {
-    emitUserChanged({ userId: String(userInfo?._id || userInfo?.id || '') || null, userInfo });
+  const resolvedUserId = String(userInfo?._id || userInfo?.id || '') || null;
+
+  // Tag the local cache with its owner so a later session reset can tell a
+  // same-account re-login (keep cache) from a different user (wipe). Fire-and-
+  // forget + best-effort: a DB hiccup must never break login. Runs AFTER any
+  // performSessionReset (login does reset→save), so it stamps the NEW owner.
+  if (resolvedUserId) {
+    try {
+      const { Platform } = require('react-native');
+      if (Platform.OS !== 'web') { ChatDatabase.setDBOwner(resolvedUserId); }
+    } catch {}
   }
+
+  if (userInfo) {
+    emitUserChanged({ userId: resolvedUserId, userInfo });
+  }
+};
+
+// Stamp the local-cache owner on an authenticated app relaunch. Backfills the
+// tag for installs that logged in before it existed, so the FIRST different
+// user to take over the device afterwards is correctly wiped.
+const stampCacheOwnerForBootstrap = (userId) => {
+  if (!userId) return;
+  try {
+    const { Platform } = require('react-native');
+    if (Platform.OS !== 'web') { ChatDatabase.setDBOwner(String(userId)); }
+  } catch {}
 };
 
 export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
@@ -202,18 +226,54 @@ export const resetRuntimeState = () => {
   emitSessionReset({ reason: 'runtime_reset' });
 };
 
+// Reasons that ALWAYS destroy the local SQLite cache regardless of who owns it.
+// Account deletion/removal means the data must not survive — everything else
+// (ordinary logout, token-refresh failure, account temporarily inactive) keeps
+// the cache so a same-account return is instant and local-first.
+const REASONS_THAT_WIPE = new Set(['account_deleted']);
+
 export const performSessionReset = async ({
   reason = 'logout',
   resetNavigation = true,
   clearAllStorage = true,
+  // userId about to sign in (login flows pass this); null on a pure logout.
+  nextUserId = null,
+  // Force-destroy the local cache no matter the owner (account deletion).
+  wipeLocalDB = false,
 } = {}) => {
+  // ── Decide the fate of the local SQLite cache BEFORE clearing AsyncStorage ──
+  // We must read the previous owner while it's still available. A same-account
+  // re-login keeps the cache (no full server refetch); a different user — or an
+  // explicit account deletion — wipes it so messages never leak across accounts.
+  let shouldWipeLocalDB = wipeLocalDB || REASONS_THAT_WIPE.has(reason);
+  let isWeb = false;
+  try {
+    isWeb = require('react-native').Platform.OS === 'web';
+  } catch {}
+
+  if (!shouldWipeLocalDB && !isWeb && nextUserId) {
+    try {
+      // Who the cache currently belongs to: the durable owner tag, falling back
+      // to the still-present stored session (covers installs predating the tag).
+      const owner = await ChatDatabase.getDBOwner();
+      const prevStoredUserId = owner ? null : ((await getStoredSession())?.userId || null);
+      const known = owner || prevStoredUserId;
+      // Wipe ONLY when we can prove the cache belongs to a different user. If we
+      // can't tell (no owner, no prior session — e.g. a previous logout already
+      // cleared storage), preserve it: the owner tag is re-stamped on every login
+      // so the next switch is protected.
+      shouldWipeLocalDB = Boolean(known) && String(known) !== String(nextUserId);
+    } catch {}
+  }
+
   await clearAllSessionData({ clearAllStorage });
 
-  // Clear SQLite database (messages, chats, sync_meta) — skip on web
+  // Apply the SQLite decision — skip on web (no SQLite there)
   try {
-    const { Platform } = require('react-native');
-    if (Platform.OS !== 'web') {
-      await ChatDatabase.clearSyncData();
+    if (!isWeb) {
+      if (shouldWipeLocalDB) {
+        await ChatDatabase.clearSyncData();
+      }
       await ChatDatabase.closeDB();
     }
   } catch {}
@@ -308,6 +368,7 @@ export const bootstrapSession = async () => {
   }
 
   if (session.accessToken && !isTokenExpired(session.accessToken)) {
+    stampCacheOwnerForBootstrap(session.userId);
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap' });
     return { authenticated: true, refreshed: false, session };
   }
@@ -318,6 +379,7 @@ export const bootstrapSession = async () => {
 
   try {
     const refreshed = await refreshAccessToken({ force: true });
+    stampCacheOwnerForBootstrap(session.userId);
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap_refresh' });
     return {
       authenticated: true,

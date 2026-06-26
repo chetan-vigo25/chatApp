@@ -127,10 +127,14 @@ export default function Otp({ navigation, route }) {
             // old device session if its socket is still live) then the local
             // wipe below removes all on-device state for the old account.
             try { await emitLogoutCurrentDevice(); } catch (_) {}
+            // Pass the incoming userId so the reset KEEPS the local SQLite cache
+            // on a same-account re-login (instant local-first load) and only
+            // wipes it when a different user takes over the device.
             await performSessionReset({
               reason: 'user_switch_login',
               resetNavigation: false,
               clearAllStorage: true,
+              nextUserId: loginData?.data?._id || loginData?.data?.id || null,
             });
 
             await saveAuthSession({

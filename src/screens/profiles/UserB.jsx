@@ -303,9 +303,17 @@ export default function UserB({ navigation, route }) {
 
   // ─── Block / Unblock (WhatsApp parity) ───
   const blockedIds = useSelector((s) => s?.block?.blockedIds || []);
+  const blockedByIds = useSelector((s) => s?.block?.blockedByIds || []);
   // Prefer live Redux; fall back to the server's profile-view flag on first load.
   const isPeerBlocked = peerId
     ? blockedIds.includes(String(peerId)) || !!peerProfile?.isBlocked
+    : false;
+  // Calls are gone in BOTH directions of a block (I blocked them, or they me) —
+  // disables the Audio/Video actions; the CallProvider gate enforces it too.
+  const callBlocked = peerId
+    ? isPeerBlocked
+      || blockedByIds.includes(String(peerId))
+      || !!peerProfile?.isBlockedBy
     : false;
 
   const handleToggleBlock = useCallback(() => {
@@ -473,9 +481,9 @@ export default function UserB({ navigation, route }) {
         <View style={[styles.actionsCard, { backgroundColor: cardBg }]}>
           <ActionColumn icon="chatbubble" label="Message" color={themeColor} onPress={handleMessage} />
           <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
-          <ActionColumn icon="call" label="Audio" color={themeColor} onPress={handleCall} disabled={callBusy} />
+          <ActionColumn icon="call" label="Audio" color={themeColor} onPress={handleCall} disabled={callBusy || callBlocked} />
           <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
-          <ActionColumn icon="videocam" label="Video" color={themeColor} onPress={handleVideoCall} disabled={callBusy} />
+          <ActionColumn icon="videocam" label="Video" color={themeColor} onPress={handleVideoCall} disabled={callBusy || callBlocked} />
         </View>
 
         {/* ─── About ─── */}

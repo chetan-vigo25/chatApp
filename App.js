@@ -75,7 +75,7 @@ export default function App() {
         if (cleanup) cleanup();
         if (notifeeCleanup) notifeeCleanup();
       };
-    }, []);
+    }, []); 
 
   return (
     <SafeAreaProvider>

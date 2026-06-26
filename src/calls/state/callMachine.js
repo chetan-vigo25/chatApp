@@ -38,6 +38,11 @@ export const initialCallState = {
   // it expands to the full-screen ring screen (incomingExpanded:true). Reset to
   // false on every new INCOMING since that action spreads initialCallState.
   incomingExpanded: false,
+  // Foreground incoming calls are presented ONLY via the OS push notification
+  // (CallStyle Accept/Decline), NOT the in-app banner/ring screen. We still enter
+  // INCOMING state so the lifecycle works (notification Accept/Decline answer or
+  // reject; cancel/timeout dismiss it) — this flag just hides the in-app ring UI.
+  notificationOnly: false,
   peer: null,            // { id, name, avatar } — 1:1 other party / group fallback
   peers: [],             // [{ id, name, avatar }] — full invited list
   participants: {},      // { [id]: { id, name, avatar, joined } }
@@ -150,6 +155,7 @@ export function callReducer(state, action) {
     case ACT.INCOMING: {
       const {
         callId, signalId, awaitingEngine, peer, peers, media, chatId, isGroup, groupId, groupName, nowMs,
+        notificationOnly,
       } = action;
       // Ignore a second incoming while busy.
       if (state.status !== CALL_STATUS.IDLE && state.status !== CALL_STATUS.ENDED) return state;
@@ -173,6 +179,7 @@ export function callReducer(state, action) {
         cameraOn: media === 'video',
         speakerOn: media === 'video' || group,
         startedAt: nowMs || null,
+        notificationOnly: !!notificationOnly,
       };
     }
     case ACT.RECONCILE_CALLID: {

@@ -65,7 +65,10 @@ const _closeReadDB = async () => {
   _readDb = null;
   _readDbInitPromise = null;
   _readerUnavailable = false;
-  if (r) { try { await r.closeAsync(); } catch {} }
+  // Only close if it's a genuinely independent handle. If expo-sqlite handed back
+  // the SAME connection as the writer (shared cache), closing it here would close
+  // the WRITER's connection out from under it.
+  if (r && r !== _db) { try { await r.closeAsync(); } catch {} }
 };
 
 const _safeClose = async () => {
@@ -91,10 +94,23 @@ const getReadDB = async () => {
       const handle = typeof SQLite.openDatabaseSync === 'function'
         ? SQLite.openDatabaseSync(DB_NAME)
         : await SQLite.openDatabaseAsync(DB_NAME);
-      // Probe + best-effort pragmas. query_only hard-guards against accidental
-      // writes on this connection; busy_timeout mirrors the writer.
+      // CRITICAL: expo-sqlite caches connections by (name, options). Because the
+      // writer and this reader open the SAME name with the SAME options,
+      // openDatabaseSync hands back the *same* underlying connection — it is NOT
+      // an independent handle. So we must NOT set `PRAGMA query_only = ON` here:
+      // that pragma is connection-scoped and would flip the SHARED connection
+      // read-only, making every writer statement fail with "attempt to write a
+      // readonly database" (the presence-cache / status-flush errors). If we did
+      // get the very same JS instance back, there's no concurrency to gain —
+      // fall back to the primary and skip the dedicated reader entirely.
+      if (handle === primary) {
+        _readDb = null;
+        _readerUnavailable = true;
+        return primary;
+      }
       await handle.getFirstAsync('SELECT 1');
-      try { await handle.execAsync('PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;'); } catch {}
+      // busy_timeout only (mirrors the writer); never query_only — see above.
+      try { await handle.execAsync('PRAGMA busy_timeout = 5000;'); } catch {}
       _readDb = handle;
       return handle;
     } catch (e) {
@@ -301,6 +317,11 @@ const _initDB = async () => {
         'PRAGMA journal_mode = WAL;',
         'PRAGMA synchronous = NORMAL;',
         'PRAGMA foreign_keys = ON;',
+        // Defensive: guarantee the WRITER connection is never read-only. The
+        // shared-cache reader used to set `query_only = ON`; if that ever lands on
+        // the shared connection, writes fail with "attempt to write a readonly
+        // database". Force it OFF on the writer so a stale state can't brick it.
+        'PRAGMA query_only = OFF;',
         // busy_timeout makes SQLite block up to 5s for a write lock instead of
         // failing immediately with "database is locked" — critical for the
         // upsertMessages path where many batches contend on the WAL writer.
@@ -2402,7 +2423,11 @@ const getChatCount = async () => {
 // REMOVEd after the server acks. Survives app kills. The retry worker
 // (src/services/OutboxWorker.js) drains it with exponential backoff.
 
-const outboxEnqueue = async ({ clientMessageId, chatId, payload }) => {
+// `notBefore` (epoch ms) lets the caller hold the row back from the drain
+// worker for a grace window. The send path uses this so the socket fast-path
+// can settle (and outboxRemove the row) before the worker REST-resends —
+// keeping the online happy-path socket-only while still surviving an app kill.
+const outboxEnqueue = async ({ clientMessageId, chatId, payload, notBefore = 0 }) => {
   if (!clientMessageId || !chatId) return;
   await runExclusive(async () => {
     const db = await getDB();
@@ -2410,8 +2435,8 @@ const outboxEnqueue = async ({ clientMessageId, chatId, payload }) => {
     await db.runAsync(
       `INSERT OR REPLACE INTO outbox
          (client_message_id, chat_id, payload, attempts, next_retry_at, created_at, updated_at)
-       VALUES ($c, $cid, $p, 0, 0, $n, $n)`,
-      { $c: clientMessageId, $cid: chatId, $p: JSON.stringify(payload), $n: now }
+       VALUES ($c, $cid, $p, 0, $nb, $n, $n)`,
+      { $c: clientMessageId, $cid: chatId, $p: JSON.stringify(payload), $nb: Number(notBefore) || 0, $n: now }
     );
   });
 };
@@ -2536,6 +2561,25 @@ const isInitialSyncDone = async (userId) => {
   if (!userId) return false;
   const val = await getSyncMeta('INITIAL_SYNC_COMPLETE');
   return val === String(userId);
+};
+
+// ── Local-cache ownership ─────────────────────────────────────────────────
+// The on-device SQLite cache belongs to exactly ONE user at a time. We tag it
+// with the owner's userId so a session reset can tell a SAME-account re-login
+// (keep the cache → instant local-first load, no full server refetch) apart
+// from a DIFFERENT user taking over the device (must wipe → no cross-account
+// data leak). Stored in sync_meta so it lives with the data it guards; it is
+// re-stamped on every authentication and cleared with the rest of sync_meta on
+// an actual wipe.
+const DB_OWNER_KEY = 'DB_OWNER_USER_ID';
+
+const getDBOwner = async () => {
+  try { return await getSyncMeta(DB_OWNER_KEY); } catch { return null; }
+};
+
+const setDBOwner = async (userId) => {
+  if (!userId) return;
+  try { await setSyncMeta(DB_OWNER_KEY, String(userId)); } catch {}
 };
 
 const clearSyncData = async () => {
@@ -2760,7 +2804,7 @@ export default {
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
   updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, deleteChatRow, getChatCount,
   // Sync meta
-  getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData,
+  getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner,
   // Outbox + watermarks (V8)
   outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
   setPeerReadWatermark, getPeerReadWatermark,

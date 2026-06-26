@@ -15,7 +15,9 @@
 
 // ─── Configuration ─────────────────────────────────────
 const MAX_MESSAGES_PER_CHAT = 50;
-const MAX_CACHED_CHATS_MESSAGES = 20; // Keep messages in memory for up to N chats
+const MAX_CACHED_CHATS_MESSAGES = 40; // Keep messages in memory for up to N chats.
+// Higher = a re-opened recently-viewed chat stays a memory cache HIT → instant
+// render with no blank-then-reload flash. 40 chats × 50 msgs is a small footprint.
 const EVICTION_CHECK_INTERVAL = 60000; // 1 minute
 
 // ─── In-Memory Stores ──────────────────────────────────

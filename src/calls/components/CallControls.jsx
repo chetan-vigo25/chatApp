@@ -17,7 +17,10 @@ import { useTheme } from '../../contexts/ThemeContext';
  *
  * Layout (matches WhatsApp):
  *   voice call → [ Speaker ] [ Mute ] [ End ]
- *   video call → [ Flip ] [ Camera ] [ Mute ] [ End ]
+ *   video call → [ Flip ] [ Camera ] [ Speaker ] [ Mute ] [ End ]
+ *
+ * Speaker toggles the audio route: ON = loudspeaker (loud), OFF = earpiece
+ * (normal, follows the device volume) — same on both call types.
  */
 function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, palette, onPress }) {
   const Icon = lib === 'mci' ? MaterialIcons : Ionicons;
@@ -96,6 +99,14 @@ export default function CallControls({
               palette={palette}
               onPress={onToggleCamera}
             />
+            <CircleButton
+              icon={speakerOn ? 'volume-high' : 'volume-medium'}
+              active={speakerOn}
+              disabled={!speakerSupported}
+              label={speakerSupported ? 'Speaker' : 'Auto'}
+              palette={palette}
+              onPress={onToggleSpeaker}
+            />
           </>
         ) : (
           <CircleButton
@@ -135,9 +146,9 @@ const styles = StyleSheet.create({
     borderRadius: 36,
     overflow: 'hidden',
     paddingVertical: 16,
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     width: '92%',
-    maxWidth: 420,
+    maxWidth: 440,
   },
   row: {
     flexDirection: 'row',
@@ -145,13 +156,16 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     width: '100%',
   },
-  btnWrap: { alignItems: 'center' },
+  // Sized so the 5-button video bar (Flip · Camera · Speaker · Mute · End) fits
+  // even on narrow (~320dp) screens without clipping; the 3-button voice bar just
+  // gets a touch more breathing room.
+  btnWrap: { alignItems: 'center', flexShrink: 1 },
   circle: {
-    width: 58, height: 58, borderRadius: 29,
+    width: 54, height: 54, borderRadius: 27,
     alignItems: 'center', justifyContent: 'center',
   },
   circleDanger: {
-    width: 62, height: 62, borderRadius: 31,
+    width: 58, height: 58, borderRadius: 29,
   },
   label: {
     fontFamily: 'Roboto-Regular',

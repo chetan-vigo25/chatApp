@@ -86,7 +86,15 @@ export default function LoginEmail({ navigation }) {
       // M6 — single-account: force-logout the previous account server-side
       // (best-effort) before wiping local state and switching.
       try { await emitLogoutCurrentDevice(); } catch (_) {}
-      await performSessionReset({ reason: "user_switch_login", resetNavigation: false, clearAllStorage: true });
+      // Pass the incoming userId so the reset KEEPS the local SQLite cache on a
+      // same-account re-login (instant local-first load) and only wipes it when
+      // a different user signs in on this device.
+      await performSessionReset({
+        reason: "user_switch_login",
+        resetNavigation: false,
+        clearAllStorage: true,
+        nextUserId: loginData?.data?._id || loginData?.data?.id || null,
+      });
       await saveAuthSession({
         userInfo: loginData.data,
         accessToken: loginData?.token?.accessToken,

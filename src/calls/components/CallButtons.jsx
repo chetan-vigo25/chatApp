@@ -1,6 +1,7 @@
 import React, { useCallback } from 'react';
 import { View, TouchableOpacity, StyleSheet } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../useCall';
 
@@ -18,6 +19,17 @@ export default function CallButtons({ peer, chatId }) {
     name: peer.fullName || peer.name || 'Unknown',
     avatar: peer.profileImage || peer.profilePicture || null,
   } : null;
+  const peerId = peerObj?.id || '';
+
+  // Contact-block: dim + disable both call buttons when either side blocked the
+  // other (I blocked them, or they blocked me) — same source the composer guard
+  // uses. The CallProvider startCall gate enforces this too; this is the UI half.
+  const isBlocked = useSelector((s) => {
+    if (!peerId) return false;
+    const iBlocked = (s?.block?.blockedIds || []).map(String).includes(peerId);
+    const blockedMe = (s?.block?.blockedByIds || []).map(String).includes(peerId);
+    return iBlocked || blockedMe;
+  });
 
   const onAudio = useCallback(() => {
     if (peerObj?.id && startAudioCall) startAudioCall(peerObj, chatId);
@@ -28,26 +40,27 @@ export default function CallButtons({ peer, chatId }) {
   }, [peerObj, chatId, startVideoCall]);
 
   if (!peerObj?.id) return null;
-  // Dim + disable both buttons while another call is in progress so a second
-  // call can't be started over a live/ringing one.
-  const color = callBusy ? theme.colors.secondaryTextColor : theme.colors.primaryTextColor;
+  // Dim + disable both buttons while another call is in progress (so a second
+  // call can't start over a live/ringing one) or when blocked either direction.
+  const disabled = callBusy || isBlocked;
+  const color = disabled ? theme.colors.secondaryTextColor : theme.colors.primaryTextColor;
 
   return (
     <View style={styles.row}>
       <TouchableOpacity
         onPress={onVideo}
-        disabled={callBusy}
+        disabled={disabled}
         activeOpacity={0.7}
-        style={[styles.btn, callBusy && styles.disabled]}
+        style={[styles.btn, disabled && styles.disabled]}
         hitSlop={styles.hit}
       >
         <Ionicons name="videocam-outline" size={23} color={color} />
       </TouchableOpacity>
       <TouchableOpacity
         onPress={onAudio}
-        disabled={callBusy}
+        disabled={disabled}
         activeOpacity={0.7}
-        style={[styles.btn, callBusy && styles.disabled]}
+        style={[styles.btn, disabled && styles.disabled]}
         hitSlop={styles.hit}
       >
         <Ionicons name="call-outline" size={21} color={color} />

@@ -1,11 +1,11 @@
 import * as Notifications from 'expo-notifications';
-import { Platform, PermissionsAndroid, DeviceEventEmitter } from 'react-native';
+import { Platform, PermissionsAndroid, DeviceEventEmitter, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { isGroupInactive } from '../utils/inactiveGroups';
 import { setPushToken } from '../Redux/Services/Socket/socket';
 import { navigateToChat } from '../Redux/Services/navigationService';
-import { CALL_PUSH_EVENTS } from './callEvents';
-import { displayIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
+import { CALL_PUSH_EVENTS, isStaleCallPush } from './callEvents';
+import { displayIncomingCallNotifee, cancelIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
 import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
 import { buildNotificationModel } from './notificationModel';
 import { claimNotification } from './notificationDedupe';
@@ -211,6 +211,25 @@ const presentIncomingCallNotification = async (data) => {
   }
 };
 
+// Dismiss the incoming-call notification on BOTH backends: the Android CallStyle
+// (ExpoCallUi / notifee, via cancelIncomingCallNotifee) AND the iOS expo-
+// notifications heads-up (which cancelIncomingCallNotifee does NOT cover, since
+// iOS presents the call via scheduleNotificationAsync, not notifee). Used by the
+// `call_cancel` push so the caller hanging up clears the callee's notification on
+// both platforms.
+const dismissIncomingCallNotification = async (callId) => {
+  try { await cancelIncomingCallNotifee(callId); } catch (_) { /* android backend */ }
+  try {
+    const presented = await Notifications.getPresentedNotificationsAsync();
+    await Promise.all((presented || [])
+      .filter((n) => {
+        const d = n?.request?.content?.data || {};
+        return d.type === 'call' && (!callId || String(d.callId) === String(callId));
+      })
+      .map((n) => Notifications.dismissNotificationAsync(n.request.identifier).catch(() => {})));
+  } catch (_) { /* expo-notifications backend (iOS heads-up) */ }
+};
+
 // Request permission for notifications
 export const requestNotificationPermission = async () => {
   try {
@@ -272,8 +291,10 @@ export const getFCMToken = async () => {
   try {
     m().onTokenRefresh((newToken) => {
       // console.log('[FCM] Token refreshed → re-registering:', newToken);
-      try { setPushToken(newToken); } catch (_) {}
-      AsyncStorage.setItem('fcmToken', newToken).catch(() => {});
+      _persistToken(newToken);
+      // If recovery was running and FCM finally delivered a token via refresh,
+      // we no longer need to poll.
+      if (newToken) _stopTokenRecovery();
     });
   } catch (_) {}
 
@@ -296,11 +317,128 @@ export const getFCMToken = async () => {
     // first failure returned null → push stayed dead until the next login.
     const token = await _getTokenWithRetry(m);
     // console.log('[FCM] Token:', token);
+    if (token) {
+      _persistToken(token);
+      _stopTokenRecovery(); // a previous failed boot may have left it running
+    }
     return token;
   } catch (error) {
     console.error('[FCM] Error getting FCM token:', error?.message, error?.code, error);
+    // The boot-time retries (~11s) weren't enough for Play Services to come up
+    // on this device. Keep trying in the background — on a timer, on app
+    // foreground, and on network reconnect — until FCM finally hands us a token,
+    // then register it with the backend. Without this, a token-less boot stays
+    // token-less (and SERVICE_NOT_AVAILABLE also suppresses onTokenRefresh, so
+    // nothing else recaptures it) until the next manual restart/login.
+    if (_isTransientFcmError(error)) _startTokenRecovery(m);
     return null;
   }
+};
+
+// Persist + re-register a freshly obtained token. Shared by the boot path,
+// onTokenRefresh, and the background recovery loop so they all converge on the
+// same "store it + tell the backend" behaviour.
+const _persistToken = (token) => {
+  if (!token) return;
+  try { setPushToken(token); } catch (_) {}
+  AsyncStorage.setItem('fcmToken', token).catch(() => {});
+};
+
+// ─── PERSISTENT TOKEN RECOVERY ───
+// Boot-time _getTokenWithRetry only covers ~11s. On devices where Play Services
+// takes longer to complete FCM/FIS registration (MIUI, Nothing OS, fresh
+// installs, flaky networks) that window expires and getToken stays null. This
+// loop keeps retrying past boot until success: a capped-backoff timer PLUS
+// event triggers (app returns to foreground, network reconnects) that often
+// coincide with Play Services recovering. Idempotent + self-terminating.
+let _recoveryActive = false;
+let _recoveryTimer = null;
+let _recoveryAttempts = 0;
+let _recoveryAppStateSub = null;
+let _recoveryNetUnsub = null;
+let _recoveryInFlight = false;
+// Backoff schedule (ms), capped — then repeats at the last value. ~15s→30s→60s
+// then every 2min. Stop after enough tries (~20min) to avoid an endless loop on
+// a device that will never register (e.g. no Google account / Play Services).
+const _RECOVERY_DELAYS = [15000, 30000, 60000, 120000];
+const _RECOVERY_MAX_ATTEMPTS = 15;
+
+const _stopTokenRecovery = () => {
+  _recoveryActive = false;
+  if (_recoveryTimer) { clearTimeout(_recoveryTimer); _recoveryTimer = null; }
+  try { _recoveryAppStateSub?.remove?.(); } catch (_) {}
+  _recoveryAppStateSub = null;
+  try { _recoveryNetUnsub?.(); } catch (_) {}
+  _recoveryNetUnsub = null;
+};
+
+const _attemptRecovery = async (m, fromTrigger = false) => {
+  if (!_recoveryActive || _recoveryInFlight) return;
+  _recoveryInFlight = true;
+  try {
+    const token = await m().getToken();
+    if (token) {
+      // console.log('[FCM] recovery succeeded — token captured');
+      _persistToken(token);
+      _stopTokenRecovery();
+      return;
+    }
+  } catch (err) {
+    if (!_isTransientFcmError(err)) {
+      // A non-transient error (e.g. AUTHENTICATION_FAILED) won't fix itself by
+      // retrying — stop rather than spin forever.
+      console.warn('[FCM] recovery stopped on non-transient error:', err?.code || err?.message);
+      _stopTokenRecovery();
+      return;
+    }
+    // transient → fall through and let the timer schedule the next attempt
+  } finally {
+    _recoveryInFlight = false;
+  }
+  // An event-triggered attempt (foreground/reconnect) doesn't consume the timer
+  // budget — only the scheduled ticks count toward the cap.
+  if (!fromTrigger) _scheduleRecovery(m);
+};
+
+const _scheduleRecovery = (m) => {
+  if (!_recoveryActive) return;
+  if (_recoveryAttempts >= _RECOVERY_MAX_ATTEMPTS) {
+    console.warn('[FCM] token recovery gave up after max attempts — Play Services never registered this device');
+    _stopTokenRecovery();
+    return;
+  }
+  const delay = _RECOVERY_DELAYS[Math.min(_recoveryAttempts, _RECOVERY_DELAYS.length - 1)];
+  _recoveryAttempts += 1;
+  if (_recoveryTimer) clearTimeout(_recoveryTimer);
+  _recoveryTimer = setTimeout(() => { _attemptRecovery(m, false); }, delay);
+};
+
+const _startTokenRecovery = (m) => {
+  if (_recoveryActive || !m) return;
+  _recoveryActive = true;
+  _recoveryAttempts = 0;
+  console.warn('[FCM] starting background token recovery (Play Services not ready at boot)');
+
+  // Trigger 1: app returns to the foreground — Play Services often recovers
+  // while the user is away, and a foreground transition is a cheap moment to retry.
+  try {
+    _recoveryAppStateSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') _attemptRecovery(m, true);
+    });
+  } catch (_) {}
+
+  // Trigger 2: network regained — SERVICE_NOT_AVAILABLE is frequently a
+  // check-in/connectivity gap, so a reconnect is a strong signal to retry now.
+  try {
+    // eslint-disable-next-line global-require
+    const NetInfo = require('@react-native-community/netinfo').default;
+    _recoveryNetUnsub = NetInfo.addEventListener((s) => {
+      if (s?.isConnected) _attemptRecovery(m, true);
+    });
+  } catch (_) { /* netinfo optional */ }
+
+  // Kick off the first scheduled attempt.
+  _scheduleRecovery(m);
 };
 
 // Transient FCM backend errors that clear on retry. `messaging/unknown` wraps a
@@ -479,18 +617,11 @@ export const registerBackgroundHandler = () => {
       // fall back to the expo-notifications heads-up with Accept/Decline. If the
       // notifee path errors for any reason, fall back to the proven expo heads-up
       // so the user ALWAYS gets a ringing notification.
-      if (remoteMessage?.data?.type === 'call') {
-        // console.log('[FCM][bg] incoming-call push received', JSON.stringify(remoteMessage.data));
-        try {
-          if (isNotifeeCallAvailable()) {
-            await displayIncomingCallNotifee(remoteMessage.data);
-          } else {
-            await presentIncomingCallNotification(remoteMessage.data);
-          }
-        } catch (err) {
-          console.warn('[FCM][bg] full-screen call notif failed — falling back to heads-up:', err?.message);
-          try { await presentIncomingCallNotification(remoteMessage.data); } catch (_) {}
-        }
+      // Caller hung up / ring timed out → dismiss the incoming-call notification
+      // (a killed/backgrounded callee never got the call:cancelled socket event,
+      // so without this the ringing notification lingers / arrives for a dead call).
+      if (remoteMessage?.data?.type === 'call_cancel') {
+        await dismissIncomingCallNotification(remoteMessage.data.callId);
         return;
       }
 
@@ -500,6 +631,34 @@ export const registerBackgroundHandler = () => {
       // already posted one (call rang then went unanswered), this is a no-op.
       if (remoteMessage?.data?.type === 'call-missed') {
         try { await displayMissedCallNotification(remoteMessage.data); } catch (_) {}
+        return;
+      }
+
+      if (remoteMessage?.data?.type === 'call') {
+        // console.log('[FCM][bg] incoming-call push received', JSON.stringify(remoteMessage.data));
+        // Drop a buffered/late-flushed call push (Doze / force-stopped OEM holds
+        // the high-priority message, then delivers a burst when the device wakes).
+        // The call is long over — showing it would ring a ghost and a backlog
+        // would ring many at once.
+        if (isStaleCallPush(remoteMessage.data)) {
+          return;
+        }
+        try {
+          // displayIncomingCallNotifee returns false when BOTH the native
+          // CallStyle and the notifee paths failed/were unavailable (it swallows
+          // their errors internally), so a falsy return — not just a throw — must
+          // trigger the expo heads-up fallback. Otherwise a silent notifee
+          // failure left the killed app showing nothing ("notification nahi aaya").
+          const shown = isNotifeeCallAvailable()
+            ? await displayIncomingCallNotifee(remoteMessage.data)
+            : false;
+          if (!shown) {
+            await presentIncomingCallNotification(remoteMessage.data);
+          }
+        } catch (err) {
+          console.warn('[FCM][bg] full-screen call notif failed — falling back to heads-up:', err?.message);
+          try { await presentIncomingCallNotification(remoteMessage.data); } catch (_) {}
+        }
         return;
       }
 
@@ -531,6 +690,11 @@ export const initializeNotifications = () => {
     // console.log('Foreground message received:', JSON.stringify(remoteMessage));
     // Logged out → ignore any push that still lands (calls + messages).
     if (!(await hasActiveSession())) return;
+    // Caller hung up / timed out → dismiss the incoming-call notification.
+    if (remoteMessage?.data?.type === 'call_cancel') {
+      dismissIncomingCallNotification(remoteMessage.data.callId).catch(() => {});
+      return;
+    }
     // A call push in the foreground → drive the live ringing overlay directly
     // (the always-connected app socket usually beats it; this is the wake-up
     // fallback). Never render a banner for it.
@@ -538,9 +702,9 @@ export const initializeNotifications = () => {
       DeviceEventEmitter.emit(CALL_PUSH_EVENTS.INCOMING, remoteMessage.data);
       return;
     }
-    // Missed-call push while the app is foreground. The live call layer usually
-    // already classified + notified locally (deduped), but if this call never rang
-    // on this device the push is the only signal — surface the missed notification.
+    // Missed-call push while foreground. The live call layer usually already
+    // classified + notified locally (deduped), but if this call never rang on this
+    // device the push is the only signal — surface the missed notification.
     if (remoteMessage?.data?.type === 'call-missed') {
       await displayMissedCallNotification(remoteMessage.data);
       return;

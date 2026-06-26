@@ -9,7 +9,9 @@ import ChatDatabase from '../../../services/ChatDatabase';
 // Presence heartbeat: while the app is foregrounded we refresh the server's
 // liveness key on this cadence. Stopped on background/disconnect so a suspended
 // app stops being counted as live (the server's conn-key TTL then expires).
-const PRESENCE_HEARTBEAT_MS = 15000;
+// Short (~4s) so presence is snappy — a force-killed app lapses offline within
+// ~9-12s (server conn TTL + sweeper). MUST stay <= server PRESENCE_CONN_TTL_SECONDS.
+const PRESENCE_HEARTBEAT_MS = 4000;
 let presenceHeartbeatTimer = null;
 
 const startPresenceHeartbeat = () => {
@@ -990,6 +992,33 @@ export const initSocket = async (deviceInfo, navigation) => {
   }
 };
 
+// Whether the screen is currently locked (Android keyguard). A locked phone is
+// "not foreground" for presence even though AppState reports 'active' (because
+// MainActivity is showWhenLocked). Tracked so the AppState + lock listeners stay
+// in agreement and we don't double-emit.
+let deviceLocked = false;
+
+// Tell the server we've left the foreground (app backgrounded OR screen locked):
+// announce away + stop the heartbeat. The server holds a short grace then
+// finalizes offline. Idempotent — stopping an already-stopped heartbeat is a
+// no-op, and a second presence:away inside the grace just resets the same timer.
+const emitGoingBackground = () => {
+  stopPresenceHeartbeat();
+  if (socket && socket.connected) {
+    socket.emit('app:state', { state: 'background' });
+    socket.emit('presence:away', {});
+  }
+};
+
+// Tell the server we're foreground & active again: announce active + resume the
+// heartbeat (which refreshes the server's liveness key). Only call when the app
+// is genuinely usable — foregrounded AND unlocked.
+const emitBackToForeground = () => {
+  emitSocketEvent('app:state', { state: 'foreground' });
+  emitSocketEvent('presence:active');
+  startPresenceHeartbeat();
+};
+
 export const setupAppStateListener = (navigation) => {
   const handleAppStateChange = async (nextAppState) => {
     const goingBackground = nextAppState.match(/inactive|background/);
@@ -1001,30 +1030,56 @@ export const setupAppStateListener = (navigation) => {
       } else if (accessTokenCache) {
         socket.emit('token:validate', { token: accessTokenCache });
       }
-      // Back in the foreground → mark active again + resume heartbeat. The socket
-      // may have reconnected above, so queue presence:active (emitSocketEvent) to
-      // fire the moment the connection is live rather than dropping it.
-      emitSocketEvent('app:state', { state: 'foreground' });
-      emitSocketEvent('presence:active');
-      startPresenceHeartbeat();
+      // Foregrounded — but if the device is still locked (showWhenLocked resumes
+      // the app over the keyguard), we are NOT really active yet. Stay "away"
+      // until the unlock event fires.
+      if (!deviceLocked) emitBackToForeground();
     } else if (goingBackground && appState === 'active') {
-      // App minimized / removed from recents → announce "away" and stop the
-      // heartbeat. The OS suspends background sockets, so once the conn-key TTL
-      // lapses (no more heartbeats) the server's grace+sweeper finalizes offline.
-      // We send "away" rather than "offline" so a brief app-switch (or another
-      // active device) doesn't flap the user straight to offline.
-      stopPresenceHeartbeat();
-      if (socket && socket.connected) {
-        socket.emit('app:state', { state: 'background' });
-        socket.emit('presence:away', {});
-      }
+      // App minimized / removed from recents → announce away + stop heartbeat.
+      emitGoingBackground();
     }
 
     appState = nextAppState;
   };
 
   const subscription = AppState.addEventListener('change', handleAppStateChange);
-  return () => subscription.remove();
+  // The screen-lock listener is part of the same foreground-tracking lifecycle,
+  // so register it here and fold its teardown into the returned cleanup — every
+  // existing caller (AuthContext) then gets lock-aware presence for free.
+  const unsubLock = setupDeviceLockPresence();
+  return () => {
+    subscription.remove();
+    try { unsubLock(); } catch (_) { /* */ }
+  };
+};
+
+// Device screen lock/unlock → presence. This is the fix for "device locked but
+// app was open → still online": because MainActivity is showWhenLocked, locking
+// the screen does NOT background the app (AppState stays 'active'), so the
+// heartbeat would otherwise keep the user falsely online. We key off the native
+// keyguard signal instead: lock → away + stop heartbeat; unlock → active +
+// resume (only if the app is also foregrounded). No-op off Android.
+export const setupDeviceLockPresence = () => {
+  let unsub = () => {};
+  try {
+    // Lazy require to avoid pulling the native call-UI module into modules that
+    // never need it (and to keep this crash-safe when the module isn't built).
+    const { addDeviceLockListener, isDeviceLockedNow } = require('../../../firebase/callNotifee');
+    deviceLocked = !!isDeviceLockedNow?.();
+    unsub = addDeviceLockListener((locked) => {
+      if (locked === deviceLocked) return;
+      deviceLocked = locked;
+      if (locked) {
+        emitGoingBackground();
+      } else if (AppState.currentState === 'active') {
+        // Unlocked AND foregrounded → genuinely active again.
+        emitBackToForeground();
+      }
+    });
+  } catch (e) {
+    console.warn('device lock presence wiring skipped (non-fatal):', e?.message);
+  }
+  return () => { try { unsub(); } catch (_) { /* */ } };
 };
 
 export const emitLogoutCurrentDevice = async () => {
@@ -1066,7 +1121,10 @@ export const emitLogoutCurrentDevice = async () => {
   }
 };
 
-export const clearLocalStorageAndDisconnect = async () => {
+// `wipeLocalDB` force-destroys the on-device SQLite cache. An ordinary logout
+// PRESERVES it (so a same-account return is instant + local-first); account
+// deletion passes `wipeLocalDB: true` so the data does not survive.
+export const clearLocalStorageAndDisconnect = async ({ wipeLocalDB = false } = {}) => {
   safeDisconnectSocket();
   updateSocketState({
     status: 'disconnected',
@@ -1079,9 +1137,10 @@ export const clearLocalStorageAndDisconnect = async () => {
 
   try {
     await performSessionReset({
-      reason: 'manual_logout',
+      reason: wipeLocalDB ? 'account_deleted' : 'manual_logout',
       resetNavigation: false,
       clearAllStorage: true,
+      wipeLocalDB,
     });
   } catch (error) {
     console.error('❌ Failed clearing session state:', error);

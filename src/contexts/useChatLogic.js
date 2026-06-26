@@ -17,6 +17,7 @@ import ChatDatabase from '../services/ChatDatabase';
 import ContactDatabase from '../services/ContactDatabase';
 import { hashPhoneForMatch, onlyDigits } from '../utils/savedContactName';
 import ChatCache from '../services/ChatCache';
+import OutboxWorker from '../services/OutboxWorker';
 import { isInForwardWindow, clearForwardTimestamp } from '../utils/forwardState';
 import { shouldEmitReadAll } from '../utils/readAllThrottle';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
@@ -46,6 +47,17 @@ import { subscribeSessionReset, subscribeUserChanged } from "../services/session
 let _cachedUserInfo = null;
 subscribeSessionReset(() => { _cachedUserInfo = null; });
 subscribeUserChanged(() => { _cachedUserInfo = null; });
+
+// Per-chat "last on-open server delta-sync" timestamp, MODULE-LEVEL so it survives
+// ChatScreen unmount/remount (rapid open→close→reopen remounts the screen). WhatsApp
+// doesn't re-sync a chat from the server on every open: while a chat is open the live
+// socket delivers new messages, and on reconnect message:sync:catchup fills gaps. So
+// a re-open within the throttle window skips the redundant server request — far fewer
+// requests, no reload churn. Cleared on logout/account switch so a new account never
+// reuses a stale throttle.
+const _lastChatSyncAt = new Map();
+subscribeSessionReset(() => { _lastChatSyncAt.clear(); });
+subscribeUserChanged(() => { _lastChatSyncAt.clear(); });
 const getCachedUserInfo = async () => {
   if (_cachedUserInfo) return _cachedUserInfo;
   try {
@@ -81,6 +93,10 @@ const MEDIA_STATUS_QUEUE_KEY = 'media_status_update_queue';
 const DELETED_TOMBSTONES_PREFIX = "chat_deleted_tombstones_";
 const READ_MARK_DELAY = 800;
 const SOCKET_FETCH_LIMIT = 50;
+// First-paint page: small for the fastest possible initial render. Scroll-up
+// paging grows the displayed window; refreshMessagesFromDB then reads at least
+// the whole loaded window so a re-read never shrinks the list back to one page.
+const INITIAL_PAGE_SIZE = 40;
 const LOCAL_SAVE_DEBOUNCE_MS = 220;
 const MEDIA_STATUS_ACK_TIMEOUT_MS = 9000;
 const MEDIA_STATUS_MAX_RETRIES = 5;
@@ -413,6 +429,11 @@ export default function useChatLogic({ navigation, route }) {
   const currentUserNameRef = useRef('');
   const groupMembersMapRef = useRef({});
   const allMessagesRef = useRef([]);
+  // Size of the currently-loaded message window (grows as the user scrolls up).
+  // refreshMessagesFromDB reads at least this many rows so a re-read triggered
+  // by an incoming message / receipt / reaction never collapses the list back
+  // to the first page (which made it "load again and again" on every event).
+  const loadedLimitRef = useRef(INITIAL_PAGE_SIZE);
   const pendingMessagesRef = useRef([]);
   const socketCheckInterval = useRef(null);
   const isComponentMounted = useRef(true);
@@ -1473,6 +1494,9 @@ export default function useChatLogic({ navigation, route }) {
       pauseBackgroundSyncFor(1500);
 
       if (!isSameChat) {
+        // New chat → start with a small fast first page; the window grows again
+        // as the user scrolls up in this chat.
+        loadedLimitRef.current = INITIAL_PAGE_SIZE;
         // Try memory cache first (synchronous — zero delay)
         const cached = ChatCache.hasMessages(generatedChatId)
           ? ChatCache.getMessages(generatedChatId)
@@ -1480,6 +1504,10 @@ export default function useChatLogic({ navigation, route }) {
 
         if (cached.length > 0) {
           setAllMessages(cached);
+          // The cache may already hold a grown window from a prior visit; keep
+          // the floor at least that big so the first refresh doesn't shrink it.
+          loadedLimitRef.current = Math.max(INITIAL_PAGE_SIZE, cached.length);
+          allMessagesRef.current = cached;
           setIsLoadingInitial(false);
           setIsLoadingFromLocal(false);
         } else {
@@ -1576,17 +1604,32 @@ export default function useChatLogic({ navigation, route }) {
       // ═══════════════════════════════════════════════════════════
       // STEP 4: BACKGROUND SYNC — fetch only new messages from server
       // ═══════════════════════════════════════════════════════════
+      const SYNC_THROTTLE_MS = 15000;
+      const nowTs = Date.now();
+      const lastSyncTs = _lastChatSyncAt.get(generatedChatId) || 0;
       if (localCount === 0) {
+        // No local data → must do the one full fetch regardless of throttle.
         cslog('🌐 SQLite empty for this chat → FULL fetch over SOCKET (message:sync/fetch)', {
           chatId: generatedChatId,
         });
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
-      } else {
+        _lastChatSyncAt.set(generatedChatId, nowTs);
+      } else if (nowTs - lastSyncTs > SYNC_THROTTLE_MS) {
+        // Has local data → cheap forward delta (seq cursor; never re-downloads
+        // stored rows), but only if we haven't just synced this chat.
         cslog('🔄 SQLite had messages → DELTA sync only over SOCKET (fills gaps, not a reload)', {
           chatId: generatedChatId,
           sqliteRecordCount: localCount,
         });
         fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
+        _lastChatSyncAt.set(generatedChatId, nowTs);
+      } else {
+        // Re-opened within the throttle window → skip the server request entirely.
+        // SQLite already rendered; the live socket keeps this chat fresh while open.
+        cslog('⏭️ Skipped on-open delta sync (synced recently) — local-first, no server hit', {
+          chatId: generatedChatId,
+          msSinceLastSync: nowTs - lastSyncTs,
+        });
       }
       scheduleMarkVisibleUnreadAsRead();
 
@@ -1903,6 +1946,10 @@ export default function useChatLogic({ navigation, route }) {
           : null),
       createdAt,
       timestamp: new Date(createdAt).getTime(),
+      // Server-allocated monotonic per-chat sequence. MUST be preserved so the
+      // SQLite cursor (MAX(seq)) advances for live + synced messages alike —
+      // otherwise the next delta/catchup re-requests already-stored rows.
+      seq: (apiMsg?.seq != null && !Number.isNaN(Number(apiMsg?.seq))) ? Number(apiMsg.seq) : null,
       synced: true,
       chatId: apiMsg?.chatId || chatIdRef.current,
       groupId: apiMsg?.groupId || null,
@@ -2336,11 +2383,19 @@ export default function useChatLogic({ navigation, route }) {
           try { await SqliteWriter.awaitDrain(); } catch {}
         }
         const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
+        // First paint reads one small screenful (INITIAL_PAGE_SIZE) for the
+        // fastest possible render. Once the user has scrolled up and grown the
+        // window, read AT LEAST that many rows so this re-read preserves the
+        // loaded window instead of snapping back to page one — which is what
+        // made the screen re-trigger pagination ("load again and again") on
+        // every incoming message, receipt or reaction.
+        const pageLimit = Math.max(
+          INITIAL_PAGE_SIZE,
+          loadedLimitRef.current || 0,
+          allMessagesRef.current?.length || 0,
+        );
         const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, {
-          // First page is intentionally small (~one screenful) for the fastest
-          // possible first paint; scroll-up paging + background sync fill the
-          // rest. Older pages still use the larger network/local page size.
-          limit: 40,
+          limit: pageLimit,
           afterTimestamp: clearedAt,
           // Always skip the inline temp-row cleanup WRITE on the read path — it
           // queues behind the cold-start storm and stalls the first paint. The
@@ -3055,7 +3110,7 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     if (syncOnly) {
-      // Delta sync only — fetch messages after last known
+      // Delta sync only — fetch messages NEWER than what SQLite already has.
       const currentMessages = allMessagesRef.current || [];
       const latestMessage = currentMessages.reduce((candidate, msg) => {
         const ts = Number(msg?.timestamp || new Date(msg?.createdAt || 0).getTime() || 0);
@@ -3071,17 +3126,40 @@ export default function useChatLogic({ navigation, route }) {
       ) || null;
 
       if (isGrpSync) {
+        // Group sync is a correct forward delta server-side (createdAt > cursor);
+        // it still keys on lastMessageId.
         socket.emit('group:message:sync', {
           groupId: chatData?.groupId || chatData?.group?._id || chatIdParam,
           lastMessageId,
           limit: Number(limit) > 0 ? Number(limit) : 50,
         });
       } else {
-        socket.emit('message:sync', {
-          chatId: chatIdParam,
-          lastMessageId,
-          limit: Number(limit) > 0 ? Number(limit) : 50,
-        });
+        // 1-1 delta is keyed on the per-chat seq cursor so opening a chat only
+        // pulls messages with seq > MAX(seq) — never re-downloads stored rows.
+        // Fall back to the in-memory max seq, then to lastMessageId for safety.
+        (async () => {
+          let sinceSeq = 0;
+          try {
+            sinceSeq = await ChatDatabase.getLatestSeq(chatIdParam);
+          } catch {
+            sinceSeq = 0;
+          }
+          if (!sinceSeq) {
+            const memMax = currentMessages.reduce((mx, m) => {
+              const s = Number(m?.seq || 0);
+              return s > mx ? s : mx;
+            }, 0);
+            sinceSeq = memMax;
+          }
+          const liveSocket = socketRef.current || getSocket();
+          if (!liveSocket || !isSocketConnected()) return;
+          liveSocket.emit('message:sync', {
+            chatId: chatIdParam,
+            sinceSeq,
+            lastMessageId, // legacy fallback (server resolves it to its own seq)
+            limit: Number(limit) > 0 ? Number(limit) : 50,
+          });
+        })();
       }
       return;
     }
@@ -5592,6 +5670,10 @@ export default function useChatLogic({ navigation, route }) {
           // so all future actions (reply / react / read / edit / delete) use
           // the server-recognized id, not the temp one.
           ChatDatabase.acknowledgeMessage(targetTempId, serverMessageId).catch(() => {});
+          // Socket delivered it — drop the durable outbox row so the REST drain
+          // worker never re-sends. (Server dedupes on (chatId, clientMessageId)
+          // anyway, but removing it keeps the happy path socket-only.)
+          ChatDatabase.outboxRemove(targetTempId).catch(() => {});
         };
 
         // Shared ack handler — runs for both the live emit and the queued
@@ -5802,12 +5884,46 @@ export default function useChatLogic({ navigation, route }) {
       console.warn('[handleSendText] SQLite write failed:', err?.message);
     });
 
-    // Fire-and-forget socket send — message is already in UI via optimistic update
+    // Durable outbox (1-1 only — the REST send endpoint requires a receiverId):
+    // persist the send so it survives an app kill while offline. The OutboxWorker
+    // drains it via REST; the socket fast-path below races it and removes the row
+    // on ack, so on the happy path the worker never fires (4s grace window). The
+    // server dedupes on (chatId, clientMessageId), so a race can't duplicate.
+    if (!isGrpSend && chatData.peerUser?._id) {
+      // REST createMessage expects replyTo as an id + replyPreview as an object;
+      // the socket payload carries replyTo as an embedded object, so remap for
+      // the REST-based outbox worker. clientMessageId is the cross-transport
+      // dedupe key, so a socket+REST race can't duplicate.
+      const outboxPayload = {
+        ...payload,
+        clientMessageId: tempId,
+        ...(replyToMsgId
+          ? {
+              replyTo: replyToMsgId,
+              replyPreview: {
+                text: quotedText || '',
+                messageType: currentReply?.type || 'text',
+                senderName: resolvedReplySenderName || null,
+                senderId: currentReply?.senderId || null,
+              },
+            }
+          : {}),
+      };
+      ChatDatabase.outboxEnqueue({
+        clientMessageId: tempId,
+        chatId: chatIdRef.current,
+        payload: outboxPayload,
+        notBefore: Date.now() + 4000,
+      }).then(() => OutboxWorker.wake()).catch(() => {});
+    }
+
+    // Fire-and-forget socket send — message is already in UI via optimistic update.
+    // If the socket is down, kick a reconnect but DON'T drop the message:
+    // sendMessageViaSocket buffers it in the in-memory queue (replayed with its
+    // ack on reconnect), and the durable outbox above is the app-kill safety net.
     const socket = socketRef.current || getSocket();
     if (!socket || !isSocketConnected()) {
-      updateMessageStatus(tempId, 'failed');
       checkAndReconnectSocket();
-      return;
     }
 
     sendMessageViaSocket(payload, tempId).catch((error) => {
@@ -7927,7 +8043,7 @@ export default function useChatLogic({ navigation, route }) {
   // callback), carrying the result under `.data`. Resolves { ok, messages,
   // hasMore, oldestCursor }; ok=false on offline/timeout so the caller does NOT
   // mark the chat fully loaded on a mere network failure.
-  const requestHistoryPage = useCallback(({ chatId, beforeSeq, limit, afterClearedAt }) => {
+  const requestHistoryPage = useCallback(({ chatId, beforeSeq, limit, afterClearedAt, beforeCreatedAt }) => {
     return new Promise((resolve) => {
       const socket = getSocket();
       if (!socket || !isSocketConnected()) {
@@ -7957,6 +8073,9 @@ export default function useChatLogic({ navigation, route }) {
       socket.emit('message:history', {
         chatId,
         beforeSeq: beforeSeq || null,
+        // Legacy (pre-seq) fallback cursor: when seq paging bottoms out at the
+        // first seq'd message, the server pages older null-seq rows by createdAt.
+        beforeCreatedAt: beforeCreatedAt || null,
         limit: limit || SOCKET_FETCH_LIMIT,
         afterClearedAt: afterClearedAt || null,
       });
@@ -8005,6 +8124,9 @@ export default function useChatLogic({ navigation, route }) {
           if (newOnes.length === 0) return prev;
           const merged = [...prev, ...newOnes];
           merged.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+          // Grow the loaded-window floor so a later refreshMessagesFromDB reads
+          // the whole window and doesn't drop these older rows we just paged in.
+          loadedLimitRef.current = Math.max(loadedLimitRef.current || 0, merged.length);
           return merged;
         });
       };
@@ -8040,6 +8162,11 @@ export default function useChatLogic({ navigation, route }) {
         const resp = await requestHistoryPage({
           chatId: cid,
           beforeSeq,
+          // Once seq paging bottoms out (beforeSeq pinned at the lowest seq),
+          // the server pages legacy null-seq rows OLDER than this timestamp.
+          // `oldest` = the oldest loaded message's timestamp; it descends as
+          // legacy rows are paged in, so this cursor advances each page.
+          beforeCreatedAt: oldest || 0,
           limit: SOCKET_FETCH_LIMIT,
           afterClearedAt: clearedAt || 0,
         });
@@ -8054,12 +8181,18 @@ export default function useChatLogic({ navigation, route }) {
             seq: (m.seq != null && !Number.isNaN(Number(m.seq))) ? Number(m.seq) : null,
             synced: true,
           }));
-          // Persist NEWEST-seq FIRST so the derived oldest cursor (MIN(seq))
-          // only ever descends one chunk at a time. If the app is killed
-          // mid-page, the next backfill (seq < MIN) resumes exactly at the gap
-          // — persisting oldest-first would jump MIN to the floor and skip the
-          // un-persisted middle of the page.
-          normalized.sort((a, b) => (Number(b.seq) || 0) - (Number(a.seq) || 0));
+          // Persist NEWEST-FIRST so the oldest cursor only ever descends one
+          // chunk at a time; a kill mid-page resumes exactly at the gap (oldest-
+          // first would jump the floor past the un-persisted middle → skip).
+          // seq'd rows: by MIN(seq). Legacy (seq null) rows: by createdAt, since
+          // the legacy backfill cursor is `beforeCreatedAt` (timestamp), not seq.
+          normalized.sort((a, b) => {
+            const sa = Number(a.seq), sb = Number(b.seq);
+            const aHas = Number.isFinite(sa), bHas = Number.isFinite(sb);
+            if (aHas && bHas && sa !== sb) return sb - sa;       // both seq'd → newest seq first
+            if (aHas !== bHas) return aHas ? -1 : 1;             // seq'd before legacy (pages don't mix)
+            return (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0); // legacy → newest createdAt first
+          });
           // Persist in SHORT chunks through the existing serialized writer,
           // AWAITED, yielding a macrotask between chunks so live message/receipt
           // writers win the writer lock — never one long/bulk transaction.

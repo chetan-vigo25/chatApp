@@ -90,6 +90,27 @@ export const buildCallEngineHtml = () => `<!doctype html>
 
   video { background:#000; }
   .mirror { transform: scaleX(-1); }
+
+  /* "Camera off" placeholder shown over a tile whose camera is muted, instead of
+     a black frame (WhatsApp-style). Fills the localWrap — small in the PiP, full
+     in the solo full-screen self-view. */
+  .camoff {
+    position:absolute; inset:0; z-index:2;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:10px; background:#1f2c34;
+  }
+  .camoff-badge {
+    width:60px; height:60px; border-radius:50%;
+    background:rgba(255,255,255,0.14);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .camoff-badge svg { width:30px; height:30px; fill:rgba(255,255,255,0.9); }
+  .camoff-text { color:rgba(255,255,255,0.85); font:13px/1.2 -apple-system, Roboto, system-ui, sans-serif; }
+  /* Bigger badge/label when the self-view fills the whole stage. */
+  #localWrap.solo .camoff-badge { width:104px; height:104px; }
+  #localWrap.solo .camoff-badge svg { width:52px; height:52px; }
+  #localWrap.solo .camoff-text { font-size:16px; }
+
   .hidden { display:none !important; }
 </style>
 </head>
@@ -98,6 +119,12 @@ export const buildCallEngineHtml = () => `<!doctype html>
     <div id="remotes" class="count-1"></div>
     <div id="localWrap" class="hidden">
       <video id="local" autoplay playsinline muted class="mirror"></video>
+      <div id="localCamOff" class="camoff hidden">
+        <div class="camoff-badge">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 6.5l-4 4V7c0-.55-.45-1-1-1H9.82L21 17.18V6.5zM3.27 2L2 3.27 4.73 6H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.21 0 .39-.08.54-.18L19.73 21 21 19.73 3.27 2z"></path></svg>
+        </div>
+        <div class="camoff-text">Camera off</div>
+      </div>
     </div>
   </div>
 
@@ -108,6 +135,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
     var remotes = document.getElementById('remotes');
     var local   = document.getElementById('local');
     var localWrap = document.getElementById('localWrap');
+    var localCamOff = document.getElementById('localCamOff');
     var stage   = document.getElementById('stage');
     var swapped = false;       // tap-to-swap: true = self-camera is the full-screen feed
     var pipCorner = 'tr';      // which corner the small PiP snaps to: tl|tr|bl|br
@@ -308,6 +336,15 @@ export const buildCallEngineHtml = () => `<!doctype html>
       try {
         if (localStream && localStream.getVideoTracks) {
           (localStream.getVideoTracks() || []).forEach(function (t) { t.enabled = !!on; n += 1; });
+        }
+      } catch (e) {}
+      // Show the "Camera off" placeholder over the self-view when the camera is
+      // off, so the user sees a clear card instead of a black frame (esp. when the
+      // self-view is the full-screen solo tile before/without a remote feed).
+      try {
+        if (localCamOff) {
+          if (on) localCamOff.classList.add('hidden');
+          else localCamOff.classList.remove('hidden');
         }
       } catch (e) {}
       return n;
@@ -708,8 +745,10 @@ export const buildCallEngineHtml = () => `<!doctype html>
           case 'toggleCamera': {
             if (call) { try { call.toggleCamera(!!msg.on); } catch (e) {} }
             var camN = enableLocalCamera(!!msg.on);
-            // Hide the self-preview when the camera is off.
-            try { if (!!msg.on) localWrap.classList.remove('hidden'); else localWrap.classList.add('hidden'); } catch (e) {}
+            // Keep the self-view VISIBLE when the camera is off and show the
+            // "Camera off" placeholder over it (enableLocalCamera handles the
+            // placeholder) — instead of hiding it to a black frame.
+            try { localWrap.classList.remove('hidden'); } catch (e) {}
             logToRN('toggleCamera → ' + (!!msg.on ? 'ON' : 'OFF') + ' (videoTracks=' + camN + ')');
             break;
           }

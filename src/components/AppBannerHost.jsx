@@ -308,6 +308,17 @@ export default function WhatsAppBannerHost() {
   const enqueueBanner = useCallback(async (rawPayload) => {
     if (appStateRef.current !== 'active') return;
 
+    // Call-log entries (the in-thread "call" message the backend writes when a
+    // call ends) still fan out as a normal message:new so the call bubble renders
+    // in the thread — but they must NEVER raise a chat banner. Suppress here, the
+    // single chokepoint every banner path funnels through.
+    const msgType = rawPayload?.notificationData?.data?.messageType
+      || rawPayload?.notificationData?.data?.type
+      || rawPayload?.messageType
+      || rawPayload?.type
+      || 'text';
+    if (String(msgType).toLowerCase() === 'call') return;
+
     const dndEnabled = await shouldRespectDnd();
     if (dndEnabled) return;
 

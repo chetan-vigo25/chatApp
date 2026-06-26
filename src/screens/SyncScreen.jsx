@@ -38,12 +38,13 @@ let _initialSyncDoneFor = null;
 // Set true when the background message warm should stop (logout / user-switch).
 let _warmAbort = false;
 
-// A session reset (logout / user-switch / token-refresh failure) wipes SQLite
-// via performSessionReset, so the in-memory "already restored" memory must be
-// cleared too — otherwise a same-session re-login of the SAME user would short-
-// circuit the restore and land on an empty chat list. We also abort any in-flight
-// background message warm so it can't write the previous user's messages back
-// into a freshly-wiped DB.
+// A session reset (logout / user-switch / token-refresh failure) clears the
+// in-memory "already restored" memory so the next login re-evaluates restore
+// from scratch. NOTE: performSessionReset now only WIPES SQLite for a different
+// user or account deletion — a same-account logout PRESERVES the cache, so a
+// returning user short-circuits via the persisted INITIAL_SYNC_COMPLETE flag and
+// loads local-first (no full server refetch). We still abort any in-flight
+// background warm so it can't write a logging-out user's messages mid-reset.
 subscribeSessionReset(() => {
   _initialSyncPromise = null;
   _initialSyncDoneFor = null;
@@ -95,6 +96,13 @@ const _warmRecentMessages = (chats) => {
       const chatId = chat.chatId || chat._id;
       if (!chatId) continue;
       try {
+        // Same-account re-login keeps the cache, so a chat may already hold its
+        // recent messages locally. Skip the REST warm for those — chat-open
+        // delta sync + reconnect catchup fill any gap. Only chats with no local
+        // history (a fresh/different-user restore) are warmed from the server.
+        const existingCount = await ChatDatabase.getMessageCount(chatId);
+        if (_warmAbort) return;
+        if (existingCount > 0) continue;
         const msgResponse = await chatServices.chatMessageList({ chatId, page: 1, limit: MSG_WARM_LIMIT });
         if (_warmAbort) return;
         const messages = msgResponse?.data?.docs || [];
@@ -183,6 +191,10 @@ const _performInitialRestore = async (userId, onProgress) => {
 
   await ChatDatabase.upsertChats(normalizedChats);
   ChatCache.setChats(normalizedChats);
+
+  // Tag the freshly-populated cache with its owner so a later session reset can
+  // tell a same-account re-login (keep) from a different user (wipe).
+  await ChatDatabase.setDBOwner(userId);
 
   // ── Step 3: Mark complete + let the user in NOW. Message history is warmed
   // in the background (not awaited) and lazily on chat open. ──

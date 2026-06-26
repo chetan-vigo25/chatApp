@@ -6,15 +6,19 @@ import {
   Animated, Pressable, TouchableOpacity, AppState, Keyboard,
 } from 'react-native';
 import Constants from 'expo-constants';
-import { Audio } from 'expo-av';
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 import { useCameraPermissions } from 'expo-camera';
+import * as ScreenCapture from 'expo-screen-capture';
 import { MaterialIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../contexts/AuthContext';
 import { CallContext } from './CallContext';
 import CallEngineWebView from './engine/CallEngineWebView';
 import CallOverlay from './screens/CallOverlay';
-import IncomingCallBanner from './components/IncomingCallBanner';
+// In-app incoming-call banner temporarily disabled (OS notification handles
+// incoming calls). Re-enable this import + the <IncomingCallBanner /> render below.
+// import IncomingCallBanner from './components/IncomingCallBanner';
+import PrivacyOverlay from '../components/PrivacyOverlay';
 import CallTimer from './components/CallTimer';
 import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
@@ -40,12 +44,15 @@ import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // build (required for the ExpoCallUi CallStyle notification anyway), enabling
 // cold-start Answer replay (consumeInitialNotifeeCall) and dismissing the
 // incoming-call notification once answered/ended (cancelIncomingCallNotifee).
-import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
+import { CALL_PUSH_EVENTS, isStaleCallPush } from '../firebase/callEvents';
 import {
-  cancelAllIncomingCallNotifee, consumeInitialNotifeeCall,
+  cancelAllIncomingCallNotifee, consumeInitialNotifeeCall, displayIncomingCallNotifee,
   startOngoingCallNotification, stopOngoingCallNotification,
-  isDeviceLockedNow, returnToLockScreen, displayMissedCallNotification,
+  isDeviceLockedNow, returnToLockScreen, addDeviceLockListener,
+  setShowWhenLockedNative, displayMissedCallNotification, setCallActiveNative,
+  peekInitialCallLaunch,
 } from '../firebase/callNotifee';
+import ColdStartCallCover from './components/ColdStartCallCover';
 import { notifyIncomingCall } from './services/callNotifyService';
 
 // CallContext now lives in its own leaf module (./CallContext) to break the
@@ -80,6 +87,11 @@ const getRingTimeoutMs = () => clampRingSec(getServerRingDurationSec() || ENV_RI
 // on "Connecting…" forever. 30s ≈ WhatsApp's "couldn't connect" window.
 const CONNECT_TIMEOUT_MS = 30000;
 
+// When a call ends with a reason the user needs to READ (busy / unavailable /
+// blocked-by-admin / declined / failed), keep the end screen up at least this
+// long before auto-returning to chat. A plain hang-up resets fast.
+const END_MESSAGE_LINGER_MS = 3000;
+
 // AsyncStorage key recording that the user has granted call media permission
 // (value = highest level granted: 'audio' or 'video'). The OS is the real source
 // of truth (we always confirm via getPermissionsAsync), but this persists the
@@ -93,6 +105,28 @@ const PIP_H = 170;
 const deriveChatId = (a, b) => {
   if (!a || !b) return null;
   return `u_${[String(a), String(b)].sort().join('_')}`;
+};
+
+// Contact-block relation for a 1:1 peer, read straight off the Redux block slice
+// (same source the composer guard uses). Required so a call can't be placed when
+// either side blocked the other — the backend ring gate is the authority, this is
+// the matching client-side gate so the UI never even rings.
+//   iBlocked  — I blocked this peer
+//   blockedMe — this peer blocked me
+export const getBlockRelation = (peerId) => {
+  try {
+    if (!peerId) return { iBlocked: false, blockedMe: false };
+    const mod = require('../Redux/Store');
+    const store = mod.store || mod.default || mod;
+    const st = store?.getState?.() || {};
+    const id = String(peerId);
+    return {
+      iBlocked: (st?.block?.blockedIds || []).map(String).includes(id),
+      blockedMe: (st?.block?.blockedByIds || []).map(String).includes(id),
+    };
+  } catch (e) {
+    return { iBlocked: false, blockedMe: false };
+  }
 };
 
 export const CallProvider = ({ children }) => {
@@ -141,7 +175,25 @@ export const CallProvider = ({ children }) => {
   const [lockedCall, setLockedCall] = useState(false);
   // Opaque privacy overlay shown when the app is backgrounded/locked with no call,
   // so chat content is never visible over the lock screen / in the app switcher.
-  const [privacyMask, setPrivacyMask] = useState(false);
+  // Initialize SYNCHRONOUSLY from the live keyguard state: a terminated app
+  // cold-started OVER the lock screen (the full-screen-intent launch targets the
+  // single MainActivity, which carries showWhenLocked) would otherwise paint
+  // ChatList for the frames before the lock effect runs. Fail CLOSED — cover from
+  // the first render whenever the device is locked. No-op (false) on iOS / when the
+  // native module isn't present, so a normal unlocked launch never flashes it.
+  const [privacyMask, setPrivacyMask] = useState(
+    () => Platform.OS === 'android' && isDeviceLockedNow(),
+  );
+
+  // Instant cold-start call cover. Read the launch intent SYNCHRONOUSLY at the very
+  // first render (non-consuming native peek) so that when the app was cold-started
+  // by a call full-screen intent we paint the full-screen incoming-call cover from
+  // frame 1 — before Splash/ChatList can flash. The real interactive CallOverlay
+  // (driven by the auth-gated consumeInitialNotifeeCall replay) replaces it the
+  // moment the live call state mounts; see the effect below that clears it.
+  const [coldStartCall, setColdStartCall] = useState(
+    () => (Platform.OS === 'android' ? peekInitialCallLaunch() : null),
+  );
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
@@ -257,6 +309,10 @@ export const CallProvider = ({ children }) => {
         playsInSilentModeIOS: true,
         staysActiveInBackground: true,
         shouldDuckAndroid: false,
+        // DoNotMix = a phone/other VoIP call cleanly INTERRUPTS our call (instead
+        // of mixing into silence), so the OS hands audio back when it ends and our
+        // foreground recovery can resume cleanly.
+        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
         playThroughEarpieceAndroid: !speakerOn,
       });
       if (__DEV__) console.log('[CALL][APP][audio] speaker route →', speakerOn ? 'LOUDSPEAKER' : 'earpiece');
@@ -282,6 +338,10 @@ export const CallProvider = ({ children }) => {
         playsInSilentModeIOS: true,
         staysActiveInBackground: true,
         shouldDuckAndroid: false,
+        // DoNotMix = our call owns the audio session; a phone call interrupts it
+        // and, when the interruption ends, the OS posts the "resume" so our
+        // foreground recovery can re-activate the session and play audio again.
+        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
       });
       if (__DEV__) console.log('[CALL][APP][audio] iOS AVAudioSession → play+record, silent-mode play ON');
     } catch (e) {
@@ -346,20 +406,85 @@ export const CallProvider = ({ children }) => {
 
   // ---- device-lock content protection (privacy mask) ----
   // MainActivity carries android:showWhenLocked (so a call can show over the
-  // keyguard). That also lets normal CONTENT draw over the lock screen. Rather than
-  // toggle showWhenLocked (unreliable for a backgrounded app — currentActivity is
-  // null, so the call could never re-arm it), we MASK content with an opaque
-  // overlay whenever the app is not foreground and there is no call in progress.
-  // No-op on iOS (the OS already hides a locked app).
+  // keyguard). That also lets normal CONTENT draw over the lock screen — AND it
+  // means waking a locked device RESUMES the app, so AppState reports 'active'
+  // while the keyguard is still up. AppState alone therefore can't tell us the
+  // device is locked. We combine two signals:
+  //   • AppState !== 'active'  → app-switcher / background / lock transition
+  //   • native keyguard locked → woken-over-the-lock-screen (showWhenLocked) case
+  // and MASK content whenever either is true and no call is in progress. Toggling
+  // showWhenLocked itself is unreliable (currentActivity is null for a
+  // backgrounded app), which is why we mask instead. No keyguard signal on iOS —
+  // there AppState is sufficient (the OS hides a locked app + the native overlay).
+  const maskAppStateRef = useRef(AppState.currentState);
+  const deviceLockedRef = useRef(false);
+  const recomputePrivacyMask = useCallback(() => {
+    const inCall = stateRef.current.status !== CALL_STATUS.IDLE;
+    const hidden = maskAppStateRef.current !== 'active' || deviceLockedRef.current;
+    setPrivacyMask(hidden && !inCall);
+
+    // Android FLAG_SECURE, scoped to "not safely foregrounded". preventScreenCapture
+    // sets FLAG_SECURE on the window, which blanks the recents/lock-screen preview
+    // thumbnail AND blocks screenshots. Armed whenever we're backgrounded OR the
+    // keyguard is up (so the OS snapshot is already secured) and released only when
+    // foregrounded AND unlocked — that keeps the in-foreground screenshot-detection
+    // feature (`chat:screenshot`) working, since FLAG_SECURE would otherwise
+    // suppress the screenshot it listens for. Dedicated key so it never clashes
+    // with any other capture-prevention. No-op on iOS (no FLAG_SECURE there).
+    if (Platform.OS === 'android') {
+      if (hidden) {
+        ScreenCapture.preventScreenCaptureAsync('privacy-lock').catch(() => {});
+      } else {
+        ScreenCapture.allowScreenCaptureAsync('privacy-lock').catch(() => {});
+      }
+    }
+  }, []);
+
   useEffect(() => {
     const onAppStateChange = (next) => {
-      const inCall = stateRef.current.status !== CALL_STATUS.IDLE;
-      setPrivacyMask(next !== 'active' && !inCall);
+      maskAppStateRef.current = next;
+      recomputePrivacyMask();
     };
+    // Native keyguard lock/unlock (Android) — the only signal that survives the
+    // showWhenLocked "app resumes over the lock screen" case.
+    const unsubLock = addDeviceLockListener((locked) => {
+      deviceLockedRef.current = locked;
+      recomputePrivacyMask();
+    });
+    deviceLockedRef.current = isDeviceLockedNow();
     onAppStateChange(AppState.currentState);
     const sub = AppState.addEventListener('change', onAppStateChange);
-    return () => sub.remove();
-  }, []);
+    return () => { sub.remove(); unsubLock(); };
+  }, [recomputePrivacyMask]);
+
+  // Re-evaluate when a call starts/ends — covers a call ending while the screen
+  // is off/locked, so the mask reasserts the instant it returns to idle.
+  useEffect(() => { recomputePrivacyMask(); }, [state.status, recomputePrivacyMask]);
+
+  // Dismiss the instant cold-start cover once the real call UI takes over (status
+  // left IDLE), or after a safety window if the replay never produced a call (e.g.
+  // the caller already cancelled / a stale launch) — so the cover can never stick.
+  useEffect(() => {
+    if (!coldStartCall) return undefined;
+    if (state.status !== CALL_STATUS.IDLE) { setColdStartCall(null); return undefined; }
+    const t = setTimeout(() => setColdStartCall(null), 12000);
+    return () => clearTimeout(t);
+  }, [coldStartCall, state.status]);
+
+  // Show-over-the-keyguard ONLY during a call. Idle → off, so locking the phone
+  // drops the app behind the keyguard and the user sees the system lock screen
+  // (never the app or any overlay over it). A call → on, so the incoming/ongoing
+  // call UI can legitimately appear over the lock screen (LK6). Cold-start calls
+  // are unaffected — the manifest flag still applies before JS runs.
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const inCall = state.status !== CALL_STATUS.IDLE;
+    setShowWhenLockedNative(inCall);
+    // Keep the native keyguard backstop in sync: while a call is active the app may
+    // legitimately show over the lock screen; idle → any over-keyguard foreground is
+    // bounced behind it (see ExpoCallUiModule OnActivityEntersForeground).
+    setCallActiveNative(inCall);
+  }, [state.status]);
 
   // ---- ring timeout (auto-end an unanswered call after the configured window) ----
   const clearRingTimeout = useCallback(() => {
@@ -507,6 +632,9 @@ export const CallProvider = ({ children }) => {
   const finalizeEnd = useCallback((reason, message) => {
     if (endedRef.current) return;
     endedRef.current = true;
+    // Defensive: a pending "answer on next INCOMING" must never survive a call —
+    // a leaked flag would auto-accept the NEXT incoming call without a tap.
+    pushAcceptPendingRef.current = false;
     clearRingTimeout();
     clearMediaWatchdog();
     clearConnectWatchdog();
@@ -532,14 +660,14 @@ export const CallProvider = ({ children }) => {
     // Tear down the active-call ongoing foreground service / notification (Android).
     stopOngoingCallNotification();
 
-    // WhatsApp-style "Missed call" tray notification. Only for an INCOMING call
-    // that was never answered (ring timeout, or the caller cancelled before we
-    // picked up). The dismissed ringing notification above leaves nothing behind,
-    // so without this the missed call would be invisible in the tray. De-duped by
-    // call id inside displayMissedCallNotification, so a backend `call-missed` push
-    // for the same call won't double-post. Skipped if the call was answered.
+    // WhatsApp-style "Missed call" tray notification. Only for an INCOMING call that
+    // was never answered (ring timeout, or the caller cancelled before we picked
+    // up). The dismissed ringing notification above leaves nothing behind, so without
+    // this the missed call would be invisible in the tray. De-duped by call id inside
+    // displayMissedCallNotification, so a backend `call-missed` push for the same call
+    // won't double-post. Skipped if the call was answered.
     if (outcome === 'missed' && snap.direction === 'incoming' && !snap.answeredAt && snap.peer?.id) {
-      const isGroup = !!snap.isGroup;
+      const isGroupMiss = !!snap.isGroup;
       displayMissedCallNotification({
         callId: snap.signalId || snap.callId,
         callerId: snap.peer.id,
@@ -547,10 +675,10 @@ export const CallProvider = ({ children }) => {
         callerImage: snap.peer.avatar,
         callType: snap.media === 'video' ? 'video' : 'audio',
         media: snap.media,
-        chatId: isGroup ? (snap.groupId || null) : (snap.chatId || deriveChatId(myId, snap.peer.id)),
+        chatId: isGroupMiss ? (snap.groupId || null) : (snap.chatId || deriveChatId(myId, snap.peer.id)),
         senderId: snap.peer.id,
         senderName: snap.peer.name,
-        isGroup,
+        isGroup: isGroupMiss,
         groupId: snap.groupId || null,
         groupName: snap.groupName || null,
       });
@@ -575,10 +703,16 @@ export const CallProvider = ({ children }) => {
 
     // persist (best-effort, never blocks UX)
     if (snap.peer?.id) {
-      // An outgoing call cancelled during "Calling…" (before the engine returns
-      // a callId) still deserves a log row — synthesize a stable local id so it
-      // records and de-dupes correctly. Incoming calls always carry a callId.
-      const callId = snap.callId || `local_${snap.direction || 'out'}_${snap.startedAt || Date.now()}`;
+      // Use the SIGNALING id as the canonical call-log id — it's shared by BOTH
+      // parties and is the id the backend keys every call write on (ring / accept /
+      // end / missed / in-thread message). The engine's WebRTC `callId` is a
+      // DIFFERENT id, so logging with it made the callee's optimistic row (WebRTC
+      // id) and the backend's missed/fanned-out row (signaling id) carry different
+      // ids → the SAME call showed as TWO entries until a refresh re-merged it
+      // ("kabhi ek entry kabhi separate"). Fall back to the engine id, then a
+      // synthesized local id for an outgoing call cancelled before any id exists.
+      const callId = snap.signalId || snap.callId
+        || `local_${snap.direction || 'out'}_${snap.startedAt || Date.now()}`;
       const durationSec = snap.answeredAt ? Math.max(0, Math.round((Date.now() - snap.answeredAt) / 1000)) : 0;
       const isGroup = !!snap.isGroup;
       const participantIds = (snap.peers || []).map((p) => p.id).filter(Boolean);
@@ -639,9 +773,15 @@ export const CallProvider = ({ children }) => {
       });
     }
 
-    // Return to chat quickly after the brief end state. Kept short so that a call
-    // answered over the lock screen drops straight back to the chat list on
-    // hang-up instead of lingering on the "Call ended" / lock screen.
+    // How long to hold the end screen before auto-returning to chat. A completed
+    // conversation or a self-cancelled ring drops back fast (so a call answered
+    // over the lock screen returns straight to the chat list). But an outcome the
+    // user needs to READ — declined / missed / busy / unavailable / blocked /
+    // failed, or any end carrying an explicit message — lingers ≥3s so the
+    // message on the call screen is actually readable.
+    const needsRead = !!message
+      || ['rejected', 'missed', 'busy', 'failed'].includes(outcome);
+    const resetDelay = needsRead ? END_MESSAGE_LINGER_MS : 500;
     if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
     resetTimerRef.current = setTimeout(() => {
       endedRef.current = false;
@@ -654,7 +794,7 @@ export const CallProvider = ({ children }) => {
         setLockedCall(false);
       }
       dispatch({ type: ACT.RESET });
-    }, 500);
+    }, resetDelay);
   }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, resetAudioRoute]);
 
   // Arm the unanswered-call timeout. Fires once after the configured ring window
@@ -849,7 +989,11 @@ export const CallProvider = ({ children }) => {
         // Reflect that on the button so its on/off state is always the REAL route
         // — incl. the initial loudspeaker default for video/group calls, and a
         // failed earpiece switch that fell back to the speaker.
-        const supported = payload?.supported !== false;
+        // On Android the speaker toggle routes at the OS level via applyAudioRoute
+        // (expo-av), so it ALWAYS works regardless of the WebRTC engine's setSinkId
+        // support — never let a 'speakerResult: unsupported' disable the button
+        // there (that's also why toggleSpeaker skips CMD.SET_SPEAKER on Android).
+        const supported = Platform.OS === 'android' ? true : (payload?.supported !== false);
         setAudioRouteSupported(supported);
         if (typeof payload?.speaker === 'boolean') {
           dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: payload.speaker });
@@ -862,6 +1006,13 @@ export const CallProvider = ({ children }) => {
         // track (caller at ring, callee after accept). Cancel the hung-media watchdog.
         if (__DEV__) console.log('[CALL] localstream acquired ✓ — mic enabled:', payload?.mic !== false, '(direction:', stateRef.current.direction, ')');
         clearMediaWatchdog();
+        // The engine FORCE-ENABLES the mic on capture. If the user had already
+        // muted (e.g. tapped Mute during "Connecting…"), re-apply it so the actual
+        // mic track matches the button — otherwise they look muted but are still
+        // transmitting audio.
+        if (stateRef.current.micOn === false) {
+          sendCmd({ cmd: CMD.TOGGLE_MIC, on: false });
+        }
         break;
       }
       case 'camerachanged': {
@@ -964,6 +1115,22 @@ export const CallProvider = ({ children }) => {
     // Cap the group size (including self).
     const peers = list.slice(0, MAX_PARTICIPANTS - 1);
     const isGroup = peers.length > 1;
+
+    // Contact-block gate (1:1 only): never ring when either side blocked the other.
+    // Group calls let the backend silently drop blocked members. This mirrors the
+    // chat composer guard and backs the disabled call buttons in the UI.
+    if (!isGroup && peers[0]?.id) {
+      const blk = getBlockRelation(peers[0].id);
+      if (blk.iBlocked) {
+        Alert.alert('You blocked this contact', 'Unblock them to start a call.');
+        return;
+      }
+      if (blk.blockedMe) {
+        Alert.alert('Call unavailable', "You can't call this contact.");
+        return;
+      }
+    }
+
     if (stateRef.current.status !== CALL_STATUS.IDLE && stateRef.current.status !== CALL_STATUS.ENDED) {
       if (__DEV__) console.log('[CALL][APP][startCall] ABORT — already in a call', { status: stateRef.current.status });
       return;
@@ -1037,7 +1204,7 @@ export const CallProvider = ({ children }) => {
         message: isGroup ? 'Everyone is busy on another call' : 'User is busy on another call',
       });
       if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
-      resetTimerRef.current = setTimeout(() => { endedRef.current = false; dispatch({ type: ACT.RESET }); }, 1800);
+      resetTimerRef.current = setTimeout(() => { endedRef.current = false; dispatch({ type: ACT.RESET }); }, END_MESSAGE_LINGER_MS);
       return;
     }
 
@@ -1059,7 +1226,7 @@ export const CallProvider = ({ children }) => {
         message: ack.unavailableMessage || (isGroup ? 'No one could be reached.' : 'User is unavailable right now.'),
       });
       if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
-      resetTimerRef.current = setTimeout(() => { endedRef.current = false; dispatch({ type: ACT.RESET }); }, 2200);
+      resetTimerRef.current = setTimeout(() => { endedRef.current = false; dispatch({ type: ACT.RESET }); }, END_MESSAGE_LINGER_MS);
       return;
     }
 
@@ -1206,9 +1373,14 @@ export const CallProvider = ({ children }) => {
     // Always flip the button state immediately so it's a reliable toggle.
     dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: next });
     if (Platform.OS === 'android') {
-      // Real OS-level routing; do NOT send CMD.SET_SPEAKER (its setSinkId can
-      // report "unsupported" and wrongly disable the button).
+      // Android needs BOTH: applyAudioRoute sets the OS audio mode (loudspeaker vs
+      // earpiece / device-volume), and CMD.SET_SPEAKER makes the engine setSinkId
+      // re-route the WebView's WebRTC <audio> element — which actually carries the
+      // call audio, so expo-av alone often left the sound on the loudspeaker
+      // regardless of the toggle. A 'speakerResult: unsupported' no longer disables
+      // the button (audioRouteSupported is forced true on Android), so it's safe.
       applyAudioRoute(next);
+      sendCmd({ cmd: CMD.SET_SPEAKER, on: next });
     } else {
       // iOS/desktop: best-effort via the engine's setSinkId.
       sendCmd({ cmd: CMD.SET_SPEAKER, on: next });
@@ -1219,6 +1391,35 @@ export const CallProvider = ({ children }) => {
     dispatch({ type: ACT.NEEDS_UNMUTE, value: false });
     sendCmd({ cmd: CMD.RESUME_AUDIO });
   }, [sendCmd]);
+
+  // ---- audio-interruption recovery (WhatsApp parity) ----
+  // A phone / WhatsApp / other VoIP call grabs the OS audio focus mid-call, so the
+  // OS mutes our WebRTC audio and may release the mic — UNAVOIDABLE while that
+  // other call holds the mic/speaker hardware. Our call itself stays CONNECTED
+  // (the engine WebView lives on at the app root). When the user returns to our app
+  // (the interruption is over → AppState flips back to 'active'), re-arm the audio
+  // session + route, resume remote playback, and re-assert the mic so the call's
+  // sound comes back on its own instead of staying silent. Self-gates: only acts
+  // during an answered (active) call. Placed AFTER resumeAudio so all the audio
+  // helpers are initialised (an earlier effect can't reference them — TDZ on deps).
+  useEffect(() => {
+    const onChange = (next) => {
+      if (next !== 'active') return;
+      const s = stateRef.current;
+      if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
+      (async () => {
+        try {
+          if (Platform.OS === 'ios') await configureIOSAudioSession();
+          else if (audioRouteAppliedRef.current) await applyAudioRoute(s.speakerOn);
+        } catch (_) { /* best-effort */ }
+        resumeAudio();
+        // Re-assert the mic: an interruption can leave the local track disabled.
+        sendCmd({ cmd: CMD.TOGGLE_MIC, on: s.micOn !== false });
+      })();
+    };
+    const sub = AppState.addEventListener('change', onChange);
+    return () => { try { sub.remove(); } catch (_) { /* */ } };
+  }, [configureIOSAudioSession, applyAudioRoute, resumeAudio, sendCmd]);
 
   // ---- minimize / maximize (WhatsApp-style floating call window) ----
   // Shrink the call to a draggable floating window so the rest of the app stays
@@ -1283,6 +1484,30 @@ export const CallProvider = ({ children }) => {
       .map((id) => ({ id, name: 'Member', avatar: null }));
     const isGroup = !!payload?.isGroup || others.length >= 1;
     const roster = isGroup ? [peer, ...others] : [peer];
+    // Foreground incoming call → present ONLY the OS push notification (CallStyle
+    // with Accept/Decline), NOT the in-app banner/ring screen (product choice;
+    // call case only). We STILL enter INCOMING state (flagged notificationOnly) so
+    // the full lifecycle works: Accept/Decline on the notification answer/reject
+    // it, and a cancel/timeout dismisses it. `opts.fromAccept` (user already tapped
+    // Accept) forces the normal in-app connect path.
+    // Present incoming calls via the OS notification (the in-app banner is
+    // disabled). notification-only in EVERY state — foreground AND backgrounded —
+    // so a backgrounded callee (whose live socket made the server skip the wake
+    // push) still gets a real-time CallStyle notification from this socket path
+    // instead of nothing. The ONE exception is a call that woke a LOCKED device
+    // (AppState 'active' while the keyguard is up): that keeps the full-screen
+    // CallOverlay over the lock screen. `fromAccept` also forces the full path.
+    // A FULL-SCREEN-INTENT launch (a killed/locked device woken by the call, i.e.
+    // the OS launched the app specifically to ring) must ALWAYS show the full-screen
+    // CallOverlay — never notification-only. At cold-start neither AppState (often
+    // 'inactive'/'background' for the first ticks) nor isDeviceLockedNow() can be
+    // trusted to read 'active'+locked in time, so relying on them dropped the call to
+    // notification-only and the app showed ChatList instead of the call (the
+    // regression vs the old code, which had no notification-only path). The
+    // _fullScreen marker on the push/notification action is the reliable signal.
+    const fullScreenLaunch = !!opts.fullScreen;
+    const notificationOnly = !opts.fromAccept && !fullScreenLaunch
+      && !(AppState.currentState === 'active' && isDeviceLockedNow());
     dispatch({
       type: ACT.INCOMING,
       callId: null,                       // WebRTC id arrives via the engine
@@ -1296,12 +1521,33 @@ export const CallProvider = ({ children }) => {
       media: payload?.media || 'audio',
       chatId: isGroup ? null : deriveChatId(myId, callerId),
       nowMs: Date.now(),
+      notificationOnly,
     });
+    if (notificationOnly) {
+      // Show / refresh the OS notification (the native FCM service usually posted
+      // it already; this covers a socket-first race). Both key the notification on
+      // callId.hashCode(), so this is a refresh — never a duplicate. No in-app
+      // ringtone: the call notification channel rings. Engine is warmed so a quick
+      // Accept connects fast; the ring timeout still auto-misses if unanswered.
+      displayIncomingCallNotifee({
+        callId: payload?.callId,
+        callerId,
+        callerName: isGroup ? (payload?.groupName || 'Group call') : (peer?.name || 'Unknown'),
+        callerImage: peer?.avatar || null,
+        callType: payload?.media || 'audio',
+      });
+      armRingTimeout();
+      ensureConnected();
+      return;
+    }
     startRinging('incoming');
     armRingTimeout();
     // Record whether the device was locked when this call arrived → back/end will
-    // return to the lock screen instead of exposing the app.
-    const locked = isDeviceLockedNow();
+    // return to the lock screen instead of exposing the app. Use BOTH the live
+    // keyguard check AND the native lock-receiver value (deviceLockedRef, driven by
+    // SCREEN_OFF/USER_PRESENT) so a cold-start where one signal isn't ready yet still
+    // treats a locked-screen call as locked — preventing navigation off the call.
+    const locked = isDeviceLockedNow() || deviceLockedRef.current;
     lockedCallRef.current = locked;
     setLockedCall(locked);
     ensureConnected(); // wake the WebRTC engine so its `incoming` can land
@@ -1433,21 +1679,49 @@ export const CallProvider = ({ children }) => {
 
   const onPushIncoming = useCallback((data) => {
     if (!data?.callerId) return;
+    // Drop a buffered/late-flushed call push. Doze / a force-stopped OEM can hold
+    // the high-priority push and then deliver a BURST when the app is reopened —
+    // which rang every long-over call at once. `data.ts` (backend sent-at) lets us
+    // suppress anything older than the ring window so only a genuinely live call
+    // rings. (The FCM bg handler drops these before display too; this guards the
+    // foreground / cold-launch / notification-tap emit paths.)
+    if (isStaleCallPush(data)) return;
     // A push-driven ring means the app wasn't foreground (or it's a full-screen
     // intent launch) → bring up the full-screen incoming screen.
     const expand = !!data?._fullScreen || AppState.currentState !== 'active';
     // A VoIP push (iOS) is already reported to CallKit by the AppDelegate; don't
     // report it a second time from JS.
-    onSignalIncoming(mapPushToIncoming(data), { expand, skipNativeUi: !!data?._voip });
+    // `fullScreen` forces the full-screen CallOverlay (never notification-only) for a
+    // notification/full-screen-intent launch — the killed/locked wake case the user
+    // expects to ring full-screen over the lock screen.
+    onSignalIncoming(mapPushToIncoming(data), {
+      expand,
+      fullScreen: !!data?._fullScreen,
+      skipNativeUi: !!data?._voip,
+    });
   }, [onSignalIncoming, mapPushToIncoming]);
 
   // Accept tapped on the notification (or a plain tap): make sure the ringing
   // state exists (cold start from a killed app), then answer once it commits.
   const onPushAccept = useCallback((data) => {
     if (!data?.callerId) return;
-    onSignalIncoming(mapPushToIncoming(data), { expand: true });
+    const snap = stateRef.current;
+    // Already ringing this call (e.g. a foreground notification-only call whose
+    // INCOMING state was built on ARRIVAL) → answer NOW. The pending-accept effect
+    // below only re-runs when status/accepted CHANGE, and here status is already
+    // INCOMING, so it would never fire — leaving the first call un-answered AND a
+    // stale pendingAccept flag that auto-accepted the NEXT call. Accept directly
+    // instead and never arm the flag.
+    if (snap.status === CALL_STATUS.INCOMING && !snap.accepted) {
+      accept();
+      return;
+    }
+    // Cold start / killed: build the ringing state first, then the pending-accept
+    // effect fires accept() the moment status flips to INCOMING. fromAccept forces
+    // the full in-app connect path (not the notification-only path).
+    onSignalIncoming(mapPushToIncoming(data), { expand: true, fromAccept: true });
     pushAcceptPendingRef.current = true;
-  }, [onSignalIncoming, mapPushToIncoming]);
+  }, [accept, onSignalIncoming, mapPushToIncoming]);
 
   // Decline from the notification: reject if we're ringing, else tell the caller
   // over the app socket directly (best-effort — needs the socket connected).
@@ -1508,12 +1782,15 @@ export const CallProvider = ({ children }) => {
   // the app is active).
   useEffect(() => {
     if (state.status !== CALL_STATUS.INCOMING) return undefined;
+    // notificationOnly (foreground call) deliberately shows ONLY the OS
+    // notification, so do NOT dismiss it here — that's the whole UI for this call.
+    if (state.notificationOnly) return undefined;
     if (AppState.currentState === 'active') cancelAllIncomingCallNotifee();
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') cancelAllIncomingCallNotifee();
     });
     return () => { try { sub.remove(); } catch (_) { /* */ } };
-  }, [state.status]);
+  }, [state.status, state.notificationOnly]);
 
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = { accept, reject, hangup, toggleMic };
@@ -1646,18 +1923,26 @@ export const CallProvider = ({ children }) => {
         </Animated.View>
       )}
       <CallOverlay />
-      <IncomingCallBanner />
-      {privacyMask && state.status === CALL_STATUS.IDLE && Platform.OS === 'android' ? (
-        // Opaque mask over all content when the app is backgrounded/locked with no
-        // call — hides chats over the keyguard + in the recents preview. Never shown
-        // while a call is in progress, so the call UI over the lock screen is visible.
-        <View
-          pointerEvents="auto"
-          style={{
-            position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
-            backgroundColor: '#0B141A', zIndex: 99999, elevation: 99999,
-          }}
-        />
+      {/* In-app incoming-call banner temporarily DISABLED — incoming calls are
+          surfaced via the OS push/CallStyle notification instead. Re-enable by
+          uncommenting when the in-app banner is wanted again. */}
+      {/* <IncomingCallBanner /> */}
+      {privacyMask && state.status === CALL_STATUS.IDLE ? (
+        // Opaque, branded overlay over ALL content whenever the app is not in the
+        // foreground and no call is in progress — hides chats during the lock
+        // transition, over the keyguard (Android MainActivity has showWhenLocked),
+        // and in the OS app-switcher / recents snapshot. Cross-platform on purpose:
+        // iOS has no FLAG_SECURE, so this overlay is the snapshot protection there.
+        // Suppressed while a call is in progress so the call UI may legitimately
+        // show over the lock screen (LK6).
+        <PrivacyOverlay />
+      ) : null}
+      {/* Instant cold-start call cover — painted from frame 1 on a killed/locked
+          call launch so the user sees the incoming call immediately, never the
+          Splash/ChatList boot. Replaced by the real CallOverlay once the live call
+          state mounts (status leaves IDLE). */}
+      {coldStartCall && state.status === CALL_STATUS.IDLE ? (
+        <ColdStartCallCover call={coldStartCall} />
       ) : null}
     </CallContext.Provider>
   );

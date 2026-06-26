@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import {
   View,
   Text,
@@ -193,6 +193,69 @@ const isSameContactMap = (a, b) => {
   return true;
 };
 
+// Memoized chat-row wrapper. The FlatList renderItem previously inlined the row,
+// minting fresh onPress/onLongPress/onAvatarPress closures (and getter props) for
+// EVERY row on EVERY parent render (presence/typing/status/list ticks), which
+// defeated memo(ChatCard) → the whole visible list re-rendered each tick ("slow
+// to update" warning, jank, OOM crash on large lists). This component is memo'd on
+// stable props (item ref, theme, booleans, stable callbacks/getters), so only rows
+// whose own data actually changed re-render. The per-row closures are built HERE,
+// inside a component that re-renders only when its props change — not in the parent.
+const ChatListRow = memo(function ChatListRow({
+  item,
+  theme,
+  isSelected,
+  statusInfo,
+  selectionMode,
+  onOpen,
+  onToggleSelect,
+  onEnterSelection,
+  onOpenStatusViewer,
+  onOpenProfile,
+  getUserColor,
+  getPreviewText,
+  getRelativeTime,
+  getLastMessageText,
+  renderMessageStatus,
+}) {
+  const itemChatId = item?.chatId || item?._id;
+  return (
+    <View>
+      <ChatCard
+        item={item}
+        theme={theme}
+        isSelected={isSelected}
+        statusInfo={statusInfo}
+        onPress={() => {
+          if (selectionMode) onToggleSelect(itemChatId);
+          else onOpen(item);
+        }}
+        onLongPress={() => {
+          if (selectionMode) onToggleSelect(itemChatId);
+          else onEnterSelection(itemChatId);
+        }}
+        onAvatarPress={() => {
+          if (selectionMode) onToggleSelect(itemChatId);
+          else if (statusInfo && statusInfo.count > 0) onOpenStatusViewer(statusInfo.group);
+          else onOpenProfile(item);
+        }}
+        getUserColor={getUserColor}
+        getPreviewText={getPreviewText}
+        getRelativeTime={getRelativeTime}
+        getLastMessageText={getLastMessageText}
+        renderMessageStatus={renderMessageStatus}
+      />
+      {isSelected && (
+        <View style={styles.selectionCheckOverlay} pointerEvents="none">
+          <View style={[styles.selectionCheckCircle, { backgroundColor: theme.colors.themeColor }]}>
+            <Ionicons name="checkmark" size={14} color="#fff" />
+          </View>
+        </View>
+      )}
+    </View>
+  );
+});
+
 export default function ChatList({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -209,7 +272,10 @@ export default function ChatList({ navigation }) {
   const [visible, setVisible] = useState(false);
   const [menuKey, setMenuKey] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
-  const [, setTimeTick] = useState(0);
+  // timeTick drives the 30s relative-time refresh. With memoized rows it must be
+  // threaded into renderItem so visible rows re-render and recompute "Today" /
+  // "Yesterday" etc. (only the ~10-15 mounted rows re-render — negligible).
+  const [timeTick, setTimeTick] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState('all');
   const [actionSheetVisible, setActionSheetVisible] = useState(false);
@@ -334,7 +400,7 @@ export default function ChatList({ navigation }) {
     [effectiveChatList, currentUserId, contactMap]
   );
 
-  const getLastMessageText = (item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || item?.lastMessage?.text || 'No messages yet';
+  const getLastMessageText = useCallback((item) => item?.lastMessageDisplay?.fullText || item?.lastMessageDisplay?.text || item?.lastMessage?.text || 'No messages yet', []);
 
   // LayoutAnimation disabled — causes frame drops on low-end Android devices
 
@@ -494,13 +560,13 @@ export default function ChatList({ navigation }) {
 
   const clearSearch = () => setSearchQuery('');
 
-  const getPreviewText = (text, maxLength = 20) => {
+  const getPreviewText = useCallback((text, maxLength = 20) => {
     if (!text) return '';
     if (text.length <= maxLength) return text;
     return `${text.substring(0, maxLength)}... `;
-  };
+  }, []);
 
-  const getRelativeTime = (value) => {
+  const getRelativeTime = useCallback((value) => {
     const ts = value ? new Date(value).getTime() : 0;
     if (!ts) return '';
     const msgDate = new Date(ts);
@@ -519,28 +585,18 @@ export default function ChatList({ navigation }) {
     if (ts >= yesterdayStart) return 'Yesterday';
     if (ts >= weekAgoStart) return msgDate.toLocaleDateString(undefined, { weekday: 'long' });
     return `${String(msgDate.getDate()).padStart(2, '0')}/${String(msgDate.getMonth() + 1).padStart(2, '0')}/${String(msgDate.getFullYear()).slice(-2)}`;
-  };
+  }, []);
 
-  const getLastMessageStatus = (item) => (
-    item?.lastMessageStatus || item?.lastMessage?.status || item?.status || null
-  );
-
-  // Last message is "mine" only when current user sent it. Receiver side: hide ticks.
-  const isLastMessageMine = (item) => {
-    if (!currentUserId) return false;
+  const renderMessageStatus = useCallback((item) => {
+    // Hide ticks on chat summary when the last message is incoming (receiver side).
     const senderId = item?.lastMessage?.senderId
-      || item?.lastMessageSender         // backend ships this as a sibling field
+      || item?.lastMessageSender
       || item?.lastMessageSenderId
       || item?.lastMessage?.createdBy
       || item?.lastSenderId;
-    if (!senderId) return false;
-    return String(senderId) === currentUserId;
-  };
-
-  const renderMessageStatus = (item) => {
-    // Hide ticks on chat summary when the last message is incoming (receiver side).
-    if (!isLastMessageMine(item)) return null;
-    const status = (getLastMessageStatus(item) || '').toLowerCase();
+    const isMine = currentUserId && senderId && String(senderId) === currentUserId;
+    if (!isMine) return null;
+    const status = String(item?.lastMessageStatus || item?.lastMessage?.status || item?.status || '').toLowerCase();
     if (!status) return null;
     const grayColor = theme.colors.placeHolderTextColor;
     if (status === 'read' || status === 'seen') {
@@ -556,9 +612,9 @@ export default function ChatList({ navigation }) {
       return <Ionicons name="alert-circle" size={14} color="#FF8A80" style={{ marginRight: 4 }} />;
     }
     return null;
-  };
+  }, [theme, currentUserId]);
 
-  const getUserColor = (str) => {
+  const getUserColor = useCallback((str) => {
     const colors = ['#833AB4', '#1DB954', '#128C7E', '#075E54', '#777737', '#F56040', '#34B7F1', '#25D366'];
     if (!str) return colors[0];
     let hash = 0;
@@ -566,7 +622,7 @@ export default function ChatList({ navigation }) {
       hash = str.charCodeAt(i) + ((hash << 5) - hash);
     }
     return colors[Math.abs(hash) % colors.length];
-  };
+  }, []);
 
   // ─── ACTION SHEET (animated) ───
 
@@ -639,6 +695,43 @@ export default function ChatList({ navigation }) {
     setProfilePreviewVisible(false);
     // Don't clear selectedChatItem here — image viewer may need it
   }, []);
+
+  // Stable renderItem → memoized ChatListRow. Per-row derived values (isSelected,
+  // statusInfo) are computed here from primitives; everything passed to the row is
+  // either a stable ref or a stable callback, so memo(ChatListRow) holds and only
+  // changed rows re-render. Defined AFTER all its dependencies so the deps array
+  // never references a const in the temporal dead zone.
+  const renderChatRow = useCallback(({ item }) => {
+    const itemChatId = item?.chatId || item?._id;
+    const isSelected = selectionMode && selectedChatIds.includes(itemChatId);
+    const isGroupRow = item?.chatType === 'group' || item?.isGroup;
+    const peerId = !isGroupRow ? String(item?.peerUser?._id || item?.peerUserId || '') : '';
+    const statusInfo = peerId ? (statusByUserId[peerId] || null) : null;
+    return (
+      <ChatListRow
+        item={item}
+        theme={theme}
+        isSelected={isSelected}
+        statusInfo={statusInfo}
+        selectionMode={selectionMode}
+        timeTick={timeTick}
+        onOpen={openChat}
+        onToggleSelect={toggleChatSelection}
+        onEnterSelection={enterSelectionMode}
+        onOpenStatusViewer={openContactStatusViewer}
+        onOpenProfile={openProfilePreview}
+        getUserColor={getUserColor}
+        getPreviewText={getPreviewText}
+        getRelativeTime={getRelativeTime}
+        getLastMessageText={getLastMessageText}
+        renderMessageStatus={renderMessageStatus}
+      />
+    );
+  }, [
+    selectionMode, selectedChatIds, statusByUserId, theme, timeTick,
+    openChat, toggleChatSelection, enterSelectionMode, openContactStatusViewer, openProfilePreview,
+    getUserColor, getPreviewText, getRelativeTime, getLastMessageText, renderMessageStatus,
+  ]);
 
   // Start an audio/video call to the previewed 1-1 contact (WhatsApp preview row).
   const startPreviewCall = useCallback((media) => {
@@ -1278,76 +1371,7 @@ export default function ChatList({ navigation }) {
           <FlatList
             data={filteredChats}
             keyExtractor={(item) => String(item?.chatId || item?._id)}
-            renderItem={({ item }) => {
-              const itemChatId = item?.chatId || item?._id;
-              const isSelected = selectionMode && selectedChatIds.includes(itemChatId);
-              const isGroupRow = item?.chatType === 'group' || item?.isGroup;
-              const peerId = !isGroupRow ? String(item?.peerUser?._id || item?.peerUserId || '') : '';
-              const statusInfo = peerId ? (statusByUserId[peerId] || null) : null;
-              return (
-              <View>
-              <ChatCard
-                item={item}
-                theme={theme}
-                isSelected={isSelected}
-                statusInfo={statusInfo}
-                openSwipeableRef={openSwipeableRef}
-                onPress={() => {
-                  if (selectionMode) {
-                    toggleChatSelection(itemChatId);
-                  } else {
-                    openChat(item);
-                  }
-                }}
-                onLongPress={() => {
-                  if (selectionMode) {
-                    toggleChatSelection(itemChatId);
-                  } else {
-                    enterSelectionMode(itemChatId);
-                  }
-                }}
-                onAvatarPress={() => {
-                  if (selectionMode) {
-                    toggleChatSelection(itemChatId);
-                  } else if (statusInfo && statusInfo.count > 0) {
-                    // Has a live status → open the Status Viewer (WhatsApp behaviour).
-                    openContactStatusViewer(statusInfo.group);
-                  } else {
-                    openProfilePreview(item);
-                  }
-                }}
-                onSwipePin={() => {
-                  const ct = item?.chatType || 'private';
-                  if (item?.isPinned) unpinChat(item?.chatId || item?._id, ct);
-                  else pinChat(item?.chatId || item?._id, ct);
-                }}
-                onSwipeMute={() => {
-                  const ct = item?.chatType || 'private';
-                  if (item?.isMuted) unmuteChat(item?.chatId || item?._id, ct);
-                  else muteChat(item?.chatId || item?._id, 8 * 60 * 60 * 1000, ct);
-                }}
-                onSwipeArchive={() => {
-                  const chatId = item?.chatId || item?._id;
-                  const ct = item?.chatType || 'private';
-                  if (item?.isArchived) unarchiveChat(chatId, ct);
-                  else archiveChat(chatId, ct);
-                }}
-                getUserColor={getUserColor}
-                getPreviewText={getPreviewText}
-                getRelativeTime={getRelativeTime}
-                getLastMessageText={getLastMessageText}
-                renderMessageStatus={renderMessageStatus}
-              />
-              {isSelected && (
-                <View style={styles.selectionCheckOverlay} pointerEvents="none">
-                  <View style={[styles.selectionCheckCircle, { backgroundColor: theme.colors.themeColor }]}>
-                    <Ionicons name="checkmark" size={14} color="#fff" />
-                  </View>
-                </View>
-              )}
-              </View>
-              );
-            }}
+            renderItem={renderChatRow}
             showsVerticalScrollIndicator={false}
             extraData={statusByUserId}
             refreshing={refreshing}
@@ -1602,6 +1626,7 @@ export default function ChatList({ navigation }) {
         isBroadcast={isPreviewBroadcast}
         isVerified={Boolean(selectedChatItem?.isVerified)}
         subtitle={isPreviewBroadcast ? 'Broadcast channel' : undefined}
+        peerId={(isPreviewGroup || isPreviewBroadcast) ? null : (selectedChatItem?.peerUser?._id || selectedChatItem?.peerUserId || null)}
         onMessage={() => { if (selectedChatItem) openChat(selectedChatItem); closeProfilePreview(); }}
         onCall={(isPreviewGroup || isPreviewBroadcast) ? undefined : () => startPreviewCall('audio')}
         onVideo={(isPreviewGroup || isPreviewBroadcast) ? undefined : () => startPreviewCall('video')}
