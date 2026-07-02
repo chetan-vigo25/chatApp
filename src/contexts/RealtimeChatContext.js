@@ -19,6 +19,52 @@ const CHAT_HIGHLIGHT_TTL = 2000;
 const CHAT_UPDATE_BATCH_WINDOW = 90;
 const CHAT_LIST_CACHE_KEY = 'CHAT_LIST_CACHE';
 const CHAT_LIST_SAVE_DEBOUNCE_MS = 300;
+// Per-chat mutation-delta cursor (edits/deletes applied while away). MUST match
+// the prefix in useChatLogic so both share one cursor per chat.
+const MUTATION_CURSOR_PREFIX = 'chat_mutation_cursor_';
+
+const _getMutationCursor = async (chatId) => {
+  try {
+    const raw = await AsyncStorage.getItem(`${MUTATION_CURSOR_PREFIX}${chatId}`);
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch { return 0; }
+};
+
+const _setMutationCursor = async (chatId, at) => {
+  try {
+    const n = Number(at);
+    if (!chatId || !Number.isFinite(n) || n <= 0) return;
+    const prev = await _getMutationCursor(chatId);
+    if (n <= prev) return; // monotonic
+    await AsyncStorage.setItem(`${MUTATION_CURSOR_PREFIX}${chatId}`, String(n));
+  } catch {}
+};
+
+// Apply a single server mutation doc to SQLite idempotently (absolute values).
+// Returns 'delete' | 'edit' | null so the caller can skip re-dispatching a row
+// into the chat map for deletes (which would resurrect it in the list).
+const _applyMutatedDoc = async (doc, myUserId) => {
+  const mid = doc?._id || doc?.messageId || doc?.id;
+  if (!mid) return null;
+  if (doc?.isDeleted === true) {
+    await ChatDatabase.markMessageDeleted(String(mid), doc?.deletedBy || null, doc?.placeholderText || 'This message was deleted');
+    return 'delete';
+  }
+  const deletedForArr = doc?.deletedFor;
+  const isForMe = Array.isArray(deletedForArr)
+    ? deletedForArr.some((u) => myUserId && String(u) === String(myUserId))
+    : false;
+  if (isForMe) {
+    await ChatDatabase.deleteMessageForMe(String(mid));
+    return 'delete';
+  }
+  if (doc?.isEdited === true && (doc?.text || doc?.content)) {
+    await ChatDatabase.updateMessageEdit(String(mid), doc.text || doc.content, doc?.editedAt || doc?.updatedAt || new Date().toISOString());
+    return 'edit';
+  }
+  return null;
+};
 
 // Debug switch for the incoming-message → SQLite-store pipeline. Flip to false
 // (or remove the logs) once the storage path is verified. Kept here so all the
@@ -3286,11 +3332,12 @@ export function RealtimeChatProvider({ children }) {
         const knownChatIds = Array.from(new Set([...dbChatIds, ...memChatIds]));
         if (knownChatIds.length === 0) return;
 
-        // Gather { chatId, lastSeq } per chat.
+        // Gather { chatId, lastSeq, mutatedSince } per chat.
         const entries = await Promise.all(knownChatIds.map(async (chatId) => {
           try {
             const lastSeq = await ChatDatabase.getLatestSeq(chatId);
-            return { chatId, lastSeq };
+            const mutatedSince = await _getMutationCursor(chatId);
+            return { chatId, lastSeq, ...(mutatedSince > 0 ? { mutatedSince } : {}) };
           } catch { return { chatId, lastSeq: 0 }; }
         }));
 
@@ -3329,6 +3376,27 @@ export function RealtimeChatProvider({ children }) {
               normalizedNew.forEach((m) => {
                 dispatch({ type: 'INCOMING_MESSAGE', payload: m });
               });
+            }
+
+            // Mutation delta — edits/deletes applied to already-stored messages
+            // while we were away. Idempotent absolute-value writes, then advance
+            // the per-chat mutation cursor.
+            const mutated = Array.isArray(entry.mutatedMessages) ? entry.mutatedMessages : [];
+            if (mutated.length > 0) {
+              const myId = currentUserIdRef.current;
+              for (const doc of mutated) {
+                let kind = null;
+                try { kind = await _applyMutatedDoc(doc, myId); } catch {}
+                // Only re-dispatch edits into the chat map; deletes must not
+                // resurrect a removed row in the list.
+                if (kind === 'edit') {
+                  const n = normalizeMessagePayload({ ...doc, chatId: doc.chatId || entry.chatId });
+                  dispatch({ type: 'INCOMING_MESSAGE', payload: n });
+                }
+              }
+            }
+            if (Number(entry.latestMutationAt) > 0) {
+              _setMutationCursor(entry.chatId, entry.latestMutationAt);
             }
 
             // Peer's read watermark — drives our outgoing-message ticks.

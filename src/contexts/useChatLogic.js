@@ -91,6 +91,8 @@ const PRESENCE_IDLE_TIMEOUT = 5 * 60 * 1000;
 const MANUAL_PRESENCE_QUEUE_KEY = "presence_manual_queue";
 const MEDIA_STATUS_QUEUE_KEY = 'media_status_update_queue';
 const DELETED_TOMBSTONES_PREFIX = "chat_deleted_tombstones_";
+const PENDING_EDITS_PREFIX = "chat_pending_edits_";
+const MUTATION_CURSOR_PREFIX = "chat_mutation_cursor_";
 const READ_MARK_DELAY = 800;
 const SOCKET_FETCH_LIMIT = 50;
 // First-paint page: small for the fastest possible initial render. Scroll-up
@@ -462,6 +464,18 @@ export default function useChatLogic({ navigation, route }) {
   const lastInitializedChatRef = useRef(null);
   const isHardReloadingRef = useRef(false);
   const deletedTombstonesRef = useRef({});
+  // Pending edits for messages not yet in local state (out-of-order arrival).
+  // Keyed by normalized messageId → { text, editedAt }. Persisted per-chat so a
+  // relaunch before the message syncs in still applies the edit on arrival.
+  const pendingEditsRef = useRef({});
+  // Latest applyMutatedMessages — held in a ref so the socket-handler closure
+  // (setupSocketListeners, defined earlier) can call the up-to-date function
+  // without a TDZ forward-reference in its dependency array.
+  const applyMutatedMessagesRef = useRef(null);
+  // Snapshots of messages optimistically deleted-for-everyone, keyed by resolved
+  // id, so a server rejection (CANNOT_DELETE_FOR_EVERYONE / DELETE_TIMEOUT) can
+  // restore the original message.
+  const pendingDeleteSnapshotsRef = useRef({});
   // Tracks chatIds whose local "clear" cleanup is currently in-flight.
   // Prevents the REST success path and the `chat:cleared:*` socket echo from
   // racing on the same SQLite writes (which surfaces as "database is locked").
@@ -1564,6 +1578,7 @@ export default function useChatLogic({ navigation, route }) {
             loadQueuedMediaStatusUpdates(),
             loadQueuedMediaUploads(),
             loadDeletedTombstones(generatedChatId),
+            loadPendingEdits(generatedChatId),
           ]);
           await checkAndReconnectSocket();
           const socket = getSocket();
@@ -1808,6 +1823,71 @@ export default function useChatLogic({ navigation, route }) {
     await persistDeletedTombstones();
   }, [persistDeletedTombstones]);
 
+  // ─── PENDING EDITS (out-of-order edit arrival) ───
+  const pendingEditsKeyForChat = useCallback((chatIdParam) => `${PENDING_EDITS_PREFIX}${chatIdParam}`, []);
+
+  const persistPendingEdits = useCallback(async () => {
+    try {
+      if (!chatIdRef.current) return;
+      await AsyncStorage.setItem(
+        pendingEditsKeyForChat(chatIdRef.current),
+        JSON.stringify(pendingEditsRef.current || {})
+      );
+    } catch {}
+  }, [pendingEditsKeyForChat]);
+
+  const loadPendingEdits = useCallback(async (chatIdParam) => {
+    try {
+      if (!chatIdParam) return;
+      const raw = await AsyncStorage.getItem(pendingEditsKeyForChat(chatIdParam));
+      const parsed = raw ? JSON.parse(raw) : {};
+      pendingEditsRef.current = parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      pendingEditsRef.current = {};
+    }
+  }, [pendingEditsKeyForChat]);
+
+  const registerPendingEdit = useCallback(async (messageId, text, editedAt) => {
+    const normalizedId = normalizeId(messageId);
+    if (!normalizedId || !text) return;
+    pendingEditsRef.current = {
+      ...(pendingEditsRef.current || {}),
+      [normalizedId]: { text, editedAt: editedAt || new Date().toISOString() },
+    };
+    await persistPendingEdits();
+  }, [persistPendingEdits]);
+
+  const removePendingEdit = useCallback(async (messageId) => {
+    const normalizedId = normalizeId(messageId);
+    if (!normalizedId || !pendingEditsRef.current?.[normalizedId]) return;
+    const next = { ...(pendingEditsRef.current || {}) };
+    delete next[normalizedId];
+    pendingEditsRef.current = next;
+    await persistPendingEdits();
+  }, [persistPendingEdits]);
+
+  // ─── MUTATION CURSOR (reconnect mutation delta — edits/deletes) ───
+  const getMutationCursor = useCallback(async (chatIdParam) => {
+    try {
+      if (!chatIdParam) return 0;
+      const raw = await AsyncStorage.getItem(`${MUTATION_CURSOR_PREFIX}${chatIdParam}`);
+      const n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch {
+      return 0;
+    }
+  }, []);
+
+  const setMutationCursor = useCallback(async (chatIdParam, at) => {
+    try {
+      const n = Number(at);
+      if (!chatIdParam || !Number.isFinite(n) || n <= 0) return;
+      const prev = await getMutationCursor(chatIdParam);
+      if (n <= prev) return; // monotonic — never move the cursor backwards
+      await AsyncStorage.setItem(`${MUTATION_CURSOR_PREFIX}${chatIdParam}`, String(n));
+    } catch {}
+  }, [getMutationCursor]);
+
   const normalizeIncomingMessage = useCallback((apiMsg) => {
     const mediaMeta = apiMsg?.mediaMeta || apiMsg?.contact || apiMsg?.payload?.mediaMeta || apiMsg?.payload?.contact || {};
     const serverId = normalizeId(apiMsg?._id || apiMsg?.messageId || apiMsg?.id);
@@ -1832,6 +1912,12 @@ export default function useChatLogic({ navigation, route }) {
     const resolvedDeletedBy = normalizeId(apiMsg?.deletedBy) || normalizeId(tombstone?.deletedBy) || null;
     const isDeletedBySelf = sameId(resolvedDeletedBy, normalizedCurrentUser);
     const resolvedPlaceholderText = apiMsg?.placeholderText || tombstone?.placeholderText || buildDeletePlaceholderText(isDeletedBySelf);
+
+    // OUT-OF-ORDER edit: an edit that arrived before this message is applied here
+    // on arrival. Only override when NOT deleted (a delete wins over an edit).
+    const pendingEdit = (!resolvedIsDeleted && normalizedServerId)
+      ? pendingEditsRef.current?.[normalizedServerId]
+      : null;
 
     const incomingRawType = String(apiMsg?.messageType || apiMsg?.fileCategory || apiMsg?.type || '').toLowerCase();
     const incomingCategory = String(apiMsg?.fileCategory || mediaMeta?.fileCategory || '').toLowerCase();
@@ -1925,7 +2011,7 @@ export default function useChatLogic({ navigation, route }) {
       mediaId: normalizedMediaId,
       type: resolvedMessageType,
       mediaType: apiMsg?.fileCategory || (isMediaMessageType(resolvedMessageType) ? resolvedMessageType : null),
-      text: apiMsg?.text || apiMsg?.content || "",
+      text: pendingEdit ? pendingEdit.text : (apiMsg?.text || apiMsg?.content || ""),
       time: moment(createdAt).format("hh:mm A"),
       date: moment(createdAt).format("YYYY-MM-DD"),
       senderId: normalizedSenderId,
@@ -1963,8 +2049,8 @@ export default function useChatLogic({ navigation, route }) {
         ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
         : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
       reactions: sanitizeReactions(apiMsg?.reactions),
-      isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited),
-      editedAt: apiMsg?.editedAt || apiMsg?.edited_at || null,
+      isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited || pendingEdit),
+      editedAt: (pendingEdit ? pendingEdit.editedAt : null) || apiMsg?.editedAt || apiMsg?.edited_at || null,
       isForwarded: Boolean(apiMsg?.isForwarded || apiMsg?.is_forwarded || apiMsg?.forwarded || apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.forwardedMessage || apiMsg?.isForwardedMessage),
       forwardedFrom: apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.originalMessageId || apiMsg?.forwardedMessageId || null,
       isDeleted: resolvedIsDeleted,
@@ -3151,12 +3237,24 @@ export default function useChatLogic({ navigation, route }) {
             }, 0);
             sinceSeq = memMax;
           }
+          // Mutation-delta cursor: pull edits/deletes applied to already-stored
+          // messages since we last synced. With no stored cursor, seed from the
+          // newest stored message time so we only pull FUTURE mutations (the
+          // delta above already carries current state for anything it returns).
+          let mutatedSince = await getMutationCursor(chatIdParam);
+          if (!mutatedSince) {
+            mutatedSince = currentMessages.reduce((mx, m) => {
+              const t = Number(m?.timestamp || new Date(m?.createdAt || 0).getTime() || 0);
+              return t > mx ? t : mx;
+            }, 0);
+          }
           const liveSocket = socketRef.current || getSocket();
           if (!liveSocket || !isSocketConnected()) return;
           liveSocket.emit('message:sync', {
             chatId: chatIdParam,
             sinceSeq,
             lastMessageId, // legacy fallback (server resolves it to its own seq)
+            ...(mutatedSince > 0 ? { mutatedSince } : {}),
             limit: Number(limit) > 0 ? Number(limit) : 50,
           });
         })();
@@ -3179,7 +3277,7 @@ export default function useChatLogic({ navigation, route }) {
         before,
       });
     }
-  }, [chatData]);
+  }, [chatData, getMutationCursor]);
 
   useEffect(() => {
     const docs = chatMessagesData?.data?.docs || chatMessagesData?.docs || null;
@@ -4441,7 +4539,6 @@ export default function useChatLogic({ navigation, route }) {
 
     // ─── MESSAGE EDIT (sender confirmation + receiver broadcast) ───
     const onEditResponse = async (data) => {
-      console.log('[Edit] received:', JSON.stringify(data));
       const source = data?.data || data || {};
       if (source?.status === false || data?.status === false) return;
 
@@ -4453,11 +4550,16 @@ export default function useChatLogic({ navigation, route }) {
 
       if (editedChatId && !sameId(editedChatId, currentChatId)) return;
 
-      console.log('[Edit] applying:', { messageId, newText, editedAt });
-
-      // Update in DB then refresh UI
+      // OUT-OF-ORDER: if the message isn't in local state yet, stash the edit so
+      // normalizeIncomingMessage applies it when the message later syncs in.
       if (newText) {
+        const existing = await ChatDatabase.getMessage(messageId);
+        if (!existing) {
+          registerPendingEdit(messageId, newText, editedAt);
+          return;
+        }
         await ChatDatabase.updateMessageEdit(messageId, newText, editedAt);
+        removePendingEdit(messageId);
       }
       refreshMessagesFromDB();
     };
@@ -4559,6 +4661,15 @@ export default function useChatLogic({ navigation, route }) {
         if (latestTs > 0) {
           lastMessageSyncAtRef.current = Math.max(lastMessageSyncAtRef.current, latestTs);
         }
+      }
+
+      // Apply the mutation delta (edits/deletes done while away) to stored rows,
+      // then advance the per-chat mutation cursor.
+      const mutated = source?.mutatedMessages;
+      if (Array.isArray(mutated) && mutated.length > 0) {
+        applyMutatedMessagesRef.current?.(mutated, currentChatId, source?.latestMutationAt);
+      } else if (Number(source?.latestMutationAt) > 0) {
+        setMutationCursor(currentChatId, source.latestMutationAt);
       }
 
       // Update hasMore from server response
@@ -5272,17 +5383,39 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:delete:sync', onMessageDeleteSync);
 
     const onMessageDeleteEveryoneResponse = async (data) => {
-      console.log('🧪 [B:SOCKET:DELETE:RECV]', {
-        event: 'message:delete:everyone:response',
-        raw: data,
-      });
       const source = data?.data || data || {};
 
       if (source?.status === false || source?.success === false) {
-        Alert.alert("Error", source?.message || "Failed to delete message for everyone");
+        // ROLLBACK (CANNOT_DELETE_FOR_EVERYONE / DELETE_TIMEOUT): restore the
+        // optimistically-deleted message from its snapshot + drop the tombstone.
+        const failedId = source?.messageId || source?._id || source?.id;
+        const snapKey = failedId != null ? String(failedId) : null;
+        const snapshot = snapKey ? pendingDeleteSnapshotsRef.current[snapKey] : null;
+        if (snapshot) {
+          delete pendingDeleteSnapshotsRef.current[snapKey];
+          await removeDeletedTombstone(failedId);
+          const restored = { ...snapshot, isDeleted: false, deletedFor: null, deletedBy: null, placeholderText: null };
+          // Directly un-delete in SQLite (upsert can only RAISE is_deleted).
+          ChatDatabase.restoreDeletedMessage(failedId, restored).catch(() => {});
+          setAllMessages(prev => {
+            const exists = prev.some(m =>
+              sameId(m.serverMessageId, failedId) || sameId(m.id, failedId) || sameId(m.tempId, failedId)
+            );
+            if (exists) {
+              return prev.map(m => {
+                const isMatch = sameId(m.serverMessageId, failedId) || sameId(m.id, failedId) || sameId(m.tempId, failedId);
+                return isMatch ? restored : m;
+              });
+            }
+            return [...prev, restored];
+          });
+        }
+        const code = source?.code || source?.error;
+        Alert.alert('Delete failed', source?.message || (code ? String(code) : 'Failed to delete message for everyone'));
         return;
       }
       const messageId = source?.messageId || source?._id || source?.id;
+      if (messageId) delete pendingDeleteSnapshotsRef.current[String(messageId)];
       const responseChatId = source?.chatId || source?.chat || source?.roomId;
       const isDeleteForEveryone = (
         source?.deleteForEveryone === true ||
@@ -5528,6 +5661,8 @@ export default function useChatLogic({ navigation, route }) {
     queueMediaStatusUpdate,
     saveMessagesToLocal,
     applyChatClearedLocally,
+    setMutationCursor,
+    removeDeletedTombstone,
   ]);
 
   const removeDuplicateMessages = useCallback((messagesArr) => {
@@ -6489,6 +6624,14 @@ export default function useChatLogic({ navigation, route }) {
       receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
     }
 
+    // Anti-resurrection: a message the user delete-for-me'd must not come back via
+    // a realtime re-delivery / echo. The registry is warm after any load or the
+    // delete itself; ensure it's loaded before the sync check.
+    await ChatDatabase.ensureDeletedForMeLoaded();
+    if (ChatDatabase.isDeletedForMe(receivedMessage.serverMessageId, receivedMessage.id, receivedMessage.tempId)) {
+      return;
+    }
+
     // If this message is a reply but missing preview data, try multiple sources
     if (receivedMessage.replyToMessageId && !receivedMessage.replyPreviewText) {
       // Source 1: Check permanent reply table first (fastest)
@@ -6692,7 +6835,19 @@ export default function useChatLogic({ navigation, route }) {
     // Check SQLite first — if already deleted, only refresh UI (no duplicate write)
     const existing = await ChatDatabase.getMessage(normalizedMsgId);
     if (!existing) {
-      // Message not in DB at all — nothing to delete
+      // OUT-OF-ORDER: the delete arrived before the message itself. Persist the
+      // intent so it's re-applied when the message later syncs in.
+      if (isDeletedForEveryone) {
+        // Everyone-tombstone registry already re-applies on arrival
+        // (normalizeIncomingMessage resolves isDeleted from it).
+        registerDeletedTombstone(normalizedMsgId, {
+          deletedBy,
+          placeholderText: buildDeletePlaceholderText(isDeletedBySelf),
+        });
+      } else {
+        // Delete-for-me before arrival: register so upsert/load never inserts it.
+        ChatDatabase.registerDeletedForMe(normalizedMsgId).catch(() => {});
+      }
       return;
     }
     if (existing.isDeleted && isDeletedForEveryone) {
@@ -6746,6 +6901,64 @@ export default function useChatLogic({ navigation, route }) {
     removeDeletedTombstone,
   ]);
 
+  // ─── RECONNECT MUTATION DELTA ───
+  // Apply the server's mutation delta (edits / deletes that happened while we
+  // were away) to already-stored messages. Reuses the SAME handlers as the live
+  // edit/delete socket events so there is no parallel apply path. Each apply is
+  // idempotent (absolute values), so replaying the same mutation is a no-op.
+  const applyMutatedMessages = useCallback(async (mutatedMessages, chatIdParam, latestMutationAt) => {
+    try {
+      const list = Array.isArray(mutatedMessages) ? mutatedMessages : [];
+      const myId = normalizeId(currentUserIdRef.current);
+      for (const doc of list) {
+        const mid = normalizeId(doc?._id || doc?.messageId || doc?.id);
+        if (!mid) continue;
+
+        if (doc?.isDeleted === true) {
+          // Server-side tombstone (edit-then-delete or delete-for-everyone).
+          await handleDeleteMessage(mid, true, {
+            deletedBy: doc?.deletedBy || doc?.senderId || doc?.userId,
+          });
+          continue;
+        }
+
+        const deletedForArr = doc?.deletedFor;
+        const isDeletedForMe = Array.isArray(deletedForArr)
+          ? deletedForArr.some((u) => sameId(u, myId))
+          : false;
+        if (isDeletedForMe) {
+          await handleDeleteMessage(mid, false, { deletedBy: myId, _initiatedLocally: true });
+          continue;
+        }
+
+        if (doc?.isEdited === true) {
+          const newText = doc?.text || doc?.content;
+          const editedAt = doc?.editedAt || doc?.updatedAt || new Date().toISOString();
+          if (newText) {
+            const existing = await ChatDatabase.getMessage(mid);
+            if (!existing) {
+              await registerPendingEdit(mid, newText, editedAt);
+            } else {
+              await ChatDatabase.updateMessageEdit(mid, newText, editedAt);
+              await removePendingEdit(mid);
+            }
+          }
+        }
+      }
+      if (list.length > 0) refreshMessagesFromDB();
+    } catch (err) {
+      console.warn('[Mutation] applyMutatedMessages error:', err?.message);
+    } finally {
+      if (chatIdParam && Number(latestMutationAt) > 0) {
+        setMutationCursor(chatIdParam, latestMutationAt);
+      }
+    }
+  }, [handleDeleteMessage, registerPendingEdit, removePendingEdit, refreshMessagesFromDB, setMutationCursor]);
+
+  useEffect(() => {
+    applyMutatedMessagesRef.current = applyMutatedMessages;
+  }, [applyMutatedMessages]);
+
   useEffect(() => {
     if (!pendingPreviewSyncRef.current) return;
     pendingPreviewSyncRef.current = false;
@@ -6762,14 +6975,17 @@ export default function useChatLogic({ navigation, route }) {
   // without forcing the whole message list to re-render every render.
   const clearSelectedMessages = useCallback(() => setSelectedMessages([]), []);
 
-  const deleteSelectedMessages = useCallback(async (deleteForEveryone) => {
+  // Delete an explicit set of message ids (used by both the multi-select flow and
+  // the long-press action sheet, which deletes a single message WITHOUT ever
+  // entering selection mode — so no header selection toolbar appears).
+  const deleteMessagesByIds = useCallback(async (ids, deleteForEveryone) => {
     try {
       const socket = getSocket();
       const latestMessages = allMessagesRef.current || [];
       const isGroupDel = chatData?.chatType === 'group' || chatData?.isGroup;
       const groupId = isGroupDel ? (chatData?.groupId || chatData?.group?._id || chatIdRef.current) : null;
 
-      const selectedResolved = selectedMessage
+      const selectedResolved = (ids || [])
         .map((messageId) => {
           const found = latestMessages.find(m =>
             sameId(m.id, messageId) ||
@@ -6791,8 +7007,13 @@ export default function useChatLogic({ navigation, route }) {
         return;
       }
 
-      // 1. Optimistic local update — instant UI change
-      for (const { resolvedId } of selectedResolved) {
+      // 1. Optimistic local update — instant UI change.
+      // For delete-for-everyone, snapshot the original row first so a server
+      // rejection can restore it (the optimistic delete wipes local content).
+      for (const { resolvedId, found } of selectedResolved) {
+        if (deleteForEveryone && found) {
+          pendingDeleteSnapshotsRef.current[String(resolvedId)] = { ...found };
+        }
         await handleDeleteMessage(resolvedId, deleteForEveryone, {
           deletedBy: currentUserIdRef.current,
           _initiatedLocally: true,
@@ -6830,7 +7051,28 @@ export default function useChatLogic({ navigation, route }) {
     } catch (error) {
       Alert.alert("Error", "Failed to delete messages");
     }
-  }, [selectedMessage, handleDeleteMessage, chatData]);
+  }, [handleDeleteMessage, chatData]);
+
+  // Backward-compatible wrapper: delete the currently multi-selected messages.
+  const deleteSelectedMessages = useCallback(
+    (deleteForEveryone) => deleteMessagesByIds(selectedMessage, deleteForEveryone),
+    [deleteMessagesByIds, selectedMessage]
+  );
+
+  // Prompt (me / everyone) + delete a SINGLE message by id — for the action sheet.
+  // `msg` is used only to decide whether "Delete for everyone" is offered.
+  const promptDeleteSingleMessage = useCallback((msg) => {
+    if (!msg) return;
+    const resolvedId = msg.serverMessageId || msg.id || msg.tempId;
+    if (!resolvedId) return;
+    const isMine = sameId(msg.senderId, currentUserIdRef.current);
+    const options = [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete for me', onPress: () => deleteMessagesByIds([resolvedId], false) },
+    ];
+    if (isMine) options.push({ text: 'Delete for everyone', style: 'destructive', onPress: () => deleteMessagesByIds([resolvedId], true) });
+    Alert.alert('Delete Message', 'Delete this message?', options);
+  }, [deleteMessagesByIds]);
 
   // ─── MESSAGE EDITING ───
 
@@ -6901,6 +7143,13 @@ export default function useChatLogic({ navigation, route }) {
       const trimmedText = newText.trim();
       const editedAt = new Date().toISOString();
 
+      // Snapshot pre-edit values so we can roll back if the server rejects.
+      const preEdit = {
+        text: editingMessage.text,
+        isEdited: Boolean(editingMessage.isEdited),
+        editedAt: editingMessage.editedAt || null,
+      };
+
       // Optimistic UI: update state immediately
       setAllMessages(prev => prev.map(m => {
         const isMatch = sameId(m.serverMessageId, serverMsgId) || sameId(m.id, serverMsgId);
@@ -6940,11 +7189,24 @@ export default function useChatLogic({ navigation, route }) {
         ...(isGroupEdit && { groupId: chatData?.groupId || chatData?.group?._id || cId }),
         text: trimmedText,
       };
-      console.log('[Edit] emit', editEvent, ':', editPayload);
       socket.emit(editEvent, editPayload, (ack) => {
-        console.log('[Edit] ack:', JSON.stringify(ack));
-        if (ack?.status === false) {
-          console.warn('[Edit] server rejected:', ack);
+        // Rollback on server rejection (NOT_MESSAGE_OWNER / EDIT_TIMEOUT /
+        // MESSAGE_DELETED / NO_EDIT_CONTENT). Restore the snapshot in state +
+        // SQLite so the optimistic edit doesn't stick.
+        if (ack?.status === false || ack?.success === false) {
+          setAllMessages(prev => prev.map(m => {
+            const isMatch = sameId(m.serverMessageId, serverMsgId) || sameId(m.id, serverMsgId);
+            if (!isMatch) return m;
+            return { ...m, text: preEdit.text, isEdited: preEdit.isEdited, editedAt: preEdit.editedAt };
+          }));
+          // Restore the pre-edit TEXT in SQLite. (upsert can't lower is_edited —
+          // its merge does MAX(is_edited) — so we write the original text back
+          // via updateMessageEdit; the in-memory state above governs the UI.)
+          if (preEdit.text) {
+            ChatDatabase.updateMessageEdit(serverMsgId, preEdit.text, preEdit.editedAt || editedAt).catch(() => {});
+          }
+          const code = ack?.code || ack?.error;
+          Alert.alert('Edit failed', ack?.message || (code ? String(code) : 'The message could not be edited.'));
         }
       });
     } catch (err) {
@@ -8001,6 +8263,7 @@ export default function useChatLogic({ navigation, route }) {
     setIsRefreshing(true);
     try {
       await loadDeletedTombstones(chatIdRef.current);
+      await loadPendingEdits(chatIdRef.current);
 
       setAllMessages((prevMessages) => (
         prevMessages.filter((msg) => msg.chatId !== chatIdRef.current)
@@ -8014,7 +8277,7 @@ export default function useChatLogic({ navigation, route }) {
         setIsRefreshing(false);
       }, 500);
     }
-  }, [loadDeletedTombstones]);
+  }, [loadDeletedTombstones, loadPendingEdits]);
 
   const toggleChatMute = useCallback((durationMs = null) => {
     const socket = socketRef.current || getSocket();
@@ -8598,7 +8861,7 @@ export default function useChatLogic({ navigation, route }) {
     userStatus, customStatus, presenceDetails, manualPresencePending, renderStatusText,
     setManualPresence, clearManualPresence,
     search, handleSearch, clearSearch, goToNextResult, goToPreviousResult, searchResults, currentSearchIndex,
-    selectedMessage, handleToggleSelectMessages, handleDeleteSelected,
+    selectedMessage, handleToggleSelectMessages, handleDeleteSelected, promptDeleteSingleMessage,
     text, setText, handleTextChange, handleSendText,
     scheduleMessage, cancelScheduledMessage,
     sendLocationMessage, sendContactMessage,

@@ -160,14 +160,13 @@ const useSaveContact = (peerUser) => {
         return;
       }
 
-      // Immediately update SQLite
-      const hashResult = contactHasher.hashPhoneNumber(normalizedPhone);
+      // Immediately update SQLite (keyed by canonical E.164)
       await upsertContactToSQLite({
         userId: String(peerUser._id || ''),
         fullName,
         normalizedPhone,
         profileImage: peerUser.profileImage || peerUser.profilePicture || null,
-        hash: hashResult?.hash || null,
+        phoneNumber: contactHasher.toE164(normalizedPhone),
       });
 
       setSavedSuccessfully(true);

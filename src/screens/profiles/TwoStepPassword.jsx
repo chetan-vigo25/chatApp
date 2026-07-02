@@ -111,7 +111,7 @@ export default function TwoStepPassword({ navigation }) {
     if (!next) {
       // Disable: confirm and clear server-side
       Alert.alert(
-        'Disable 2-step verification?',
+        'Disable app lock?',
         'You will no longer be asked for a password when reopening the app.',
         [
           { text: 'Cancel', style: 'cancel' },
@@ -129,7 +129,7 @@ export default function TwoStepPassword({ navigation }) {
                 setEnabled(false);
                 setHasPassword(false);
                 await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '0');
-                setSuccess('2-step verification disabled.');
+                setSuccess('App lock disabled.');
               } catch (e) {
                 setError(typeof e === 'string' ? e : 'Could not disable. Try again.');
               } finally {
@@ -151,7 +151,7 @@ export default function TwoStepPassword({ navigation }) {
   const handleSave = async () => {
     clearMessages();
     if (!enabled) {
-      setError('Turn on the 2-step toggle first.');
+      setError('Turn on the app lock toggle first.');
       return;
     }
     const trimmed = pwd.trim();
@@ -176,7 +176,7 @@ export default function TwoStepPassword({ navigation }) {
       setPwd('');
       setConfirmPwd('');
       await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '1');
-      setSuccess(hasPassword ? 'Password updated.' : '2-step password set.');
+      setSuccess(hasPassword ? 'Password updated.' : 'App lock password set.');
     } catch (e) {
       // Surface the server message (e.g. "This password is already in use as
       // your deleted-chats password.") — the rejected error is an object, not a
@@ -195,8 +195,8 @@ export default function TwoStepPassword({ navigation }) {
     Alert.alert(
       'Reset password?',
       hasDeletedPassword
-        ? 'Your current 2-step password will be cleared. Your deleted-chats password depends on it, so it will be cleared too. You can set new ones afterwards — 2-step will stay enabled.'
-        : 'Your current 2-step password will be cleared. You can set a new one below — 2-step will stay enabled.',
+        ? 'Your current app lock password will be cleared. Your chat delete password depends on it, so it will be cleared too. You can set new ones afterwards — app lock will stay enabled.'
+        : 'Your current app lock password will be cleared. You can set a new one below — app lock will stay enabled.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -217,8 +217,8 @@ export default function TwoStepPassword({ navigation }) {
               setConfirmPwd('');
               setSuccess(
                 deletedWasSet
-                  ? 'Password reset. Your deleted-chats password was also cleared. Set a new one to keep 2-step active.'
-                  : 'Password reset. Set a new one to keep 2-step active.'
+                  ? 'Password reset. Your chat delete password was also cleared. Set a new one to keep app lock active.'
+                  : 'Password reset. Set a new one to keep app lock active.'
               );
             } catch (e) {
               setError(typeof e === 'string' ? e : 'Could not reset password.');
@@ -243,7 +243,7 @@ export default function TwoStepPassword({ navigation }) {
       </TouchableOpacity>
       <View style={styles.flex}>
         <Text style={[styles.headerTitle, { color: primaryText }]}>
-          2-step verification
+          App lock password
         </Text>
         <Text style={[styles.headerSubtitle, { color: subText }]}>
           {loading
@@ -276,7 +276,7 @@ export default function TwoStepPassword({ navigation }) {
         <Text style={[styles.heroBody, { color: subText }]}>
           When enabled, you'll be asked for this password every time the app
           launches or returns from the background. Different from your
-          deleted-chats password.
+          chat delete password.
         </Text>
       </View>
     </Animated.View>
@@ -299,7 +299,7 @@ export default function TwoStepPassword({ navigation }) {
           </View>
           <View style={styles.flex}>
             <Text style={[styles.toggleLabel, { color: primaryText }]}>
-              Enable 2-step verification
+              Enable app lock
             </Text>
             <Text style={[styles.toggleSub, { color: subText }]}>
               {enabled
@@ -451,7 +451,7 @@ export default function TwoStepPassword({ navigation }) {
           </TouchableOpacity>
         </View>
         <Text style={[styles.footerHint, { color: subText }]}>
-          The 2-step password must be different from your deleted-chats password.
+          The app lock password must be different from your chat delete password.
         </Text>
       </View>
     );

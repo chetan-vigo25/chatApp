@@ -9,6 +9,11 @@ const DB_VERSION = 13;
 // last init outcome is recorded for telemetry. See _deleteCorruptDB / _recordOutcome.
 const OUTBOX_BACKUP_KEY = '@chatdb/outboxBackup';
 const DB_OUTCOME_KEY = '@chatdb/lastInitOutcome';
+// Persistent "delete for me" registry. Delete-for-me hard-removes the SQLite row
+// for instant UX, but a later message:sync / history / catch-up can re-return the
+// same doc and resurrect it. This registry is the anti-resurrection guard: an id
+// added here is filtered out of every load AND every upsert, and survives restart.
+const DELETED_FOR_ME_KEY = '@chatdb/deletedForMe';
 
 let _db = null;
 let _hasReplyColumns = false;
@@ -1009,6 +1014,10 @@ const _runCacheWrite = async (label, task, attempts = 4) => {
 const upsertMessages = async (messages) => {
   if (!Array.isArray(messages) || messages.length === 0) return;
 
+  // Ensure the delete-for-me registry is warm so _runUpsertBatch can filter
+  // resurrected rows synchronously inside the transaction.
+  await ensureDeletedForMeLoaded();
+
   const run = async () => {
     const db = await getDB();
 
@@ -1071,6 +1080,8 @@ const upsertMessages = async (messages) => {
 const _runUpsertBatch = async (db, messages) => {
   for (const msg of messages) {
     try {
+        // Anti-resurrection: never re-insert a message the user delete-for-me'd.
+        if (isDeletedForMe(msg.serverMessageId, msg.id, msg.tempId)) continue;
         // Same 5-step flow as upsertMessage
         let replyData = null;
         const needsRecovery = !msg.replyToMessageId || (msg.replyToMessageId && !msg.replyPreviewText);
@@ -1518,10 +1529,14 @@ const loadMessages = async (chatId, opts = {}) => {
   } catch {}
 
   // ── STEP 4: Convert rows + enrich with reply data ──
+  // Hydrate the delete-for-me registry once so any row that was delete-for-me'd
+  // (and later resurrected by a sync/upsert race) is filtered out on read too.
+  await ensureDeletedForMeLoaded();
   const allMsgs = [];
   for (const row of rows) {
     const msg = rowToMsg(row);
     if (!msg) continue;
+    if (isDeletedForMe(msg.serverMessageId, msg.id, msg.tempId)) continue;
     if (!msg.replyToMessageId) {
       const rd = replyMap[msg.id] || replyMap[msg.serverMessageId] || replyMap[msg.tempId];
       if (rd) Object.assign(msg, rd);
@@ -1843,6 +1858,55 @@ const clearScheduleData = async (messageId, newStatus = 'sent') => {
   }
 };
 
+// ─── DELETE-FOR-ME REGISTRY (anti-resurrection) ─────────────────────────────
+// Lazily hydrated from AsyncStorage on first use, then kept in-memory so the hot
+// load/upsert paths stay synchronous once warm.
+let _deletedForMeSet = null;
+let _deletedForMeLoad = null;
+
+const _ensureDeletedForMe = async () => {
+  if (_deletedForMeSet) return _deletedForMeSet;
+  if (_deletedForMeLoad) return _deletedForMeLoad;
+  _deletedForMeLoad = (async () => {
+    try {
+      const raw = await AsyncStorage.getItem(DELETED_FOR_ME_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      _deletedForMeSet = new Set(Array.isArray(arr) ? arr.map((x) => String(x)) : []);
+    } catch {
+      _deletedForMeSet = new Set();
+    } finally {
+      _deletedForMeLoad = null;
+    }
+    return _deletedForMeSet;
+  })();
+  return _deletedForMeLoad;
+};
+
+const _persistDeletedForMe = async () => {
+  try {
+    await AsyncStorage.setItem(DELETED_FOR_ME_KEY, JSON.stringify(Array.from(_deletedForMeSet || [])));
+  } catch {}
+};
+
+// True if ANY of a message's ids has been delete-for-me'd. Synchronous — callers
+// on the hot path must call ensureDeletedForMeLoaded() once beforehand.
+const isDeletedForMe = (...ids) => {
+  if (!_deletedForMeSet) return false;
+  for (const id of ids) {
+    if (id != null && _deletedForMeSet.has(String(id))) return true;
+  }
+  return false;
+};
+
+const ensureDeletedForMeLoaded = () => _ensureDeletedForMe();
+
+const registerDeletedForMe = async (messageId) => {
+  if (!messageId) return;
+  await _ensureDeletedForMe();
+  _deletedForMeSet.add(String(messageId));
+  await _persistDeletedForMe();
+};
+
 const markMessageDeleted = async (messageId, deletedBy, placeholderText) => {
   if (!messageId) return;
   await runExclusive(async () => {
@@ -1854,8 +1918,36 @@ const markMessageDeleted = async (messageId, deletedBy, placeholderText) => {
   });
 };
 
+// Undo a delete-for-everyone tombstone (used to roll back an optimistic delete
+// that the server rejected). Directly clears the delete flags and rewrites the
+// original content — the upsert merge can only RAISE is_deleted, so a plain
+// upsert can't un-delete; this UPDATE can.
+const restoreDeletedMessage = async (messageId, restored = {}) => {
+  if (!messageId) return;
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(
+      `UPDATE messages SET is_deleted = 0, deleted_for = NULL, deleted_by = NULL, placeholder_text = NULL,
+         text = $text, type = COALESCE($type, type), media_url = $media_url, media_type = COALESCE($media_type, media_type),
+         preview_url = $preview_url, local_uri = $local_uri
+       WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+      {
+        $id: messageId,
+        $text: restored?.text ?? '',
+        $type: restored?.type || null,
+        $media_url: restored?.mediaUrl || null,
+        $media_type: restored?.mediaType || null,
+        $preview_url: restored?.previewUrl || restored?.mediaThumbnailUrl || null,
+        $local_uri: restored?.localUri || null,
+      }
+    );
+  });
+};
+
 const deleteMessageForMe = async (messageId) => {
   if (!messageId) return;
+  // Register FIRST so a re-sync that races the hard-delete still gets filtered.
+  await registerDeletedForMe(messageId);
   await runExclusive(async () => {
     const db = await getDB();
     await db.runAsync(`DELETE FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId });
@@ -2596,7 +2688,13 @@ const clearSyncData = async () => {
       await db.runAsync(`DELETE FROM message_replies`);
       await db.runAsync(`DELETE FROM sync_meta`);
     }),
-  );
+  ).finally(async () => {
+    // Drop the delete-for-me registry too — it is per-user and must not leak
+    // across a different-user login / account deletion (the full-wipe callers).
+    _deletedForMeSet = null;
+    _deletedForMeLoad = null;
+    try { await AsyncStorage.removeItem(DELETED_FOR_ME_KEY); } catch {}
+  });
 };
 
 // ── Broadcast status cache (official application updates) ─────────────────────
@@ -2794,7 +2892,8 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
   loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
-  markMessageDeleted, deleteMessageForMe, clearChat, deduplicateChat,
+  markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
+  registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
   closeDB, closeCleanly, saveMessageSync, saveMessages,

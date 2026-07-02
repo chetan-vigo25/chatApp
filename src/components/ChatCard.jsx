@@ -6,11 +6,13 @@ import SegmentedRing from './SegmentedRing';
 const AVATAR_SIZE = 52;
 const RING_SIZE   = 58; // outer ring diameter — leaves a small gap around the avatar
 const RING_STROKE = 2.5;
-// Default (no-photo) avatar: thin, light-gray border + muted person icon.
-const DEFAULT_AVATAR_BORDER = '#E4E7EB';
+// Default (no-photo) avatar: muted person icon.
 const DEFAULT_AVATAR_ICON   = '#8696A0';
-// Thin hairline ring drawn around every chat-list avatar.
-const AVATAR_BORDER_WIDTH   = 1;
+// Thinnest device hairline around every chat-list avatar. The COLOR is taken from
+// the theme's `border` token (light: subtle grey #e6e6e6, dark: faintly-lit slate
+// #2A3942) so dark mode gets a dark, only-slightly-highlighted ring — not a bright
+// light-grey one bleeding onto the dark background.
+const AVATAR_BORDER_WIDTH   = StyleSheet.hairlineWidth;
 
 const ChatCard = ({
   item,
@@ -88,9 +90,9 @@ const ChatCard = ({
             <View style={styles.avatarInner}>
               {(isGroup || isBroadcast) ? (
                 groupAvatarUri ? (
-                  <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={styles.avatarImage} />
+                  <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={[styles.avatarImage, { borderColor: theme.colors.border }]} />
                 ) : (
-                  <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName) }]}>
+                  <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName), borderColor: theme.colors.border }]}>
                     <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={22} color="#fff" />
                   </View>
                 )
@@ -98,14 +100,14 @@ const ChatCard = ({
                 <Image
                   resizeMode="cover"
                   source={{ uri: item.peerUser.profileImage }}
-                  style={styles.avatarImage}
+                  style={[styles.avatarImage, { borderColor: theme.colors.border }]}
                 />
               ) : (
-                // No profile picture → default person avatar with a light-gray border.
+                // No profile picture → default person avatar with a subtle theme border.
                 <View
                   style={[
                     styles.avatarDefault,
-                    { backgroundColor: theme.colors.cardBackground || 'transparent', borderColor: DEFAULT_AVATAR_BORDER },
+                    { backgroundColor: theme.colors.cardBackground || 'transparent', borderColor: theme.colors.border },
                   ]}
                 >
                   <Ionicons name="person" size={28} color={DEFAULT_AVATAR_ICON} />
@@ -232,9 +234,8 @@ const styles = StyleSheet.create({
     width: AVATAR_SIZE,
     height: AVATAR_SIZE,
     borderRadius: AVATAR_SIZE / 2,
-    // Thin light-gray circle around every avatar in the chat list.
+    // Hairline circle around every avatar; color is applied inline from theme.colors.border.
     borderWidth: AVATAR_BORDER_WIDTH,
-    borderColor: DEFAULT_AVATAR_BORDER,
   },
   avatarFallback: {
     width: AVATAR_SIZE,
@@ -243,7 +244,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: AVATAR_BORDER_WIDTH,
-    borderColor: DEFAULT_AVATAR_BORDER,
   },
   // Default person avatar shown when the peer has no profile picture.
   avatarDefault: {

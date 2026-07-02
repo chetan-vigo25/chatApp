@@ -126,7 +126,7 @@ export default function DeletedPasswordGate({ navigation }) {
             </View>
             <Text style={[styles.title, { color: primaryText }]}>Locked area</Text>
             <Text style={[styles.body, { color: subText }]}>
-              Enter your deleted-chats password to continue. If you'd rather
+              Enter your chat delete password to continue. If you'd rather
               skip, you'll be taken straight to your regular chat list.
             </Text>
 

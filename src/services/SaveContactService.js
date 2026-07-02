@@ -135,22 +135,21 @@ export const upsertContactToSQLite = async ({
   fullName,
   normalizedPhone,
   profileImage,
-  hash,
+  phoneNumber, // canonical E.164 (preferred)
 }) => {
   try {
     const now = Date.now();
-    const computedHash = hash || (normalizedPhone
-      ? contactHasher.hashPhoneNumber(normalizedPhone)?.hash
-      : null);
+    // Canonical E.164 is the primary key. Derive it from whatever was passed.
+    const e164 = phoneNumber || (normalizedPhone ? contactHasher.toE164(normalizedPhone) : null);
 
-    if (!computedHash) return;
+    if (!e164) return;
 
     await ContactDatabase.upsertContacts([{
-      hash: computedHash,
+      phoneNumber: e164,
       userId: userId || null,
       type: userId ? 'registered' : 'unregistered',
       fullName: fullName || '',
-      normalizedPhone: normalizedPhone || null,
+      normalizedPhone: e164,
       profileImage: profileImage || null,
       isActive: true,
       canMessage: !!userId,

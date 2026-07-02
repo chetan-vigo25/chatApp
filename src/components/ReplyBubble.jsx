@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Image } from 'react-native';
 
 const MEDIA_LABELS = {
   image: '📷 Photo',
@@ -18,6 +18,7 @@ const ReplyBubble = React.memo(function ReplyBubble({
   replyPreviewType,
   replySenderName,
   replySenderId,
+  replyThumbnailUrl,
   currentUserId,
   isMyMessage,
   onPress,
@@ -31,6 +32,8 @@ const ReplyBubble = React.memo(function ReplyBubble({
   const msgType = (replyPreviewType || 'text').toLowerCase();
   const isMedia = msgType !== 'text' && msgType !== 'system';
   const isDeleted = replyPreviewText === 'This message was deleted';
+  // Small thumbnail only for image/video quotes that actually have a URL.
+  const showThumb = !isDeleted && (msgType === 'image' || msgType === 'photo' || msgType === 'video') && Boolean(replyThumbnailUrl);
   const displayText = isDeleted
     ? 'This message was deleted'
     : isMedia
@@ -78,6 +81,9 @@ const ReplyBubble = React.memo(function ReplyBubble({
           {displayText}
         </Text>
       </View>
+      {showThumb && (
+        <Image source={{ uri: replyThumbnailUrl }} style={styles.thumb} resizeMode="cover" />
+      )}
     </TouchableOpacity>
   );
 });
@@ -110,6 +116,15 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: 'Roboto-Regular',
     lineHeight: 17,
+  },
+  thumb: {
+    width: 38,
+    height: 38,
+    borderRadius: 4,
+    alignSelf: 'center',
+    marginRight: 6,
+    marginLeft: 2,
+    backgroundColor: 'rgba(0,0,0,0.1)',
   },
 });
 

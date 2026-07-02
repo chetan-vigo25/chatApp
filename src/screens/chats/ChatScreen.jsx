@@ -1154,6 +1154,8 @@ export default function ChatScreen({ navigation, route }) {
   const [isAtLatest, setIsAtLatest] = useState(true);
   const [showSearchBar, setShowSearchBar] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
+  // Manual "load older messages" spinner for the 3-dots menu action.
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   // WhatsApp-style dropdown — pop-in from the top-right corner via combined
   // scale + opacity. Origin is set so the transform appears to grow out of
   // the 3-dot button rather than from the center.
@@ -1625,6 +1627,7 @@ export default function ChatScreen({ navigation, route }) {
     handleToggleSelectMessages,
     clearSelectedMessages,
     handleDeleteSelected,
+    promptDeleteSingleMessage,
     text,
     handleTextChange,
     handleSendText,
@@ -4623,13 +4626,15 @@ export default function ChatScreen({ navigation, route }) {
             }
           }}
           onLongPress={() => {
-            if (!isDeletedMessage) {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-              // Show emoji bar + select message for header toolbar
-              setReactionMsgId(prev => prev === messageKey ? null : messageKey);
-              if (!selectedMessage.includes(messageKey)) {
-                handleToggleSelectMessages(messageKey);
-              }
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+            // WhatsApp style: actions appear in the TOP bar (header rightActions
+            // selection toolbar) + a floating emoji reaction row above the message.
+            // Select the message (drives the top toolbar) for ANY message incl.
+            // tombstones (top toolbar then offers Delete). Emoji picker itself is
+            // gated to non-deleted messages.
+            setReactionMsgId(prev => prev === messageKey ? null : messageKey);
+            if (!selectedMessage.includes(messageKey)) {
+              handleToggleSelectMessages(messageKey);
             }
           }}
           delayLongPress={300}
@@ -4792,14 +4797,22 @@ export default function ChatScreen({ navigation, route }) {
               let replyType = msg.replyPreviewType;
               let replySName = msg.replySenderName;
               let replySId = msg.replySenderId;
+              let replyThumb = null;
+
+              // Always try to resolve a thumbnail for image/video quotes from the
+              // original message (preview data alone doesn't carry the URL).
+              const quotedOriginal = messages.find(m =>
+                sameId(m.serverMessageId, msg.replyToMessageId) ||
+                sameId(m.id, msg.replyToMessageId) ||
+                sameId(m.tempId, msg.replyToMessageId)
+              );
+              if (quotedOriginal && !quotedOriginal.isDeleted) {
+                replyThumb = quotedOriginal.mediaThumbnailUrl || quotedOriginal.previewUrl || quotedOriginal.mediaUrl || null;
+              }
 
               // If reply preview data is missing, look up the original message
               if (!replyText || !replySName) {
-                const originalMsg = messages.find(m =>
-                  sameId(m.serverMessageId, msg.replyToMessageId) ||
-                  sameId(m.id, msg.replyToMessageId) ||
-                  sameId(m.tempId, msg.replyToMessageId)
-                );
+                const originalMsg = quotedOriginal;
                 if (originalMsg) {
                   if (!replyText) {
                     replyText = originalMsg.isDeleted ? 'This message was deleted' : (originalMsg.text || originalMsg.content || null);
@@ -4837,6 +4850,7 @@ export default function ChatScreen({ navigation, route }) {
                   replyPreviewType={replyType}
                   replySenderName={replySName}
                   replySenderId={replySId}
+                  replyThumbnailUrl={replyThumb}
                   currentUserId={currentUserId}
                   isMyMessage={isMyMessage}
                   chatColor={chatColor}
@@ -5175,8 +5189,11 @@ export default function ChatScreen({ navigation, route }) {
             const isOwnMsg = selMsg && sameId(selMsg?.senderId, currentUserId);
             const msgStatus = (selMsg?.status || '').toLowerCase();
             const isSeen = msgStatus === 'seen' || msgStatus === 'read';
-            const canEdit = isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted;
+            const hasServerId = Boolean(selMsg?.serverMessageId) && !String(selMsg?.serverMessageId).startsWith('temp_');
+            const canEdit = selectedMessage.length === 1 && isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && hasServerId;
             const isTextMsg = selMsg?.type === 'text';
+            // Copy allowed whenever the message has any text — including a media caption.
+            const hasCopyableText = Boolean(selMsg?.text && String(selMsg.text).trim().length > 0);
             const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
             const canCancelSchedule = selectedMessage.length === 1 && (selMsg?.status === 'scheduled' || selMsg?.status === 'processing') && isOwnMsg;
             return (
@@ -5208,8 +5225,8 @@ export default function ChatScreen({ navigation, route }) {
                   style={{ padding: 10 }}>
                   <Ionicons name="trash-outline" size={22} color={theme.colors.primaryTextColor} />
                 </TouchableOpacity>
-                {/* Copy */}
-                {selectedMessage.length === 1 && isTextMsg && (
+                {/* Copy — text messages AND media captions */}
+                {selectedMessage.length === 1 && hasCopyableText && (
                   <TouchableOpacity
                     onPress={() => {
                       const Clipboard = require('expo-clipboard');
@@ -5267,8 +5284,8 @@ export default function ChatScreen({ navigation, route }) {
                     </TouchableOpacity>
                   );
                 })()}
-                {/* Edit — only if NOT seen/read */}
-                {/* {canEdit && (
+                {/* Edit — own text message, server-acked, not deleted */}
+                {canEdit && (
                   <TouchableOpacity
                     onPress={() => {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -5278,7 +5295,7 @@ export default function ChatScreen({ navigation, route }) {
                     style={{ padding: 10 }}>
                     <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
-                )} */}
+                )}
                 {/* Message Info — only for own, non-deleted messages */}
                 {selectedMessage.length === 1 && isOwnMsg && selMsg && !selMsg?.isDeleted && (
                   <TouchableOpacity
@@ -6012,6 +6029,29 @@ export default function ChatScreen({ navigation, route }) {
                 onPress={() => { closeChatMenu(); setTimeout(() => handleOpenContactInfo(), 140); }}
                 theme={theme}
               />
+              {/* Load older messages — WhatsApp-style backfill of history from the
+                  server. Only shown while older messages remain (hasMoreMessages). */}
+              {hasMoreMessages && (
+                <ChatMenuItem
+                  icon="history"
+                  iconLib="MaterialCommunityIcons"
+                  color="#4DB6AC"
+                  label={isLoadingOlder ? 'Loading older messages…' : 'Load older messages'}
+                  onPress={() => {
+                    closeChatMenu();
+                    setTimeout(async () => {
+                      if (isLoadingOlder || !hasMoreMessages) return;
+                      setIsLoadingOlder(true);
+                      if (Platform.OS === 'android') {
+                        const { ToastAndroid: T } = require('react-native');
+                        T.show('Loading older messages…', T.SHORT);
+                      }
+                      try { await loadMoreMessages?.(); } catch (_) {} finally { setIsLoadingOlder(false); }
+                    }, 140);
+                  }}
+                  theme={theme}
+                />
+              )}
               <View style={[chatMenuStyles.popoverDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)' }]} />
 
               <ChatMenuItem

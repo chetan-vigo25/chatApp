@@ -6,31 +6,34 @@ import contactHasher from '../Redux/Services/Contact/ContactHasher';
  * Helpers for matching a registered app user (sender / receiver / group member)
  * to a locally-saved device contact.
  *
- * The canonical join key is the phone-number HASH. The contact-sync pipeline
- * (`useContactSync` → `ContactHasher.hashContactList`) stores every device
- * contact under `hash = SHA256(normalizedPhone + SALT_SECRET)`. Because the
- * salt is global and the normalization is identical, we can re-hash a user's
- * phone number at render time and look it up against the stored contact hashes.
+ * The canonical join key is the PLAINTEXT E.164 number (matching switched from
+ * hashed → plaintext). The contact-sync pipeline stores every device contact
+ * under `phone_number = E.164`. Because both sides normalize with libphonenumber-js
+ * to the same string, we can re-normalize a user's phone at render time and look
+ * it up against the stored contact numbers.
  *
- * Matching by hash is more reliable than matching by `user_id` (which the
- * backend doesn't always populate on the saved contact row) or by raw phone
- * digits (which break on country-code / formatting differences, e.g. a member
- * number stored as "98765 43210" vs the synced "+919876543210").
+ * Matching by E.164 is more reliable than by `user_id` (not always populated on
+ * the saved row) or by raw digits (which break on country-code/formatting).
  */
 
 // Memoized: this runs once per distinct phone number during list rendering.
-const _hashMemo = new Map();
+const _e164Memo = new Map();
 
-/** Deterministic phone → contact hash (lowercase hex), or null on failure. */
-export const hashPhoneForMatch = (phone) => {
+/** Deterministic phone → canonical E.164, or null on failure. */
+export const e164ForMatch = (phone) => {
   if (!phone) return null;
   const key = String(phone);
-  if (_hashMemo.has(key)) return _hashMemo.get(key);
-  let h = null;
-  try { h = contactHasher.hashPhoneNumber(key)?.hash || null; } catch { h = null; }
-  if (h) h = h.toLowerCase();
-  _hashMemo.set(key, h);
-  return h;
+  if (_e164Memo.has(key)) return _e164Memo.get(key);
+  let e164 = null;
+  try { e164 = contactHasher.toE164(key) || null; } catch { e164 = null; }
+  _e164Memo.set(key, e164);
+  return e164;
 };
+
+// Back-compat alias — the match key is now the E.164 number, not a hash. Callers
+// that pass the result to ContactDatabase.getContactByHash (aliased to
+// getContactByPhone) or compare against a contact's `.hash` (now the E.164) keep
+// working unchanged.
+export const hashPhoneForMatch = e164ForMatch;
 
 export const onlyDigits = (value) => String(value || '').replace(/\D/g, '');

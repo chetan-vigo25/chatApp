@@ -1,11 +1,59 @@
 import CryptoJS from 'crypto-js';
 import { SALT_SECRET, CONTACT_SALT } from '@env';
+import { parsePhoneNumberFromString, getCountryCallingCode } from 'libphonenumber-js';
+
+// Default region used when a device contact has no country code (e.g. "9876543210").
+// India-centric app; a number that already carries a "+<country>" is parsed as-is.
+const DEFAULT_REGION = 'IN';
 
 class ContactHasher {
   constructor() {
     this.algorithm = 'sha256';
     this.saltLength = 32;
     this.cipherVersion = 'v2';
+  }
+
+  /**
+   * Canonical E.164 for contact discovery (e.g. "+919876543210"). Uses
+   * libphonenumber-js so it matches the server's join key. Returns null for
+   * anything that can't be parsed into a valid number. NO hashing — plaintext.
+   */
+  toE164(raw, defaultCountry = DEFAULT_REGION) {
+    if (!raw) return null;
+    const str = String(raw).trim();
+    try {
+      const parsed = parsePhoneNumberFromString(str, defaultCountry);
+      // Accept isPossible() as well as isValid(): test/simulator numbers (e.g. the
+      // iOS sample contacts' fake "555" numbers) are the right length but flagged
+      // invalid — we still want them discoverable. A real number is unaffected;
+      // the E.164 string it produces is the same either way.
+      if (parsed && (parsed.isValid() || parsed.isPossible())) return parsed.number;
+    } catch {}
+
+    // Fallback: build E.164 from the raw digits.
+    let digits = str.replace(/[^\d+]/g, '');
+    if (digits.startsWith('+')) {
+      return /^\+[1-9]\d{6,14}$/.test(digits) ? digits : null;
+    }
+    // No country code present — strip a trunk zero and prepend the default
+    // region's calling code (matches the server's toE164 from { code, number }).
+    digits = digits.replace(/^0+/, '');
+    if (digits.length < 6) return null;
+    let cc = '91';
+    try { cc = getCountryCallingCode(defaultCountry); } catch {}
+    const candidate = `+${cc}${digits}`;
+    return /^\+[1-9]\d{6,14}$/.test(candidate) ? candidate : null;
+  }
+
+  /**
+   * Deterministic hash of a phonebook's (sorted, deduped) E.164 set. Bit-for-bit
+   * identical to the server's buildContactsHash so the client can short-circuit a
+   * whole sync when nothing changed. Uses SHA-256 over "n1|n2|n3".
+   */
+  computeContactListHash(numbers = []) {
+    const sorted = [...new Set((numbers || []).filter(Boolean).map(String))].sort();
+    if (sorted.length === 0) return '';
+    return CryptoJS.SHA256(sorted.join('|')).toString(CryptoJS.enc.Hex);
   }
 
   generatePseudoRandomBytes(byteLength) {

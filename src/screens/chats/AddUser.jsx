@@ -242,7 +242,7 @@ export default function AddUser({ navigation }) {
       isActive: discoveredData.isActive ?? true,
       canMessage: discoveredData.canMessage ?? true,
       originalId: discoveredData.originalId,
-      hash: discoveredData.hash
+      phoneNumber: discoveredData.phoneNumber || discoveredData.hash,
     };
 
     const existingChat = chatsData?.find((chat) => {
@@ -434,9 +434,10 @@ export default function AddUser({ navigation }) {
         return;
       }
 
-      // 3. Unregistered (only hash known) → discover then handle in discoverResponse effect
-      if (normalizedUser?.hash && discoverContact) {
-        try { await discoverContact(normalizedUser.hash); }
+      // 3. Unregistered (only number known) → discover then handle in discoverResponse effect
+      const discoverNumber = normalizedUser?.phoneNumber || normalizedUser?.hash;
+      if (discoverNumber && discoverContact) {
+        try { await discoverContact(discoverNumber); }
         catch (err) { showMessage(err?.message || 'Failed to discover contact.'); }
         return;
       }
@@ -514,7 +515,7 @@ export default function AddUser({ navigation }) {
     try {
       if (handleSenInvatation) {
         const payload = {
-          contactHash: contact?.hash || contact?.contactHash || contact?.id || null,
+          phoneNumber: phone || contact?.phoneNumber || contact?.hash || null,
           inviteMethod: "sms",
           contactName: contact?.fullName || contact?.name || "",
           message,

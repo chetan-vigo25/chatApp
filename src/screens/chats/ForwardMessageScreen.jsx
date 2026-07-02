@@ -146,6 +146,11 @@ export default function ForwardMessageScreen({ navigation, route }) {
 
           const sendEvent = isGroup ? 'group:message:send' : 'message:send';
 
+          // The ORIGINAL sender (not the forwarder). The server sets the canonical
+          // forwardedFrom and echoes it back; we never claim the current user as
+          // the original sender. Use the source message's sender if we have it.
+          const originalSender = msg?.forwardedFrom || msg?.senderId || null;
+
           const sendPayload = isGroup
             ? {
                 groupId,
@@ -153,7 +158,6 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 messageType: msg.type || 'text',
                 mediaUrl: msg.mediaUrl || '',
                 mediaMeta: msg.mediaMeta || {},
-                forwardedFrom: currentUserId,
                 isForwarded: true,
                 tempId,
                 senderId: currentUserId,
@@ -167,7 +171,6 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 text: msg.text || '',
                 mediaUrl: msg.mediaUrl || '',
                 mediaMeta: msg.mediaMeta || {},
-                forwardedFrom: currentUserId,
                 isForwarded: true,
                 chatId: chatIdForCache,
                 senderId: currentUserId,
@@ -177,9 +180,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
               };
 
           // Fire and don't wait — the existing message:new handler will pick it up
-          console.log('[Forward] Emitting:', sendEvent, JSON.stringify(sendPayload, null, 2));
           socket.emit(sendEvent, sendPayload, (ack) => {
-            console.log('[Forward] ACK received:', JSON.stringify(ack));
             if (ack?.error) console.warn('[Forward] send ack error:', ack.error);
           });
 
@@ -198,7 +199,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
             createdAt: timestamp,
             status: 'sent', // Mark as sent immediately for instant feedback
             isForwarded: true,
-            forwardedFrom: currentUserId,
+            // Original sender if known; never the current user (the forwarder).
+            // The server echoes the canonical forwardedFrom on the real message.
+            ...(originalSender ? { forwardedFrom: originalSender } : {}),
             senderType: 'self',
           };
           ChatCache.addMessage(chatIdForCache, optimisticMessage);

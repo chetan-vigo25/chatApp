@@ -1,10 +1,26 @@
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'TalksTry_contacts.db';
-const DB_VERSION = 1;
+// v2: contact matching switched from hashed → PLAINTEXT E.164. The primary key is
+// now `phone_number` (E.164); hash/salt/encrypt columns are gone. The local DB is
+// a re-syncable cache, so the migration simply drops the old table and clears the
+// sync markers — the next open triggers a fresh full sync that repopulates it.
+const DB_VERSION = 2;
 
 let _db = null;
 let _dbInitPromise = null; // prevents race conditions — only one init at a time
+
+// Serialize every multi-statement write on the single SQLite connection. expo-sqlite
+// shares ONE native connection, so two concurrent `BEGIN TRANSACTION`s (e.g. a sync
+// upsert overlapping a contact:registered upsert) collide with
+// "cannot start a transaction within a transaction". This promise-chain mutex makes
+// each write wait its turn. Reads don't need it. Mirrors ChatDatabase.runExclusive.
+let _writeChain = Promise.resolve();
+const runExclusive = (fn) => {
+  const run = _writeChain.then(fn, fn); // run regardless of the prior task's outcome
+  _writeChain = run.catch(() => {});    // keep the chain alive; don't poison it on error
+  return run;
+};
 
 // ─── DATABASE INIT ──────────────────────────────────────
 
@@ -124,47 +140,52 @@ const runMigrations = async (db) => {
   const currentVersion = result?.user_version ?? 0;
   if (currentVersion >= DB_VERSION) return;
 
-  if (currentVersion < 1) {
-    await db.execAsync(`
-      CREATE TABLE IF NOT EXISTS contacts (
-        hash TEXT PRIMARY KEY NOT NULL,
-        original_id TEXT,
-        user_id TEXT,
-        type TEXT DEFAULT 'unregistered',
-        full_name TEXT,
-        email TEXT,
-        phone TEXT,
-        phone_normalized TEXT,
-        encrypt_number TEXT,
-        mobile_code TEXT,
-        mobile_number TEXT,
-        profile_image TEXT,
-        about TEXT,
-        is_active INTEGER DEFAULT 0,
-        last_login TEXT,
-        can_message INTEGER DEFAULT 0,
-        is_blocked INTEGER DEFAULT 0,
-        is_favorite INTEGER DEFAULT 0,
-        hash_algorithm TEXT,
-        hash_salt TEXT,
-        last_contacted TEXT,
-        joined_at INTEGER,
-        is_new_until INTEGER,
-        updated_highlight_until INTEGER,
-        synced_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
-      CREATE INDEX IF NOT EXISTS idx_contacts_original_id ON contacts(original_id);
-      CREATE INDEX IF NOT EXISTS idx_contacts_type ON contacts(type);
-      CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone_normalized);
-
-      CREATE TABLE IF NOT EXISTS contact_sync_meta (
-        key TEXT PRIMARY KEY NOT NULL,
-        value TEXT
-      );
-    `);
+  // v2 replaced the hashed schema. Drop any legacy hashed `contacts` table so we
+  // don't mix hash-keyed and E.164-keyed rows, and clear the sync markers so the
+  // next open runs a fresh full sync. (No data loss — it re-syncs from backend.)
+  if (currentVersion < 2) {
+    await db.execAsync('DROP TABLE IF EXISTS contacts;').catch(() => {});
+    // Clear sync markers if the meta table already exists (fresh installs skip this).
+    await db.execAsync(
+      "DELETE FROM contact_sync_meta WHERE key IN ('initial_sync_done','sync_session_id','sync_metadata','last_sync_time','contacts_hash');"
+    ).catch(() => {});
   }
+
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      phone_number TEXT PRIMARY KEY NOT NULL,
+      original_id TEXT,
+      user_id TEXT,
+      type TEXT DEFAULT 'unregistered',
+      full_name TEXT,
+      email TEXT,
+      phone TEXT,
+      mobile_code TEXT,
+      mobile_number TEXT,
+      profile_image TEXT,
+      about TEXT,
+      is_active INTEGER DEFAULT 0,
+      last_login TEXT,
+      can_message INTEGER DEFAULT 0,
+      is_blocked INTEGER DEFAULT 0,
+      is_favorite INTEGER DEFAULT 0,
+      last_contacted TEXT,
+      joined_at INTEGER,
+      is_new_until INTEGER,
+      updated_highlight_until INTEGER,
+      synced_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
+    CREATE INDEX IF NOT EXISTS idx_contacts_original_id ON contacts(original_id);
+    CREATE INDEX IF NOT EXISTS idx_contacts_type ON contacts(type);
+    CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone);
+
+    CREATE TABLE IF NOT EXISTS contact_sync_meta (
+      key TEXT PRIMARY KEY NOT NULL,
+      value TEXT
+    );
+  `);
 
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
 };
@@ -222,52 +243,54 @@ const setLastSyncTime = async (ts) => setMeta('last_sync_time', String(ts));
 
 // ─── CONTACT ROW MAPPING ────────────────────────────────
 
-const contactToRow = (c, now) => ({
-  $hash: c.hash,
-  $original_id: c.originalId || null,
-  $user_id: c.userId || null,
-  $type: c.type || (c.userId ? 'registered' : 'unregistered'),
-  $full_name: c.fullName || c.name || null,
-  $email: c.email || null,
-  $phone: c.originalPhone || c.phone || c.mobileFormatted || (c.mobile?.number) || null,
-  $phone_normalized: c.normalizedPhone || null,
-  $encrypt_number: c.encryptNumber || null,
-  $mobile_code: c.mobile?.code || null,
-  $mobile_number: c.mobile?.number || null,
-  $profile_image: c.profileImage || c.profilePicture || null,
-  $about: c.about || null,
-  $is_active: c.isActive ? 1 : 0,
-  $last_login: c.lastLogin || null,
-  $can_message: c.canMessage ? 1 : 0,
-  $is_blocked: c.isBlocked ? 1 : 0,
-  $is_favorite: c.isFavorite ? 1 : 0,
-  $hash_algorithm: c.hashDetails?.algorithm || c.algorithm || null,
-  $hash_salt: c.hashDetails?.salt || c.salt || null,
-  $last_contacted: c.lastContacted || null,
-  $joined_at: c.joinedWhatsAppAt || null,
-  $is_new_until: c.isNewUntil || null,
-  $updated_highlight_until: c.updatedHighlightUntil || null,
-  $synced_at: now,
-  $updated_at: now,
-});
+// The canonical key is the plaintext E.164 number (`c.phoneNumber`). The device's
+// original display-formatted string is kept separately in `phone` for the UI.
+const contactToRow = (c, now) => {
+  const e164 = c.phoneNumber || c.normalizedPhone || null;
+  return {
+    $phone_number: e164,
+    $original_id: c.originalId || null,
+    $user_id: c.userId || null,
+    $type: c.type || (c.userId ? 'registered' : 'unregistered'),
+    $full_name: c.fullName || c.name || null,
+    $email: c.email || null,
+    $phone: c.originalPhone || c.phone || c.mobileFormatted || (c.mobile?.number) || e164 || null,
+    $mobile_code: c.mobile?.code || null,
+    $mobile_number: c.mobile?.number || null,
+    $profile_image: c.profileImage || c.profilePicture || null,
+    $about: c.about || null,
+    $is_active: c.isActive ? 1 : 0,
+    $last_login: c.lastLogin || null,
+    $can_message: c.canMessage ? 1 : 0,
+    $is_blocked: c.isBlocked ? 1 : 0,
+    $is_favorite: c.isFavorite ? 1 : 0,
+    $last_contacted: c.lastContacted || null,
+    $joined_at: c.joinedWhatsAppAt || null,
+    $is_new_until: c.isNewUntil || null,
+    $updated_highlight_until: c.updatedHighlightUntil || null,
+    $synced_at: now,
+    $updated_at: now,
+  };
+};
 
 const rowToContact = (row) => {
   if (!row) return null;
   return {
-    hash: row.hash,
+    phoneNumber: row.phone_number,
+    // Back-compat alias: some UI code still reads `.hash` as the contact key.
+    hash: row.phone_number,
     originalId: row.original_id,
     userId: row.user_id,
     type: row.type || 'unregistered',
     fullName: row.full_name || '',
     name: row.full_name || '',
     email: row.email,
-    originalPhone: row.phone,
-    normalizedPhone: row.phone_normalized,
-    phone: row.phone,
-    number: row.phone,
-    encryptNumber: row.encrypt_number,
+    originalPhone: row.phone || row.phone_number,
+    normalizedPhone: row.phone_number,
+    phone: row.phone || row.phone_number,
+    number: row.phone || row.phone_number,
     mobile: { code: row.mobile_code, number: row.mobile_number || row.phone },
-    mobileFormatted: row.phone || '',
+    mobileFormatted: row.phone || row.phone_number || '',
     profileImage: row.profile_image || '',
     profilePicture: row.profile_image || '',
     about: row.about || '',
@@ -276,7 +299,6 @@ const rowToContact = (row) => {
     canMessage: Boolean(row.can_message),
     isBlocked: Boolean(row.is_blocked),
     isFavorite: Boolean(row.is_favorite),
-    hashDetails: { algorithm: row.hash_algorithm, salt: row.hash_salt },
     lastContacted: row.last_contacted,
     joinedWhatsAppAt: row.joined_at,
     isNewUntil: row.is_new_until,
@@ -289,26 +311,24 @@ const rowToContact = (row) => {
 // ─── CRUD OPERATIONS ────────────────────────────────────
 
 const UPSERT_SQL = `INSERT INTO contacts (
-  hash, original_id, user_id, type, full_name, email, phone, phone_normalized,
-  encrypt_number, mobile_code, mobile_number, profile_image, about,
+  phone_number, original_id, user_id, type, full_name, email, phone,
+  mobile_code, mobile_number, profile_image, about,
   is_active, last_login, can_message, is_blocked, is_favorite,
-  hash_algorithm, hash_salt, last_contacted, joined_at,
+  last_contacted, joined_at,
   is_new_until, updated_highlight_until, synced_at, updated_at
 ) VALUES (
-  $hash, $original_id, $user_id, $type, $full_name, $email, $phone, $phone_normalized,
-  $encrypt_number, $mobile_code, $mobile_number, $profile_image, $about,
+  $phone_number, $original_id, $user_id, $type, $full_name, $email, $phone,
+  $mobile_code, $mobile_number, $profile_image, $about,
   $is_active, $last_login, $can_message, $is_blocked, $is_favorite,
-  $hash_algorithm, $hash_salt, $last_contacted, $joined_at,
+  $last_contacted, $joined_at,
   $is_new_until, $updated_highlight_until, $synced_at, $updated_at
-) ON CONFLICT(hash) DO UPDATE SET
+) ON CONFLICT(phone_number) DO UPDATE SET
   original_id = COALESCE($original_id, original_id),
   user_id = COALESCE($user_id, user_id),
   type = $type,
   full_name = COALESCE($full_name, full_name),
   email = COALESCE($email, email),
   phone = COALESCE($phone, phone),
-  phone_normalized = COALESCE($phone_normalized, phone_normalized),
-  encrypt_number = COALESCE($encrypt_number, encrypt_number),
   mobile_code = COALESCE($mobile_code, mobile_code),
   mobile_number = COALESCE($mobile_number, mobile_number),
   profile_image = COALESCE($profile_image, profile_image),
@@ -318,8 +338,6 @@ const UPSERT_SQL = `INSERT INTO contacts (
   can_message = $can_message,
   is_blocked = $is_blocked,
   is_favorite = MAX(is_favorite, $is_favorite),
-  hash_algorithm = COALESCE($hash_algorithm, hash_algorithm),
-  hash_salt = COALESCE($hash_salt, hash_salt),
   last_contacted = COALESCE($last_contacted, last_contacted),
   joined_at = COALESCE($joined_at, joined_at),
   is_new_until = COALESCE($is_new_until, is_new_until),
@@ -330,34 +348,36 @@ const UPSERT_SQL = `INSERT INTO contacts (
 const upsertContacts = async (contacts) => {
   if (!Array.isArray(contacts) || contacts.length === 0) return;
 
-  return withDB(async (db) => {
+  // Serialized so no two upserts (or another write) open a transaction at once.
+  return runExclusive(() => withDB(async (db) => {
     const now = Date.now();
-    // Batch in chunks of 50 inside a transaction for performance + safety
+    // Batch in chunks of 50, each wrapped in expo-sqlite's own transaction helper
+    // (handles BEGIN/COMMIT/ROLLBACK internally — no manual, un-nestable BEGIN).
     const BATCH_SIZE = 50;
     for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
       const chunk = contacts.slice(i, i + BATCH_SIZE);
       try {
-        await db.execAsync('BEGIN TRANSACTION');
-        for (const c of chunk) {
-          if (!c?.hash) continue;
-          await db.runAsync(UPSERT_SQL, contactToRow(c, now));
-        }
-        await db.execAsync('COMMIT');
+        await db.withTransactionAsync(async () => {
+          for (const c of chunk) {
+            if (!c?.phoneNumber && !c?.normalizedPhone) continue;
+            await db.runAsync(UPSERT_SQL, contactToRow(c, now));
+          }
+        });
       } catch (err) {
-        try { await db.execAsync('ROLLBACK'); } catch {}
         console.warn('[ContactDB] upsert batch error:', err?.message);
-        // Fallback: try one-by-one for this chunk
+        // Fallback: one-by-one, no transaction (also covers older expo-sqlite
+        // builds without withTransactionAsync).
         for (const c of chunk) {
-          if (!c?.hash) continue;
+          if (!c?.phoneNumber && !c?.normalizedPhone) continue;
           try {
             await db.runAsync(UPSERT_SQL, contactToRow(c, now));
           } catch (singleErr) {
-            console.warn('[ContactDB] upsert single error for', c.hash, singleErr?.message);
+            console.warn('[ContactDB] upsert single error for', c.phoneNumber, singleErr?.message);
           }
         }
       }
     }
-  });
+  }));
 };
 
 const loadAllContacts = async () => {
@@ -394,13 +414,16 @@ const getContactCount = async () => {
   });
 };
 
-const getContactByHash = async (hash) => {
-  if (!hash) return null;
+// Look up a contact by its canonical E.164 number.
+const getContactByPhone = async (phoneNumber) => {
+  if (!phoneNumber) return null;
   return withDB(async (db) => {
-    const row = await db.getFirstAsync('SELECT * FROM contacts WHERE hash = $h', { $h: hash });
+    const row = await db.getFirstAsync('SELECT * FROM contacts WHERE phone_number = $p', { $p: String(phoneNumber) });
     return rowToContact(row);
   });
 };
+// Back-compat alias — the key is now the E.164 number, not a hash.
+const getContactByHash = getContactByPhone;
 
 const getContactByUserId = async (userId) => {
   if (!userId) return null;
@@ -428,15 +451,18 @@ const getContactDisplay = async ({ userId = null, phone = null } = {}) => {
     if (!row && phone) {
       const digits = String(phone).replace(/\D/g, '');
       if (digits) {
-        row = await db.getFirstAsync(
-          "SELECT full_name, profile_image FROM contacts WHERE phone_normalized = $p AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
-          { $p: digits }
-        );
-        // Country-code variance fallback — match on the last 10 digits.
-        if (!row && digits.length >= 10) {
+        // Match the last 10 digits against the E.164 key (handles country-code
+        // variance — "+91XXXXXXXXXX" vs a bare 10-digit number).
+        if (digits.length >= 10) {
           row = await db.getFirstAsync(
-            "SELECT full_name, profile_image FROM contacts WHERE phone_normalized LIKE $p AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
+            "SELECT full_name, profile_image FROM contacts WHERE phone_number LIKE $p AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
             { $p: `%${digits.slice(-10)}` }
+          );
+        }
+        if (!row) {
+          row = await db.getFirstAsync(
+            "SELECT full_name, profile_image FROM contacts WHERE phone_number = $p AND full_name IS NOT NULL AND TRIM(full_name) != '' LIMIT 1",
+            { $p: `+${digits}` }
           );
         }
       }
@@ -446,59 +472,59 @@ const getContactDisplay = async ({ userId = null, phone = null } = {}) => {
   });
 };
 
-const removeContacts = async (hashes) => {
-  if (!Array.isArray(hashes) || hashes.length === 0) return;
-  return withDB(async (db) => {
-    const ph = hashes.map(() => '?').join(',');
-    await db.runAsync(`DELETE FROM contacts WHERE hash IN (${ph})`, hashes);
-  });
+const removeContacts = async (numbers) => {
+  if (!Array.isArray(numbers) || numbers.length === 0) return;
+  return runExclusive(() => withDB(async (db) => {
+    const ph = numbers.map(() => '?').join(',');
+    await db.runAsync(`DELETE FROM contacts WHERE phone_number IN (${ph})`, numbers);
+  }));
 };
 
-const getExistingHashes = async () => {
+const getExistingNumbers = async () => {
   return withDB(async (db) => {
-    const rows = await db.getAllAsync('SELECT hash FROM contacts');
-    return new Set(rows.map(r => r.hash));
+    const rows = await db.getAllAsync('SELECT phone_number FROM contacts');
+    return new Set(rows.map(r => r.phone_number));
   });
 };
 
 const clearAllContacts = async () => {
-  return withDB(async (db) => {
+  return runExclusive(() => withDB(async (db) => {
     await db.execAsync('DELETE FROM contacts; DELETE FROM contact_sync_meta;');
-  });
+  }));
 };
 
 /**
- * Remove contacts from SQLite whose hashes are NOT in the given set of current hashes.
- * This cleans up old contacts that were deleted from the device or SIM.
+ * Remove contacts from SQLite whose E.164 numbers are NOT in the given set of
+ * current device numbers. Cleans up contacts deleted from the device or SIM.
  * Returns the number of rows removed.
  */
-const removeStaleContacts = async (currentHashes) => {
-  if (!currentHashes || currentHashes.size === 0) return 0;
-  return withDB(async (db) => {
-    const allRows = await db.getAllAsync('SELECT hash FROM contacts');
-    const staleHashes = allRows
-      .map((r) => r.hash)
-      .filter((h) => !currentHashes.has(h));
-    if (staleHashes.length === 0) return 0;
+const removeStaleContacts = async (currentNumbers) => {
+  if (!currentNumbers || currentNumbers.size === 0) return 0;
+  return runExclusive(() => withDB(async (db) => {
+    const allRows = await db.getAllAsync('SELECT phone_number FROM contacts');
+    const stale = allRows
+      .map((r) => r.phone_number)
+      .filter((n) => !currentNumbers.has(n));
+    if (stale.length === 0) return 0;
 
     const BATCH = 100;
     let removed = 0;
-    for (let i = 0; i < staleHashes.length; i += BATCH) {
-      const chunk = staleHashes.slice(i, i + BATCH);
+    for (let i = 0; i < stale.length; i += BATCH) {
+      const chunk = stale.slice(i, i + BATCH);
       const ph = chunk.map(() => '?').join(',');
-      const result = await db.runAsync(`DELETE FROM contacts WHERE hash IN (${ph})`, chunk);
+      const result = await db.runAsync(`DELETE FROM contacts WHERE phone_number IN (${ph})`, chunk);
       removed += result?.changes || chunk.length;
     }
     console.log(`[ContactDB] removeStaleContacts: removed ${removed} stale records`);
     return removed;
-  });
+  }));
 };
 
 const searchContacts = async (query, limit = 50) => {
   if (!query) return [];
   return withDB(async (db) => {
     const rows = await db.getAllAsync(
-      'SELECT * FROM contacts WHERE full_name LIKE $q OR phone LIKE $q OR phone_normalized LIKE $q ORDER BY type ASC, full_name ASC LIMIT $l',
+      'SELECT * FROM contacts WHERE full_name LIKE $q OR phone LIKE $q OR phone_number LIKE $q ORDER BY type ASC, full_name ASC LIMIT $l',
       { $q: `%${query}%`, $l: limit }
     );
     return rows.map(rowToContact);
@@ -507,11 +533,17 @@ const searchContacts = async (query, limit = 50) => {
 
 // ─── DIFF / INCREMENTAL SYNC HELPERS ────────────────────
 
-const findNewContacts = async (incomingHashes) => {
-  if (!Array.isArray(incomingHashes) || incomingHashes.length === 0) return [];
-  const existing = await getExistingHashes();
-  return incomingHashes.filter(h => !existing.has(h));
+const findNewContacts = async (incomingNumbers) => {
+  if (!Array.isArray(incomingNumbers) || incomingNumbers.length === 0) return [];
+  const existing = await getExistingNumbers();
+  return incomingNumbers.filter(n => !existing.has(n));
 };
+
+// ─── DELTA CONTENT-HASH (skip unchanged syncs) ──────────
+// The SHA-256 of the sorted E.164 set at the last successful sync. If the device
+// phonebook produces the same hash, the client sends NO network request at all.
+const getContactsHash = async () => getMeta('contacts_hash');
+const setContactsHash = async (hash) => setMeta('contacts_hash', hash);
 
 const getStats = async () => {
   return withDB(async (db) => {
@@ -538,17 +570,20 @@ export default {
   setSyncMetadata,
   getLastSyncTime,
   setLastSyncTime,
+  getContactsHash,
+  setContactsHash,
   // CRUD
   upsertContacts,
   loadAllContacts,
   loadRegisteredContacts,
   loadUnregisteredContacts,
   getContactCount,
-  getContactByHash,
+  getContactByPhone,
+  getContactByHash, // alias of getContactByPhone (back-compat)
   getContactByUserId,
   getContactDisplay,
   removeContacts,
-  getExistingHashes,
+  getExistingNumbers,
   clearAllContacts,
   removeStaleContacts,
   searchContacts,

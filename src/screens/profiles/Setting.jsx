@@ -110,7 +110,7 @@ export default function Setting({ navigation }) {
         {
           icon: 'lock-closed-outline',
           label: 'Chat privacy',
-          subtitle: 'Deleted chats password',
+          subtitle: 'Chat delete & app lock password',
           onPress: () => navigation.navigate('ChatPrivacy'),
         },
       ],

@@ -230,37 +230,77 @@ const dismissIncomingCallNotification = async (callId) => {
   } catch (_) { /* expo-notifications backend (iOS heads-up) */ }
 };
 
-// Request permission for notifications
+// Request permission for notifications.
+//
+// The interactive prompts (`PermissionsAndroid.request` and
+// `messaging().requestPermission()`) require a foreground Activity. When this
+// runs from a background/headless context — a background FCM message, a boot
+// task, or simply before the Activity has attached — Android throws
+// `IllegalStateException: Tried to use permissions API while not attached to an
+// Activity.` So we:
+//   1) read the CURRENT status non-interactively (never needs an Activity), and
+//      short-circuit as granted if it already is; then
+//   2) only fire the interactive prompt when the app is actually in the
+//      foreground. Off-foreground we return the current status instead of
+//      throwing, and the next foreground boot re-runs this and prompts.
 export const requestNotificationPermission = async () => {
   try {
     // console.log('[FCM] requestNotificationPermission start, platform:', Platform.OS, 'version:', Platform.Version);
-
-    if (Platform.OS === 'android' && Platform.Version >= 33) {
-      const granted = await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
-      );
-      // console.log('[FCM] POST_NOTIFICATIONS result:', granted);
-      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
-        console.warn('[FCM] POST_NOTIFICATIONS permission denied');
-        return false;
-      }
-    }
-
     const m = getMessaging();
     if (!m) {
       console.warn('[FCM] requestNotificationPermission skipped — native module unavailable');
       return false;
     }
+
+    // An interactive prompt is only safe while an Activity is attached, i.e. the
+    // app is in the foreground.
+    const isForeground = AppState.currentState === 'active';
+
+    // ── Android 13+ POST_NOTIFICATIONS ──
+    if (Platform.OS === 'android' && Platform.Version >= 33) {
+      // check() is passive — safe from any context.
+      const alreadyGranted = await PermissionsAndroid.check(
+        PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
+      );
+      if (!alreadyGranted) {
+        // Can't prompt without an Activity — defer to the next foreground boot.
+        if (!isForeground) {
+          console.warn('[FCM] POST_NOTIFICATIONS not granted; deferring prompt (no foreground Activity)');
+          return false;
+        }
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
+        );
+        // console.log('[FCM] POST_NOTIFICATIONS result:', granted);
+        if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+          console.warn('[FCM] POST_NOTIFICATIONS permission denied');
+          return false;
+        }
+      }
+    }
+
+    // ── Firebase messaging auth status ──
+    // hasPermission() is passive; use it to avoid the interactive prompt when
+    // we're already authorized (or can't prompt).
+    const current = await m().hasPermission();
+    const isEnabled = (status) =>
+      status === m.AuthorizationStatus.AUTHORIZED ||
+      status === m.AuthorizationStatus.PROVISIONAL;
+
+    if (isEnabled(current)) return true;
+
+    // NOT_DETERMINED (or denied) and we can't safely prompt off-foreground.
+    if (!isForeground) {
+      console.warn('[FCM] messaging permission not yet granted; deferring prompt (no foreground Activity)');
+      return false;
+    }
+
     const authStatus = await m().requestPermission();
     // console.log('[FCM] messaging.requestPermission authStatus:', authStatus);
-    const enabled =
-      authStatus === m.AuthorizationStatus.AUTHORIZED ||
-      authStatus === m.AuthorizationStatus.PROVISIONAL;
-
+    const enabled = isEnabled(authStatus);
     if (!enabled) {
       console.warn('[FCM] permission not granted, status:', authStatus);
     }
-
     return enabled;
   } catch (error) {
     console.error('[FCM] Permission request error:', error);

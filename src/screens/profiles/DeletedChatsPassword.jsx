@@ -92,14 +92,14 @@ export default function DeletedChatsPassword({ navigation }) {
     // Gate: the deleted-chats password requires an existing 2-step password.
     // Warn and offer to set it up instead of proceeding half-configured.
     if (!twoStepSet) {
-      setError('Set up your two-step verification password first.');
+      setError('Set up your app lock password first.');
       Alert.alert(
-        'Set two-step password first',
-        'The deleted-chats password needs two-step verification to be enabled first. Set up your two-step verification password, then come back to configure this.',
+        'Set app lock password first',
+        'The chat delete password needs the app lock to be enabled first. Set up your app lock password, then come back to configure this.',
         [
           { text: 'Cancel', style: 'cancel' },
           {
-            text: 'Set up two-step',
+            text: 'Set up app lock',
             onPress: () => navigation.navigate('TwoStepPassword'),
           },
         ]
@@ -133,10 +133,10 @@ export default function DeletedChatsPassword({ navigation }) {
     }
     setChecking(false);
     if (clashesWithTwoStep) {
-      setError('This password is already your two-step password. Choose a different one.');
+      setError('This password is already your app lock password. Choose a different one.');
       Alert.alert(
         'Use a different password',
-        'Your deleted-chats password must be different from your two-step verification password. Please choose a different password.',
+        'Your chat delete password must be different from your app lock password. Please choose a different password.',
         [{ text: 'OK' }]
       );
       return;
@@ -196,7 +196,7 @@ export default function DeletedChatsPassword({ navigation }) {
       </TouchableOpacity>
       <View style={styles.flex}>
         <Text style={[styles.headerTitle, { color: primaryText }]}>
-          Deleted chats password
+          Chat delete password
         </Text>
       </View>
     </View>
@@ -286,10 +286,10 @@ export default function DeletedChatsPassword({ navigation }) {
           >
             <Ionicons name="warning-outline" size={18} color="#C97B00" />
             <View style={styles.flex}>
-              <Text style={styles.warnTitle}>Two-step password required</Text>
+              <Text style={styles.warnTitle}>App lock password required</Text>
               <Text style={styles.warnBody}>
-                Set up your two-step verification password before you can create
-                a deleted-chats password. Tap to set it up.
+                Set up your app lock password before you can create
+                a chat delete password. Tap to set it up.
               </Text>
             </View>
             <Ionicons name="chevron-forward" size={16} color="#C97B00" />

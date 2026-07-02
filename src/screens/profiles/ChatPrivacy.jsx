@@ -121,7 +121,7 @@ export default function ChatPrivacy({ navigation }) {
           <View style={styles.rowTextWrap}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: primaryText }]}>
-                Deleted chats password
+                Chat delete password
               </Text>
               <Text style={[styles.rowSub, { color: subText }]}>
                 {loading
@@ -159,7 +159,7 @@ export default function ChatPrivacy({ navigation }) {
           <View style={styles.rowTextWrap}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: primaryText }]}>
-                2-step verification password
+                App lock password
               </Text>
               <Text style={[styles.rowSub, { color: subText }]}>
                 {loading

@@ -11,13 +11,46 @@ import ContactDatabase from '../services/ContactDatabase';
 const STORAGE_KEYS = {
   DEVICE_ID: '@device_id',
   PENDING_REFRESH: '@pending_contact_refresh',
-  HASHED_CONTACTS: '@hashed_contacts',
-  // Persistent phone -> hashed-record cache so re-syncs don't re-run SHA256+AES
-  // over the entire phonebook. Keyed by normalized phone (hash is deterministic).
-  HASH_CACHE: '@contact_hash_cache',
+  // Persistent raw-phone → E.164 cache so a resync only runs libphonenumber-js on
+  // numbers it hasn't seen before (the main cost on a large phonebook).
+  E164_CACHE: '@contact_e164_cache',
 };
 
 const UPDATE_HIGHLIGHT_MS = 24 * 60 * 60 * 1000;
+
+// Contacts synced per socket frame. Devices with thousands of contacts can't be
+// sent in one payload (huge frame + a server-side validation/match loop that
+// blocks the event loop + one giant Mongo write). Lists larger than this are
+// streamed in batches sharing one batch id; the server matches + accumulates
+// each and finalizes on the last. Must stay <= the server's per-batch cap
+// (MAX_CONTACTS_PER_BATCH = 1000 in contect.handler.js).
+const SYNC_BATCH_SIZE = 800;
+
+// The FIRST chunk of a large first-sync is deliberately small so the earliest
+// matched contacts render almost immediately (the whole point of progressive
+// reveal) instead of the user staring at a spinner while an 800-contact batch is
+// matched server-side. Later chunks use the full SYNC_BATCH_SIZE for throughput.
+const FIRST_SYNC_BATCH_SIZE = 200;
+
+// First-time sync preview: parse + send ONLY this many device contacts up front so
+// the first screenful lands in ~1-2s, THEN the full phonebook syncs in the
+// background. Kept small because normalizing the WHOLE phonebook to E.164
+// (libphonenumber-js) is the dominant client-side cost on a large first sync —
+// parsing just the head lets the list appear before that finishes.
+const PREVIEW_SYNC_SIZE = 100;
+
+// Build ramped chunks: one small head chunk (firstSize) for instant first paint,
+// then rest-sized chunks. Keeps total round-trips low while making the list
+// appear fast. e.g. 2000 items → [200, 800, 800, 200].
+const buildRampedChunks = (items, firstSize, restSize) => {
+  const chunks = [];
+  if (!items.length) return chunks;
+  chunks.push(items.slice(0, firstSize));
+  for (let i = firstSize; i < items.length; i += restSize) {
+    chunks.push(items.slice(i, i + restSize));
+  }
+  return chunks;
+};
 
 const clampNumber = (value, fallback = 0) => {
   const n = Number(value);
@@ -46,11 +79,11 @@ const parseExpiresInToMs = (expiresIn) => {
   return 0;
 };
 
-const dedupeByHashOrId = (contacts = []) => {
+const dedupeByNumberOrId = (contacts = []) => {
   const seen = new Set();
   const list = [];
   for (const contact of contacts) {
-    const key = contact?.hash || contact?.userId || contact?.originalId;
+    const key = contact?.phoneNumber || contact?.normalizedPhone || contact?.userId || contact?.originalId;
     if (!key || seen.has(key)) continue;
     seen.add(key);
     list.push(contact);
@@ -67,6 +100,9 @@ export const useContactSync = () => {
   const mountedRef = useRef(true);
   const bootstrappedRef = useRef(false);
   const screenOpenSyncInProgressRef = useRef(false);
+  // Guards the background full sync so a screen re-open (while the first-time full
+  // sync is still streaming in the background) doesn't spawn a duplicate one.
+  const fullSyncInProgressRef = useRef(false);
 
   const [matchedContacts, setMatchedContacts] = useState([]);
   const [matchedRegistered, setMatchedRegistered] = useState([]);
@@ -109,45 +145,44 @@ export const useContactSync = () => {
     };
   }, [deviceInfo, getDeviceId]);
 
-  // Ref to hold the latest fresh device contacts (updated by getHashedContacts)
+  // Ref to hold the latest fresh device contacts (updated by getE164Contacts)
   const freshDeviceContactsRef = useRef([]);
 
-  const buildLocalHashMap = useCallback(() => {
-    // Use fresh device contacts if available, fall back to context
+  // Map of E.164 number -> device-saved details, so incoming server matches can be
+  // labelled with the name as saved on THIS device (WhatsApp behaviour).
+  const buildLocalNumberMap = useCallback(() => {
     const contacts = freshDeviceContactsRef.current.length > 0
       ? freshDeviceContactsRef.current
       : (deviceContacts || []);
-    const localHashMap = {};
+    const map = {};
     for (const localContact of contacts) {
-      try {
-        const phone = localContact?.phoneNumbers?.[0]?.number || localContact?.phoneNumber || null;
-        if (!phone) continue;
-        const hashed = contactHasher.hashPhoneNumber(String(phone));
-        if (!hashed?.hash) continue;
-        localHashMap[hashed.hash] = {
+      const nums = (localContact?.phoneNumbers || []).map(p => p?.number).filter(Boolean);
+      if (localContact?.phoneNumber) nums.push(localContact.phoneNumber);
+      for (const raw of nums) {
+        const e164 = contactHasher.toE164(String(raw));
+        if (!e164 || map[e164]) continue;
+        map[e164] = {
           originalId: localContact?.id || null,
-          originalPhone: phone,
-          normalizedPhone: hashed?.normalized || null,
+          originalPhone: raw,
           localName: localContact?.name || null
         };
-      } catch {}
+      }
     }
-    return localHashMap;
+    return map;
   }, [deviceContacts]);
 
   const normalizeIncomingContacts = useCallback((incoming = []) => {
-    const localHashMap = buildLocalHashMap();
+    const numberMap = buildLocalNumberMap();
     return incoming.filter(Boolean).map((contact) => {
-      const hash = contact?.hash || null;
-      const localMapEntry = hash ? localHashMap[hash] : null;
+      const phoneNumber = contact?.phoneNumber || contact?.normalizedPhone || null;
+      const localMapEntry = phoneNumber ? numberMap[phoneNumber] : null;
       // Device contact name takes priority over the backend-stored name, per
       // product spec (show the name as saved on THIS device). Fall back to the
       // backend name only when the number isn't in the device's contacts.
       const fullName = localMapEntry?.localName || contact?.fullName || contact?.name || contact?.displayName || '';
       return {
         originalId: contact?.originalId || localMapEntry?.originalId || contact?.id || null,
-        hash,
-        encryptNumber: contact?.encryptNumber || null,
+        phoneNumber,
         type: (contact?.type || (contact?.userId ? 'registered' : 'unregistered')).toLowerCase(),
         userId: contact?.userId || null,
         fullName,
@@ -155,9 +190,9 @@ export const useContactSync = () => {
         email: contact?.email || null,
         mobile: contact?.mobile || {
           code: null,
-          number: contact?.phone || contact?.number || localMapEntry?.originalPhone || null
+          number: contact?.phone || contact?.number || localMapEntry?.originalPhone || phoneNumber || null
         },
-        mobileFormatted: contact?.mobileFormatted || contact?.phone || contact?.number || localMapEntry?.originalPhone || '',
+        mobileFormatted: contact?.mobileFormatted || contact?.phone || contact?.number || localMapEntry?.originalPhone || phoneNumber || '',
         profileImage: contact?.profileImage || contact?.profilePicture || contact?.avatar || '',
         profilePicture: contact?.profileImage || contact?.profilePicture || contact?.avatar || '',
         about: contact?.about || '',
@@ -165,20 +200,16 @@ export const useContactSync = () => {
         lastLogin: contact?.lastLogin || null,
         canMessage: contact?.canMessage ?? !!contact?.userId,
         isBlocked: !!contact?.isBlocked,
-        hashDetails: {
-          algorithm: contact?.hashDetails?.algorithm || contact?.algorithm || null,
-          salt: contact?.hashDetails?.salt || contact?.salt || null
-        },
         isFavorite: !!contact?.isFavorite,
         lastContacted: contact?.lastContacted || null,
         isNewUntil: contact?.isNewUntil || null,
         updatedHighlightUntil: contact?.updatedHighlightUntil || null,
         joinedWhatsAppAt: contact?.joinedWhatsAppAt || null,
-        originalPhone: contact?.originalPhone || localMapEntry?.originalPhone || null,
-        normalizedPhone: contact?.normalizedPhone || localMapEntry?.normalizedPhone || null,
+        originalPhone: contact?.originalPhone || localMapEntry?.originalPhone || phoneNumber || null,
+        normalizedPhone: phoneNumber,
       };
     });
-  }, [buildLocalHashMap]);
+  }, [buildLocalNumberMap]);
 
   // ─── APPLY TO STATE FROM SQLITE ───
 
@@ -225,7 +256,7 @@ export const useContactSync = () => {
         fields: [Contacts.Fields.PhoneNumbers],
       });
       const filtered = (data || []).filter(c => c.phoneNumbers?.length > 0);
-      freshDeviceContactsRef.current = filtered; // save for buildLocalHashMap
+      freshDeviceContactsRef.current = filtered; // save for buildLocalNumberMap
       return filtered;
     } catch (err) {
       console.warn('[useContactSync] readFreshDeviceContacts error:', err?.message);
@@ -233,74 +264,63 @@ export const useContactSync = () => {
     }
   }, []);
 
-  const getHashedContacts = useCallback(async () => {
-    // Always read fresh from device — this is the ONLY way to pick up newly added numbers
+  /**
+   * Read device contacts fresh and normalize every number to plaintext E.164
+   * (libphonenumber-js), deduped across the whole phonebook. No hashing. A device
+   * contact may carry several numbers — each becomes its own entry.
+   * Returns [{ id, fullName, phoneNumber, originalPhone }].
+   */
+  const getE164Contacts = useCallback(async () => {
     const freshContacts = await readFreshDeviceContacts();
     if (freshContacts.length === 0) return [];
 
-    // Load the persistent hash cache. The hash is a pure function of the
-    // normalized phone + fixed salt, so a number that hasn't changed never
-    // needs to be re-hashed — we only pay the SHA256+AES cost for new numbers.
+    // Persistent raw-phone → E.164 cache. libphonenumber-js parsing is the dominant
+    // cost of a resync (thousands of numbers), and a number that hasn't changed
+    // normalizes to the same E.164 forever — so we only pay the parse cost for NEW
+    // raw numbers. Null results are cached too, so junk isn't re-parsed every time.
     let cache = {};
     try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEYS.HASH_CACHE);
+      const raw = await AsyncStorage.getItem(STORAGE_KEYS.E164_CACHE);
       if (raw) cache = JSON.parse(raw) || {};
-    } catch {
-      cache = {};
-    }
+    } catch { cache = {}; }
 
     const nextCache = {};
     let cacheMisses = 0;
+    const seen = new Set();
     const valid = [];
 
     for (const contact of freshContacts) {
-      const phoneNumber = contact.phoneNumbers?.[0]?.number || contact.phoneNumber;
-      if (!phoneNumber) continue;
+      const rawNumbers = (contact.phoneNumbers || []).map(p => p?.number).filter(Boolean);
+      if (contact.phoneNumber) rawNumbers.push(contact.phoneNumber);
 
-      let normalized;
-      try {
-        normalized = contactHasher.normalizePhoneNumber(phoneNumber);
-      } catch {
-        continue;
-      }
-      if (!normalized) continue;
-
-      let core = cache[normalized];
-      if (!core) {
-        // Cache miss — hash this number once (the only expensive path).
-        try {
-          const h = contactHasher.hashPhoneNumber(phoneNumber);
-          core = {
-            hash: h.hash,
-            salt: h.salt,
-            algorithm: h.algorithm,
-            normalizedPhone: h.normalized,
-            encryptNumber: h.encryptNumber || null,
-          };
+      for (const rawPhone of rawNumbers) {
+        const key = String(rawPhone);
+        let e164 = Object.prototype.hasOwnProperty.call(cache, key) ? cache[key] : undefined;
+        if (e164 === undefined) {
+          e164 = contactHasher.toE164(key); // string or null; only new numbers hit this
           cacheMisses += 1;
-        } catch {
-          continue;
         }
-      }
-      // Keep only entries for numbers still on the device so the cache can't
-      // grow unbounded across SIM/contact churn.
-      nextCache[normalized] = core;
+        // Keep only entries for numbers still on the device so the cache can't grow
+        // unbounded across SIM/contact churn.
+        nextCache[key] = e164;
 
-      const record = {
-        id: contact.id || `${normalized}`,
-        fullName: contact.name || '',
-        ...core,
-        originalPhone: phoneNumber,
-      };
-      if (contactHasher.validateHashedContact(record)) valid.push(record);
+        if (!e164 || seen.has(e164)) continue; // invalid or duplicate → skip
+        seen.add(e164);
+        valid.push({
+          id: contact.id || e164,
+          fullName: contact.name || '',
+          phoneNumber: e164,
+          originalPhone: rawPhone,
+        });
+      }
+    }
+
+    // Persist the pruned cache only when it actually changed.
+    if (cacheMisses > 0 || Object.keys(nextCache).length !== Object.keys(cache).length) {
+      AsyncStorage.setItem(STORAGE_KEYS.E164_CACHE, JSON.stringify(nextCache)).catch(() => {});
     }
 
     if (mountedRef.current) setHashedContacts(valid);
-    await AsyncStorage.setItem(STORAGE_KEYS.HASHED_CONTACTS, JSON.stringify(valid));
-    // Persist the pruned cache only when it actually changed.
-    if (cacheMisses > 0 || Object.keys(nextCache).length !== Object.keys(cache).length) {
-      await AsyncStorage.setItem(STORAGE_KEYS.HASH_CACHE, JSON.stringify(nextCache));
-    }
     return valid;
   }, [readFreshDeviceContacts]);
 
@@ -369,12 +389,176 @@ export const useContactSync = () => {
 
   // ─── FULL SYNC (first time or expired) ───
 
-  const runFullSync = useCallback(async ({ reason = 'manual', silent = false } = {}) => {
+  const runFullSync = useCallback(async ({ reason = 'manual', silent = false, force = false } = {}) => {
     if (!socket?.emit) throw new Error('Socket not available for full sync');
 
-    const hashed = await getHashedContacts();
-    if (!hashed.length) {
+    // A full sync is already running (e.g. the background one kicked off after the
+    // preview) — don't start a second, overlapping full re-upload + re-match.
+    if (fullSyncInProgressRef.current) return;
+    fullSyncInProgressRef.current = true;
+
+    const e164Contacts = await getE164Contacts();
+    if (!e164Contacts.length) {
       await ContactDatabase.setSyncMetadata({ lastSyncStatus: 'empty_device_contacts' });
+      await applyFromDB();
+      fullSyncInProgressRef.current = false;
+      return;
+    }
+
+    // ── Delta content-hash short-circuit ──
+    // Hash the sorted E.164 set. If it matches the last successful sync's hash and
+    // we've synced before, the phonebook is unchanged → send NO network request.
+    const numbers = e164Contacts.map((c) => c.phoneNumber);
+    const contactsHash = contactHasher.computeContactListHash(numbers);
+    const prevHash = await ContactDatabase.getContactsHash();
+    const initialDone = await ContactDatabase.isInitialSyncDone();
+    if (!force && initialDone && prevHash && prevHash === contactsHash) {
+      await applyFromDB();
+      fullSyncInProgressRef.current = false;
+      return;
+    }
+
+    if (mountedRef.current) {
+      setError(null);
+      if (!silent) setIsSyncing(true);
+    }
+
+    try {
+      const clientInfo = await getClientInfo();
+
+      // Plaintext E.164 payload — no hashing. `fullName` is the device-saved label
+      // the backend persists; matching is by `phoneNumber`.
+      const toPayloadItem = (contact) => ({
+        id: contact.id,
+        originalId: contact.id,
+        fullName: contact.fullName || null,
+        phoneNumber: contact.phoneNumber,
+      });
+
+      const allItems = e164Contacts.map(toPayloadItem);
+      const syncOptions = { fullSync: true, overwrite: false };
+
+      let parsed;
+      if (allItems.length <= FIRST_SYNC_BATCH_SIZE) {
+        // ── Single-shot (small phonebook, <= first-batch size) ──
+        const rawResponse = await withRetry(
+          () => emitWithAckAndEvent('contact:sync', { contacts: allItems, clientInfo, syncOptions }, 'contact:sync:response'),
+          3
+        );
+        parsed = parseSyncResponse(rawResponse);
+        const deduped = dedupeByNumberOrId(normalizeIncomingContacts(parsed.contacts));
+        await ContactDatabase.upsertContacts(deduped);
+        await applyFromDB(); // reflect immediately
+      } else {
+        // ── Batched streaming (large phonebook) — lazy/progressive ──
+        // One shared batch id ties the chunks together server-side. Chunks are RAMPED:
+        // a small 200-item head chunk lands + renders first (fast first paint), then
+        // full-size chunks stream in. Chunks are sent SEQUENTIALLY because the server
+        // finalizes on the last index and resets its accumulator on index 0, so order
+        // must be preserved. Each chunk's matches are upserted AND rendered as they
+        // land, so the list fills in gradually instead of blocking on the whole set.
+        const batchId = `${clientInfo?.deviceId || 'dev'}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+        const chunks = buildRampedChunks(allItems, FIRST_SYNC_BATCH_SIZE, SYNC_BATCH_SIZE);
+        const total = chunks.length;
+        let lastParsed = null;
+
+        for (let index = 0; index < total; index++) {
+          const chunk = chunks[index];
+          const payload = { contacts: chunk, clientInfo, syncOptions, batch: { id: batchId, index, total } };
+
+          const rawResponse = await withRetry(
+            () => emitWithAckAndEvent('contact:sync', payload, 'contact:sync:response'),
+            3
+          );
+
+          const chunkParsed = parseSyncResponse(rawResponse);
+          const chunkDeduped = dedupeByNumberOrId(normalizeIncomingContacts(chunkParsed.contacts));
+          if (chunkDeduped.length) {
+            await ContactDatabase.upsertContacts(chunkDeduped);
+            // Progressive reveal, but don't reload the WHOLE table after every batch
+            // (that's O(n) each time → O(n²) for a big first sync). Repaint on the
+            // first batch (instant first contacts), then every 3rd, and at the end.
+            if (index === 0 || index % 3 === 0 || index === total - 1) await applyFromDB();
+          }
+
+          if (index === total - 1) lastParsed = chunkParsed;
+        }
+
+        // Only the final (isLast) response carries syncSessionId/stats.
+        parsed = lastParsed || parseSyncResponse(null);
+      }
+
+      // Remove server-side deleted contacts
+      if (parsed.changes?.removed?.length > 0) {
+        await ContactDatabase.removeContacts(parsed.changes.removed);
+      }
+
+      // Remove stale contacts no longer on device / SIM (keyed by E.164 number)
+      const currentDeviceNumbers = new Set(numbers.filter(Boolean));
+      if (currentDeviceNumbers.size > 0) {
+        await ContactDatabase.removeStaleContacts(currentDeviceNumbers).catch((err) =>
+          console.warn('[useContactSync] removeStaleContacts error:', err?.message)
+        );
+      }
+
+      // Save sync metadata. Contacts are PERMANENT now — no expiry. Resync is
+      // driven by the content hash changing, not by a TTL.
+      const refreshedAt = clampNumber(parsed.refreshedAt, Date.now());
+      await ContactDatabase.setSyncSessionId(parsed.syncSessionId);
+      await ContactDatabase.setLastSyncTime(refreshedAt);
+      await ContactDatabase.setContactsHash(contactsHash);
+      await ContactDatabase.setSyncMetadata({
+        syncSessionId: parsed.syncSessionId,
+        syncedAt: refreshedAt,
+        lastFullSync: refreshedAt,
+        lastSyncStatus: `full_sync_${reason}`,
+      });
+      await ContactDatabase.markInitialSyncDone();
+
+      setChanges(parsed.changes || { added: [], updated: [], removed: [], statusChanged: [] });
+      await AsyncStorage.removeItem(STORAGE_KEYS.PENDING_REFRESH);
+
+      // Final reload from SQLite
+      await applyFromDB();
+    } catch (err) {
+      if (mountedRef.current) setError(err?.message || 'Failed to sync contacts');
+      throw err;
+    } finally {
+      fullSyncInProgressRef.current = false;
+      if (mountedRef.current) {
+        setIsSyncing(false);
+        setIsExpiredUpdating(false);
+      }
+    }
+  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
+
+  // ─── DELTA SYNC (only added / removed numbers) ───
+  // After the first full sync, subsequent syncs send ONLY the numbers added since
+  // last time (+ a removed list) — not the whole phonebook. Adding one contact
+  // costs one small round-trip, not a full re-upload + re-match.
+  const runDeltaSync = useCallback(async ({ reason = 'delta', silent = true } = {}) => {
+    if (!socket?.emit) throw new Error('Socket not available for delta sync');
+
+    const e164Contacts = await getE164Contacts();
+    const numbers = e164Contacts.map((c) => c.phoneNumber);
+    const contactsHash = contactHasher.computeContactListHash(numbers);
+
+    // Nothing changed since last sync → ZERO network.
+    const prevHash = await ContactDatabase.getContactsHash();
+    if (prevHash && prevHash === contactsHash) {
+      await applyFromDB();
+      return;
+    }
+
+    // Diff the device set against what we already hold locally.
+    const existing = await ContactDatabase.getExistingNumbers(); // Set<E.164>
+    const deviceSet = new Set(numbers);
+    const added = e164Contacts.filter((c) => !existing.has(c.phoneNumber));
+    const removed = [...existing].filter((n) => !deviceSet.has(n));
+
+    // No structural change (e.g. only a saved-name edit) → just record the hash.
+    if (added.length === 0 && removed.length === 0) {
+      await ContactDatabase.setContactsHash(contactsHash);
       await applyFromDB();
       return;
     }
@@ -386,80 +570,69 @@ export const useContactSync = () => {
 
     try {
       const clientInfo = await getClientInfo();
-      const payload = {
-        contacts: hashed.map(contact => ({
-          id: contact.id,
-          originalId: contact.id,
-          // Upload the device-saved contact name so the backend can persist it
-          // (Mongo ContactSync + Redis cache) and other surfaces resolve the same
-          // name. Matching is still done purely by hashed phone; the name is just
-          // the label the user has saved for this number.
-          fullName: contact.fullName || null,
-          hash: contact.hash,
-          salt: contact.salt,
-          algorithm: contact.algorithm,
-          // Already computed during hashing (cached) — no per-contact re-encrypt.
-          encryptNumber: contact.encryptNumber || null,
-        })),
-        clientInfo,
-        syncOptions: { fullSync: true, overwrite: false },
+      const toPayloadItem = (c) => ({ id: c.id, originalId: c.id, fullName: c.fullName || null, phoneNumber: c.phoneNumber });
+      const addedItems = added.map(toPayloadItem);
+
+      const applyResponse = async (parsed) => {
+        const deduped = dedupeByNumberOrId(normalizeIncomingContacts(parsed.contacts));
+        if (deduped.length) await ContactDatabase.upsertContacts(deduped);
       };
 
-      const rawResponse = await withRetry(
-        () => emitWithAckAndEvent('contact:sync', payload, 'contact:sync:response'),
-        3
-      );
-
-      const parsed = parseSyncResponse(rawResponse);
-      const normalized = normalizeIncomingContacts(parsed.contacts);
-      const deduped = dedupeByHashOrId(normalized);
-
-      // Write to SQLite
-      await ContactDatabase.upsertContacts(deduped);
-
-      // Remove server-side deleted contacts
-      if (parsed.changes?.removed?.length > 0) {
-        await ContactDatabase.removeContacts(parsed.changes.removed);
-      }
-
-      // Remove stale contacts no longer on device / SIM
-      const currentDeviceHashes = new Set(hashed.map((c) => c.hash).filter(Boolean));
-      if (currentDeviceHashes.size > 0) {
-        await ContactDatabase.removeStaleContacts(currentDeviceHashes).catch((err) =>
-          console.warn('[useContactSync] removeStaleContacts error:', err?.message)
+      if (addedItems.length <= SYNC_BATCH_SIZE) {
+        // Single frame carries the added set, the removed list, and the full hash.
+        const payload = {
+          contacts: addedItems,
+          removedContacts: removed,
+          syncOptions: { incremental: true },
+          contactsHash,
+          clientInfo,
+        };
+        const rawResponse = await withRetry(
+          () => emitWithAckAndEvent('contact:sync', payload, 'contact:sync:response'),
+          3
         );
+        await applyResponse(parseSyncResponse(rawResponse));
+      } else {
+        // Rare: a huge number of contacts added at once → stream the added set.
+        const batchId = `${clientInfo?.deviceId || 'dev'}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+        const total = Math.ceil(addedItems.length / SYNC_BATCH_SIZE);
+        for (let index = 0; index < total; index++) {
+          const chunk = addedItems.slice(index * SYNC_BATCH_SIZE, (index + 1) * SYNC_BATCH_SIZE);
+          const isLast = index === total - 1;
+          const payload = {
+            contacts: chunk,
+            syncOptions: { incremental: true },
+            batch: { id: batchId, index, total },
+            // removed list + full hash only on the final frame.
+            ...(isLast ? { removedContacts: removed, contactsHash } : {}),
+            clientInfo,
+          };
+          const rawResponse = await withRetry(
+            () => emitWithAckAndEvent('contact:sync', payload, 'contact:sync:response'),
+            3
+          );
+          await applyResponse(parseSyncResponse(rawResponse));
+        }
       }
 
-      // Save sync metadata
-      const refreshedAt = clampNumber(parsed.refreshedAt, Date.now());
-      const expiresMs = parseExpiresInToMs(parsed.expiresIn);
-      await ContactDatabase.setSyncSessionId(parsed.syncSessionId);
-      await ContactDatabase.setLastSyncTime(refreshedAt);
-      await ContactDatabase.setSyncMetadata({
-        syncSessionId: parsed.syncSessionId,
-        syncedAt: refreshedAt,
-        expiresIn: parsed.expiresIn,
-        expiresAt: expiresMs > 0 ? refreshedAt + expiresMs : null,
-        lastFullSync: refreshedAt,
-        lastSyncStatus: `full_sync_${reason}`,
-      });
-      await ContactDatabase.markInitialSyncDone();
+      // Drop removed contacts locally.
+      if (removed.length) await ContactDatabase.removeContacts(removed);
 
-      setChanges(parsed.changes || { added: [], updated: [], removed: [], statusChanged: [] });
-      await AsyncStorage.removeItem(STORAGE_KEYS.PENDING_REFRESH);
+      // Record the new full-set hash + sync time.
+      const now = Date.now();
+      await ContactDatabase.setContactsHash(contactsHash);
+      await ContactDatabase.setLastSyncTime(now);
+      const prevMeta = (await ContactDatabase.getSyncMetadata()) || {};
+      await ContactDatabase.setSyncMetadata({ ...prevMeta, syncedAt: now, lastSyncStatus: `delta_${reason}` });
 
-      // Reload UI from SQLite
       await applyFromDB();
     } catch (err) {
       if (mountedRef.current) setError(err?.message || 'Failed to sync contacts');
       throw err;
     } finally {
-      if (mountedRef.current) {
-        setIsSyncing(false);
-        setIsExpiredUpdating(false);
-      }
+      if (mountedRef.current) setIsSyncing(false);
     }
-  }, [socket, getHashedContacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
+  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
 
   // ─── INCREMENTAL REFRESH ───
 
@@ -495,7 +668,7 @@ export const useContactSync = () => {
 
       const parsed = parseSyncResponse(rawResponse);
       const normalizedIncoming = normalizeIncomingContacts(parsed.contacts);
-      const deduped = dedupeByHashOrId(normalizedIncoming);
+      const deduped = dedupeByNumberOrId(normalizedIncoming);
 
       // Upsert new/updated contacts into SQLite
       if (deduped.length > 0) {
@@ -549,6 +722,57 @@ export const useContactSync = () => {
     }
   }, [socket, getDeviceId, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB, runFullSync]);
 
+  // ─── FAST FIRST-PAINT PREVIEW ───
+  // Parse + send ONLY the first `limit` device contacts so the earliest matches
+  // render in ~1-2s, instead of waiting for the WHOLE phonebook to be normalized to
+  // E.164 (the dominant client cost on a large first sync). Uses an INCREMENTAL sync
+  // so it MERGES (non-destructive) into the server's ContactSync — the authoritative
+  // full sync runs right after in the background. Returns how many contacts it
+  // rendered so the caller knows whether anything is on screen yet.
+  const runPreviewSync = useCallback(async ({ limit = PREVIEW_SYNC_SIZE } = {}) => {
+    if (!socket?.emit) return 0;
+
+    const freshContacts = await readFreshDeviceContacts();
+    if (!freshContacts.length) return 0;
+
+    // Normalize just the head of the phonebook to E.164 (cheap — a few dozen parses).
+    const seen = new Set();
+    const items = [];
+    for (const contact of freshContacts) {
+      if (items.length >= limit) break;
+      const rawNumbers = (contact.phoneNumbers || []).map(p => p?.number).filter(Boolean);
+      if (contact.phoneNumber) rawNumbers.push(contact.phoneNumber);
+      for (const rawPhone of rawNumbers) {
+        const e164 = contactHasher.toE164(String(rawPhone));
+        if (!e164 || seen.has(e164)) continue;
+        seen.add(e164);
+        items.push({ id: contact.id || e164, originalId: contact.id || e164, fullName: contact.name || null, phoneNumber: e164 });
+        if (items.length >= limit) break;
+      }
+    }
+    if (!items.length) return 0;
+
+    const clientInfo = await getClientInfo();
+    // Incremental so it merges (server does existing ∪ added) rather than replacing
+    // the stored set with just these `limit`. No contactsHash sent → the client-side
+    // delta short-circuit stays unset until the full sync records the real full hash.
+    const rawResponse = await withRetry(
+      () => emitWithAckAndEvent(
+        'contact:sync',
+        { contacts: items, clientInfo, syncOptions: { incremental: true } },
+        'contact:sync:response'
+      ),
+      2
+    );
+    const parsed = parseSyncResponse(rawResponse);
+    const deduped = dedupeByNumberOrId(normalizeIncomingContacts(parsed.contacts));
+    if (deduped.length) {
+      await ContactDatabase.upsertContacts(deduped);
+      await applyFromDB();
+    }
+    return deduped.length;
+  }, [socket, readFreshDeviceContacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
+
   // ─── MAIN ENTRY: syncContacts (called on screen open) ───
 
   const syncContacts = useCallback(async ({ reason = 'screen_open' } = {}) => {
@@ -567,35 +791,45 @@ export const useContactSync = () => {
         return;
       }
 
-      // Step 2: First time ever → full sync
+      // Step 2: First time ever → fast preview then background full sync.
+      // Phase 1 (awaited): parse + send only the first PREVIEW_SYNC_SIZE contacts so
+      // the list appears in ~1-2s. Phase 2 (background, NOT awaited): the full
+      // phonebook syncs, finalizes, and marks initial-sync done. If the preview
+      // showed nothing (failed / no matches yet), fall back to awaiting the full
+      // sync so the user isn't left on an empty screen.
       if (!initialDone) {
-        await runFullSync({ reason: `${reason}_first_time`, silent: false });
+        let previewCount = 0;
+        try {
+          previewCount = await runPreviewSync({ limit: PREVIEW_SYNC_SIZE });
+        } catch (err) {
+          console.warn('[useContactSync] preview sync failed:', err?.message);
+        }
+
+        const fullSyncPromise = runFullSync({ reason: `${reason}_first_time`, silent: previewCount > 0 })
+          .catch((err) => console.warn('[useContactSync] background full sync failed:', err?.message));
+
+        // Nothing on screen yet → wait for the full sync; otherwise let it run in
+        // the background while the previewed contacts are already visible.
+        if (previewCount === 0) await fullSyncPromise;
         return;
       }
 
-      // Step 3: Check if metadata expired
-      const metadata = await ContactDatabase.getSyncMetadata();
-      const isExpired = metadata?.expiresAt ? Date.now() >= Number(metadata.expiresAt) : false;
-
-      if (isExpired) {
-        if (mountedRef.current) setIsExpiredUpdating(true);
-        await runFullSync({ reason: `${reason}_expired`, silent: false });
-        return;
-      }
-
-      // Step 4: Has cached + not expired → silent background refresh for delta
-      runRefresh({ reason: `${reason}_silent`, silent: true, fallbackToSync: true, incremental: true })
-        .catch((err) => console.warn('[useContactSync] silent refresh failed:', err?.message));
+      // Step 3: Already synced once → DELTA sync. Sends only numbers added/removed
+      // since last time (zero network if nothing changed). Silent so an unchanged
+      // open is invisible. Contacts are permanent — no TTL expiry.
+      runDeltaSync({ reason, silent: true })
+        .catch((err) => console.warn('[useContactSync] delta sync failed:', err?.message));
     } finally {
       screenOpenSyncInProgressRef.current = false;
       if (mountedRef.current) setIsInitialLoading(false);
     }
-  }, [applyFromDB, isConnected, runFullSync, runRefresh]);
+  }, [applyFromDB, isConnected, runFullSync, runDeltaSync, runPreviewSync]);
 
   // ─── PUBLIC: refreshContacts (pull-to-refresh) ───
-  // Always does a FULL sync so new device contacts (added since last sync) are discovered.
-  // The incremental runRefresh only handles server-side changes — it never sends device
-  // contact hashes, so new phone numbers would never appear.
+  // Delta sync: re-reads the device phonebook and sends only what changed (added /
+  // removed) — fast, not a full re-upload. First-ever run still falls back to a
+  // full sync. Contacts that JOINED since last sync flip live via the
+  // `contact:registered` push, so a manual refresh doesn't need a full re-match.
 
   const refreshContacts = useCallback(async ({ fallbackToSync = true } = {}) => {
     if (!isConnected) {
@@ -606,10 +840,10 @@ export const useContactSync = () => {
     // Re-read device contacts fresh (picks up any newly added numbers)
     try { await askPermissionAndLoadContacts?.(); } catch {}
 
-    // Always full sync: hashes ALL device contacts and sends to server.
-    // Server returns the complete matched list including any new contacts.
-    return runFullSync({ reason: 'pull_to_refresh', silent: false });
-  }, [isConnected, runFullSync, askPermissionAndLoadContacts]);
+    const initialDone = await ContactDatabase.isInitialSyncDone();
+    if (!initialDone) return runFullSync({ reason: 'pull_to_refresh_first', silent: false });
+    return runDeltaSync({ reason: 'pull_to_refresh', silent: false });
+  }, [isConnected, runFullSync, runDeltaSync, askPermissionAndLoadContacts]);
 
   // ─── PUBLIC: processContacts ───
 
@@ -627,8 +861,8 @@ export const useContactSync = () => {
 
   // ─── DISCOVER + INVITE (unchanged logic) ───
 
-  const discoverContact = useCallback((contactHash) => {
-    if (!socket?.emit || !contactHash) return Promise.reject(new Error('Invalid contact hash'));
+  const discoverContact = useCallback((phoneNumber) => {
+    if (!socket?.emit || !phoneNumber) return Promise.reject(new Error('Invalid phone number'));
     if (mountedRef.current) setIsSyncing(true);
     setDiscoverResponse(null);
 
@@ -655,7 +889,7 @@ export const useContactSync = () => {
       };
 
       responseEvents.forEach(e => socket?.once?.(e, handleResponse));
-      socket.emit('contact:discover', { contactHash }, (ack) => {
+      socket.emit('contact:discover', { phoneNumber }, (ack) => {
         if (ack?.error && !settled) {
           settled = true;
           clearTimeout(timeout);
@@ -730,14 +964,39 @@ export const useContactSync = () => {
       setInviteResponse(payload);
     };
 
+    // "X joined the app" — pushed by the backend when someone in our phonebook
+    // registers. Upsert them as a registered contact so they flip live without a
+    // resync, then refresh the UI from SQLite.
+    const handleContactRegistered = async (payload) => {
+      try {
+        const data = payload?.data || payload;
+        const phoneNumber = data?.phoneNumber || data?.normalizedPhone;
+        if (!phoneNumber) return;
+        const [normalized] = normalizeIncomingContacts([{
+          ...data,
+          phoneNumber,
+          type: 'registered',
+          userId: data?.userId || null,
+        }]);
+        if (normalized) {
+          await ContactDatabase.upsertContacts([normalized]);
+          await applyFromDB();
+        }
+      } catch (err) {
+        console.warn('[useContactSync] contact:registered handler error:', err?.message);
+      }
+    };
+
     socket.on('contact:sync:error', handleSyncError);
     socket.on('invitesent:response', handleInviteResponse);
+    socket.on('contact:registered', handleContactRegistered);
 
     return () => {
       socket?.off?.('contact:sync:error', handleSyncError);
       socket?.off?.('invitesent:response', handleInviteResponse);
+      socket?.off?.('contact:registered', handleContactRegistered);
     };
-  }, [socket]);
+  }, [socket, normalizeIncomingContacts, applyFromDB]);
 
   // ─── CLEAR HELPERS ───
 
