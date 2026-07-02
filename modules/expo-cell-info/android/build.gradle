@@ -1,0 +1,41 @@
+apply plugin: 'com.android.library'
+
+group = 'expo.modules.cellinfo'
+version = '1.0.0'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useExpoPublishing()
+
+// Inherit the app's SDK versions from the root project so this library always
+// matches the host app's compile/min/target SDK (avoids manifest-merge minSdk
+// conflicts). Falls back to sensible defaults if the root doesn't define them.
+buildscript {
+  ext.safeExtGet = { prop, fallback ->
+    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+  }
+}
+
+android {
+  namespace "expo.modules.cellinfo"
+  compileSdkVersion safeExtGet("compileSdkVersion", 35)
+  defaultConfig {
+    // getAllCellInfo() exists since API 17, but NR (5G) / TD-SCDMA identities
+    // are API 29+. We keep minSdk at the app level (24) and guard the 29+ code
+    // paths at runtime with Build.VERSION.SDK_INT checks.
+    minSdkVersion safeExtGet("minSdkVersion", 24)
+    targetSdkVersion safeExtGet("targetSdkVersion", 35)
+    versionCode 1
+    versionName "1.0.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+dependencies {
+  // ContextCompat.checkSelfPermission
+  implementation "androidx.core:core-ktx:1.13.1"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "expo-cell-info",
+  "version": "1.0.0",
+  "description": "Expo native module exposing Android TelephonyManager.getAllCellInfo() (LTE/NR/GSM/WCDMA/CDMA/TDSCDMA) to JavaScript.",
+  "main": "index.ts",
+  "private": true
+}

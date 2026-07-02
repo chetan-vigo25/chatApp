@@ -1,0 +1,18 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- getAllCellInfo() requires FINE location on Android 10+ (the OS treats cell
+       identifiers as location data). READ_PHONE_STATE is optional and only used
+       to enumerate per-SIM TelephonyManagers on dual-SIM devices. Declared here
+       in the module manifest so the permissions ship with the module and are
+       merged into the app manifest at build time (no config-plugin needed).
+       ACCESS_COARSE_LOCATION is declared as a companion; some OEMs surface the
+       coarse toggle in the runtime dialog. -->
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+  <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+  <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+
+  <!-- Ensures the app is still installable on tablets / Wi-Fi-only devices that
+       have no telephony radio; getAllCellInfo() simply returns []. -->
+  <uses-feature
+    android:name="android.hardware.telephony"
+    android:required="false" />
+</manifest>

@@ -2,7 +2,7 @@ import React from 'react';
 import { View, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
 import { WebView } from 'react-native-webview';
-import { WEB_URL, BACKEND_URL } from '@env';
+import { WEB_PAGE_URL, BACKEND_URL } from '@env';
 import { FontAwesome6 } from '@expo/vector-icons';
 
 
@@ -10,7 +10,8 @@ export default function Privacy({ navigation }) {
   const { theme } = useTheme();
 
   // Strip any trailing slash so we never produce a double "//" or a missing "/".
-  const privacyUrl = `${(WEB_URL || '').replace(/\/+$/, '')}/webview/privacy-policy`;
+  const privacyUrl = `${(WEB_PAGE_URL || '').replace(/\/+$/, '')}/webview/privacy-policy`;
+  console.log('Privacy URL:', privacyUrl); // Log the constructed URL for debugging
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
@@ -21,7 +22,7 @@ export default function Privacy({ navigation }) {
         <Text style={{ color: theme.colors.primaryTextColor, fontSize:16, fontFamily:'Roboto-Regular' }} >Privacy</Text>
       </View>
       <WebView
-        source={{ uri: `${WEB_URL}/webview/privacy-policy` }}
+        source={{ uri: `${WEB_PAGE_URL}/webview/privacy-policy` }}
         style={{ flex:1 }}
         startInLoadingState={true}  // shows a loader while loading
       />

@@ -24,6 +24,7 @@ import NoInternet from './src/screens/NoInternet';
 import { CallProvider } from './src/calls/CallProvider';
 import CallContentInset from './src/calls/components/CallContentInset';
 import AppLockGate from './src/components/AppLockGate';
+import { CellInfoModule } from 'expo-cell-info';
 
 import 'react-native-gesture-handler';
 
@@ -69,13 +70,68 @@ export default function App() {
         } catch (error) {
           console.error('FCM setup error:', error);
         }
+
+        // AFTER notification permission has been asked/resolved above (getFCMToken
+        // → requestNotificationPermission awaits the POST_NOTIFICATIONS dialog),
+        // request location + read the serving cell. Running it here — rather than
+        // in a parallel effect — guarantees the two runtime dialogs appear one at
+        // a time (Android shows only one at once; racing them dropped the
+        // notification prompt and hung the location request).
+        await logCellInfo();
       };
+
+      // Reads the serving cell tower(s) and logs the cell IDs. Android-only;
+      // no-op on iOS / Expo Go. Requests FINE location if not already granted.
+      const logCellInfo = async () => {
+        try {
+          const available = CellInfoModule.isAvailable();
+          console.log('CellInfo: isAvailable =', available);
+          if (!available) {
+            console.log('CellInfo: native module missing — rebuild with `npx expo run:android` (Android-only, not Expo Go)');
+            return;
+          }
+
+          if (!CellInfoModule.hasPermissions()) {
+            const perm = await CellInfoModule.requestPermissionsAsync();
+            console.log('CellInfo: permission result =', perm);
+            // Gate on FINE location ONLY. hasPermissions() checks just
+            // ACCESS_FINE_LOCATION, whereas perm.granted is an aggregate that
+            // also folds in the optional READ_PHONE_STATE — so perm.granted can
+            // read false even when location itself was granted. Re-checking here
+            // avoids that false negative. If this is still false, the user picked
+            // "Approximate" (coarse) — getAllCellInfo needs "Precise".
+            if (!CellInfoModule.hasPermissions()) {
+              console.log('CellInfo: FINE location not granted — pick "Precise" in the dialog');
+              return;
+            }
+          }
+
+          const cells = await CellInfoModule.getAllCellInfo({ includeNeighbors: false });
+          console.log(`CellInfo: got ${cells.length} serving cell(s) ->`, cells);
+          if (cells.length === 0) {
+            console.log('CellInfo: empty — likely an emulator/no SIM (no cellular modem)');
+          }
+
+          cells.forEach((c) => {
+            // The "cell id" field name differs per radio type.
+            const cellId = c.ci ?? c.cid ?? c.nci ?? c.basestationId ?? null;
+            console.log(
+              `CellInfo[${c.cellType}] id=${cellId} pci=${c.pci ?? '-'} ` +
+              `mcc/mnc=${c.mcc ?? '-'}/${c.mnc ?? '-'} ` +
+              `dbm=${c.dbm ?? '-'} (${c.signalStrength})`
+            );
+          });
+        } catch (error) {
+          console.error('CellInfo error:', error?.code, error?.message);
+        }
+      };
+
       setup();
       return () => {
         if (cleanup) cleanup();
         if (notifeeCleanup) notifeeCleanup();
       };
-    }, []); 
+    }, []);
 
   return (
     <SafeAreaProvider>

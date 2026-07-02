@@ -1,0 +1,36 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="expo.modules.cellinfo" >
+4
+5    <uses-sdk android:minSdkVersion="24" />
+6    <!--
+7       getAllCellInfo() requires FINE location on Android 10+ (the OS treats cell
+8       identifiers as location data). READ_PHONE_STATE is optional and only used
+9       to enumerate per-SIM TelephonyManagers on dual-SIM devices. Declared here
+10       in the module manifest so the permissions ship with the module and are
+11       merged into the app manifest at build time (no config-plugin needed).
+12       ACCESS_COARSE_LOCATION is declared as a companion; some OEMs surface the
+13       coarse toggle in the runtime dialog.
+14    -->
+15    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+15-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:9:3-77
+15-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:9:20-74
+16    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:10:3-79
+16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:10:20-76
+17    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+17-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:11:3-73
+17-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:11:20-70
+18
+19    <!--
+20       Ensures the app is still installable on tablets / Wi-Fi-only devices that
+21       have no telephony radio; getAllCellInfo() simply returns [].
+22    -->
+23    <uses-feature
+23-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:15:3-17:32
+24        android:name="android.hardware.telephony"
+24-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:16:5-46
+25        android:required="false" />
+25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-cell-info/android/src/main/AndroidManifest.xml:17:5-29
+26
+27</manifest>
