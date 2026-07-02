@@ -2704,6 +2704,14 @@ export function RealtimeChatProvider({ children }) {
         const replySenderName = source?.replySenderName || source?.quotedSender
           || (srcReplyIsObj ? (srcReplyTo.senderName || srcReplyTo.sender?.fullName) : null) || null;
 
+        // Status reply / share snapshot — the status owner (receiver) is almost
+        // never inside the chat when a status reply lands, so THIS global path is
+        // what persists it. Without these fields the row is saved plain-text and
+        // the StatusReplyPreview card is missing when the receiver opens the chat.
+        const statusPreview = source?.statusPreview || normalized?.statusPreview || null;
+        const statusRef = source?.statusRef || source?.statusRefId || normalized?.statusRef
+          || (statusPreview && (statusPreview.statusId || statusPreview._id)) || null;
+
         // [2] About to persist this message to SQLite.
         dlog('💾 storing message in SQLite', {
           id: msgId,
@@ -2742,6 +2750,10 @@ export function RealtimeChatProvider({ children }) {
           replyPreviewType,
           replySenderName,
           replySenderId,
+          // Persist the status snapshot so the reply's status card renders when
+          // the receiver opens the chat later (loaded back from SQLite payload).
+          statusRef,
+          statusPreview,
         }).then(async () => {
           // [3] Write landed — report how many rows this chatId now holds in SQLite.
           if (DEBUG_MSG_STORE) {
@@ -3341,10 +3353,28 @@ export function RealtimeChatProvider({ children }) {
           } catch { return { chatId, lastSeq: 0 }; }
         }));
 
-        socket.emit('message:sync:catchup', { chats: entries }, async (response) => {
-          const payload = response?.data || response || {};
-          const chats = Array.isArray(payload?.chats) ? payload.chats : [];
+        // One catch-up round-trip. Resolves from EITHER the Socket.IO ack
+        // callback (servers that honor it) or the `message:sync:catchup:response`
+        // event (the wrapHandler convention) — older servers NEVER invoked the
+        // ack callback, which silently killed this entire reconnect catch-up
+        // path (messages that arrived while the app was killed only surfaced
+        // on the next per-chat open). Whichever arrives first wins.
+        const emitCatchupRound = (entriesArg) => new Promise((resolve) => {
+          let settled = false;
+          const finish = (response) => {
+            if (settled) return;
+            settled = true;
+            try { socket.off('message:sync:catchup:response', finish); } catch {}
+            clearTimeout(timer);
+            const payload = response?.data || response || {};
+            resolve(Array.isArray(payload?.chats) ? payload.chats : null);
+          };
+          const timer = setTimeout(() => finish(null), 20000);
+          socket.on('message:sync:catchup:response', finish);
+          socket.emit('message:sync:catchup', { chats: entriesArg }, finish);
+        });
 
+        const processCatchupChats = async (chats) => {
           for (const entry of chats) {
             if (!entry || !entry.chatId) continue;
             const newMessages = Array.isArray(entry.newMessages) ? entry.newMessages : [];
@@ -3415,7 +3445,22 @@ export function RealtimeChatProvider({ children }) {
               } catch {}
             }
           }
-        });
+        };
+
+        // Continuation loop: the server caps each round at 200 messages per
+        // chat and flags the overflow with { hasMore, latestSeq }. Re-issue
+        // only the overflowing chats with the advanced cursor so a large
+        // offline backlog fully converges (bounded to keep a hostile/buggy
+        // server from looping us forever).
+        let pending = entries;
+        for (let round = 0; round < 10 && pending.length > 0; round += 1) {
+          const chats = await emitCatchupRound(pending);
+          if (!chats) break; // timeout / old server — per-chat message:sync remains the fallback
+          await processCatchupChats(chats);
+          pending = chats
+            .filter((c) => c && c.chatId && c.hasMore === true && Number(c.latestSeq) > 0)
+            .map((c) => ({ chatId: c.chatId, lastSeq: Number(c.latestSeq) }));
+        }
       } catch (err) {
         // Best-effort — catchup is a non-essential reconciliation path.
       }

@@ -558,24 +558,42 @@ const SwipeReplyRow = React.memo(function SwipeReplyRow({ isMyMessage, disabled,
   );
 });
 
-// ── Smooth seekable audio progress bar ──
+// Deterministic pseudo-waveform bar heights (0.15..1) from a stable seed string
+// (the message id) so the bars look identical on every render and across the two
+// participants, without needing real amplitude data. Envelope keeps the middle
+// bars a touch taller for a natural WhatsApp voice-note shape.
+const makeWaveBars = (seed, count) => {
+  let h = 2166136261;
+  const s = String(seed || 'a');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  let x = (h >>> 0) || 1;
+  const bars = [];
+  for (let i = 0; i < count; i++) {
+    x = (Math.imul(x, 1103515245) + 12345) & 0x7fffffff;
+    const r = (x % 1000) / 1000; // 0..1
+    const env = Math.sin((i / Math.max(1, count - 1)) * Math.PI); // taller mid
+    const v = 0.2 + r * 0.8 * (0.45 + 0.55 * env);
+    bars.push(Math.max(0.15, Math.min(1, v)));
+  }
+  return bars;
+};
+
+// ── WhatsApp-style seekable voice-note waveform ──
 const AudioSeekBar = React.memo(function AudioSeekBar({
   isThisPlaying, isDownloading, totalMs, seekRatio, progress,
-  trackBg, trackFill, subColor, posLabel, durLabel, dlStatus, onSeek,
+  trackBg, trackFill, subColor, posLabel, durLabel, dlStatus, onSeek, seedKey,
 }) {
-  const trackWidthRef = useRef(0);
+  const widthRef = useRef(0);
   const canSeekRef = useRef(false);
   const onSeekRef = useRef(onSeek);
   const totalMsRef = useRef(totalMs);
-  const isDraggingRef = useRef(false);
-  const dragRatioRef = useRef(0);
+  const draggingRef = useRef(false);
 
-  // fillAnim  → drives fill bar width (JS driver only, layout prop)
-  // thumbScale → drives thumb grow/shrink (native driver only, transform)
-  // thumbPx    → plain state for thumb left position (avoids mixing drivers)
-  const fillAnim = useRef(new Animated.Value(0)).current;
-  const thumbScale = useRef(new Animated.Value(1)).current;
-  const [thumbPx, setThumbPx] = useState(0);
+  const [trackW, setTrackW] = useState(0);
+  const [displayRatio, setDisplayRatio] = useState(0);
   const [dragLabel, setDragLabel] = useState(null);
 
   const canSeek = isThisPlaying && totalMs > 0;
@@ -583,29 +601,24 @@ const AudioSeekBar = React.memo(function AudioSeekBar({
   onSeekRef.current = onSeek;
   totalMsRef.current = totalMs;
 
-  // Sync fill to playback position when not dragging
+  // Follow playback position when the user isn't actively scrubbing. Guard with
+  // a functional equality bail so an unchanged ratio never triggers a redundant
+  // re-render (prevents any setState feedback loop).
   useEffect(() => {
-    if (isDraggingRef.current) return;
-    const w = trackWidthRef.current;
-    if (w > 0) {
-      const px = seekRatio * w;
-      fillAnim.setValue(px);
-      setThumbPx(px);
-    }
-  }, [seekRatio, fillAnim]);
+    if (draggingRef.current) return;
+    setDisplayRatio((prev) => (prev === seekRatio ? prev : seekRatio));
+  }, [seekRatio]);
 
-  const clampPx = (px) => Math.min(Math.max(px, 0), trackWidthRef.current || 1);
+  const BAR_W = 2.6;
+  const BAR_GAP = 2;
+  const BAR_MAX_H = 22;
+  const barCount = Math.max(14, Math.floor((trackW || 150) / (BAR_W + BAR_GAP)));
+  const bars = useMemo(() => makeWaveBars(seedKey, barCount), [seedKey, barCount]);
 
+  const ratioFromX = (x) => Math.min(1, Math.max(0, x / (widthRef.current || 1)));
   const formatMsLabel = (ms) => {
-    const s = Math.floor(ms / 1000);
+    const s = Math.floor((ms || 0) / 1000);
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-  };
-
-  const setPosition = (px) => {
-    fillAnim.setValue(px);
-    setThumbPx(px);
-    dragRatioRef.current = px / (trackWidthRef.current || 1);
-    setDragLabel(formatMsLabel(dragRatioRef.current * totalMsRef.current));
   };
 
   const panResponder = useMemo(() => PanResponder.create({
@@ -613,116 +626,102 @@ const AudioSeekBar = React.memo(function AudioSeekBar({
     onMoveShouldSetPanResponder: (_, gs) => canSeekRef.current && Math.abs(gs.dx) > 1,
     onPanResponderGrant: (evt) => {
       if (!canSeekRef.current) return;
-      isDraggingRef.current = true;
-      setPosition(clampPx(evt.nativeEvent.locationX));
-      Animated.spring(thumbScale, { toValue: 1.4, useNativeDriver: true, friction: 8, tension: 200 }).start();
+      draggingRef.current = true;
+      const r = ratioFromX(evt.nativeEvent.locationX);
+      setDisplayRatio(r);
+      setDragLabel(formatMsLabel(r * totalMsRef.current));
     },
     onPanResponderMove: (evt) => {
-      if (!isDraggingRef.current) return;
-      setPosition(clampPx(evt.nativeEvent.locationX));
+      if (!draggingRef.current) return;
+      const r = ratioFromX(evt.nativeEvent.locationX);
+      setDisplayRatio(r);
+      setDragLabel(formatMsLabel(r * totalMsRef.current));
     },
-    onPanResponderRelease: () => {
-      if (!isDraggingRef.current) return;
-      isDraggingRef.current = false;
-      Animated.spring(thumbScale, { toValue: 1, useNativeDriver: true, friction: 8, tension: 200 }).start();
+    onPanResponderRelease: (evt) => {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      const r = ratioFromX(evt.nativeEvent.locationX);
+      setDisplayRatio(r);
       setDragLabel(null);
-      onSeekRef.current?.(dragRatioRef.current);
+      onSeekRef.current?.(r);
     },
     onPanResponderTerminate: () => {
-      isDraggingRef.current = false;
-      Animated.spring(thumbScale, { toValue: 1, useNativeDriver: true, friction: 8, tension: 200 }).start();
+      draggingRef.current = false;
       setDragLabel(null);
     },
-  }), [fillAnim, thumbScale]);
+  }), []);
 
-  // Tap-to-seek
-  const handleTapSeek = useCallback((evt) => {
-    if (!canSeekRef.current || isDraggingRef.current) return;
-    const px = clampPx(evt.nativeEvent.locationX);
-    const ratio = px / (trackWidthRef.current || 1);
-    Animated.timing(fillAnim, { toValue: px, duration: 100, useNativeDriver: false }).start();
-    setThumbPx(px);
-    onSeekRef.current?.(ratio);
-  }, [fillAnim]);
-
-  const showThumb = canSeek || (isThisPlaying && seekRatio > 0);
-  const shownPosLabel = dragLabel !== null ? dragLabel : posLabel;
+  // While downloading, fill the bars to the download progress; otherwise to the
+  // playback / scrub position.
+  const fillRatio = isDownloading ? Math.max(0, Math.min(1, progress || 0)) : displayRatio;
+  const showThumb = canSeek || (isThisPlaying && displayRatio > 0);
+  const shownPosLabel = dragLabel !== null
+    ? dragLabel
+    : (isThisPlaying ? posLabel : durLabel);
 
   return (
     <View style={{ flex: 1, marginLeft: 10 }}>
       <View
         onLayout={(e) => {
-          const newW = e.nativeEvent.layout.width;
-          trackWidthRef.current = newW;
-          if (!isDraggingRef.current) {
-            const px = seekRatio * newW;
-            fillAnim.setValue(px);
-            setThumbPx(px);
-          }
+          const w = Math.round(e.nativeEvent.layout.width);
+          widthRef.current = w;
+          // Integer + functional bail: identical/near-identical layout widths
+          // never cause a re-render, so bar-count churn can't feed back a loop.
+          setTrackW((prev) => (prev === w ? prev : w));
         }}
         {...panResponder.panHandlers}
-        onTouchEnd={handleTapSeek}
-        style={{ height: 28, justifyContent: 'center' }}
+        style={{ height: 30, justifyContent: 'center' }}
       >
-        {/* Track bg */}
-        <View style={{ height: 3.5, borderRadius: 3, backgroundColor: trackBg, overflow: 'hidden' }}>
-          {isDownloading ? (
-            <View style={{
-              width: `${Math.round(Math.max(6, progress * 100))}%`,
-              height: 3.5, borderRadius: 3, backgroundColor: trackFill,
-            }} />
-          ) : (
-            <Animated.View style={{
-              width: fillAnim,
-              maxWidth: '100%',
-              height: 3.5, borderRadius: 3, backgroundColor: trackFill,
-            }} />
-          )}
+        {/* Waveform bars */}
+        <View style={{ flexDirection: 'row', alignItems: 'center', height: BAR_MAX_H }}>
+          {bars.map((bh, i) => {
+            const filled = (i + 0.5) / barCount <= fillRatio;
+            return (
+              <View
+                key={i}
+                style={{
+                  width: BAR_W,
+                  marginRight: BAR_GAP,
+                  height: Math.max(3, bh * BAR_MAX_H),
+                  borderRadius: BAR_W,
+                  backgroundColor: filled ? trackFill : trackBg,
+                }}
+              />
+            );
+          })}
         </View>
 
-        {/* Thumb — plain View for position, Animated.View only for native scale */}
-        {showThumb && (
+        {/* Playhead dot */}
+        {showThumb && trackW > 0 && (
           <View
             pointerEvents="none"
             style={{
               position: 'absolute',
-              left: thumbPx - 6,
-              top: 8,
+              left: Math.min(trackW - 6, Math.max(-6, fillRatio * trackW - 6)),
+              top: 9,
               width: 12,
               height: 12,
+              borderRadius: 6,
+              backgroundColor: trackFill,
+              elevation: 2,
+              shadowColor: '#000',
+              shadowOffset: { width: 0, height: 1 },
+              shadowOpacity: 0.18,
+              shadowRadius: 1.5,
             }}
-          >
-            <Animated.View
-              style={{
-                width: 12,
-                height: 12,
-                borderRadius: 6,
-                backgroundColor: trackFill,
-                transform: [{ scale: thumbScale }],
-                elevation: 2,
-                shadowColor: '#000',
-                shadowOffset: { width: 0, height: 1 },
-                shadowOpacity: 0.18,
-                shadowRadius: 1.5,
-              }}
-            />
-          </View>
+          />
         )}
       </View>
 
-      {/* Time labels */}
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Roboto-Regular' }}>
-          {isDownloading
-            ? `${Math.round(progress * 100)}%`
-            : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
-              ? 'Failed'
-              : shownPosLabel}
-        </Text>
-        <Text style={{ color: subColor, fontSize: 10, fontFamily: 'Roboto-Regular' }}>
-          {isDownloading ? 'downloading...' : durLabel}
-        </Text>
-      </View>
+      {/* Single duration/elapsed label (WhatsApp shows total when idle, elapsed
+          while playing). Message time + ticks come from the media time overlay. */}
+      <Text style={{ color: subColor, fontSize: 11, fontFamily: 'Roboto-Regular', marginTop: 1 }}>
+        {isDownloading
+          ? `${Math.round((progress || 0) * 100)}%`
+          : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
+            ? 'Failed'
+            : shownPosLabel}
+      </Text>
     </View>
   );
 });
@@ -1689,6 +1688,14 @@ export default function ChatScreen({ navigation, route }) {
   // The server rejects sends too; this just gives immediate feedback.
   const amBlocked = useSelector((s) => s?.profile?.isBlocked);
 
+  // My avatar — shown on the sender side of a voice-note bubble (WhatsApp shows
+  // the SENDER's avatar with a mic badge next to the waveform).
+  const myProfileImage = useSelector((s) =>
+    s?.profile?.profileData?.profileImage
+    || s?.profile?.profileData?.profileImageThumbnailUrl
+    || null,
+  );
+
   // User-to-user (contact) block state for this 1-1 chat. `iBlockedPeer` hides
   // the composer with an Unblock CTA; `peerBlockedMe` silently disables sending.
   const chatPeerId = chatData?.peerUser?._id || chatData?.peerUserId || null;
@@ -1998,16 +2005,20 @@ export default function ChatScreen({ navigation, route }) {
     // Stop previous audio
     await stopCurrentAudio();
 
-    // Resolve URI
+    // Resolve URI. For received notes we STREAM from the remote URL when the
+    // file isn't downloaded yet (WhatsApp-style) instead of blocking on a full
+    // download — expo-av plays remote https progressively.
     const isSender = msg?.senderType === 'self' || msg?.senderId === currentUserId;
     let uri = null;
 
     if (isSender) {
-      uri = msg?.localUri || msg?.payload?.file?.uri || resolveDownloadedUri(msg) || msg?.mediaUrl;
+      uri = msg?.localUri || msg?.payload?.file?.uri || resolveDownloadedUri(msg) || toSecureMediaUri(msg?.mediaUrl) || msg?.mediaUrl;
     } else {
-      uri = resolveDownloadedUri(msg) || msg?.localUri;
+      // Prefer an already-downloaded local file (instant + offline); otherwise
+      // stream straight from the secure remote URL.
+      uri = resolveDownloadedUri(msg) || msg?.localUri || toSecureMediaUri(msg?.mediaUrl);
       if (!uri) {
-        // Need to download first
+        // No remote URL either — fall back to the download-then-open path.
         uri = await resolveFileForOpen(msg);
       }
     }
@@ -2026,7 +2037,9 @@ export default function ChatScreen({ navigation, route }) {
 
       const { sound } = await Audio.Sound.createAsync(
         { uri },
-        { shouldPlay: true },
+        // progressUpdateIntervalMillis 60ms → the waveform playhead advances
+        // smoothly (default is ~500ms, which looks choppy/jumpy while playing).
+        { shouldPlay: true, progressUpdateIntervalMillis: 60 },
         (status) => {
           if (status.isLoaded) {
             setAudioPlaybackStatus({
@@ -4096,16 +4109,28 @@ export default function ChatScreen({ navigation, route }) {
     const durLabel = totalMs > 0 ? formatMs(totalMs) : '--:--';
 
     const isDownloading = dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
-    const canPlay = isMyMessage || downloaded;
+    // Received voice notes STREAM from the remote URL (WhatsApp-style) — no need
+    // to download first, so the play button shows immediately.
+    const remoteAudioUrl = toSecureMediaUri(msg?.mediaUrl);
+    const canPlay = isMyMessage || downloaded || Boolean(remoteAudioUrl);
     const bubbleColor = isMyMessage
       ? (chatColor || '#00A884')
       : (isDarkMode ? 'rgba(30, 45, 60, 0.95)' : '#fff');
-    const textColor = isMyMessage ? '#fff' : theme.colors.primaryTextColor;
-    const subColor = isMyMessage ? 'rgba(255,255,255,0.65)' : theme.colors.placeHolderTextColor;
-    const trackBg = isMyMessage ? 'rgba(255,255,255,0.25)' : 'rgba(0,0,0,0.12)';
+    const subColor = isMyMessage ? 'rgba(255,255,255,0.72)' : theme.colors.placeHolderTextColor;
+    const trackBg = isMyMessage ? 'rgba(255,255,255,0.30)' : 'rgba(0,0,0,0.16)';
     const trackFill = isMyMessage ? '#fff' : theme.colors.themeColor;
-    const iconBg = isMyMessage ? 'rgba(255,255,255,0.2)' : (theme.colors.themeColor + '22');
+    const iconBg = isMyMessage ? 'rgba(255,255,255,0.22)' : (theme.colors.themeColor + '22');
     const iconColor = isMyMessage ? '#fff' : theme.colors.themeColor;
+
+    // Sender's avatar (with a mic badge) beside the waveform — mine on my
+    // messages, the peer's / the group member's on received ones.
+    const isGroupChat = chatData?.chatType === 'group' || chatData?.isGroup;
+    const rawAvatar = isMyMessage
+      ? myProfileImage
+      : (isGroupChat
+          ? (groupMembersMapRef.current?.[msg?.senderId]?.profileImage || null)
+          : (chatData?.peerUser?.profileImage || chatData?.peerUser?.profilePicture || null));
+    const avatarUri = rawAvatar ? toSecureMediaUri(rawAvatar) : null;
 
     const handleTap = () => {
       if (msg.status === 'sending') return;
@@ -4120,30 +4145,53 @@ export default function ChatScreen({ navigation, route }) {
 
     return (
       <View style={{
-        width: Math.min(MAX_MEDIA_BUBBLE_WIDTH, 280),
+        width: Math.min(MAX_MEDIA_BUBBLE_WIDTH, 288),
         borderRadius: 14,
         paddingVertical: 8,
-        paddingHorizontal: 10,
+        paddingHorizontal: 8,
         marginBottom: 4,
         overflow: 'hidden',
       }}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+          {/* Sender avatar + mic badge */}
+          <View style={{ width: 44, height: 44, marginRight: 6 }}>
+            <View style={{
+              width: 44, height: 44, borderRadius: 22, overflow: 'hidden',
+              backgroundColor: isMyMessage ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.10)',
+              alignItems: 'center', justifyContent: 'center',
+            }}>
+              {avatarUri
+                ? <Image source={{ uri: avatarUri }} style={{ width: 44, height: 44 }} />
+                : <Ionicons name="person" size={24} color={isMyMessage ? 'rgba(255,255,255,0.85)' : theme.colors.placeHolderTextColor} />}
+            </View>
+            <View style={{
+              position: 'absolute', right: -2, bottom: -2,
+              width: 18, height: 18, borderRadius: 9,
+              backgroundColor: '#00A884',
+              alignItems: 'center', justifyContent: 'center',
+              borderWidth: 1.5, borderColor: bubbleColor,
+            }}>
+              <Ionicons name="mic" size={10} color="#fff" />
+            </View>
+          </View>
+
           {/* Play/Pause/Download button */}
           <TouchableOpacity onPress={handleTap} activeOpacity={0.7}
-            style={{ width: 42, height: 42, borderRadius: 21, backgroundColor: iconBg, alignItems: 'center', justifyContent: 'center' }}>
+            style={{ width: 38, height: 38, borderRadius: 19, backgroundColor: iconBg, alignItems: 'center', justifyContent: 'center' }}>
             {isDownloading || msg.status === 'sending'
               ? <ActivityIndicator size="small" color={iconColor} />
               : <Ionicons
                   name={canPlay ? (isPlaying ? 'pause' : 'play') : 'cloud-download'}
-                  size={canPlay ? 22 : 18}
+                  size={canPlay ? 21 : 18}
                   color={iconColor}
                   style={canPlay && !isPlaying ? { marginLeft: 2 } : undefined}
                 />
             }
           </TouchableOpacity>
 
-          {/* Progress bar + time */}
+          {/* Waveform + duration */}
           <AudioSeekBar
+            seedKey={msgKey}
             isThisPlaying={isThisPlaying}
             isDownloading={isDownloading}
             totalMs={totalMs}

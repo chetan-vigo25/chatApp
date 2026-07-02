@@ -822,6 +822,34 @@ const attachCoreSocketListeners = (navigation) => {
     if (info.category === 'account' || state) {
       handleAccountStateError(state || 'blocked', info.message).catch(() => {});
     }
+
+    // Send-failure correlation: the server now echoes clientMessageId/tempId
+    // on send errors. Flip the optimistic row to 'failed' (retry affordance)
+    // instead of leaving it on the clock icon forever — but only for
+    // NON-retryable failures on send events; transient ones stay with the
+    // durable outbox's backoff cycle.
+    const failedClientId = info.clientMessageId || info.tempId;
+    const failedEvent = payload?.event || info.event || '';
+    const SEND_EVENTS = ['message:send', 'message:reply', 'message:quote', 'group:message:send'];
+    if (failedClientId && SEND_EVENTS.includes(failedEvent) && info.retryable !== true) {
+      try {
+        const ChatDatabase = require('../../../services/ChatDatabase').default
+          || require('../../../services/ChatDatabase');
+        ChatDatabase.updateMessageStatus(failedClientId, 'failed').catch(() => {});
+        ChatDatabase.outboxRemove(failedClientId).catch(() => {});
+      } catch (e) {}
+      try {
+        const { DeviceEventEmitter } = require('react-native');
+        DeviceEventEmitter.emit('chat:send:failed', {
+          clientMessageId: failedClientId,
+          code: info.code || null,
+          message: info.message || null,
+          chatId: info.chatId || null,
+        });
+        // Nudge any open thread to re-read from SQLite so the bubble updates.
+        if (info.chatId) DeviceEventEmitter.emit('chat:thread:update', { chatId: info.chatId });
+      } catch (e) {}
+    }
   });
 
   // Admin blocked/unblocked this account. A blocked user is NOT logged out —

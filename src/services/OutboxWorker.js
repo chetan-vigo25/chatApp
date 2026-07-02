@@ -38,11 +38,48 @@ export const wake = () => {
   }
 };
 
+const SOCKET_ACK_TIMEOUT_MS = 12000;
+
+// Group rows can't drain over REST (the endpoint requires a receiverId), so
+// they re-emit `group:message:send` with the SAME clientMessageId — the server
+// dedupes on (chatId, clientMessageId), so a replay can never duplicate. If
+// the socket is down the throw feeds the normal backoff/retry cycle.
+const sendViaSocket = (payload) => new Promise((resolve, reject) => {
+  // Lazy require — the socket module transitively imports app state; a
+  // top-level import here would re-create the require cycles that were
+  // deliberately broken (see sessionManager.resetRuntimeState).
+  const { getSocket, isSocketConnected } = require('../Redux/Services/Socket/socket');
+  const socket = getSocket();
+  if (!socket || !isSocketConnected()) {
+    reject(new Error('socket offline'));
+    return;
+  }
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    reject(new Error('ack timeout'));
+  }, SOCKET_ACK_TIMEOUT_MS);
+  socket.emit('group:message:send', payload, (response) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (response && response.status === false) {
+      reject(new Error(response?.message || 'send failed'));
+      return;
+    }
+    resolve(response?.data || response || null);
+  });
+});
+
 const sendOnce = async (row) => {
   // The payload was created by useChatLogic / send code at compose time and
-  // contains everything the REST endpoint needs: receiverId / chatType /
+  // contains everything the transport needs: receiverId / chatType /
   // messageType / text / mediaUrl / clientMessageId / ...
   const payload = row.payload || {};
+  if (payload.chatType === 'group' || payload.groupId) {
+    return sendViaSocket(payload);
+  }
   const response = await apiCall('POST', 'user/chat/message/send', payload);
   const failed = response && (response.success === false || response.status === false || response.ok === false || response.error);
   if (failed) {

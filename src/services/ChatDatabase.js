@@ -1162,14 +1162,19 @@ const _runInsert = async (db, msg, _retried = false) => {
     }
   }
 
-  // Read existing payload to carry forward _reply* fields that might be lost
+  // Read existing payload to carry forward fields a later partial upsert might
+  // otherwise drop: the _reply* quote data AND the status-reply snapshot
+  // (statusRef/statusPreview). Without the latter, a status-update/tick upsert
+  // that omits the snapshot would strip the StatusReplyPreview card.
   let existingReplyInPayload = null;
-  if (!msg.replyToMessageId) {
+  let existingStatusInPayload = null;
+  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview) {
     try {
       const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id LIMIT 1`, { $id: id });
       if (ex?.payload) {
         const ep = JSON.parse(ex.payload);
         if (ep?._replyToMessageId) existingReplyInPayload = ep;
+        if (ep?.statusRef || ep?.statusPreview) existingStatusInPayload = ep;
       }
     } catch {}
   }
@@ -1205,10 +1210,16 @@ const _runInsert = async (db, msg, _retried = false) => {
       _replySenderId: msg.replySenderId || null,
     } : {}),
     // Status reply / share — snapshot kept so the preview survives status expiry
-    ...(msg.statusRef ? { statusRef: String(msg.statusRef) } : {}),
+    // AND later partial upserts (carry forward the existing snapshot if the
+    // incoming msg doesn't include it).
+    ...((msg.statusRef || existingStatusInPayload?.statusRef)
+      ? { statusRef: String(msg.statusRef || existingStatusInPayload.statusRef) }
+      : {}),
     ...(msg.statusPreview && typeof msg.statusPreview === 'object'
       ? { statusPreview: msg.statusPreview }
-      : {}),
+      : (existingStatusInPayload?.statusPreview
+          ? { statusPreview: existingStatusInPayload.statusPreview }
+          : {})),
   };
 
   const baseParams = {
@@ -1451,7 +1462,7 @@ const _preserveLocalState = async (db, msg) => {
 
 const loadMessages = async (chatId, opts = {}) => {
   if (!chatId) return [];
-  const { limit = 50, offset = 0, afterTimestamp = 0, beforeTimestamp = 0, skipCleanup = false } = opts;
+  const { limit = 50, offset = 0, afterTimestamp = 0, beforeTimestamp = 0, beforeId = null, skipCleanup = false } = opts;
 
   // ── STEP 1: Lightweight cleanup — only run on first load (not every refresh) ──
   // This is a WRITE on the read path; route it through the write mutex so it can't
@@ -1481,19 +1492,29 @@ const loadMessages = async (chatId, opts = {}) => {
   // storm on the shared connection.
   const rows = await _readQuery(async (db) => {
     if (beforeTimestamp > 0) {
+      // Composite (timestamp, id) keyset: with `beforeId`, rows sharing the
+      // exact boundary timestamp are paged too (strict `timestamp <` alone
+      // skipped same-millisecond ties at the page edge forever). `id DESC`
+      // matches the ORDER BY tiebreak so the cursor is deterministic.
+      if (beforeId) {
+        return db.getAllAsync(
+          `SELECT * FROM messages WHERE chat_id = $cid AND (timestamp < $bts OR (timestamp = $bts AND id < $bid)) ORDER BY timestamp DESC, id DESC LIMIT $lim`,
+          { $cid: chatId, $bts: beforeTimestamp, $bid: String(beforeId), $lim: limit }
+        );
+      }
       return db.getAllAsync(
-        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp < $bts ORDER BY timestamp DESC LIMIT $lim`,
+        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp < $bts ORDER BY timestamp DESC, id DESC LIMIT $lim`,
         { $cid: chatId, $bts: beforeTimestamp, $lim: limit }
       );
     }
     if (afterTimestamp > 0) {
       return db.getAllAsync(
-        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+        `SELECT * FROM messages WHERE chat_id = $cid AND timestamp > $ts ORDER BY timestamp DESC, id DESC LIMIT $lim OFFSET $off`,
         { $cid: chatId, $ts: afterTimestamp, $lim: limit, $off: offset }
       );
     }
     return db.getAllAsync(
-      `SELECT * FROM messages WHERE chat_id = $cid ORDER BY timestamp DESC LIMIT $lim OFFSET $off`,
+      `SELECT * FROM messages WHERE chat_id = $cid ORDER BY timestamp DESC, id DESC LIMIT $lim OFFSET $off`,
       { $cid: chatId, $lim: limit, $off: offset }
     );
   });
@@ -1659,9 +1680,13 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
     await db.runAsync(`UPDATE messages SET id = $s, server_message_id = $s, synced = 1, status = $st WHERE temp_id = $t OR id = $t`, { $s: serverMessageId, $t: tempId, $st: ackStatus });
   }
 
-  // Copy reply data to serverId in permanent table
+  // Copy reply data to serverId in permanent table. Awaited WITH the held
+  // connection: fire-and-forget here could run after the enclosing
+  // runExclusive released the mutex — a bare write racing the batch writers.
   const rd = await getReplyData(tempId);
-  if (rd) saveReplyData(serverMessageId, rd).catch(() => {});
+  if (rd) {
+    try { await saveReplyData(serverMessageId, rd, db); } catch {}
+  }
 
   // NUCLEAR CLEANUP: after acknowledge, delete ALL remaining temp rows that could
   // be orphans of this same message (matched by sender + text + timestamp).

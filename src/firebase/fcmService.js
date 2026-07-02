@@ -3,7 +3,7 @@ import { Platform, PermissionsAndroid, DeviceEventEmitter, AppState } from 'reac
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { isGroupInactive } from '../utils/inactiveGroups';
 import { setPushToken } from '../Redux/Services/Socket/socket';
-import { navigateToChat } from '../Redux/Services/navigationService';
+import { navigateToChat, getCurrentRouteSnapshot, getActiveChatFromRoute } from '../Redux/Services/navigationService';
 import { CALL_PUSH_EVENTS, isStaleCallPush } from './callEvents';
 import { displayIncomingCallNotifee, cancelIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
 import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
@@ -551,6 +551,31 @@ const showLocalNotification = async (remoteMessage) => {
   // duplicate. The real message is shown either by the OS (notification payload)
   // or by a content-bearing one.
   if (!model || (!model.title && !model.body)) return;
+
+  // Never raise an OS notification for the chat the user is actively viewing.
+  // The in-app banner has this guard (AppBannerHost.shouldSuppressForActiveRoute);
+  // this path relied on losing the shared-dedupe race to it — timing-dependent,
+  // so a push processed first showed a heads-up over the very chat being read.
+  // Foreground only: in the background the route snapshot is stale and the user
+  // can't be "viewing" anything.
+  try {
+    if (AppState.currentState === 'active') {
+      const active = getActiveChatFromRoute(getCurrentRouteSnapshot());
+      if (active?.routeName === 'ChatScreen') {
+        const ac = active.chatId ? String(active.chatId) : '';
+        const itemChatId = model.chatId ? String(model.chatId) : (data?.chatId ? String(data.chatId) : '');
+        const itemGroupId = data?.groupId ? String(data.groupId) : '';
+        const itemSenderId = data?.senderId ? String(data.senderId) : '';
+        if (
+          (ac && itemChatId && ac === itemChatId) ||
+          (ac && itemGroupId && ac === itemGroupId) ||
+          (!ac && active.peerUserId && itemSenderId && String(active.peerUserId) === itemSenderId)
+        ) {
+          return;
+        }
+      }
+    }
+  } catch {}
 
   // Drop duplicates of the same message — SHARED with the in-app banner, so a
   // message delivered over both the socket and a push notifies the user once.

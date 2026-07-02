@@ -1233,9 +1233,15 @@ export default function useChatLogic({ navigation, route }) {
     const combined = [...filteredScheduled, ...filteredChat];
     const sorted = combined.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-    // Dedup using ID + content fingerprint
+    // Dedup by ID, plus a content fingerprint that ONLY suppresses
+    // optimistic-temp ↔ server twins (the pre-ack duplicate flash). Two
+    // server-confirmed messages may legitimately repeat the same short text
+    // from the same sender within seconds ("ok", "hi", "?") — fingerprinting
+    // those silently dropped real messages from paged-in history.
     const seenIds = new Set();
-    const fpMap = new Map();
+    const fpMap = new Map(); // fp → { tempish } of the row that claimed it
+    const isTempish = (m) => !m.serverMessageId
+      && (Boolean(m.tempId) || String(m.id || '').startsWith('temp_'));
     const deduped = sorted.filter(msg => {
       const ids = [normalizeId(msg.serverMessageId), normalizeId(msg.id), normalizeId(msg.tempId)].filter(Boolean);
       if (ids.some(id => seenIds.has(id))) return false;
@@ -1244,8 +1250,10 @@ export default function useChatLogic({ navigation, route }) {
         const fp = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs}`;
         const fpPrev = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs - 1}`;
         const fpNext = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs + 1}`;
-        if (fpMap.has(fp) || fpMap.has(fpPrev) || fpMap.has(fpNext)) return false;
-        fpMap.set(fp, true);
+        const clash = fpMap.get(fp) || fpMap.get(fpPrev) || fpMap.get(fpNext);
+        const tempish = isTempish(msg);
+        if (clash && (tempish || clash.tempish)) return false;
+        if (!fpMap.has(fp)) fpMap.set(fp, { tempish });
       }
       for (const id of ids) seenIds.add(id);
       return true;
@@ -4672,13 +4680,13 @@ export default function useChatLogic({ navigation, route }) {
         setMutationCursor(currentChatId, source.latestMutationAt);
       }
 
-      // Update hasMore from server response
-      if (typeof source?.hasMore === 'boolean') {
-        setHasMoreMessages(source.hasMore);
-      } else if (Array.isArray(rows) && rows.length === 0) {
-        // No messages returned — no more to load
-        setHasMoreMessages(false);
-      }
+      // Do NOT touch hasMoreMessages here. `message:sync` is the on-open
+      // FORWARD delta (messages newer than our seq cursor) — its hasMore /
+      // emptiness says "no more NEWER messages", while hasMoreMessages gates
+      // OLDER-history scroll-up. Writing it here made pagination die on any
+      // already-caught-up chat (delta returns 0 rows → flag false → scroll-up
+      // no-ops). Older-history exhaustion is owned by loadMoreMessages via
+      // the `message:history` response + the persisted hist_done marker.
 
       // Reset loading states — critical for stopping the spinner
       setIsLoadingMore(false);
@@ -5858,10 +5866,13 @@ export default function useChatLogic({ navigation, route }) {
           return resolve({ status: true, queued: true });
         }
 
-        // ONLINE — immediate optimistic 'sent' for instant UI feedback, then emit.
-        updateMessageStatus(tempId, 'sent');
+        // ONLINE — keep the honest 'sending' clock until the server confirms.
+        // The single tick comes from the ack (inline callback or the global
+        // message:sent:ack / group:message:sent event handlers); a pre-ack
+        // 'sent' lied whenever the server never stored the message, and for
+        // groups there was no retry path behind it.
+        updateMessageStatus(tempId, 'sending');
         socket.emit(sendEvent, emitPayload, onAck);
-        // Resolve immediately since we marked as sent above.
         resolve({ status: true, optimistic: true });
       } catch (err) {
         console.error("❌ sendMessageViaSocket error:", err);
@@ -5971,7 +5982,9 @@ export default function useChatLogic({ navigation, route }) {
       senderType: 'self',
       receiverId: isGrpSend ? null : (chatData.peerUser?._id || null),
       chatType: chatData.chatType || 'private',
-      status: "sent",
+      // WhatsApp semantics: clock icon until the SERVER confirms via
+      // message:sent:ack / group:message:sent — never a pre-ack single tick.
+      status: "sending",
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
       payload,
@@ -6019,31 +6032,37 @@ export default function useChatLogic({ navigation, route }) {
       console.warn('[handleSendText] SQLite write failed:', err?.message);
     });
 
-    // Durable outbox (1-1 only — the REST send endpoint requires a receiverId):
-    // persist the send so it survives an app kill while offline. The OutboxWorker
-    // drains it via REST; the socket fast-path below races it and removes the row
-    // on ack, so on the happy path the worker never fires (4s grace window). The
-    // server dedupes on (chatId, clientMessageId), so a race can't duplicate.
-    if (!isGrpSend && chatData.peerUser?._id) {
+    // Durable outbox for BOTH 1-1 and group sends: persist the send so it
+    // survives an app kill while offline. The OutboxWorker drains 1-1 rows via
+    // REST and group rows via a socket re-emit (the REST send endpoint requires
+    // a receiverId, which is why groups used to be excluded — and a group
+    // message composed offline was silently LOST on app kill). The socket
+    // fast-path below races the worker and removes the row on ack, so on the
+    // happy path the worker never fires (4s grace window). The server dedupes
+    // on (chatId, clientMessageId), so a race can't duplicate.
+    if (isGrpSend || chatData.peerUser?._id) {
       // REST createMessage expects replyTo as an id + replyPreview as an object;
       // the socket payload carries replyTo as an embedded object, so remap for
-      // the REST-based outbox worker. clientMessageId is the cross-transport
-      // dedupe key, so a socket+REST race can't duplicate.
-      const outboxPayload = {
-        ...payload,
-        clientMessageId: tempId,
-        ...(replyToMsgId
-          ? {
-              replyTo: replyToMsgId,
-              replyPreview: {
-                text: quotedText || '',
-                messageType: currentReply?.type || 'text',
-                senderName: resolvedReplySenderName || null,
-                senderId: currentReply?.senderId || null,
-              },
-            }
-          : {}),
-      };
+      // the REST-based outbox worker (1-1 only — group rows replay the socket
+      // payload verbatim). clientMessageId is the cross-transport dedupe key,
+      // so a socket+REST race can't duplicate.
+      const outboxPayload = isGrpSend
+        ? { ...payload, clientMessageId: tempId, clientId: tempId, tempId }
+        : {
+            ...payload,
+            clientMessageId: tempId,
+            ...(replyToMsgId
+              ? {
+                  replyTo: replyToMsgId,
+                  replyPreview: {
+                    text: quotedText || '',
+                    messageType: currentReply?.type || 'text',
+                    senderName: resolvedReplySenderName || null,
+                    senderId: currentReply?.senderId || null,
+                  },
+                }
+              : {}),
+          };
       ChatDatabase.outboxEnqueue({
         clientMessageId: tempId,
         chatId: chatIdRef.current,
@@ -8349,18 +8368,31 @@ export default function useChatLogic({ navigation, route }) {
     if (isLoadingMore || loadMoreInFlightRef.current) return;
     if (!hasMoreMessages) return;
 
-    const oldest = messages.length > 0
-      ? messages.reduce((acc, msg) => {
-          const ts = Number(msg?.timestamp || 0);
-          if (!acc || ts < acc) return ts;
-          return acc;
-        }, 0)
-      : null;
+    // Oldest DISPLAYED anchor as a composite (timestamp, id) keyset cursor.
+    // Ignore 0/NaN timestamps: one malformed row used to collapse the cursor
+    // to 0 (or poison it with NaN), which disabled pagination for the whole
+    // chat. The id tiebreak lets SQLite page past same-millisecond boundary
+    // ties that a strict `timestamp <` could never reach.
+    let oldest = 0;
+    let oldestId = null;
+    for (const msg of messages) {
+      const ts = Number(msg?.timestamp);
+      if (!Number.isFinite(ts) || ts <= 0) continue;
+      const mid = String(msg.id || msg.serverMessageId || msg.tempId || '') || null;
+      if (!oldest || ts < oldest) {
+        oldest = ts;
+        oldestId = mid;
+      } else if (ts === oldest && mid && (!oldestId || mid < oldestId)) {
+        oldestId = mid;
+      }
+    }
+    if (!oldest) return;
 
-    if (!oldest || fetchOlderCursorRef.current === oldest) return;
+    const cursorKey = `${oldest}:${oldestId || ''}`;
+    if (fetchOlderCursorRef.current === cursorKey) return;
 
     loadMoreInFlightRef.current = true;
-    fetchOlderCursorRef.current = oldest;
+    fetchOlderCursorRef.current = cursorKey;
     setIsLoadingMore(true);
 
     try {
@@ -8401,6 +8433,7 @@ export default function useChatLogic({ navigation, route }) {
       const olderLocal = await ChatDatabase.loadMessages(cid, {
         limit: SOCKET_FETCH_LIMIT,
         beforeTimestamp: oldest,
+        beforeId: oldestId,
         skipCleanup: true,
       });
       if (olderLocal.length > 0) {
@@ -8468,6 +8501,7 @@ export default function useChatLogic({ navigation, route }) {
           const olderNow = await ChatDatabase.loadMessages(cid, {
             limit: SOCKET_FETCH_LIMIT,
             beforeTimestamp: oldest,
+            beforeId: oldestId,
             skipCleanup: true,
           });
           mergeOlderRows(olderNow);
@@ -8479,6 +8513,14 @@ export default function useChatLogic({ navigation, route }) {
           setHasMoreMessages(false);
         } else if (!resp.ok) {
           // Network failure/timeout — let a later scroll retry the same cursor.
+          fetchOlderCursorRef.current = null;
+        } else {
+          // resp.ok && hasMore: clear the cursor guard even if this page
+          // produced no VISIBLE older rows (seq-vs-timestamp order can make a
+          // whole page dedupe into the current window). The persisted page
+          // still moved MIN(seq) down, so the next scroll fetches strictly
+          // older rows — without this reset the guard froze on an unchanged
+          // `oldest` and pagination was dead until remount.
           fetchOlderCursorRef.current = null;
         }
       } finally {
