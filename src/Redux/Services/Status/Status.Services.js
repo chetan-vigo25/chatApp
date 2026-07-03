@@ -160,7 +160,12 @@ export const statusServices = {
   },
 
   async replyToStatus(statusId, message) {
-    const response = await apiCall('POST', `${BASE}/${statusId}/reply`, { message });
+    // Client-generated idempotency key: the server keys the chat message on
+    // (chatId, clientMessageId), so a network retry of this POST can never
+    // create a duplicate reply bubble. Without it the server derived one from
+    // Date.now(), which differs per attempt.
+    const clientMessageId = `status-reply-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    const response = await apiCall('POST', `${BASE}/${statusId}/reply`, { message, clientMessageId });
     if (response?.statusCode === 200) return response;
     showToast(response?.message || 'Failed to send reply');
     return Promise.reject(response?.message);

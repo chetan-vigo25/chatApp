@@ -2442,6 +2442,11 @@ export function RealtimeChatProvider({ children }) {
   const socketUnsubscribersRef = useRef([]);
   const attachedSocketRef = useRef(null);
   const handledGroupMsgIdsRef = useRef(new Set());
+  // The backend mirrors REST-created private messages (status replies, media,
+  // scheduled) to BOTH 'message:new' AND 'message:received'. Dedupe by id so
+  // the second event doesn't double-dispatch (double unread bump, double
+  // preview churn, redundant SQLite work).
+  const handledPrivateMsgIdsRef = useRef(new Set());
   // Tracks messageIds we've already sent a delivery receipt for, so the same
   // incoming message arriving via both 'message:new' and 'message:received'
   // doesn't emit 'delivered' twice.
@@ -2674,19 +2679,45 @@ export function RealtimeChatProvider({ children }) {
         if (source?.data) { source.data.isScheduled = false; source.data.scheduleTime = null; source.data.scheduleTimeLabel = null; }
       }
       const normalized = normalizeMessagePayload(payload);
+      const msgId = normalized.serverMessageId || normalized.messageId || normalized.id;
+
+      // Dedupe the mirrored 'message:new' / 'message:received' pair (REST-
+      // created messages arrive on BOTH) — the second event must not
+      // re-dispatch (double unread) or re-run the SQLite work.
+      if (msgId) {
+        const key = String(msgId);
+        if (handledPrivateMsgIdsRef.current.has(key)) return;
+        handledPrivateMsgIdsRef.current.add(key);
+        if (handledPrivateMsgIdsRef.current.size > 1000) {
+          const it = handledPrivateMsgIdsRef.current.values();
+          for (let i = 0; i < 200; i += 1) {
+            const v = it.next();
+            if (v.done) break;
+            handledPrivateMsgIdsRef.current.delete(v.value);
+          }
+        }
+      }
+
       dispatch({ type: 'INCOMING_MESSAGE', payload: normalized });
 
-      // Persist to SQLite so messages are available when ChatScreen opens later
-      const msgId = normalized.serverMessageId || normalized.messageId || normalized.id;
-      if (msgId && !isSelf) {
+      // Persist to SQLite so messages are available when ChatScreen opens
+      // later. SELF messages are persisted too — the sender echo is how a
+      // message sent from another device (or created via REST, e.g. a status
+      // reply) reaches this device's local DB; skipping them left the sender's
+      // own thread empty until the next sync round. The upsert reconciles the
+      // echo against any optimistic temp row (cleanBeforeUpsert), so the
+      // socket-send fast path can't duplicate.
+      if (msgId) {
         // Send delivery receipt back to the sender (double gray tick) regardless
-        // of whether this chat is open.
-        emitDeliveryReceipt({
-          isGroup: false,
-          messageId: msgId,
-          chatId: normalized.chatId,
-          senderId: normalized.senderId,
-        });
+        // of whether this chat is open — but never for our own echo.
+        if (!isSelf) {
+          emitDeliveryReceipt({
+            isGroup: false,
+            messageId: msgId,
+            chatId: normalized.chatId,
+            senderId: normalized.senderId,
+          });
+        }
         const ts = normalized.createdAt ? new Date(normalized.createdAt).getTime() : Date.now();
 
         // Extract reply data — server may send replyTo as object or string
@@ -2728,9 +2759,18 @@ export function RealtimeChatProvider({ children }) {
           // catch-up only fetches the true delta (not from 0).
           seq: (source?.seq != null && !Number.isNaN(Number(source.seq))) ? Number(source.seq) : (normalized?.seq ?? null),
           serverMessageId: msgId,
+          // Dedupe bridges (cleanBeforeUpsert rule 0): the Mongo _id form and
+          // the cross-transport idempotency key — rows stored under either by
+          // other ingest paths get replaced instead of duplicated.
+          mongoId: source?._id ? String(source._id) : null,
+          clientMessageId: source?.clientMessageId || source?.clientId || null,
           tempId: normalized.tempId || null,
           chatId: normalized.chatId,
           senderId: normalized.senderId,
+          // Pin the bubble side at write time — rows without sender_type fall
+          // back to a senderId comparison at render, which breaks if the id
+          // forms ever diverge; self echoes must never render as received.
+          senderType: isSelf ? 'self' : 'other',
           text: normalized.text || '',
           type: source?.messageType || source?.type || 'text',
           status: normalized.status || 'sent',
@@ -2784,7 +2824,8 @@ export function RealtimeChatProvider({ children }) {
           }).catch(() => {});
         }
 
-        // Update chatlist in SQLite — last message + unread count
+        // Update chatlist in SQLite — last message + unread count (unread
+        // never bumps for our own echo).
         ChatDatabase.updateChatLastMessage(normalized.chatId, {
           text: normalized.text || '',
           type: source?.messageType || source?.type || 'text',
@@ -2793,7 +2834,9 @@ export function RealtimeChatProvider({ children }) {
           createdAt: normalized.createdAt,
           serverMessageId: msgId,
         }).catch(() => {});
-        ChatDatabase.incrementChatUnread(normalized.chatId).catch(() => {});
+        if (!isSelf) {
+          ChatDatabase.incrementChatUnread(normalized.chatId).catch(() => {});
+        }
       }
     };
 
@@ -3277,6 +3320,23 @@ export function RealtimeChatProvider({ children }) {
       const text = source?.text || source?.data?.text || '';
       const messageId = normalizeId(source?.messageId || source?._id || source?.data?.messageId);
       const isGroup = !!(groupId || source?.chatType === 'group' || source?.data?.chatType === 'group');
+
+      // Reconcile the optimistic SQLite row here too — the per-screen
+      // (useChatLogic) ack handler only exists while a ChatScreen is mounted,
+      // so acks for sends fired elsewhere (ForwardMessageScreen) or after the
+      // user backed out of the chat left the row stuck as a 'sending' temp
+      // row until the next sync. Idempotent alongside the screen handler.
+      const ackClientId = normalizeId(
+        source?.clientMessageId || source?.tempId
+        || source?.data?.clientMessageId || source?.data?.tempId,
+      );
+      if (ackClientId) {
+        if (messageId && messageId !== ackClientId) {
+          ChatDatabase.acknowledgeMessage(ackClientId, messageId).catch(() => {});
+        }
+        ChatDatabase.updateMessageStatus(messageId || ackClientId, 'sent').catch(() => {});
+        ChatDatabase.outboxRemove(ackClientId).catch(() => {});
+      }
 
       // For scheduled messages: strip schedule flags
       if (source?.isScheduled) {

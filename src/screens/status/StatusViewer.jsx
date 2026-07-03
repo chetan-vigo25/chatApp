@@ -433,17 +433,35 @@ export default function StatusViewer({ navigation, route }) {
       // preview attached. Server has already created the canonical record;
       // this just keeps the local DB in sync without waiting for a sync round.
       try {
-        const ChatDatabase = require('../../services/ChatDatabase');
+        // ESM default-export interop: a bare require() returns the module
+        // namespace ({ default: ... }) — reading upsertMessage off it was
+        // undefined, so this whole optimistic write silently no-oped and the
+        // reply only appeared after the next (15s-throttled) sync round.
+        const dbModule = require('../../services/ChatDatabase');
+        const ChatDatabase = dbModule?.default || dbModule;
         const chatMessage = res?.data?.chatMessage;
         if (chatMessage && ChatDatabase?.upsertMessage) {
           const firstMedia = currentStatus?.mediaItems?.[0] || {};
+          const canonicalId = String(chatMessage.messageId || chatMessage._id);
           await ChatDatabase.upsertMessage({
-            id:               String(chatMessage._id || chatMessage.messageId),
-            serverMessageId:  String(chatMessage._id || chatMessage.messageId),
+            // Key by the UUID messageId (realtime/sync canonical form) — the
+            // Mongo _id form used to create a twin row when the echo landed.
+            id:               canonicalId,
+            serverMessageId:  canonicalId,
+            mongoId:          chatMessage._id ? String(chatMessage._id) : null,
+            clientMessageId:  chatMessage.clientMessageId || null,
+            seq:              (chatMessage.seq != null && !Number.isNaN(Number(chatMessage.seq)))
+              ? Number(chatMessage.seq) : null,
             chatId:           chatMessage.chatId,
-            senderId:         String(user?._id || user?.id),
+            // The server response carries the authoritative senderId (us) —
+            // the redux auth `user` shape isn't guaranteed to expose _id, and
+            // String(undefined) produced "undefined", which made the bubble
+            // fail the isMyMessage check and render LEFT (as a received
+            // message). senderType pins the side explicitly either way.
+            senderId:         String(chatMessage.senderId || user?._id || user?.id || ''),
+            senderType:       'self',
             senderName:       user?.fullName || null,
-            receiverId:       String(userId || currentStatus.ownerId),
+            receiverId:       String(chatMessage.receiverId || userId || currentStatus.ownerId),
             text:             body,
             type:             'text',
             status:           'sent',

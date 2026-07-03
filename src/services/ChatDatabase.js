@@ -882,6 +882,27 @@ const cleanBeforeUpsert = async (db, msg) => {
     } catch {}
   }
 
+  // 0. Alternate-id bridge: the same server message can reach us keyed by its
+  //    UUID `messageId` (realtime path) or its Mongo `_id` (older sync/REST
+  //    normalizers, or rows persisted before the normalizers were unified).
+  //    When the incoming msg carries the other form, delete any row stored
+  //    under it — otherwise the two forms coexist as duplicate bubbles that
+  //    no other rule can match (both have non-null, different ids).
+  if (msg.mongoId && msg.mongoId !== id) {
+    await db.runAsync(
+      `DELETE FROM messages WHERE (id = $alt OR server_message_id = $alt) AND id != $id`,
+      { $alt: String(msg.mongoId), $id: id }
+    );
+  }
+  //    Same idea for the cross-transport idempotency key: an optimistic /
+  //    REST-created row may be keyed by the clientMessageId itself.
+  if (msg.clientMessageId && msg.clientMessageId !== id) {
+    await db.runAsync(
+      `DELETE FROM messages WHERE (id = $cmid OR temp_id = $cmid) AND id != $id`,
+      { $cmid: String(msg.clientMessageId), $id: id }
+    );
+  }
+
   // 1. If we know the tempId→serverId link, remove the temp row
   if (serverId && tempId && serverId !== tempId) {
     await db.runAsync(`DELETE FROM messages WHERE (id = $t OR temp_id = $t) AND id != $s`, { $t: tempId, $s: serverId });

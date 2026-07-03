@@ -1234,12 +1234,14 @@ export default function useChatLogic({ navigation, route }) {
     const sorted = combined.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
     // Dedup by ID, plus a content fingerprint that ONLY suppresses
-    // optimistic-temp ↔ server twins (the pre-ack duplicate flash). Two
-    // server-confirmed messages may legitimately repeat the same short text
-    // from the same sender within seconds ("ok", "hi", "?") — fingerprinting
-    // those silently dropped real messages from paged-in history.
+    // (a) optimistic-temp ↔ server twins (the pre-ack duplicate flash) and
+    // (b) EXACT-same-timestamp twins — the same server message stored under
+    // two id forms (uuid messageId vs Mongo _id) shares the identical ms.
+    // Two server-confirmed messages may legitimately repeat the same short
+    // text from the same sender within seconds ("ok", "hi", "?") — broad
+    // fingerprinting those silently dropped real messages from history.
     const seenIds = new Set();
-    const fpMap = new Map(); // fp → { tempish } of the row that claimed it
+    const fpMap = new Map(); // fp → { tempish, ts } of the row that claimed it
     const isTempish = (m) => !m.serverMessageId
       && (Boolean(m.tempId) || String(m.id || '').startsWith('temp_'));
     const deduped = sorted.filter(msg => {
@@ -1252,8 +1254,8 @@ export default function useChatLogic({ navigation, route }) {
         const fpNext = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs + 1}`;
         const clash = fpMap.get(fp) || fpMap.get(fpPrev) || fpMap.get(fpNext);
         const tempish = isTempish(msg);
-        if (clash && (tempish || clash.tempish)) return false;
-        if (!fpMap.has(fp)) fpMap.set(fp, { tempish });
+        if (clash && (tempish || clash.tempish || clash.ts === Number(msg.timestamp || 0))) return false;
+        if (!fpMap.has(fp)) fpMap.set(fp, { tempish, ts: Number(msg.timestamp || 0) });
       }
       for (const id of ids) seenIds.add(id);
       return true;
@@ -1898,7 +1900,12 @@ export default function useChatLogic({ navigation, route }) {
 
   const normalizeIncomingMessage = useCallback((apiMsg) => {
     const mediaMeta = apiMsg?.mediaMeta || apiMsg?.contact || apiMsg?.payload?.mediaMeta || apiMsg?.payload?.contact || {};
-    const serverId = normalizeId(apiMsg?._id || apiMsg?.messageId || apiMsg?.id);
+    // Canonical id MUST prefer the UUID `messageId` over the Mongo `_id` —
+    // the realtime path (normalizeMessagePayload) keys rows by messageId, so
+    // preferring `_id` here gave the SAME message two different SQLite ids
+    // (one from the live event, one from sync/REST/history) → duplicate
+    // bubbles that no dedupe rule could bridge.
+    const serverId = normalizeId(apiMsg?.messageId || apiMsg?._id || apiMsg?.id);
     const normalizedMediaId = normalizeId(
       apiMsg?.mediaId ||
       mediaMeta?.mediaId ||
@@ -2016,6 +2023,14 @@ export default function useChatLogic({ navigation, route }) {
       id: serverId,
       serverMessageId: serverId,
       tempId: originalTempId || serverId,
+      // Cross-transport idempotency key — lets the SQLite upsert reconcile
+      // this row against one stored under a different id form (uuid vs _id)
+      // or against the optimistic outbox row.
+      clientMessageId: normalizeId(apiMsg?.clientMessageId || apiMsg?.clientId) || null,
+      // Alternate id form for the upsert's dedupe bridge (see
+      // cleanBeforeUpsert rule 0) — rows persisted under the Mongo _id by
+      // older normalizers get replaced instead of duplicated.
+      mongoId: normalizeId(apiMsg?._id) || null,
       mediaId: normalizedMediaId,
       type: resolvedMessageType,
       mediaType: apiMsg?.fileCategory || (isMediaMessageType(resolvedMessageType) ? resolvedMessageType : null),
@@ -2068,26 +2083,35 @@ export default function useChatLogic({ navigation, route }) {
       // Reply/Quote fields — support both local field names and server field names
       // Handle replyTo being an object (server populates it) vs a plain ID string
       // Check top-level, payload, and multiple server naming conventions
+      // `apiMsg.replyPreview` is the SCHEMA snapshot the server persists (1-1
+      // reply + group send/reply now store it) — raw Mongo docs from sync /
+      // history / catch-up carry the preview ONLY there, so without these
+      // fallbacks a refetched reply rendered as "Unknown / Message".
       replyToMessageId: apiMsg?.replyToMessageId || apiMsg?.quotedMessageId || apiMsg?.reply_to_message_id
         || normalizedPayload?.replyToMessageId || normalizedPayload?._replyToMessageId
         || (replyObj ? (replyObj._id || replyObj.id || replyObj.messageId) : null)
+        || apiMsg?.replyPreview?.messageId
         || (typeof apiMsg?.replyTo === 'string' ? apiMsg.replyTo : null)
         || null,
       replyPreviewText: apiMsg?.replyPreviewText || apiMsg?.quotedText || apiMsg?.reply_preview_text
         || normalizedPayload?.replyPreviewText || normalizedPayload?._replyPreviewText
         || replyObj?.text || replyObj?.content || replyObj?.message
+        || apiMsg?.replyPreview?.text
         || null,
       replyPreviewType: apiMsg?.replyPreviewType || apiMsg?.reply_preview_type
         || normalizedPayload?.replyPreviewType || normalizedPayload?._replyPreviewType
         || replyObj?.messageType || replyObj?.type
+        || apiMsg?.replyPreview?.messageType
         || null,
       replySenderName: apiMsg?.replySenderName || apiMsg?.quotedSender || apiMsg?.reply_sender_name
         || normalizedPayload?.replySenderName || normalizedPayload?._replySenderName
         || replyObj?.senderName || replyObj?.sender?.fullName || replyObj?.sender?.name
+        || apiMsg?.replyPreview?.senderName
         || null,
       replySenderId: apiMsg?.replySenderId || apiMsg?.reply_sender_id
         || normalizedPayload?.replySenderId || normalizedPayload?._replySenderId
         || replyObj?.senderId || replyObj?.sender?._id || (typeof replyObj?.sender === 'string' ? replyObj.sender : null)
+        || (apiMsg?.replyPreview?.senderId != null ? String(apiMsg.replyPreview.senderId) : null)
         || null,
       // Status reply / share — preserve both the id reference and the preview snapshot
       // so the chat bubble can render the preview pill and link back to the StatusViewer.

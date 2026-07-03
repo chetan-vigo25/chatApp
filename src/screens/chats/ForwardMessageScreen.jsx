@@ -12,6 +12,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setForwardTimestamp } from '../../utils/forwardState';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCache from '../../services/ChatCache';
+import ChatDatabase from '../../services/ChatDatabase';
+import OutboxWorker from '../../services/OutboxWorker';
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
   '#E84393', '#00CEC9', '#FDCB6E', '#D63031',
@@ -160,6 +162,11 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 mediaMeta: msg.mediaMeta || {},
                 isForwarded: true,
                 tempId,
+                // Explicit idempotency key (tempId is only the legacy alias):
+                // the server dedupes on (chatId, clientMessageId), so a retry
+                // or outbox replay can never create a duplicate forward.
+                clientMessageId: tempId,
+                clientId: tempId,
                 senderId: currentUserId,
                 senderName: currentUserName,
                 createdAt: timestamp,
@@ -176,6 +183,8 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 senderId: currentUserId,
                 senderName: currentUserName,
                 tempId,
+                clientMessageId: tempId,
+                clientId: tempId,
                 createdAt: timestamp,
               };
 
@@ -188,6 +197,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
           const optimisticMessage = {
             id: tempId,
             tempId,
+            clientMessageId: tempId,
             text: msg.text || '',
             type: msg.type || 'text',
             mediaUrl: msg.mediaUrl || '',
@@ -197,7 +207,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
             chatId: chatIdForCache,
             timestamp: new Date(timestamp).getTime(),
             createdAt: timestamp,
-            status: 'sent', // Mark as sent immediately for instant feedback
+            // Honest clock until the server ack — the premature 'sent' lied
+            // whenever the emit was dropped (and forwards had no retry path).
+            status: 'sending',
             isForwarded: true,
             // Original sender if known; never the current user (the forwarder).
             // The server echoes the canonical forwardedFrom on the real message.
@@ -205,6 +217,20 @@ export default function ForwardMessageScreen({ navigation, route }) {
             senderType: 'self',
           };
           ChatCache.addMessage(chatIdForCache, optimisticMessage);
+
+          // Local-first durability: the row used to live ONLY in the in-memory
+          // cache — opening the destination chat re-read SQLite (which had
+          // nothing) and the forward vanished until the next sync round, and
+          // an app kill lost it entirely. Persist it, and enqueue a durable
+          // outbox row so a dropped emit auto-resends (server dedupes on
+          // clientMessageId, so the socket/outbox race can't duplicate).
+          ChatDatabase.upsertMessage({ ...optimisticMessage, synced: false }).catch(() => {});
+          ChatDatabase.outboxEnqueue({
+            clientMessageId: tempId,
+            chatId: chatIdForCache,
+            payload: sendPayload,
+            notBefore: Date.now() + 4000,
+          }).then(() => OutboxWorker.wake()).catch(() => {});
 
           sentCount++;
           // Small delay between messages to avoid flooding
