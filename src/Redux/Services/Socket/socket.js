@@ -271,10 +271,13 @@ const handleLogout = async (navigation = currentNavigation, alertMessage = null)
 // Register this device's push token on the active backend session so the server
 // can push to it. Safe to call repeatedly (idempotent upsert server-side).
 const emitDeviceRegister = () => {
-  if (!socket || !socket.connected || !pushToken || !deviceId) return;
+  // Send as soon as we have EITHER a regular push token or a VoIP token — the
+  // VoIP token is what powers incoming-call CallKit pushes and must reach the
+  // backend even if the standard APNs/FCM token hasn't arrived yet.
+  if (!socket || !socket.connected || !deviceId || (!pushToken && !voipToken)) return;
   socket.emit('notification:device:register', {
     deviceId,
-    pushToken,
+    ...(pushToken ? { pushToken } : {}),
     pushProvider: Platform.OS === 'ios' ? 'apns' : 'fcm',
     // iOS-only PushKit token for incoming-call VoIP pushes (CallKit). Omitted on
     // Android, where call pushes ride the existing FCM data-message path.

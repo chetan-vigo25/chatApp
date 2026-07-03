@@ -630,8 +630,12 @@ export const CallProvider = ({ children }) => {
     }
     dispatch({ type: ACT.ENDED, reason: outcome, nowMs: Date.now(), message: message || null });
 
-    // Dismiss the native call UI (no-op unless CallKeep is installed).
+    // Dismiss the native call UI (no-op unless CallKeep is installed). End by BOTH
+    // ids: the CallKit call is keyed on the SIGNALING id (displayIncomingCall /
+    // the VoIP push's registered uuid), while snap.callId is the later WebRTC id —
+    // ending only one would leave the native CallKit screen up after the call ends.
     if (snap.callId) nativeCall.endCall(snap.callId);
+    if (snap.signalId && snap.signalId !== snap.callId) nativeCall.endCall(snap.signalId);
     // Dismiss the OS full-screen incoming-call notification (notifee), keyed on
     // the signaling id that the push/notification used as its callId. Cancel ALL
     // shown call notifications so none lingers regardless of id drift.
@@ -1550,7 +1554,16 @@ export const CallProvider = ({ children }) => {
       ensureConnected();
       return;
     }
-    startRinging('incoming');
+    // iOS with CallKit: the native call screen (reported below, or by the VoIP
+    // push's AppDelegate handler on a killed/locked device) IS the ring UI and
+    // plays the system ringtone — so don't also play the in-app expo-av ringtone
+    // or expand the in-app ring overlay, which would double-ring and stack a
+    // second screen under CallKit. The in-app CallOverlay takes over once the user
+    // answers on the CallKit screen (accepted → overlay un-collapses). Every other
+    // case (Android, or an iOS build without the CallKit native module) keeps the
+    // in-app ring exactly as before.
+    const useCallKit = Platform.OS === 'ios' && nativeCall.isAvailable();
+    if (!useCallKit) startRinging('incoming');
     armRingTimeout();
     // Record whether the device was locked when this call arrived → back/end will
     // return to the lock screen instead of exposing the app. Use BOTH the live
@@ -1570,9 +1583,11 @@ export const CallProvider = ({ children }) => {
     // foreground on another screen — iOS has no native call UI, so an incoming call
     // must cover whatever screen the user is on (WhatsApp behaviour), not just show
     // a top banner.
-    const shouldExpand = Platform.OS === 'ios'
-      ? true
-      : (opts.expand !== undefined ? opts.expand : AppState.currentState !== 'active');
+    const shouldExpand = useCallKit
+      ? false // CallKit is the ring UI; the overlay un-collapses on answer.
+      : (Platform.OS === 'ios'
+        ? true
+        : (opts.expand !== undefined ? opts.expand : AppState.currentState !== 'active'));
     if (shouldExpand) {
       dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
     }
@@ -1699,7 +1714,25 @@ export const CallProvider = ({ children }) => {
     // suppress anything older than the ring window so only a genuinely live call
     // rings. (The FCM bg handler drops these before display too; this guards the
     // foreground / cold-launch / notification-tap emit paths.)
-    if (isStaleCallPush(data)) return;
+    //
+    // The most common trigger is opening the app by tapping a call notification
+    // that LINGERED after the call already ended (its cancel/missed push never
+    // arrived while the device was locked/killed): that replay carries no backend
+    // `ts`, but isStaleCallPush falls back to the dial time embedded in the
+    // signaling callId. Dismiss the dead notification so it can't ring again.
+    if (isStaleCallPush(data)) {
+      if (__DEV__) console.log('[CALL][APP] stale incoming push/tap dropped — call is over', { callId: data?.callId });
+      cancelAllIncomingCallNotifee();
+      return;
+    }
+    // iOS VoIP push: the AppDelegate already reported this call to CallKit with
+    // the backend-supplied `uuid`. Bind that uuid to our signaling callId so a
+    // later end/decline (finalizeEnd → nativeCall.endCall(signalId)) dismisses the
+    // exact CallKit call the native side put up, instead of a mismatched uuid that
+    // would leave the CallKit screen lingering after the call is over.
+    if (data?._voip && data?.uuid && data?.callId) {
+      nativeCall.registerCallUuid(data.callId, data.uuid);
+    }
     // A push-driven ring means the app wasn't foreground (or it's a full-screen
     // intent launch) → bring up the full-screen incoming screen.
     const expand = !!data?._fullScreen || AppState.currentState !== 'active';
@@ -1719,6 +1752,15 @@ export const CallProvider = ({ children }) => {
   // state exists (cold start from a killed app), then answer once it commits.
   const onPushAccept = useCallback((data) => {
     if (!data?.callerId) return;
+    // Accept tapped on a call notification that lingered after the call already
+    // ended → don't build a ghost ringing state that hangs 30s on the connect
+    // watchdog. Same staleness test as onPushIncoming (dial time embedded in the
+    // signaling callId when the replay carries no backend `ts`); clear the notif.
+    if (isStaleCallPush(data)) {
+      if (__DEV__) console.log('[CALL][APP] stale accept-tap dropped — call is over', { callId: data?.callId });
+      cancelAllIncomingCallNotifee();
+      return;
+    }
     const snap = stateRef.current;
     // Already ringing this call (e.g. a foreground notification-only call whose
     // INCOMING state was built on ARRIVAL) → answer NOW. The pending-accept effect
@@ -1836,7 +1878,19 @@ export const CallProvider = ({ children }) => {
     if (!isAuthenticated || !nativeCall.isAvailable()) return undefined;
     nativeCall.setup();
     const unsub = nativeCall.registerEvents({
-      onAnswer: () => { actionsRef.current.accept && actionsRef.current.accept(); },
+      onAnswer: () => {
+        const snap = stateRef.current;
+        // Ring state already committed (VoIP push / socket built INCOMING) →
+        // answer now. On a cold launch from a killed device the CallKit answer can
+        // fire BEFORE the push's INCOMING state lands; defer via the same
+        // pending-accept flag so accept() runs the moment INCOMING commits (a bare
+        // accept() would no-op against a not-yet-INCOMING state and be lost).
+        if (snap.status === CALL_STATUS.INCOMING && !snap.accepted) {
+          actionsRef.current.accept && actionsRef.current.accept();
+        } else {
+          pushAcceptPendingRef.current = true;
+        }
+      },
       onEnd: () => {
         const snap = stateRef.current;
         if (snap.status === CALL_STATUS.INCOMING) actionsRef.current.reject && actionsRef.current.reject();
@@ -1848,10 +1902,19 @@ export const CallProvider = ({ children }) => {
         if (snap.micOn === muted) actionsRef.current.toggleMic && actionsRef.current.toggleMic();
       },
     });
-    // iOS PushKit: register the VoIP token + listen for incoming VoIP pushes so a
-    // terminated/locked app rings via CallKit. No-op on Android / Expo Go.
+    return () => { unsub(); };
+  }, [isAuthenticated]);
+
+  // iOS PushKit: register the VoIP token + listen for incoming VoIP pushes so a
+  // terminated/locked app rings via CallKit (the AppDelegate PushKit → CallKit
+  // path). This is INDEPENDENT of nativeCall.isAvailable() / IOS_CALLKIT_ENABLED:
+  // that switch only gates the in-call CallKit flow, whereas the native incoming
+  // path works regardless and needs the VoIP token to have been registered with
+  // the backend. registerVoipPush() itself no-ops on Android / Expo Go.
+  useEffect(() => {
+    if (!isAuthenticated) return undefined;
     const unsubVoip = registerVoipPush();
-    return () => { unsub(); unsubVoip(); };
+    return () => { unsubVoip(); };
   }, [isAuthenticated]);
 
   const value = {

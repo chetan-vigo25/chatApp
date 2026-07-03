@@ -38,16 +38,27 @@ const uuidv4 = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c)
   return v.toString(16);
 });
 
-// MASTER SWITCH for the in-app CallKit call-flow integration (outgoing/active/end
-// + the answer/end event listeners). Currently OFF: wiring CallKit into the live
-// call flow let CallKit's `endCall` (fired during the connecting phase) terminate
-// the WebRTC call right after the callee answered — a call dropping "after ~2
-// rings". With this off, calls run on the proven WebRTC path exactly as before.
+// MASTER SWITCH for the in-app CallKit integration (incoming CallKit screen +
+// answer/end/mute listeners + active-call reporting). ON: required for the iOS
+// killed/locked full-screen native call screen — a VoIP (PushKit) push has the
+// AppDelegate report the call to CallKit natively, and this JS side then handles
+// the user's Answer/End on that screen and connects the WebRTC call.
 //
-// NOTE: this does NOT disable the PushKit→CallKit incoming path in AppDelegate
-// (that only acts on a real VoIP push, which the backend isn't sending yet, so
-// it stays inert). Flip to true to re-enable + debug CallKit on a PHYSICAL device.
-const IOS_CALLKIT_ENABLED = false;
+// Requires a PHYSICAL iPhone + a dev/EAS build (never Expo Go / simulator) AND the
+// backend actually sending the APNs VoIP push — without that push the CallKit
+// screen never appears (the AppDelegate path stays inert).
+const IOS_CALLKIT_ENABLED = true;
+
+// CallKit is scoped to the INCOMING ring only. We deliberately do NOT report
+// OUTGOING calls to CallKit: RNCallKeep.startCall files a CXStartCallAction that
+// iOS expects the app to fulfil by reporting the outgoing call's
+// startedConnecting/connectedAt lifecycle. This app runs calls on WebRTC, not
+// CallKit's lifecycle, so that action was never fulfilled — iOS then timed it out
+// and fired `endCall`, tearing down the live WebRTC call "after ~2 rings" (the
+// regression that had CallKit disabled). The caller is never on a locked screen
+// needing the native UI, so the in-app CallOverlay is the right (and only) caller
+// UI; leaving CallKit out of the outgoing path removes the drop entirely.
+const REPORT_OUTGOING_TO_CALLKIT = false;
 
 // iOS-ONLY even when enabled. Android keeps its own incoming UI (expo-call-ui
 // CallStyle) + the active-call foreground service, so we must NOT let
@@ -63,6 +74,19 @@ export const uuidForCall = (callId) => {
     uuidToId[u] = key;
   }
   return idToUuid[key];
+};
+
+// Bind our callId to the EXACT CallKit UUID an incoming VoIP push already reported
+// with (the AppDelegate calls reportNewIncomingCall using the backend-supplied
+// `uuid`). Without this the JS uuid map would mint a DIFFERENT uuid for the same
+// call, so endCall(callId) couldn't dismiss the CallKit screen the native side
+// put up — it would linger after the call ended. Idempotent; no-op on empty args.
+export const registerCallUuid = (callId, uuid) => {
+  const key = String(callId || '');
+  const u = String(uuid || '');
+  if (!key || !u) return;
+  idToUuid[key] = u;
+  uuidToId[u] = key;
 };
 
 const callIdForUuid = (uuid) => uuidToId[String(uuid || '')] || null;
@@ -114,7 +138,9 @@ export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
 };
 
 export const startOutgoingCall = (callId, handle, name, hasVideo = false) => {
-  if (!isAvailable()) return;
+  // Intentionally NOT reported to CallKit — see REPORT_OUTGOING_TO_CALLKIT above
+  // (unfulfilled CXStartCallAction → CallKit ends the WebRTC call mid-connect).
+  if (!isAvailable() || !REPORT_OUTGOING_TO_CALLKIT) return;
   try {
     RNCallKeep.startCall(uuidForCall(callId), String(handle || name || 'call'), name || 'Call', 'generic', !!hasVideo);
   } catch (_) { /* no-op */ }
@@ -169,6 +195,7 @@ export default {
   isAvailable,
   setup,
   uuidForCall,
+  registerCallUuid,
   displayIncomingCall,
   startOutgoingCall,
   setCurrentCallActive,

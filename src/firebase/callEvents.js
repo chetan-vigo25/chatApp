@@ -18,13 +18,32 @@ export const CALL_PUSH_EVENTS = {
 // ~30–45s, so a push older than this is for a call that's certainly over.
 export const STALE_CALL_PUSH_MS = 60 * 1000;
 
-// True when a call push's sent-at stamp (`data.ts`, epoch ms set by the backend)
-// is older than the staleness window. Missing/garbled ts → NOT stale (fail-open:
-// an older client/payload must still ring rather than silently swallow a call).
+// The signaling call id is minted by the caller as `sig_<callerId>_<dialEpochMs>`
+// (see CallProvider.startCall), so it embeds the dial time. Pull that trailing
+// epoch out — it's the ONLY timing signal a REPLAYED notification tap carries: the
+// native CallStyle / notifee tap payload (emitCallAction) has no backend `ts`, so
+// a call notification that lingered in the tray (its cancel/missed push never
+// arrived while the app was dead/locked) would otherwise ring a ghost call when
+// the user opens the app by tapping it. The callerId is a hex Mongo id (letters),
+// so the trailing all-digit group is unambiguously the timestamp. NaN when the id
+// isn't in that shape (e.g. a raw WebRTC id).
+const callIdDialTime = (callId) => {
+  const m = /_(\d{11,})$/.exec(String(callId || ''));
+  return m ? Number(m[1]) : NaN;
+};
+
+// True when a call push is older than the staleness window. Prefer the backend
+// sent-at stamp (`data.ts`, epoch ms); when it's missing/garbled — notably on the
+// notification-tap REPLAY path — fall back to the dial time embedded in the
+// signaling callId. Only when NEITHER is available do we fail open (ring rather
+// than silently swallow a call from an older client/payload).
 export const isStaleCallPush = (data) => {
+  const now = Date.now();
   const ts = Number(data && data.ts);
-  if (!Number.isFinite(ts) || ts <= 0) return false;
-  return Date.now() - ts > STALE_CALL_PUSH_MS;
+  if (Number.isFinite(ts) && ts > 0) return now - ts > STALE_CALL_PUSH_MS;
+  const dialTs = callIdDialTime(data && data.callId);
+  if (Number.isFinite(dialTs) && dialTs > 0) return now - dialTs > STALE_CALL_PUSH_MS;
+  return false;
 };
 
 export default CALL_PUSH_EVENTS;
