@@ -6,6 +6,7 @@ import {
 import { useSelector } from "react-redux";
 import { useTheme } from "../../contexts/ThemeContext";
 import countryCodes from '../../jsonFile/countryCodes.json';
+import { detectIpCountry, getCachedIpCountry } from "../../utils/ipCountry";
 
 // The user's own registered dial code (e.g. "+91") is stored on their profile as
 // mobile.code and matches a countryCodes[].code exactly, so we can default the
@@ -36,24 +37,28 @@ export default function AddNewContact({ navigation }) {
     const [phoneFocused, setPhoneFocused] = useState(false);
     const [username, setUsername] = useState('');
     const [usernameFocused, setUsernameFocused] = useState(false);
-    // Default the country to the one the CURRENT user registered with (their
-    // profile mobile.code), so it reflects the country they use the app in — not a
-    // hard-coded India. Falls back to the first catalogue entry until the profile
-    // is available. `userPickedCountry` guards against overriding a manual choice.
+    // Default country priority: user's manual pick > current IP/VPN country >
+    // the user's registered number's country > first catalogue entry. IP is the
+    // requested primary (follows a VPN); the registered number is the fallback when
+    // the geo lookup fails. `userPickedCountry` guards against overriding a choice.
     const myDialCode = useSelector((state) => state.profile?.profileData?.mobile?.code) || null;
     const userPickedCountry = useRef(false);
     const [selectedCountry, setSelectedCountry] = useState(
-      () => matchCountryByDialCode(myDialCode) || countryCodes[0]
+      () => getCachedIpCountry() || matchCountryByDialCode(myDialCode) || countryCodes[0]
     );
 
-    // Adopt the user's country once the profile loads (New Contact may open before
-    // the profile fetch finishes). Never overrides a country the user picked.
+    // Resolve the IP/VPN country (async); fall back to the registered number.
+    // Never overrides a country the user picked.
     useEffect(() => {
-      if (userPickedCountry.current) return;
-      const match = matchCountryByDialCode(myDialCode);
-      if (match && match.code !== selectedCountry?.code) {
-        setSelectedCountry(match);
-      }
+      let alive = true;
+      detectIpCountry().then((ipCountry) => {
+        if (!alive || userPickedCountry.current) return;
+        const next = ipCountry || matchCountryByDialCode(myDialCode);
+        if (next && next.code !== selectedCountry?.code) {
+          setSelectedCountry(next);
+        }
+      });
+      return () => { alive = false; };
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [myDialCode]);
     const [isSearching, setIsSearching] = useState(false);

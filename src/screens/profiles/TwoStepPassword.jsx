@@ -236,6 +236,15 @@ export default function TwoStepPassword({ navigation }) {
     );
   };
 
+  // The Update/Set button stays DISABLED until both fields hold a valid, matching
+  // password (4–128 chars) and the lock is on — same rules handleSave enforces.
+  const trimmedNewPwd = pwd.trim();
+  const isPasswordFormValid =
+    enabled &&
+    trimmedNewPwd.length >= 4 &&
+    trimmedNewPwd.length <= 128 &&
+    trimmedNewPwd === confirmPwd.trim();
+
   // ─── Header ───
   const renderHeader = () => (
     <View style={styles.header}>
@@ -394,10 +403,10 @@ export default function TwoStepPassword({ navigation }) {
           <TouchableOpacity
             activeOpacity={0.85}
             onPress={handleSave}
-            disabled={submitting || busy || loading}
+            disabled={!isPasswordFormValid || submitting || busy || loading}
             style={[styles.primaryBtn, {
               backgroundColor: themeColor,
-              opacity: (submitting || busy || loading) ? 0.7 : 1,
+              opacity: (!isPasswordFormValid || submitting || busy || loading) ? 0.5 : 1,
             }]}
           >
             {submitting ? (

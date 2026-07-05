@@ -13,6 +13,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { generateOtpAction } from '../Redux/Reducer/Auth/Auth.reducer';
 import { getAllowedCountries } from '../Redux/Services/Auth/AppConfig.Services';
 import { getPhoneRule, isPhoneValid, phoneLengthHint } from '../utils/phoneValidation';
+import { detectIpCountry, getCachedIpCountry } from '../utils/ipCountry';
 import { APP_TAG_NAME } from '@env';
 
 function showToast(message) {
@@ -30,9 +31,27 @@ export default function Login({ navigation }) {
   // bundled catalogue so the screen renders instantly, then swap in the list the
   // backend allows (falls back to the bundled list if the fetch fails).
   const [countries, setCountries] = useState(countryCodes);
-  const [selectedCountry, setSelectedCountry] = useState(countryCodes[0]);
+  const [selectedCountry, setSelectedCountry] = useState(getCachedIpCountry() || countryCodes[0]);
   const [phoneNumber, setPhoneNumber] = useState('');
   const [phoneFocused, setPhoneFocused] = useState(false);
+  // Set once the user manually picks a country → stops IP auto-selection from
+  // overriding their choice.
+  const userPickedCountry = useRef(false);
+
+  // Default to the country of the current network/IP (follows a VPN), but only if
+  // that country is actually offered in the (admin-allowed) picker list. Re-checks
+  // when the allowed list loads. Never overrides a manual pick.
+  useEffect(() => {
+    let alive = true;
+    detectIpCountry().then((ip) => {
+      if (!alive || userPickedCountry.current || !ip) return;
+      const inList = countries.some((c) => c.code === ip.code && c.name === ip.name);
+      if (inList) {
+        setSelectedCountry((prev) => (prev?.code === ip.code && prev?.name === ip.name ? prev : ip));
+      }
+    });
+    return () => { alive = false; };
+  }, [countries]);
 
   useEffect(() => {
     let alive = true;
@@ -61,6 +80,7 @@ export default function Login({ navigation }) {
   }, []);
 
   const handleCountrySelect = (country) => {
+    userPickedCountry.current = true;
     setSelectedCountry(country);
     const { max } = getPhoneRule(country?.code);
     setPhoneNumber((prev) => prev.slice(0, max));

@@ -263,12 +263,6 @@ export default function ChatColorTheme({ navigation }) {
                   <View style={[styles.colorCardSwatch, { backgroundColor: color }]}>
                     {isSel && <Ionicons name="checkmark" size={24} color="#fff" />}
                   </View>
-                  <Text
-                    style={[styles.colorCardHex, { color: isSel ? color : subText }]}
-                    numberOfLines={1}
-                  >
-                    {color.toUpperCase()}
-                  </Text>
                 </TouchableOpacity>
               </Animated.View>
             );
@@ -577,9 +571,8 @@ const styles = StyleSheet.create({
     borderWidth: 2.5,
     paddingHorizontal: 6,
     paddingTop: 6,
-    paddingBottom: 9,
+    paddingBottom: 6,
     alignItems: 'center',
-    gap: 8,
   },
   colorCardSwatch: {
     width: '100%',

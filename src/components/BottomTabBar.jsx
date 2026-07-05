@@ -19,7 +19,7 @@ const TABS = [
   { key: 'chats',    label: 'Chats',    lib: 'ion', icon: 'chatbubble',    iconOutline: 'chatbubble-outline' },
   { key: 'status',   label: 'Updates',  lib: 'mci', icon: 'record-circle', iconOutline: 'record-circle-outline' },
   { key: 'calls',    label: 'Calls',    lib: 'ion', icon: 'call',          iconOutline: 'call-outline' },
-  { key: 'settings', label: 'Settings', lib: 'ion', icon: 'settings',      iconOutline: 'settings-outline' },
+  { key: 'settings', label: 'You', lib: 'ion', icon: 'settings',      iconOutline: 'settings-outline' },
 ];
 
 function TabIcon({ lib, name, size, color }) {
