@@ -1,7 +1,7 @@
 -- Merging decision tree log ---
 manifest
-ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:1:1-25:12
-INJECTED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:1:1-25:12
+ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:1:1-32:12
+INJECTED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:1:1-32:12
 	package
 		INJECTED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml
 	xmlns:android
@@ -18,22 +18,26 @@ uses-permission#android.permission.FOREGROUND_SERVICE_CAMERA
 ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:3-82
 	android:name
 		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:20-79
+uses-permission#android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:3-93
+	android:name
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:20-90
 application
-ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:12:3-24:17
+ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:3-31:17
 receiver#expo.modules.callui.CallActionReceiver
-ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:15:5-17:34
+ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:22:5-24:34
 	android:exported
-		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:7-31
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:24:7-31
 	android:name
-		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:16:7-41
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:23:7-41
 service#expo.modules.callui.CallForegroundService
-ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:20:5-23:59
+ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:27:5-30:59
 	android:exported
-		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:22:7-31
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:29:7-31
 	android:foregroundServiceType
-		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:23:7-56
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:30:7-56
 	android:name
-		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:21:7-44
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:28:7-44
 uses-sdk
 INJECTED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml reason: use-sdk injection requested
 INJECTED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml

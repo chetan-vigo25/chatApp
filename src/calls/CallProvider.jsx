@@ -11,6 +11,7 @@ import { useCameraPermissions } from 'expo-camera';
 import * as ScreenCapture from 'expo-screen-capture';
 import { MaterialIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import { useAuth } from '../contexts/AuthContext';
 import { CallContext } from './CallContext';
 import CallEngineWebView from './engine/CallEngineWebView';
@@ -34,7 +35,7 @@ import nativeCall from './services/nativeCallService';
 import { registerVoipPush } from './services/voipPushService';
 import {
   ringCall, cancelCall, acceptCallSignal, rejectCallSignal, endCallSignal,
-  registerCallSignalListeners,
+  registerCallSignalListeners, pullPendingCalls,
 } from './services/callSignalService';
 import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // CALL_PUSH_EVENTS lives in its own dep-free module; callNotifee resolves its
@@ -50,8 +51,11 @@ import {
   startOngoingCallNotification, stopOngoingCallNotification,
   isDeviceLockedNow, returnToLockScreen, addDeviceLockListener,
   setShowWhenLockedNative, displayMissedCallNotification, setCallActiveNative,
+  peekInitialCallLaunch, hideCallLaunchCover,
 } from '../firebase/callNotifee';
 import { notifyIncomingCall } from './services/callNotifyService';
+import ColdStartCallCover from './components/ColdStartCallCover';
+import CallReliabilityGate from './components/CallReliabilityGate';
 
 // CallContext now lives in its own leaf module (./CallContext) to break the
 // useCall ↔ CallProvider require cycle. Re-exported here for backward compat.
@@ -84,6 +88,11 @@ const getRingTimeoutMs = () => clampRingSec(getServerRingDurationSec() || ENV_RI
 // is captured but the remote stream never arrives. Without it either case sits
 // on "Connecting…" forever. 30s ≈ WhatsApp's "couldn't connect" window.
 const CONNECT_TIMEOUT_MS = 30000;
+
+// After the media layer drops mid-call (network blip / ICE failed), how long to
+// wait for it to recover (auto ICE-restart + the SDK's own reconnect) before
+// giving up and ending the call as "Connection lost". ~30s ≈ WhatsApp's window.
+const RECONNECT_TIMEOUT_MS = 30000;
 
 // When a call ends with a reason the user needs to READ (busy / unavailable /
 // blocked-by-admin / declined / failed), keep the end screen up at least this
@@ -155,6 +164,7 @@ export const CallProvider = ({ children }) => {
   const ringTimeoutRef = useRef(null); // auto-end an unanswered ringing call
   const mediaWatchdogRef = useRef(null); // detect a hung getUserMedia (no localstream)
   const connectWatchdogRef = useRef(null); // detect an answered call that never reaches ACTIVE (no remote media)
+  const reconnectWatchdogRef = useRef(null); // mid-call media-drop recovery watchdog (APP-6)
   const audioRouteAppliedRef = useRef(false); // did the user toggle Speaker this call? (so we reset routing on end)
   const presenceWaiters = useRef({}); // ref -> resolve
   const readyWaiters = useRef([]);    // [resolve]
@@ -182,6 +192,17 @@ export const CallProvider = ({ children }) => {
   const [privacyMask, setPrivacyMask] = useState(
     () => Platform.OS === 'android' && isDeviceLockedNow(),
   );
+
+  // Cold-start call cover (APP-14). When the app was KILLED and launched by a
+  // call full-screen intent (killed+locked incoming ring), the first frames would
+  // otherwise paint Splash/ChatList before the JS call state mounts. Peek the
+  // launch intent SYNCHRONOUSLY (non-consuming — getInitialCallAction still drives
+  // the real accept/incoming action) and paint an instant "Incoming call" cover
+  // until the live call UI takes over. No-op on iOS / normal launches (peek → null).
+  const [coldStartCall, setColdStartCall] = useState(() => {
+    if (Platform.OS !== 'android') return null;
+    try { return peekInitialCallLaunch(); } catch (_) { return null; }
+  });
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
@@ -217,29 +238,44 @@ export const CallProvider = ({ children }) => {
     const label = s.isGroup
       ? (s.groupName || 'Group call')
       : (s.peer?.name || 'Ongoing call');
+    const ringing = !s.answeredAt; // dialed but not yet connected
     return {
       callId: s.signalId || s.callId,
       callerName: label,
       callerImage: s.isGroup ? null : (s.peer?.avatar || null),
       callType: s.media === 'video' ? 'video' : 'audio',
-      startedAt: s.answeredAt || Date.now(),
+      // 0 while ringing → native shows "Calling…" with no duration timer.
+      startedAt: s.answeredAt || 0,
+      state: ringing ? 'ringing' : 'ongoing',
     };
   }, []);
 
-  const showOngoingNotif = !!state.answeredAt
+  // Run the ongoing foreground service for a CONNECTED call (either party) OR for
+  // the CALLER's still-ringing outgoing call. The caller dials while foregrounded,
+  // so starting a mic foreground service now is allowed by Android 12+; it then
+  // (a) keeps the call alive when backgrounded DURING the ring and (b) lets
+  // CallForegroundService.onTaskRemoved catch a swipe-away during the ring, not
+  // only after answer. The callee stays gated on answeredAt — it often reaches
+  // ACTIVE only after the app has backgrounded, where a mic-FGS start is rejected.
+  const isOutgoingRinging =
+    state.direction === 'outgoing' && state.status === CALL_STATUS.OUTGOING;
+
+  const showOngoingNotif = (!!state.answeredAt || isOutgoingRinging)
     && state.status !== CALL_STATUS.IDLE
     && state.status !== CALL_STATUS.ENDED;
 
   useEffect(() => {
     if (showOngoingNotif) {
+      // Re-fires on the ringing→connected transition (answeredAt flips), refreshing
+      // the notification from "Calling…" to the live duration timer.
       startOngoingCallNotification(buildOngoingPayload());
     } else {
-      // OUTGOING-ringing / INCOMING-ringing / ENDED / IDLE → no ongoing notification.
+      // INCOMING-ringing (callee) / ENDED / IDLE → no ongoing notification.
       stopOngoingCallNotification();
     }
   }, [
     showOngoingNotif, buildOngoingPayload,
-    state.signalId, state.callId, state.isGroup,
+    state.signalId, state.callId, state.isGroup, state.direction, state.status,
     state.groupName, state.peer, state.media, state.answeredAt,
   ]);
 
@@ -449,6 +485,20 @@ export const CallProvider = ({ children }) => {
   // is off/locked, so the mask reasserts the instant it returns to idle.
   useEffect(() => { recomputePrivacyMask(); }, [state.status, recomputePrivacyMask]);
 
+  // Retire the cold-start call cover once the real call state has mounted (status
+  // left IDLE → CallOverlay is now up), or after a safety timeout so a stale
+  // launch intent (call already over) can never leave the cover stuck (APP-14).
+  useEffect(() => {
+    if (!coldStartCall) return undefined;
+    if (state.status !== CALL_STATUS.IDLE) {
+      hideCallLaunchCover();
+      setColdStartCall(null);
+      return undefined;
+    }
+    const t = setTimeout(() => { hideCallLaunchCover(); setColdStartCall(null); }, 15000);
+    return () => clearTimeout(t);
+  }, [coldStartCall, state.status]);
+
 
   // Show-over-the-keyguard ONLY during a call. Idle → off, so locking the phone
   // drops the app behind the keyguard and the user sees the system lock screen
@@ -495,6 +545,18 @@ export const CallProvider = ({ children }) => {
     }
   }, []);
 
+  // ---- mid-call reconnect watchdog (APP-6) ----
+  // A live call whose media layer dropped (network blip / ICE failed) is given a
+  // window to recover (auto ICE restart + the engine's own reconnect). If it
+  // hasn't recovered by RECONNECT_TIMEOUT_MS the call is ended cleanly with
+  // "Connection lost" instead of hanging silently on a dead transport.
+  const clearReconnectWatchdog = useCallback(() => {
+    if (reconnectWatchdogRef.current) {
+      clearTimeout(reconnectWatchdogRef.current);
+      reconnectWatchdogRef.current = null;
+    }
+  }, []);
+
   // ---- connect lifecycle ----
   // Mint a fresh calling-service token (GET /call/token) and connect the engine.
   // Connect is LAZY: the token is minted + the engine connected only AT CALL TIME
@@ -526,12 +588,44 @@ export const CallProvider = ({ children }) => {
   const ensureConnected = useCallback(async () => {
     if (engineReadyRef.current) return true;
     doConnect();
-    // wait up to 8s for engineReady
+    // Wait for engineReady. With the pre-warm effect below the engine is usually
+    // ALREADY connected, so this resolves instantly; this window only matters when
+    // the user calls before the warm-up finished. 12s (was 8s) covers a genuinely
+    // cold connect (WebView SDK load + socket.io handshake + token mint) on a slow
+    // network so we don't falsely tell the user "still connecting, try again".
     return new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(engineReadyRef.current), 8000);
+      const timer = setTimeout(() => resolve(engineReadyRef.current), 12000);
       readyWaiters.current.push(() => { clearTimeout(timer); resolve(true); });
     });
   }, [doConnect]);
+
+  // ---- pre-warm the WebRTC engine connection (first-call reliability) ----
+  // The engine connect (WebView SDK load + socket.io handshake to whatsapp-call +
+  // token mint) takes several seconds when COLD. Connecting it lazily only when the
+  // user presses Call meant the FIRST call raced that cold connect and usually lost
+  // — ensureConnected's wait expired → "still connecting, try again", and the call
+  // only worked on the 2nd/3rd attempt once the engine was warm ("ek baar nahi teen
+  // baar call karne par lagti hai"). The same cold-connect delay hit the CALLEE
+  // (engine woken only on the incoming signal), so the first ring often couldn't
+  // connect media in the window either.
+  //
+  // Fix: warm the engine WHILE THE APP IS OPEN (authenticated + foreground) so the
+  // connection is READY before the call, not built during it. doConnect is
+  // idempotent (no-ops once connecting/ready) and the persistent CallEngineWebView
+  // is already mounted for every authenticated user (showEngine), so this only
+  // brings the connect forward. Trade-off vs the old "no pre-connect at login": one
+  // call token is minted per active session — well worth first-try reliability.
+  useEffect(() => {
+    if (IS_EXPO_GO || !isAuthenticated) return undefined;
+    // Small delay so the warm-up doesn't compete with app-startup work (chat sync).
+    const t = setTimeout(() => { doConnect(); }, 3000);
+    // Re-warm on foreground: the engine socket may have dropped while backgrounded,
+    // and a cold reconnect would re-introduce the first-call delay.
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') doConnect();
+    });
+    return () => { clearTimeout(t); sub.remove(); };
+  }, [isAuthenticated, doConnect]);
 
   // Runtime mic (+ camera for video) permission. On Android a manifest entry is
   // NOT enough — the permission must be granted at runtime, or the WebView's
@@ -617,6 +711,7 @@ export const CallProvider = ({ children }) => {
     clearRingTimeout();
     clearMediaWatchdog();
     clearConnectWatchdog();
+    clearReconnectWatchdog();
     stopRinging();
     resetAudioRoute(); // restore loudspeaker if the user had switched to earpiece
 
@@ -778,7 +873,7 @@ export const CallProvider = ({ children }) => {
       }
       dispatch({ type: ACT.RESET });
     }, resetDelay);
-  }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, resetAudioRoute]);
+  }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, resetAudioRoute]);
 
   // Arm the unanswered-call timeout. Fires once after the configured ring window
   // (getRingTimeoutMs) unless the call is answered (ACTIVE) or already ended.
@@ -823,6 +918,21 @@ export const CallProvider = ({ children }) => {
       finalizeEnd('failed', 'Could not connect the call');
     }, CONNECT_TIMEOUT_MS);
   }, [clearConnectWatchdog, finalizeEnd]);
+
+  // Arm the mid-call reconnect watchdog (APP-6). Fires once if the dropped media
+  // layer hasn't recovered within RECONNECT_TIMEOUT_MS — ending the call as
+  // "Connection lost" rather than leaving a live-looking but dead call on screen.
+  const armReconnectWatchdog = useCallback(() => {
+    clearReconnectWatchdog();
+    reconnectWatchdogRef.current = setTimeout(() => {
+      reconnectWatchdogRef.current = null;
+      const snap = stateRef.current;
+      if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+      if (!snap.reconnecting) return; // recovered already
+      if (__DEV__) console.log('[CALL] reconnect watchdog — media never recovered → ending');
+      finalizeEnd('failed', 'Connection lost');
+    }, RECONNECT_TIMEOUT_MS);
+  }, [clearReconnectWatchdog, finalizeEnd]);
 
   // ---- event handling from the engine ----
   const onEngineEvent = useCallback((type, payload) => {
@@ -962,6 +1072,20 @@ export const CallProvider = ({ children }) => {
           dispatch({ type: ACT.REMOTE_JOINED, nowMs: Date.now() });
         }
         if (snap.callId) nativeCall.setCurrentCallActive(snap.callId);
+        // Caller side: the OUTGOING call was NOT put in CallKit at dial time (that
+        // caused the ~2-ring drop). Now that it's genuinely connected, register it
+        // as an already-connected CallKit call so the caller gets the native
+        // ongoing-call notch / Dynamic Island indicator + background keep-alive +
+        // lock-screen hang-up — WITHOUT the dial-time CXStartCallAction timeout,
+        // since the ring window had no CallKit call. iOS-only / no-op inside.
+        if (snap.callId && snap.direction === 'outgoing') {
+          nativeCall.reportOutgoingConnected(
+            snap.callId,
+            snap.peer?.id,
+            snap.isGroup ? (snap.groupName || 'Group call') : snap.peer?.name,
+            snap.media === 'video',
+          );
+        }
         // Call connected → begin recording for the admin monitor (caller only).
         maybeStartRecording();
         break;
@@ -1050,6 +1174,28 @@ export const CallProvider = ({ children }) => {
         break;
       }
       case 'ended': { finalizeEnd('completed'); break; }
+      // ---- mid-call media-layer drop / recovery (APP-6) ----
+      case 'mediaDown': {
+        const snap = stateRef.current;
+        // Only meaningful once the call is actually up (ACTIVE, or answered and
+        // connecting). A drop before that is handled by the connect watchdog.
+        if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) break;
+        if (!snap.answeredAt) break;
+        if (!snap.reconnecting) {
+          dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: true });
+          armReconnectWatchdog();
+          // Nudge the transport to renegotiate immediately (in addition to any
+          // NetInfo-triggered restart) so recovery is as fast as possible.
+          sendCmd({ cmd: CMD.RESTART_ICE });
+        }
+        break;
+      }
+      case 'mediaUp': {
+        const snap = stateRef.current;
+        clearReconnectWatchdog();
+        if (snap.reconnecting) dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: false });
+        break;
+      }
       case 'error': {
         const snap = stateRef.current;
         if (snap.status !== CALL_STATUS.IDLE) finalizeEnd('failed', payload?.message);
@@ -1080,7 +1226,7 @@ export const CallProvider = ({ children }) => {
       }
       default: break;
     }
-  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, maybeStartRecording]);
+  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording]);
 
   // ---- public actions ----
   // `peerOrPeers` is a single peer object OR an array (group, up to
@@ -1375,6 +1521,24 @@ export const CallProvider = ({ children }) => {
     sendCmd({ cmd: CMD.RESUME_AUDIO });
   }, [sendCmd]);
 
+  // Re-assert the call's audio session + route + remote playback + mic. Called when
+  // the app returns to foreground AND when CallKit (re)activates the audio session
+  // (didActivateAudioSession) — both are moments iOS may have torn down or replaced
+  // our play-and-record session, leaving the WebView WebRTC call silent. Self-gates
+  // to an answered (active) call so it never fires on a ringing/ended call.
+  const reassertCallAudio = useCallback(async () => {
+    const s = stateRef.current;
+    if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
+    try {
+      if (Platform.OS === 'ios') await configureIOSAudioSession();
+      else if (audioRouteAppliedRef.current) await applyAudioRoute(s.speakerOn);
+    } catch (_) { /* best-effort */ }
+    resumeAudio();
+    // An interruption / session swap can leave the local track disabled — re-assert
+    // the mic so it matches the button state.
+    sendCmd({ cmd: CMD.TOGGLE_MIC, on: s.micOn !== false });
+  }, [configureIOSAudioSession, applyAudioRoute, resumeAudio, sendCmd]);
+
   // ---- audio-interruption recovery (WhatsApp parity) ----
   // A phone / WhatsApp / other VoIP call grabs the OS audio focus mid-call, so the
   // OS mutes our WebRTC audio and may release the mic — UNAVOIDABLE while that
@@ -1388,21 +1552,34 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     const onChange = (next) => {
       if (next !== 'active') return;
-      const s = stateRef.current;
-      if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
-      (async () => {
-        try {
-          if (Platform.OS === 'ios') await configureIOSAudioSession();
-          else if (audioRouteAppliedRef.current) await applyAudioRoute(s.speakerOn);
-        } catch (_) { /* best-effort */ }
-        resumeAudio();
-        // Re-assert the mic: an interruption can leave the local track disabled.
-        sendCmd({ cmd: CMD.TOGGLE_MIC, on: s.micOn !== false });
-      })();
+      reassertCallAudio();
     };
     const sub = AppState.addEventListener('change', onChange);
     return () => { try { sub.remove(); } catch (_) { /* */ } };
-  }, [configureIOSAudioSession, applyAudioRoute, resumeAudio, sendCmd]);
+  }, [reassertCallAudio]);
+
+  // ---- network-change ICE restart (APP-6) ----
+  // A mid-call network switch (wifi↔cellular, or reconnecting to a different AP)
+  // changes the device's local candidates; without a transport renegotiation the
+  // WebRTC media path stays pinned to the dead route and the call silently hangs.
+  // On any connection-TYPE change during an answered call, ask the engine to
+  // restart ICE so the SDK re-gathers candidates and recovers the media path.
+  useEffect(() => {
+    let lastType = null;
+    const unsub = NetInfo.addEventListener((s) => {
+      const type = s?.type || null;
+      const prev = lastType;
+      lastType = type;
+      if (prev == null) return; // first sample — just record the baseline
+      if (type === prev) return; // no type change
+      const snap = stateRef.current;
+      if (!snap.answeredAt) return;
+      if (snap.status !== CALL_STATUS.ACTIVE && snap.status !== CALL_STATUS.INCOMING && snap.status !== CALL_STATUS.OUTGOING) return;
+      if (__DEV__) console.log('[CALL] network type changed', { prev, type }, '→ CMD.RESTART_ICE');
+      sendCmd({ cmd: CMD.RESTART_ICE });
+    });
+    return () => { try { unsub(); } catch (_) { /* */ } };
+  }, [sendCmd]);
 
   // ---- minimize / maximize (WhatsApp-style floating call window) ----
   // Shrink the call to a draggable floating window so the rest of the app stays
@@ -1663,6 +1840,66 @@ export const CallProvider = ({ children }) => {
     }
   }, [clearRingTimeout, armConnectWatchdog]);
 
+  // Server-authoritative end-of-ring (XR-1 / APP-4). The backend ring timer fired
+  // before either side hung up. Previously the caller's end-of-ring depended ONLY
+  // on the local timer (armRingTimeout) — clock skew between server and device
+  // could double-end or ring past the server's window. Honour the server signal:
+  // an outgoing call ends as "No answer"; an un-accepted incoming becomes missed.
+  const onSignalTimeout = useCallback((payload) => {
+    if (!matchesCurrent(payload)) return;
+    const snap = stateRef.current;
+    if (snap.direction === 'outgoing') finalizeEnd('cancelled', 'No answer');
+    else if (snap.direction === 'incoming' && !snap.answeredAt) finalizeEnd('missed');
+  }, [finalizeEnd]);
+
+  // Multi-device dismissal (XR-1 / APP-4). Another device on THIS account handled
+  // the call, or the caller cancelled — dismiss the ring on THIS device. finalizeEnd
+  // tears down the ring UI / ringtone / notifee / CallKit by callId. Map the reason:
+  // answered elsewhere → 'completed' (quiet dismiss, no "missed" notification);
+  // anything else → 'missed' for an un-answered incoming, else 'cancelled'.
+  const onSignalCancelledElsewhere = useCallback((payload) => {
+    if (!matchesCurrent(payload)) return;
+    const snap = stateRef.current;
+    const reason = String(payload?.reason || '');
+    if (reason === 'answered_elsewhere' || reason === 'accepted_elsewhere') {
+      finalizeEnd('completed');
+      return;
+    }
+    if (snap.direction === 'incoming' && !snap.answeredAt) finalizeEnd('missed');
+    else finalizeEnd('cancelled');
+  }, [finalizeEnd]);
+
+  // Recovery pull (XR-2 / APP-5). On socket (re)connect (incl. cold start) while
+  // we're IDLE, ask the server for any invite that is STILL ringing for us — a
+  // push-woken / just-reconnected callee whose live `call:incoming` was missed
+  // (CallStyle notif timed out, socket was down) recovers the ring here.
+  const pullStillRingingInvites = useCallback(async () => {
+    if (stateRef.current.status !== CALL_STATUS.IDLE) return;
+    try {
+      const ack = await pullPendingCalls();
+      const calls = Array.isArray(ack?.calls) ? ack.calls : [];
+      if (!calls.length) return;
+      if (stateRef.current.status !== CALL_STATUS.IDLE) return; // a real ring landed meanwhile
+      // Take the freshest still-ringing invite and render it through the normal
+      // incoming path (shows ring + wakes the WebRTC engine to reconcile callId).
+      const inv = calls[0] || {};
+      const from = inv.from || {};
+      onSignalIncoming({
+        from: {
+          id: (from.id != null ? String(from.id) : (inv.callerId != null ? String(inv.callerId) : null)),
+          name: from.name || inv.callerName || 'Unknown',
+          avatar: from.avatar || inv.callerImage || null,
+        },
+        callId: inv.callId || null,
+        media: inv.media || inv.callType || 'audio',
+        members: Array.isArray(inv.members) ? inv.members : [],
+        isGroup: !!inv.isGroup,
+        groupId: inv.groupId || null,
+        groupName: inv.groupName || null,
+      });
+    } catch (_) { /* best-effort recovery */ }
+  }, [onSignalIncoming]);
+
   // Attach the server→client call listeners, re-attaching whenever the socket
   // (re)connects so a fresh underlying instance keeps them.
   useEffect(() => {
@@ -1674,6 +1911,8 @@ export const CallProvider = ({ children }) => {
       onRejected: onSignalRejected,
       onEnded: onSignalEnded,
       onUnavailable: onSignalUnavailable,
+      onTimeout: onSignalTimeout,
+      onCancelledElsewhere: onSignalCancelledElsewhere,
     };
     let unsub = () => {};
     let wasConnected = false;
@@ -1682,11 +1921,14 @@ export const CallProvider = ({ children }) => {
       if (connected && !wasConnected) {
         unsub();
         unsub = registerCallSignalListeners(handlers);
+        // On every (re)connect while IDLE, recover any still-ringing invite the
+        // device may have missed while offline / killed (XR-2 / APP-5).
+        pullStillRingingInvites();
       }
       wasConnected = connected;
     });
     return () => { unsub(); unsubState(); };
-  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable]);
+  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites]);
 
   // ---- incoming call from an FCM PUSH (callee offline / app backgrounded) ----
   // The push wakes the device; we reuse onSignalIncoming (which shows the ring +
@@ -1849,7 +2091,7 @@ export const CallProvider = ({ children }) => {
   }, [state.status, state.notificationOnly]);
 
   // Keep the latest action handles available to the native OS-call listeners.
-  actionsRef.current = { accept, reject, hangup, toggleMic };
+  actionsRef.current = { accept, reject, hangup, toggleMic, reassertCallAudio };
 
   // mount/teardown engine with auth
   useEffect(() => {
@@ -1900,6 +2142,12 @@ export const CallProvider = ({ children }) => {
         const snap = stateRef.current;
         // Sync our mic flag with the OS toggle if they diverge.
         if (snap.micOn === muted) actionsRef.current.toggleMic && actionsRef.current.toggleMic();
+      },
+      // CallKit activated its own AVAudioSession (call answered from killed/locked,
+      // or an interruption ended). This is the moment WebRTC audio can start in the
+      // background — re-assert our play-and-record session so the call is not silent.
+      onAudioSessionActivated: () => {
+        actionsRef.current.reassertCallAudio && actionsRef.current.reassertCallAudio();
       },
     });
     return () => { unsub(); };
@@ -2000,6 +2248,17 @@ export const CallProvider = ({ children }) => {
         </Animated.View>
       )}
       <CallOverlay />
+      {/* One-time "let calls ring when the app is closed / after restart"
+          onboarding — jumps the user to battery-optimization + OEM Autostart
+          toggles. Self-gates (Android + not-yet-granted + not dismissed) and only
+          while idle, so it never covers a live call. */}
+      {state.status === CALL_STATUS.IDLE ? <CallReliabilityGate /> : null}
+      {/* Cold-start incoming-call cover (APP-14): painted instantly over
+          Splash/ChatList on a killed+locked call launch, retired the moment the
+          live call state mounts (CallOverlay takes over) or on the safety timeout. */}
+      {coldStartCall && state.status === CALL_STATUS.IDLE ? (
+        <ColdStartCallCover call={coldStartCall} />
+      ) : null}
       {/* In-app incoming-call banner temporarily DISABLED — incoming calls are
           surfaced via the OS push/CallStyle notification instead. Re-enable by
           uncommenting when the in-app banner is wanted again. */}

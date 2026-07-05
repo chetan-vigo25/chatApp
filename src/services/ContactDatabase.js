@@ -5,7 +5,9 @@ const DB_NAME = 'TalksTry_contacts.db';
 // now `phone_number` (E.164); hash/salt/encrypt columns are gone. The local DB is
 // a re-syncable cache, so the migration simply drops the old table and clears the
 // sync markers — the next open triggers a fresh full sync that repopulates it.
-const DB_VERSION = 2;
+// v4: composite (type, full_name) index so the first-paint LIMIT query returns
+// without sorting the whole table.
+const DB_VERSION = 4;
 
 let _db = null;
 let _dbInitPromise = null; // prevents race conditions — only one init at a time
@@ -168,6 +170,7 @@ const runMigrations = async (db) => {
       last_login TEXT,
       can_message INTEGER DEFAULT 0,
       is_blocked INTEGER DEFAULT 0,
+      is_verified INTEGER DEFAULT 0,
       is_favorite INTEGER DEFAULT 0,
       last_contacted TEXT,
       joined_at INTEGER,
@@ -180,12 +183,20 @@ const runMigrations = async (db) => {
     CREATE INDEX IF NOT EXISTS idx_contacts_original_id ON contacts(original_id);
     CREATE INDEX IF NOT EXISTS idx_contacts_type ON contacts(type);
     CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone);
+    CREATE INDEX IF NOT EXISTS idx_contacts_type_name ON contacts(type, full_name);
 
     CREATE TABLE IF NOT EXISTS contact_sync_meta (
       key TEXT PRIMARY KEY NOT NULL,
       value TEXT
     );
   `);
+
+  // v3 added the admin "verified badge" flag. Existing v2 tables aren't dropped
+  // (see the v<2 branch above), so add the column in place; fresh/older installs
+  // already got it from the CREATE TABLE above, hence the ignored duplicate error.
+  if (currentVersion === 2) {
+    await db.execAsync('ALTER TABLE contacts ADD COLUMN is_verified INTEGER DEFAULT 0;').catch(() => {});
+  }
 
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
 };
@@ -263,6 +274,7 @@ const contactToRow = (c, now) => {
     $last_login: c.lastLogin || null,
     $can_message: c.canMessage ? 1 : 0,
     $is_blocked: c.isBlocked ? 1 : 0,
+    $is_verified: c.isVerified ? 1 : 0,
     $is_favorite: c.isFavorite ? 1 : 0,
     $last_contacted: c.lastContacted || null,
     $joined_at: c.joinedWhatsAppAt || null,
@@ -298,6 +310,7 @@ const rowToContact = (row) => {
     lastLogin: row.last_login,
     canMessage: Boolean(row.can_message),
     isBlocked: Boolean(row.is_blocked),
+    isVerified: Boolean(row.is_verified),
     isFavorite: Boolean(row.is_favorite),
     lastContacted: row.last_contacted,
     joinedWhatsAppAt: row.joined_at,
@@ -313,13 +326,13 @@ const rowToContact = (row) => {
 const UPSERT_SQL = `INSERT INTO contacts (
   phone_number, original_id, user_id, type, full_name, email, phone,
   mobile_code, mobile_number, profile_image, about,
-  is_active, last_login, can_message, is_blocked, is_favorite,
+  is_active, last_login, can_message, is_blocked, is_verified, is_favorite,
   last_contacted, joined_at,
   is_new_until, updated_highlight_until, synced_at, updated_at
 ) VALUES (
   $phone_number, $original_id, $user_id, $type, $full_name, $email, $phone,
   $mobile_code, $mobile_number, $profile_image, $about,
-  $is_active, $last_login, $can_message, $is_blocked, $is_favorite,
+  $is_active, $last_login, $can_message, $is_blocked, $is_verified, $is_favorite,
   $last_contacted, $joined_at,
   $is_new_until, $updated_highlight_until, $synced_at, $updated_at
 ) ON CONFLICT(phone_number) DO UPDATE SET
@@ -337,6 +350,7 @@ const UPSERT_SQL = `INSERT INTO contacts (
   last_login = COALESCE($last_login, last_login),
   can_message = $can_message,
   is_blocked = $is_blocked,
+  is_verified = $is_verified,
   is_favorite = MAX(is_favorite, $is_favorite),
   last_contacted = COALESCE($last_contacted, last_contacted),
   joined_at = COALESCE($joined_at, joined_at),
@@ -384,6 +398,20 @@ const loadAllContacts = async () => {
   return withDB(async (db) => {
     const rows = await db.getAllAsync(
       'SELECT * FROM contacts ORDER BY type ASC, full_name ASC'
+    );
+    return rows.map(rowToContact);
+  });
+};
+
+// First-paint page: same ordering as loadAllContacts ('registered' sorts before
+// 'unregistered', so the head of the list is the contacts the user actually
+// messages). Bridging only `limit` rows out of native SQLite is what makes the
+// contacts screen paint fast on large phonebooks.
+const loadContactsPage = async (limit = 100, offset = 0) => {
+  return withDB(async (db) => {
+    const rows = await db.getAllAsync(
+      'SELECT * FROM contacts ORDER BY type ASC, full_name ASC LIMIT $l OFFSET $o',
+      { $l: limit, $o: offset }
     );
     return rows.map(rowToContact);
   });
@@ -545,6 +573,20 @@ const findNewContacts = async (incomingNumbers) => {
 const getContactsHash = async () => getMeta('contacts_hash');
 const setContactsHash = async (hash) => setMeta('contacts_hash', hash);
 
+// Realtime `profile:update` — admin toggled the verified badge on a user.
+// Keeps the contact directory (AddUser, contact pickers) in step without a
+// full contact re-sync.
+const setUserVerified = async (userId, isVerified) => {
+  const uid = userId != null ? String(userId) : '';
+  if (!uid) return;
+  return withDB(async (db) => {
+    await db.runAsync(
+      'UPDATE contacts SET is_verified = $v, updated_at = $n WHERE user_id = $id OR original_id = $id',
+      { $v: isVerified ? 1 : 0, $n: Date.now(), $id: uid }
+    );
+  });
+};
+
 const getStats = async () => {
   return withDB(async (db) => {
     const total = await db.getFirstAsync('SELECT COUNT(*) as c FROM contacts');
@@ -575,6 +617,7 @@ export default {
   // CRUD
   upsertContacts,
   loadAllContacts,
+  loadContactsPage,
   loadRegisteredContacts,
   loadUnregisteredContacts,
   getContactCount,
@@ -587,6 +630,7 @@ export default {
   clearAllContacts,
   removeStaleContacts,
   searchContacts,
+  setUserVerified,
   // Helpers
   findNewContacts,
   getStats,

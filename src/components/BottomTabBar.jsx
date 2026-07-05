@@ -6,8 +6,11 @@ import {
   Animated,
   StyleSheet,
   Platform,
+  Image,
 } from 'react-native';
+import { useSelector, useDispatch } from 'react-redux';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { profileDetail } from '../Redux/Reducer/Profile/Profile.reducer';
 
 // WhatsApp-style bottom tabs. The active tab shows a filled "pill" highlight
 // behind the icon (Material-You / WhatsApp Android pattern) with the label
@@ -24,7 +27,54 @@ function TabIcon({ lib, name, size, color }) {
   return <Ionicons name={name} size={size} color={color} />;
 }
 
-export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode, unreadCount }) {
+// First + last initial for the Settings-tab avatar fallback (no profile photo set).
+function getInitials(name) {
+  const n = (name || '').trim();
+  if (!n) return '';
+  const parts = n.split(/\s+/);
+  return ((parts[0]?.[0] || '') + (parts.length > 1 ? (parts[parts.length - 1][0] || '') : '')).toUpperCase();
+}
+
+// The Settings tab shows the user's profile photo instead of a gear icon. Sized
+// to match the 22px tab icons; a green ring marks the active state (mirroring how
+// the other icons tint green when active).
+function ProfileTabAvatar({ image, name, isActive, activeTint, inactiveTint }) {
+  // Profile not loaded yet (fresh app open) → show the familiar gear icon rather
+  // than a "?" placeholder. Once the photo/name arrives this swaps to the avatar.
+  if (!image && !getInitials(name)) {
+    return <Ionicons name={isActive ? 'settings' : 'settings-outline'} size={22} color={isActive ? activeTint : inactiveTint} />;
+  }
+  return (
+    <View style={[styles.avatarWrap, { borderColor: isActive ? activeTint : 'transparent' }]}>
+      {image ? (
+        <Image source={{ uri: image }} style={styles.avatarImg} resizeMode="cover" />
+      ) : (
+        <View style={[styles.avatarFallback, { backgroundColor: activeTint }]}>
+          <Text style={styles.avatarInitials}>{getInitials(name)}</Text>
+        </View>
+      )}
+    </View>
+  );
+}
+
+export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode, unreadCount, missedCallCount = 0 }) {
+  // The Settings tab renders the user's profile photo instead of the gear icon.
+  const dispatch = useDispatch();
+  const { profileData } = useSelector((state) => state.profile || {});
+  const profileImage = profileData?.profileImageThumbnailUrl || profileData?.profileImage || null;
+  const profileName = profileData?.fullName || '';
+
+  // Profile is otherwise fetched only when the Settings screen mounts, so on a
+  // fresh app open the tab bar had no photo/name and showed the "?" fallback.
+  // Fetch it once here (when the always-mounted tab bar first appears) so the
+  // avatar is ready immediately. Guarded so we don't refetch if it's already loaded.
+  useEffect(() => {
+    if (!profileData?.profileImage && !profileData?.fullName) {
+      dispatch(profileDetail()).catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const scaleAnims = useRef(TABS.map(() => new Animated.Value(1))).current;
   const pillAnims = useRef(
     TABS.map((t) => new Animated.Value(t.key === activeTab ? 1 : 0))
@@ -90,15 +140,30 @@ export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode,
                 ]}
               >
                 <View style={styles.iconWrap}>
-                  <TabIcon
-                    lib={tab.lib}
-                    name={isActive ? tab.icon : tab.iconOutline}
-                    size={22}
-                    color={isActive ? activeTint : inactiveTint}
-                  />
+                  {tab.key === 'settings' ? (
+                    <ProfileTabAvatar
+                      image={profileImage}
+                      name={profileName}
+                      isActive={isActive}
+                      activeTint={activeTint}
+                      inactiveTint={inactiveTint}
+                    />
+                  ) : (
+                    <TabIcon
+                      lib={tab.lib}
+                      name={isActive ? tab.icon : tab.iconOutline}
+                      size={22}
+                      color={isActive ? activeTint : inactiveTint}
+                    />
+                  )}
                   {tab.key === 'chats' && unreadCount > 0 && (
                     <View style={[styles.badge, { backgroundColor: activeTint }]}>
                       <Text style={styles.badgeText}>{unreadCount > 99 ? '99+' : unreadCount}</Text>
+                    </View>
+                  )}
+                  {tab.key === 'calls' && missedCallCount > 0 && (
+                    <View style={[styles.badge, { backgroundColor: '#F15C6D' }]}>
+                      <Text style={styles.badgeText}>{missedCallCount > 99 ? '99+' : missedCallCount}</Text>
                     </View>
                   )}
                 </View>
@@ -150,6 +215,30 @@ const styles = StyleSheet.create({
   },
   iconWrap: {
     position: 'relative',
+  },
+  avatarWrap: {
+    width: 30,
+    height: 30,
+    borderRadius: 50,
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+  },
+  avatarImg: {
+    width: '100%',
+    height: '100%',
+  },
+  avatarFallback: {
+    width: '100%',
+    height: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarInitials: {
+    color: '#fff',
+    fontSize: 10,
+    fontFamily: 'Roboto-Bold',
   },
   badge: {
     position: 'absolute',

@@ -443,6 +443,11 @@ export default function useChatLogic({ navigation, route }) {
   const reconnectTimeoutRef = useRef(null);
   const searchTimeoutRef = useRef(null);
   const initialLoadDoneRef = useRef(false);
+  // Cold-start recovery: set when the on-open message fetch could not be
+  // emitted (socket still connecting). The `connect` handler checks it and
+  // fires the FULL fetch the open owed, instead of a seq-delta that assumes
+  // local rows already exist.
+  const pendingInitialFetchRef = useRef(false);
   const heartbeatIntervalRef = useRef(null);
   const idleTimeoutRef = useRef(null);
   const backgroundAwayTimeoutRef = useRef(null);
@@ -1389,6 +1394,7 @@ export default function useChatLogic({ navigation, route }) {
       groupScheduleTimersRef.current.clear();
 
       initialLoadDoneRef.current = false;
+      pendingInitialFetchRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatData.peerUser?._id, isGroupInit && chatData.chatId, isBroadcastInit && chatData.chatId]);
@@ -1428,6 +1434,18 @@ export default function useChatLogic({ navigation, route }) {
               flushQueuedManualPresence();
               flushQueuedMediaStatusUpdates();
               requestUserPresence();
+              // Listeners were registered AFTER `connect` fired on this socket,
+              // so the onConnect fetch never ran on this path. Settle any owed
+              // cold-start full fetch (or a cheap delta) explicitly.
+              if (pendingInitialFetchRef.current) {
+                const emitted = fetchAndSyncMessagesViaSocket(chatIdRef.current, { limit: SOCKET_FETCH_LIMIT });
+                if (emitted) {
+                  pendingInitialFetchRef.current = false;
+                  _lastChatSyncAt.set(chatIdRef.current, Date.now());
+                }
+              } else {
+                fetchAndSyncMessagesViaSocket(chatIdRef.current, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
+              }
             }
           } else {
             if (isComponentMounted.current) checkAndReconnectSocket();
@@ -1592,9 +1610,18 @@ export default function useChatLogic({ navigation, route }) {
           ]);
           await checkAndReconnectSocket();
           const socket = getSocket();
-          if (socket && isSocketConnected()) {
+          // Register listeners on the socket OBJECT even while it is still
+          // connecting (cold start): socket.io queues `.on` handlers, and the
+          // `connect` handler is the ONLY thing that re-fetches this chat once
+          // the connection comes up. Gating registration on isSocketConnected()
+          // left the first open with no listeners at all — the socket connected
+          // 1-2s later, nothing fetched, and the screen stayed empty until the
+          // user backed out and reopened.
+          if (socket) {
             socketRef.current = socket;
             setupSocketListeners(socket, generatedChatId);
+          }
+          if (socket && isSocketConnected()) {
             requestUserPresence();
             socket.emit('user:status', { userId, status: 'online', chatId: generatedChatId });
             socket.emit('chat:join', { chatId: generatedChatId, userId }, (response) => {});
@@ -1637,8 +1664,15 @@ export default function useChatLogic({ navigation, route }) {
         cslog('🌐 SQLite empty for this chat → FULL fetch over SOCKET (message:sync/fetch)', {
           chatId: generatedChatId,
         });
-        fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
-        _lastChatSyncAt.set(generatedChatId, nowTs);
+        const emitted = fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT });
+        if (emitted) {
+          _lastChatSyncAt.set(generatedChatId, nowTs);
+        } else {
+          // Socket still connecting (cold start): the fetch never left the
+          // device. Leave the throttle UNARMED (so a quick reopen retries) and
+          // flag the owed full fetch for the `connect` handler to fire.
+          pendingInitialFetchRef.current = true;
+        }
       } else if (nowTs - lastSyncTs > SYNC_THROTTLE_MS) {
         // Has local data → cheap forward delta (seq cursor; never re-downloads
         // stored rows), but only if we haven't just synced this chat.
@@ -1646,8 +1680,8 @@ export default function useChatLogic({ navigation, route }) {
           chatId: generatedChatId,
           sqliteRecordCount: localCount,
         });
-        fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
-        _lastChatSyncAt.set(generatedChatId, nowTs);
+        const emitted = fetchAndSyncMessagesViaSocket(generatedChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
+        if (emitted) _lastChatSyncAt.set(generatedChatId, nowTs);
       } else {
         // Re-opened within the throttle window → skip the server request entirely.
         // SQLite already rendered; the live socket keeps this chat fresh while open.
@@ -2708,8 +2742,11 @@ export default function useChatLogic({ navigation, route }) {
           return merged;
         });
 
-        // Sync memory cache with the latest enriched messages from SQLite
-        if (cid) ChatCache.mergeMessages(cid, enriched);
+        // Sync memory cache with the latest enriched messages from SQLite.
+        // Skip empty reads: merging [] on a cold start creates a hydrated-but-
+        // empty cache entry for a chat whose rows simply haven't landed yet,
+        // and later opens would trust that empty entry instead of re-reading.
+        if (cid && enriched.length > 0) ChatCache.mergeMessages(cid, enriched);
 
         // Clean up: remove sent/delivered messages from scheduledMessages
         // (they're now in allMessages via DB, no longer need the in-memory copy)
@@ -3184,10 +3221,13 @@ export default function useChatLogic({ navigation, route }) {
     }
   };
 
+  // Returns true when a sync/fetch request was actually emitted, false when it
+  // bailed (socket down). Callers use this to avoid arming throttles/cursors on
+  // a request that never left the device.
   const fetchAndSyncMessagesViaSocket = useCallback((chatIdParam, options = {}) => {
     const socket = socketRef.current || getSocket();
     if (!socket || !isSocketConnected() || !chatIdParam) {
-      return;
+      return false;
     }
 
     const { before = null, limit = SOCKET_FETCH_LIMIT } = options;
@@ -3224,7 +3264,7 @@ export default function useChatLogic({ navigation, route }) {
           force: true,
         });
       }
-      return;
+      return true;
     }
 
     if (syncOnly) {
@@ -3291,7 +3331,7 @@ export default function useChatLogic({ navigation, route }) {
           });
         })();
       }
-      return;
+      return true;
     }
 
     // Full fetch (no local messages) — single request only
@@ -3309,6 +3349,7 @@ export default function useChatLogic({ navigation, route }) {
         before,
       });
     }
+    return true;
   }, [chatData, getMutationCursor]);
 
   useEffect(() => {
@@ -5650,8 +5691,18 @@ export default function useChatLogic({ navigation, route }) {
       markUserOnline("socket-connect");
       socket.emit('chat:join', { chatId: currentChatId, userId: currentUserIdRef.current });
       socket.emit('user:status', { userId: currentUserIdRef.current, status: 'online', chatId: currentChatId });
-      if (!initialLoadDoneRef.current) {
-        fetchAndSyncMessagesViaSocket(currentChatId, { limit: SOCKET_FETCH_LIMIT });
+      // pendingInitialFetch = the on-open fetch for an EMPTY local chat never
+      // emitted (cold start, socket was still connecting). It must be the FULL
+      // fetch here — initializeChat may have already finished (setting
+      // initialLoadDoneRef), and a seq-delta over an empty local store is not
+      // guaranteed to backfill history.
+      const owesInitialFetch = pendingInitialFetchRef.current;
+      if (owesInitialFetch || !initialLoadDoneRef.current) {
+        const emitted = fetchAndSyncMessagesViaSocket(currentChatId, { limit: SOCKET_FETCH_LIMIT });
+        if (emitted) {
+          pendingInitialFetchRef.current = false;
+          _lastChatSyncAt.set(currentChatId, Date.now());
+        }
       } else {
         fetchAndSyncMessagesViaSocket(currentChatId, { limit: SOCKET_FETCH_LIMIT, syncOnly: true });
       }

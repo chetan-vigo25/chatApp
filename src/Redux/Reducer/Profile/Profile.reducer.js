@@ -69,6 +69,11 @@ const profileSlice = createSlice({
       state.isBlocked = !!action.payload;
       if (state.profileData) state.profileData.isBlocked = !!action.payload;
     },
+    // Set by the realtime `profile:update` event when an admin grants/revokes
+    // the verified badge on THIS account (Setting.jsx badge next to own name).
+    setVerified: (state, action) => {
+      if (state.profileData) state.profileData.isVerified = !!action.payload;
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -132,5 +137,5 @@ const profileSlice = createSlice({
   },
 });
 
-export const { logout, setBlocked } = profileSlice.actions;
+export const { logout, setBlocked, setVerified } = profileSlice.actions;
 export default profileSlice.reducer;

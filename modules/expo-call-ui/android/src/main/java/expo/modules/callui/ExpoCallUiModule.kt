@@ -5,27 +5,27 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Color
+import android.media.AudioAttributes
+import android.media.RingtoneManager
+import android.net.Uri
 import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.WindowManager
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
-const val CHANNEL_ID = "calls_fullscreen"
+// Bumped to _v2 (APP-13): a notification channel is IMMUTABLE once created, so
+// adding the ringtone sound + DND bypass requires a new channel id — the old
+// "calls_fullscreen" channel keeps whatever settings it was first created with.
+const val CHANNEL_ID = "calls_fullscreen_v2"
 const val EVENT_NAME = "onCallAction"
 // Emitted whenever the keyguard locks/unlocks (screen off, screen on while
 // locked, or user-present unlock). Drives the privacy overlay: MainActivity
@@ -45,6 +45,8 @@ const val EXTRA_CALLER_NAME = "callerName"
 const val EXTRA_CALLER_IMAGE = "callerImage"
 const val EXTRA_CALL_TYPE = "callType"
 const val EXTRA_STARTED_AT = "startedAt"
+// "ringing" (outgoing call dialed, not yet answered) or "ongoing" (connected).
+const val EXTRA_STATE = "state"
 
 // Process-wide bridge from the (static) BroadcastReceiver to the live JS module.
 // When JS isn't running yet (cold start from a killed app), the action is queued
@@ -52,11 +54,6 @@ const val EXTRA_STARTED_AT = "startedAt"
 object CallUiBus {
   @Volatile var module: ExpoCallUiModule? = null
   @Volatile var pending: Map<String, Any?>? = null
-  // Set from JS (setCallActive) whenever a call is ringing/connecting/active. The
-  // keyguard backstop uses it to know a foreground-over-lock is a legitimate call
-  // surface (so it is NOT bounced behind the keyguard). Process-wide so it survives
-  // the module being torn down/recreated across a cold start.
-  @Volatile var callActive = false
 
   fun dispatch(payload: Map<String, Any?>) {
     val m = module
@@ -71,15 +68,10 @@ class ExpoCallUiModule : Module() {
   // <receiver>.
   private var lockReceiver: BroadcastReceiver? = null
 
-  // Native full-screen "incoming call" cover. Drawn over the activity content the
-  // instant MainActivity is launched/resumed for a call — BEFORE React Native
-  // renders its first frame (the Splash route / last screen). This is the only way
-  // to get WhatsApp-style INSTANT call UI: a JS cover can't paint over the native
-  // resume flash of a backgrounded-but-alive app. Removed when JS signals the real
-  // call overlay is up (hideCallLaunchCover), or by a safety timeout.
-  private var callLaunchCover: View? = null
-  private val mainHandler = Handler(Looper.getMainLooper())
-  private var coverTimeout: Runnable? = null
+  // True while a call is ringing/connecting/active. Gates the keyguard backstop
+  // (OnActivityEntersForeground) so app content is bounced behind the lock screen
+  // when no call justifies showing over it.
+  @Volatile private var callActive: Boolean = false
 
   override fun definition() = ModuleDefinition {
     Name("ExpoCallUi")
@@ -117,11 +109,29 @@ class ExpoCallUiModule : Module() {
       }
     }
 
-    // Send the app BEHIND the keyguard: revoke show-over-keyguard, then move the
-    // task to back so the system lock screen reasserts. Called when a call that
-    // began on a LOCKED device ends or the user backs out of it — the user lands on
-    // the lock screen, never the app. (JS: callNotifee.returnToLockScreen →
-    // CallProvider finalizeEnd / leaveToLock.)
+    Function("displayIncomingCall") { options: Map<String, Any?> ->
+      appContext.reactContext?.let { display(it, options) }
+    }
+
+    Function("cancelIncomingCall") { callId: String ->
+      appContext.reactContext?.let {
+        NotificationManagerCompat.from(it).cancel(callId.hashCode())
+      }
+      postedIncomingIds.remove(callId.hashCode())
+    }
+
+    // Dismiss EVERY incoming-call notification we've posted (JS calls this on
+    // answer/end). Because the live call state's id can drift from the id the
+    // notification was posted with, cancelling one-by-one can miss — so we track
+    // every posted incoming notification id and clear them all here (APP-3).
+    Function("cancelAllIncomingCalls") {
+      appContext.reactContext?.let { cancelAllIncoming(it) }
+    }
+
+    // Send the app behind the keyguard: drop show-when-locked + move the task to
+    // back so the system lock screen reasserts. Used when a call that arrived /
+    // ran on a LOCKED device ends or is minimized — the user must land on the lock
+    // screen, never inside the app (APP-3).
     Function("returnToLockScreen") {
       appContext.currentActivity?.let { activity ->
         activity.runOnUiThread {
@@ -135,21 +145,89 @@ class ExpoCallUiModule : Module() {
                 WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
             )
           }
-          activity.moveTaskToBack(true)
+          try { activity.moveTaskToBack(true) } catch (_: Exception) {}
         }
       }
       Unit
     }
 
-    Function("displayIncomingCall") { options: Map<String, Any?> ->
-      appContext.reactContext?.let { display(it, options) }
+    // Track whether a call is ringing/connecting/active. While true the app may
+    // legitimately show over the lock screen (the call UI); while false (idle) the
+    // keyguard backstop below bounces any over-keyguard foreground behind the lock
+    // screen so app content never leaks over it (APP-3).
+    Function("setCallActive") { active: Boolean ->
+      callActive = active
     }
 
-    Function("cancelIncomingCall") { callId: String ->
-      appContext.reactContext?.let {
-        NotificationManagerCompat.from(it).cancel(callId.hashCode())
+    // Non-consuming peek of the launch intent: was the app cold-started by a call
+    // full-screen intent? Returns the call payload WITHOUT clearing the marker or
+    // dismissing the notification (unlike getInitialCallAction), so the JS
+    // ColdStartCallCover can paint the incoming-call screen from the first frame
+    // while getInitialCallAction still drives the real accept/incoming action once
+    // CallProvider mounts (APP-3 / APP-14).
+    Function("peekInitialCallLaunch") {
+      peekCallIntent(appContext.currentActivity?.intent)
+    }
+
+    // The instant cold-start cover is a JS overlay (ColdStartCallCover); there is
+    // no native cover view to remove, so this is a safe no-op kept for API
+    // symmetry with the JS bridge (APP-3).
+    Function("hideCallLaunchCover") {
+      // no-op — the cover lives in React Native (ColdStartCallCover).
+    }
+
+    // ---- background-delivery reliability (OEM battery / autostart) ----
+    // On many OEM skins (MIUI, FuntouchOS, ColorOS, …) a killed/rebooted app is
+    // blocked from starting in the background, so the high-priority incoming-call
+    // FCM push is dropped and the phone never rings until the app is opened once
+    // ("device restart ke baad call/notification nahi aata"). The two user-grantable
+    // escapes are (1) exempt the app from battery optimization and (2) enable OEM
+    // "Autostart". These helpers let JS surface a one-time onboarding that takes the
+    // user straight to those toggles.
+
+    // True when the app is already exempt from Doze battery optimization (or on
+    // pre-M where the concept doesn't exist). When false, background FCM delivery
+    // can be throttled/killed and the onboarding should be offered.
+    Function("isIgnoringBatteryOptimizations") {
+      val ctx = appContext.reactContext ?: return@Function true
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return@Function true
+      val pm = ctx.getSystemService(Context.POWER_SERVICE) as? PowerManager
+      pm?.isIgnoringBatteryOptimizations(ctx.packageName) ?: true
+    }
+
+    // Open the system dialog asking the user to exempt THIS app from battery
+    // optimization. Needs the REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission
+    // (declared in this module's manifest). Returns true if a screen was launched.
+    Function("requestDisableBatteryOptimization") {
+      val ctx = appContext.reactContext ?: return@Function false
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return@Function false
+      try {
+        launchExternal(ctx, Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+          data = Uri.parse("package:" + ctx.packageName)
+        })
+        true
+      } catch (_: Exception) {
+        // Some OEMs / Play builds reject the direct request — fall back to the
+        // battery-optimization LIST so the user can still find the toggle.
+        try {
+          launchExternal(ctx, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+          true
+        } catch (_: Exception) { false }
       }
     }
+
+    // Open the OEM "Autostart" / "Background start" manager when we can identify
+    // one, else the app's system settings details page (where autostart usually
+    // lives on stock-ish ROMs). Returns true if a manufacturer-specific autostart
+    // screen was opened (so JS can tailor its instructions), false if it fell back.
+    Function("openAutoStartSettings") {
+      val ctx = appContext.reactContext ?: return@Function false
+      val opened = tryOpenAutoStart(ctx)
+      if (!opened) openAppDetails(ctx)
+      opened
+    }
+
+    Function("getManufacturer") { Build.MANUFACTURER ?: "" }
 
     // ---- active-call ongoing foreground service (CallStyle.forOngoingCall) ----
     Function("startOngoingCall") { options: Map<String, Any?> ->
@@ -159,40 +237,12 @@ class ExpoCallUiModule : Module() {
       val image = options["callerImage"] as? String
       val type = options["callType"] as? String ?: "audio"
       val startedAtMs = (options["startedAt"] as? Number)?.toLong() ?: 0L
-      CallForegroundService.start(ctx, callId, name, image, type, startedAtMs)
+      val state = options["state"] as? String ?: "ongoing"
+      CallForegroundService.start(ctx, callId, name, image, type, startedAtMs, state)
     }
 
     Function("stopOngoingCall") {
       appContext.reactContext?.let { CallForegroundService.stop(it) }
-    }
-
-    // JS marks a call ringing/connecting/active (true) or fully idle (false). The
-    // keyguard backstop (OnActivityEntersForeground) reads this so an active call's
-    // UI is allowed over the lock screen while a non-call launch is bounced.
-    Function("setCallActive") { active: Boolean ->
-      CallUiBus.callActive = active
-    }
-
-    // NON-consuming peek of the launch intent: did a call full-screen-intent launch
-    // this activity (killed/locked cold start)? Returns the caller info so JS can
-    // paint the full-screen call UI from the VERY FIRST frame — before the Splash /
-    // ChatList boot flow shows — eliminating the "last screen → splash → call UI"
-    // flash. Unlike getInitialCallAction() it does NOT remove the extra, so the real
-    // cold-start replay (consumeInitialNotifeeCall) still drives the live call.
-    Function("peekInitialCallLaunch") {
-      val intent = appContext.currentActivity?.intent
-      if (intent?.hasExtra(EXTRA_CALL_ACTION) == true) {
-        mapOf(
-          "action" to intent.getStringExtra(EXTRA_CALL_ACTION),
-          "callId" to intent.getStringExtra(EXTRA_CALL_ID),
-          "callerId" to intent.getStringExtra(EXTRA_CALLER_ID),
-          "callerName" to intent.getStringExtra(EXTRA_CALLER_NAME),
-          "callerImage" to intent.getStringExtra(EXTRA_CALLER_IMAGE),
-          "callType" to intent.getStringExtra(EXTRA_CALL_TYPE)
-        )
-      } else {
-        null
-      }
     }
 
     Function("getInitialCallAction") {
@@ -211,30 +261,17 @@ class ExpoCallUiModule : Module() {
       readCallIntent(intent)?.let { emit(it) }
     }
 
-    // No-op kept for JS compatibility (the native caller-name cover was removed in
-    // favour of showing the real React-Native call UI directly).
-    Function("hideCallLaunchCover") { hideCallLaunchCover() }
-
-    // ---- KEYGUARD BACKSTOP (deterministic lock-screen security) ----
-    // MainActivity carries a static android:showWhenLocked (so a call's full-screen
-    // intent can draw over the lock screen). The side effect is that ANY launch of
-    // the single-Activity app — a message-notification tap, a stale call FSI, an
-    // OS relaunch — would otherwise paint the whole app (ChatList) over the keyguard
-    // and let the user interact while locked. This guard runs every time the app
-    // enters the foreground: if the keyguard is locked AND this is NOT a call (the
-    // launch intent carries no call action AND no call is currently active), it
-    // sends the task BEHIND the keyguard so the system lock screen reasserts — the
-    // app can never be used over the lock screen for a non-call reason. A genuine
-    // call is exempt (call FSI intents carry EXTRA_CALL_ACTION; an in-progress call
-    // sets CallUiBus.callActive via setCallActive), so call-over-lock keeps working.
+    // Keyguard backstop (APP-3): if the activity comes to the foreground OVER the
+    // lock screen while NO call is active, bounce it back behind the keyguard so
+    // app content can't leak over the lock screen (MainActivity carries
+    // showWhenLocked so it can resume over the keyguard for calls). During a call
+    // (callActive) the over-keyguard foreground is legitimate — leave it.
     OnActivityEntersForeground {
-      appContext.currentActivity?.let { activity ->
-        val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-        val locked = km?.isKeyguardLocked ?: false
-        val hasCallIntent = activity.intent?.hasExtra(EXTRA_CALL_ACTION) == true
-        if (locked && !hasCallIntent && !CallUiBus.callActive) {
-          activity.runOnUiThread { activity.moveTaskToBack(true) }
-        }
+      if (callActive) return@OnActivityEntersForeground
+      val activity = appContext.currentActivity ?: return@OnActivityEntersForeground
+      val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+      if (km?.isKeyguardLocked == true) {
+        try { activity.moveTaskToBack(true) } catch (_: Exception) {}
       }
     }
 
@@ -251,69 +288,6 @@ class ExpoCallUiModule : Module() {
   fun emit(payload: Map<String, Any?>) = sendEvent(EVENT_NAME, payload)
 
   private fun emitLock(locked: Boolean) = sendEvent(LOCK_EVENT, mapOf("locked" to locked))
-
-  // Draw a full-screen native "incoming call" cover over the activity content the
-  // instant the app is launched/resumed for a call — so the user sees the call, not
-  // the last screen or the JS Splash. Removed by hideCallLaunchCover() once the RN
-  // call overlay is up, or by a safety timeout.
-  private fun showCallLaunchCoverFor(intent: Intent?) {
-    if (intent?.hasExtra(EXTRA_CALL_ACTION) != true) return
-    val activity = appContext.currentActivity ?: return
-    val name = intent.getStringExtra(EXTRA_CALLER_NAME)?.takeIf { it.isNotBlank() } ?: "Incoming call"
-    val isVideo = (intent.getStringExtra(EXTRA_CALL_TYPE) ?: "audio") == "video"
-    activity.runOnUiThread {
-      if (callLaunchCover != null) return@runOnUiThread
-      val root = (activity.findViewById<View>(android.R.id.content) as? ViewGroup) ?: return@runOnUiThread
-      val column = LinearLayout(activity).apply {
-        orientation = LinearLayout.VERTICAL
-        gravity = Gravity.CENTER
-      }
-      column.addView(TextView(activity).apply {
-        text = name
-        setTextColor(Color.WHITE)
-        textSize = 26f
-        gravity = Gravity.CENTER
-      })
-      column.addView(TextView(activity).apply {
-        text = if (isVideo) "Incoming video call" else "Incoming voice call"
-        setTextColor(Color.parseColor("#8AA0AB"))
-        textSize = 15f
-        gravity = Gravity.CENTER
-      })
-      val cover = FrameLayout(activity).apply {
-        setBackgroundColor(Color.parseColor("#0B141A"))
-        isClickable = true   // swallow touches so the app behind can't be used
-        isFocusable = true
-        addView(
-          column,
-          FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT
-          ).apply { gravity = Gravity.CENTER }
-        )
-      }
-      root.addView(
-        cover,
-        ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-      )
-      callLaunchCover = cover
-      // Never let the cover get stuck if JS never mounts the call UI (stale launch,
-      // call already cancelled, etc.).
-      coverTimeout?.let { mainHandler.removeCallbacks(it) }
-      val r = Runnable { hideCallLaunchCover() }
-      coverTimeout = r
-      mainHandler.postDelayed(r, 8000)
-    }
-  }
-
-  private fun hideCallLaunchCover() {
-    mainHandler.post {
-      coverTimeout?.let { mainHandler.removeCallbacks(it) }
-      coverTimeout = null
-      val c = callLaunchCover ?: return@post
-      (c.parent as? ViewGroup)?.removeView(c)
-      callLaunchCover = null
-    }
-  }
 
   private fun registerLockReceiver() {
     val ctx = appContext.reactContext ?: return
@@ -352,6 +326,71 @@ class ExpoCallUiModule : Module() {
     lockReceiver = null
   }
 
+  // Launch an external settings/system intent from a (possibly non-activity)
+  // context — prefers the current activity, else adds NEW_TASK so it still starts.
+  private fun launchExternal(ctx: Context, intent: Intent) {
+    val activity = appContext.currentActivity
+    if (activity != null) {
+      activity.startActivity(intent)
+    } else {
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)
+    }
+  }
+
+  // Best-effort: try the known OEM autostart components for this device and launch
+  // the FIRST that actually resolves (guarded by resolveActivity + try/catch so an
+  // unexported/absent component on another brand just falls through). Returns true
+  // when one opened.
+  private fun tryOpenAutoStart(ctx: Context): Boolean {
+    val components = listOf(
+      // Xiaomi / MIUI / Redmi / POCO
+      "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+      // Vivo / FuntouchOS / iQOO
+      "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+      "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity",
+      "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager",
+      // Oppo / ColorOS / realme
+      "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+      "com.coloros.safecenter" to "com.coloros.safecenter.startupapp.StartupAppListActivity",
+      "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity",
+      // Huawei / Honor
+      "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+      "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+      // Letv
+      "com.letv.android.letvsafe" to "com.letv.android.letvsafe.AutobootManageActivity",
+      // Asus
+      "com.asus.mobilemanager" to "com.asus.mobilemanager.MainActivity"
+    )
+    for ((pkg, cls) in components) {
+      try {
+        val intent = Intent().apply {
+          component = ComponentName(pkg, cls)
+          addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        // Attempt the launch directly rather than gating on resolveActivity():
+        // Android 11+ package-visibility filtering hides these OEM security-center
+        // components, so resolveActivity() returns null even when the screen is
+        // launchable. The package names are brand-specific (com.miui.* only on
+        // Xiaomi, com.vivo.* only on vivo, …) so there is no cross-brand false
+        // match; a missing/unexported component just throws and we try the next.
+        launchExternal(ctx, intent)
+        return true
+      } catch (_: Exception) { /* not this OEM / not launchable — try the next */ }
+    }
+    return false
+  }
+
+  // Fallback: the app's own system settings page (App info), where "Autostart" /
+  // "Battery" / "Allow background activity" toggles live on most ROMs.
+  private fun openAppDetails(ctx: Context) {
+    try {
+      launchExternal(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+        data = Uri.parse("package:" + ctx.packageName)
+      })
+    } catch (_: Exception) {}
+  }
+
   // Extract a call action from a launch/new intent (Answer → "accept",
   // full-screen / body → "incoming"), consume the marker so it can't replay, and
   // dismiss the notification now that its action is being handled.
@@ -371,27 +410,30 @@ class ExpoCallUiModule : Module() {
     )
   }
 
+  // NON-consuming read of a launch intent's call action — same fields as
+  // readCallIntent but it does NOT strip the marker or dismiss the notification,
+  // so the cold-start cover can peek repeatedly until the real call state mounts
+  // (APP-3). Returns null when the launch wasn't a call.
+  private fun peekCallIntent(intent: Intent?): Map<String, Any?>? {
+    if (intent == null) return null
+    val action = intent.getStringExtra(EXTRA_CALL_ACTION) ?: return null
+    val callId = intent.getStringExtra(EXTRA_CALL_ID) ?: return null
+    return mapOf(
+      "action" to action,
+      "callId" to callId,
+      "callerId" to intent.getStringExtra(EXTRA_CALLER_ID),
+      "callerName" to intent.getStringExtra(EXTRA_CALLER_NAME),
+      "callerImage" to intent.getStringExtra(EXTRA_CALLER_IMAGE),
+      "callType" to intent.getStringExtra(EXTRA_CALL_TYPE)
+    )
+  }
+
   // Instance entry (JS `displayIncomingCall`) — delegates to the static renderer
   // so the SAME CallStyle notification can be posted from a native FCM service
   // (CallMessagingService) WITHOUT the React Native JS runtime being up. Both
   // paths key the notification on callId.hashCode(), so a later JS re-render just
   // refreshes the same notification — never a duplicate.
   private fun display(ctx: Context, options: Map<String, Any?>) {
-    // Re-arm show-when-locked TRUE on the (possibly backgrounded) activity. When the
-    // app is alive but NOT in a call we revoke the flag at runtime (CallProvider →
-    // setShowWhenLocked(false)) / returnToLockScreen() also clears it, and that
-    // value PERSISTS on the live Activity. Without resetting it here, THIS call's
-    // full-screen intent would light the screen but the call UI couldn't draw over
-    // the keyguard — the "screen turns on, no call UI" bug. Killed app → no activity
-    // → the manifest android:showWhenLocked handles it (nothing to re-arm).
-    appContext.currentActivity?.let { act ->
-      act.runOnUiThread {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-          act.setShowWhenLocked(true)
-          act.setTurnScreenOn(true)
-        }
-      }
-    }
     render(
       ctx,
       options["callId"] as? String ?: return,
@@ -403,6 +445,19 @@ class ExpoCallUiModule : Module() {
   }
 
   companion object {
+    // Notification ids (callId.hashCode()) of every incoming-call notification
+    // currently posted, so cancelAllIncomingCalls can dismiss them all even when
+    // the live call state's id has drifted from the posted id (APP-3).
+    private val postedIncomingIds = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
+
+    // Dismiss every posted incoming-call notification and clear the tracking set.
+    fun cancelAllIncoming(ctx: Context) {
+      val nm = NotificationManagerCompat.from(ctx)
+      val ids = synchronized(postedIncomingIds) { postedIncomingIds.toList() }
+      ids.forEach { try { nm.cancel(it) } catch (_: Exception) {} }
+      postedIncomingIds.clear()
+    }
+
     fun pendingFlags(): Int =
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
@@ -415,6 +470,7 @@ class ExpoCallUiModule : Module() {
     fun cancelIncoming(ctx: Context, callId: String?) {
       if (callId.isNullOrBlank()) return
       try { NotificationManagerCompat.from(ctx).cancel(callId.hashCode()) } catch (_: Exception) {}
+      postedIncomingIds.remove(callId.hashCode())
     }
 
     // Map a raw FCM `data` payload to a native CallStyle render. Called by the
@@ -487,6 +543,7 @@ class ExpoCallUiModule : Module() {
 
       try {
         NotificationManagerCompat.from(ctx).notify(callId.hashCode(), builder.build())
+        postedIncomingIds.add(callId.hashCode())
       } catch (_: SecurityException) {
         // POST_NOTIFICATIONS not granted — nothing we can do; ignore.
       }
@@ -502,6 +559,19 @@ class ExpoCallUiModule : Module() {
         enableVibration(true)
         vibrationPattern = longArrayOf(0, 900, 700, 900)
         lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+        // Ring like a real phone call (APP-13): a ringtone-class sound played with
+        // the ringtone usage so it's loud + loops on the call notification, and
+        // bypass Do-Not-Disturb so an incoming call still rings in DND (WhatsApp
+        // parity). The notifee fallback channel already sets these.
+        setBypassDnd(true)
+        val ringtone = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        if (ringtone != null) {
+          val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+          setSound(ringtone, attrs)
+        }
       }
       nm.createNotificationChannel(channel)
     }

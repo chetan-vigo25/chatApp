@@ -30,10 +30,13 @@ import { SALT_SECRET } from '@env';
 import contactHasher from "../../Redux/Services/Contact/ContactHasher";
 import * as SMS from 'expo-sms';
 import ProfilePreviewModal from "../../components/ProfilePreviewModal";
+import VerifiedBadge from "../../components/VerifiedBadge";
 import { useCall } from "../../calls/useCall";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const COLLAPSED_MAX_HEIGHT = 210;
+// Only the SEARCH BAR collapses on scroll now (New Contact / New Group stay
+// fixed), so this is just the search bar's height: outer padding (4 + 10) + inner (48).
+const COLLAPSED_MAX_HEIGHT = 64;
 const CONTACT_ROW_HEIGHT = 68; // fixed height for getItemLayout
 
 const AVATAR_COLORS = [
@@ -89,9 +92,12 @@ const ContactRow = memo(function ContactRow({
       </TouchableOpacity>
 
       <View style={styles.contactInfo}>
-        <Text style={[styles.contactName, { color: textColor }]} numberOfLines={1}>
-          {displayName}
-        </Text>
+        <View style={styles.contactNameRow}>
+          <Text style={[styles.contactName, { color: textColor, flexShrink: 1 }]} numberOfLines={1}>
+            {displayName}
+          </Text>
+          <VerifiedBadge verified={contact?.isVerified} size={14} />
+        </View>
         <Text style={[styles.contactPhone, { color: subTextColor }]} numberOfLines={1}>
           {displayPhone || (showInvite ? 'Not on ' + APP_TAG_NAME : 'Registered')}
         </Text>
@@ -754,7 +760,10 @@ export default function AddUser({ navigation }) {
     extrapolate: 'clamp',
   });
 
-  const renderCollapsibleSection = () => (
+  // ONLY the search bar collapses on scroll (maxHeight animates to 0). New Contact
+  // and New Group are the list's ListHeaderComponent (renderListActions) so they
+  // scroll away WITH the contacts instead of staying pinned.
+  const renderCollapsibleSearch = () => (
     <Animated.View
       style={[
         styles.collapsibleWrap,
@@ -784,7 +793,13 @@ export default function AddUser({ navigation }) {
           )}
         </View>
       </View>
+    </Animated.View>
+  );
 
+  // New Contact / New Group — rendered as the FlatList's ListHeaderComponent so
+  // they scroll together with the contact list (sit above the sync bar + contacts).
+  const renderListActions = () => (
+    <View style={{ backgroundColor: theme.colors.background }}>
       <TouchableOpacity
         onPress={() => navigation.navigate('AddNewContact')}
         activeOpacity={0.7}
@@ -812,7 +827,7 @@ export default function AddUser({ navigation }) {
         </Text>
         <FontAwesome6 name="chevron-right" size={14} color={theme.colors.placeHolderTextColor} />
       </TouchableOpacity>
-    </Animated.View>
+    </View>
   );
 
   // ─── STABLE CALLBACK REFS (never change identity → memo works) ───
@@ -937,7 +952,7 @@ export default function AddUser({ navigation }) {
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: theme.colors.background }]}>
       {renderHeader()}
-      {renderCollapsibleSection()}
+      {renderCollapsibleSearch()}
 
       {(isProcessing || isInitialLoading) ? (
         <View style={styles.processingWrap}>
@@ -958,8 +973,12 @@ export default function AddUser({ navigation }) {
           data={listData}
           renderItem={renderItem}
           keyExtractor={keyExtractor}
+          // New Contact / New Group scroll WITH the list (they sit at the top of the
+          // scroll content, above the sync bar + contacts). Only the search bar above
+          // the list stays and collapses on scroll.
+          ListHeaderComponent={renderListActions}
           onScroll={handleScroll}
-          scrollEventThrottle={32}
+          scrollEventThrottle={16}
           keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
@@ -968,7 +987,11 @@ export default function AddUser({ navigation }) {
           maxToRenderPerBatch={20}
           updateCellsBatchingPeriod={30}
           windowSize={7}
-          removeClippedSubviews={Platform.OS === 'android'}
+          // removeClippedSubviews on Android detaches off-screen rows, but it's the
+          // #1 cause of scroll FLICKER (rows blank out and repaint mid-scroll). With
+          // only a few hundred lightweight contact rows + windowSize virtualization,
+          // the memory win isn't worth the jank — keep it OFF so scrolling is smooth.
+          removeClippedSubviews={false}
           keyboardShouldPersistTaps="handled"
           // Pull-to-refresh disabled — scrolling must NOT trigger any API/event.
           // Use the explicit Refresh button in the header to re-sync.
@@ -992,6 +1015,7 @@ export default function AddUser({ navigation }) {
             image={cImg}
             avatarColor={getAvatarColor(cName)}
             isGroup={false}
+            isVerified={Boolean(c?.isVerified)}
             peerId={peerId || null}
             onMessage={isReg ? () => { closeModal(); handleContactPress(c); } : undefined}
             onCall={canCall ? () => { closeModal(); setTimeout(() => startAudioCall?.(peerObj), 220); } : undefined}
@@ -1190,6 +1214,10 @@ const styles = StyleSheet.create({
   contactInfo: {
     flex: 1,
     justifyContent: 'center',
+  },
+  contactNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   contactName: {
     fontFamily: 'Roboto-Medium',

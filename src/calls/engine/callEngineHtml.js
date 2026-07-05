@@ -316,6 +316,86 @@ export const buildCallEngineHtml = () => `<!doctype html>
       post('recordingStopped', { totalChunks: total, durationSec: durationSec });
     }
 
+    // ---- mic re-capture after a full release (APP-12, JS half) ----
+    // A phone/telephony interruption can END the captured mic track outright
+    // (readyState 'ended'), not just disable it. An ended track can never be
+    // re-enabled — the ONLY recovery is to re-run getUserMedia and swap the fresh
+    // track onto the peer connection's audio sender, else our outbound audio is
+    // dead one-way for the rest of the call. Best-effort + cooldown so a persistent
+    // failure (mic still held by the other call) doesn't spin.
+    // NOTE: this is the JS half only. Robust telephony handling (Android audio
+    // focus / MODE_IN_COMMUNICATION / TelephonyCallback, iOS AVAudioSession
+    // interruption observer) needs react-native-incall-manager + a native rebuild.
+    // TODO(audit APP-12): add native audio-focus/telephony interruption handling.
+    var recapturing = false;
+    var lastRecaptureMs = 0;
+    function replaceAudioTrackOnSenders(newTrack) {
+      // Try the common SDK/peer-connection surfaces to swap the outbound audio
+      // track. Any that don't exist are skipped; at least one usually matches.
+      var replaced = false;
+      try {
+        if (call && typeof call.replaceTrack === 'function') { call.replaceTrack(newTrack, 'audio'); replaced = true; }
+      } catch (e) {}
+      try {
+        if (call && typeof call.replaceAudioTrack === 'function') { call.replaceAudioTrack(newTrack); replaced = true; }
+      } catch (e) {}
+      // Direct RTCPeerConnection sender access (call.pc / call.peerConnection /
+      // a map of per-peer connections).
+      function swapOnPc(pc) {
+        try {
+          if (!pc || typeof pc.getSenders !== 'function') return;
+          pc.getSenders().forEach(function (s) {
+            if (s && s.track && s.track.kind === 'audio' && typeof s.replaceTrack === 'function') {
+              s.replaceTrack(newTrack); replaced = true;
+            }
+          });
+        } catch (e) {}
+      }
+      try { swapOnPc(call && (call.pc || call.peerConnection)); } catch (e) {}
+      try {
+        var pcs = call && (call.pcs || call.connections || call.peers);
+        if (pcs) Object.keys(pcs).forEach(function (k) {
+          var p = pcs[k]; swapOnPc(p && (p.pc || p.peerConnection || p));
+        });
+      } catch (e) {}
+      return replaced;
+    }
+    function recaptureMic() {
+      if (recapturing) return;
+      var now = Date.now();
+      if (now - lastRecaptureMs < 4000) return; // cooldown
+      lastRecaptureMs = now;
+      recapturing = true;
+      logToRN('mic track ended — re-capturing via getUserMedia');
+      try {
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ns) {
+          try {
+            var nt = (ns.getAudioTracks() || [])[0];
+            if (!nt) { recapturing = false; return; }
+            nt.enabled = !!micWanted;
+            // Swap onto the outbound sender(s), then update our localStream so the
+            // recording mix + future toggles see the live track.
+            replaceAudioTrackOnSenders(nt);
+            if (localStream) {
+              try {
+                (localStream.getAudioTracks() || []).forEach(function (old) {
+                  try { old.stop(); } catch (e) {}
+                  try { localStream.removeTrack(old); } catch (e) {}
+                });
+                localStream.addTrack(nt);
+              } catch (e) {}
+            }
+            logToRN('mic re-captured — audio restored');
+            post('micRecaptured', {});
+          } catch (e) { logToRN('mic recapture apply failed: ' + (e && e.message)); }
+          recapturing = false;
+        }).catch(function (e) {
+          logToRN('mic recapture getUserMedia failed: ' + (e && e.message));
+          recapturing = false;
+        });
+      } catch (e) { recapturing = false; }
+    }
+
     // Force the local mic (and, for video, camera) track(s) to enabled, so we
     // actually transmit from the moment media is captured — the CALLER at ring
     // time and the CALLEE right after accept. Returns the audio-track count.
@@ -628,6 +708,32 @@ export const buildCallEngineHtml = () => `<!doctype html>
       call.on('error', function (err) {
         post('error', { message: (err && err.message) ? err.message : 'call error' });
       });
+      // ---- mid-call media-layer connection state (network resilience) ----
+      // Forward the peer-connection's up/down transitions to RN so it can show a
+      // "Reconnecting…" state + arm a recovery watchdog (APP-6). The SDK exposes
+      // these under a few possible event names depending on version, so we listen
+      // to all of them; RN de-dupes via a flag so duplicate mediaDown/mediaUp are
+      // harmless. ICE 'failed'/'disconnected' also surfaces via the debug handler
+      // below.
+      var mediaDownSent = false;
+      function emitMediaDown(why) {
+        if (mediaDownSent) return;
+        mediaDownSent = true;
+        logToRN('media DOWN (' + (why || '?') + ')');
+        post('mediaDown', { reason: why || null });
+      }
+      function emitMediaUp(why) {
+        if (!mediaDownSent) return;
+        mediaDownSent = false;
+        logToRN('media UP (' + (why || '?') + ')');
+        post('mediaUp', { reason: why || null });
+      }
+      ['disconnect', 'disconnected', 'reconnecting'].forEach(function (ev) {
+        try { call.on(ev, function () { emitMediaDown(ev); }); } catch (e) {}
+      });
+      ['reconnect', 'reconnected', 'peerconnected', 'connected'].forEach(function (ev) {
+        try { call.on(ev, function () { emitMediaUp(ev); }); } catch (e) {}
+      });
       // Temporary WebRTC diagnostics — only fires when the SDK was built with
       // debug:true (passed on 'connect'). Surfaces PC/ICE/DTLS transitions,
       // candidate-type counts and periodic getStats to the RN log stream.
@@ -635,6 +741,17 @@ export const buildCallEngineHtml = () => `<!doctype html>
         if (!d) return;
         logToRN('[RTC] ' + d.tag + ' ' + (d.data ? JSON.stringify(d.data) : ''));
         post('rtcDebug', d);
+        // Derive media up/down from ICE / PC connection-state transitions in the
+        // debug stream (covers SDK builds that don't emit the named events above).
+        try {
+          var data = d.data || {};
+          var st = String(
+            data.iceConnectionState || data.connectionState || data.state
+            || (typeof d.tag === 'string' ? d.tag : '')
+          ).toLowerCase();
+          if (st.indexOf('failed') >= 0 || st.indexOf('disconnected') >= 0) emitMediaDown('ice:' + st);
+          else if (st.indexOf('connected') >= 0 || st.indexOf('completed') >= 0) emitMediaUp('ice:' + st);
+        } catch (e) {}
       });
     }
 
@@ -678,6 +795,18 @@ export const buildCallEngineHtml = () => `<!doctype html>
               post('connectError', { message: 'CallingSDK failed to load' });
               return;
             }
+            // APP-7: tear down any PREVIOUS SDK instance before constructing a new
+            // one. A re-connect (token refresh / re-login) that left the old
+            // instance alive kept its socket + listeners → it could post ghost
+            // 'incoming'/'stream' events for a stale call. Hang up + disconnect it
+            // first so only the fresh instance is ever wired.
+            if (call) {
+              try { call.hangup && call.hangup(); } catch (e) {}
+              try { call.disconnect && call.disconnect(); } catch (e) {}
+              try { call.close && call.close(); } catch (e) {}
+              call = null;
+            }
+            resetTiles();
             logToRN('connecting to ' + (msg.url || '${SDK_ORIGIN}'));
             call = new CallingSDK({ url: msg.url || '${SDK_ORIGIN}', token: msg.token, debug: !!msg.debug });
             wireEvents();
@@ -769,6 +898,19 @@ export const buildCallEngineHtml = () => `<!doctype html>
           }
           case 'resumeAudio': { playAllRemotes(); break; }
           case 'setSpeaker': { wantSpeaker = !!msg.on; applySpeakerPreference(); break; }
+          case 'restartIce': {
+            // Network changed (wifi↔cellular) mid-call — ask the SDK to renegotiate
+            // its transport so media recovers instead of hanging (APP-6). Best-effort:
+            // try the common method names; a no-op if the SDK lacks it.
+            if (call) {
+              try {
+                if (typeof call.restartIce === 'function') call.restartIce();
+                else if (typeof call.reconnect === 'function') call.reconnect();
+                logToRN('restartIce requested');
+              } catch (e) { logToRN('restartIce failed: ' + (e && e.message)); }
+            }
+            break;
+          }
           default: break;
         }
       } catch (e) {
@@ -802,11 +944,21 @@ export const buildCallEngineHtml = () => `<!doctype html>
         }
         // 2) Local (outgoing) mic — an interruption can leave the captured track
         //    disabled even though the user wants it ON; re-enable it (only while the
-        //    track is still live — a fully released mic needs re-capture, not this).
+        //    track is still live). A track fully RELEASED by the OS (readyState
+        //    'ended') can't be re-enabled — re-capture it via getUserMedia + swap it
+        //    onto the sender so outbound audio isn't dead one-way (APP-12).
         if (micWanted && localStream && localStream.getAudioTracks) {
-          (localStream.getAudioTracks() || []).forEach(function (a) {
-            if (a && a.readyState === 'live' && a.enabled === false) a.enabled = true;
+          var atracks = localStream.getAudioTracks() || [];
+          var anyLive = false;
+          atracks.forEach(function (a) {
+            if (a && a.readyState === 'live') {
+              anyLive = true;
+              if (a.enabled === false) a.enabled = true;
+            }
           });
+          // Had audio tracks but none are live any more (all ended) → the mic was
+          // released by the OS; re-capture it.
+          if (!anyLive && atracks.length > 0) recaptureMic();
         }
         // 3) The recording-mix AudioContext (if any) can be left suspended.
         if (recCtx && recCtx.state === 'suspended' && recCtx.resume) {

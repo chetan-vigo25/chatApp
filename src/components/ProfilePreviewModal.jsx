@@ -155,8 +155,8 @@ export default function ProfilePreviewModal({
               <View style={styles.nameOverlay} pointerEvents="none">
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                   <Text style={[styles.nameText, { flexShrink: 1 }]} numberOfLines={1}>{name}</Text>
-                  {isBroadcast && isVerified && (
-                    <Ionicons name="checkmark-circle" size={18} color="#fff" style={{ marginLeft: 6 }} />
+                  {isVerified && (
+                    <Ionicons name="checkmark-circle" size={18} color={theme.colors.themeColor} style={{ marginLeft: 6 }} />
                   )}
                 </View>
                 {subtitle ? (

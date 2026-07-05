@@ -11,6 +11,7 @@ import CountryCodeSelector from '../components/CountryCodeSelector';
 import countryCodes from '../jsonFile/countryCodes.json';
 import { useDispatch, useSelector } from 'react-redux';
 import { generateOtpAction } from '../Redux/Reducer/Auth/Auth.reducer';
+import { getAllowedCountries } from '../Redux/Services/Auth/AppConfig.Services';
 import { getPhoneRule, isPhoneValid, phoneLengthHint } from '../utils/phoneValidation';
 import { APP_TAG_NAME } from '@env';
 
@@ -25,9 +26,29 @@ export default function Login({ navigation }) {
   const dispatch = useDispatch();
   const { isLoading } = useSelector(state => state.authentication);
 
+  // Country picker is driven by the admin-controlled allowlist. We seed with the
+  // bundled catalogue so the screen renders instantly, then swap in the list the
+  // backend allows (falls back to the bundled list if the fetch fails).
+  const [countries, setCountries] = useState(countryCodes);
   const [selectedCountry, setSelectedCountry] = useState(countryCodes[0]);
   const [phoneNumber, setPhoneNumber] = useState('');
   const [phoneFocused, setPhoneFocused] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const allowed = await getAllowedCountries();
+      if (!alive || !Array.isArray(allowed) || !allowed.length) return;
+      setCountries(allowed);
+      // If the currently selected country isn't allowed anymore, snap to the
+      // first allowed one so the visible dial code always matches the picker.
+      setSelectedCountry((prev) => {
+        const stillAllowed = prev && allowed.some((c) => c.code === prev.code && c.name === prev.name);
+        return stillAllowed ? prev : allowed[0];
+      });
+    })();
+    return () => { alive = false; };
+  }, []);
 
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(14)).current;
@@ -110,6 +131,7 @@ export default function Login({ navigation }) {
             {/* Country selector — centered, green underline */}
             <View style={[styles.countryRow, { borderBottomColor: accent }]}>
               <CountryCodeSelector
+                countries={countries}
                 selectedCountry={selectedCountry}
                 onCountrySelect={handleCountrySelect}
                 showFlag={false}
@@ -159,7 +181,7 @@ export default function Login({ navigation }) {
             style={styles.altRow}
           >
             <Text style={[styles.altText, { color: secondaryText }]}>or </Text>
-            <Text style={[styles.altLink, { color: link }]}>sign in with UserName</Text>
+            <Text style={[styles.altLink, { color: link }]}>sign in with username</Text>
           </TouchableOpacity>
 
           <TouchableOpacity

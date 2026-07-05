@@ -12,6 +12,7 @@ import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import { getCallStats, deleteCalls } from '../../calls/services/callLogService';
 import CallAvatar from '../../calls/components/CallAvatar';
+import VerifiedBadge from '../../components/VerifiedBadge';
 
 const CALL_GREEN = '#1DAB61'; // WhatsApp connected-call green
 const CALL_RED = '#F15C6D';   // WhatsApp missed-call red
@@ -133,6 +134,7 @@ export default function CallDetailScreen() {
 
   const peerId = String(peer?._id || peer?.id || '');
   const avatarUri = peer ? toSecureMediaUri(peer.profileImageUrl || peer.profileImage) || null : null;
+  const isVerified = !isGroup && Boolean(peer?.isVerified);
 
   // Saved phone number from the device contact directory (the server only keeps
   // a hash, so the human-readable number lives on-device).
@@ -231,6 +233,7 @@ export default function CallDetailScreen() {
     fullName: name,
     profileImage: peer?.profileImage || peer?.profileImageUrl || '',
     profilePicture: peer?.profileImage || peer?.profileImageUrl || '',
+    isVerified: Boolean(peer?.isVerified),
   }), [peerId, name, peer]);
 
   // Send a message: open the chat thread with this contact.
@@ -291,9 +294,12 @@ export default function CallDetailScreen() {
           ) : (
             <CallAvatar uri={avatarUri} name={name} id={peerId} size={108} />
           )}
-          <Text style={[styles.heroName, { color: c.primaryTextColor }]} numberOfLines={2}>
-            {name}
-          </Text>
+          <View style={styles.heroNameRow}>
+            <Text style={[styles.heroName, { color: c.primaryTextColor, flexShrink: 1 }]} numberOfLines={2}>
+              {name}
+            </Text>
+            <VerifiedBadge verified={isVerified} size={18} />
+          </View>
           {!isGroup && phone ? (
             <Text style={[styles.heroPhone, { color: c.placeHolderTextColor }]} numberOfLines={1}>
               {phone}
@@ -546,9 +552,13 @@ const styles = StyleSheet.create({
     width: 108, height: 108, borderRadius: 54,
     alignItems: 'center', justifyContent: 'center',
   },
+  heroNameRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    marginTop: 16, maxWidth: '100%',
+  },
   heroName: {
     fontSize: 22, fontFamily: 'Roboto-SemiBold',
-    marginTop: 16, textAlign: 'center', letterSpacing: -0.2,
+    textAlign: 'center', letterSpacing: -0.2,
   },
   heroPhone: { fontSize: 14.5, fontFamily: 'Roboto-Regular', marginTop: 8 },
   heroSub: { fontSize: 13.5, fontFamily: 'Roboto-Regular', marginTop: 6 },

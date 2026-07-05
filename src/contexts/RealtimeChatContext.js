@@ -555,12 +555,16 @@ const getChatTimestampValue = (chat = {}) => {
   // stale sort position and never bubbled to the top — the row only moved when a
   // separate chat:list:update happened to refresh `timestamp`. Taking the max
   // makes ordering deterministic regardless of which path last touched the row.
-  return Math.max(
+  // `updatedAt` is deliberately NOT part of the max: it's a server-doc touch
+  // time (mute/read/archive changes bump it), so a REST hydrate could float a
+  // stale chat above rows with genuinely newer messages. It only breaks the tie
+  // for rows that have no message activity at all (brand-new empty chat).
+  const messageActivity = Math.max(
     toTimestamp(chat?.timestamp),
     toTimestamp(chat?.lastMessageAt),
     toTimestamp(chat?.lastMessage?.createdAt),
-    toTimestamp(chat?.updatedAt),
   );
+  return messageActivity || toTimestamp(chat?.updatedAt);
 };
 
 const getChatTimestampIso = (chat = {}) => {
@@ -755,6 +759,13 @@ const reducer = (state, action) => {
               ...(prev?.peerUser || {}),
               ...(chat?.peerUser || {}),
               _id: normalizeId(chat?.peerUser?._id || chat?.peerUser?.userId || chat?.peerUser?.id || prev?.peerUser?._id || prev?.peerUser?.userId || prev?.peerUser?.id || peerUserId),
+              // Non-destructive: a REST row that comes back with an empty/stale
+              // name (brand-new peer not fully indexed yet) must not blank out a
+              // name already resolved via realtime updates.
+              fullName: String(chat?.peerUser?.fullName || '').trim()
+                || String(prev?.peerUser?.fullName || '').trim()
+                || '',
+              profileImage: chat?.peerUser?.profileImage || prev?.peerUser?.profileImage || null,
             };
 
         // Preserve locally edited lastMessage if server hasn't caught up
@@ -787,6 +798,8 @@ const reducer = (state, action) => {
           _id: normalizeId(chat?._id) || chatId,
           chatId,
           peerUser: normalizedPeerUser,
+          chatName: String(chat?.chatName || '').trim() || prev?.chatName || null,
+          chatAvatar: chat?.chatAvatar || prev?.chatAvatar || null,
           unreadCount,
           lastMessage: preserveLocal ? prevLastMsg : (incomingLastMsg || prevLastMsg),
           lastMessageEdited: preserveEdit ? true : (chat?.lastMessageEdited || prev?.lastMessageEdited || false),
@@ -964,7 +977,7 @@ const reducer = (state, action) => {
     // The display name only updates the server-side fallback — a locally-saved
     // contact name still wins via the contact directory's resolveName().
     case 'PATCH_PEER_PROFILE': {
-      const { userId, profileImage, about, name } = action.payload || {};
+      const { userId, profileImage, about, name, isVerified } = action.payload || {};
       const uid = normalizeId(userId);
       if (!uid) return state;
 
@@ -981,12 +994,16 @@ const reducer = (state, action) => {
         if (profileImage !== undefined) nextPeer.profileImage = profileImage;
         if (about !== undefined) nextPeer.about = about;
         if (name) nextPeer.fullName = name;
+        if (isVerified !== undefined) nextPeer.isVerified = !!isVerified;
 
         chatMap[cid] = {
           ...chat,
           peerUser: nextPeer,
           otherUser: nextPeer,
           ...(profileImage !== undefined ? { chatAvatar: profileImage } : {}),
+          // ChatCard reads `item.isVerified || item.peerUser.isVerified` — a stale
+          // top-level true would keep the badge visible after an admin removes it.
+          ...(isVerified !== undefined ? { isVerified: !!isVerified } : {}),
         };
         changed = true;
       }
@@ -1155,14 +1172,25 @@ const reducer = (state, action) => {
       // Opportunistically take any name/avatar the realtime payload carried; the
       // follow-up chat:list:update (now resolved server-side) fills the rest.
       const existingPeerUser = existing?.peerUser || null;
+      // sender* fields describe the PEER only when the peer is the sender —
+      // for own echoes from another device they'd be the current user's
+      // identity, which must never be seeded onto the peer row.
+      const senderIsPeer = senderId && peerUserId && String(senderId) === String(peerUserId);
       const seededPeerUser = (!chatId.startsWith('grp_') && peerUserId)
         ? {
             ...(existingPeerUser || {}),
             _id: normalizeId(existingPeerUser?._id || peerUserId),
             fullName: existingPeerUser?.fullName
-              || message.peerName || message.senderName || existingPeerUser?.fullName || '',
+              || message.peerName
+              || (senderIsPeer ? message.senderName : '')
+              || '',
             profileImage: existingPeerUser?.profileImage
-              || message.peerAvatar || message.senderAvatar || existingPeerUser?.profileImage || null,
+              || message.peerAvatar
+              || (senderIsPeer ? (message.senderProfileImage || message.senderAvatar) : null)
+              || null,
+            mobileNumber: existingPeerUser?.mobileNumber
+              || (senderIsPeer ? (message.senderMobile || null) : null)
+              || null,
           }
         : existingPeerUser;
 
@@ -1528,6 +1556,13 @@ const reducer = (state, action) => {
           ...(existing?.peerUser || {}),
           ...(item?.peerUser || {}),
           _id: normalizeId(item?.peerUser?._id || item?.peerUser?.userId || item?.peerUser?.id || existing?.peerUser?._id || existing?.peerUser?.userId || existing?.peerUser?.id || itemPeerUserId),
+          // Name/avatar merges are non-destructive: an update that ships an
+          // empty/missing fullName (degraded buildChatListItem, half-hydrated
+          // fanout) must never blank out a name we already resolved.
+          fullName: String(item?.peerUser?.fullName || '').trim()
+            || String(existing?.peerUser?.fullName || '').trim()
+            || '',
+          profileImage: item?.peerUser?.profileImage || existing?.peerUser?.profileImage || null,
         };
 
         // Check if existing lastMessage was edited locally and server hasn't caught up
@@ -1572,6 +1607,9 @@ const reducer = (state, action) => {
           _id: normalizeId(item?._id) || normalizeId(existing?._id) || chatId,
           chatId,
           peerUser: mergedPeerUser,
+          // Same non-destructive rule for the flat aliases the row can render from.
+          chatName: String(item?.chatName || '').trim() || existing?.chatName || null,
+          chatAvatar: item?.chatAvatar || existing?.chatAvatar || null,
           // Preserve edited lastMessage over server's old data
           ...(shouldPreserveEdit ? {
             lastMessage: existingLastMsg,
@@ -2778,7 +2816,11 @@ export function RealtimeChatProvider({ children }) {
           createdAt: normalized.createdAt,
           synced: 1,
           mediaUrl: source?.mediaUrl || null,
-          mediaType: source?.mediaType || null,
+          // Broadcast (and some server) payloads only send messageType/type, not
+          // mediaType. Derive it so media UI/branches stay consistent on reload.
+          mediaType: source?.mediaType || source?.fileCategory
+            || (['image', 'video', 'audio', 'file', 'album'].includes(source?.messageType || source?.type)
+              ? (source?.messageType || source?.type) : null),
           previewUrl: source?.mediaThumbnailUrl || source?.previewUrl || null,
           mediaId: source?.mediaId || null,
           mediaMeta: source?.mediaMeta || null,
@@ -2825,7 +2867,16 @@ export function RealtimeChatProvider({ children }) {
         }
 
         // Update chatlist in SQLite — last message + unread count (unread
-        // never bumps for our own echo).
+        // never bumps for our own echo). For an incoming message the sender IS
+        // the peer, so persist their identity with the same write: without it a
+        // brand-new chat row sits nameless in SQLite until the debounced
+        // chat-list flush runs, and shows "Unknown" after an early kill/reload.
+        const peerName = !isSelf
+          ? (source?.senderName || normalized?.senderName || '')
+          : '';
+        const peerAvatar = !isSelf
+          ? (source?.senderProfileImage || source?.senderAvatar || null)
+          : null;
         ChatDatabase.updateChatLastMessage(normalized.chatId, {
           text: normalized.text || '',
           type: source?.messageType || source?.type || 'text',
@@ -2833,6 +2884,20 @@ export function RealtimeChatProvider({ children }) {
           status: normalized.status || 'sent',
           createdAt: normalized.createdAt,
           serverMessageId: msgId,
+        }, {
+          chatName: peerName || null,
+          chatAvatar: peerAvatar,
+          // Only ship a peerUser when it carries a real name/number — writing a
+          // nameless JSON would occupy the fill-if-missing slot and block a
+          // later, better identity from landing.
+          peerUser: (!isSelf && normalized.senderId && (peerName || source?.senderMobile))
+            ? {
+                _id: String(normalized.senderId),
+                fullName: peerName,
+                profileImage: peerAvatar,
+                mobileNumber: source?.senderMobile || null,
+              }
+            : null,
         }).catch(() => {});
         if (!isSelf) {
           ChatDatabase.incrementChatUnread(normalized.chatId).catch(() => {});
@@ -3786,7 +3851,9 @@ export function RealtimeChatProvider({ children }) {
           createdAt,
           synced: 1,
           mediaUrl: data?.mediaUrl || null,
-          mediaType: data?.mediaType || null,
+          mediaType: data?.mediaType || data?.fileCategory
+            || (['image', 'video', 'audio', 'file', 'album'].includes(data?.messageType || data?.type)
+              ? (data?.messageType || data?.type) : null),
           previewUrl: data?.mediaThumbnailUrl || data?.previewUrl || null,
           mediaId: data?.mediaId || null,
           mediaMeta: data?.mediaMeta || null,
@@ -4176,6 +4243,38 @@ export function RealtimeChatProvider({ children }) {
     };
     socket.on('contact:updated', onContactUpdated);
 
+    // Admin granted/revoked the verified badge (`POST /admin/user/set-verified`
+    // → profile.service.emitProfileUpdate fans `profile:update` to the user and
+    // everyone who has them as a contact or chat peer). Toggle the badge on our
+    // 1-1 rows in realtime, persist to SQLite (chats + contacts) so it survives
+    // a restart, and nudge any open thread header via DeviceEventEmitter.
+    const onProfileUpdate = (payload) => {
+      const data = payload?.data || payload || {};
+      const userId = normalizeId(data.userId || data._id);
+      if (!userId || typeof data.isVerified !== 'boolean') return;
+      const isVerified = data.isVerified;
+
+      dispatch({ type: 'PATCH_PEER_PROFILE', payload: { userId, isVerified } });
+      ChatDatabase.updatePeerVerified(userId, isVerified).catch(() => {});
+      try {
+        const cd = require('../services/ContactDatabase');
+        (cd.default || cd).setUserVerified(userId, isVerified).catch(() => {});
+      } catch (e) {}
+      DeviceEventEmitter.emit('peer:profile:updated', { userId, isVerified });
+
+      // The badge was toggled on THIS account — refresh the profile slice so
+      // Setting.jsx shows/hides it without a re-login.
+      if (currentUserIdRef.current && String(currentUserIdRef.current) === userId) {
+        try {
+          const mod = require('../Redux/Store');
+          const store = mod.store || mod.default || mod;
+          const pr = require('../Redux/Reducer/Profile/Profile.reducer');
+          if (store?.dispatch && pr.setVerified) store.dispatch(pr.setVerified(isVerified));
+        } catch (e) {}
+      }
+    };
+    socket.on('profile:update', onProfileUpdate);
+
     socket.on('group:settings:updated', onGroupSettingsUpdated);
     socket.on('group:settings:response', onGroupSettingsUpdated);
     socket.on('group:settings:update:success', onGroupSettingsUpdated);
@@ -4379,6 +4478,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('group:member:list:response', onGroupMemberListResponse),
       () => socket.off('group:member:info:response', onGroupMemberInfoResponse),
       () => socket.off('contact:updated', onContactUpdated),
+      () => socket.off('profile:update', onProfileUpdate),
       // Settings & metadata
       () => socket.off('group:settings:updated', onGroupSettingsUpdated),
       () => socket.off('group:settings:response', onGroupSettingsUpdated),

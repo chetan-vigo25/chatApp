@@ -12,6 +12,7 @@ import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import { listCalls, deleteCalls, clearCalls } from '../../calls/services/callLogService';
 import { registerCallLogListeners } from '../../calls/services/callLogSyncService';
+import { clearMissed } from '../../calls/services/missedCallBadge';
 import { subscribeSocketState } from '../../Redux/Services/Socket/socket';
 import CallAvatar from '../../calls/components/CallAvatar';
 import CallsEmptyState from './CallsEmptyState';
@@ -260,6 +261,8 @@ export default function CallsScreen({ navigation }) {
       fetchPage(1, true);
     }
     refreshContacts?.();
+    // Opening the Calls tab clears the unseen missed-call badge (APP-9).
+    clearMissed();
   }, [fetchPage, refreshContacts]));
 
   // De-duped prepend/patch of a single call row, keyed by callId, so neither a
@@ -470,9 +473,11 @@ export default function CallsScreen({ navigation }) {
           </View>
 
           <View style={styles.rowText}>
-            <Text style={[styles.rowName, { color: nameColor }]} numberOfLines={1}>
-              {name}{g.count > 1 ? `  (${g.count})` : ''}
-            </Text>
+            <View style={styles.nameLine}>
+              <Text style={[styles.rowName, { color: nameColor, flexShrink: 1 }]} numberOfLines={1}>
+                {name}{g.count > 1 ? `  (${g.count})` : ''}
+              </Text>
+            </View>
             <View style={styles.metaRow}>
               {/* direction arrow — green when connected, red when missed/declined */}
               <MaterialIcons name={arrowIcon} size={16} color={arrowColor} style={styles.metaArrow} />
@@ -818,7 +823,8 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   rowText: { flex: 1, minWidth: 0, marginLeft: 14 },
-  rowName: { fontSize: 16, fontFamily: 'Roboto-Medium', marginBottom: 3 },
+  nameLine: { flexDirection: 'row', alignItems: 'center', marginBottom: 3 },
+  rowName: { fontSize: 16, fontFamily: 'Roboto-Medium' },
   metaRow: { flexDirection: 'row', alignItems: 'center' },
   metaArrow: { marginRight: 4 },
   metaMedia: { marginRight: 5 },

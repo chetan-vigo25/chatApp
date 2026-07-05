@@ -63,6 +63,10 @@ export const initialCallState = {
   // lifecycle
   accepted: false,       // callee tapped Accept; waiting for media to connect
   remoteJoined: false,
+  // Mid-call media-layer drop (network blip): the peer connection reported
+  // disconnect/ICE-failed. The overlay shows "Reconnecting…" while true; a
+  // watchdog ends the call if it doesn't recover. Cleared on media recovery.
+  reconnecting: false,
   needsUnmuteGesture: false,
   endReason: null,       // 'completed'|'rejected'|'cancelled'|'missed'|'failed'
   startedAt: null,

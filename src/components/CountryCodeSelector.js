@@ -16,6 +16,7 @@ import countryCodes from '../jsonFile/countryCodes.json';
 import { Ionicons } from '@expo/vector-icons';
 
 const CountryCodeSelector = ({
+  countries = countryCodes,
   selectedCountry = countryCodes[0],
   onCountrySelect,
   style = {},
@@ -25,6 +26,9 @@ const CountryCodeSelector = ({
   showCode = true,
   showName = true,
 }) => {
+  // Admin-controlled list passed by the login screen; fall back to the bundled
+  // catalogue if a caller doesn't provide one (or provides an empty array).
+  const countryList = Array.isArray(countries) && countries.length ? countries : countryCodes;
   const { theme, isDarkMode } = useTheme();
   const [showModal, setShowModal] = useState(false);
   const [search, setSearch] = useState('');
@@ -79,12 +83,12 @@ const CountryCodeSelector = ({
   };
 
   const filteredCountries = search.trim()
-    ? countryCodes.filter(
+    ? countryList.filter(
         (c) =>
           c.name.toLowerCase().includes(search.toLowerCase()) ||
           c.code.includes(search)
       )
-    : countryCodes;
+    : countryList;
 
   const renderCountryItem = ({ item }) => {
     const isSelected = selectedCountry?.code === item.code && selectedCountry?.name === item.name;

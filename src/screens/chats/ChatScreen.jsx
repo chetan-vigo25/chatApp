@@ -23,7 +23,8 @@ import {
   UIManager,
   PanResponder,
   useWindowDimensions,
-  StyleSheet
+  StyleSheet,
+  DeviceEventEmitter
 } from "react-native";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
@@ -39,7 +40,6 @@ import useChatLogic from "../../contexts/useChatLogic";
 import { useSelector, useDispatch } from "react-redux";
 import { unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
-import UserDetailsSheet from "../../components/UserDetailsSheet";
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -1167,7 +1167,6 @@ export default function ChatScreen({ navigation, route }) {
   const [deleteEveryoneModalVisible, setDeleteEveryoneModalVisible] = useState(false);
   const [isDeletingEveryone, setIsDeletingEveryone] = useState(false);
   // Draggable peer-details bottom sheet (opened by tapping the header avatar)
-  const [userSheetVisible, setUserSheetVisible] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [newMessagesCount, setNewMessagesCount] = useState(0);
   const [inputHeight, setInputHeight] = useState(34);
@@ -1488,8 +1487,19 @@ export default function ChatScreen({ navigation, route }) {
   }, []);
 
   // IMPROVED: Better function to check if media is downloaded
+  // Broadcast-channel media is public (uploaded via the Status media pipeline)
+  // and one-way — there's no per-user mediaId to sign a download with. So we
+  // render it straight from the remote URL, exactly like the web client, rather
+  // than gating it behind the 1-1 download flow (which would never resolve).
+  const isBroadcastMedia = (msg) =>
+    Boolean((chatData?.chatType === 'broadcast' || chatData?.isBroadcast) &&
+      (msg?.mediaUrl || msg?.mediaThumbnailUrl || msg?.previewUrl));
+
   const isMediaDownloaded = (msg) => {
     if (!msg) return false;
+
+    // Broadcast media is always "available" — served directly from its remote URL.
+    if (isBroadcastMedia(msg)) return true;
 
     // Check persisted download flag on the message itself (survives app restart)
     if (msg.isMediaDownloaded === true || msg.downloadStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED) {
@@ -1525,6 +1535,13 @@ export default function ChatScreen({ navigation, route }) {
 
   const resolveDownloadedUri = (msg) => {
     if (!msg) return null;
+
+    // Broadcast media resolves straight to its (secure) remote URL — no local
+    // download file exists, and web renders the same URL directly.
+    if (isBroadcastMedia(msg)) {
+      const remote = msg.mediaUrl || msg.mediaThumbnailUrl || msg.previewUrl;
+      if (remote) return toSecureMediaUri(remote);
+    }
 
     // Check msg.localUri first (persisted across app restarts)
     if (msg.localUri) {
@@ -1706,6 +1723,20 @@ export default function ChatScreen({ navigation, route }) {
     chatPeerId ? (s?.block?.blockedByIds || []).map(String).includes(String(chatPeerId)) : false,
   );
   const blockDispatch = useDispatch();
+
+  // Live verified-badge override for the header. chatData is built from static
+  // route params, so when an admin toggles the badge while this thread is open
+  // the realtime `profile:update` path (RealtimeChatContext) re-emits it here.
+  const [liveVerified, setLiveVerified] = useState(null);
+  useEffect(() => {
+    if (!chatPeerId) return undefined;
+    const sub = DeviceEventEmitter.addListener('peer:profile:updated', (p) => {
+      if (p && String(p.userId) === String(chatPeerId) && typeof p.isVerified === 'boolean') {
+        setLiveVerified(p.isVerified);
+      }
+    });
+    return () => sub.remove();
+  }, [chatPeerId]);
 
   // Sync chatData to ref for callbacks declared before destructuring (web TDZ fix)
   useEffect(() => { chatDataRef.current = chatData; }, [chatData]);
@@ -3248,18 +3279,6 @@ export default function ChatScreen({ navigation, route }) {
     }
   };
 
-  // Tapping the header profile photo opens a draggable bottom sheet with the
-  // peer's complete details + Message/Audio/Video actions. Groups keep the
-  // existing behaviour (open Group Info).
-  const handleOpenUserSheet = () => {
-    const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
-    if (isGroupChat) {
-      handleOpenContactInfo();
-    } else {
-      setUserSheetVisible(true);
-    }
-  };
-
   const handleChatMuteOptions = () => {
     setShowMenu(false);
     const now = Date.now();
@@ -4715,6 +4734,16 @@ export default function ChatScreen({ navigation, route }) {
             // the bubble stays left-aligned under the run's first bubble.
             <View style={{ width: 30, marginRight: 6 }} />
           ) : null}
+          {/* Column wrapper around bubble + reaction picker + pill. The picker
+              and pill position themselves with alignSelf/stacking margins, so
+              they MUST live in a column. In group-received rows the outer
+              Pressable is a row ([avatar | bubble]); without this wrapper the
+              picker/pill would render beside the bubble instead of above/below. */}
+          <View style={
+            isGroupReceived
+              ? { flex: 1, alignItems: 'flex-start' }
+              : { alignItems: isMyMessage ? 'flex-end' : 'flex-start' }
+          }>
           <View style={{
             // WhatsApp bubble geometry: ~7.5px corners with a small tail at the
             // TOP corner on the sender's side (top-right for me, top-left for them).
@@ -5020,6 +5049,7 @@ export default function ChatScreen({ navigation, route }) {
               }}
             />
           )}
+          </View>
         </Pressable>
         </SwipeReplyRow>
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
@@ -5220,13 +5250,13 @@ export default function ChatScreen({ navigation, route }) {
           onBack={() => navigation.goBack()}
           // Broadcast: tapping the header/avatar opens the channel info page.
           onPressProfile={handleOpenContactInfo}
-          onPressAvatar={isBroadcastChat ? handleOpenContactInfo : handleOpenUserSheet}
+          onPressAvatar={handleOpenContactInfo}
           getUserColor={getUserColor}
           // Render the channel via the group-like header path (name + logo, no
           // peer presence). isBroadcast lets the header suppress "last seen".
           isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup || isBroadcastChat)}
           isBroadcast={isBroadcastChat}
-          isVerified={Boolean(chatData?.isVerified)}
+          isVerified={liveVerified ?? Boolean(chatData?.isVerified || chatData?.peerUser?.isVerified)}
           groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
           groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
           memberCount={isBroadcastChat ? undefined : (liveMemberCount ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount))}
@@ -6079,7 +6109,7 @@ export default function ChatScreen({ navigation, route }) {
               />
               {/* Load older messages — WhatsApp-style backfill of history from the
                   server. Only shown while older messages remain (hasMoreMessages). */}
-              {hasMoreMessages && (
+              {/* {hasMoreMessages && (
                 <ChatMenuItem
                   icon="history"
                   iconLib="MaterialCommunityIcons"
@@ -6099,7 +6129,7 @@ export default function ChatScreen({ navigation, route }) {
                   }}
                   theme={theme}
                 />
-              )}
+              )} */}
               <View style={[chatMenuStyles.popoverDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)' }]} />
 
               <ChatMenuItem
@@ -6496,18 +6526,6 @@ export default function ChatScreen({ navigation, route }) {
         onSuccess={() => clearSelectedMessages()}
         payload={reportPayload}
         analytics={reportAnalytics}
-      />
-
-      {/* Draggable peer-details sheet — opened by tapping the header avatar */}
-      <UserDetailsSheet
-        visible={userSheetVisible}
-        onClose={() => setUserSheetVisible(false)}
-        peerId={chatData?.peerUser?._id || chatData?.peerUserId || null}
-        fallbackName={chatData?.peerUser?.fullName || chatData?.peerUser?.name || 'User'}
-        fallbackImage={chatData?.peerUser?.profileImage || chatData?.peerUser?.profilePicture || null}
-        avatarColor={getUserColor?.(chatData?.peerUser?._id || chatData?.peerUser?.fullName || '') || '#6C5CE7'}
-        onMessage={() => { /* already in this chat — just dismiss */ }}
-        onViewFullInfo={() => navigation.navigate('UserB', { item: chatData })}
       />
 
       {/* Schedule Time Picker is rendered inside ChatInputBar */}

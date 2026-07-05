@@ -39,6 +39,11 @@ const FIRST_SYNC_BATCH_SIZE = 200;
 // parsing just the head lets the list appear before that finishes.
 const PREVIEW_SYNC_SIZE = 100;
 
+// First screen paint from SQLite: bridge only this many rows out of the native DB
+// before rendering, so the contacts screen appears well under a second even on a
+// multi-thousand-row phonebook. The full table streams in right after.
+const FIRST_PAINT_LIMIT = 100;
+
 // Build ramped chunks: one small head chunk (firstSize) for instant first paint,
 // then rest-sized chunks. Keeps total round-trips low while making the list
 // appear fast. e.g. 2000 items → [200, 800, 800, 200].
@@ -200,6 +205,7 @@ export const useContactSync = () => {
         lastLogin: contact?.lastLogin || null,
         canMessage: contact?.canMessage ?? !!contact?.userId,
         isBlocked: !!contact?.isBlocked,
+        isVerified: !!contact?.isVerified,
         isFavorite: !!contact?.isFavorite,
         lastContacted: contact?.lastContacted || null,
         isNewUntil: contact?.isNewUntil || null,
@@ -213,21 +219,48 @@ export const useContactSync = () => {
 
   // ─── APPLY TO STATE FROM SQLITE ───
 
+  // First-paint guards: the head page is loaded exactly once per hook lifetime,
+  // and never applied after a full-table load has already landed (a late head
+  // page must not shrink an already-complete list back down to 100 rows).
+  const firstPaintDoneRef = useRef(false);
+  const fullAppliedRef = useRef(false);
+
+  const applyContactsToState = useCallback((all) => {
+    if (!mountedRef.current) return;
+    setMatchedContacts(all);
+    setMatchedRegistered(all.filter(c => c.type === 'registered' || !!c.userId));
+    setMatchedUnregistered(all.filter(c => c.type !== 'registered' && !c.userId));
+  }, []);
+
   const applyFromDB = useCallback(async () => {
     try {
-      const all = await ContactDatabase.loadAllContacts();
-      const registered = all.filter(c => c.type === 'registered' || !!c.userId);
-      const unregistered = all.filter(c => c.type !== 'registered' && !c.userId);
-
-      if (mountedRef.current) {
-        setMatchedContacts(all);
-        setMatchedRegistered(registered);
-        setMatchedUnregistered(unregistered);
+      // Phase 1 (first call only): paint the head of the table immediately —
+      // bridging 100 rows is fast no matter how big the phonebook is — and drop
+      // the initial spinner so the user sees contacts right away. The full load
+      // below then replaces it.
+      if (!firstPaintDoneRef.current) {
+        firstPaintDoneRef.current = true;
+        try {
+          const head = await ContactDatabase.loadContactsPage(FIRST_PAINT_LIMIT, 0);
+          if (head.length > 0 && !fullAppliedRef.current) {
+            applyContactsToState(head);
+            if (mountedRef.current) setIsInitialLoading(false);
+          }
+        } catch (headErr) {
+          console.warn('[useContactSync] first-paint load error:', headErr?.message);
+        }
       }
 
-      const sessionId = await ContactDatabase.getSyncSessionId();
-      const lastSync = await ContactDatabase.getLastSyncTime();
-      const metadata = await ContactDatabase.getSyncMetadata();
+      // Phase 2: full table.
+      const all = await ContactDatabase.loadAllContacts();
+      fullAppliedRef.current = true;
+      applyContactsToState(all);
+
+      const [sessionId, lastSync, metadata] = await Promise.all([
+        ContactDatabase.getSyncSessionId(),
+        ContactDatabase.getLastSyncTime(),
+        ContactDatabase.getSyncMetadata(),
+      ]);
 
       if (mountedRef.current) {
         setLastSyncSessionId(sessionId);
@@ -240,7 +273,7 @@ export const useContactSync = () => {
       console.warn('[useContactSync] applyFromDB error:', err?.message);
       return [];
     }
-  }, []);
+  }, [applyContactsToState]);
 
   // ─── HASHING ───
 

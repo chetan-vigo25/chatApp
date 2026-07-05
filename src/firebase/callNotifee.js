@@ -128,6 +128,7 @@ export const startOngoingCallNotification = (call) => {
       callerImage: call.callerImage || null,
       callType: call.callType === 'video' ? 'video' : 'audio',
       startedAt: call.startedAt || 0,
+      state: call.state === 'ringing' ? 'ringing' : 'ongoing',
     });
   } catch (err) {
     console.warn('[callNotif] startOngoingCall failed:', err?.message);

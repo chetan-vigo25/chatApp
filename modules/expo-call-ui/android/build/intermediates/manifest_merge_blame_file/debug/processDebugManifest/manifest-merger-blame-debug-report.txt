@@ -21,29 +21,40 @@
 16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:3-82
 16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:20-79
 17
-18    <application>
-18-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:12:3-24:17
-19
-20        <!--
-21         Receives the Decline / Hang-up taps from the CallStyle notifications.
-22         Runs natively even when the JS app is killed.
-23        -->
-24        <receiver
-24-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:15:5-17:34
-25            android:name="expo.modules.callui.CallActionReceiver"
-25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:16:7-41
-26            android:exported="false" />
-26-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:7-31
-27
-28        <!-- Persistent active-call notification (duration timer + Hang up). -->
-29        <service
-29-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:20:5-23:59
-30            android:name="expo.modules.callui.CallForegroundService"
-30-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:21:7-44
-31            android:exported="false"
-31-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:22:7-31
-32            android:foregroundServiceType="microphone|camera" />
-32-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:23:7-56
-33    </application>
-34
-35</manifest>
+18    <!--
+19       Lets the app open the system dialog to exempt itself from Doze battery
+20       optimization (requestDisableBatteryOptimization). Without this exemption a
+21       killed/rebooted app on OEM skins is blocked from waking on the incoming-call
+22       FCM push, so calls never ring until the app is opened. Declared here so it
+23       merges into the app manifest with the module that uses it.
+24    -->
+25    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:3-93
+25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:20-90
+26
+27    <application>
+27-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:3-31:17
+28
+29        <!--
+30         Receives the Decline / Hang-up taps from the CallStyle notifications.
+31         Runs natively even when the JS app is killed.
+32        -->
+33        <receiver
+33-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:22:5-24:34
+34            android:name="expo.modules.callui.CallActionReceiver"
+34-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:23:7-41
+35            android:exported="false" />
+35-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:24:7-31
+36
+37        <!-- Persistent active-call notification (duration timer + Hang up). -->
+38        <service
+38-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:27:5-30:59
+39            android:name="expo.modules.callui.CallForegroundService"
+39-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:28:7-44
+40            android:exported="false"
+40-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:29:7-31
+41            android:foregroundServiceType="microphone|camera" />
+41-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:30:7-56
+42    </application>
+43
+44</manifest>

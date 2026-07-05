@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   View, Text, Image, Animated, TouchableOpacity, ScrollView,
-  Alert, StyleSheet, ActivityIndicator,
+  Alert, StyleSheet, ActivityIndicator, Platform,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
@@ -12,6 +12,8 @@ import { useAuth } from "../../contexts/AuthContext";
 import { Ionicons, FontAwesome6, AntDesign } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
+import VerifiedBadge from '../../components/VerifiedBadge';
+import { openCallReliability } from '../../calls/services/callReliability';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
@@ -115,6 +117,20 @@ export default function Setting({ navigation }) {
         },
       ],
     },
+    // OEM skins (MIUI, FuntouchOS, …) block a killed/rebooted app from waking on
+    // the incoming-call push. This re-opens the battery-optimization + Autostart
+    // onboarding so calls ring when the app is closed. Android-only.
+    ...(Platform.OS === 'android' ? [{
+      title: 'Calls',
+      items: [
+        {
+          icon: 'call-outline',
+          label: 'Call reliability',
+          subtitle: 'Let calls ring when the app is closed',
+          onPress: () => openCallReliability(),
+        },
+      ],
+    }] : []),
     // {
     //   title: 'Chats',
     //   items: [
@@ -185,9 +201,12 @@ export default function Setting({ navigation }) {
       </View>
 
       <View style={styles.profileInfo}>
-        <Text style={[styles.profileName, { color: primaryText }]} numberOfLines={1}>
-          {profileData?.fullName || 'User'}
-        </Text>
+        <View style={styles.profileNameRow}>
+          <Text style={[styles.profileName, { color: primaryText, flexShrink: 1 }]} numberOfLines={1}>
+            {profileData?.fullName || 'User'}
+          </Text>
+          <VerifiedBadge verified={profileData?.isVerified} size={16} />
+        </View>
         <Text style={[styles.profileSub, { color: subText }]} numberOfLines={1}>
           {profileData?.about || profileData?.email || 'Tap to set up your profile'}
         </Text>
@@ -337,6 +356,7 @@ const styles = StyleSheet.create({
     fontSize: 22,
   },
   profileInfo: { flex: 1, gap: 3 },
+  profileNameRow: { flexDirection: 'row', alignItems: 'center' },
   profileName: {
     fontFamily: 'Roboto-SemiBold',
     fontSize: 18,

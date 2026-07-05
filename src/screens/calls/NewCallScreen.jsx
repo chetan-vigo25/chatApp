@@ -14,6 +14,7 @@ import { toSecureMediaUri } from '../../utils/mediaService';
 import ContactDatabase from '../../services/ContactDatabase';
 import CallAvatar from '../../calls/components/CallAvatar';
 import ProfilePreviewModal from '../../components/ProfilePreviewModal';
+import VerifiedBadge from '../../components/VerifiedBadge';
 
 const ROW_HEIGHT = 72;
 
@@ -27,7 +28,7 @@ const getAvatarColor = (name = '') => {
 
 // ─── one contact row (memoized — only re-renders when its primitives change) ──
 const ContactRow = memo(function ContactRow({
-  name, avatarUri, peerId, subText,
+  name, avatarUri, peerId, subText, isVerified,
   textColor, subColor, themeColor, onAudio, onVideo, onPressName, onPressAvatar,
 }) {
   return (
@@ -43,7 +44,10 @@ const ContactRow = memo(function ContactRow({
 
       {/* Name + number → opens the chat thread. */}
       <TouchableOpacity style={styles.rowText} activeOpacity={0.6} onPress={onPressName}>
-        <Text style={[styles.rowName, { color: textColor }]} numberOfLines={1}>{name}</Text>
+        <View style={styles.nameLine}>
+          <Text style={[styles.rowName, { color: textColor, flexShrink: 1 }]} numberOfLines={1}>{name}</Text>
+          <VerifiedBadge verified={isVerified} size={14} />
+        </View>
         <Text style={[styles.rowSub, { color: subColor }]} numberOfLines={1}>
           {subText}
         </Text>
@@ -62,7 +66,7 @@ const ContactRow = memo(function ContactRow({
 }, (a, b) => (
   a.name === b.name && a.avatarUri === b.avatarUri
   && a.textColor === b.textColor && a.themeColor === b.themeColor
-  && a.subText === b.subText
+  && a.subText === b.subText && a.isVerified === b.isVerified
 ));
 
 export default function NewCallScreen() {
@@ -109,7 +113,7 @@ export default function NewCallScreen() {
       const profileImageRaw = c.profileImage || c.profilePicture || null;
       const avatarUri = toSecureMediaUri(profileImageRaw) || null;
       const phone = c.mobileFormatted || c.originalPhone || c.normalizedPhone || '';
-      return { peerId, name, avatarUri, profileImageRaw, phone };
+      return { peerId, name, avatarUri, profileImageRaw, phone, isVerified: Boolean(c.isVerified) };
     });
     // De-dup by peerId + sort by name once (search keeps this order).
     const seen = new Set();
@@ -204,6 +208,7 @@ export default function NewCallScreen() {
       avatarUri={item.avatarUri}
       peerId={item.peerId}
       subText={item.phone || 'Tap to call'}
+      isVerified={item.isVerified}
       textColor={c.primaryTextColor}
       subColor={c.placeHolderTextColor}
       themeColor={c.themeColor}
@@ -296,6 +301,7 @@ export default function NewCallScreen() {
         image={selected?.avatarUri || null}
         avatarColor={getAvatarColor(selected?.name || '')}
         isGroup={false}
+        isVerified={Boolean(selected?.isVerified)}
         onMessage={previewMessage}
         onCall={() => previewCall('audio')}
         onVideo={() => previewCall('video')}
@@ -332,7 +338,8 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16 },
   avatar: { width: 48, height: 48, borderRadius: 24 },
   rowText: { flex: 1, minWidth: 0, marginLeft: 14 },
-  rowName: { fontSize: 16, fontFamily: 'Roboto-Medium', marginBottom: 2 },
+  nameLine: { flexDirection: 'row', alignItems: 'center', marginBottom: 2 },
+  rowName: { fontSize: 16, fontFamily: 'Roboto-Medium' },
   rowSub: { fontSize: 13, fontFamily: 'Roboto-Regular' },
   rowActions: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   actionBtn: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', borderRadius: 21 },

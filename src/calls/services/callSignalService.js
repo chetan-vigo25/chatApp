@@ -51,6 +51,24 @@ export const endCallSignal = ({ callId, otherUserIds }) => {
   return emitSocketEvent('call:end', { callId, otherUserIds });
 };
 
+// Recovery pull (XR-2 / APP-5). A push-woken / cold-started / just-reconnected
+// device may have MISSED the live `call:incoming` (e.g. its CallStyle notif timed
+// out, or the socket was down when the caller rang). On (re)connect while IDLE we
+// ask the server for any invite that is STILL ringing for us and re-render it.
+// Resolves with the server ack `{ ok, calls: [...] }` (or an empty list on a
+// no/late ack) so a missing handler never blocks anything.
+const PENDING_PULL_ACK_TIMEOUT_MS = 4000;
+export const pullPendingCalls = () => new Promise((resolve) => {
+  let settled = false;
+  const done = (res) => { if (!settled) { settled = true; resolve(res || { ok: true, calls: [] }); } };
+  if (__DEV__) console.log('[CALL][APP][signal] → emit call:pending:pull');
+  emitSocketEvent('call:pending:pull', {}, (res) => {
+    if (__DEV__) console.log('[CALL][APP][signal] ← call:pending:pull ACK', res);
+    done(res);
+  });
+  setTimeout(() => done({ ok: true, calls: [], timedOut: true }), PENDING_PULL_ACK_TIMEOUT_MS);
+});
+
 /**
  * Attach the server→client call event listeners to the CURRENT socket instance.
  * Returns an unsubscribe. Re-call this whenever the socket (re)connects so a new
@@ -75,6 +93,16 @@ export const registerCallSignalListeners = (handlers = {}) => {
     // deactivated / deleted / blocked / no active session). Carries a human
     // `message` for the call screen.
     'call:unavailable': wrap('call:unavailable', handlers.onUnavailable),
+    // Server-authoritative end-of-ring (XR-1). The backend's ring timer fired
+    // before either side hung up — the caller should stop ringing with "No
+    // answer", an un-accepted callee should mark it missed. Covers clock skew
+    // where the local ring timer would otherwise disagree with the server.
+    'call:timeout': wrap('call:timeout', handlers.onTimeout),
+    // Multi-device dismissal (XR-1). Another device on THIS account handled the
+    // call (answered / declined elsewhere), or the caller cancelled — this device
+    // must stop ringing and dismiss its ring UI. Payload carries a `reason`
+    // (e.g. 'answered_elsewhere' | 'declined_elsewhere' | 'cancelled').
+    'call:cancelled-elsewhere': wrap('call:cancelled-elsewhere', handlers.onCancelledElsewhere),
   };
   if (__DEV__) console.log('[CALL][APP][signal] registered call:* listeners on socket', socket.id || '(no id yet)');
   Object.keys(map).forEach((evt) => socket.on(evt, map[evt]));

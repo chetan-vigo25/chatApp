@@ -313,7 +313,7 @@ export default function StatusList({ navigation }) {
               <Text style={[styles.rowName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
                 {displayName}
               </Text>
-              {isOfficial && (
+              {(isOfficial || item?.isVerified) && (
                 <Ionicons name="checkmark-circle" size={15} color={theme.colors.themeColor} style={styles.nameVerified} />
               )}
             </View>

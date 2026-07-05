@@ -216,6 +216,8 @@ export default function UserB({ navigation, route }) {
   const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
   const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
   const about = peerProfile?.about || peer?.about || '';
+  // Admin-granted verified badge (from the profile view endpoint / chat item).
+  const isVerified = Boolean(peerProfile?.isVerified || peer?.isVerified);
 
   // Image source — the live server profile photo wins so profile-picture
   // changes show up immediately (the locally-saved contact image is only a
@@ -427,9 +429,14 @@ export default function UserB({ navigation, route }) {
 
           {scrolledPastHeader && (
             <View style={styles.collapsedInfo}>
-              <Text style={[styles.collapsedName, { color: primaryText }]} numberOfLines={1}>
-                {displayName}
-              </Text>
+              <View style={styles.collapsedNameRow}>
+                <Text style={[styles.collapsedName, { color: primaryText, flexShrink: 1 }]} numberOfLines={1}>
+                  {displayName}
+                </Text>
+                {isVerified && (
+                  <Ionicons name="checkmark-circle" size={15} color={themeColor} style={styles.collapsedVerified} />
+                )}
+              </View>
               {!!statusLine && (
                 <Text style={[styles.collapsedSub, { color: subText }]} numberOfLines={1}>
                   {statusLine}
@@ -467,6 +474,9 @@ export default function UserB({ navigation, route }) {
           <View style={styles.heroOverlay}>
             <View style={styles.heroNameRow}>
               <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
+              {isVerified && (
+                <Ionicons name="checkmark-circle" size={18} color={themeColor} style={styles.heroVerified} />
+              )}
               {isOnline && <View style={styles.heroOnlineDot} />}
             </View>
             {(displayPhone || statusLine) ? (
@@ -737,6 +747,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.32)',
   },
   collapsedInfo: { flex: 1, paddingHorizontal: 8, justifyContent: 'center' },
+  collapsedNameRow: { flexDirection: 'row', alignItems: 'center' },
+  collapsedVerified: { marginLeft: 4 },
   collapsedName: { fontFamily: 'Roboto-SemiBold', fontSize: 16, lineHeight: 20 },
   collapsedSub: { fontFamily: 'Roboto-Regular', fontSize: 11, lineHeight: 14, marginTop: 1 },
 
@@ -787,6 +799,11 @@ const styles = StyleSheet.create({
     textShadowColor: 'rgba(0,0,0,0.45)',
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 5,
+  },
+  heroVerified: {
+    textShadowColor: 'rgba(0,0,0,0.45)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 4,
   },
   heroOnlineDot: {
     width: 11,

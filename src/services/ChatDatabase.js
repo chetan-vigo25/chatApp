@@ -2387,9 +2387,12 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
   // never a blank "private" placeholder. INSERT OR IGNORE only seeds when the
   // row is genuinely missing; existing rows are left untouched.
   const isGroup = Boolean(opts.isGroup);
+  const peerUserJson = !isGroup && opts.peerUser && opts.peerUser._id
+    ? JSON.stringify(opts.peerUser)
+    : null;
   await db.runAsync(
-    `INSERT OR IGNORE INTO chats (chat_id, chat_type, is_group, group_id, chat_name, chat_avatar, group_data, unread_count, created_at, updated_at)
-     VALUES ($chatId, $chatType, $isGroup, $groupId, $chatName, $chatAvatar, $groupData, 0, $now, $now)`,
+    `INSERT OR IGNORE INTO chats (chat_id, chat_type, is_group, group_id, chat_name, chat_avatar, peer_user, group_data, unread_count, created_at, updated_at)
+     VALUES ($chatId, $chatType, $isGroup, $groupId, $chatName, $chatAvatar, $peerUser, $groupData, 0, $now, $now)`,
     {
       $chatId: chatId,
       $chatType: isGroup ? 'group' : 'private',
@@ -2397,12 +2400,35 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
       $groupId: isGroup ? (opts.groupId || chatId) : null,
       $chatName: opts.chatName || null,
       $chatAvatar: opts.chatAvatar || null,
+      $peerUser: peerUserJson,
       $groupData: isGroup
         ? JSON.stringify(opts.group || { _id: opts.groupId || chatId, name: opts.chatName || null, avatar: opts.chatAvatar || null })
         : null,
       $now: now,
     }
   );
+
+  // Backfill identity on rows that already exist but are nameless (seeded by an
+  // earlier message before any chat:list:update landed). Fill-only — never
+  // overwrite an existing name/avatar/peer_user with realtime-payload data,
+  // which is weaker than the server-resolved chat list item.
+  if (peerUserJson || opts.chatName || opts.chatAvatar) {
+    await db.runAsync(
+      `UPDATE chats SET
+        peer_user = COALESCE(peer_user, $peerUser),
+        chat_name = COALESCE(chat_name, $chatName),
+        chat_avatar = COALESCE(chat_avatar, $chatAvatar),
+        updated_at = $now
+      WHERE chat_id = $chatId`,
+      {
+        $chatId: chatId,
+        $peerUser: peerUserJson,
+        $chatName: opts.chatName || null,
+        $chatAvatar: opts.chatAvatar || null,
+        $now: now,
+      }
+    );
+  }
 
   // Anti-downgrade: don't let a stale 'sent' overwrite an existing 'delivered'/'read'
   // for the SAME message. Different message id always wins (it's a new last-message).
@@ -2539,6 +2565,35 @@ const updateChatGroupMeta = async (chatId, { name, avatar, description } = {}) =
         $id: chatId,
       }
     );
+  });
+};
+
+// Admin toggled the verified badge on a user (realtime `profile:update`).
+// Patch every 1-1 chat row whose peer matches: both the peer_user JSON and the
+// raw_data JSON must flip, because _rowToChat spreads raw_data first — a stale
+// top-level isVerified there would resurrect a removed badge after restart.
+const updatePeerVerified = async (userId, isVerified) => {
+  const uid = userId != null ? String(userId) : '';
+  if (!uid) return;
+  await runExclusive(async () => {
+    const db = await getDB();
+    const rows = await db.getAllAsync(
+      `SELECT chat_id, peer_user, raw_data FROM chats WHERE is_group = 0`
+    );
+    for (const row of rows || []) {
+      const peer = parseJSON(row.peer_user);
+      const peerId = peer?._id || peer?.userId || peer?.id;
+      if (!peerId || String(peerId) !== uid) continue;
+      const raw = parseJSON(row.raw_data) || {};
+      peer.isVerified = !!isVerified;
+      raw.isVerified = !!isVerified;
+      if (raw.peerUser) raw.peerUser = { ...raw.peerUser, isVerified: !!isVerified };
+      if (raw.otherUser) raw.otherUser = { ...raw.otherUser, isVerified: !!isVerified };
+      await db.runAsync(
+        `UPDATE chats SET peer_user = $peer, raw_data = $raw, updated_at = $n WHERE chat_id = $id`,
+        { $peer: JSON.stringify(peer), $raw: JSON.stringify(raw), $n: Date.now(), $id: row.chat_id }
+      );
+    }
   });
 };
 
@@ -2947,7 +3002,7 @@ export default {
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
   updateChatLastMessage, updateChatLastMessageStatusById, updateChatUnread, incrementChatUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
-  updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, deleteChatRow, getChatCount,
+  updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, updatePeerVerified, deleteChatRow, getChatCount,
   // Sync meta
   getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner,
   // Outbox + watermarks (V8)

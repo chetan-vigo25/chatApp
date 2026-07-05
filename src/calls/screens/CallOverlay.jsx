@@ -67,7 +67,18 @@ export default function CallOverlay() {
     || (status === CALL_STATUS.INCOMING && accepted0)
   );
   const isGroup = !!call?.isGroup;
-  const accepted = !!call?.accepted; // callee tapped Accept, media still connecting
+  const accepted = !!call?.accepted; // callee tapped Accept / caller got the accept signal — media may still be connecting
+  // "Connected" for the UI means REAL remote media is flowing — status === ACTIVE,
+  // which is driven ONLY by the SDK's remote-media `stream` (ontrack) event, never
+  // by the accept signal. `connecting` is the answered-but-not-yet-connected gap
+  // (accept signal received, no remote media yet): we show "Connecting…" then, so
+  // the screen never claims "connected"/shows a running timer before media exists.
+  // The post-answer connect watchdog (CallProvider) ends this gap as "Couldn't
+  // connect" if media never arrives (e.g. the callee accepted then lost internet).
+  const mediaConnected = status === CALL_STATUS.ACTIVE;
+  const connecting = accepted
+    && status !== CALL_STATUS.ACTIVE
+    && status !== CALL_STATUS.ENDED;
   // Show the incoming Accept/Decline card only until the user answers.
   const showIncomingActions = status === CALL_STATUS.INCOMING && !accepted;
   // A ring pulse while genuinely ringing (stops once either side has answered).
@@ -138,14 +149,21 @@ export default function CallOverlay() {
     || (isGroup ? `Group ${isVideo ? 'video ' : ''}call` : peerDisplayName);
 
   const subtitle = (() => {
+    // Mid-call network drop (APP-6): while the media layer is re-establishing,
+    // surface "Reconnecting…" over the normal timer/status until it recovers.
+    if (call?.reconnecting && status !== CALL_STATUS.ENDED && call?.answeredAt) {
+      return 'Reconnecting…';
+    }
+    // Answered (accept signal / tap) but remote media hasn't arrived yet → the
+    // honest indicator is "Connecting…", NOT a running timer. The timer only shows
+    // once status === ACTIVE (real media), so a call to an unreachable/offline peer
+    // that was accepted-then-dropped never reads as connected.
+    if (connecting) return 'Connecting…';
     if (status === CALL_STATUS.OUTGOING) {
-      // Once the callee answers, the running timer is the indicator (no subtitle).
-      if (accepted) return null;
       if (isGroup) return call?.callId ? 'Ringing…' : 'Calling group…';
       return call?.callId ? 'Ringing…' : 'Calling…';
     }
     if (status === CALL_STATUS.INCOMING) {
-      if (accepted) return null; // answered → timer shows below the name
       if (isGroup) return `Incoming group ${isVideo ? 'video' : 'voice'} call`;
       return isVideo ? 'Incoming video call' : 'Incoming voice call';
     }
@@ -172,7 +190,7 @@ export default function CallOverlay() {
         groupName={call?.groupName}
         media={call?.media}
         statusText={subtitle || ''}
-        showTimer={status === CALL_STATUS.ACTIVE || accepted}
+        showTimer={mediaConnected}
         answeredAt={call?.answeredAt}
         micOn={call?.micOn}
         onToggleMic={toggleMic}
@@ -201,7 +219,7 @@ export default function CallOverlay() {
             <Text style={styles.videoName} numberOfLines={1}>{groupTitle}</Text>
             {isGroup ? (
               <Text style={styles.videoSub}>{joined + 1} in call</Text>
-            ) : (status === CALL_STATUS.ACTIVE || accepted0) ? (
+            ) : mediaConnected ? (
               <CallTimer startMs={call?.answeredAt} />
             ) : (
               <Text style={styles.videoSub}>{subtitle}</Text>
@@ -265,7 +283,7 @@ export default function CallOverlay() {
             <View style={styles.gridWrap}>
               <CallParticipantsGrid participants={call?.participants} ringing={ringing} />
             </View>
-            {(status === CALL_STATUS.ACTIVE || accepted) ? (
+            {mediaConnected ? (
               <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
             ) : null}
           </View>
@@ -327,7 +345,7 @@ export default function CallOverlay() {
               </View>
             </View>
             <Text style={[styles.name, { color: onBg }]} numberOfLines={1}>{peerDisplayName}</Text>
-            {(status === CALL_STATUS.ACTIVE || accepted) ? (
+            {mediaConnected ? (
               <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
             ) : (
               <View style={styles.mediaRow}>

@@ -23,6 +23,9 @@ export const CMD = {
   SET_SPEAKER: 'setSpeaker',
   START_RECORDING: 'startRecording',
   STOP_RECORDING: 'stopRecording',
+  // Ask the SDK to restart ICE (renegotiate transport) after a network change —
+  // e.g. wifi↔cellular — so a live call recovers its media path instead of hanging.
+  RESTART_ICE: 'restartIce',
 };
 
 // Engine → RN events (SDK passthroughs + engine/control results)
@@ -43,6 +46,9 @@ export const EVT = {
   CAMERACHANGED: 'camerachanged',
   PEERFACING: 'peerfacing',
   ERROR: 'error',
+  // mid-call media-layer connection state (network resilience)
+  MEDIA_DOWN: 'mediaDown',
+  MEDIA_UP: 'mediaUp',
   // command results
   START_CALL_RESULT: 'startCallResult',
   START_CALL_ERROR: 'startCallError',

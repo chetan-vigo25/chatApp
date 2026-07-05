@@ -20,6 +20,7 @@ import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { hashPhoneForMatch, onlyDigits } from '../../utils/savedContactName';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
+import VerifiedBadge from '../../components/VerifiedBadge';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
@@ -48,12 +49,17 @@ function HeroGradient() {
 const getMemberUser = (m) => {
   if (!m) return {};
   const u = (typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
+  // The populated user carries `mobile: { code, number }` (code includes the
+  // leading '+'); older/flatter payload shapes may carry a plain string field.
+  const mobileObj = (u.mobile && typeof u.mobile === 'object') ? u.mobile : null;
+  const mobileFromObj = mobileObj?.number ? `${mobileObj.code || ''}${mobileObj.number}` : null;
   return {
     id: u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id,
     fullName: u.fullName || m.fullName || m.name || 'Unknown',
     profileImage: u.profileImage || m.profileImage || null,
     email: u.email || m.email || null,
-    mobile: u.mobileNumber || u.phoneNumber || u.phone || m.mobileNumber || m.phone || null,
+    mobile: u.mobileNumber || u.phoneNumber || u.phone || mobileFromObj || m.mobileNumber || m.phone || null,
+    isVerified: Boolean(u.isVerified || m.isVerified),
   };
 };
 
@@ -77,7 +83,14 @@ export default function GroupInfo({ navigation, route }) {
       saved = (h && directory?.[`h:${h}`]?.fullName?.trim())
         || directory?.[`p:${onlyDigits(u.mobile)}`]?.fullName?.trim();
     }
-    return saved || u.fullName;
+    if (saved) return saved;
+    // Not saved on this device → show the phone number (WhatsApp behaviour);
+    // the server profile name is only the last resort when no number is known.
+    if (u.mobile) {
+      const num = String(u.mobile).replace(/[^\d+]/g, '');
+      if (num) return num.startsWith('+') ? num : `+${num}`;
+    }
+    return u.fullName;
   };
   const fadeAnim = useRef(new Animated.Value(0)).current;
   // Scroll position drives the collapsing header: the solid header bar + title
@@ -321,6 +334,25 @@ export default function GroupInfo({ navigation, route }) {
     setMemberActionVisible(true);
   };
 
+  // Tapping a member's avatar opens their full profile details page.
+  const openMemberProfile = (member) => {
+    const user = getMemberUser(member);
+    if (!user.id) return;
+    const displayName = resolveMemberName(member);
+    navigation.navigate('UserB', {
+      item: {
+        _id: user.id,
+        id: user.id,
+        userId: user.id,
+        fullName: displayName,
+        name: displayName,
+        profileImage: user.profileImage || '',
+        profilePicture: user.profileImage || '',
+        isVerified: user.isVerified,
+      },
+    });
+  };
+
   // ─── RENDER MEMBER ───
   const renderMember = (member, index) => {
     const user = getMemberUser(member);
@@ -338,8 +370,11 @@ export default function GroupInfo({ navigation, route }) {
         activeOpacity={(canRemoveMembers || canPromoteDemote) && !isSelf && !memberIsOwner ? 0.6 : 1}
         style={styles.memberRow}
       >
-        {/* Avatar */}
-        <View>
+        {/* Avatar — tap opens the member's profile details page */}
+        <TouchableOpacity
+          onPress={isSelf ? undefined : () => openMemberProfile(member)}
+          activeOpacity={isSelf ? 1 : 0.7}
+        >
           {user.profileImage ? (
             <Image source={{ uri: user.profileImage }} style={styles.memberAvatar} />
           ) : (
@@ -352,7 +387,7 @@ export default function GroupInfo({ navigation, route }) {
               <Ionicons name="star" size={8} color="#fff" />
             </View>
           )}
-        </View>
+        </TouchableOpacity>
 
         {/* Info */}
         <View style={styles.memberInfo}>
@@ -360,6 +395,7 @@ export default function GroupInfo({ navigation, route }) {
             <Text style={[styles.memberName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
               {displayName}{isSelf ? ' (You)' : ''}
             </Text>
+            <VerifiedBadge verified={user?.isVerified} size={13} style={{ marginLeft: 0 }} />
             {isMuted && <Ionicons name="volume-mute" size={12} color={theme.colors.placeHolderTextColor} />}
           </View>
           <Text style={[styles.memberSub, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
@@ -497,7 +533,7 @@ export default function GroupInfo({ navigation, route }) {
             <Ionicons name="chatbubble" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Message</Text>
           </TouchableOpacity>
-          <TouchableOpacity
+          {/* <TouchableOpacity
             onPress={() => startGroupCall('audio')}
             disabled={callBusy}
             activeOpacity={0.7}
@@ -505,8 +541,8 @@ export default function GroupInfo({ navigation, route }) {
           >
             <Ionicons name="call" size={21} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Audio</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
+          </TouchableOpacity> */}
+          {/* <TouchableOpacity
             onPress={() => startGroupCall('video')}
             disabled={callBusy}
             activeOpacity={0.7}
@@ -514,7 +550,7 @@ export default function GroupInfo({ navigation, route }) {
           >
             <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Video</Text>
-          </TouchableOpacity>
+          </TouchableOpacity> */}
         </View>
 
         {/* ═══ DESCRIPTION CARD ═══ */}

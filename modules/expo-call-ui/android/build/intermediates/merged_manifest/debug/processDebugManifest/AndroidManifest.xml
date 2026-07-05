@@ -15,6 +15,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 
+    <!--
+       Lets the app open the system dialog to exempt itself from Doze battery
+       optimization (requestDisableBatteryOptimization). Without this exemption a
+       killed/rebooted app on OEM skins is blocked from waking on the incoming-call
+       FCM push, so calls never ring until the app is opened. Declared here so it
+       merges into the app manifest with the module that uses it.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application>
 
         <!--

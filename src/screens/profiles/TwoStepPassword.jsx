@@ -195,8 +195,8 @@ export default function TwoStepPassword({ navigation }) {
     Alert.alert(
       'Reset password?',
       hasDeletedPassword
-        ? 'Your current app lock password will be cleared. Your chat delete password depends on it, so it will be cleared too. You can set new ones afterwards — app lock will stay enabled.'
-        : 'Your current app lock password will be cleared. You can set a new one below — app lock will stay enabled.',
+        ? 'Your app lock password will be cleared and app lock will be TURNED OFF so you can keep using the app. Your chat delete password depends on it, so it will be cleared too. You can re-enable app lock and set new passwords afterwards.'
+        : 'Your app lock password will be cleared and app lock will be TURNED OFF so you can keep using the app. You can re-enable it and set a new password afterwards.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -207,18 +207,23 @@ export default function TwoStepPassword({ navigation }) {
             setBusy(true);
             const deletedWasSet = hasDeletedPassword;
             try {
+              // Reset is the RECOVERY path (e.g. forgotten password): clear the
+              // password AND disable app lock, so the user isn't locked out on the
+              // next launch/foreground and can use the app right away.
               await updateUserSettings({
-                chat: { twoStep: { enabled: true, password: null } },
+                chat: { twoStep: { enabled: false, password: null } },
               });
               // Reset the deleted-chats password too — it depended on this one.
               await clearDeletedPasswordIfSet();
+              setEnabled(false);
               setHasPassword(false);
               setPwd('');
               setConfirmPwd('');
+              await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '0');
               setSuccess(
                 deletedWasSet
-                  ? 'Password reset. Your chat delete password was also cleared. Set a new one to keep app lock active.'
-                  : 'Password reset. Set a new one to keep app lock active.'
+                  ? 'Password reset and app lock turned off. Your chat delete password was also cleared. Re-enable app lock to set a new one.'
+                  : 'Password reset and app lock turned off. Re-enable app lock anytime to set a new password.'
               );
             } catch (e) {
               setError(typeof e === 'string' ? e : 'Could not reset password.');

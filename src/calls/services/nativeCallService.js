@@ -1,4 +1,10 @@
-import { Platform } from 'react-native';
+import { Platform, NativeModules } from 'react-native';
+// Strong RFC4122-v4 UUID via the `uuid` package (backed by the
+// react-native-get-random-values polyfill imported at the app root). CallKit
+// rejects a malformed uuid, so the previous time-seeded hand-rolled generator
+// (weak, collision-prone) is replaced with this. expo-crypto is not installed;
+// `uuid` + the crypto polyfill is the strongest option available in the build.
+import { v4 as uuidGen } from 'uuid';
 
 /**
  * Native phone-call UI bridge (CallKit on iOS / ConnectionService on Android)
@@ -27,16 +33,23 @@ let setupDone = false;
 // Map our string callId <-> the RFC4122 UUID CallKeep requires.
 const idToUuid = {};
 const uuidToId = {};
+// callIds already registered with CallKit as connected outgoing calls — guards
+// against a repeated `stream` event (ICE restart / renegotiation) re-filing
+// startCall on a UUID CallKit already knows (which would error).
+const outgoingReported = new Set();
 
-// Lightweight RFC4122-v4 UUID (not crypto-grade; only needs to be unique per
-// call for CallKeep bookkeeping). Avoids pulling in a uuid dependency.
-const uuidv4 = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-  // Derive pseudo-randomness from time + a counter so we don't use Math.random
-  // in a way that breaks (it's fine here, but keep it cheap and unique-enough).
-  const r = (Date.now() + Math.floor(Math.random() * 1e6)) % 16;
-  const v = c === 'x' ? r : (r % 4) + 8;
-  return v.toString(16);
-});
+// Strong RFC4122-v4 UUID for CallKit bookkeeping. Falls back to a cheap
+// hand-rolled generator only if the uuid package/crypto polyfill somehow throws,
+// so this never crashes the call flow.
+const uuidv4 = () => {
+  try { return uuidGen(); } catch (_) {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = (Date.now() + Math.floor(Math.random() * 1e6)) % 16;
+      const v = c === 'x' ? r : (r % 4) + 8;
+      return v.toString(16);
+    });
+  }
+};
 
 // MASTER SWITCH for the in-app CallKit integration (incoming CallKit screen +
 // answer/end/mute listeners + active-call reporting). ON: required for the iOS
@@ -47,23 +60,55 @@ const uuidv4 = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c)
 // Requires a PHYSICAL iPhone + a dev/EAS build (never Expo Go / simulator) AND the
 // backend actually sending the APNs VoIP push — without that push the CallKit
 // screen never appears (the AppDelegate path stays inert).
-const IOS_CALLKIT_ENABLED = true;
+// TEMPORARILY DISABLED — CallKit + the WebView WebRTC engine conflict on answer:
+// when an INCOMING call is answered via CallKit, iOS seizes the process-global
+// AVAudioSession away from the WKWebView engine, so the media never connects and
+// the call cuts on pickup — while CallKit still shows a phantom "running" call
+// (00:11) that lingers into the next call. OUTGOING calls are unaffected because
+// they never touch CallKit until connected (REPORT_OUTGOING_TO_CALLKIT=false),
+// which is exactly why outgoing works and incoming cuts. This surfaced when a
+// clean prebuild finally compiled react-native-callkeep into the build (before
+// that isAvailable() was false and incoming used the robust in-app UI). Until the
+// call media moves to native react-native-webrtc (which can share CallKit's audio
+// session), keep CallKit OFF so incoming calls use the same working in-app path as
+// outgoing. Flip back to true only alongside that native-WebRTC migration.
+const IOS_CALLKIT_ENABLED = false;
 
 // CallKit is scoped to the INCOMING ring only. We deliberately do NOT report
-// OUTGOING calls to CallKit: RNCallKeep.startCall files a CXStartCallAction that
-// iOS expects the app to fulfil by reporting the outgoing call's
-// startedConnecting/connectedAt lifecycle. This app runs calls on WebRTC, not
-// CallKit's lifecycle, so that action was never fulfilled — iOS then timed it out
-// and fired `endCall`, tearing down the live WebRTC call "after ~2 rings" (the
-// regression that had CallKit disabled). The caller is never on a locked screen
-// needing the native UI, so the in-app CallOverlay is the right (and only) caller
-// UI; leaving CallKit out of the outgoing path removes the drop entirely.
+// OUTGOING calls to CallKit AT DIAL TIME: RNCallKeep.startCall files a
+// CXStartCallAction that iOS expects the app to fulfil by reporting the outgoing
+// call's startedConnecting/connectedAt lifecycle. This app runs calls on WebRTC,
+// not CallKit's lifecycle, so during the RINGING window that action sat unfulfilled
+// — iOS timed it out and fired `endCall`, tearing down the live WebRTC call "after
+// ~2 rings" (the regression that had CallKit disabled). So `startOutgoingCall`
+// (dial time) stays a no-op.
 const REPORT_OUTGOING_TO_CALLKIT = false;
+
+// …but once the caller's call is genuinely CONNECTED (remote media arrived) we DO
+// register it with CallKit — see reportOutgoingConnected(). Reporting at
+// connect-time (not dial-time) is regression-proof: the ringing window has NO
+// CallKit call at all, so there is no CXStartCallAction for iOS to time out and
+// kill. We create the call and immediately report it connected in the same tick,
+// so it goes straight to the active/ongoing state — giving the caller the same
+// green status-bar notch / Dynamic Island ongoing-call indicator as the callee,
+// plus lets the caller hang up from the notch/lock screen. iOS only.
+const REPORT_OUTGOING_CONNECTED_TO_CALLKIT = true;
 
 // iOS-ONLY even when enabled. Android keeps its own incoming UI (expo-call-ui
 // CallStyle) + the active-call foreground service, so we must NOT let
 // react-native-callkeep's Android ConnectionService UI activate and double up.
-export const isAvailable = () => IOS_CALLKIT_ENABLED && !!RNCallKeep && Platform.OS === 'ios';
+// The lazy `require('react-native-callkeep')` above can SUCCEED (the JS package
+// is in node_modules) even when the underlying native pod was never compiled
+// into the build — the checked-in ios/ project is stale (APP-1). In that state
+// RNCallKeep's methods throw / no-op, but isAvailable() would still return true,
+// so CallProvider skips its in-app foreground ring UI and the iOS call shows
+// NOTHING. Gate on the actual native module being registered (NativeModules
+// .RNCallKeep) so isAvailable() is only true when CallKit can really work — the
+// in-app foreground incoming UI is used otherwise.
+export const isAvailable = () => IOS_CALLKIT_ENABLED
+  && Platform.OS === 'ios'
+  && !!RNCallKeep
+  && !!NativeModules.RNCallKeep;
 
 export const uuidForCall = (callId) => {
   const key = String(callId || '');
@@ -96,6 +141,7 @@ const forget = (callId) => {
   const u = idToUuid[key];
   if (u) { delete uuidToId[u]; }
   delete idToUuid[key];
+  outgoingReported.delete(key);
 };
 
 export const setup = async () => {
@@ -138,11 +184,41 @@ export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
 };
 
 export const startOutgoingCall = (callId, handle, name, hasVideo = false) => {
-  // Intentionally NOT reported to CallKit — see REPORT_OUTGOING_TO_CALLKIT above
-  // (unfulfilled CXStartCallAction → CallKit ends the WebRTC call mid-connect).
+  // Intentionally NOT reported to CallKit at DIAL time — see
+  // REPORT_OUTGOING_TO_CALLKIT above (unfulfilled CXStartCallAction during the ring
+  // → CallKit ends the WebRTC call mid-connect). The connected call is registered
+  // later via reportOutgoingConnected().
   if (!isAvailable() || !REPORT_OUTGOING_TO_CALLKIT) return;
   try {
     RNCallKeep.startCall(uuidForCall(callId), String(handle || name || 'call'), name || 'Call', 'generic', !!hasVideo);
+  } catch (_) { /* no-op */ }
+};
+
+/**
+ * Register an OUTGOING call with CallKit ONCE IT HAS CONNECTED (remote media
+ * arrived). Gives the caller the native ongoing-call presence — green status-bar
+ * notch / Dynamic Island indicator, background keep-alive, and hang-up from the
+ * lock screen — WITHOUT the dial-time CXStartCallAction-timeout drop, because the
+ * whole ringing window had no CallKit call. We create the call and report it
+ * connected+active in the same tick so it never sits in an unfulfilled
+ * "connecting" state. iOS only; idempotent per callId (startCall on an existing
+ * uuid is a no-op on the native side); safe no-op when CallKit is unavailable.
+ */
+export const reportOutgoingConnected = (callId, handle, name, hasVideo = false) => {
+  if (!isAvailable() || !REPORT_OUTGOING_CONNECTED_TO_CALLKIT || Platform.OS !== 'ios') return;
+  const key = String(callId || '');
+  if (!key || outgoingReported.has(key)) return; // once per call — repeated stream events no-op
+  outgoingReported.add(key);
+  const uuid = uuidForCall(callId);
+  try {
+    RNCallKeep.startCall(uuid, String(handle || name || 'call'), name || 'Call', 'generic', !!hasVideo);
+    if (typeof RNCallKeep.reportConnectingOutgoingCallWithUUID === 'function') {
+      RNCallKeep.reportConnectingOutgoingCallWithUUID(uuid);
+    }
+    if (typeof RNCallKeep.reportConnectedOutgoingCallWithUUID === 'function') {
+      RNCallKeep.reportConnectedOutgoingCallWithUUID(uuid);
+    }
+    RNCallKeep.setCurrentCallActive(uuid);
   } catch (_) { /* no-op */ }
 };
 
@@ -164,7 +240,8 @@ export const endCall = (callId) => {
 
 /**
  * Register the OS-action listeners. `handlers` may include:
- *   onAnswer(callId), onEnd(callId), onToggleMute(callId, muted)
+ *   onAnswer(callId), onEnd(callId), onToggleMute(callId, muted),
+ *   onAudioSessionActivated(), onAudioSessionDeactivated()
  * Returns an unsubscribe function. Safe no-op when the native module is absent.
  */
 export const registerEvents = (handlers = {}) => {
@@ -172,10 +249,20 @@ export const registerEvents = (handlers = {}) => {
   const answer = ({ callUUID }) => handlers.onAnswer && handlers.onAnswer(callIdForUuid(callUUID));
   const end = ({ callUUID }) => handlers.onEnd && handlers.onEnd(callIdForUuid(callUUID));
   const mute = ({ callUUID, muted }) => handlers.onToggleMute && handlers.onToggleMute(callIdForUuid(callUUID), muted);
+  // CallKit owns the process-global AVAudioSession. When a call is answered from a
+  // KILLED/LOCKED state, iOS DEACTIVATES whatever session we set up and activates
+  // its OWN, firing `didActivateAudioSession` — the ONLY moment WebRTC audio inside
+  // the WKWebView engine can legally start in the background. If we don't re-assert
+  // our play-and-record session here, a CallKit-answered call can connect SILENT
+  // (no in/out audio) until the app is foregrounded. These events carry no callUUID.
+  const audioOn = () => handlers.onAudioSessionActivated && handlers.onAudioSessionActivated();
+  const audioOff = () => handlers.onAudioSessionDeactivated && handlers.onAudioSessionDeactivated();
   try {
     RNCallKeep.addEventListener('answerCall', answer);
     RNCallKeep.addEventListener('endCall', end);
     RNCallKeep.addEventListener('didPerformSetMutedCallAction', mute);
+    RNCallKeep.addEventListener('didActivateAudioSession', audioOn);
+    RNCallKeep.addEventListener('didDeactivateAudioSession', audioOff);
     // Android: the user accepted from the native UI before JS came up.
     if (Platform.OS === 'android') {
       RNCallKeep.addEventListener('showIncomingCallUi', () => {});
@@ -186,6 +273,8 @@ export const registerEvents = (handlers = {}) => {
       RNCallKeep.removeEventListener('answerCall');
       RNCallKeep.removeEventListener('endCall');
       RNCallKeep.removeEventListener('didPerformSetMutedCallAction');
+      RNCallKeep.removeEventListener('didActivateAudioSession');
+      RNCallKeep.removeEventListener('didDeactivateAudioSession');
       if (Platform.OS === 'android') RNCallKeep.removeEventListener('showIncomingCallUi');
     } catch (_) { /* no-op */ }
   };
@@ -198,6 +287,7 @@ export default {
   registerCallUuid,
   displayIncomingCall,
   startOutgoingCall,
+  reportOutgoingConnected,
   setCurrentCallActive,
   setMuted,
   endCall,

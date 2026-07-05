@@ -169,7 +169,7 @@ export default function ChatHeaderPresence({
           >
             {displayName}
           </Text>
-          {isBroadcast && isVerified && (
+          {isVerified && (
             <Ionicons name="checkmark-circle" size={15} color={themeColor} style={{ marginLeft: 4 }} />
           )}
         </View>

@@ -1624,7 +1624,7 @@ export default function ChatList({ navigation }) {
         avatarColor={previewAvatarColor}
         isGroup={isPreviewGroup || isPreviewBroadcast}
         isBroadcast={isPreviewBroadcast}
-        isVerified={Boolean(selectedChatItem?.isVerified)}
+        isVerified={Boolean(selectedChatItem?.isVerified || selectedChatItem?.peerUser?.isVerified)}
         subtitle={isPreviewBroadcast ? 'Broadcast channel' : undefined}
         peerId={(isPreviewGroup || isPreviewBroadcast) ? null : (selectedChatItem?.peerUser?._id || selectedChatItem?.peerUserId || null)}
         onMessage={() => { if (selectedChatItem) openChat(selectedChatItem); closeProfilePreview(); }}

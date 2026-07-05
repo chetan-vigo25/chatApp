@@ -145,6 +145,12 @@ const nseInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
 <dict>
   <key>CFBundleDisplayName</key>
   <string>NotificationServiceExtension</string>
+  <!-- REQUIRED: names the extension's binary. Without it the built .appex has no
+       CFBundleExecutable and iOS refuses to install the host app ("has missing or
+       invalid CFBundleExecutable"). Xcode does NOT auto-inject it for a manual
+       INFOPLIST_FILE, so declare it explicitly. $(EXECUTABLE_NAME) → the product. -->
+  <key>CFBundleExecutable</key>
+  <string>$(EXECUTABLE_NAME)</string>
   <key>CFBundleIdentifier</key>
   <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -259,16 +265,45 @@ const withNSETarget = (config, appGroup) =>
       bs.CURRENT_PROJECT_VERSION = '1';
     }
 
-    // Make the app depend on + embed the extension.
+    // Make the app DEPEND on the extension. We deliberately do NOT add an explicit
+    // "Embed App Extensions" copy phase: node-xcode's addTarget() ALREADY creates a
+    // "Copy Files" phase (PlugIns / dstSubfolderSpec 13) in the app target and
+    // embeds the .appex into it for an 'app_extension' target (see
+    // xcode/lib/pbxProject.js addTarget, targetType === 'app_extension'). Adding a
+    // second embed phase made Xcode schedule TWO identical copy +
+    // ValidateEmbeddedBinary tasks for the same appex → "Unexpected duplicate
+    // tasks" (xcodebuild error 65). One embed (from addTarget) is all that's needed.
     const appTarget = proj.getFirstTarget().uuid;
     proj.addTargetDependency(appTarget, [target.uuid]);
-    proj.addBuildPhase(
-      [`${NSE_TARGET_NAME}.appex`],
-      'PBXCopyFilesBuildPhase',
-      'Embed App Extensions',
-      appTarget,
-      'app_extension',
-    );
+
+    // Break the Xcode 15/16 "Cycle inside <app>; building could produce unreliable
+    // results" error. node-xcode's addTarget() appends the app-extension embed
+    // phase ("Copy Files" → PlugIns) as the LAST build phase — AFTER the
+    // "[CP-User] [RNFB] Core Configuration" script phase, which declares the app
+    // Info.plist as an input and rewrites it (PlistBuddy). Xcode then sees a cycle:
+    // embed appex → (runs after) RNFB script → Info.plist → ExtractAppIntentsMetadata
+    // → (depends on) embed appex. The .appex is produced by the NSE target
+    // dependency added just above, so the embed can run at ANY position and code
+    // signing still happens last — moving the embed phase to the FRONT removes the
+    // embed→RNFB edge and breaks the cycle. Guarded so a node-xcode internal-shape
+    // change can never fail prebuild (the checked-in project keeps the same order).
+    try {
+      const appObj = proj.pbxNativeTargetSection()[appTarget];
+      const phases = (appObj && appObj.buildPhases) || [];
+      const copySection = proj.hash.project.objects.PBXCopyFilesBuildPhase || {};
+      const embedIdx = phases.findIndex((ph) => {
+        const obj = copySection[ph.value];
+        return obj && obj.isa === 'PBXCopyFilesBuildPhase'
+          && String(obj.dstSubfolderSpec) === '13'
+          && (obj.files || []).some((f) => String(f.comment || '').includes(`${NSE_TARGET_NAME}.appex`));
+      });
+      if (embedIdx > 1) {
+        const [embed] = phases.splice(embedIdx, 1);
+        phases.splice(1, 0, embed); // before Sources / RNFB script
+      }
+    } catch (e) {
+      // Non-fatal: leave phase order as-is; the committed project already has it.
+    }
 
     return cfg;
   });

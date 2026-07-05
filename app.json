@@ -67,7 +67,8 @@
         "android.permission.USE_FULL_SCREEN_INTENT",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_MICROPHONE",
-        "android.permission.FOREGROUND_SERVICE_CAMERA"
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
       ],
       "notification": {
         "icon": "./assets/ic_notification.png",
@@ -126,7 +127,8 @@
       "./plugins/withNotifeeMavenRepo",
       "./plugins/withFirebaseNotificationMeta",
       "./plugins/withNotificationServiceExtension",
-      "./plugins/withIosVoip"
+      "./plugins/withIosVoip",
+      "./plugins/withFmtConstevalFix"
     ],
     "extra": {
       "eas": {

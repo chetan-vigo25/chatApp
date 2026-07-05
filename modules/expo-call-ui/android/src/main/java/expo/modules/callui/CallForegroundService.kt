@@ -37,6 +37,9 @@ import androidx.core.content.ContextCompat
  * up), so the Android 12+ background-FGS-start restriction does not apply.
  */
 class CallForegroundService : Service() {
+  // Remembered so onTaskRemoved (app swiped away) can signal a hangup for THIS call.
+  private var currentCallId: String? = null
+
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -51,14 +54,18 @@ class CallForegroundService : Service() {
       stopSelf()
       return START_NOT_STICKY
     }
+    currentCallId = callId
     val name = intent.getStringExtra(EXTRA_CALLER_NAME)?.takeIf { it.isNotBlank() } ?: "Ongoing call"
     val image = intent.getStringExtra(EXTRA_CALLER_IMAGE)
     val type = intent.getStringExtra(EXTRA_CALL_TYPE) ?: "audio"
     val isVideo = type == "video"
     // Wall-clock ms when the call was answered; 0 → count from now.
     val startedAtMs = intent.getLongExtra(EXTRA_STARTED_AT, 0L)
+    // "ringing" = outgoing call still dialing (no answer yet) → show "Calling…"
+    // without a duration timer. "ongoing" = connected → live duration chronometer.
+    val ringing = (intent.getStringExtra(EXTRA_STATE) ?: "ongoing") == "ringing"
 
-    val notification = buildNotification(callId, name, image, isVideo, startedAtMs)
+    val notification = buildNotification(callId, name, image, isVideo, startedAtMs, ringing)
     val promoted = startForegroundWithType(notification, isVideo)
     if (!promoted) {
       // Could not become a foreground service (e.g. a microphone-type FGS start
@@ -74,7 +81,8 @@ class CallForegroundService : Service() {
   }
 
   private fun buildNotification(
-    callId: String, name: String, image: String?, isVideo: Boolean, startedAtMs: Long
+    callId: String, name: String, image: String?, isVideo: Boolean, startedAtMs: Long,
+    ringing: Boolean = false
   ): Notification {
     ensureOngoingChannel(this)
 
@@ -101,10 +109,17 @@ class CallForegroundService : Service() {
     var smallIcon = resources.getIdentifier("notification_icon", "drawable", packageName)
     if (smallIcon == 0) smallIcon = android.R.drawable.sym_action_call
 
+    val contentText = when {
+      ringing && isVideo -> "Calling… (video)"
+      ringing -> "Calling…"
+      isVideo -> "Ongoing video call"
+      else -> "Ongoing voice call"
+    }
+
     val builder = NotificationCompat.Builder(this, ONGOING_CHANNEL_ID)
       .setSmallIcon(smallIcon)
       .setContentTitle(name)
-      .setContentText(if (isVideo) "Ongoing video call" else "Ongoing voice call")
+      .setContentText(contentText)
       .setCategory(NotificationCompat.CATEGORY_CALL)
       .setOngoing(true)
       .setAutoCancel(false)
@@ -115,12 +130,18 @@ class CallForegroundService : Service() {
           .setIsVideo(isVideo)
       )
 
-    // Live duration chronometer. setWhen to the answer time + usesChronometer
-    // makes the system render a counting-up timer; CallStyle surfaces it as the
-    // call duration. ALWAYS set (fall back to "now" when the answer time is
-    // unknown) so the status-bar/shade notification shows a running timer.
-    val whenBase = if (startedAtMs > 0) startedAtMs else System.currentTimeMillis()
-    builder.setWhen(whenBase).setUsesChronometer(true).setShowWhen(true)
+    if (ringing) {
+      // No duration timer while still dialing — a counting-up "0:03" during the
+      // ring reads as if the call is already connected.
+      builder.setShowWhen(false).setUsesChronometer(false)
+    } else {
+      // Live duration chronometer. setWhen to the answer time + usesChronometer
+      // makes the system render a counting-up timer; CallStyle surfaces it as the
+      // call duration. ALWAYS set (fall back to "now" when the answer time is
+      // unknown) so the status-bar/shade notification shows a running timer.
+      val whenBase = if (startedAtMs > 0) startedAtMs else System.currentTimeMillis()
+      builder.setWhen(whenBase).setUsesChronometer(true).setShowWhen(true)
+    }
 
     if (!image.isNullOrBlank()) {
       // Avatar is best-effort: a remote URL can't be loaded synchronously here,
@@ -173,6 +194,26 @@ class CallForegroundService : Service() {
     try { NotificationManagerCompat.from(this).cancel(ONGOING_NOTIF_ID) } catch (_: Exception) { /* */ }
   }
 
+  // ── App swiped away from Recents during an ACTIVE call ──
+  // The call media lives in the app's WebView, which dies with the task, so the
+  // call itself cannot survive a kill (that needs native WebRTC). What we CAN do
+  // is fail gracefully: best-effort signal a hangup into JS while the process is
+  // briefly still alive — CallProvider's HANGUP handler emits `call:end` so the
+  // OTHER party isn't left frozen on a dead call — then guarantee the persistent
+  // "ongoing call" notification is cleared so no ghost lingers for a call that no
+  // longer exists. (The reliable peer-cleanup is the backend treating this
+  // device's socket disconnect as call-end; this is the client's best effort.)
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    try {
+      currentCallId?.takeIf { it.isNotBlank() }?.let {
+        CallUiBus.dispatch(mapOf("action" to "hangup", "callId" to it))
+      }
+    } catch (_: Exception) { /* JS bridge may already be tearing down */ }
+    stopForegroundCompat()
+    stopSelf()
+    super.onTaskRemoved(rootIntent)
+  }
+
   override fun onDestroy() {
     // Belt-and-braces: ensure the ongoing notification is gone when the service
     // is torn down via stopService() (no ACTION_STOP round-trip).
@@ -204,7 +245,8 @@ class CallForegroundService : Service() {
     }
 
     fun start(
-      ctx: Context, callId: String, name: String?, image: String?, type: String?, startedAtMs: Long
+      ctx: Context, callId: String, name: String?, image: String?, type: String?, startedAtMs: Long,
+      state: String? = "ongoing"
     ) {
       val i = Intent(ctx, CallForegroundService::class.java).apply {
         putExtra(EXTRA_CALL_ID, callId)
@@ -212,6 +254,7 @@ class CallForegroundService : Service() {
         putExtra(EXTRA_CALLER_IMAGE, image)
         putExtra(EXTRA_CALL_TYPE, type ?: "audio")
         putExtra(EXTRA_STARTED_AT, startedAtMs)
+        putExtra(EXTRA_STATE, state ?: "ongoing")
       }
       try { ContextCompat.startForegroundService(ctx, i) } catch (_: Exception) { /* */ }
     }

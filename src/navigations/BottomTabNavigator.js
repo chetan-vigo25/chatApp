@@ -26,6 +26,7 @@ import CallsScreen from '../screens/calls/CallsScreen';
 import BottomTabBar from '../components/BottomTabBar';
 import { useTheme } from '../contexts/ThemeContext';
 import { useRealtimeChat } from '../contexts/RealtimeChatContext';
+import { useMissedCallBadge, startMissedCallTracking } from '../calls/services/missedCallBadge';
 
 const SCREEN_W = Dimensions.get('window').width;
 
@@ -42,6 +43,12 @@ const COMMIT_VELOCITY = 520;
 function CustomTabBar({ state, navigation }) {
   const { theme, isDarkMode } = useTheme();
   const { state: realtimeState } = useRealtimeChat();
+  const missedCallCount = useMissedCallBadge();
+
+  // Track unseen missed calls for the Calls-tab badge for as long as the tab bar
+  // is mounted (i.e. the whole time the user is inside the app shell). Cleared
+  // when the Calls tab gains focus (CallsScreen).
+  useEffect(() => startMissedCallTracking(), []);
 
   // Order MUST match the <Tab.Screen> registration order below — `state.index`
   // is the position of the active route in that list.
@@ -78,6 +85,7 @@ function CustomTabBar({ state, navigation }) {
       theme={theme}
       isDarkMode={isDarkMode}
       unreadCount={Number(realtimeState?.totalUnread || 0)}
+      missedCallCount={Number(missedCallCount || 0)}
     />
   );
 }

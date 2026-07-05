@@ -44,12 +44,26 @@ const ChatCard = ({
   const isLastMsgDeleted = item?.lastMessageDisplay?.isDeleted || item?.lastMessage?.isDeleted;
   const isBroadcast = Boolean(item?.chatType === 'broadcast' || item?.isBroadcast);
   const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
-  const isVerified = Boolean(item?.isVerified);
+  // Verified badge: broadcast channels + admin-verified peer users. `isVerified`
+  // rides at the top level (REST getChatList / realtime buildChatListItem); we
+  // also fall back to peerUser.isVerified in case a normalization path kept it
+  // nested. Groups never carry the flag.
+  const isVerified = Boolean(item?.isVerified || item?.peerUser?.isVerified);
+  // Half-hydrated rows (peerUser seeded with just an _id before the resolved
+  // chat:list:update lands) must degrade to the peer's number / flat chatName —
+  // never to the literal "Unknown" — per the display rule saved-name > number >
+  // profile name. `mobile` may be an object ({code, number}) or a flat string.
+  const peerMobile =
+    item?.mobileNumber
+    || item?.peerUser?.mobileNumber
+    || (item?.peerUser?.mobile?.number
+      ? `${item.peerUser.mobile.code || ''}${item.peerUser.mobile.number}`
+      : (typeof item?.peerUser?.mobile === 'string' ? item.peerUser.mobile : ''));
   const peerName = isBroadcast
     ? (item?.chatName || item?.broadcastChannel?.name || 'Channel')
     : isGroup
       ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
-      : (item?.peerUser?.fullName || item?.peerUser?.userName || 'Unknown');
+      : (item?.peerUser?.fullName || item?.chatName || peerMobile || item?.peerUser?.userName || 'Unknown');
   // Broadcast channels render their logo just like a group avatar.
   const groupAvatarUri = isGroup || isBroadcast
     ? (item?.chatAvatar || item?.group?.avatar || item?.groupAvatar)

@@ -34,14 +34,54 @@ const {
   withEntitlementsPlist,
   withInfoPlist,
   withAppDelegate,
+  withXcodeProject,
 } = require('@expo/config-plugins');
- 
-const APS_ENVIRONMENT = 'development'; // EAS swaps to 'production' for release builds
- 
-// ---- 1. entitlement ----
+
+// The `aps-environment` entitlement MUST match the APNs environment the build
+// actually talks to, or push/VoIP tokens fail with BadDeviceToken:
+//   - App Store / TestFlight archive (Release) → 'production' (api.push.apple.com)
+//   - local run / dev testing (Debug)          → 'development' (sandbox)
+//
+// This project is built by ARCHIVING IN XCODE (not EAS), and Debug + Release
+// share ONE entitlements file — so we can't pick a value at prebuild time. Instead
+// the entitlement value is the Xcode build-setting variable `$(APS_ENVIRONMENT)`,
+// and we set that variable PER BUILD CONFIGURATION on the app target below. Result:
+// a plain Xcode "Archive" (Release) automatically ships `production`, while a
+// local Debug run stays `development` — zero manual toggling, no way to
+// accidentally ship a sandbox build to the App Store.
+const APS_ENVIRONMENT_BY_CONFIG = { Debug: 'development', Release: 'production' };
+
+// ---- 1a. entitlement → resolve from the build-setting variable ----
 const withApsEntitlement = (config) =>
   withEntitlementsPlist(config, (cfg) => {
-    cfg.modResults['aps-environment'] = APS_ENVIRONMENT;
+    cfg.modResults['aps-environment'] = '$(APS_ENVIRONMENT)';
+    return cfg;
+  });
+
+// ---- 1b. define APS_ENVIRONMENT per configuration on the app target only ----
+const withApsBuildSetting = (config) =>
+  withXcodeProject(config, (cfg) => {
+    const project = cfg.modResults;
+    const buildConfigs = project.pbxXCBuildConfigurationSection();
+    Object.keys(buildConfigs).forEach((key) => {
+      const bc = buildConfigs[key];
+      if (!bc || typeof bc !== 'object' || !bc.buildSettings) return;
+      const ent = bc.buildSettings.CODE_SIGN_ENTITLEMENTS;
+      // Identify the MAIN APP target by its entitlements path — skip the
+      // NotificationServiceExtension and Pods targets (they must not get this).
+      // NOTE: match by the ".entitlements" suffix (excluding the extension) rather
+      // than a hard-coded app name — the app has been renamed before (VibeConnect →
+      // TalksTry) and a name-specific check silently stopped setting APS_ENVIRONMENT,
+      // which shipped an EMPTY aps-environment entitlement and killed APNs/VoIP
+      // registration ("no valid aps-environment entitlement string found").
+      if (
+        ent &&
+        String(ent).endsWith('.entitlements') &&
+        !String(ent).includes('NotificationServiceExtension')
+      ) {
+        bc.buildSettings.APS_ENVIRONMENT = APS_ENVIRONMENT_BY_CONFIG[bc.name] || 'development';
+      }
+    });
     return cfg;
   });
  
@@ -155,4 +195,6 @@ const withVoipAppDelegate = (config) =>
   });
  
 module.exports = (config) =>
-  withVoipAppDelegate(withVoipBackgroundModes(withApsEntitlement(config)));
+  withVoipAppDelegate(
+    withVoipBackgroundModes(withApsBuildSetting(withApsEntitlement(config))),
+  );
