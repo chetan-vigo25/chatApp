@@ -3,8 +3,15 @@ import {
   View, Text, ScrollView, Animated, TouchableOpacity, Image,
   ActivityIndicator, Alert, StyleSheet, TextInput, Platform, KeyboardAvoidingView,
 } from "react-native";
+import { useSelector } from "react-redux";
 import { useTheme } from "../../contexts/ThemeContext";
 import countryCodes from '../../jsonFile/countryCodes.json';
+
+// The user's own registered dial code (e.g. "+91") is stored on their profile as
+// mobile.code and matches a countryCodes[].code exactly, so we can default the
+// picker to the country they signed up from — i.e. the country they use the app in.
+const matchCountryByDialCode = (dialCode) =>
+  (dialCode ? countryCodes.find((c) => c.code === dialCode) : null) || null;
 import CountryCodeContact from "../../components/CountryCodeContact";
 import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
 import { getStoredSession } from "../../services/sessionManager";
@@ -29,7 +36,26 @@ export default function AddNewContact({ navigation }) {
     const [phoneFocused, setPhoneFocused] = useState(false);
     const [username, setUsername] = useState('');
     const [usernameFocused, setUsernameFocused] = useState(false);
-    const [selectedCountry, setSelectedCountry] = useState(countryCodes[0]);
+    // Default the country to the one the CURRENT user registered with (their
+    // profile mobile.code), so it reflects the country they use the app in — not a
+    // hard-coded India. Falls back to the first catalogue entry until the profile
+    // is available. `userPickedCountry` guards against overriding a manual choice.
+    const myDialCode = useSelector((state) => state.profile?.profileData?.mobile?.code) || null;
+    const userPickedCountry = useRef(false);
+    const [selectedCountry, setSelectedCountry] = useState(
+      () => matchCountryByDialCode(myDialCode) || countryCodes[0]
+    );
+
+    // Adopt the user's country once the profile loads (New Contact may open before
+    // the profile fetch finishes). Never overrides a country the user picked.
+    useEffect(() => {
+      if (userPickedCountry.current) return;
+      const match = matchCountryByDialCode(myDialCode);
+      if (match && match.code !== selectedCountry?.code) {
+        setSelectedCountry(match);
+      }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [myDialCode]);
     const [isSearching, setIsSearching] = useState(false);
     const [searchResult, setSearchResult] = useState(null);
 
@@ -69,6 +95,7 @@ export default function AddNewContact({ navigation }) {
     }, []);
 
     const handleCountrySelect = (country) => {
+      userPickedCountry.current = true;
       setSelectedCountry(country);
       // Trim a now-too-long number when switching to a shorter-format country.
       const { max } = getPhoneRule(country?.code);

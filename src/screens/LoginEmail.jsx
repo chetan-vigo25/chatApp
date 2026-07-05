@@ -15,8 +15,9 @@ import { performSessionReset, saveAuthSession } from "../services/sessionManager
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { APP_TAG_NAME } from '@env';
 
-// Minimum length for the system-generated username (e.g. "ballu1").
-const MIN_USERNAME_LENGTH = 3;
+// Password length bounds for the sign-in field.
+const MIN_PASSWORD_LENGTH = 4;
+const MAX_PASSWORD_LENGTH = 10;
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -36,9 +37,9 @@ export default function LoginEmail({ navigation }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
-  const [usernameTouched, setUsernameTouched] = useState(false);
   const [usernameFocused, setUsernameFocused] = useState(false);
   const [passwordFocused, setPasswordFocused] = useState(false);
+  const [passwordTouched, setPasswordTouched] = useState(false);
   const [fcmToken, setFcmToken] = useState(null);
   const isSubmitting = isLoading;
 
@@ -50,9 +51,20 @@ export default function LoginEmail({ navigation }) {
     ]).start();
   }, []);
 
-  const isUsernameValid = username.trim().length >= MIN_USERNAME_LENGTH;
-  const showUsernameError = usernameTouched && username.length > 0 && !isUsernameValid;
-  const isFormValid = isUsernameValid && password.length >= 1;
+  // Username: just required — no length rule.
+  const isUsernameValid = username.trim().length > 0;
+
+  // Password: must be MIN_PASSWORD_LENGTH–MAX_PASSWORD_LENGTH characters.
+  const passwordLen = password.length;
+  const passwordTooLong = passwordLen > MAX_PASSWORD_LENGTH;
+  const isPasswordValid = passwordLen >= MIN_PASSWORD_LENGTH && passwordLen <= MAX_PASSWORD_LENGTH;
+  // "Too short" nags only after the field is blurred; "too long" shows immediately
+  // (it's a definite error the moment they exceed the max).
+  const showPasswordError = password.length > 0 && !isPasswordValid && (passwordTouched || passwordTooLong);
+  const passwordErrorText = passwordTooLong
+    ? `Password must be at most ${MAX_PASSWORD_LENGTH} characters`
+    : `Password must be at least ${MIN_PASSWORD_LENGTH} characters`;
+  const isFormValid = isUsernameValid && isPasswordValid;
 
   const handleSubmit = async () => {
     if (!isFormValid || isLoading) return;
@@ -126,8 +138,8 @@ export default function LoginEmail({ navigation }) {
   const disabledBtn = isDarkMode ? '#1F2C33' : '#D8DEE2';
   const disabledTxt = isDarkMode ? '#54656F' : '#9AA6AE';
 
-  const usernameUnderline = showUsernameError ? errorColor : (usernameFocused ? accent : underlineIdle);
-  const passwordUnderline = passwordFocused ? accent : underlineIdle;
+  const usernameUnderline = usernameFocused ? accent : underlineIdle;
+  const passwordUnderline = showPasswordError ? errorColor : (passwordFocused ? accent : underlineIdle);
 
   return (
     <View style={[styles.root, { backgroundColor: bg }]}>
@@ -157,15 +169,15 @@ export default function LoginEmail({ navigation }) {
             {/* Username */}
             <Text style={[styles.label, { color: secondaryText }]}>USERNAME</Text>
             <View style={[styles.inputRow, { borderBottomColor: usernameUnderline }]}>
-              <Ionicons name="person-outline" size={20} color={showUsernameError ? errorColor : (usernameFocused ? accent : placeholderText)} style={styles.inputIcon} />
+              <Ionicons name="person-outline" size={20} color={usernameFocused ? accent : placeholderText} style={styles.inputIcon} />
               <TextInput
                 style={[styles.input, { color: primaryText }]}
-                placeholder="UserName"
+                placeholder="Username"
                 placeholderTextColor={placeholderText}
                 value={username}
                 onChangeText={setUsername}
                 onFocus={() => setUsernameFocused(true)}
-                onBlur={() => { setUsernameTouched(true); setUsernameFocused(false); }}
+                onBlur={() => setUsernameFocused(false)}
                 autoCapitalize="none"
                 autoCorrect={false}
                 autoComplete="username"
@@ -173,25 +185,22 @@ export default function LoginEmail({ navigation }) {
                 returnKeyType="next"
               />
             </View>
-            {showUsernameError ? (
-              <View style={styles.errorRow}>
-                <Ionicons name="alert-circle" size={14} color={errorColor} />
-                <Text style={styles.errorText}>Username must be at least {MIN_USERNAME_LENGTH} characters</Text>
-              </View>
-            ) : null}
 
             {/* Password */}
             <Text style={[styles.label, { color: secondaryText, marginTop: 26 }]}>PASSWORD</Text>
             <View style={[styles.inputRow, { borderBottomColor: passwordUnderline }]}>
-              <Ionicons name="lock-closed-outline" size={20} color={passwordFocused ? accent : placeholderText} style={styles.inputIcon} />
+              <Ionicons name="lock-closed-outline" size={20} color={showPasswordError ? errorColor : (passwordFocused ? accent : placeholderText)} style={styles.inputIcon} />
               <TextInput
                 style={[styles.input, { color: primaryText }]}
                 placeholder="Enter your password"
                 placeholderTextColor={placeholderText}
                 value={password}
                 onChangeText={setPassword}
+                // Cap above the max so the user CAN exceed 10 and see the "too long"
+                // error, but can't type an unbounded string.
+                maxLength={MAX_PASSWORD_LENGTH + 10}
                 onFocus={() => setPasswordFocused(true)}
-                onBlur={() => setPasswordFocused(false)}
+                onBlur={() => { setPasswordTouched(true); setPasswordFocused(false); }}
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoCorrect={false}
@@ -208,6 +217,12 @@ export default function LoginEmail({ navigation }) {
                 <Ionicons name={showPassword ? "eye-off-outline" : "eye-outline"} size={22} color={placeholderText} />
               </TouchableOpacity>
             </View>
+            {showPasswordError ? (
+              <View style={styles.errorRow}>
+                <Ionicons name="alert-circle" size={14} color={errorColor} />
+                <Text style={styles.errorText}>{passwordErrorText}</Text>
+              </View>
+            ) : null}
           </Animated.View>
         </ScrollView>
 
