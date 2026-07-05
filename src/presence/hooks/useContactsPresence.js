@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { usePresenceStore } from '../store/PresenceContext';
 import * as socketService from '../services/presenceSocket.service';
 import { getStatusPriority } from '../services/lastSeenFormatter.service';
@@ -9,7 +9,11 @@ export default function useContactsPresence() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [sortCriteria, setSortCriteria] = useState('status');
 
-  const refresh = async () => {
+  // Memoized so consumers can safely put `refresh` in effect/callback dependency
+  // arrays. A new identity every render made NewCallScreen's useFocusEffect re-run
+  // on every render → loadRegistered() setState → re-render → "Maximum update depth
+  // exceeded". `actions` is stable (useMemo [] in PresenceContext), so this is too.
+  const refresh = useCallback(async () => {
     setIsRefreshing(true);
     try {
       const response = await socketService.emitGetContactsPresence();
@@ -37,7 +41,7 @@ export default function useContactsPresence() {
     } finally {
       setIsRefreshing(false);
     }
-  };
+  }, [actions]);
 
   const contacts = useMemo(() => {
     const entries = Object.keys(state.contactsPresence).map((userId) => ({
