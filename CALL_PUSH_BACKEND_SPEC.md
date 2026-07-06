@@ -1,9 +1,35 @@
 # Incoming-call push — backend spec
 
 For an incoming call to ring when the callee's app is **backgrounded, on another
-app, or killed**, the backend must send a **high-priority FCM data message** to
-the callee's CURRENT device token(s) the moment a call rings. A closed app cannot
-receive the socket `call:incoming`, so this push is the ONLY way to ring it.
+app, or killed**, the backend must send a high-priority push to the callee's
+CURRENT device token(s) the moment a call rings. A closed app cannot receive the
+socket `call:incoming`, so this push is the ONLY way to ring it.
+
+> ## 🚨🚨 CURRENT DECISION (2026-07-06) — iOS = send the VoIP push (native CallKit ring)
+>
+> The app has **CallKit ENABLED** (`IOS_CALLKIT_ENABLED=true`). The user wants the
+> native iOS full-screen + banner ring over the lock screen / when the app is
+> killed, and has accepted that call audio is broken on answer until the
+> native-WebRTC migration (CALL_NATIVE_WEBRTC_MIGRATION_PLAN.md) lands. So for now:
+>
+> **iOS incoming call → send the VoIP push ONLY** (see §"iOS incoming call —
+> PushKit"). It rings the native CallKit screen even killed/locked. Do **NOT** also
+> send the FCM/APNs **alert** push for an incoming call to iOS — that adds a
+> DUPLICATE "Incoming voice call" banner under the CallKit UI. On iOS the alert
+> push is for **missed/cancelled** only (`type:"call-missed"`).
+>
+> **Android incoming call → send the FCM data push below** (CallStyle/notifee
+> full-screen intent is its ring UI).
+>
+> | Callee platform | Incoming ring | Missed / cancelled |
+> |---|---|---|
+> | **iOS** (`apns`) | **VoIP push only** (§ PushKit), NO alert push | alert push, `type:"call-missed"` |
+> | **Android** (`fcm`) | **FCM data push** (below) | data push, `type:"call-missed"` |
+>
+> ⚠️ Send the iOS VoIP push on EVERY ring — do NOT gate on the callee looking
+> "online" (a swipe-killed app's socket looks connected 30-60s; gating skips the
+> push and the phone shows nothing). And use the correct APNs environment
+> (dev build = sandbox endpoint) + topic `com.chat.baatCheet.voip`.
 
 > ## ⚠️ Deregister tokens on logout (REQUIRED — prevents "logged-out device still rings")
 >
@@ -160,10 +186,33 @@ Payload (no `aps.alert`; CallKit renders the UI from these fields):
 
 ## Recommended ring flow (both platforms)
 
-On `call:ring`, for each offline/background callee, branch by device platform:
-- **iOS device** → send the **VoIP push** above to its `voipToken`.
-- **Android device** → send the **FCM data push** (top of this doc) to its FCM token.
-Both carry the same `callId` so foreground socket + push de-dupe on it.
+On `call:ring`, branch by device platform:
+- **iOS device** → send the **VoIP push** above to its `voipToken` — **on EVERY
+  ring, do NOT gate on the callee looking "online/offline"**. When the user
+  swipe-kills the app, the server-side socket can look connected for another
+  30–60s (stale, not yet timed out). Gating on presence routes the ring to that
+  dead socket and skips the push → the callee's phone shows nothing and only the
+  missed-call alert arrives later. This is the classic "first call after killing
+  the app doesn't ring; it rings again after the user reopens the app" bug.
+  Always-send is safe: if the app happens to be alive, CallKit is the intended
+  ring UI on iOS anyway (WhatsApp behaves the same) and the app de-dupes the
+  socket event against the push on `callId`.
+- **Android device** → send the **FCM data push** (top of this doc) to its FCM
+  token (also best sent on every ring for the same stale-socket reason; the app
+  de-dupes).
+
+## APNs environment (sandbox vs production) — silent-drop trap
+
+The `voipToken` a device registers is bound to the APNs environment of its build:
+- **Debug / dev build (Xcode run)** → `aps-environment: development` → push via
+  **`api.sandbox.push.apple.com`**.
+- **TestFlight / App Store archive** → `production` → **`api.push.apple.com`**.
+
+Sending a sandbox token to the production endpoint (or vice-versa) returns
+`BadDeviceToken` and the push silently never arrives — while message alert
+pushes may still work if they ride FCM. If dev-build testing never rings when
+killed, check the backend is hitting the **sandbox** APNs endpoint for that
+token (or log the APNs HTTP response; don't fire-and-forget).
 
 ---
 

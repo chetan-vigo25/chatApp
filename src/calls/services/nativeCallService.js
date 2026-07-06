@@ -60,19 +60,18 @@ const uuidv4 = () => {
 // Requires a PHYSICAL iPhone + a dev/EAS build (never Expo Go / simulator) AND the
 // backend actually sending the APNs VoIP push — without that push the CallKit
 // screen never appears (the AppDelegate path stays inert).
-// TEMPORARILY DISABLED — CallKit + the WebView WebRTC engine conflict on answer:
-// when an INCOMING call is answered via CallKit, iOS seizes the process-global
-// AVAudioSession away from the WKWebView engine, so the media never connects and
-// the call cuts on pickup — while CallKit still shows a phantom "running" call
-// (00:11) that lingers into the next call. OUTGOING calls are unaffected because
-// they never touch CallKit until connected (REPORT_OUTGOING_TO_CALLKIT=false),
-// which is exactly why outgoing works and incoming cuts. This surfaced when a
-// clean prebuild finally compiled react-native-callkeep into the build (before
-// that isAvailable() was false and incoming used the robust in-app UI). Until the
-// call media moves to native react-native-webrtc (which can share CallKit's audio
-// session), keep CallKit OFF so incoming calls use the same working in-app path as
-// outgoing. Flip back to true only alongside that native-WebRTC migration.
-const IOS_CALLKIT_ENABLED = false;
+// ENABLED — 2026-07-06, the user's DELIBERATE, INFORMED choice: they want the
+// native iOS full-screen + banner ring (over the lock screen / when the app is
+// killed) back, and ACCEPT that answering breaks call audio until the native-WebRTC
+// migration lands. KNOWN TRADEOFF (not a bug to "fix" by flipping this): CallKit +
+// the WKWebView WebRTC engine fight over the process-global AVAudioSession, so
+// answering a CallKit call cuts ALL audio (in + out, voice + video) — expo-av's
+// reassertCallAudio canNOT restart WebKit's internal audio unit. The permanent fix
+// is CALL_NATIVE_WEBRTC_MIGRATION_PLAN.md (react-native-webrtc owns RTCAudioSession
+// and CAN share CallKit's session). Requires the backend to send the iOS VoIP push
+// (see CALL_PUSH_BACKEND_SPEC.md). Do NOT "fix the silent audio" by disabling this
+// without asking the user — they knowingly picked the native ring over audio.
+const IOS_CALLKIT_ENABLED = true;
 
 // CallKit is scoped to the INCOMING ring only. We deliberately do NOT report
 // OUTGOING calls to CallKit AT DIAL TIME: RNCallKeep.startCall files a

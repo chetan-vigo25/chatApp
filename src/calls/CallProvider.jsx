@@ -1876,7 +1876,22 @@ export const CallProvider = ({ children }) => {
   const pullStillRingingInvites = useCallback(async () => {
     if (stateRef.current.status !== CALL_STATUS.IDLE) return;
     try {
-      const ack = await pullPendingCalls();
+      // RETRY (observed live): the pull fires the instant the socket connects,
+      // but the backend may not have finished binding this socket's session yet —
+      // the ACK comes back `{ok:false, error:'not authenticated'}` even though
+      // the very same socket receives user-targeted events (call:incoming)
+      // moments later. Without a retry, a cold-started app silently loses its
+      // one chance to recover a still-ringing invite. Retry a couple of times
+      // with backoff; a no-ack timeout resolves ok:true and stops the loop.
+      let ack = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (attempt) {
+          await new Promise((r) => setTimeout(r, 1200 * attempt));
+          if (stateRef.current.status !== CALL_STATUS.IDLE) return; // a real ring landed meanwhile
+        }
+        ack = await pullPendingCalls();
+        if (ack?.ok !== false) break; // success (or optimistic timeout) — done
+      }
       const calls = Array.isArray(ack?.calls) ? ack.calls : [];
       if (!calls.length) return;
       if (stateRef.current.status !== CALL_STATUS.IDLE) return; // a real ring landed meanwhile

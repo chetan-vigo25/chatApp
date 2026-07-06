@@ -6,6 +6,7 @@ import { setPushToken } from '../Redux/Services/Socket/socket';
 import { navigateToChat, getCurrentRouteSnapshot, getActiveChatFromRoute } from '../Redux/Services/navigationService';
 import { CALL_PUSH_EVENTS, isStaleCallPush } from './callEvents';
 import { displayIncomingCallNotifee, cancelIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
+import { isAvailable as isNativeCallKitAvailable } from '../calls/services/nativeCallService';
 import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
 import { buildNotificationModel } from './notificationModel';
 import { claimNotification } from './notificationDedupe';
@@ -190,6 +191,14 @@ export const setupCallNotificationCategory = async () => {
 // data-only call pushes). High-importance 'calls' channel + the Accept/Decline
 // category so the user can answer right from the notification.
 const presentIncomingCallNotification = async (data) => {
+  // iOS: skip this heads-up ONLY when CallKit is actually the ring UI (a VoIP push
+  // already drew the native CallKit screen) — otherwise this expo-notifications
+  // banner is a DUPLICATE sitting under the CallKit UI. But when CallKit is
+  // DISABLED (IOS_CALLKIT_ENABLED=false, e.g. because of the WebView-WebRTC audio
+  // conflict), this heads-up is the ONLY iOS incoming ring, so it MUST show —
+  // tapping it opens the app and the in-app UI + WebView audio take over.
+  // Gate on the live CallKit availability, not a blanket Platform check.
+  if (Platform.OS === 'ios' && isNativeCallKitAvailable()) return;
   try {
     await setupCallNotificationCategory();
     const isVideo = (data?.callType || data?.media) === 'video';

@@ -270,7 +270,6 @@ export default function ChatList({ navigation }) {
   const { startAudioCall, startVideoCall } = useCall();
 
   const [visible, setVisible] = useState(false);
-  const [menuKey, setMenuKey] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   // timeTick drives the 30s relative-time refresh. With memoized rows it must be
   // threaded into renderItem so visible rows re-render and recompute "Today" /
@@ -1317,9 +1316,8 @@ export default function ChatList({ navigation }) {
 
         <View style={styles.headerRight}>
           <Menu
-            key={menuKey}
             visible={visible}
-            onDismiss={() => { setVisible(false); setMenuKey((prev) => prev + 1); }}
+            onDismiss={() => setVisible(false)}
             contentStyle={[styles.menuContent, { backgroundColor: theme.colors.cardBackground }]}
             anchor={(
               <TouchableOpacity

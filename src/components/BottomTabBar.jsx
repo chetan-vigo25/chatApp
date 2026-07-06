@@ -55,7 +55,7 @@ function ProfileTabAvatar({ image, name, isActive, activeTint, inactiveTint }) {
       )}
     </View>
   );
-}
+}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
 
 export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode, unreadCount, missedCallCount = 0 }) {
   // The Settings tab renders the user's profile photo instead of the gear icon.
@@ -219,7 +219,7 @@ const styles = StyleSheet.create({
   avatarWrap: {
     width: 30,
     height: 30,
-    borderRadius: 50,
+    borderRadius: 100,
     overflow: 'hidden',
     alignItems: 'center',
     justifyContent: 'center',
@@ -228,6 +228,7 @@ const styles = StyleSheet.create({
   avatarImg: {
     width: '100%',
     height: '100%',
+    borderRadius: 100,
   },
   avatarFallback: {
     width: '100%',
