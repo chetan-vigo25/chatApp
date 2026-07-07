@@ -348,6 +348,7 @@ const tryRefreshEndpoint = async ({ endpoint, refreshToken, deviceId }) => {
 
 const refreshAccessTokenInternal = async ({ refreshToken, deviceId }) => {
   let lastError = null;
+  let sawAuthRejection = false;
 
   for (const endpoint of REFRESH_ENDPOINTS) {
     try {
@@ -369,10 +370,22 @@ const refreshAccessTokenInternal = async ({ refreshToken, deviceId }) => {
       }
     } catch (error) {
       lastError = error;
+      // A 401/403 from the refresh endpoint means the server EXPLICITLY rejected
+      // the refresh token → the session is genuinely dead. Anything else
+      // (no response / timeout / 5xx / a 404 wrong-path) is transient or a
+      // config blip and must NOT be treated as a real expiry — otherwise a flaky
+      // connection would log the user out on the very next request.
+      const status = error?.response?.status;
+      if (status === 401 || status === 403) {
+        sawAuthRejection = true;
+      }
     }
   }
 
-  throw lastError || new Error('Unable to refresh token');
+  const err = lastError || new Error('Unable to refresh token');
+  err.isAuthRejection = sawAuthRejection;
+  err.isTransient = !sawAuthRejection;
+  throw err;
 };
 
 export const refreshAccessToken = async ({ force = false } = {}) => {
@@ -382,7 +395,12 @@ export const refreshAccessToken = async ({ force = false } = {}) => {
 
   const session = await getStoredSession();
   if (!session.refreshToken || !session.deviceId) {
-    throw new Error('Missing refresh token or device ID');
+    // No credentials to refresh with → this can never recover on its own, so it
+    // IS a genuine end-of-session (unlike a transient network failure). Tag it
+    // so the caller cleanly signs the user out instead of looping on errors.
+    const err = new Error('Missing refresh token or device ID');
+    err.isAuthRejection = true;
+    throw err;
   }
 
   refreshPromise = refreshAccessTokenInternal({
