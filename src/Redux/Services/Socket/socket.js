@@ -274,26 +274,7 @@ const emitDeviceRegister = () => {
   // Send as soon as we have EITHER a regular push token or a VoIP token — the
   // VoIP token is what powers incoming-call CallKit pushes and must reach the
   // backend even if the standard APNs/FCM token hasn't arrived yet.
-  if (!socket || !socket.connected || !deviceId || (!pushToken && !voipToken)) {
-    // Dev visibility: a silent skip here means the backend never learns this
-    // device's push/VoIP token → killed-app calls can NEVER ring. Log why.
-    if (__DEV__) {
-      console.log('📲 device register SKIPPED', {
-        socketConnected: !!(socket && socket.connected),
-        hasDeviceId: !!deviceId,
-        hasPushToken: !!pushToken,
-        hasVoipToken: !!voipToken,
-      });
-    }
-    return;
-  }
-  if (__DEV__) {
-    console.log('📲 → notification:device:register', {
-      hasPushToken: !!pushToken,
-      hasVoipToken: !!voipToken,
-      voipTokenLen: voipToken ? voipToken.length : 0,
-    });
-  }
+  if (!socket || !socket.connected || !deviceId || (!pushToken && !voipToken)) return;
   socket.emit('notification:device:register', {
     deviceId,
     ...(pushToken ? { pushToken } : {}),
@@ -341,7 +322,6 @@ export const setVoipToken = (token) => {
   const next = token ? String(token) : '';
   if (next === voipToken) return;
   voipToken = next;
-  if (__DEV__) console.log('📞 VoIP (PushKit) token received', { len: next.length });
   emitDeviceRegister();
 };
 
@@ -445,9 +425,11 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
 
     const auth = await getAuthStorage();
     if (!auth?.refreshTokenHash || !auth?.deviceId) {
-      console.error('❌ Missing refreshTokenHash/deviceId for socket reauth');
-      await handleLogout(navigation);
-      throw new Error('Missing refresh credentials');
+      // Do NOT log out here — storage can be transiently unreadable and the
+      // existing access token may still be valid. Treat as a temporary failure
+      // so we retry later instead of wiping a live session.
+      console.warn('⚠️ Missing refreshTokenHash/deviceId for socket reauth (will retry, no logout)');
+      throw new Error('reauthentication temporary failure: missing refresh credentials');
     }
 
     const reauthPayload = {
@@ -457,8 +439,8 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
 
     const socketRef = socket;
     if (!socketRef) {
-      await handleLogout(navigation);
-      throw new Error('Socket not initialized for reauthentication');
+      // Transient: socket not built yet. Retry later, never log out.
+      throw new Error('reauthentication temporary failure: socket not initialized');
     }
 
     let lastError = null;
@@ -501,7 +483,9 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
             });
 
             if (response?.status !== true) {
-              finalize(createAuthRejectedError(response?.message || 'Reauthentication rejected by server'));
+              // Treat as a temporary/retryable failure — never a logout. The
+              // in-loop retry runs, and if exhausted the session is preserved.
+              finalize(new Error(`reauthentication temporary failure: ${response?.message || 'reauth rejected'}`));
               return;
             }
 
@@ -511,20 +495,20 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
           };
 
           // The server replies to a REJECTED reauth with a dedicated
-          // `reauthentication_failed` event (not on `reauthenticated`). Without
-          // handling it the attempt just waits out REAUTH_TIMEOUT_MS and retries
-          // 3× — surfacing a misleading "reauthentication timeout". Settle now:
-          // fatal auth codes (bad/expired refresh token, device mismatch) →
-          // log out; system/timeout codes (retryable) → let the retry loop run.
+          // `reauthentication_failed` event (not on `reauthenticated`).
+          // POLICY: a reauth failure must NEVER log the user out on its own. A
+          // logged-in session stays logged in until the user explicitly logs out
+          // (or the server sends an explicit terminal event — force_logout /
+          // device:terminated / logout / account deleted-or-blocked). So we treat
+          // EVERY reauth failure as a temporary/retryable condition: the loop
+          // retries, and if it exhausts, the session is preserved and the next
+          // connect / foreground / token-failure event tries again.
           const onReauthFailed = (response) => {
             const data = response?.data || {};
             const code = String(data.code || '');
-            const serverMessage = data.message || response?.message || 'Reauthentication rejected by server';
-            const retryable = data.retryable === true && (code === 'REAUTH_TIMEOUT' || code === 'REAUTH_ERROR');
-            console.warn('📥 reauthentication_failed received', { code, retryable, attempt });
-            finalize(retryable
-              ? new Error(`reauthentication temporary failure: ${serverMessage}`)
-              : createAuthRejectedError(serverMessage));
+            const serverMessage = data.message || response?.message || 'Reauthentication temporarily failed';
+            console.warn('📥 reauthentication_failed received (will retry, no logout)', { code, attempt });
+            finalize(new Error(`reauthentication temporary failure: ${serverMessage}`));
           };
 
           const onConnectError = (error) => {
@@ -616,19 +600,20 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
     flushPendingEmitQueue();
   })()
     .catch(async (error) => {
-      // Handled gracefully below (temporary failure → retry/await; auth reject →
-      // logout). Log-level keeps LogBox from flagging a routine reauth miss.
-      console.log('❌ socket reauthentication failed:', error?.message || error);
+      // POLICY: a reauth failure NEVER logs the user out. Whatever went wrong
+      // (rejected token, timeout, network, missing creds) is treated as a
+      // recoverable/temporary state — the session is preserved locally and the
+      // next connect / foreground / token-failure event retries reauth. Only an
+      // explicit terminal server event (force_logout / device:terminated /
+      // logout / account deleted-or-blocked) or the user's own logout button
+      // ends the session. Log-level keeps LogBox from flagging a routine miss.
+      console.log('❌ socket reauthentication failed (kept logged in, will retry):', error?.message || error);
 
-      if (error?.isAuthRejected || error?.code === 'REAUTH_REJECTED' || error?.message === 'Missing refresh credentials') {
-        await handleLogout(navigation);
-      } else {
-        updateSocketState({
-          status: 'reauth_temporary_failure',
-          connected: !!socket?.connected,
-          lastError: error?.message || 'reauth_temporary_failure',
-        });
-      }
+      updateSocketState({
+        status: 'reauth_temporary_failure',
+        connected: !!socket?.connected,
+        lastError: error?.message || 'reauth_temporary_failure',
+      });
 
       throw error;
     })
@@ -805,8 +790,11 @@ const attachCoreSocketListeners = (navigation) => {
     }
 
     if (response?.status === false) {
-      console.log('❌ reauthenticated failure', { message: response?.message });
-      await handleLogout(navigation);
+      // Do NOT log out on a stray/unsolicited reauth-failure frame — attempt a
+      // fresh reauth instead. A live session must never be ended by anything
+      // other than the user's own logout or an explicit terminal event.
+      console.log('❌ unsolicited reauthenticated failure — retrying reauth (no logout)', { message: response?.message });
+      requestSocketReauthentication('unsolicited_reauth_failure', navigation).catch(() => {});
     }
   });
 
@@ -1024,7 +1012,11 @@ export const initSocket = async (deviceInfo, navigation) => {
     const auth = await getAuthStorage();
 
     if (!auth?.accessToken || !auth?.deviceId) {
-      await handleLogout(navigation);
+      // Do NOT log out here — a transient storage-read miss (racing a concurrent
+      // write) must not wipe a live session. Just skip socket init; a later
+      // foreground/checkLoginStatus retries, and AuthContext's own token check
+      // governs whether the login screen is actually shown.
+      console.warn('⚠️ initSocket: missing accessToken/deviceId — skipping init (no logout)');
       return null;
     }
 

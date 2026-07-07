@@ -1774,6 +1774,19 @@ export const CallProvider = ({ children }) => {
     // time). cancel-all avoids missing it when the posted id differs from the
     // live state id.
     cancelAllIncomingCallNotifee();
+    // CRITICAL de-dup: converge on the SAME CallKit UUID the native iOS VoIP push
+    // uses. The backend mints one RFC4122 `uuid` per call; the AppDelegate reports
+    // CallKit with THAT uuid, while this JS socket path would otherwise mint its
+    // OWN uuid for the `sig_..._<ms>` callId → CallKit sees TWO distinct calls for
+    // one logical call (the duplicate incoming banner, and a leftover CallKit call
+    // that lingers during/after an answered call). Binding callId→uuid HERE, before
+    // we report, makes both paths share one UUID so CallKit collapses them into a
+    // single call — and end/decline dismisses the exact call the native side put up.
+    // No-op when the payload carries no uuid (older backend) → zero behaviour change.
+    const backendCallUuid = payload?.uuid || payload?.callUuid || payload?.callKitUuid || null;
+    if (backendCallUuid && payload?.callId) {
+      nativeCall.registerCallUuid(payload.callId, backendCallUuid);
+    }
     // iOS CallKit: report the incoming call so the native call screen rings (also
     // when foreground). Skipped when a VoIP push already reported it (opts.skip
     // NativeUi) to avoid a duplicate CallKit call. No-op on Android (CallKeep is

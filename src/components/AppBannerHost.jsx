@@ -30,6 +30,9 @@ try {
 }
 
 const AUTO_DISMISS_MS = 4000;
+// Absolute upper bound a banner may stay visible, regardless of interaction /
+// dropped timers. Pure safety net — normal dismissal happens at AUTO_DISMISS_MS.
+const MAX_VISIBLE_MS = 12000;
 const ATTACH_RETRY_MS = 800;
 const DND_KEYS = ['do_not_disturb', 'dnd_enabled', 'notifications_dnd_enabled'];
 
@@ -123,6 +126,12 @@ export default function WhatsAppBannerHost() {
   const dragY = useRef(new Animated.Value(0)).current;
   const autoDismissRef = useRef(null);
   const attachTimerRef = useRef(null);
+  // Backstops so a banner can NEVER get stuck on screen (the "K + blur card on
+  // every screen until restart" bug): a guaranteed fallback for the exit
+  // animation's dropped completion callback, and an absolute max-visible cap.
+  const dismissFallbackRef = useRef(null);
+  const maxVisibleRef = useRef(null);
+  const dismissCurrentRef = useRef(null);
   const queueRef = useRef([]);
   const currentRef = useRef(null);
   const listenerSocketRef = useRef(null);
@@ -170,6 +179,8 @@ export default function WhatsAppBannerHost() {
         soundRef.current.unloadAsync().catch(() => {});
         soundRef.current = null;
       }
+      if (dismissFallbackRef.current) { clearTimeout(dismissFallbackRef.current); dismissFallbackRef.current = null; }
+      if (maxVisibleRef.current) { clearTimeout(maxVisibleRef.current); maxVisibleRef.current = null; }
     };
   }, []);
 
@@ -249,6 +260,13 @@ export default function WhatsAppBannerHost() {
 
       currentRef.current = next;
       setBanner(next);
+      // Absolute backstop: force this banner away after MAX_VISIBLE_MS no matter
+      // what (a dropped onPressOut, a cleared auto-dismiss, a swallowed animation
+      // callback). Uses a ref to the latest dismissCurrent to avoid a dep cycle.
+      if (maxVisibleRef.current) clearTimeout(maxVisibleRef.current);
+      maxVisibleRef.current = setTimeout(() => {
+        if (currentRef.current) dismissCurrentRef.current?.('max_visible');
+      }, MAX_VISIBLE_MS);
       animateIn();
       return;
     }
@@ -256,11 +274,18 @@ export default function WhatsAppBannerHost() {
 
   const dismissCurrent = useCallback((reason = 'manual', onDone) => {
     clearAutoDismiss();
-    Animated.timing(translateY, {
-      toValue: -130,
-      duration: 180,
-      useNativeDriver: true,
-    }).start(() => {
+    if (maxVisibleRef.current) { clearTimeout(maxVisibleRef.current); maxVisibleRef.current = null; }
+    // The state reset MUST NOT depend solely on the native animation's completion
+    // callback — on iOS that callback can be dropped (app goes inactive/background
+    // mid-animation, or the animated node detaches), which left `banner` set and
+    // the blurred card stuck on every screen until an app restart. Run the reset
+    // through a guarded `finish()` invoked by BOTH the animation callback AND a
+    // guaranteed fallback timer, so whichever fires first clears the banner.
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (dismissFallbackRef.current) { clearTimeout(dismissFallbackRef.current); dismissFallbackRef.current = null; }
       dragY.setValue(0);
       currentRef.current = null;
       setBanner(null);
@@ -268,8 +293,21 @@ export default function WhatsAppBannerHost() {
       requestAnimationFrame(() => {
         showNext();
       });
-    });
+    };
+    Animated.timing(translateY, {
+      toValue: -130,
+      duration: 180,
+      useNativeDriver: true,
+    }).start(finish);
+    if (dismissFallbackRef.current) clearTimeout(dismissFallbackRef.current);
+    dismissFallbackRef.current = setTimeout(finish, 320);
   }, [clearAutoDismiss, dragY, showNext, translateY]);
+
+  // Keep a live ref to dismissCurrent so backstop timers (armed in showNext) can
+  // call the latest version without creating a useCallback dependency cycle.
+  useEffect(() => {
+    dismissCurrentRef.current = dismissCurrent;
+  }, [dismissCurrent]);
 
   // Is this chat currently muted FOR THIS USER? Checks the in-memory chatMap
   // first (cheap, kept fresh by mute:updated), then falls back to SQLite. A null
@@ -482,7 +520,20 @@ export default function WhatsAppBannerHost() {
     const onAppState = (next) => {
       appStateRef.current = next;
       if (next !== 'active') {
+        // Hard-clear any visible banner on leaving the foreground. A transient
+        // message banner must never survive a background→foreground cycle: the
+        // exit-animation callback that normally clears it can be dropped while
+        // backgrounding, which is exactly what left the blurred "K" card stuck on
+        // every screen until a restart. Dropping a stale banner here is harmless.
         clearAutoDismiss();
+        if (dismissFallbackRef.current) { clearTimeout(dismissFallbackRef.current); dismissFallbackRef.current = null; }
+        if (maxVisibleRef.current) { clearTimeout(maxVisibleRef.current); maxVisibleRef.current = null; }
+        if (currentRef.current) {
+          currentRef.current = null;
+          setBanner(null);
+          dragY.setValue(0);
+          translateY.setValue(-120);
+        }
       } else if (currentRef.current) {
         startAutoDismiss();
       }

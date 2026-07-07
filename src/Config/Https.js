@@ -171,22 +171,14 @@ api.interceptors.response.use(
       originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
       return api(originalRequest);
     } catch (refreshError) {
+      // POLICY: a failed token refresh must NOT log the user out. The session is
+      // kept; we simply fail THIS request and let the socket layer keep retrying
+      // reauth in the background (it recovers a fresh token as soon as the server
+      // is reachable and the session is valid). Only an explicit terminal event
+      // (force_logout / device:terminated / account deleted-or-blocked) or the
+      // user's own logout ends the session. Previously this did performSessionReset
+      // which wiped storage + bounced to login on any transient refresh miss.
       processQueue(refreshError, null);
-      // Only wipe the session + bounce to Login when the server EXPLICITLY
-      // rejected the refresh token (real expiry) or there are no credentials to
-      // refresh with. For transient failures — network drop, timeout, a server
-      // hiccup — we KEEP the session so a flaky connection never logs the user
-      // out. The request just fails softly; the next one refreshes normally.
-      if (refreshError?.isAuthRejection) {
-        // Mark it so handleApiError doesn't ALSO flash an error toast — we're
-        // already transitioning to Login, which is feedback enough.
-        try { refreshError.__sessionEnded = true; } catch (_) {}
-        await performSessionReset({
-          reason: 'session_expired',
-          resetNavigation: true,
-          clearAllStorage: true,
-        });
-      }
       return Promise.reject(refreshError);
     } finally {
       isRefreshing = false;
@@ -196,13 +188,6 @@ api.interceptors.response.use(
 
 // Centralized error handling
 async function handleApiError(error) {
-  // Session was cleanly ended (expired / server-rejected) and we're already
-  // redirecting to Login — swallow the toast so the user just sees a smooth
-  // transition, not a scary "no response / unauthorized" error flashing first.
-  if (error?.__sessionEnded) {
-    return Promise.reject(error);
-  }
-
   console.log("API Error in HTTPS Config:", {
     platform: Platform.OS,
     status: error?.response?.status,
@@ -388,17 +373,9 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
           },
         });
       } catch (refreshError) {
-        // Same rule as the JSON path: only sign the user out on a genuine
-        // server rejection of the refresh token. A network/timeout failure
-        // during an upload keeps the session intact so the user can just retry.
-        if (refreshError?.isAuthRejection) {
-          try { refreshError.__sessionEnded = true; } catch (_) {}
-          await performSessionReset({
-            reason: 'session_expired_upload',
-            resetNavigation: true,
-            clearAllStorage: true,
-          });
-        }
+        // POLICY (see JSON interceptor above): never log out on a failed refresh.
+        // Fail just this upload; the socket layer keeps retrying reauth and the
+        // upload can be retried once a fresh token lands. Session is preserved.
         throw refreshError;
       }
     }
