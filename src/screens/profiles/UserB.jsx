@@ -25,7 +25,7 @@ import ContactDatabase from "../../services/ContactDatabase";
 import useSaveContact from "../../hooks/useSaveContact";
 import { findInDeviceContacts } from "../../services/SaveContactService";
 import { useCall } from "../../calls/useCall";
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ReportBottomSheet from "../../components/ReportBottomSheet";
 
 const { width } = Dimensions.get('window');
@@ -57,12 +57,13 @@ function HeroGradient() {
 // battery) and the back button stay readable over a bright photo. Without it,
 // light-content status-bar icons vanish on a light image on both iOS & Android.
 const TOP_SCRIM_HEIGHT = STATUS_BAR_HEIGHT + 56;
-function HeroTopScrim() {
+function HeroTopScrim({ topInset = STATUS_BAR_HEIGHT }) {
   return (
     <View pointerEvents="none" style={styles.heroTopScrimWrap}>
       {/* Solid-ish dark band directly behind the status bar icons (time/signal/
-          battery) so white light-content icons stay readable over a busy photo. */}
-      <View style={{ height: STATUS_BAR_HEIGHT + 6, backgroundColor: 'rgba(0,0,0,0.5)' }} />
+          battery) so white light-content icons stay readable over a busy photo.
+          Sized to the REAL top inset so it matches the notch / Dynamic Island. */}
+      <View style={{ height: topInset + 6, backgroundColor: 'rgba(0,0,0,0.5)' }} />
       {/* Short fade-out below it so the band blends into the photo. Many thin
           bands (54px split into ~1px steps) so the fade is smooth — not striped. */}
       {Array.from({ length: 54 }).map((_, i) => {
@@ -76,6 +77,10 @@ function HeroTopScrim() {
 
 export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
+  // Real per-device top inset (notch / Dynamic Island on iOS, status-bar height
+  // on Android). Drives the floating header so its solid background fills the
+  // whole top strip when scrolled — no empty gap above it on any device.
+  const insets = useSafeAreaInsets();
   const { theme, isDarkMode } = useTheme();
   const { startAudioCall, startVideoCall, callBusy } = useCall();
   const dispatch = useDispatch();
@@ -417,6 +422,10 @@ export default function UserB({ navigation, route }) {
         style={[
           styles.topBarSafe,
           {
+            // Push the row below the notch/status bar, and let the solid
+            // background (when scrolled) fill from y=0 up through the inset so
+            // there's never a bare strip above the header.
+            paddingTop: insets.top,
             backgroundColor: scrolledPastHeader ? headerBg : 'transparent',
             borderBottomColor: scrolledPastHeader ? dividerClr : 'transparent',
             borderBottomWidth: scrolledPastHeader ? StyleSheet.hairlineWidth : 0,
@@ -475,7 +484,7 @@ export default function UserB({ navigation, route }) {
             </View>
           )}
           <HeroGradient />
-          <HeroTopScrim />
+          <HeroTopScrim topInset={insets.top} />
           <View style={styles.heroOverlay}>
             <View style={styles.heroNameRow}>
               <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
@@ -728,7 +737,7 @@ const styles = StyleSheet.create({
   // ── Top bar (transparent over hero, solid when scrolled) ──
   topBarSafe: {
     position: 'absolute',
-    top: 20,
+    top: 0,
     left: 0,
     right: 0,
     zIndex: 100,

@@ -225,6 +225,10 @@ const styles = StyleSheet.create({
   avatarFallback: {
     width: '100%',
     height: '100%',
+    // Own borderRadius (like avatarImg) so the letter fallback is a PERFECT
+    // circle on its own — not relying on the parent's overflow clip, which
+    // leaves the solid-background corners slightly squared on device.
+    borderRadius: 100,
     alignItems: 'center',
     justifyContent: 'center',
   },

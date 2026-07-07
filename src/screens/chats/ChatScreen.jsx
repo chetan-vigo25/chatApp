@@ -6189,15 +6189,19 @@ export default function ChatScreen({ navigation, route }) {
                 theme={theme}
                 isDanger
               />
-              <ChatMenuItem
-                icon="broom"
-                iconLib="MaterialCommunityIcons"
-                color="#E06A6A"
-                label="Clear for everyone"
-                onPress={handleDeleteForEveryone}
-                theme={theme}
-                isDanger
-              />
+              {/* "Clear for everyone" is not offered in channels (broadcast) —
+                  only in one-to-one and group chats. */}
+              {!isBroadcastChat && (
+                <ChatMenuItem
+                  icon="broom"
+                  iconLib="MaterialCommunityIcons"
+                  color="#E06A6A"
+                  label="Clear for everyone"
+                  onPress={handleDeleteForEveryone}
+                  theme={theme}
+                  isDanger
+                />
+              )}
             </Animated.View>
           </TouchableOpacity>
         </Modal>
