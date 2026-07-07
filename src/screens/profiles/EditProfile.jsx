@@ -23,8 +23,11 @@ function showToast(message) {
 }
 
 function HeroGradient() {
-  const BANDS = 14;
+  // ~1px bands so the fake gradient is smooth. A low count (14 → ~13px steps)
+  // shows visible horizontal STRIPS on the cover photo; ~1px steps are
+  // imperceptible. JS-only — no expo-linear-gradient dependency/rebuild.
   const TOTAL = 180;
+  const BANDS = 180;
   const bandH = TOTAL / BANDS;
   return (
     <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, bottom: 0, justifyContent: 'flex-end' }}>

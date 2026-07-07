@@ -11,7 +11,7 @@ import { useDeviceLocation } from "../contexts/DeviceLoc";
 import { useDispatch, useSelector } from "react-redux";
 import { emailLogin } from "../Redux/Reducer/Auth/Auth.reducer";
 import { initSocket, emitLogoutCurrentDevice } from "../Redux/Services/Socket/socket";
-import { performSessionReset, saveAuthSession } from "../services/sessionManager";
+import { performSessionReset, saveAuthSession, extractLoginSession } from "../services/sessionManager";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { APP_TAG_NAME } from '@env';
 
@@ -107,11 +107,12 @@ export default function LoginEmail({ navigation }) {
         clearAllStorage: true,
         nextUserId: loginData?.data?._id || loginData?.data?.id || null,
       });
+      const session = extractLoginSession(loginData);
       await saveAuthSession({
         userInfo: loginData.data,
-        accessToken: loginData?.token?.accessToken,
-        refreshToken: loginData?.token?.refreshToken,
-        deviceId: loginData?.data?.deviceId,
+        accessToken: session.accessToken,
+        refreshToken: session.refreshToken,
+        deviceId: session.deviceId,
         loginMethod: 'username',
       });
       showToast(loginData.message);

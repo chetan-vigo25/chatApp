@@ -143,13 +143,9 @@ export default function ProfilePreviewModal({
                 </View>
               )}
 
-              {/* Faux top gradient (no LinearGradient dep) */}
-              <View style={styles.scrim} pointerEvents="none">
-                <View style={[styles.scrimLayer, { height: 92 }]} />
-                <View style={[styles.scrimLayer, { height: 66 }]} />
-                <View style={[styles.scrimLayer, { height: 44 }]} />
-                <View style={[styles.scrimLayer, { height: 26 }]} />
-              </View>
+              {/* No scrim gradient — a banded scrim showed hairline strips on
+                  Android (1px-view sub-pixel seams). The name stays readable via a
+                  strong text drop-shadow alone, so the photo shows clean. */}
 
               {/* Name on the photo, with a soft drop shadow */}
               <View style={styles.nameOverlay} pointerEvents="none">
@@ -234,19 +230,6 @@ const styles = StyleSheet.create({
     fontSize: 92,
     letterSpacing: -2,
   },
-  scrim: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-  },
-  scrimLayer: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    backgroundColor: 'rgba(0,0,0,0.16)',
-  },
   nameOverlay: {
     position: 'absolute',
     top: 0,
@@ -262,18 +245,18 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto-Medium',
     fontSize: 16,
     letterSpacing: 0.1,
-    textShadowColor: 'rgba(0,0,0,0.75)',
+    textShadowColor: 'rgba(0,0,0,0.9)',
     textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 6,
+    textShadowRadius: 9,
   },
   subtitleText: {
     color: 'rgba(255,255,255,0.92)',
     fontFamily: 'Roboto-Regular',
     fontSize: 12.5,
     marginTop: 2,
-    textShadowColor: 'rgba(0,0,0,0.75)',
+    textShadowColor: 'rgba(0,0,0,0.9)',
     textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 6,
+    textShadowRadius: 9,
   },
   actionRow: {
     flexDirection: 'row',

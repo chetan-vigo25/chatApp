@@ -109,6 +109,46 @@ const extractTokens = (responseData = {}) => {
   };
 };
 
+// Pull the backend-issued deviceId out of a login / OTP-verify response.
+// The device id is created server-side (the app never sends one at login), so
+// it can only ever be a value the backend actually returned — we probe every
+// shape the backend might use but NEVER fabricate one, because refresh must
+// send back the SAME id the server associated with this session (a made-up id
+// would just be rejected). Returns null only when the response truly carries no
+// device id — which is a backend contract problem, not something the app can fix.
+const extractDeviceId = (responseData = {}) => {
+  const d = responseData?.data || {};
+  const device = d?.device || responseData?.device || {};
+  const candidate =
+    d?.deviceId ||
+    device?.deviceId ||
+    device?._id ||
+    device?.id ||
+    d?.deviceInfo?.deviceId ||
+    d?.session?.deviceId ||
+    responseData?.deviceId ||
+    responseData?.token?.deviceId ||
+    null;
+  return candidate ? String(candidate) : null;
+};
+
+// Single robust entry point for login screens: resolves accessToken,
+// refreshToken and deviceId from a login response regardless of nesting.
+export const extractLoginSession = (responseData = {}) => {
+  const tokens = extractTokens(responseData);
+  const deviceId = extractDeviceId(responseData);
+  if (!tokens.refreshToken || !deviceId) {
+    // Loud, actionable signal: if either is missing at login, token refresh is
+    // GUARANTEED to fail later (sessionManager throws before hitting the server)
+    // and the user will be auto-logged-out on the first access-token expiry.
+    console.warn(
+      '[auth] login response missing session field(s) — refresh will fail → auto-logout.',
+      { hasRefreshToken: !!tokens.refreshToken, hasDeviceId: !!deviceId }
+    );
+  }
+  return { ...tokens, deviceId };
+};
+
 export const getStoredSession = async () => {
   const [accessToken, refreshTokenHash, refreshTokenLegacy, userRaw, deviceId, sessionId, loginMethod] = await Promise.all([
     AsyncStorage.getItem(AUTH_KEYS.accessToken),

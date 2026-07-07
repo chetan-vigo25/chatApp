@@ -34,7 +34,11 @@ const HERO_HEIGHT = Math.min(width, 430);
 
 // Smooth dark bottom gradient over the hero photo (stacked bands → no
 // LinearGradient dependency; renders identically on Android + iOS).
-const GRADIENT_BANDS = 14;
+// Use MANY ~1px bands so the fake gradient reads as smooth. A low band count
+// (e.g. 14 → ~14px steps) shows visible horizontal STRIPS on the photo; at ~1px
+// per band the alpha delta between neighbours is imperceptible. Still JS-only —
+// no expo-linear-gradient native dependency / rebuild needed.
+const GRADIENT_BANDS = 200;
 const GRADIENT_HEIGHT = 200;
 function HeroGradient() {
   const bandH = GRADIENT_HEIGHT / GRADIENT_BANDS;
@@ -59,11 +63,12 @@ function HeroTopScrim() {
       {/* Solid-ish dark band directly behind the status bar icons (time/signal/
           battery) so white light-content icons stay readable over a busy photo. */}
       <View style={{ height: STATUS_BAR_HEIGHT + 6, backgroundColor: 'rgba(0,0,0,0.5)' }} />
-      {/* Short fade-out below it so the band blends into the photo. */}
-      {Array.from({ length: 9 }).map((_, i) => {
-        const t = (i + 1) / 9;
+      {/* Short fade-out below it so the band blends into the photo. Many thin
+          bands (54px split into ~1px steps) so the fade is smooth — not striped. */}
+      {Array.from({ length: 54 }).map((_, i) => {
+        const t = (i + 1) / 54;
         const alpha = 0.5 * (1 - t);
-        return <View key={i} style={{ height: 6, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
+        return <View key={i} style={{ height: 1, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
       })}
     </View>
   );
