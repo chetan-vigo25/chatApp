@@ -1187,6 +1187,7 @@ export default function ChatScreen({ navigation, route }) {
   const [audioPlaybackStatus, setAudioPlaybackStatus] = useState({});
   const audioSoundRef = useRef(null);
   const previousTopMessageRef = useRef(null);
+  const lastAutoScrollIdRef = useRef(null);
   const [isInputFocused, setIsInputFocused] = useState(false);
   const [contactViewer, setContactViewer] = useState({ visible: false, data: null });
   const videoRefs = useRef({});
@@ -3233,6 +3234,38 @@ export default function ChatScreen({ navigation, route }) {
     }
     previousTopMessageRef.current = latestId;
   }, [messages, isAtLatest]);
+
+  // WhatsApp-style auto-scroll to the newest message. This is an INVERTED list,
+  // so the bottom edge (newest) is offset 0. When a brand-new latest message
+  // appears we pin the view to the bottom if EITHER:
+  //   (a) it's my own outgoing message — I just sent it, so it must never be
+  //       left hidden below the fold (the exact bug in the screenshots), or
+  //   (b) I'm already following the latest message.
+  // If I'm scrolled up reading history and someone ELSE writes, we leave the
+  // scroll position alone — the "new messages" pill handles that case.
+  useEffect(() => {
+    const latest = messages?.[0];
+    const latestId = latest?.id || latest?.serverMessageId || null;
+    if (!latestId) return;
+    // First run: an inverted list already opens pinned to the newest message,
+    // so just record the id without an initial animated jump.
+    if (lastAutoScrollIdRef.current === null) {
+      lastAutoScrollIdRef.current = latestId;
+      return;
+    }
+    if (lastAutoScrollIdRef.current === latestId) return;
+    lastAutoScrollIdRef.current = latestId;
+
+    const isMine = latest?.senderType === 'self' || (currentUserId && latest?.senderId === currentUserId);
+    if (!isMine && !isAtLatest) return;
+
+    const pinToBottom = () => flatListRef?.current?.scrollToOffset?.({ offset: 0, animated: true });
+    // Next frame so the freshly-inserted row is laid out first, then once more
+    // shortly after to defeat maintainVisibleContentPosition nudging the new
+    // row off-screen when it inserts at index 0.
+    requestAnimationFrame(pinToBottom);
+    setTimeout(pinToBottom, 120);
+  }, [messages, isAtLatest, currentUserId, flatListRef]);
 
   useEffect(() => {
     if (!messages?.length) {
