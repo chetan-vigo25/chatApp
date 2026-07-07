@@ -3522,7 +3522,12 @@ export default function ChatScreen({ navigation, route }) {
   }, []);
 
   const parseInlineTokens = useCallback((line = '') => {
-    const pattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+|www\.[^\s)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*]+)\*|_([^_]+)_|\+\+([^+]+)\+\+|(https?:\/\/[^\s]+|www\.[^\s]+)/g;
+    // Groups 1-9: markdown link / code / bold / italic / underline / explicit http(s)|www URL.
+    // Group 10: bare email → mailto. Group 11: bare domain (example.com/.in/.org …) → https,
+    // WhatsApp-style. The bare-domain alt uses a curated TLD list + a `(?![a-z])` boundary so
+    // it doesn't false-match words like "example.communication" or "node.js". `i` flag lets it
+    // catch upper-case domains/TLDs too.
+    const pattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+|www\.[^\s)]+)\)|`([^`]+)`|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*]+)\*|_([^_]+)_|\+\+([^+]+)\+\+|(https?:\/\/[^\s]+|www\.[^\s]+)|([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})|((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:com|org|net|in|io|co|info|biz|app|dev|me|gov|edu|us|uk|ai|xyz|online|site|tech|store|link|live|news|blog|shop)(?![a-z])(?:\/[^\s]*)?)/gi;
     const tokens = [];
     let cursor = 0;
     let match;
@@ -3548,6 +3553,12 @@ export default function ChatScreen({ navigation, route }) {
         tokens.push({ type: 'underline', text: match[8] });
       } else if (match[9]) {
         tokens.push({ type: 'link', text: match[9], href: match[9] });
+      } else if (match[10]) {
+        // Bare email → mailto (normalizeLink adds the scheme).
+        tokens.push({ type: 'link', text: match[10], href: match[10] });
+      } else if (match[11]) {
+        // Bare domain (example.com / .in / .org) → https (normalizeLink adds the scheme).
+        tokens.push({ type: 'link', text: match[11], href: match[11] });
       }
 
       cursor = match.index + match[0].length;
@@ -3585,8 +3596,12 @@ export default function ChatScreen({ navigation, route }) {
     const value = String(rawLink || '').trim();
     if (!value) return '';
     if (/^https?:\/\//i.test(value)) return value;
+    if (/^mailto:/i.test(value)) return value;
     if (/^www\./i.test(value)) return `https://${value}`;
-    return value;
+    // Bare email → mailto: so the phone opens the mail app (WhatsApp parity).
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return `mailto:${value}`;
+    // Bare domain (example.com/.in/.org …) → default to https.
+    return `https://${value}`;
   };
 
   const handleOpenLink = useCallback(async (rawLink) => {

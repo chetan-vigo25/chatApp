@@ -120,17 +120,19 @@ export default function Setting({ navigation }) {
     // OEM skins (MIUI, FuntouchOS, …) block a killed/rebooted app from waking on
     // the incoming-call push. This re-opens the battery-optimization + Autostart
     // onboarding so calls ring when the app is closed. Android-only.
-    ...(Platform.OS === 'android' ? [{
-      title: 'Calls',
-      items: [
-        {
-          icon: 'call-outline',
-          label: 'Call reliability',
-          subtitle: 'Let calls ring when the app is closed',
-          onPress: () => openCallReliability(),
-        },
-      ],
-    }] : []),
+
+    // ...(Platform.OS === 'android' ? [{
+    //   title: 'Calls',
+    //   items: [
+    //     {
+    //       icon: 'call-outline',
+    //       label: 'Call reliability',
+    //       subtitle: 'Let calls ring when the app is closed',
+    //       onPress: () => openCallReliability(),
+    //     },
+    //   ],
+    // }] : []),
+    
     // {
     //   title: 'Chats',
     //   items: [
@@ -158,12 +160,12 @@ export default function Setting({ navigation }) {
           subtitle: 'FAQs, contact support, tickets',
           onPress: () => navigation.navigate('HelpSupport'),
         },
-        {
-          icon: 'flag-outline',
-          label: 'My Reports',
-          subtitle: 'Reports you have submitted',
-          onPress: () => navigation.navigate('MyReports'),
-        },
+        // {
+        //   icon: 'flag-outline',
+        //   label: 'My Reports',
+        //   subtitle: 'Reports you have submitted',
+        //   onPress: () => navigation.navigate('MyReports'),
+        // },
       ],
     },
     {

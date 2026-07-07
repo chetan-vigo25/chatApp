@@ -1,13 +1,5 @@
 import React, { useRef, useEffect } from 'react';
-import {
-  View,
-  TouchableOpacity,
-  Text,
-  Animated,
-  StyleSheet,
-  Platform,
-  Image,
-} from 'react-native';
+import { View, TouchableOpacity, Text, Animated, StyleSheet, Platform, Image,} from 'react-native';
 import { useSelector, useDispatch } from 'react-redux';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { profileDetail } from '../Redux/Reducer/Profile/Profile.reducer';

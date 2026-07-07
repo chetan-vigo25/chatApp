@@ -120,7 +120,7 @@ export default function CallReliabilityGate() {
             onPress={onOpenAutostart}
           >
             <Ionicons name="rocket-outline" size={18} color={text} />
-            <Text style={[styles.secondaryBtnText, { color: text }]}>Open Autostart settings</Text>
+            <Text style={[styles.secondaryBtnText, { color: text }]}>Open autostart settings</Text>
           </TouchableOpacity>
 
           <View style={styles.footer}>
