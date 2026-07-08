@@ -100,7 +100,7 @@ export default function DeletedPasswordGate({ navigation }) {
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
-  const pageBg = isDarkMode ? '#0B141A' : '#F4F6F9';
+  const pageBg = isDarkMode ? '#000000' : '#F4F6F9';
   const cardBg = isDarkMode ? '#16222C' : '#FFFFFF';
   const inputBg = isDarkMode ? '#0F1A21' : '#F2F4F8';
 

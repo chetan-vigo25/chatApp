@@ -409,7 +409,7 @@ export default function AppLockGate() {
   const subText = theme.colors.placeHolderTextColor;
   // WhatsApp lock screen is flat and full-bleed — pure white / WhatsApp-dark,
   // no floating card. Surfaces match WhatsApp's input/track greys per mode.
-  const pageBg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  const pageBg = isDarkMode ? '#000000' : '#FFFFFF';
   const inputBg = isDarkMode ? '#1F2C33' : '#F0F2F5';
   const trackBg = isDarkMode ? '#1F2C33' : '#E9EDEF';
 

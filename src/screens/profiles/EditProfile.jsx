@@ -206,7 +206,7 @@ export default function EditProfile({ navigation, route }) {
   };
 
   // ─── Theme helpers ─────────────────────────
-  const pageBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+  const pageBg = isDarkMode ? '#000000' : '#F4F5F7';
   const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
   const borderClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
   const primaryText = theme.colors.primaryTextColor;

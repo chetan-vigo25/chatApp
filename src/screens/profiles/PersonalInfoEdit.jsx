@@ -120,7 +120,7 @@ export default function PersonalInfoEdit({ navigation, route }) {
   };
 
   // WhatsApp dark/light surfaces, accented by the user's theme colour.
-  const pageBg = isDarkMode ? '#0B141A' : '#FFFFFF';
+  const pageBg = isDarkMode ? '#000000' : '#FFFFFF';
   const headerBg = isDarkMode ? '#1F2C33' : theme.colors.themeColor;
   const onHeader = isDarkMode ? theme.colors.primaryTextColor : '#FFFFFF';
   const primaryText = theme.colors.primaryTextColor;

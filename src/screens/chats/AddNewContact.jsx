@@ -386,7 +386,7 @@ export default function AddNewContact({ navigation }) {
 
     // WhatsApp palette
     const accent = isDarkMode ? '#00A884' : '#008069';
-    const bg = isDarkMode ? '#0B141A' : '#FFFFFF';
+    const bg = isDarkMode ? '#000000' : '#FFFFFF';
     const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';
     const secondaryText = isDarkMode ? '#8696A0' : '#54656F';
     const placeholderText = isDarkMode ? '#5E7280' : '#A6B0BD';

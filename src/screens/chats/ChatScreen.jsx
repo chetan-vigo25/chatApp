@@ -751,7 +751,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
   const displayPhone = countryCode ? `${countryCode} ${phone}` : phone;
   const fullPhone = countryCode ? `${countryCode}${phone}` : phone;
 
-  const bgColor = isDarkMode ? '#0b141a' : '#f5f5f5';
+  const bgColor = isDarkMode ? '#000000' : '#f5f5f5';
   const cardBg = isDarkMode ? '#1a2b3c' : '#fff';
   const textColor = isDarkMode ? '#EDF6FC' : '#111';
   const subColor = isDarkMode ? 'rgba(200,216,228,0.6)' : '#666';

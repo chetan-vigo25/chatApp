@@ -91,7 +91,7 @@ export default function MessageInfoScreen() {
   const palette = useMemo(() => {
     const c = theme?.colors || {};
     return {
-      background: c.background || (isDarkMode ? '#0B141A' : '#ffffff'),
+      background: c.background || (isDarkMode ? '#000000' : '#ffffff'),
       surface: c.cardBackground || c.menuBackground || (isDarkMode ? '#1F2C33' : '#F7F8FA'),
       headerBg: c.menuBackground || c.cardBackground || (isDarkMode ? '#1F2C33' : '#F0F2F5'),
       text: c.primaryTextColor || (isDarkMode ? '#FFFFFF' : '#111B21'),

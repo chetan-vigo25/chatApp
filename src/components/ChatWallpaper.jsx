@@ -100,7 +100,7 @@ const PLACEMENTS = [
 ];
 
 function ChatWallpaper({ isDarkMode }) {
-  const bg = isDarkMode ? '#0B141A' : '#EAE1D6';
+  const bg = isDarkMode ? '#000000' : '#EAE1D6';
   const doodle = isDarkMode ? '#FFFFFF' : '#5C4B36';
   const doodleOpacity = isDarkMode ? 0.05 : 0.06;
   const doodles = buildDoodles(doodle);

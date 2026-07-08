@@ -23,7 +23,7 @@ export default function TicketChat({ navigation, route }) {
   const accent = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.secondaryTextColor;
-  const pageBg = isDarkMode ? "#0B141A" : "#ECE5DD";
+  const pageBg = isDarkMode ? "#000000" : "#ECE5DD";
   const cardBg = isDarkMode ? "#16222C" : "#FFFFFF";
   const adminBubble = isDarkMode ? "#1F2C34" : "#FFFFFF";
 
