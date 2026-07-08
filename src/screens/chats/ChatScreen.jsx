@@ -3887,6 +3887,12 @@ export default function ChatScreen({ navigation, route }) {
   const renderMessageMeta = (msg, isMyMessage, { inline = false } = {}) => {
     const showEdited = Boolean(msg?.isEdited || msg?.editedAt || msg?.edited);
     const metaColor = isMyMessage ? 'rgba(233,237,239,0.6)' : theme.colors.placeHolderTextColor;
+    // A freshly-sent (optimistic) message may not have `time` populated yet —
+    // derive it from the timestamp so the bubble never renders as bare text with
+    // no time (the "sometimes it just shows the message" glitch). Mirrors the
+    // same fallback CallMessageBubble already uses.
+    const timeText = msg?.time
+      || ((msg?.timestamp || msg?.createdAt) ? moment(msg.timestamp || msg.createdAt).format('hh:mm A') : '');
     return (
       <View
         style={[
@@ -3901,7 +3907,7 @@ export default function ChatScreen({ navigation, route }) {
             edited
           </Text>
         )}
-        <Text style={{ fontSize: 11, color: metaColor, fontFamily: 'Roboto-Regular' }}>{msg.time}</Text>
+        <Text style={{ fontSize: 11, color: metaColor, fontFamily: 'Roboto-Regular' }}>{timeText}</Text>
         {isMyMessage && renderTicks(msg)}
       </View>
     );
@@ -4634,7 +4640,7 @@ export default function ChatScreen({ navigation, route }) {
               </View>
             </View>
           )}
-          <View style={{ paddingHorizontal: 12 }}>
+          <View style={{ paddingHorizontal: 12, paddingVertical: 2 }}>
             <CallMessageBubble
               msg={msg}
               peer={chatData?.peerUser}
