@@ -268,9 +268,15 @@ export default function WhatsAppBannerHost() {
         if (currentRef.current) dismissCurrentRef.current?.('max_visible');
       }, MAX_VISIBLE_MS);
       animateIn();
+      // Arm the 4s auto-dismiss HERE — directly, not only inside animateIn's
+      // entrance-animation completion callback. On iOS that native callback can
+      // be dropped (app inactive/detached mid-animation), which left auto-dismiss
+      // unarmed and the banner parked on screen. Arming it here guarantees the
+      // normal 4s dismissal independent of the animation firing its callback.
+      startAutoDismiss();
       return;
     }
-  }, [animateIn, shouldSuppressForActiveRoute]);
+  }, [animateIn, shouldSuppressForActiveRoute, startAutoDismiss]);
 
   const dismissCurrent = useCallback((reason = 'manual', onDone) => {
     clearAutoDismiss();
@@ -308,6 +314,27 @@ export default function WhatsAppBannerHost() {
   useEffect(() => {
     dismissCurrentRef.current = dismissCurrent;
   }, [dismissCurrent]);
+
+  // BULLETPROOF backstop — keyed on the RENDERED `banner` state, so it covers
+  // EVERY path that can put a banner up (showNext, the same-chat in-place
+  // `setBanner` update, or anything added later), not just the ones that arm
+  // their own timer. Whenever a banner is on screen it is guaranteed to be torn
+  // down after MAX_VISIBLE_MS regardless of dropped animation callbacks or
+  // cleared auto-dismiss timers. This is what makes the stuck "K + blur" card
+  // impossible: no set-path can escape a state-driven effect.
+  useEffect(() => {
+    if (!banner) return undefined;
+    const killTimer = setTimeout(() => {
+      clearAutoDismiss();
+      if (dismissFallbackRef.current) { clearTimeout(dismissFallbackRef.current); dismissFallbackRef.current = null; }
+      if (maxVisibleRef.current) { clearTimeout(maxVisibleRef.current); maxVisibleRef.current = null; }
+      currentRef.current = null;
+      setBanner(null);
+      dragY.setValue(0);
+      translateY.setValue(-120);
+    }, MAX_VISIBLE_MS);
+    return () => clearTimeout(killTimer);
+  }, [banner, clearAutoDismiss, dragY, translateY]);
 
   // Is this chat currently muted FOR THIS USER? Checks the in-memory chatMap
   // first (cheap, kept fresh by mute:updated), then falls back to SQLite. A null
