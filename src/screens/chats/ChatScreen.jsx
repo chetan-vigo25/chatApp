@@ -45,7 +45,7 @@ import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { BlurView } from 'expo-blur';
-import Svg, { Defs, LinearGradient as SvgLinearGradient, Stop, Circle as SvgCircle } from 'react-native-svg';
+import Svg, { Defs, LinearGradient as SvgLinearGradient, Stop, Rect as SvgRect } from 'react-native-svg';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
@@ -105,10 +105,13 @@ const MEDIA_PANEL_OPTIONS = [
   { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', grad: ['#3BD17A', '#16A34A'], color: '#23B85F' },
 ];
 
-// WhatsApp attachment disc — a true vertical gradient circle (SVG) with a white
-// glyph centred on top. Drop shadow tinted to the disc colour gives the lift.
+// WhatsApp-style attachment tile — a vertical gradient ROUNDED SQUARE (squircle)
+// with a white glyph centred on top. Drop shadow tinted to the tile colour gives
+// the lift. (Previously a circle; switched to the squircle to match WhatsApp's
+// current attachment sheet.)
 function GradientDisc({ id, grad = ['#888', '#666'], color = '#777', icon, size = 54 }) {
   const gid = `mediaDisc-${id}`;
+  const radius = Math.round(size * 0.30); // squircle corner radius
   return (
     <View
       style={{
@@ -117,10 +120,10 @@ function GradientDisc({ id, grad = ['#888', '#666'], color = '#777', icon, size 
         alignItems: 'center',
         justifyContent: 'center',
         shadowColor: color,
-        shadowOpacity: 0.4,
-        shadowRadius: 7,
-        shadowOffset: { width: 0, height: 4 },
-        elevation: 5,
+        shadowOpacity: 0.35,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 3 },
+        elevation: 4,
       }}
     >
       <Svg width={size} height={size} style={StyleSheet.absoluteFill}>
@@ -130,9 +133,9 @@ function GradientDisc({ id, grad = ['#888', '#666'], color = '#777', icon, size 
             <Stop offset="1" stopColor={grad[1]} />
           </SvgLinearGradient>
         </Defs>
-        <SvgCircle cx={size / 2} cy={size / 2} r={size / 2} fill={`url(#${gid})`} />
+        <SvgRect x="0" y="0" width={size} height={size} rx={radius} ry={radius} fill={`url(#${gid})`} />
       </Svg>
-      <Ionicons name={icon} size={Math.round(size * 0.45)} color="#fff" />
+      <Ionicons name={icon} size={Math.round(size * 0.44)} color="#fff" />
     </View>
   );
 }

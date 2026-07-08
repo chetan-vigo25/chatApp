@@ -274,7 +274,26 @@ const emitDeviceRegister = () => {
   // Send as soon as we have EITHER a regular push token or a VoIP token — the
   // VoIP token is what powers incoming-call CallKit pushes and must reach the
   // backend even if the standard APNs/FCM token hasn't arrived yet.
-  if (!socket || !socket.connected || !deviceId || (!pushToken && !voipToken)) return;
+  if (!socket || !socket.connected || !deviceId || (!pushToken && !voipToken)) {
+    // Dev visibility: a silent skip here means the backend never learns this
+    // device's push/VoIP token → killed-app calls can NEVER ring. Log why.
+    if (__DEV__) {
+      console.log('📲 device register SKIPPED', {
+        socketConnected: !!(socket && socket.connected),
+        hasDeviceId: !!deviceId,
+        hasPushToken: !!pushToken,
+        hasVoipToken: !!voipToken,
+      });
+    }
+    return;
+  }
+  if (__DEV__) {
+    console.log('📲 → notification:device:register', {
+      hasPushToken: !!pushToken,
+      hasVoipToken: !!voipToken,
+      voipTokenLen: voipToken ? voipToken.length : 0,
+    });
+  }
   socket.emit('notification:device:register', {
     deviceId,
     ...(pushToken ? { pushToken } : {}),
@@ -322,6 +341,7 @@ export const setVoipToken = (token) => {
   const next = token ? String(token) : '';
   if (next === voipToken) return;
   voipToken = next;
+  if (__DEV__) console.log('📞 VoIP (PushKit) token received', { len: next.length });
   emitDeviceRegister();
 };
 
