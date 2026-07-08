@@ -148,6 +148,9 @@ export default function StatusViewer({ navigation, route }) {
   // to unmuted; the user can tap to silence — preference persists across
   // slides within the same viewer session.
   const [isMuted, setIsMuted]             = useState(false);
+  // WhatsApp-style: hold the progress bar until the slide's media has actually
+  // loaded, and show a blurred placeholder until then. Reset for every slide.
+  const [mediaLoaded, setMediaLoaded]     = useState(false);
 
   const progressAnim = useRef(new Animated.Value(0)).current;
   const animRef      = useRef(null);
@@ -157,6 +160,21 @@ export default function StatusViewer({ navigation, route }) {
 
   const currentStatus = statuses[currentIndex];
   const reactionData  = currentStatus ? (reactionCache[String(currentStatus._id)] || {}) : {};
+
+  // Media fields live under `mediaItems[0]` for OWN statuses (/my endpoint) but at
+  // the TOP LEVEL of the status object for OTHER users' statuses (/feed endpoint
+  // and the socket fan-out). Resolve from BOTH shapes so others' statuses render
+  // and gate the progress bar correctly instead of being skipped over a blank.
+  const currentMediaItem = currentStatus?.mediaItems?.[0] || null;
+  const currentMediaType =
+    currentMediaItem?.mediaType || currentStatus?.mediaType || currentStatus?.type
+    || (currentStatus?.textContent ? 'text' : null);
+  const currentMediaUrl =
+    currentMediaItem?.mediaUrl || currentStatus?.mediaUrl
+    || currentMediaItem?.thumbnailUrl || currentStatus?.thumbnailUrl || null;
+  const currentThumbUrl =
+    currentMediaItem?.thumbnailUrl || currentStatus?.thumbnailUrl
+    || currentMediaItem?.mediaUrl || currentStatus?.mediaUrl || null;
 
   // ── Progress bar ─────────────────────────────────────────────────────────
   const startProgress = useCallback((duration) => {
@@ -172,6 +190,9 @@ export default function StatusViewer({ navigation, route }) {
     });
   }, []);
 
+  // Every slide starts "not loaded" so the bar waits for its own media.
+  useEffect(() => { setMediaLoaded(false); }, [currentIndex]);
+
   useEffect(() => {
     if (pausedRef.current) {
       animRef.current?.stop();
@@ -180,11 +201,20 @@ export default function StatusViewer({ navigation, route }) {
     // Schema has no top-level `type` field on a Status — derive from the
     // first media item's mediaType so videos actually run for their full
     // duration instead of getting auto-skipped after STORY_DURATION.
-    const firstMedia = currentStatus?.mediaItems?.[0];
-    const isVideo = firstMedia?.mediaType === 'video' || currentStatus?.type === 'video';
+    const isVideo = currentMediaType === 'video';
+    const needsMedia = currentMediaType === 'image' || isVideo;
+    // WhatsApp behaviour: for image/video slides, DON'T advance the progress bar
+    // until the media has actually loaded (onLoad / playback isLoaded). Hold it at
+    // 0 so a slow-loading photo/video is never skipped over a blank screen.
+    // Text / link / audio have nothing to wait for.
+    if (needsMedia && !mediaLoaded) {
+      animRef.current?.stop();
+      progressAnim.setValue(0);
+      return;
+    }
     startProgress(isVideo ? videoDuration : STORY_DURATION);
     return () => animRef.current?.stop();
-  }, [currentIndex, paused, videoDuration]);
+  }, [currentIndex, paused, videoDuration, mediaLoaded]);
 
   // Safe back — always works even if StatusViewer is the root screen
   const safeGoBack = useCallback(() => {
@@ -497,8 +527,12 @@ export default function StatusViewer({ navigation, route }) {
   }, [replyText, currentStatus, dispatch, resume, user, userId, userName]);
 
   const onPlaybackStatusUpdate = useCallback((status) => {
-    if (status.isLoaded && status.durationMillis && videoDuration === STORY_DURATION) {
-      setVideoDuration(Math.min(status.durationMillis, VIDEO_MAX_MS));
+    if (status.isLoaded) {
+      // Video is ready → release the progress bar (WhatsApp behaviour).
+      setMediaLoaded(true);
+      if (status.durationMillis && videoDuration === STORY_DURATION) {
+        setVideoDuration(Math.min(status.durationMillis, VIDEO_MAX_MS));
+      }
     }
     if (status.didJustFinish) goNext();
   }, [videoDuration, goNext]);
@@ -542,11 +576,9 @@ export default function StatusViewer({ navigation, route }) {
   //                  status.bgColor      (text background)
   // There is NO top-level `type`, `text`, `backgroundColor`, or `mediaUrl`.
   const renderContent = () => {
-    const firstItem  = currentStatus?.mediaItems?.[0];
-    // Derive type: prefer the mediaItem's mediaType, fall back to text if textContent exists
-    const statusType = firstItem?.mediaType
-      ?? (currentStatus?.textContent ? 'text' : null);
-    const mediaUrl   = toSecureMediaUri(firstItem?.mediaUrl);
+    // Resolved from BOTH the nested (own) and top-level (others) shapes above.
+    const statusType = currentMediaType;
+    const mediaUrl   = toSecureMediaUri(currentMediaUrl);
 
     switch (statusType) {
       case 'text':
@@ -555,14 +587,39 @@ export default function StatusViewer({ navigation, route }) {
             <Text style={styles.textBody}>{currentStatus.textContent}</Text>
           </View>
         );
-      case 'image':
+      case 'image': {
+        const thumbUrl = toSecureMediaUri(currentThumbUrl);
         return (
-          <Image
-            source={{ uri: mediaUrl }}
-            style={styles.mediaContent}
-            resizeMode="contain"
-          />
+          <View style={styles.mediaContent}>
+            {/* Blurred low-res placeholder (WhatsApp blur-up) — visible until the
+                full-resolution image finishes loading, then it clears sharp. */}
+            {!mediaLoaded && thumbUrl ? (
+              <Image
+                source={{ uri: thumbUrl }}
+                style={StyleSheet.absoluteFill}
+                resizeMode="contain"
+                blurRadius={18}
+              />
+            ) : null}
+            <Image
+              source={{ uri: mediaUrl }}
+              style={styles.mediaContent}
+              resizeMode="contain"
+              onLoad={() => setMediaLoaded(true)}
+              // Never hang the progress bar forever on a broken URL.
+              onError={() => setMediaLoaded(true)}
+            />
+            {!mediaLoaded ? (
+              <View
+                style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}
+                pointerEvents="none"
+              >
+                <ActivityIndicator color="#fff" size="large" />
+              </View>
+            ) : null}
+          </View>
         );
+      }
       case 'video':
         return (
           <Video

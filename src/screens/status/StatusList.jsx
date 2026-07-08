@@ -22,11 +22,18 @@ const IS_IPAD = Platform.OS === 'ios' && Platform.isPad;
 // where the ring previews the actual story content.
 function StatusThumb({ status, style }) {
   if (!status) return <View style={[style, styles.thumbNeutral]} />;
-  const firstItem  = status.mediaItems?.[0];
-  const statusType = firstItem?.mediaType ?? (status.textContent ? 'text' : null);
+  // Media fields are nested under mediaItems[0] for OWN statuses (/my) but at the
+  // TOP LEVEL for OTHER users' statuses (/feed, socket) — resolve from both so
+  // others' thumbnails also show. OUTSIDE we prefer the small `thumbnailUrl`
+  // (the full-res `mediaUrl` is only used inside the viewer when opened).
+  const firstItem  = status.mediaItems?.[0] || null;
+  const statusType = firstItem?.mediaType || status.mediaType || status.type
+    || (status.textContent ? 'text' : null);
+  const thumbUrl   = firstItem?.thumbnailUrl || status.thumbnailUrl
+    || firstItem?.mediaUrl || status.mediaUrl || null;
 
-  if ((statusType === 'image' || statusType === 'video') && (firstItem?.thumbnailUrl || firstItem?.mediaUrl)) {
-    return <Image source={{ uri: toSecureMediaUri(firstItem.thumbnailUrl || firstItem.mediaUrl) }} style={[style, styles.thumbCover]} />;
+  if ((statusType === 'image' || statusType === 'video') && thumbUrl) {
+    return <Image source={{ uri: toSecureMediaUri(thumbUrl) }} style={[style, styles.thumbCover]} />;
   }
   if (statusType === 'text') {
     return (

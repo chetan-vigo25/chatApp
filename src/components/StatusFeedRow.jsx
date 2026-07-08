@@ -208,6 +208,13 @@ export default function StatusFeedRow({ navigation, style }) {
           const viewed   = group.allViewed || isGroupFullyViewed(group, viewedSet);
           const ringColor = viewed ? RING_VIEWED : RING_UNSEEN;
           const avatarUri = group.avatar || group.profileImage || group.userAvatar;
+          // Small status-thumbnail badge (exactly like "My Status"). Media fields
+          // are nested under mediaItems[0] for some payloads and at the top level
+          // for others — resolve from both, preferring the small thumbnailUrl.
+          const firstSt  = (group.statuses || [])[0];
+          const stItem   = firstSt?.mediaItems?.[0] || null;
+          const stThumb  = stItem?.thumbnailUrl || firstSt?.thumbnailUrl
+            || stItem?.mediaUrl || firstSt?.mediaUrl || null;
           const serverName = group.name || group.fullName || group.userName;
           const phone      = group.phone || group.number || group.mobile?.number || group.mobileNumber;
           // Saved contact name → phone number → server-provided name.
@@ -235,6 +242,12 @@ export default function StatusFeedRow({ navigation, style }) {
                     />
                   </View>
                 </View>
+                {/* Status-thumbnail badge — same corner preview as "My Status". */}
+                {stThumb ? (
+                  <View style={styles.thumbnailBadge}>
+                    <Image source={{ uri: stThumb }} style={styles.thumbnailImg} />
+                  </View>
+                ) : null}
                 {/* Unseen count badge */}
                 {!viewed && group.unseenCount > 0 && (
                   <View style={[styles.unseenBadge, { backgroundColor: RING_UNSEEN }]}>
