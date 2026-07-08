@@ -75,6 +75,7 @@ import SaveContactBanner from '../../components/SaveContactBanner';
 import useSaveContact from '../../hooks/useSaveContact';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import * as ScreenCapture from 'expo-screen-capture';
+import LinkPreviewCard from '../../components/LinkPreviewCard';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 import CallButtons from '../../calls/components/CallButtons';
 import GroupCallButtons from '../../calls/components/GroupCallButtons';
@@ -3649,6 +3650,24 @@ export default function ChatScreen({ navigation, route }) {
     }
   }, []);
 
+  // First previewable (http/https) link in a message, reusing the SAME parsed
+  // tokens that render the tappable link — so the preview card targets exactly
+  // the link the user sees. Returns null when the text has no web link.
+  const getFirstLinkHref = useCallback((rawText) => {
+    try {
+      const { lines } = getParsedRichMessage(rawText);
+      for (const line of lines) {
+        for (const tok of line) {
+          if (tok?.type === 'link' && tok.href) {
+            const href = normalizeLink(tok.href);
+            if (/^https?:\/\//i.test(href)) return href; // skip mailto:/tel:
+          }
+        }
+      }
+    } catch (_) { /* no-op */ }
+    return null;
+  }, [getParsedRichMessage]);
+
   const toggleReadMore = useCallback((messageKey) => {
     if (!messageKey) return;
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
@@ -4639,6 +4658,27 @@ export default function ChatScreen({ navigation, route }) {
       const resolvedText = systemText.replace(/\b([a-f0-9]{24})\b/g, (match) => {
         return groupMembersMap?.[match]?.fullName || match;
       });
+
+      // Screenshot notice ("Someone took a screenshot of this chat"): in a 1-to-1
+      // chat the screenshotter is ALWAYS the peer (the taker's own side hides this
+      // message), so replace the generic "Someone" with the peer's display name —
+      // the same saved-contact/profile name shown in the header.
+      let systemDisplayText = resolvedText;
+      const isGroupSys = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
+      if (!isGroupSys && /screenshot/i.test(resolvedText)) {
+        const peer = chatData?.peerUser;
+        const peerId = peer?._id || chatData?.peerUserId;
+        const peerName = resolveContactName(
+          peerId,
+          peer?.fullName || peer?.name || 'Someone',
+          peer?.mobileNumber || peer?.mobile?.number || peer?.phone || null
+        );
+        if (peerName && peerName !== 'Someone') {
+          systemDisplayText = /\bsomeone\b/i.test(resolvedText)
+            ? resolvedText.replace(/\bsomeone\b/i, peerName)
+            : `${peerName} ${resolvedText}`;
+        }
+      }
       return (
         <React.Fragment>
           {dateBadgeKey && (
@@ -4651,7 +4691,7 @@ export default function ChatScreen({ navigation, route }) {
           <View style={{ alignItems: 'center', paddingVertical: 3, paddingHorizontal: 30 }}>
             <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 10, maxWidth: '85%' }}>
               <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
-                {resolvedText}
+                {systemDisplayText}
               </Text>
             </View>
           </View>
@@ -4988,14 +5028,31 @@ export default function ChatScreen({ navigation, route }) {
             {/* TEXT MESSAGES — text flows, time/ticks tuck into the bottom-right
                 (WhatsApp). Short text → meta sits inline; long/multi-line text →
                 meta drops to the bottom-right corner. */}
-            {msg.type === "text" && !isDeletedMessage && (
-              <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'flex-end' }}>
-                <View style={{ flexShrink: 1 }}>
-                  {renderRichMessageText(msg, isMyMessage, messageKey)}
+            {msg.type === "text" && !isDeletedMessage && (() => {
+              // WhatsApp-style link preview: if the text carries a web link, show
+              // a preview card ABOVE the text (inside the same bubble). The card
+              // fetches its own metadata and renders only once resolved.
+              const linkHref = getFirstLinkHref(msg.text);
+              return (
+                <View>
+                  {!!linkHref && (
+                    <LinkPreviewCard
+                      url={linkHref}
+                      isMyMessage={isMyMessage}
+                      theme={theme}
+                      isDarkMode={isDarkMode}
+                      onOpen={handleOpenLink}
+                    />
+                  )}
+                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                    <View style={{ flexShrink: 1 }}>
+                      {renderRichMessageText(msg, isMyMessage, messageKey)}
+                    </View>
+                    {renderMessageMeta(msg, isMyMessage, { inline: true })}
+                  </View>
                 </View>
-                {renderMessageMeta(msg, isMyMessage, { inline: true })}
-              </View>
-            )}
+              );
+            })()}
             
             {/* DELETED MESSAGES */}
             {isDeletedMessage && (
