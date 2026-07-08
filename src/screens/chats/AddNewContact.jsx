@@ -15,7 +15,6 @@ const matchCountryByDialCode = (dialCode) =>
   (dialCode ? countryCodes.find((c) => c.code === dialCode) : null) || null;
 import CountryCodeContact from "../../components/CountryCodeContact";
 import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
-import { getStoredSession } from "../../services/sessionManager";
 import { getPhoneRule, isPhoneValid, phoneLengthHint } from "../../utils/phoneValidation";
 import { APP_TAG_NAME } from '@env';
 import { Ionicons } from '@expo/vector-icons';
@@ -23,20 +22,26 @@ import { Ionicons } from '@expo/vector-icons';
 const DEBOUNCE_DELAY = 500;
 // Minimum characters before we search by username (system-generated, e.g. "ballu1").
 const MIN_USERNAME_LENGTH = 3;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// ONE search box, three query kinds. We auto-detect what the user typed:
+//  - contains "@"                      → email
+//  - only phone characters (0-9 +-() ) → phone number (uses the country code)
+//  - anything else (has letters)       → username
+const detectQueryType = (raw) => {
+  const s = String(raw || '').trim();
+  if (!s) return 'empty';
+  if (s.includes('@')) return 'email';
+  if (/^[0-9+\-()\s]+$/.test(s)) return 'phone';
+  return 'username';
+};
 
 export default function AddNewContact({ navigation }) {
     const { theme, isDarkMode } = useTheme();
     const fadeAnim = useRef(new Animated.Value(0)).current;
-    // 'mobile' (default) or 'username' — which search field is active.
-    const [searchMode, setSearchMode] = useState('mobile');
-    // Search is locked to how the current user signed in: mobile-login users can
-    // only search by mobile, username-login users only by username. null until
-    // the stored login method is read (or unknown → both allowed).
-    const [allowedMode, setAllowedMode] = useState(null);
-    const [phoneNumber, setPhoneNumber] = useState('');
-    const [phoneFocused, setPhoneFocused] = useState(false);
-    const [username, setUsername] = useState('');
-    const [usernameFocused, setUsernameFocused] = useState(false);
+    // Single unified search box — phone number, username, or email.
+    const [query, setQuery] = useState('');
+    const [queryFocused, setQueryFocused] = useState(false);
     // Default country priority: user's manual pick > current IP/VPN country >
     // the user's registered number's country > first catalogue entry. IP is the
     // requested primary (follows a VPN); the registered number is the fallback when
@@ -72,9 +77,14 @@ export default function AddNewContact({ navigation }) {
 
     // Country-aware validation rules (min/max digits for the selected dial code).
     const phoneRule = getPhoneRule(selectedCountry?.code);
-    const minLen = phoneRule.min;
     const maxLen = phoneRule.max;
-    const isCompleteNumber = isPhoneValid(selectedCountry?.code, phoneNumber);
+
+    // Derived view of the current query.
+    const queryType = detectQueryType(query);
+    const phoneDigits = query.replace(/[^0-9]/g, '');
+    const isCompleteNumber = isPhoneValid(selectedCountry?.code, phoneDigits);
+    const isCompleteEmail = EMAIL_REGEX.test(query.trim());
+    const isCompleteUsername = query.trim().replace(/\s+/g, '').length >= MIN_USERNAME_LENGTH;
 
     useEffect(() => {
       const timer = setTimeout(() => {
@@ -83,28 +93,9 @@ export default function AddNewContact({ navigation }) {
       return () => clearTimeout(timer);
     }, []);
 
-    // Lock the search mode to how the current user logged in.
-    useEffect(() => {
-      let mounted = true;
-      getStoredSession()
-        .then((session) => {
-          if (!mounted) return;
-          const method = session?.loginMethod;
-          if (method === 'username' || method === 'mobile') {
-            setAllowedMode(method);
-            setSearchMode(method);
-          }
-        })
-        .catch(() => {});
-      return () => { mounted = false; };
-    }, []);
-
     const handleCountrySelect = (country) => {
       userPickedCountry.current = true;
       setSelectedCountry(country);
-      // Trim a now-too-long number when switching to a shorter-format country.
-      const { max } = getPhoneRule(country?.code);
-      setPhoneNumber((prev) => prev.slice(0, max));
     };
 
     const handleBack = () => {
@@ -112,11 +103,15 @@ export default function AddNewContact({ navigation }) {
       navigation?.navigate?.('ChatList');
     };
 
-    const handleClearPhoneNumber = () => {
-      setPhoneNumber('');
+    const resetSearchState = () => {
+      setIsSearching(false);
       setSearchResult(null);
       pendingUserDataRef.current = null;
-      setIsSearching(false);
+    };
+
+    const handleClearQuery = () => {
+      setQuery('');
+      resetSearchState();
       if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
       if (socketRef.current) removeSocketListeners(socketRef.current);
     };
@@ -164,10 +159,11 @@ export default function AddNewContact({ navigation }) {
           }
         };
         socketHandlersRef.current.onSearchResponse = onSearchResponse;
-        // Both mobile and username searches return the same response shape, so
-        // they share one handler.
+        // Mobile, username and email searches all return the same response shape,
+        // so they share one handler.
         socket.on('user:search:mobile:response', onSearchResponse);
         socket.on('user:search:username:response', onSearchResponse);
+        socket.on('user:search:email:response', onSearchResponse);
 
         const onChatCreateResponse = (response) => {
           if (response.status && response.data) {
@@ -179,7 +175,7 @@ export default function AddNewContact({ navigation }) {
             const chatData = response.data;
             const chatId = chatData.chatId || chatData._id;
             const mobileCode = userData.mobile?.code || userData.countryCode || selectedCountry.code;
-            const mobileNum  = userData.mobile?.number || userData.mobileNumber || userData.phone || phoneNumber;
+            const mobileNum  = userData.mobile?.number || userData.mobileNumber || userData.phone || phoneDigits;
             const userToPass = {
               _id: userData._id,
               fullName: userData.fullName || userData.name || '',
@@ -223,6 +219,7 @@ export default function AddNewContact({ navigation }) {
         if (socketHandlersRef.current.onSearchResponse) {
           socket.off('user:search:mobile:response', socketHandlersRef.current.onSearchResponse);
           socket.off('user:search:username:response', socketHandlersRef.current.onSearchResponse);
+          socket.off('user:search:email:response', socketHandlersRef.current.onSearchResponse);
         }
         if (socketHandlersRef.current.onChatCreateResponse) {
           socket.off('chat:create:response', socketHandlersRef.current.onChatCreateResponse);
@@ -232,13 +229,9 @@ export default function AddNewContact({ navigation }) {
         isSocketListenerActive.current = false;
     };
 
-    const searchUserByPhone = async (phoneNum) => {
-      if (!isPhoneValid(selectedCountry?.code, phoneNum)) {
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
-        setIsSearching(false);
-        return;
-      }
+    // Ensure a live socket + listeners, then emit `event` with `payload`. Shared by
+    // all three search kinds so the connection-recovery logic lives in one place.
+    const emitSearch = async (event, payload) => {
       setIsSearching(true);
       try {
         if (!isSocketConnected()) {
@@ -257,87 +250,74 @@ export default function AddNewContact({ navigation }) {
           return;
         }
         if (!isSocketListenerActive.current) setupSocketListeners(socket);
-        socket.emit('user:search:mobile', {
-          countryCode: selectedCountry.code,
-          mobileNumber: phoneNum,
-        }, () => {});
+        socket.emit(event, payload, () => {});
       } catch (error) {
         setIsSearching(false);
         setSearchResult({ found: false, message: 'Search failed. Please try again.' });
       }
     };
 
-    const searchUserByUsername = async (uname) => {
-      const query = String(uname || '').trim().toLowerCase();
-      if (query.length < MIN_USERNAME_LENGTH) {
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
-        setIsSearching(false);
-        return;
-      }
-      setIsSearching(true);
-      try {
-        if (!isSocketConnected()) {
-          await reconnectSocket(navigation);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          if (!isSocketConnected()) {
-            setIsSearching(false);
-            setSearchResult({ found: false, message: 'Connection error. Please try again.' });
-            return;
-          }
-        }
-        const socket = getSocket();
-        if (!socket) {
-          setIsSearching(false);
-          setSearchResult({ found: false, message: 'Connection error. Please try again.' });
-          return;
-        }
-        if (!isSocketListenerActive.current) setupSocketListeners(socket);
-        socket.emit('user:search:username', { userName: query }, () => {});
-      } catch (error) {
-        setIsSearching(false);
-        setSearchResult({ found: false, message: 'Search failed. Please try again.' });
-      }
+    const searchUserByPhone = (digits) => {
+      if (!isPhoneValid(selectedCountry?.code, digits)) { resetSearchState(); return; }
+      emitSearch('user:search:mobile', { countryCode: selectedCountry.code, mobileNumber: digits });
     };
 
-    const handleUsernameChange = (text) => {
-      // Usernames are lowercase alphanumerics/._ — strip spaces and uppercase.
-      const cleaned = text.replace(/\s+/g, '').toLowerCase();
-      setUsername(cleaned);
+    const searchUserByUsername = (uname) => {
+      const q = String(uname || '').trim().toLowerCase();
+      if (q.length < MIN_USERNAME_LENGTH) { resetSearchState(); return; }
+      emitSearch('user:search:username', { userName: q });
+    };
 
-      if (searchResult !== null) {
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
-      }
+    const searchUserByEmail = (email) => {
+      const q = String(email || '').trim().toLowerCase();
+      if (!EMAIL_REGEX.test(q)) { resetSearchState(); return; }
+      // NOTE: needs the backend to handle `user:search:email` and reply with
+      // `user:search:email:response` (same shape as mobile/username). Mobile and
+      // username searches already work; email is wired here on the client side.
+      emitSearch('user:search:email', { email: q });
+    };
+
+    // Route the query to the right search based on what the user typed.
+    const runSearch = (raw) => {
+      const type = detectQueryType(raw);
+      if (type === 'email') { searchUserByEmail(raw.trim().toLowerCase()); }
+      else if (type === 'phone') { searchUserByPhone(raw.replace(/[^0-9]/g, '').slice(0, maxLen)); }
+      else if (type === 'username') { searchUserByUsername(raw.replace(/\s+/g, '').toLowerCase()); }
+      else { resetSearchState(); }
+    };
+
+    const handleQueryChange = (text) => {
+      setQuery(text);
+
+      if (searchResult !== null) { setSearchResult(null); pendingUserDataRef.current = null; }
       if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
 
-      if (cleaned.trim().length >= MIN_USERNAME_LENGTH) {
-        searchTimeoutRef.current = setTimeout(() => { searchUserByUsername(cleaned); }, DEBOUNCE_DELAY);
+      const type = detectQueryType(text);
+      const complete =
+        type === 'email' ? EMAIL_REGEX.test(text.trim())
+        : type === 'phone' ? isPhoneValid(selectedCountry?.code, text.replace(/[^0-9]/g, ''))
+        : type === 'username' ? text.trim().replace(/\s+/g, '').length >= MIN_USERNAME_LENGTH
+        : false;
+
+      if (complete) {
+        searchTimeoutRef.current = setTimeout(() => { runSearch(text); }, DEBOUNCE_DELAY);
       } else {
-        setIsSearching(false);
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
+        resetSearchState();
       }
     };
 
-    const handleClearUsername = () => {
-      setUsername('');
-      setSearchResult(null);
-      pendingUserDataRef.current = null;
-      setIsSearching(false);
-      if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
-      if (socketRef.current) removeSocketListeners(socketRef.current);
-    };
-
-    // Switch between phone-number and username search; reset any in-flight state.
-    const switchMode = (mode) => {
-      if (mode === searchMode) return;
-      if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
-      setSearchResult(null);
-      pendingUserDataRef.current = null;
-      setIsSearching(false);
-      setSearchMode(mode);
-    };
+    // Re-run a phone search when the country changes (a different dial code can
+    // make the same digits valid/invalid). Only relevant while typing a number.
+    useEffect(() => {
+      if (queryType === 'phone' && isPhoneValid(selectedCountry?.code, phoneDigits)) {
+        setSearchResult(null);
+        pendingUserDataRef.current = null;
+        if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+        searchTimeoutRef.current = setTimeout(() => { searchUserByPhone(phoneDigits); }, DEBOUNCE_DELAY);
+      }
+      return () => { if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current); };
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedCountry]);
 
     const handleCreateChat = async (userId) => {
       try {
@@ -380,7 +360,7 @@ export default function AddNewContact({ navigation }) {
       if (searchResult.hasExistingChat && searchResult.chatId) {
           const exactUser = pendingUserDataRef.current || searchResult.user;
           const mobileCode = exactUser.mobile?.code || exactUser.countryCode || selectedCountry.code;
-          const mobileNum  = exactUser.mobile?.number || exactUser.mobileNumber || exactUser.phone || phoneNumber;
+          const mobileNum  = exactUser.mobile?.number || exactUser.mobileNumber || exactUser.phone || phoneDigits;
           const userToPass = {
               _id: exactUser._id,
               fullName: exactUser.fullName || exactUser.name || '',
@@ -404,35 +384,6 @@ export default function AddNewContact({ navigation }) {
       }
   };
 
-    const handlePhoneNumberChange = (text) => {
-      const digits = text.replace(/[^0-9]/g, '').slice(0, maxLen);
-      setPhoneNumber(digits);
-
-      if (searchResult !== null) {
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
-      }
-      if (searchTimeoutRef.current) { clearTimeout(searchTimeoutRef.current); searchTimeoutRef.current = null; }
-
-      if (isPhoneValid(selectedCountry?.code, digits)) {
-        searchTimeoutRef.current = setTimeout(() => { searchUserByPhone(digits); }, DEBOUNCE_DELAY);
-      } else {
-        setIsSearching(false);
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
-      }
-    };
-
-    useEffect(() => {
-      if (isPhoneValid(selectedCountry?.code, phoneNumber)) {
-        setSearchResult(null);
-        pendingUserDataRef.current = null;
-        if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-        searchTimeoutRef.current = setTimeout(() => { searchUserByPhone(phoneNumber); }, DEBOUNCE_DELAY);
-      }
-      return () => { if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current); };
-    }, [selectedCountry]);
-
     // WhatsApp palette
     const accent = isDarkMode ? '#00A884' : '#008069';
     const bg = isDarkMode ? '#0B141A' : '#FFFFFF';
@@ -443,20 +394,44 @@ export default function AddNewContact({ navigation }) {
     const cardBg = isDarkMode ? '#1F2C33' : '#F7F8FA';
     const errorColor = '#E5484D';
 
-    const isUsernameMode = searchMode === 'username';
-    const usernameValid = username.trim().length >= MIN_USERNAME_LENGTH;
     // Whether the current query is "complete enough" to trust the search result.
-    const queryComplete = isUsernameMode ? usernameValid : isCompleteNumber;
+    const queryComplete =
+      queryType === 'email' ? isCompleteEmail
+      : queryType === 'phone' ? isCompleteNumber
+      : queryType === 'username' ? isCompleteUsername
+      : false;
 
-    const hasInput = isUsernameMode ? username.length > 0 : phoneNumber.length > 0;
-    const showLengthError = !isUsernameMode && hasInput && !isCompleteNumber;
+    const hasInput = query.length > 0;
+    // Only phone numbers have a strict length rule to warn about.
+    const showLengthError = queryType === 'phone' && hasInput && !isCompleteNumber;
     const userFound = !!(searchResult && searchResult.found && queryComplete && !isSearching);
     const userNotFound = !!(searchResult && !searchResult.found && queryComplete && !isSearching);
     const userDisplayName = searchResult?.user?.fullName || searchResult?.user?.name || 'User';
     const userAvatar = searchResult?.user?.profileImage || searchResult?.user?.profilePicture;
 
-    const phoneUnderline = showLengthError ? errorColor : (phoneFocused ? accent : underlineIdle);
-    const usernameUnderline = usernameFocused ? accent : underlineIdle;
+    const queryUnderline = showLengthError ? errorColor : (queryFocused ? accent : underlineIdle);
+
+    // Sub-label of the found user, shown according to what was searched.
+    const resultSubLabel =
+      queryType === 'email' ? (searchResult?.user?.email || query.trim())
+      : queryType === 'username' ? `@${searchResult?.user?.userName || query.trim()}`
+      : `${selectedCountry.code} ${phoneDigits}`;
+
+    // Helper line under the input, based on what the user is typing.
+    const helperLine = (() => {
+      if (queryType === 'email') {
+        return isCompleteEmail ? 'Searching by email' : 'Enter a full email address';
+      }
+      if (queryType === 'username') {
+        return `Searching by username (at least ${MIN_USERNAME_LENGTH} characters)`;
+      }
+      if (queryType === 'phone') {
+        return showLengthError
+          ? `${selectedCountry?.name || 'This country'} numbers are ${phoneLengthHint(selectedCountry?.code)}`
+          : `Enter a ${phoneLengthHint(selectedCountry?.code)} ${selectedCountry?.name || ''} number`.trimEnd();
+      }
+      return 'Search by phone number, username or email';
+    })();
 
     return (
       <Animated.View style={[styles.root, { opacity: fadeAnim, backgroundColor: bg }]}>
@@ -473,7 +448,7 @@ export default function AddNewContact({ navigation }) {
           <View style={styles.headerTitleWrap}>
             <Text style={[styles.headerTitle, { color: primaryText }]}>New contact</Text>
             <Text style={[styles.headerSubtitle, { color: secondaryText }]}>
-              {searchMode === 'username' ? 'Search by username' : (selectedCountry?.name || 'Search by phone number')}
+              {selectedCountry?.name || 'Search'}
             </Text>
           </View>
         </View>
@@ -495,122 +470,57 @@ export default function AddNewContact({ navigation }) {
               </View>
               <Text style={[styles.illTitle, { color: primaryText }]}>Add a new contact</Text>
               <Text style={[styles.illSubtitle, { color: secondaryText }]}>
-                {isUsernameMode
-                  ? `Enter their username to start chatting on ${String(APP_TAG_NAME || 'the app')}.`
-                  : `Enter their phone number to start chatting on ${String(APP_TAG_NAME || 'the app')}.`}
+                {`Enter their phone number, username or email to start chatting on ${String(APP_TAG_NAME || 'the app')}.`}
               </Text>
             </View>
 
-            {/* Segmented toggle — only when the search mode isn't locked to the
-                user's login method (mobile-login → mobile, username-login → username). */}
-            {allowedMode === null && (
-              <View style={[styles.segment, { backgroundColor: cardBg }]}>
-                <TouchableOpacity
-                  activeOpacity={0.85}
-                  onPress={() => switchMode('mobile')}
-                  style={[styles.segmentBtn, !isUsernameMode && { backgroundColor: accent }]}
-                >
-                  <Ionicons name="call-outline" size={16} color={!isUsernameMode ? '#fff' : secondaryText} />
-                  <Text style={[styles.segmentText, { color: !isUsernameMode ? '#fff' : secondaryText }]}>
-                    Phone number
-                  </Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  activeOpacity={0.85}
-                  onPress={() => switchMode('username')}
-                  style={[styles.segmentBtn, isUsernameMode && { backgroundColor: accent }]}
-                >
-                  <Ionicons name="at-outline" size={16} color={isUsernameMode ? '#fff' : secondaryText} />
-                  <Text style={[styles.segmentText, { color: isUsernameMode ? '#fff' : secondaryText }]}>
-                    Username
-                  </Text>
-                </TouchableOpacity>
+            {/* Unified search row — country code chip + smart input. The chip is
+                used only when a phone number is detected; username/email ignore it. */}
+            <View style={[styles.phoneRow, { borderBottomColor: queryUnderline }]}>
+              <View style={[styles.codeChip, { backgroundColor: cardBg }]}>
+                <CountryCodeContact
+                  selectedCountry={selectedCountry}
+                  onCountrySelect={handleCountrySelect}
+                  showFlag={true}
+                  showCode={true}
+                  showName={false}
+                />
+                <Ionicons name="chevron-down" size={14} color={secondaryText} style={styles.codeChevron} />
               </View>
-            )}
 
-            {isUsernameMode ? (
-              <>
-                {/* Username row */}
-                <View style={[styles.phoneRow, { borderBottomColor: usernameUnderline }]}>
-                  <Ionicons name="at" size={20} color={usernameFocused ? accent : placeholderText} style={styles.usernameIcon} />
-                  <TextInput
-                    style={[styles.phoneInput, { color: primaryText }]}
-                    placeholder="username"
-                    placeholderTextColor={placeholderText}
-                    value={username}
-                    onChangeText={handleUsernameChange}
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    onFocus={() => setUsernameFocused(true)}
-                    onBlur={() => setUsernameFocused(false)}
-                  />
+              <TextInput
+                style={[styles.phoneInput, { color: primaryText }]}
+                placeholder="Phone, username or email"
+                placeholderTextColor={placeholderText}
+                value={query}
+                onChangeText={handleQueryChange}
+                keyboardType="default"
+                autoCapitalize="none"
+                autoCorrect={false}
+                onFocus={() => setQueryFocused(true)}
+                onBlur={() => setQueryFocused(false)}
+              />
 
-                  {isSearching ? (
-                    <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
-                  ) : userFound ? (
-                    <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
-                  ) : username.length > 0 ? (
-                    <TouchableOpacity onPress={handleClearUsername} style={styles.trailIcon}>
-                      <Ionicons name="close-circle" size={20} color={userNotFound ? errorColor : secondaryText} />
-                    </TouchableOpacity>
-                  ) : null}
-                </View>
+              {/* Trailing status icon */}
+              {isSearching ? (
+                <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
+              ) : userFound ? (
+                <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
+              ) : userNotFound ? (
+                <TouchableOpacity onPress={handleClearQuery} style={styles.trailIcon}>
+                  <Ionicons name="close-circle" size={22} color={errorColor} />
+                </TouchableOpacity>
+              ) : hasInput ? (
+                <TouchableOpacity onPress={handleClearQuery} style={styles.trailIcon}>
+                  <Ionicons name="close-circle" size={20} color={secondaryText} />
+                </TouchableOpacity>
+              ) : null}
+            </View>
 
-                <Text style={[styles.helperText, { color: secondaryText }]}>
-                  Enter at least {MIN_USERNAME_LENGTH} characters of their username.
-                </Text>
-              </>
-            ) : (
-              <>
-                {/* Phone row — code chip + number, WhatsApp underline */}
-                <View style={[styles.phoneRow, { borderBottomColor: phoneUnderline }]}>
-                  <View style={[styles.codeChip, { backgroundColor: cardBg }]}>
-                    <CountryCodeContact
-                      selectedCountry={selectedCountry}
-                      onCountrySelect={handleCountrySelect}
-                      showFlag={true}
-                      showCode={true}
-                      showName={false}
-                    />
-                    <Ionicons name="chevron-down" size={14} color={secondaryText} style={styles.codeChevron} />
-                  </View>
-
-                  <TextInput
-                    style={[styles.phoneInput, { color: primaryText }]}
-                    placeholder="phone number"
-                    placeholderTextColor={placeholderText}
-                    value={phoneNumber}
-                    onChangeText={handlePhoneNumberChange}
-                    keyboardType="phone-pad"
-                    maxLength={maxLen}
-                    onFocus={() => setPhoneFocused(true)}
-                    onBlur={() => setPhoneFocused(false)}
-                  />
-
-                  {/* Trailing status icon */}
-                  {isSearching ? (
-                    <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
-                  ) : userFound ? (
-                    <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
-                  ) : userNotFound ? (
-                    <TouchableOpacity onPress={handleClearPhoneNumber} style={styles.trailIcon}>
-                      <Ionicons name="close-circle" size={22} color={errorColor} />
-                    </TouchableOpacity>
-                  ) : hasInput ? (
-                    <TouchableOpacity onPress={handleClearPhoneNumber} style={styles.trailIcon}>
-                      <Ionicons name="close-circle" size={20} color={secondaryText} />
-                    </TouchableOpacity>
-                  ) : null}
-                </View>
-
-                {/* Validation / helper line (country-aware) */}
-                <Text style={[styles.helperText, { color: showLengthError ? errorColor : secondaryText }]}>
-                  {showLengthError
-                    ? `${selectedCountry?.name || 'This country'} numbers are ${phoneLengthHint(selectedCountry?.code)}`
-                    : `Enter a ${phoneLengthHint(selectedCountry?.code)} ${selectedCountry?.name || ''} number`.trimEnd()}
-                </Text>
-              </>
-            )}
+            {/* Validation / helper line (query-aware) */}
+            <Text style={[styles.helperText, { color: showLengthError ? errorColor : secondaryText }]}>
+              {helperLine}
+            </Text>
 
             {/* User found card */}
             {userFound && (
@@ -643,9 +553,7 @@ export default function AddNewContact({ navigation }) {
                       {userDisplayName}
                     </Text>
                     <Text style={[styles.userPhone, { color: secondaryText }]} numberOfLines={1}>
-                      {isUsernameMode
-                        ? `@${searchResult?.user?.userName || username.trim()}`
-                        : `${selectedCountry.code} ${phoneNumber}`}
+                      {resultSubLabel}
                     </Text>
                   </View>
                   <View style={[styles.userCta, { backgroundColor: accent }]}>
@@ -666,12 +574,12 @@ export default function AddNewContact({ navigation }) {
                   <Ionicons name="person-remove-outline" size={26} color={errorColor} />
                 </View>
                 <Text style={[styles.notFoundTitle, { color: primaryText }]}>
-                  {isUsernameMode ? 'No match found' : `Not on ${String(APP_TAG_NAME || 'the app')}`}
+                  {queryType === 'phone' ? `Not on ${String(APP_TAG_NAME || 'the app')}` : 'No match found'}
                 </Text>
                 <Text style={[styles.notFoundSubtitle, { color: secondaryText }]}>
-                  {isUsernameMode
-                    ? "No account matches that username. Double-check the spelling and try again."
-                    : "This number isn't registered yet. Double-check the country code and number, or invite them later."}
+                  {queryType === 'phone'
+                    ? "This number isn't registered yet. Double-check the country code and number, or invite them later."
+                    : "No account matches that. Double-check the spelling and try again."}
                 </Text>
               </View>
             )}
@@ -734,30 +642,7 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
 
-  // Search-mode segmented toggle
-  segment: {
-    flexDirection: 'row',
-    borderRadius: 12,
-    padding: 4,
-    marginBottom: 22,
-    gap: 4,
-  },
-  segmentBtn: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 6,
-    height: 38,
-    borderRadius: 9,
-  },
-  segmentText: {
-    fontFamily: 'Roboto-Medium',
-    fontSize: 13,
-  },
-  usernameIcon: { marginRight: 10 },
-
-  // Phone row
+  // Search row
   phoneRow: {
     flexDirection: 'row',
     alignItems: 'center',

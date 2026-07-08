@@ -1173,7 +1173,7 @@ export default function ChatList({ navigation }) {
   // Pinned (non-scrolling) section: ONLY the search bar.
   const pinnedSearchAndFilters = (
     <View style={[styles.pinnedHeaderWrap, { backgroundColor: theme.colors.background }]}>
-      <View style={[styles.searchBar, { backgroundColor: isDarkMode ? '#1F2C33' : '#f0f2f5' }]}>
+      <View style={[styles.searchBar, { backgroundColor: isDarkMode ? '#1F2C3380' : '#f0f2f5' }]}>
         <Ionicons name="search" size={18} color={theme.colors.iconColor} />
         <TextInput
           placeholder="Search"

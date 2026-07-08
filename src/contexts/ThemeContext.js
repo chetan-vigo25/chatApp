@@ -48,7 +48,7 @@ const lightTheme = {
 // so contrast holds (no light borders/surfaces bleeding onto a dark background).
 const darkTheme = {
   colors: {
-    background: '#0B141A',
+    background: '#000000',
     primaryTextColor: '#ffffff',
     secondaryTextColor: '#8696a0',
     textWhite: '#ffffff',
