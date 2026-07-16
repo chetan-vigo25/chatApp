@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="expo.modules.callui" >
+
+    <uses-sdk android:minSdkVersion="24" />
+    <!--
+       Foreground service for the active-call ongoing notification. Declared here
+       in the module manifest (merged into the app manifest at build time) rather
+       than via a config plugin, so the permission + <service> ship with the
+       module that uses them. microphone/camera FGS types match the WebRTC call's
+       actual mic/camera capture and need no extra runtime role (unlike the
+       phoneCall type, which requires MANAGE_OWN_CALLS / self-managed Telecom).
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+
+    <!--
+       Lets the app open the system dialog to exempt itself from Doze battery
+       optimization (requestDisableBatteryOptimization). Without this exemption a
+       killed/rebooted app on OEM skins is blocked from waking on the incoming-call
+       FCM push, so calls never ring until the app is opened. Declared here so it
+       merges into the app manifest with the module that uses it.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application>
+
+        <!--
+         Receives the Decline / Hang-up taps from the CallStyle notifications.
+         Runs natively even when the JS app is killed.
+        -->
+        <receiver
+            android:name="expo.modules.callui.CallActionReceiver"
+            android:exported="false" />
+
+        <!-- Persistent active-call notification (duration timer + Hang up). -->
+        <service
+            android:name="expo.modules.callui.CallForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|camera" />
+    </application>
+
+</manifest>

@@ -2,7 +2,7 @@
   "expo": {
     "name": "TalksTry",
     "slug": "baatCheet",
-    "version": "1.3.0",
+    "version": "1.3.1",
     "orientation": "portrait",
     "scheme": "talkstry",
     "userInterfaceStyle": "automatic",
@@ -21,7 +21,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chat.baatCheet",
-      "buildNumber": "6",
+      "buildNumber": "9",
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
@@ -48,7 +48,8 @@
       "versionCode": 5,
       "googleServicesFile": "./google-services.json",
       "edgeToEdgeEnabled": true,
-       "permissions": [
+      "allowBackup": false,
+      "permissions": [
         "CAMERA",
         "RECORD_AUDIO",
         "ACCESS_FINE_LOCATION",
@@ -65,9 +66,6 @@
         "android.permission.READ_MEDIA_VIDEO",
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.USE_FULL_SCREEN_INTENT",
-        "android.permission.FOREGROUND_SERVICE",
-        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
-        "android.permission.FOREGROUND_SERVICE_CAMERA",
         "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
       ],
       "notification": {
@@ -124,11 +122,20 @@
       ],
       "expo-sqlite",
       "./plugins/withCallFullScreen",
+      "./plugins/withCallFcmService",
+      "./plugins/withCallOnNewIntent",
       "./plugins/withNotifeeMavenRepo",
       "./plugins/withFirebaseNotificationMeta",
       "./plugins/withNotificationServiceExtension",
       "./plugins/withIosVoip",
-      "./plugins/withFmtConstevalFix"
+      "./plugins/withIosPrivacyScreen",
+      [
+        "@config-plugins/react-native-webrtc",
+        {
+          "cameraPermission": "TalksTry needs camera access for video calls.",
+          "microphonePermission": "TalksTry needs microphone access for voice and video calls."
+        }
+      ]
     ],
     "extra": {
       "eas": {

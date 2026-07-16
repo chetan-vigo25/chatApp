@@ -129,6 +129,17 @@ export const registerCallUuid = (callId, uuid) => {
   const key = String(callId || '');
   const u = String(uuid || '');
   if (!key || !u) return;
+  // Re-binding to a DIFFERENT uuid means CallKit may hold TWO calls for this one
+  // logical call: the JS-minted one (socket path rang first, old backend / race)
+  // plus the native-reported one (VoIP push). End the stale one NOW — a leftover
+  // duplicate otherwise (a) fires `endCall` on answer, which the end listener
+  // used to map to this callId and hang up the LIVE call, and (b) lingers as a
+  // ghost "running" call that holds the audio session and mutes the next call.
+  const old = idToUuid[key];
+  if (old && old !== u) {
+    try { if (isAvailable()) RNCallKeep.endCall(old); } catch (_) { /* no-op */ }
+    delete uuidToId[old];
+  }
   idToUuid[key] = u;
   uuidToId[u] = key;
 };
@@ -151,7 +162,11 @@ export const setup = async () => {
         appName: 'BaatCheet',
         supportsVideo: true,
         maximumCallGroups: '1',
-        maximumCallsPerCallGroup: '4',
+        // ONE call at a time: with >1, a second incoming ring offers iOS's
+        // "Hold & Accept" — a hold/second-line flow the WebView engine cannot
+        // service (the backend busy-gates a second call anyway). 1 makes iOS
+        // offer only End & Accept / Decline, matching what the app supports.
+        maximumCallsPerCallGroup: '1',
       },
       android: {
         alertTitle: 'Permissions required',
@@ -231,10 +246,92 @@ export const setMuted = (callId, muted) => {
   try { RNCallKeep.setMutedCall(uuidForCall(callId), !!muted); } catch (_) { /* no-op */ }
 };
 
-export const endCall = (callId) => {
+/**
+ * Answer the RINGING CallKit call for `callId` from the APP side (user accepted
+ * via an in-app UI or a replayed notification action, not the CallKit screen).
+ * Files the CXAnswerCallAction: the CallKit ring/banner dismisses, iOS switches
+ * it to an ongoing call, and — critically — ACTIVATES THE AUDIO SESSION
+ * (didActivateAudioSession), without which call audio stays dead. Without this,
+ * an in-app accept left the CallKit banner RINGING on top of a "connected"
+ * call. The resulting 'answerCall' echo event is ignored by the provider's
+ * onAnswer (the call is already accepted by then). Prefers the exact uuid the
+ * VoIP push registered; falls back to the mapped uuid.
+ */
+export const answerIncomingCall = (callId) => {
   if (!isAvailable()) return;
-  try { RNCallKeep.endCall(uuidForCall(callId)); } catch (_) { /* no-op */ }
+  const u = idToUuid[String(callId || '')] || uuidForCall(callId);
+  try { RNCallKeep.answerIncomingCall(u); } catch (_) { /* no-op */ }
+};
+
+/**
+ * End/dismiss the CallKit call for `callId`.
+ *
+ * `endedReason` (CXCallEndedReason: 1 failed · 2 remoteEnded · 3 unanswered ·
+ * 4 answeredElsewhere · 5 declinedElsewhere), when > 0, reports a REMOTE/system
+ * end via reportEndCallWithUUID — iOS then shows the right outcome (e.g. a
+ * missed ring dismisses as "unanswered" instead of looking user-ended) and no
+ * CXEndCallAction is filed. 0/omitted = local user action → plain endCall.
+ */
+export const endCall = (callId, endedReason = 0) => {
+  if (!isAvailable()) return;
+  try {
+    const u = uuidForCall(callId);
+    if (endedReason > 0 && typeof RNCallKeep.reportEndCallWithUUID === 'function') {
+      RNCallKeep.reportEndCallWithUUID(u, endedReason);
+    } else {
+      RNCallKeep.endCall(u);
+    }
+  } catch (_) { /* no-op */ }
   forget(callId);
+};
+
+/**
+ * Nuke EVERY CallKit call this app has reported. The app supports one logical
+ * call at a time, so this is a safe terminal cleanup: finalizeEnd calls it after
+ * the per-id endCall()s to dismiss any GHOST CallKit call left by a uuid split
+ * (socket-minted vs VoIP-push uuid for the same call). A ghost that survives
+ * keeps iOS showing an ongoing call AND holds the audio session hostage — the
+ * "old call still running / next call has no audio" failure.
+ */
+export const endAllCalls = () => {
+  if (!isAvailable()) return;
+  try { RNCallKeep.endAllCalls(); } catch (_) { /* no-op */ }
+  for (const key of Object.keys(idToUuid)) forget(key);
+};
+
+/**
+ * Dismiss a CallKit ring for a call that is ALREADY OVER (stale VoIP push: the
+ * AppDelegate must report every VoIP push to CallKit, so a late push for an
+ * ended call still rings full-screen). `reportEndCallWithUUID` with reason 2
+ * (CXCallEndedReason.remoteEnded) auto-dismisses the ring the way a caller
+ * hang-up does — instead of letting it ring to CallKit's own timeout. Prefers
+ * the exact backend uuid from the push payload; falls back to the mapped uuid.
+ */
+export const dismissIncoming = (callId, uuid, reason = 2) => {
+  if (!isAvailable()) return;
+  const u = String(uuid || '') || idToUuid[String(callId || '')] || null;
+  if (u) {
+    try {
+      if (typeof RNCallKeep.reportEndCallWithUUID === 'function') {
+        RNCallKeep.reportEndCallWithUUID(u, reason);
+      } else {
+        RNCallKeep.endCall(u);
+      }
+    } catch (_) { /* no-op */ }
+    delete uuidToId[u];
+  }
+  if (callId) forget(callId);
+};
+
+/**
+ * Full teardown for logout: end every CallKit call AND drop all bookkeeping
+ * (uuid maps + the outgoing-reported guard). Without this a mapping leaked
+ * across a logout→login within the same JS runtime could dismiss or dedupe
+ * against the WRONG call for the next account.
+ */
+export const resetAll = () => {
+  endAllCalls();
+  outgoingReported.clear();
 };
 
 /**
@@ -246,7 +343,30 @@ export const endCall = (callId) => {
 export const registerEvents = (handlers = {}) => {
   if (!isAvailable()) return () => {};
   const answer = ({ callUUID }) => handlers.onAnswer && handlers.onAnswer(callIdForUuid(callUUID));
-  const end = ({ callUUID }) => handlers.onEnd && handlers.onEnd(callIdForUuid(callUUID));
+  // Forward an endCall ONLY for the call's CURRENT uuid. CallKit can fire endCall
+  // for (a) a STALE duplicate of the same call (uuid split between the JS socket
+  // path and the VoIP push — ending the duplicate must not hang up the live call
+  // the user just answered) and (b) a uuid we no longer know at all (ghost from a
+  // previous call the user dismissed from the iOS call UI) — neither may tear
+  // down the current call.
+  const end = ({ callUUID }) => {
+    const u = String(callUUID || '');
+    const cid = callIdForUuid(u);
+    if (!cid) {
+      // Unknown uuid. With live mappings this is a ghost from an earlier call
+      // (user dismissed it from the iOS call UI) — ignore, it must not tear
+      // down the current call. With NO mappings at all (fresh JS — cold start
+      // answered/ended on the CallKit screen before any push landed) it can
+      // only be the real call: forward so the end isn't silently lost.
+      if (Object.keys(idToUuid).length === 0) handlers.onEnd && handlers.onEnd(null);
+      return;
+    }
+    if (idToUuid[cid] && idToUuid[cid] !== u) {
+      delete uuidToId[u]; // stale duplicate ended — drop its mapping, keep the call
+      return;
+    }
+    handlers.onEnd && handlers.onEnd(cid);
+  };
   const mute = ({ callUUID, muted }) => handlers.onToggleMute && handlers.onToggleMute(callIdForUuid(callUUID), muted);
   // CallKit owns the process-global AVAudioSession. When a call is answered from a
   // KILLED/LOCKED state, iOS DEACTIVATES whatever session we set up and activates
@@ -257,6 +377,24 @@ export const registerEvents = (handlers = {}) => {
   const audioOn = () => handlers.onAudioSessionActivated && handlers.onAudioSessionActivated();
   const audioOff = () => handlers.onAudioSessionDeactivated && handlers.onAudioSessionDeactivated();
   try {
+    // MUST be attached FIRST: RNCallKeep buffers every CallKit action that fired
+    // before JS attached listeners — on a KILLED app the user's Answer on the
+    // CallKit screen lands here, NOT on 'answerCall'. Without this replay the
+    // accept was silently lost: the app booted to a ringing state nobody had
+    // answered, the backend ring window elapsed, and the just-accepted call was
+    // torn down ("accept karte hi call cut"). Replay maps each buffered event
+    // onto the same handlers as the live listeners.
+    RNCallKeep.addEventListener('didLoadWithEvents', (events) => {
+      if (!Array.isArray(events)) return;
+      events.forEach((event) => {
+        if (!event || !event.name) return;
+        const data = event.data || {};
+        if (event.name === 'RNCallKeepPerformAnswerCallAction') answer(data);
+        else if (event.name === 'RNCallKeepPerformEndCallAction') end(data);
+        else if (event.name === 'RNCallKeepDidPerformSetMutedCallAction') mute(data);
+        else if (event.name === 'RNCallKeepDidActivateAudioSession') audioOn();
+      });
+    });
     RNCallKeep.addEventListener('answerCall', answer);
     RNCallKeep.addEventListener('endCall', end);
     RNCallKeep.addEventListener('didPerformSetMutedCallAction', mute);
@@ -269,6 +407,7 @@ export const registerEvents = (handlers = {}) => {
   } catch (_) { /* no-op */ }
   return () => {
     try {
+      RNCallKeep.removeEventListener('didLoadWithEvents');
       RNCallKeep.removeEventListener('answerCall');
       RNCallKeep.removeEventListener('endCall');
       RNCallKeep.removeEventListener('didPerformSetMutedCallAction');
@@ -289,6 +428,10 @@ export default {
   reportOutgoingConnected,
   setCurrentCallActive,
   setMuted,
+  answerIncomingCall,
   endCall,
+  endAllCalls,
+  dismissIncoming,
+  resetAll,
   registerEvents,
 };

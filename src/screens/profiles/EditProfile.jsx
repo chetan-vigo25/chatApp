@@ -211,7 +211,7 @@ export default function EditProfile({ navigation, route }) {
   const borderClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
-  const themeColor = theme.colors.themeColor || '#00A884';
+  const themeColor = theme.colors.themeColor || '#03b0a2';
   const inputBg = isDarkMode ? '#0f1923' : '#F4F5F7';
 
   const imgSrc = getImageSource();

@@ -31,17 +31,50 @@ const CALL_CATEGORY_ID = 'incoming_call';
 // simply stays off until the app is rebuilt with the native module.
 let _messaging = null;
 let _messagingResolved = false;
+// onTokenRefresh must be bound exactly once across all getFCMToken() calls.
+let _refreshListenerBound = false;
+// Single AppState listener that re-drives token acquisition once the app is
+// truly foregrounded (see ensureFcmTokenOnForeground).
+let _fgTokenSub = null;
 const getMessaging = () => {
   if (_messagingResolved) return _messaging;
   _messagingResolved = true;
   try {
-    // Make sure the [DEFAULT] app is initialized BEFORE messaging() is resolved
-    // — messaging() reaches into the default app and throws if it doesn't exist.
+    // Make sure the [DEFAULT] app is initialized BEFORE messaging is resolved
+    // — resolving reaches into the default app and throws if it doesn't exist.
     ensureFirebaseApp();
     // eslint-disable-next-line global-require
     const mod = require('@react-native-firebase/messaging');
-    const factory = mod && (mod.default || mod);
-    _messaging = typeof factory === 'function' ? factory : null;
+    if (typeof mod.getMessaging === 'function') {
+      // v22+ modular API. RNFirebase deprecated the namespaced surface
+      // (calling `messaging()` / its methods logs a deprecation warning on
+      // every boot and it's removed in the next major). Wrap the modular
+      // functions in a shim with the familiar namespaced method names so all
+      // existing `m().xyz()` call sites work unchanged, warning-free.
+      const inst = mod.getMessaging();
+      const shim = {
+        hasPermission: () => mod.hasPermission(inst),
+        requestPermission: () => mod.requestPermission(inst),
+        onTokenRefresh: (listener) => mod.onTokenRefresh(inst, listener),
+        get isDeviceRegisteredForRemoteMessages() {
+          return mod.isDeviceRegisteredForRemoteMessages(inst);
+        },
+        registerDeviceForRemoteMessages: () => mod.registerDeviceForRemoteMessages(inst),
+        getAPNSToken: () => mod.getAPNSToken(inst),
+        getToken: () => mod.getToken(inst),
+        setBackgroundMessageHandler: (handler) => mod.setBackgroundMessageHandler(inst, handler),
+        onMessage: (listener) => mod.onMessage(inst, listener),
+        onNotificationOpenedApp: (listener) => mod.onNotificationOpenedApp(inst, listener),
+        getInitialNotification: () => mod.getInitialNotification(inst),
+      };
+      _messaging = () => shim;
+      // Statics read off the accessor itself (m.AuthorizationStatus).
+      _messaging.AuthorizationStatus = mod.AuthorizationStatus;
+    } else {
+      // Older RNFirebase without the modular API — keep the namespaced factory.
+      const factory = mod && (mod.default || mod);
+      _messaging = typeof factory === 'function' ? factory : null;
+    }
   } catch (err) {
     console.warn('[FCM] native module unavailable — push disabled until rebuild:', err?.message);
     _messaging = null;
@@ -110,7 +143,7 @@ const setupNotificationChannel = async () => {
       importance: Notifications.AndroidImportance.MAX,
       vibrationPattern: [0, 900, 700, 900],
       sound: 'default',
-      lightColor: '#00A884',
+      lightColor: '#03b0a2',
       enableLights: true,
       enableVibrate: true,
       showBadge: false,
@@ -125,7 +158,7 @@ const setupNotificationChannel = async () => {
       description: 'Missed voice and video calls',
       importance: Notifications.AndroidImportance.DEFAULT,
       vibrationPattern: [0, 250],
-      lightColor: '#00A884',
+      lightColor: '#03b0a2',
       enableLights: true,
       enableVibrate: true,
       showBadge: true,
@@ -325,9 +358,18 @@ export const getFCMToken = async () => {
     console.warn('[FCM] getFCMToken skipped — native module unavailable');
     return null;
   }
+  // Ask for display permission, but NEVER let a missing/denied permission block
+  // TOKEN registration: getToken() doesn't need POST_NOTIFICATIONS — that
+  // permission only gates DISPLAYING banners. Bailing out here left the backend
+  // with no token at all for this device (push lookup finds devices:0 → messages
+  // AND call wakes dead), and it stayed dead even after the user later granted
+  // the permission in Settings. Fetching + registering anyway means data pushes
+  // (call wake, sync) keep arriving, and banners light up the moment the
+  // permission is granted — no re-login needed.
   const hasPermission = await requestNotificationPermission();
-  // console.log('[FCM] hasPermission:', hasPermission);
-  if (!hasPermission) return null;
+  if (!hasPermission) {
+    console.warn('[FCM] notification permission not granted — fetching token anyway (banners hidden until granted)');
+  }
 
   // Register the refresh listener UP FRONT — before the (retryable) getToken
   // call. A rotated token (new install, app data clear, FCM refresh) must be
@@ -337,15 +379,22 @@ export const getFCMToken = async () => {
   // FCM hands us a token via refresh, we still capture + re-register it.
   // (A fresh build install ALSO rotates the token — the most common reason
   // background calls stop notifying after `expo run:android` until re-register.)
-  try {
-    m().onTokenRefresh((newToken) => {
-      // console.log('[FCM] Token refreshed → re-registering:', newToken);
-      _persistToken(newToken);
-      // If recovery was running and FCM finally delivered a token via refresh,
-      // we no longer need to poll.
-      if (newToken) _stopTokenRecovery();
-    });
-  } catch (_) {}
+  // Bind the refresh listener only ONCE. getFCMToken can now be re-invoked
+  // (e.g. by the foreground re-trigger below when the first boot deferred the
+  // permission prompt), and stacking a fresh onTokenRefresh handler on every
+  // call would multi-register + multi-persist the same token.
+  if (!_refreshListenerBound) {
+    try {
+      m().onTokenRefresh((newToken) => {
+        // console.log('[FCM] Token refreshed → re-registering:', newToken);
+        _persistToken(newToken);
+        // If recovery was running and FCM finally delivered a token via refresh,
+        // we no longer need to poll.
+        if (newToken) _stopTokenRecovery();
+      });
+      _refreshListenerBound = true;
+    } catch (_) {}
+  }
 
   try {
     if (Platform.OS === 'ios') {
@@ -389,8 +438,59 @@ export const getFCMToken = async () => {
 // same "store it + tell the backend" behaviour.
 const _persistToken = (token) => {
   if (!token) return;
+  // ── TEMPORARY (production push debugging) — REMOVE AFTER VERIFICATION ──
+  // Deliberately NOT __DEV__-gated: prints the full FCM token in RELEASE
+  // builds so it can be grabbed from `adb logcat -s ReactNativeJS:I | grep
+  // FCM-TOKEN` and pasted into Firebase Console → Messaging → "Send test
+  // message" to prove the app/Firebase side end-to-end. The token is not a
+  // secret (it's device-addressing data), but this log is still noise —
+  // delete this block once production push is confirmed working.
+  console.log('══════════ [FCM-TOKEN] ══════════');
+  console.log('[FCM-TOKEN]', token);
+  console.log('═════════════════════════════════');
   try { setPushToken(token); } catch (_) {}
   AsyncStorage.setItem('fcmToken', token).catch(() => {});
+};
+
+// ─── FOREGROUND RE-TRIGGER ───
+// The very first getFCMToken() runs from App.js's mount effect. On a cold start
+// the Android Activity may not be attached yet, so AppState.currentState isn't
+// 'active' — requestNotificationPermission() then DEFERS the interactive prompt
+// (it can't legally show without a foreground Activity) and returns false, so no
+// permission dialog appears and the token stays null with nothing to retry it.
+//
+// This installs a single AppState listener that re-drives getFCMToken() the
+// moment the app is genuinely foregrounded — which is exactly when the OS lets
+// us show the POST_NOTIFICATIONS / messaging permission prompt. It self-removes
+// as soon as a token is obtained (or if push is unavailable). Idempotent: only
+// one listener is ever registered.
+export const ensureFcmTokenOnForeground = () => {
+  if (_fgTokenSub) return; // already watching
+  if (!getMessaging()) return; // native module absent → nothing to retry
+
+  const tryAcquire = async () => {
+    // Already have one from a previous attempt/login? Stop watching.
+    const existing = await AsyncStorage.getItem('fcmToken').catch(() => null);
+    if (existing) { _teardownFgTokenWatch(); return; }
+    const token = await getFCMToken();
+    if (token) _teardownFgTokenWatch();
+  };
+
+  try {
+    _fgTokenSub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') tryAcquire();
+    });
+  } catch (_) { _fgTokenSub = null; return; }
+
+  // If we're already in the foreground right now, don't wait for the next
+  // transition — attempt immediately (the boot deferral means the prompt never
+  // fired, but the Activity is attached now).
+  if (AppState.currentState === 'active') tryAcquire();
+};
+
+const _teardownFgTokenWatch = () => {
+  try { _fgTokenSub?.remove?.(); } catch (_) {}
+  _fgTokenSub = null;
 };
 
 // ─── PERSISTENT TOKEN RECOVERY ───

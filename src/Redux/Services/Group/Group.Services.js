@@ -47,12 +47,15 @@ export async function updateGroup(payload) {
 // VIEW GROUP
 // ============================================
 export async function viewGroup(payload) {
+  // `silent` is client-only (stripped from the request body): background
+  // refreshes retry on failure and must not toast on every attempt.
+  const { silent, ...body } = payload || {};
   try {
-    const response = await apiCall('POST', 'user/group/view', payload);
+    const response = await apiCall('POST', 'user/group/view', body);
     if (response?.statusCode === 200) {
       return response;
     }
-    showToast(response?.message || 'Failed to fetch group');
+    if (!silent) showToast(response?.message || 'Failed to fetch group');
     return Promise.reject(response?.message || 'Failed to fetch group');
   } catch (error) {
     console.error('group/view error:', error);

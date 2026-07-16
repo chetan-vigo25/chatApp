@@ -12,7 +12,7 @@ import { Text } from 'react-native';
 //   style: object        — additional text styles
 //   onMentionPress: fn   — optional callback(userId, displayName)
 
-const MENTION_HIGHLIGHT_COLOR = '#00A884';
+const MENTION_HIGHLIGHT_COLOR = '#03b0a2';
 
 const MentionText = React.memo(function MentionText({
   text,

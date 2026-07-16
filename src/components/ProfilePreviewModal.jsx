@@ -18,10 +18,10 @@
  *   name          string    — contact / group display name
  *   image         uri|null  — avatar URL (falls back to a colored initial)
  *   avatarColor   string    — fallback circle background
- *   isGroup       bool      — group → people icon + no call buttons
+ *   isGroup       bool      — group → people fallback icon
  *   onMessage     fn?       — show Message button when provided
- *   onCall        fn?       — show Call button when provided (1-1 only)
- *   onVideo       fn?       — show Video button when provided (1-1 only)
+ *   onCall        fn?       — show Call button when provided (1-1 + group)
+ *   onVideo       fn?       — show Video button when provided (1-1 + group)
  *   onInfo        fn?       — show Info button when provided
  *   onViewPhoto   fn?       — tapping the photo (e.g. open full-screen viewer)
  */
@@ -98,12 +98,14 @@ export default function ProfilePreviewModal({
   if (!mounted) return null;
 
   // WhatsApp's popup action icons are bright green (dark) / teal-green (light).
-  const actionGreen = isDarkMode ? '#25D366' : '#008069';
+  const actionGreen = isDarkMode ? '#03b0a2' : '#028578';
   const initial = (name || '?').charAt(0).toUpperCase();
 
   const showMessage = typeof onMessage === 'function';
-  const showCall = typeof onCall === 'function' && !isGroup;
-  const showVideo = typeof onVideo === 'function' && !isGroup;
+  // Groups get call/video too (group call rings all members); only broadcast
+  // channels never show them. Callers control availability via the callbacks.
+  const showCall = typeof onCall === 'function' && !isBroadcast;
+  const showVideo = typeof onVideo === 'function' && !isBroadcast;
   const showInfo = typeof onInfo === 'function';
   const hasActions = showMessage || showCall || showVideo || showInfo;
 

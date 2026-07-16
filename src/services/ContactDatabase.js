@@ -26,6 +26,41 @@ const runExclusive = (fn) => {
 
 // ─── DATABASE INIT ──────────────────────────────────────
 
+// Crash guard (mirrors ChatDatabase): native closeAsync frees the sqlite3 handle
+// even with a statement still executing on it — a use-after-free SEGV. Track every
+// async statement per handle and drain them (bounded) before any close.
+const _track = (db) => {
+  if (!db || db.__opsTracked) return db;
+  db.__opsTracked = true;
+  db.__inflight = new Set();
+  ['getFirstAsync', 'getAllAsync', 'runAsync', 'execAsync',
+    'withTransactionAsync', 'withExclusiveTransactionAsync'].forEach((name) => {
+    const orig = db[name];
+    if (typeof orig !== 'function') return;
+    db[name] = function tracked(...args) {
+      const p = orig.apply(this, args);
+      if (p && typeof p.then === 'function') {
+        db.__inflight.add(p);
+        const drop = () => { db.__inflight.delete(p); };
+        p.then(drop, drop);
+      }
+      return p;
+    };
+  });
+  return db;
+};
+
+const _drainThenClose = async (db) => {
+  if (!db) return;
+  try {
+    const deadline = Date.now() + 4000;
+    while (db.__inflight && db.__inflight.size && Date.now() < deadline) {
+      await Promise.allSettled(Array.from(db.__inflight));
+    }
+  } catch {}
+  try { await db.closeAsync(); } catch {}
+};
+
 const getDB = async () => {
   // Fast path: DB already open and healthy
   if (_db) {
@@ -52,7 +87,7 @@ const getDB = async () => {
   // with a small back-off plus a fresh handle. We also tolerate PRAGMA failures
   // since journal_mode/synchronous are optimizations, not correctness.
   const tryOpen = async () => {
-    const db = await SQLite.openDatabaseAsync(DB_NAME);
+    const db = _track(await SQLite.openDatabaseAsync(DB_NAME));
     // Settle tick: avoids the Android NullPointerException race between
     // openDatabaseAsync resolving and the native handle being fully ready.
     await new Promise((r) => setTimeout(r, 50));
@@ -68,7 +103,7 @@ const getDB = async () => {
 
   const safeClose = async () => {
     if (!_db) return;
-    try { await _db.closeAsync(); } catch {}
+    await _drainThenClose(_db);
     _db = null;
   };
 

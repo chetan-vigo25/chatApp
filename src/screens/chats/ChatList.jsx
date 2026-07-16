@@ -27,12 +27,20 @@ import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import useStatusIndicators from '../../hooks/useStatusIndicators';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { useCall } from '../../calls/useCall';
+import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Services';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import ContactDatabase from '../../services/ContactDatabase';
 import { subscribeSessionReset } from '../../services/sessionEvents';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
+import { getUserSettings } from '../../Redux/Services/Profile/Settings.Services';
+import {
+  DELETED_PWD_SET_KEY,
+  getDeletedChatConfig,
+  saveDeletedChatConfig,
+  markDeletedPasswordSet,
+} from '../../utils/deletedChatConfig';
 import { APP_TAG_NAME } from '@env';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -267,7 +275,7 @@ export default function ChatList({ navigation }) {
   // via the status feed + realtime sockets (see the hook for data-source order).
   const statusByUserId = useStatusIndicators();
   const { resolveName } = useContactDirectory();
-  const { startAudioCall, startVideoCall } = useCall();
+  const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall } = useCall();
 
   const [visible, setVisible] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -293,6 +301,14 @@ export default function ChatList({ navigation }) {
   // Multi-select state (WhatsApp-style "delete for me" of multiple chats)
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedChatIds, setSelectedChatIds] = useState([]);
+  // "Add to deleted chats" (panic-password automation). The header action only
+  // appears when a deleted-chats password actually exists — arming chats with no
+  // password to trigger them would be a dead switch. `armedChatIds` is the set
+  // already armed, so re-adding the same chat is a no-op instead of a duplicate.
+  const [deletedPwdSet, setDeletedPwdSet] = useState(false);
+  const [armedChatIds, setArmedChatIds] = useState([]);
+  const [armedScope, setArmedScope] = useState('me');
+  const [isArming, setIsArming] = useState(false);
   const [bulkDeleteModalVisible, setBulkDeleteModalVisible] = useState(false);
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
   // Visible during the entire blocking delete (server call + local cleanup).
@@ -479,6 +495,82 @@ export default function ChatList({ navigation }) {
     }, [])
   );
 
+  // Keep the "add to deleted chats" action in sync with the panic-password state:
+  // the cached flag paints immediately, the server settings call corrects it (the
+  // password can be cleared from another device), and the armed config tells us
+  // which chats are already in the list so we never add one twice.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      (async () => {
+        try {
+          const [cached, config] = await Promise.all([
+            AsyncStorage.getItem(DELETED_PWD_SET_KEY),
+            getDeletedChatConfig(),
+          ]);
+          if (!active) return;
+          setDeletedPwdSet(cached === '1');
+          setArmedChatIds(config?.chatIds || []);
+          setArmedScope(config?.scope || 'me');
+        } catch {}
+
+        try {
+          const settings = await getUserSettings();
+          if (!active) return;
+          const isSet = !!settings?.chat?.hasDeletedPassword;
+          setDeletedPwdSet(isSet);
+          await markDeletedPasswordSet(isSet);
+        } catch {
+          /* offline — keep the cached flag */
+        }
+      })();
+      return () => { active = false; };
+    }, [])
+  );
+
+  // Arm the currently-selected chats for the panic purge. Chats already armed are
+  // skipped, so selecting a mix of new + already-added chats only adds the new
+  // ones. Nothing is deleted here — the purge runs at the login gate when the
+  // deleted-chats password is entered.
+  const onBulkAddToDeletedChats = useCallback(async () => {
+    if (isArming || selectedChatIds.length === 0) return;
+
+    const already = new Set(armedChatIds.map(String));
+    const picked = selectedChatIds.map((id) => String(id)).filter(Boolean);
+    const fresh = picked.filter((id) => !already.has(id));
+
+    if (fresh.length === 0) {
+      Alert.alert(
+        'Already added',
+        picked.length === 1
+          ? 'This chat is already in your deleted-chats list.'
+          : 'These chats are already in your deleted-chats list.'
+      );
+      return;
+    }
+
+    setIsArming(true);
+    try {
+      const merged = [...armedChatIds.map(String), ...fresh];
+      const saved = await saveDeletedChatConfig({ scope: armedScope, chatIds: merged });
+      if (!saved) throw new Error('save failed');
+
+      setArmedChatIds(saved.chatIds);
+      const skipped = picked.length - fresh.length;
+      Alert.alert(
+        'Added to deleted chats',
+        `${fresh.length} chat${fresh.length === 1 ? '' : 's'} added${skipped > 0 ? ` (${skipped} already there)` : ''}. ` +
+        `${saved.chatIds.length} chat${saved.chatIds.length === 1 ? '' : 's'} will be deleted ` +
+        `(${saved.scope === 'everyone' ? 'for everyone' : 'for me'}) when the deleted-chats password is entered at login.`
+      );
+      exitSelectionMode();
+    } catch {
+      Alert.alert('Could not add', 'Please try again.');
+    } finally {
+      setIsArming(false);
+    }
+  }, [isArming, selectedChatIds, armedChatIds, armedScope, exitSelectionMode]);
+
   // Initial sync: only call API if SQLite has no chatlist data (first login)
   // After first sync, chatlist is driven entirely by SQLite + socket updates
   const initialSyncDone = useRef(false);
@@ -505,40 +597,67 @@ export default function ChatList({ navigation }) {
   // instead of showing "Unknown". This is gated on MISSING IDENTITY rather than
   // on "first population", so it also fixes the very first chat a user ever
   // receives (the old `size === 0` early-return skipped it).
-  const knownChatIdsRef = useRef(new Set());
+  // Attempts are tracked PER CHAT with a cap + backoff, instead of the old
+  // "once per chatId ever" gate. That gate stranded rows as "Unknown" forever:
+  // when the app is opened FROM a notification the very first refetch usually
+  // races a network/socket that is still coming up — the fetch fails silently,
+  // the id is already marked known, and no retry ever happens.
+  const HYDRATION_MAX_ATTEMPTS = 4;
+  const hydrationAttemptsRef = useRef({});
   const newChatRefetchTimerRef = useRef(null);
+  const [hydrationTick, setHydrationTick] = useState(0);
   useEffect(() => {
-    if (!Array.isArray(realtimeChatList) || realtimeChatList.length === 0) return;
+    if (!Array.isArray(realtimeChatList) || realtimeChatList.length === 0) return undefined;
 
-    let needsHydration = false;
+    // Collect private rows that still have NO displayable identity — no saved/
+    // profile name, no chatName, and no number to fall back on ("Unknown").
+    // Groups and broadcast channels are named server-side (chatName) and must
+    // NOT trigger peer hydration (they have no peerUser to resolve).
+    const namelessIds = [];
     realtimeChatList.forEach((c) => {
       const id = String(c?.chatId || c?._id || '');
       if (!id) return;
-      const isNew = !knownChatIdsRef.current.has(id);
-      knownChatIdsRef.current.add(id);
-
-      // A private row with no resolved peer name still renders "Unknown".
-      // Groups and broadcast channels are named server-side (chatName) and must
-      // NOT trigger peer hydration (they have no peerUser to resolve).
       const isGroupItem = c?.chatType === 'group' || c?.isGroup;
       const isBroadcastItem = c?.chatType === 'broadcast' || c?.isBroadcast;
       const isNamedNonPrivate = isGroupItem || isBroadcastItem;
       const hasName = isNamedNonPrivate
         ? Boolean(c?.chatName || c?.group?.name || c?.groupName)
-        : Boolean(c?.peerUser?.fullName);
-      if (isNew && !isNamedNonPrivate && !hasName) needsHydration = true;
+        : Boolean(
+            c?.peerUser?.fullName
+            || c?.chatName
+            || c?.mobileNumber
+            || c?.peerUser?.mobileNumber
+            || c?.peerUser?.userName
+          );
+      if (!isNamedNonPrivate && !hasName) namelessIds.push(id);
     });
 
-    if (!needsHydration) return;
+    if (!namelessIds.length) return undefined;
 
-    // Debounce: bursts of incoming events should trigger a single refetch
+    // Backoff off the least-attempted nameless row; stop once every nameless
+    // row has exhausted its attempts (server genuinely has no identity for it —
+    // ChatCard then degrades to number/username, never a permanent blank).
+    const attempt = Math.min(
+      ...namelessIds.map((id) => hydrationAttemptsRef.current[id] || 0)
+    );
+    if (attempt >= HYDRATION_MAX_ATTEMPTS) return undefined;
+
     if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
     newChatRefetchTimerRef.current = setTimeout(() => {
-      cllog('🌐 CHAT LIST: new chat missing identity → REST API refetch to hydrate name/avatar');
-      dispatch(chatListData(''));
       newChatRefetchTimerRef.current = null;
-    }, 400);
-  }, [realtimeChatList, dispatch]);
+      namelessIds.forEach((id) => {
+        hydrationAttemptsRef.current[id] = (hydrationAttemptsRef.current[id] || 0) + 1;
+      });
+      cllog('🌐 CHAT LIST: chats missing identity → REST refetch to hydrate name/avatar', {
+        chats: namelessIds.length, attempt: attempt + 1,
+      });
+      dispatch(chatListData(''));
+      // Re-evaluate after the fetch settles even if the list reference didn't
+      // change (a failed fetch changes nothing — without this tick the effect
+      // would never re-run and the row would stay "Unknown" until pull-refresh).
+      setTimeout(() => setHydrationTick((t) => t + 1), 2000);
+    }, 400 * Math.pow(2, attempt)); // 400ms, 800ms, 1.6s, 3.2s
+  }, [realtimeChatList, hydrationTick, dispatch]);
 
   useEffect(() => () => {
     if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
@@ -614,7 +733,7 @@ export default function ChatList({ navigation }) {
   }, [theme, currentUserId]);
 
   const getUserColor = useCallback((str) => {
-    const colors = ['#833AB4', '#1DB954', '#128C7E', '#075E54', '#777737', '#F56040', '#34B7F1', '#25D366'];
+    const colors = ['#833AB4', '#1DB954', '#02958a', '#026158', '#777737', '#F56040', '#34B7F1', '#03b0a2'];
     if (!str) return colors[0];
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
@@ -732,10 +851,50 @@ export default function ChatList({ navigation }) {
     getUserColor, getPreviewText, getRelativeTime, getLastMessageText, renderMessageStatus,
   ]);
 
-  // Start an audio/video call to the previewed 1-1 contact (WhatsApp preview row).
+  // Start an audio/video call from the preview popup — 1-1 contact, or a GROUP
+  // (rings every other member, WhatsApp parity). Chat-list rows don't carry the
+  // group roster, so the group path fetches it via group/view before dialing;
+  // the call engine trims the list to its participant cap.
   const startPreviewCall = useCallback((media) => {
-    const peer = selectedChatItem?.peerUser;
-    const peerId = peer?._id || selectedChatItem?.peerUserId;
+    const item = selectedChatItem;
+    if (!item) return;
+    const isGroup = item?.chatType === 'group' || item?.isGroup;
+    if (isGroup) {
+      const groupId = item?.groupId || item?.group?._id || item?.chatId || item?._id;
+      const groupName = item?.chatName || item?.group?.name || item?.groupName || 'Group';
+      if (!groupId) return;
+      closeProfilePreview();
+      setTimeout(async () => {
+        try {
+          const res = await viewGroupApi({ groupId });
+          const members = res?.data?.members || [];
+          const seen = new Set();
+          const peers = [];
+          members.forEach((m) => {
+            if (!m || m.status === 'removed' || m.isDeleted) return;
+            const u = (typeof m.userId === 'object' && m.userId !== null) ? m.userId : {};
+            const id = u._id || (typeof m.userId === 'string' ? m.userId : null) || m._id || m.id;
+            if (!id) return;
+            const sid = String(id);
+            if (sid === String(currentUserId) || seen.has(sid)) return;
+            seen.add(sid);
+            peers.push({
+              id: sid,
+              name: u.fullName || m.fullName || m.name || 'Member',
+              avatar: u.profileImage || m.profileImage || null,
+            });
+          });
+          if (!peers.length) return;
+          if (media === 'video') startGroupVideoCall?.(peers, { groupId, groupName });
+          else startGroupAudioCall?.(peers, { groupId, groupName });
+        } catch (e) {
+          // group/view already surfaces its own failure toast
+        }
+      }, 220);
+      return;
+    }
+    const peer = item?.peerUser;
+    const peerId = peer?._id || item?.peerUserId;
     if (!peerId) return;
     const peerObj = {
       id: String(peerId),
@@ -748,7 +907,10 @@ export default function ChatList({ navigation }) {
       if (media === 'video') startVideoCall?.(peerObj);
       else startAudioCall?.(peerObj);
     }, 220);
-  }, [selectedChatItem, closeProfilePreview, startVideoCall, startAudioCall]);
+  }, [
+    selectedChatItem, closeProfilePreview, startVideoCall, startAudioCall,
+    startGroupVideoCall, startGroupAudioCall, currentUserId,
+  ]);
 
   const openPreviewInfo = useCallback(() => {
     const isGroup = selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup;
@@ -927,10 +1089,10 @@ export default function ChatList({ navigation }) {
       // messages via ChatCache.hasMessages() and re-shows the deleted history.
       try { ChatCache.clearMessages(chatId); } catch (e) {}
       try { ChatCache.removeChat(chatId); } catch (e) {}
-      // Forget this chatId so a future incoming message from User B is treated as
-      // a brand-new chat and triggers the hydration refetch below (otherwise the
-      // row re-appears as a bare stub with no name / avatar).
-      knownChatIdsRef.current.delete(String(chatId));
+      // Reset hydration attempts so a future incoming message from User B is
+      // treated as a brand-new chat and re-triggers the identity refetch
+      // (otherwise the row re-appears as a bare stub with no name / avatar).
+      delete hydrationAttemptsRef.current[String(chatId)];
       removeChat?.(chatId);
       setDeleteModalVisible(false);
       setDeleteForEveryone(false);
@@ -1007,7 +1169,7 @@ export default function ChatList({ navigation }) {
         try { ChatCache.clearMessages(chatId); } catch (e) { localErrors.push({ chatId, step: 'cacheClearMessages', error: e?.message }); }
         try { ChatCache.removeChat(chatId); } catch (e) { localErrors.push({ chatId, step: 'cacheRemoveChat', error: e?.message }); }
 
-        try { knownChatIdsRef.current.delete(String(chatId)); } catch (e) {}
+        try { delete hydrationAttemptsRef.current[String(chatId)]; } catch (e) {}
         try { removeChat?.(chatId); } catch (e) {}
       }
 
@@ -1111,7 +1273,7 @@ export default function ChatList({ navigation }) {
   const previewAvatarColor = getAvatarColor(previewName);
   // WhatsApp's profile-popup action icons are a bright green (dark mode) /
   // teal-green (light mode) — distinct from the app's own brand teal.
-  const previewActionGreen = isDarkMode ? '#25D366' : '#008069';
+  const previewActionGreen = isDarkMode ? '#03b0a2' : '#028578';
 
   // ─── RENDER ───
 
@@ -1258,8 +1420,27 @@ export default function ChatList({ navigation }) {
             const allArchived = sel.length > 0 && sel.every(c => c?.isArchived);
             const btnBg = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
             const iconColor = theme.colors.primaryTextColor;
+            // Every selected chat is already armed → nothing left to add.
+            const armedSet = new Set(armedChatIds.map(String));
+            const allArmed = selectedChatIds.length > 0
+              && selectedChatIds.every((id) => armedSet.has(String(id)));
             return (
               <View style={styles.headerRight}>
+                {/* Add to deleted chats — only when a deleted-chats password exists */}
+                {deletedPwdSet && (
+                  <TouchableOpacity
+                    onPress={onBulkAddToDeletedChats}
+                    disabled={isArming || allArmed}
+                    activeOpacity={0.6}
+                    style={[styles.headerBtn, { backgroundColor: btnBg, opacity: (isArming || allArmed) ? 0.45 : 1 }]}
+                  >
+                    <MaterialCommunityIcons
+                      name={allArmed ? 'delete-clock' : 'delete-clock-outline'}
+                      size={20}
+                      color={allArmed ? theme.colors.themeColor : iconColor}
+                    />
+                  </TouchableOpacity>
+                )}
                 {/* Pin */}
                 <TouchableOpacity
                   onPress={onBulkTogglePin}
@@ -1626,8 +1807,8 @@ export default function ChatList({ navigation }) {
         subtitle={isPreviewBroadcast ? 'Broadcast channel' : undefined}
         peerId={(isPreviewGroup || isPreviewBroadcast) ? null : (selectedChatItem?.peerUser?._id || selectedChatItem?.peerUserId || null)}
         onMessage={() => { if (selectedChatItem) openChat(selectedChatItem); closeProfilePreview(); }}
-        onCall={(isPreviewGroup || isPreviewBroadcast) ? undefined : () => startPreviewCall('audio')}
-        onVideo={(isPreviewGroup || isPreviewBroadcast) ? undefined : () => startPreviewCall('video')}
+        onCall={isPreviewBroadcast ? undefined : () => startPreviewCall('audio')}
+        onVideo={isPreviewBroadcast ? undefined : () => startPreviewCall('video')}
         onInfo={openPreviewInfo}
         onViewPhoto={previewImage ? () => {
           closeProfilePreview();

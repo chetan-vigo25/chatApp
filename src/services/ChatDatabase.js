@@ -36,6 +36,52 @@ let _readerUnavailable = false;
 // ─── DATABASE INIT ──────────────────────────────────────
 let _dbInitPromise = null;
 
+// ---- in-flight statement tracking (crash guard) ----
+// expo-sqlite's native `closeAsync` frees the sqlite3 handle even while another
+// statement on the SAME connection is still executing natively — a use-after-free
+// SEGV that hard-crashes the app (seen as "app reloads while answering a call":
+// the answer-time catch-up storm has SELECTs in flight when a close lands).
+// Guard: every opened handle gets its async statement methods wrapped so the
+// handle knows its in-flight promises, and every close goes through
+// _drainThenClose, which waits for those to settle BEFORE closeAsync. The wait
+// is bounded (4s) so a wedged statement can't hang teardown forever.
+const _track = (db) => {
+  if (!db || db.__opsTracked) return db;
+  db.__opsTracked = true;
+  db.__inflight = new Set();
+  const wrap = (name) => {
+    const orig = db[name];
+    if (typeof orig !== 'function') return;
+    db[name] = function tracked(...args) {
+      const p = orig.apply(this, args);
+      if (p && typeof p.then === 'function') {
+        db.__inflight.add(p);
+        const drop = () => { db.__inflight.delete(p); };
+        p.then(drop, drop);
+      }
+      return p;
+    };
+  };
+  [
+    'getFirstAsync', 'getAllAsync', 'runAsync', 'execAsync',
+    'withTransactionAsync', 'withExclusiveTransactionAsync',
+  ].forEach(wrap);
+  return db;
+};
+
+const _drainThenClose = async (db) => {
+  if (!db) return;
+  try {
+    const deadline = Date.now() + 4000;
+    while (db.__inflight && db.__inflight.size && Date.now() < deadline) {
+      await Promise.allSettled(Array.from(db.__inflight));
+    }
+  } catch {}
+  // No await boundary between the final empty-set check above and this call, so
+  // a new statement can't start on the handle in between (single JS thread).
+  try { await db.closeAsync(); } catch {}
+};
+
 const getDB = async () => {
   if (_db) {
     // Verify connection is still alive
@@ -43,7 +89,7 @@ const getDB = async () => {
       await _db.getFirstAsync('SELECT 1');
       return _db;
     } catch {
-      try { await _db.closeAsync(); } catch {}
+      await _drainThenClose(_db);
       _db = null;
       _dbInitPromise = null;
       // Primary handle died → drop the reader too so it re-opens cleanly.
@@ -73,7 +119,7 @@ const _closeReadDB = async () => {
   // Only close if it's a genuinely independent handle. If expo-sqlite handed back
   // the SAME connection as the writer (shared cache), closing it here would close
   // the WRITER's connection out from under it.
-  if (r && r !== _db) { try { await r.closeAsync(); } catch {} }
+  if (r && r !== _db) { await _drainThenClose(r); }
 };
 
 const _safeClose = async () => {
@@ -81,7 +127,7 @@ const _safeClose = async () => {
   // recreate/recovery never leaves a stale reader handle on a deleted DB.
   await _closeReadDB();
   if (!_db) return;
-  try { await _db.closeAsync(); } catch {}
+  await _drainThenClose(_db);
   _db = null;
 };
 
@@ -96,9 +142,9 @@ const getReadDB = async () => {
   _readDbInitPromise = (async () => {
     const primary = await getDB(); // ensures file exists + migrations have run
     try {
-      const handle = typeof SQLite.openDatabaseSync === 'function'
+      const handle = _track(typeof SQLite.openDatabaseSync === 'function'
         ? SQLite.openDatabaseSync(DB_NAME)
-        : await SQLite.openDatabaseAsync(DB_NAME);
+        : await SQLite.openDatabaseAsync(DB_NAME));
       // CRITICAL: expo-sqlite caches connections by (name, options). Because the
       // writer and this reader open the SAME name with the SAME options,
       // openDatabaseSync hands back the *same* underlying connection — it is NOT
@@ -305,7 +351,7 @@ const _initDB = async () => {
   for (let attempt = 1; attempt <= MAX_INIT_ATTEMPTS; attempt++) {
     try {
       await _safeClose();
-      _db = await _openHandle(attempt);
+      _db = _track(await _openHandle(attempt));
 
       // Small tick lets the native side finish wiring up the handle before the
       // first call; a touch longer on retries.
@@ -2182,7 +2228,7 @@ const closeDB = async () => {
   _dbInitPromise = null;
   await _closeReadDB();
   if (_db) {
-    try { await _db.closeAsync(); } catch {}
+    await _drainThenClose(_db);
     _db = null;
   }
 };
@@ -2201,7 +2247,7 @@ const closeCleanly = async () => {
   await _closeReadDB();
   if (!_db) return;
   try { await _db.execAsync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch {}
-  try { await _db.closeAsync(); } catch {}
+  await _drainThenClose(_db);
   _db = null;
 };
 
@@ -2487,6 +2533,35 @@ const updateChatLastMessageStatusById = async (chatId, messageId, newStatus) => 
     await db.runAsync(
       `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $cid`,
       { $s: newStatus, $n: Date.now(), $cid: chatId }
+    );
+    return true;
+  });
+};
+
+// Rewrite the chat-list preview to a delete placeholder ONLY when the deleted
+// message IS the chat's current last message. A delete of an older message must
+// not touch the preview — the unguarded variant rewrote last_message_text,
+// nulled last_message_id, and bumped last_message_at to "now" for EVERY
+// delete-for-everyone, corrupting the list preview + ordering on next cold
+// start. Keeps last_message_id and last_message_at intact (same message, same
+// position — only the text/type/deleted flag change).
+const markChatLastMessageDeleted = async (chatId, messageId, placeholderText) => {
+  if (!chatId || !messageId) return false;
+  return runExclusive(async () => {
+    const db = await getDB();
+    const row = await db.getFirstAsync(
+      `SELECT last_message_id FROM chats WHERE chat_id = $cid LIMIT 1`,
+      { $cid: chatId }
+    );
+    if (!row || !row.last_message_id || String(row.last_message_id) !== String(messageId)) {
+      return false;
+    }
+    await db.runAsync(
+      `UPDATE chats SET
+        last_message_text = $text, last_message_type = 'system',
+        last_message_is_deleted = 1, updated_at = $now
+      WHERE chat_id = $cid`,
+      { $text: placeholderText || 'This message was deleted', $now: Date.now(), $cid: chatId }
     );
     return true;
   });
@@ -3000,7 +3075,7 @@ export default {
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
-  updateChatLastMessage, updateChatLastMessageStatusById, updateChatUnread, incrementChatUnread,
+  updateChatLastMessage, updateChatLastMessageStatusById, markChatLastMessageDeleted, updateChatUnread, incrementChatUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
   updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, updatePeerVerified, deleteChatRow, getChatCount,
   // Sync meta

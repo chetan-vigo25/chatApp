@@ -185,7 +185,7 @@ export default function UserDetailsSheet({
           {/* Name + status */}
           <Text style={[styles.name, { color: primaryText }]} numberOfLines={1}>{name}</Text>
           {!!statusLine && (
-            <Text style={[styles.status, { color: isOnline ? '#25D366' : subText }]} numberOfLines={1}>
+            <Text style={[styles.status, { color: isOnline ? '#03b0a2' : subText }]} numberOfLines={1}>
               {statusLine}
             </Text>
           )}
@@ -307,7 +307,7 @@ const styles = StyleSheet.create({
     width: 18,
     height: 18,
     borderRadius: 9,
-    backgroundColor: '#25D366',
+    backgroundColor: '#03b0a2',
     borderWidth: 3,
   },
 

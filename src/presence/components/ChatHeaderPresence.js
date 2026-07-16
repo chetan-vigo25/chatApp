@@ -122,11 +122,11 @@ export default function ChatHeaderPresence({
   const subText = theme.colors.placeHolderTextColor;
   const bg = theme.colors.background;
   const borderColor = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.08)';
-  const ringColor = isPeerOnline ? '#25D366' : (themeColor + '30');
+  const ringColor = isPeerOnline ? '#03b0a2' : (themeColor + '30');
 
   const statusColor = isTyping
     ? themeColor
-    : isPeerOnline ? '#25D366' : subText;
+    : isPeerOnline ? '#03b0a2' : subText;
 
   return (
     <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
@@ -231,7 +231,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     bottom: 0, right: 0,
     width: 12, height: 12, borderRadius: 6,
-    backgroundColor: '#25D366',
+    backgroundColor: '#03b0a2',
     borderWidth: 2,
   },
   textWrap: {

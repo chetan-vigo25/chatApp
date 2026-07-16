@@ -16,24 +16,31 @@ import { useTheme } from '../../contexts/ThemeContext';
  * over a live video feed (which is always dark), regardless of app theme.
  *
  * Layout (matches WhatsApp):
- *   voice call → [ Speaker ] [ Mute ] [ End ]
- *   video call → [ Flip ] [ Camera ] [ Speaker ] [ Mute ] [ End ]
+ *   voice call → [ Speaker ] [ Video ] [ Share ] [ Mute ] [ End ]
+ *   video call → [ Flip ] [ Camera ] [ Share ] [ Speaker ] [ Mute ] [ End ]
+ *
+ * Video (voice bar) turns the camera on mid-call, upgrading the voice call to a
+ * video call for both sides — the bar then re-renders in the video layout.
  *
  * Speaker toggles the audio route: ON = loudspeaker (loud), OFF = earpiece
  * (normal, follows the device volume) — same on both call types.
+ *
+ * Share = screen share. Availability depends on the WebView exposing
+ * getDisplayMedia — where it doesn't, tapping shows a clear "not supported"
+ * alert (the engine reports it); RECEIVING a peer's shared screen always works.
  */
-function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, palette, onPress }) {
+function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, small, palette, onPress }) {
   const Icon = lib === 'mci' ? MaterialIcons : Ionicons;
   const bg = danger ? '#EA0038' : active ? palette.activeBg : palette.idleBg;
   let color = danger ? '#ffffff' : active ? palette.activeIcon : palette.idleIcon;
   if (disabled) color = palette.disabledIcon;
-  const size = danger ? 32 : 25;
+  const size = danger ? 32 : small ? 22 : 25;
   return (
     <View style={styles.btnWrap}>
       <TouchableOpacity
         activeOpacity={disabled ? 1 : 0.8}
         onPress={disabled ? undefined : onPress}
-        style={[styles.circle, danger && styles.circleDanger, { backgroundColor: bg }]}
+        style={[styles.circle, small && styles.circleSmall, danger && styles.circleDanger, { backgroundColor: bg }]}
       >
         <Icon name={icon} size={size} color={color} />
       </TouchableOpacity>
@@ -49,11 +56,13 @@ export default function CallControls({
   forceDark = false,
   micOn,
   cameraOn,
+  screenSharing = false,
   speakerOn,
   speakerSupported = true,
   onToggleMic,
   onToggleCamera,
   onSwitchCamera,
+  onToggleScreenShare,
   onToggleSpeaker,
   onHangup,
 }) {
@@ -89,6 +98,7 @@ export default function CallControls({
             <CircleButton
               icon="camera-reverse"
               label="Flip"
+              small
               palette={palette}
               onPress={onSwitchCamera}
             />
@@ -96,33 +106,72 @@ export default function CallControls({
               icon={cameraOn ? 'videocam' : 'videocam-off'}
               active={!cameraOn}
               label={cameraOn ? 'Camera' : 'Camera off'}
+              small
               palette={palette}
               onPress={onToggleCamera}
             />
+            {/* Screen share — temporarily disabled (per request). Re-enable by
+                uncommenting; the engine/handler wiring is untouched.
+            <CircleButton
+              icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
+              lib="mci"
+              active={screenSharing}
+              label={screenSharing ? 'Sharing' : 'Share'}
+              small
+              palette={palette}
+              onPress={onToggleScreenShare}
+            />
+            */}
             <CircleButton
               icon={speakerOn ? 'volume-high' : 'volume-medium'}
               active={speakerOn}
               disabled={!speakerSupported}
               label={speakerSupported ? 'Speaker' : 'Auto'}
+              small
               palette={palette}
               onPress={onToggleSpeaker}
             />
           </>
         ) : (
-          <CircleButton
-            icon={speakerOn ? 'volume-high' : 'volume-medium'}
-            active={speakerOn}
-            disabled={!speakerSupported}
-            label={speakerSupported ? 'Speaker' : 'Auto'}
-            palette={palette}
-            onPress={onToggleSpeaker}
-          />
+          <>
+            <CircleButton
+              icon={speakerOn ? 'volume-high' : 'volume-medium'}
+              active={speakerOn}
+              disabled={!speakerSupported}
+              label={speakerSupported ? 'Speaker' : 'Auto'}
+              small
+              palette={palette}
+              onPress={onToggleSpeaker}
+            />
+            {/* Camera ON upgrades the voice call to a video call (WhatsApp style —
+                the bar then switches to the video layout). */}
+            <CircleButton
+              icon="videocam"
+              label="Video"
+              small
+              palette={palette}
+              onPress={onToggleCamera}
+            />
+            {/* Screen share — temporarily disabled (per request). Re-enable by
+                uncommenting; the engine/handler wiring is untouched.
+            <CircleButton
+              icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
+              lib="mci"
+              active={screenSharing}
+              label={screenSharing ? 'Sharing' : 'Share'}
+              small
+              palette={palette}
+              onPress={onToggleScreenShare}
+            />
+            */}
+          </>
         )}
 
         <CircleButton
           icon={micOn ? 'mic' : 'mic-off'}
           active={!micOn}
           label={micOn ? 'Mute' : 'Unmute'}
+          small
           palette={palette}
           onPress={onToggleMic}
         />
@@ -156,13 +205,16 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     width: '100%',
   },
-  // Sized so the 5-button video bar (Flip · Camera · Speaker · Mute · End) fits
-  // even on narrow (~320dp) screens without clipping; the 3-button voice bar just
-  // gets a touch more breathing room.
+  // Sized so the 6-button video bar (Flip · Camera · Share · Speaker · Mute ·
+  // End) fits even on narrow (~320dp) screens without clipping (`circleSmall`);
+  // the 3-button voice bar keeps the roomier 54dp circles.
   btnWrap: { alignItems: 'center', flexShrink: 1 },
   circle: {
     width: 54, height: 54, borderRadius: 27,
     alignItems: 'center', justifyContent: 'center',
+  },
+  circleSmall: {
+    width: 46, height: 46, borderRadius: 23,
   },
   circleDanger: {
     width: 58, height: 58, borderRadius: 29,

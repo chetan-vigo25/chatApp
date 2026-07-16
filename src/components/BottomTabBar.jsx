@@ -9,7 +9,7 @@ import { profileDetail } from '../Redux/Reducer/Profile/Profile.reducer';
 // beneath it. Order here is the visible left→right order of the bar.
 const TABS = [
   { key: 'chats',    label: 'Chats',    lib: 'ion', icon: 'chatbubble',    iconOutline: 'chatbubble-outline' },
-  { key: 'status',   label: 'Updates',  lib: 'mci', icon: 'record-circle', iconOutline: 'record-circle-outline' },
+  { key: 'status',   label: 'Status',   lib: 'mci', icon: 'record-circle', iconOutline: 'record-circle-outline' },
   { key: 'calls',    label: 'Calls',    lib: 'ion', icon: 'call',          iconOutline: 'call-outline' },
   { key: 'settings', label: 'You', lib: 'ion', icon: 'settings',      iconOutline: 'settings-outline' },
 ];
@@ -97,7 +97,7 @@ export default function BottomTabBar({ activeTab, onTabPress, theme, isDarkMode,
   const barBg = theme.colors.background;
   const activeTint = theme.colors.themeColor;
   const inactiveTint = theme.colors.placeHolderTextColor;
-  const pillBg = (theme.colors.themeColor || '#00A884') + (isDarkMode ? '40' : '24');
+  const pillBg = (theme.colors.themeColor || '#03b0a2') + (isDarkMode ? '40' : '24');
 
   return (
     <View

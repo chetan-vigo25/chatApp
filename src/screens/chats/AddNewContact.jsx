@@ -385,7 +385,7 @@ export default function AddNewContact({ navigation }) {
   };
 
     // WhatsApp palette
-    const accent = isDarkMode ? '#00A884' : '#008069';
+    const accent = isDarkMode ? '#03b0a2' : '#028578';
     const bg = isDarkMode ? '#000000' : '#FFFFFF';
     const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';
     const secondaryText = isDarkMode ? '#8696A0' : '#54656F';
@@ -505,7 +505,7 @@ export default function AddNewContact({ navigation }) {
               {isSearching ? (
                 <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
               ) : userFound ? (
-                <Ionicons name="checkmark-circle" size={22} color="#25D366" style={styles.trailIcon} />
+                <Ionicons name="checkmark-circle" size={22} color="#03b0a2" style={styles.trailIcon} />
               ) : userNotFound ? (
                 <TouchableOpacity onPress={handleClearQuery} style={styles.trailIcon}>
                   <Ionicons name="close-circle" size={22} color={errorColor} />
@@ -684,7 +684,7 @@ const styles = StyleSheet.create({
   },
   resultStatusDot: {
     width: 8, height: 8, borderRadius: 4,
-    backgroundColor: '#25D366',
+    backgroundColor: '#03b0a2',
   },
   resultStatusText: {
     fontFamily: 'Roboto-Medium',

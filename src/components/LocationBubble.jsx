@@ -128,7 +128,7 @@ const LocationBubble = memo(function LocationBubble({
       activeOpacity={0.85}
       style={[
         styles.container,
-        { backgroundColor: isMyMessage ? (themeColors?.chatBubbleRight || '#005C4B') : (themeColors?.menuBackground || '#202C33') },
+        { backgroundColor: isMyMessage ? (themeColors?.chatBubbleRight || '#03574f') : (themeColors?.menuBackground || '#202C33') },
       ]}
     >
       {/* Map Preview — 3x3 OSM tile grid */}

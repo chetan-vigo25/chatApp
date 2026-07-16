@@ -24,8 +24,9 @@ export const CALL_STATUS = {
   ENDED: 'ended',
 };
 
-// Including yourself. The hosted service caps a call at 4 tiles; 1 is local.
-export const MAX_PARTICIPANTS = 4;
+// Including yourself. The mediasoup SFU calling server scales a group call to
+// 32 participants (matches backend content CALL_MAX_GROUP_PARTICIPANTS).
+export const MAX_PARTICIPANTS = 32;
 
 export const initialCallState = {
   status: CALL_STATUS.IDLE,
@@ -46,6 +47,9 @@ export const initialCallState = {
   peer: null,            // { id, name, avatar } — 1:1 other party / group fallback
   peers: [],             // [{ id, name, avatar }] — full invited list
   participants: {},      // { [id]: { id, name, avatar, joined } }
+  // Who the SFU currently hears talking ({ peerId } relayed by the media server),
+  // or null in silence. Drives the speaking highlight on a group participant tile.
+  activeSpeakerId: null,
   isGroup: false,
   groupId: null,         // app-side group/thread id when the call originates from a group
   groupName: null,
@@ -55,6 +59,7 @@ export const initialCallState = {
   // control flags
   micOn: true,
   cameraOn: true,        // only meaningful for video
+  screenSharing: false,  // this side is sharing its screen (video calls)
   speakerOn: false,
   facingMode: 'user',
   // WhatsApp-style minimize: the call shrinks to a draggable floating window
@@ -84,7 +89,10 @@ export const ACT = {
   ACCEPT: 'ACCEPT',
   REMOTE_JOINED: 'REMOTE_JOINED',
   PARTICIPANT_JOINED: 'PARTICIPANT_JOINED',
+  PARTICIPANT_INVITED: 'PARTICIPANT_INVITED',
   PARTICIPANT_LEFT: 'PARTICIPANT_LEFT',
+  PARTICIPANT_REMOVED: 'PARTICIPANT_REMOVED',
+  ACTIVE_SPEAKER: 'ACTIVE_SPEAKER',
   SET_FLAG: 'SET_FLAG',
   CAMERA_CHANGED: 'CAMERA_CHANGED',
   NEEDS_UNMUTE: 'NEEDS_UNMUTE',
@@ -224,6 +232,9 @@ export function callReducer(state, action) {
       const id = action.id ? String(action.id) : null;
       if (!id) return state;
       const existing = state.participants[id] || {};
+      // A member can join AFTER the ring sweep removed their roster entry —
+      // recover name/avatar from the invited list so they don't show "Unknown".
+      const invited = (state.peers || []).find((p) => p && String(p.id) === id) || {};
       return {
         ...state,
         status: CALL_STATUS.ACTIVE,
@@ -233,10 +244,27 @@ export function callReducer(state, action) {
           ...state.participants,
           [id]: {
             id,
-            name: existing.name || action.name || 'Unknown',
-            avatar: existing.avatar || action.avatar || null,
+            name: existing.name || invited.name || action.name || 'Unknown',
+            avatar: existing.avatar || invited.avatar || action.avatar || null,
             joined: true,
           },
+        },
+      };
+    }
+    case ACT.PARTICIPANT_INVITED: {
+      // Mid-call "Add participant": put the invitee on the roster (joined:false
+      // → the grid shows them ringing) — PARTICIPANT_JOINED flips them live
+      // when their media arrives.
+      const p = action.peer;
+      if (!p || !p.id) return state;
+      const id = String(p.id);
+      if (state.participants[id]) return state;
+      return {
+        ...state,
+        peers: [...state.peers, { id, name: p.name || 'Member', avatar: p.avatar || null }],
+        participants: {
+          ...state.participants,
+          [id]: { id, name: p.name || 'Member', avatar: p.avatar || null, joined: false },
         },
       };
     }
@@ -247,6 +275,23 @@ export function callReducer(state, action) {
       // Keep the roster entry but flag it left so the UI can show "left".
       next[id] = { ...next[id], joined: false, left: true };
       return { ...state, participants: next };
+    }
+    case ACT.PARTICIPANT_REMOVED: {
+      // Drop a member from the LIVE roster entirely — declined / never answered
+      // (ring window over) / left. `peers` (the invited list) is kept intact for
+      // the call log. The grid simply stops showing them.
+      const id = action.id ? String(action.id) : null;
+      if (!id || !state.participants[id]) return state;
+      const next = { ...state.participants };
+      delete next[id];
+      return { ...state, participants: next };
+    }
+    case ACT.ACTIVE_SPEAKER: {
+      // Ignore once the call is over — a late relay must not resurrect a highlight.
+      if (state.status === CALL_STATUS.ENDED || state.status === CALL_STATUS.IDLE) return state;
+      const id = action.id ? String(action.id) : null;
+      if (id === state.activeSpeakerId) return state; // no-op re-render guard
+      return { ...state, activeSpeakerId: id };
     }
     case ACT.SET_FLAG: {
       return { ...state, [action.key]: action.value };

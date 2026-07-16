@@ -477,12 +477,12 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
             height: 52,
             borderRadius: 26,
             backgroundColor: ((!text.trim() && !pendingMedia) || isSearching)
-              ? (chatColor || 'rgba(0,168,132,0.5)')
-              : (chatColor || '#00A884'),
+              ? (chatColor || 'rgba(3,176,162,0.5)')
+              : (chatColor || '#03b0a2'),
             alignItems: 'center',
             justifyContent: 'center',
             opacity: 1,
-            shadowColor: chatColor || '#00A884',
+            shadowColor: chatColor || '#03b0a2',
             shadowOffset: { width: 0, height: 6 },
             shadowOpacity: 0.42,
             shadowRadius: 10,
@@ -755,7 +755,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
   const cardBg = isDarkMode ? '#1a2b3c' : '#fff';
   const textColor = isDarkMode ? '#EDF6FC' : '#111';
   const subColor = isDarkMode ? 'rgba(200,216,228,0.6)' : '#666';
-  const accentColor = theme.colors.themeColor || '#00A884';
+  const accentColor = theme.colors.themeColor || '#03b0a2';
   const borderColor = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
 
   const saveContactToDevice = () => {
@@ -770,6 +770,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         {
           text: 'OK',
           onPress: async () => {
+            // Permission dialog can background the app — don't re-trigger the lock.
+            suspendAppLock();
             try {
               let perm = await Contacts.getPermissionsAsync();
               if (perm.status !== 'granted') {
@@ -784,6 +786,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
             } catch (error) {
               console.error('save contact error', error);
               Alert.alert('Error', 'Unable to save contact.');
+            } finally {
+              resumeAppLock();
             }
           },
         },
@@ -810,8 +814,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Roboto-SemiBold', marginTop: 12 }}>{name}</Text>
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
-            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#25D366', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#25D366', fontFamily: 'Roboto-Medium' }}>On TalksTry</Text>
+            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#03b0a2', marginRight: 6 }} />
+            <Text style={{ fontSize: 13, color: '#03b0a2', fontFamily: 'Roboto-Medium' }}>On TalksTry</Text>
           </View>
         )}
 
@@ -1071,7 +1075,7 @@ export default function ChatScreen({ navigation, route }) {
       }],
       caption:     statusPreview?.text || null,
       textContent: statusPreview?.text || null,
-      bgColor:     statusPreview?.backgroundColor || '#075e54',
+      bgColor:     statusPreview?.backgroundColor || '#026158',
       createdAt:   statusPreview?.createdAt || new Date().toISOString(),
       expiresAt:   null,
       viewCount:   0,
@@ -3722,7 +3726,7 @@ export default function ChatScreen({ navigation, route }) {
 
     const baseColor = isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.primaryTextColor);
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
-    const mentionColor = isMyMessage ? '#D8ECFF' : '#00A884';
+    const mentionColor = isMyMessage ? '#D8ECFF' : '#03b0a2';
     const msgMentions = msg?.mentions || msg?.payload?.mentions;
 
     const handleMeasureLayout = (event) => {
@@ -4209,7 +4213,7 @@ export default function ChatScreen({ navigation, route }) {
     const remoteAudioUrl = toSecureMediaUri(msg?.mediaUrl);
     const canPlay = isMyMessage || downloaded || Boolean(remoteAudioUrl);
     const bubbleColor = isMyMessage
-      ? (chatColor || '#00A884')
+      ? (chatColor || '#03b0a2')
       : (isDarkMode ? 'rgba(30, 45, 60, 0.95)' : '#fff');
     const subColor = isMyMessage ? 'rgba(255,255,255,0.72)' : theme.colors.placeHolderTextColor;
     const trackBg = isMyMessage ? 'rgba(255,255,255,0.30)' : 'rgba(0,0,0,0.16)';
@@ -4223,7 +4227,7 @@ export default function ChatScreen({ navigation, route }) {
     const rawAvatar = isMyMessage
       ? myProfileImage
       : (isGroupChat
-          ? (groupMembersMapRef.current?.[msg?.senderId]?.profileImage || null)
+          ? (groupMembersMap?.[msg?.senderId]?.profileImage || null)
           : (chatData?.peerUser?.profileImage || chatData?.peerUser?.profilePicture || null));
     const avatarUri = rawAvatar ? toSecureMediaUri(rawAvatar) : null;
 
@@ -4262,7 +4266,7 @@ export default function ChatScreen({ navigation, route }) {
             <View style={{
               position: 'absolute', right: -2, bottom: -2,
               width: 18, height: 18, borderRadius: 9,
-              backgroundColor: '#00A884',
+              backgroundColor: '#03b0a2',
               alignItems: 'center', justifyContent: 'center',
               borderWidth: 1.5, borderColor: bubbleColor,
             }}>
@@ -4502,6 +4506,8 @@ export default function ChatScreen({ navigation, route }) {
           {
             text: 'OK',
             onPress: async () => {
+              // Permission dialog can background the app — don't re-trigger the lock.
+              suspendAppLock();
               try {
                 let perm = await Contacts.getPermissionsAsync();
                 if (perm.status !== 'granted') {
@@ -4518,6 +4524,8 @@ export default function ChatScreen({ navigation, route }) {
               } catch (error) {
                 console.error('save contact error', error);
                 Alert.alert('Error', 'Unable to save contact.');
+              } finally {
+                resumeAppLock();
               }
             },
           },
@@ -4546,8 +4554,8 @@ export default function ChatScreen({ navigation, route }) {
             </Text>
             {isRegistered && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
-                <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#25D366', marginRight: 4 }} />
-                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#25D366', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
+                <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#03b0a2', marginRight: 4 }} />
+                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#03b0a2', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
                   On TalksTry
                 </Text>
               </View>
@@ -4668,24 +4676,31 @@ export default function ChatScreen({ navigation, route }) {
         return groupMembersMap?.[match]?.fullName || match;
       });
 
-      // Screenshot notice ("Someone took a screenshot of this chat"): in a 1-to-1
-      // chat the screenshotter is ALWAYS the peer (the taker's own side hides this
-      // message), so replace the generic "Someone" with the peer's display name —
-      // the same saved-contact/profile name shown in the header.
+      // Screenshot notice: shown to BOTH sides. The stored text is neutral
+      // ("Someone took a screenshot of this chat"), so name the actor per viewer —
+      // "You" when this user took it, otherwise the peer's saved-contact/profile
+      // name (the same one shown in the header).
       let systemDisplayText = resolvedText;
       const isGroupSys = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
       if (!isGroupSys && /screenshot/i.test(resolvedText)) {
-        const peer = chatData?.peerUser;
-        const peerId = peer?._id || chatData?.peerUserId;
-        const peerName = resolveContactName(
-          peerId,
-          peer?.fullName || peer?.name || 'Someone',
-          peer?.mobileNumber || peer?.mobile?.number || peer?.phone || null
-        );
-        if (peerName && peerName !== 'Someone') {
+        let actorName = null;
+        if (isMyMessage) {
+          actorName = 'You';
+        } else {
+          const peer = chatData?.peerUser;
+          const peerId = peer?._id || chatData?.peerUserId;
+          const peerName = resolveContactName(
+            peerId,
+            peer?.fullName || peer?.name || 'Someone',
+            peer?.mobileNumber || peer?.mobile?.number || peer?.phone || null
+          );
+          if (peerName && peerName !== 'Someone') actorName = peerName;
+        }
+        if (actorName) {
           systemDisplayText = /\bsomeone\b/i.test(resolvedText)
-            ? resolvedText.replace(/\bsomeone\b/i, peerName)
-            : `${peerName} ${resolvedText}`;
+            ? resolvedText.replace(/\bsomeone\b/i, actorName)
+            : `${actorName} ${resolvedText}`;
+          // "You took" — not "You took" vs "Someone took"; the verb already agrees.
         }
       }
       return (
@@ -4852,8 +4867,8 @@ export default function ChatScreen({ navigation, route }) {
               ? (isDarkMode ? '#182229' : theme.colors.menuBackground)
               : (isMyMessage
                   // Keep a user-customised bubble colour; otherwise WhatsApp's
-                  // dark-mode outgoing green (#005C4B), not the bright accent.
-                  ? ((chatColor && chatColor !== '#00A884') ? chatColor : '#005C4B')
+                  // dark-mode outgoing green (#03574f), not the bright accent.
+                  ? ((chatColor && chatColor !== '#03b0a2') ? chatColor : '#03574f')
                   : (isDarkMode ? '#202C33' : theme.colors.cardBackground)),
             paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 3 : 6,
             paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 9,
@@ -5334,6 +5349,21 @@ export default function ChatScreen({ navigation, route }) {
         avatar: img ? toSecureMediaUri(img) : null,
       });
     });
+    // A chat opened from the chat LIST often carries no members on chatData —
+    // fall back to groupMembersMap (built from the viewGroup fetch dispatched on
+    // open), otherwise the header call buttons would silently do nothing.
+    if (!out.length && groupMembersMap && typeof groupMembersMap === 'object') {
+      Object.keys(groupMembersMap).forEach((sid) => {
+        if (sid === String(currentUserId) || seen.has(sid)) return;
+        seen.add(sid);
+        const info = groupMembersMap[sid] || {};
+        out.push({
+          id: sid,
+          name: info.fullName || 'Member',
+          avatar: info.profileImage ? toSecureMediaUri(info.profileImage) : null,
+        });
+      });
+    }
     return out;
   })();
   const messagingDisabledText = !memberCanSend
@@ -5381,7 +5411,15 @@ export default function ChatScreen({ navigation, route }) {
             const isOwnMsg = selMsg && sameId(selMsg?.senderId, currentUserId);
             const msgStatus = (selMsg?.status || '').toLowerCase();
             const isSeen = msgStatus === 'seen' || msgStatus === 'read';
-            const hasServerId = Boolean(selMsg?.serverMessageId) && !String(selMsg?.serverMessageId).startsWith('temp_');
+            // Canonical server id for actions that hit the server (edit / info).
+            // Same fallback chain as Forward below: rows loaded from SQLite /
+            // history sync (common in GROUP chats) may carry the server id in
+            // `id`/`messageId` with `serverMessageId` unset — requiring only
+            // `serverMessageId` hid Edit/Info for perfectly server-acked rows.
+            const serverActionId = [selMsg?.serverMessageId, selMsg?.messageId, selMsg?.id]
+              .map((v) => (v == null ? '' : String(v)))
+              .find((v) => v && !v.startsWith('temp_')) || null;
+            const hasServerId = Boolean(serverActionId);
             const canEdit = selectedMessage.length === 1 && isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && hasServerId;
             const isTextMsg = selMsg?.type === 'text';
             // Copy allowed whenever the message has any text — including a media caption.
@@ -5488,11 +5526,13 @@ export default function ChatScreen({ navigation, route }) {
                     <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
-                {/* Message Info — only for own, non-deleted messages */}
-                {selectedMessage.length === 1 && isOwnMsg && selMsg && !selMsg?.isDeleted && (
+                {/* Message Info — only for own, non-deleted, server-acked
+                    messages (receipts only exist once the server has the row;
+                    a temp-id lookup just 404s the info screen). */}
+                {selectedMessage.length === 1 && isOwnMsg && selMsg && !selMsg?.isDeleted && hasServerId && (
                   <TouchableOpacity
                     onPress={() => {
-                      const mid = selMsg.serverMessageId || selMsg.id;
+                      const mid = serverActionId;
                       const cid = selMsg.chatId || chatData?.chatId || chatData?._id;
                       clearSelectedMessages();
                       setReactionMsgId(null);
@@ -5536,6 +5576,7 @@ export default function ChatScreen({ navigation, route }) {
                   peers={groupCallPeers}
                   groupId={chatData.chatId || chatData?._id || route?.params?.chatId}
                   groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
+                  groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
                 />
               )}
               {isChatMuted && (
@@ -6588,7 +6629,7 @@ export default function ChatScreen({ navigation, route }) {
                 paddingHorizontal: 18, paddingVertical: 10,
                 flexDirection: 'row', alignItems: 'center', gap: 8,
               }}>
-                <Ionicons name="checkmark-circle" size={18} color="#25D366" />
+                <Ionicons name="checkmark-circle" size={18} color="#03b0a2" />
                 <Text style={{ color: '#fff', fontSize: 13, fontFamily: 'Roboto-Medium' }}>Saved</Text>
               </View>
             )}

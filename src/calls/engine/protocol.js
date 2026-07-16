@@ -18,14 +18,34 @@ export const CMD = {
   TOGGLE_MIC: 'toggleMic',
   TOGGLE_CAMERA: 'toggleCamera',
   SWITCH_CAMERA: 'switchCamera',
+  // Screen share (getDisplayMedia → SFU producer {source:'screen'}). Supported
+  // where the WebView/browser exposes getDisplayMedia; the engine reports an
+  // `unsupported` screenShareError otherwise.
+  TOGGLE_SCREEN: 'toggleScreen',
+  // Mid-call group invite: ring more members into the LIVE group call (they get
+  // a normal incoming-call request and join on accept).
+  INVITE_TO_GROUP: 'inviteToGroup',
+  // Stop re-inviting ONE member (they declined over the app socket / their ring
+  // window closed) — the engine's re-invite loop must not re-ring them.
+  STOP_INVITE: 'stopInvite',
   QUERY_PRESENCE: 'queryPresence',
   RESUME_AUDIO: 'resumeAudio',
+  // iOS CallKit answered → the OS re-activated the process audio session UNDER
+  // WebKit, silently killing the WebView's WebRTC audio units in BOTH directions
+  // while every track still reads 'live'. Force-rebuild the pipeline: fresh mic
+  // getUserMedia + replaceTrack on the producer, and re-attach every remote
+  // stream so playback restarts under the new session.
+  RESTART_AUDIO: 'restartAudio',
   SET_SPEAKER: 'setSpeaker',
   START_RECORDING: 'startRecording',
   STOP_RECORDING: 'stopRecording',
   // Ask the SDK to restart ICE (renegotiate transport) after a network change —
   // e.g. wifi↔cellular — so a live call recovers its media path instead of hanging.
   RESTART_ICE: 'restartIce',
+  // Liveness probe: is the SDK instance alive and its socket connected? Used by
+  // ensureConnected to catch a reloaded WebView page / dropped engine socket
+  // BEFORE dialing (a stale "ready" otherwise fails the call with 'not connected').
+  PING: 'ping',
 };
 
 // Engine → RN events (SDK passthroughs + engine/control results)
@@ -45,6 +65,9 @@ export const EVT = {
   PRESENCE: 'presence',
   CAMERACHANGED: 'camerachanged',
   PEERFACING: 'peerfacing',
+  // SFU active-speaker relay — { peerId } of whoever is currently talking (null
+  // when nobody is). Both engines already emit it; the group UI highlights the tile.
+  ACTIVE_SPEAKER: 'activeSpeaker',
   ERROR: 'error',
   // mid-call media-layer connection state (network resilience)
   MEDIA_DOWN: 'mediaDown',
@@ -53,6 +76,10 @@ export const EVT = {
   START_CALL_RESULT: 'startCallResult',
   START_CALL_ERROR: 'startCallError',
   PRESENCE_RESULT: 'presenceResult',
+  PONG: 'pong',
+  SCREEN_SHARE_STARTED: 'screenShareStarted',
+  SCREEN_SHARE_STOPPED: 'screenShareStopped',
+  SCREEN_SHARE_ERROR: 'screenShareError',
   SPEAKER_RESULT: 'speakerResult',
   NEEDS_UNMUTE_GESTURE: 'needsUnmuteGesture',
   CMD_ERROR: 'cmdError',

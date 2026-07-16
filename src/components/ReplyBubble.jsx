@@ -42,7 +42,7 @@ const ReplyBubble = React.memo(function ReplyBubble({
 
   // WhatsApp style: sender-specific accent color
   const accentColor = isRepliedToMe
-    ? (chatColor || '#25D366')
+    ? (chatColor || '#03b0a2')
     : '#6B8AFF';
 
   return (

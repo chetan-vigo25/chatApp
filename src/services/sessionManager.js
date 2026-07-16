@@ -449,7 +449,18 @@ export const bootstrapSession = async () => {
       },
     };
   } catch (error) {
-    return { authenticated: false, refreshed: false, session, error };
+    // Only a genuine server rejection (401/403 on the refresh itself) ends the
+    // session. A transient failure — offline, timeout, 5xx — on a cold launch
+    // must NOT bounce the user to the login screen: proceed with the stored
+    // (possibly expired) token and let the socket reauth path renew it once
+    // connectivity is back. This was the last client path that treated a
+    // network blip as a logout.
+    if (error?.isAuthRejection) {
+      return { authenticated: false, refreshed: false, session, error };
+    }
+    stampCacheOwnerForBootstrap(session.userId);
+    emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap_offline' });
+    return { authenticated: true, refreshed: false, offline: true, session, error };
   }
 };
 

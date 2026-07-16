@@ -5,25 +5,25 @@ import { Ionicons, MaterialIcons, MaterialCommunityIcons } from '@expo/vector-ic
 const CATEGORY_OPTIONS = [
   {
     key: 'photo',
-    icon: <Ionicons name="image" size={28} color="#075e54" />, // WhatsApp green
+    icon: <Ionicons name="image" size={28} color="#026158" />, // brand teal
     label: 'Photo/Video',
     testID: 'option-photo',
   },
   {
     key: 'video',
-    icon: <MaterialIcons name="videocam" size={28} color="#075e54" />,
+    icon: <MaterialIcons name="videocam" size={28} color="#026158" />,
     label: 'Video',
     testID: 'option-video',
   },
   {
     key: 'audio',
-    icon: <MaterialCommunityIcons name="microphone" size={28} color="#075e54" />,
+    icon: <MaterialCommunityIcons name="microphone" size={28} color="#026158" />,
     label: 'Audio',
     testID: 'option-audio',
   },
   {
     key: 'document',
-    icon: <MaterialIcons name="attach-file" size={28} color="#075e54" />,
+    icon: <MaterialIcons name="attach-file" size={28} color="#026158" />,
     label: 'Document',
     testID: 'option-document',
   },
@@ -127,7 +127,7 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: '#25d366', // WhatsApp green
+    backgroundColor: '#03b0a2', // brand teal
     alignItems: 'center',
     justifyContent: 'center',
     elevation: 4,

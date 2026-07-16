@@ -7,6 +7,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useDeviceInfo } from './DeviceInfoContext';
 import contactHasher from '../Redux/Services/Contact/ContactHasher';
 import ContactDatabase from '../services/ContactDatabase';
+import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
 
 const STORAGE_KEYS = {
   DEVICE_ID: '@device_id',
@@ -282,6 +283,9 @@ export const useContactSync = () => {
    * deviceContacts closure — it won't reflect numbers added after mount.
    */
   const readFreshDeviceContacts = useCallback(async () => {
+    // The permission dialog can background the app (OEM-dependent) — suspend
+    // the app lock so a contact fetch never bounces to the lock screen.
+    suspendAppLock();
     try {
       const { status } = await Contacts.requestPermissionsAsync();
       if (status !== 'granted') return [];
@@ -294,6 +298,8 @@ export const useContactSync = () => {
     } catch (err) {
       console.warn('[useContactSync] readFreshDeviceContacts error:', err?.message);
       return [];
+    } finally {
+      resumeAppLock();
     }
   }, []);
 

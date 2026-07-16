@@ -2,7 +2,7 @@
  * SegmentedRing
  * Draws a segmented ring around an avatar using pure React Native.
  * Each segment corresponds to one status item.
- * Viewed segments → gray (#94A3B8), Unviewed → green (#25D366).
+ * Viewed segments → gray (#94A3B8), Unviewed → green (#03b0a2).
  *
  * Props:
  *   count        — total number of statuses in the group
@@ -12,7 +12,7 @@
  */
 import { View } from 'react-native';
 
-const UNSEEN_COLOR = '#25D366';
+const UNSEEN_COLOR = '#03b0a2';
 const SEEN_COLOR   = '#94A3B8';
 
 export default function SegmentedRing({

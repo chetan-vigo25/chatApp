@@ -10,6 +10,7 @@ import { initSocket, getSocket, emitLogoutCurrentDevice } from "../Redux/Service
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { performSessionReset, saveAuthSession, extractLoginSession } from "../services/sessionManager";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getFCMToken } from "../firebase/fcmService";
 
 function showToast(message) {
   if (Platform.OS === 'android') {
@@ -95,6 +96,20 @@ export default function Otp({ navigation, route }) {
           verifyingRef.current = true;
           setOtpError("");
 
+          // Resolve the FRESHEST token at verify time. The mount-time state may
+          // still be null if the boot permission prompt was deferred; the login
+          // screen is guaranteed foreground, so re-driving getFCMToken() here
+          // both surfaces the permission dialog and yields the token to register
+          // with the backend on the very first login (not just a later reconnect).
+          let deviceFcmToken = fcmToken;
+          if (!deviceFcmToken) {
+            deviceFcmToken = await AsyncStorage.getItem('fcmToken').catch(() => null);
+          }
+          if (!deviceFcmToken) {
+            deviceFcmToken = await getFCMToken().catch(() => null);
+          }
+          if (deviceFcmToken && deviceFcmToken !== fcmToken) setFcmToken(deviceFcmToken);
+
           const payload = {
             mobileCode: selectedCountry.code,
             userName: phoneNumber,
@@ -104,7 +119,7 @@ export default function Otp({ navigation, route }) {
               deviceType: deviceInfo.deviceType,
               os: deviceInfo.osName,
               appVersion: deviceInfo.appVersion,
-              fcmToken: fcmToken || '',
+              fcmToken: deviceFcmToken || '',
               "location": {
               "lat": location?.coords?.latitude || 0,
               "lng": location?.coords?.longitude || 0,

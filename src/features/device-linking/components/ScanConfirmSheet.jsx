@@ -61,7 +61,7 @@ export default function ScanConfirmSheet({
               <MaterialIcons
                 name={isTrustedUrl ? 'verified' : 'warning'}
                 size={18}
-                color={isTrustedUrl ? '#25D366' : '#FFA000'}
+                color={isTrustedUrl ? '#03b0a2' : '#FFA000'}
               />
               <View style={styles.urlTextContainer}>
                 <Text style={[styles.urlLabel, { color: theme.colors.placeHolderTextColor }]}>

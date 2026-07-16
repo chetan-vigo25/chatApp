@@ -1208,7 +1208,7 @@ const styles = StyleSheet.create({
     width: 12,
     height: 12,
     borderRadius: 6,
-    backgroundColor: '#25D366',
+    backgroundColor: '#03b0a2',
     borderWidth: 2,
   },
   contactInfo: {

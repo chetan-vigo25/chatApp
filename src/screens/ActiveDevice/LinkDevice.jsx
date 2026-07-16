@@ -159,7 +159,7 @@ export default function LinkDevice({ navigation }) {
                                <View style={{ width: 50, height: 50, borderRadius:50, borderWidth:2, borderColor:theme.colors.themeColor }} />
                                {
                                  item?.isActive === true ?(
-                                   <View style={{ width:15, height:15, borderRadius:15, backgroundColor:'#25D366', position:'absolute', left:35, bottom:5 }} ></View>
+                                   <View style={{ width:15, height:15, borderRadius:15, backgroundColor:'#03b0a2', position:'absolute', left:35, bottom:5 }} ></View>
                                  ):(<></>)
                                }
                                <View>
@@ -196,7 +196,7 @@ export default function LinkDevice({ navigation }) {
                                    <View style={{ width: 50, height: 50, borderRadius:50, borderWidth:2, borderColor:theme.colors.themeColor }} />
                                    {
                                      selectedDevice?.isActive === true ?(
-                                       <View style={{ width:15, height:15, borderRadius:15, backgroundColor:'#25D366', position:'absolute', left:35, bottom:5 }} ></View>
+                                       <View style={{ width:15, height:15, borderRadius:15, backgroundColor:'#03b0a2', position:'absolute', left:35, bottom:5 }} ></View>
                                      ):(<></>)
                                    }
                                    <View>

@@ -27,7 +27,7 @@ import { Ionicons } from '@expo/vector-icons';
 // Accent palette mirrors ReplyBubble — green for self, soft blue-violet for
 // others. Status replies always read as "green-ish" in WhatsApp because the
 // brand colour is the visual anchor for the Status feature.
-const SELF_ACCENT  = '#25D366';
+const SELF_ACCENT  = '#03b0a2';
 const OTHER_ACCENT = '#53BDEB'; // WhatsApp's secondary accent (light teal)
 
 const StatusReplyPreview = React.memo(function StatusReplyPreview({
@@ -154,7 +154,7 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
           <View
             style={[
               styles.textSwatch,
-              { backgroundColor: statusPreview.backgroundColor || '#075E54' },
+              { backgroundColor: statusPreview.backgroundColor || '#026158' },
             ]}
           >
             <Text style={styles.textSwatchGlyph} numberOfLines={1}>

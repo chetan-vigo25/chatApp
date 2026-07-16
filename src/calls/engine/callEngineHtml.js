@@ -1,24 +1,38 @@
 /**
  * HTML for the WebView "call engine". This runs inside react-native-webview as
- * a real browser context (the only place the browser-only CallingSDK can run).
+ * a real browser context (the only place browser WebRTC/mediasoup can run).
  *
- * Load order is mandated by the SDK: socket.io FIRST, then calling-sdk, then our
- * glue. The page is loaded with baseUrl https://call.vigorousit.com so it is a
- * secure context (required for getUserMedia) and the SDK's same-origin socket
- * resolves correctly.
+ * The media stack is the mediasoup SFU calling server (CALL_BASE_URL, e.g.
+ * https://mediacall.vigorousit.com). socket.io-client + mediasoup-client are
+ * INLINED from the generated vendor bundle (callEngineVendor.js), so the engine
+ * boots with zero external <script> loads; the page still uses the calling
+ * server origin as baseUrl so it is a secure context (required for
+ * getUserMedia). The `CallingSDK` class below is an adapter that keeps the OLD
+ * SDK's public API (connect / startCall / accept / reject / hangup /
+ * toggleMic/Camera / switchCamera / queryPresence / restartIce + events) but
+ * speaks the mediasoup server's contract:
+ *   signalling — register / callUser / acceptCall / declineCall / cancelCall /
+ *     endCall / startGroupCall / joinGroupCall / inviteToGroupCall …
+ *   media — joinRoom / setRtpCapabilities / createWebRtcTransport /
+ *     connectTransport / produce / consume / resumeConsumer / restartIce.
+ * Identity: the server keys users on `sessionId` (register ack id ===
+ * sessionId), so we register with sessionId = the app userId — a call targets
+ * the peer's app userId directly.
  *
  * It renders the video tiles itself (MediaStream can only attach to a real
  * <video> element); React Native draws all call chrome as a native overlay on
  * top. Remote tiles are created/destroyed dynamically per peer so the same
- * engine serves both 1:1 and small group calls. For audio calls RN keeps this
- * WebView hidden — audio still plays through the <video> sinks.
+ * engine serves both 1:1 and group calls (up to 32 participants). For audio
+ * calls RN keeps this WebView hidden — audio still plays through the sinks.
  *
  * Audio output routing (speaker vs earpiece) is done with HTMLMediaElement
  * setSinkId() where the platform supports it (Android WebView / Chromium); on
  * iOS WKWebView the OS controls routing and setSinkId is a no-op.
  */
 
-const SDK_ORIGIN = 'https://call.vigorousit.com';
+import { VENDOR_JS } from './callEngineVendor';
+
+const SDK_ORIGIN = 'https://mediacall.vigorousit.com';
 
 export const CALL_ENGINE_BASE_URL = SDK_ORIGIN;
 
@@ -44,6 +58,8 @@ export const buildCallEngineHtml = () => `<!doctype html>
     background:#000;
   }
   #remotes.cols-2 { grid-template-columns:1fr 1fr; }
+  #remotes.cols-3 { grid-template-columns:1fr 1fr 1fr; }
+  #remotes.cols-4 { grid-template-columns:1fr 1fr 1fr 1fr; }
   #remotes.count-1 { grid-template-columns:1fr; grid-auto-rows:1fr; }
   /* Swapped (tap-to-swap): the remote feed shrinks to the PiP corner while the
      local self-camera fills the stage — WhatsApp PiP swap. */
@@ -128,8 +144,1209 @@ export const buildCallEngineHtml = () => `<!doctype html>
     </div>
   </div>
 
-  <script src="${SDK_ORIGIN}/socket.io/socket.io.js"></script>
-  <script src="${SDK_ORIGIN}/sdk/calling-sdk.js"></script>
+  <script>${VENDOR_JS}</script>
+  <script>
+  /* CallingSDK — mediasoup adapter. Same public API as the old hosted SDK so
+     the glue script + React Native side stay unchanged; internally it drives
+     the mediasoup SFU server contract (see file header). No backticks in here:
+     this whole page lives inside a JS template literal. */
+  (function () {
+    'use strict';
+
+    var RETRY_MS = 2500;          // offline-invitee redial poll interval
+    // Redial/re-invite only within roughly the ring window — past it a callee
+    // who never answered must NOT get a fresh ring out of nowhere.
+    var RETRY_WINDOW_MS = 40000;
+    var REASSERT_MS = 5000;       // min gap between ring reasserts after a successful dial
+
+    // Camera simulcast: 3 layers; the SFU forwards the best fit per receiver.
+    var CAM_ENCODINGS = [
+      { scaleResolutionDownBy: 4, maxBitrate: 150000 },
+      { scaleResolutionDownBy: 2, maxBitrate: 500000 },
+      { scaleResolutionDownBy: 1, maxBitrate: 1200000 }
+    ];
+
+    // token = base64(JSON { sub, name }) minted by chat-backend (UTF-8 safe).
+    function decodeToken(token) {
+      try {
+        var raw = atob(String(token || ''));
+        var json = decodeURIComponent(Array.prototype.map.call(raw, function (c) {
+          return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+        }).join(''));
+        var obj = JSON.parse(json);
+        if (obj && obj.sub) return { userId: String(obj.sub), name: obj.name || 'User' };
+      } catch (e) {}
+      return null;
+    }
+
+    function CallingSDK(opts) {
+      opts = opts || {};
+      this.url = String(opts.url || '').replace(/\\/+$/, '');
+      this.debug = !!opts.debug;
+      var id = decodeToken(opts.token);
+      // Keep the raw token: when it is a REAL JWT (three dot-separated parts —
+      // backend CALL_JWT_SECRET mode) it is forwarded on joinRoom so the media
+      // server can enforce REQUIRE_TOKEN=true. The legacy base64 envelope is
+      // NEVER forwarded (the server verifies any provided token, so sending a
+      // non-JWT would fail the join even with requireToken off).
+      this._token = (typeof opts.token === 'string' && opts.token.split('.').length === 3)
+        ? opts.token : '';
+      this.userId = String(opts.userId || (id && id.userId) || '');
+      this.name = String(opts.name || (id && id.name) || 'User');
+      this._handlers = {};
+      this._socket = null;
+      this._serverUrl = '';
+      this._registered = false;
+      this._device = null;
+      this._sendTransport = null;
+      this._recvTransport = null;
+      this._localStream = null;
+      this._screenStream = null; // getDisplayMedia stream while sharing
+      this._producers = {};      // 'mic' | 'camera' | 'screen' -> Producer
+      this._consumers = {};      // consumerId -> Consumer
+      this._consumed = {};       // producerId -> true
+      this._peerStreams = {};    // peerId (app userId) -> MediaStream
+      this._pendingIn = {};      // callId | groupId -> incoming info
+      this._declined = {};       // groupId -> declined-at ms (suppress re-ring briefly)
+      this._out = null;          // outgoing 1:1 { callId, roomId, to } (LATEST dial)
+      this._dialTarget = null;   // 1:1 callee id for the current dial (redial/reassert/grace-sweep recovery)
+      this._outIds = {};         // EVERY callId minted for the current dial (redials + ring reasserts)
+      this._lastDialAt = 0;      // rate-limits the ring-reassert loop
+      this._declinedPeer = {};   // 1:1 peerId -> declined-at ms (swallow ring reasserts after decline)
+      this._acceptedFrom = null; // 1:1 peerId whose call we accepted (dedupe post-accept reasserts)
+      this._acceptedId = null;   // 1:1 callId accepted; waiting for callAccepted
+      this._room = null;         // { roomId, groupId, callId, media, joined }
+      this._pendingProducers = []; // newProducer events that arrived mid-join
+      this._media = 'audio';
+      this._facing = 'user';
+      this._users = [];          // latest online-users snapshot (presence)
+      this._retryTimer = null;
+      this._retryUntil = 0;
+      this._mediaDown = false;
+      this._groupInvitees = [];
+      this._groupJoined = {};
+      // App-supplied STUN/TURN fallback (from the backend token mint). Used for
+      // the mediasoup transports when the media server's joinRoom response
+      // carries no iceServers — without a TURN relay, cross-NAT (cellular /
+      // CGNAT / symmetric NAT) calls join the room but media never flows.
+      this._fallbackIceServers = (Array.isArray(opts.iceServers) && opts.iceServers.length)
+        ? opts.iceServers : null;
+    }
+
+    CallingSDK.prototype.on = function (ev, cb) {
+      (this._handlers[ev] = this._handlers[ev] || []).push(cb);
+      return this;
+    };
+    CallingSDK.prototype._emit = function (ev, data) {
+      var list = this._handlers[ev] || [];
+      for (var i = 0; i < list.length; i++) { try { list[i](data); } catch (e) {} }
+    };
+    CallingSDK.prototype._log = function (msg) {
+      try {
+        if (window.ReactNativeWebView) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'log', payload: { message: '[sdk] ' + String(msg) } }));
+        }
+      } catch (e) {}
+    };
+
+    // Promise wrapper over a Socket.IO ack.
+    CallingSDK.prototype._req = function (event, data) {
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        if (!self._socket || !self._socket.connected) { reject(new Error(event + ': not connected')); return; }
+        var t = setTimeout(function () { reject(new Error(event + ' timeout')); }, 10000);
+        self._socket.emit(event, data || {}, function (res) {
+          clearTimeout(t);
+          if (res && res.error) reject(new Error(res.error)); else resolve(res || {});
+        });
+      });
+    };
+
+    // Wait (briefly) for the auto-reconnecting socket to come back before a
+    // dial-time request, instead of failing the call on a transient drop.
+    CallingSDK.prototype._waitSocket = function (ms) {
+      var self = this;
+      if (self._socket && self._socket.connected) return Promise.resolve();
+      return new Promise(function (resolve, reject) {
+        var s = self._socket;
+        if (!s) { reject(new Error('not connected')); return; }
+        var onC = function () { cleanup(); resolve(); };
+        var t = setTimeout(function () { cleanup(); reject(new Error('not connected')); }, ms || 6000);
+        function cleanup() { clearTimeout(t); try { s.off('connect', onC); } catch (e) {} }
+        s.on('connect', onC);
+      });
+    };
+    CallingSDK.prototype._reqDial = function (event, data) {
+      var self = this;
+      return self._waitSocket(6000).then(function () { return self._req(event, data); });
+    };
+
+    // ---- connection / presence ----
+    CallingSDK.prototype.connect = function () {
+      var self = this;
+      if (!window.io) return Promise.reject(new Error('socket library missing'));
+      if (!self.userId) return Promise.reject(new Error('missing user identity'));
+      return new Promise(function (resolve, reject) {
+        var settled = false;
+        self._connectTo(self.url, function (err) {
+          if (settled) return;
+          settled = true;
+          if (err) reject(err); else resolve();
+        });
+      });
+    };
+
+    CallingSDK.prototype._connectTo = function (url, done) {
+      var self = this;
+      if (self._socket) { try { self._socket.removeAllListeners(); self._socket.disconnect(); } catch (e) {} }
+      var s = window.io(url, {
+        transports: ['websocket', 'polling'],
+        reconnection: true, reconnectionAttempts: Infinity,
+        reconnectionDelay: 800, reconnectionDelayMax: 4000, timeout: 8000
+      });
+      self._socket = s;
+      self._serverUrl = url;
+      s.on('connect', function () {
+        self._req('register', { name: self.name, sessionId: self.userId }).then(function (res) {
+          self._users = (res && res.users) || [];
+          self._registered = true;
+          self._log('registered on ' + url + ' as ' + self.userId);
+          if (done) { var d = done; done = null; d(null); }
+          // Socket came back while we were in a call → resume the room media.
+          if (self._room && self._room.joined) self._resume();
+        }).catch(function (e) {
+          self._log('register failed: ' + (e && e.message));
+          if (done) { var d2 = done; done = null; d2(e); }
+        });
+      });
+      s.on('connect_error', function (e) {
+        self._log('connect_error: ' + (e && e.message));
+      });
+      s.on('disconnect', function (reason) {
+        self._log('socket disconnected: ' + reason);
+        if (self._room && self._room.joined) self._emitDown('signal:' + reason);
+      });
+      self._wire(s);
+    };
+
+    // Cluster room-affinity: move the socket to the server that owns the room.
+    CallingSDK.prototype._migrate = function (url) {
+      var self = this;
+      self._log('migrating to room server ' + url);
+      return new Promise(function (resolve, reject) {
+        self._connectTo(url, function (err) { if (err) reject(err); else resolve(); });
+      });
+    };
+
+    CallingSDK.prototype._wire = function (s) {
+      var self = this;
+      s.on('users', function (users) { self._users = users || []; });
+
+      s.on('incomingCall', function (p) {
+        p = p || {};
+        var key = String(p.callId);
+        if (self._pendingIn[key]) return;
+        var fromId = p.from && p.from.id != null ? String(p.from.id) : null;
+        if (fromId) {
+          // Ring-REASSERT dedupe: the caller re-emits callUser every few
+          // seconds (each mints a NEW callId server-side) so the ring survives
+          // a dead grace-period socket. A second ring from the SAME peer while
+          // we already ring/answer them is the SAME logical call — swallow it
+          // silently; surfacing it would make the app auto-reject it as busy,
+          // which the caller reads as a decline and kills the live dial.
+          var dupRinging = Object.keys(self._pendingIn).some(function (k) {
+            var q = self._pendingIn[k];
+            return q && !q.group && q.from && String(q.from.id) === fromId;
+          });
+          var dupActive = self._acceptedFrom === fromId && (self._acceptedId || self._room);
+          if (dupRinging || dupActive) { self._log('duplicate 1:1 ring from ' + fromId + ' (' + key + ') — swallowed'); return; }
+          // Just declined this peer → quietly decline their reasserts too
+          // (parity with the group _declined window) instead of re-ringing.
+          var dec = self._declinedPeer[fromId];
+          if (dec && (Date.now() - dec) < 15000) {
+            try { s.emit('declineCall', { callId: key }); } catch (e) {}
+            return;
+          }
+          delete self._declinedPeer[fromId];
+        }
+        self._pendingIn[key] = { group: false, callId: key, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio' };
+        self._emit('incoming', {
+          callId: key,
+          from: { id: p.from && p.from.id != null ? String(p.from.id) : null, name: (p.from && p.from.name) || '' },
+          media: p.callType === 'video' ? 'video' : 'audio',
+          isGroup: false, groupId: null, groupName: null, members: []
+        });
+      });
+
+      s.on('incomingGroupCall', function (p) {
+        p = p || {};
+        var key = String(p.groupId);
+        // The host re-invites not-yet-joined members (offline-wake support), so a
+        // duplicate invite for a call we are already ringing is normal. A recent
+        // DECLINE suppresses the automatic re-invites for a short window only —
+        // a deliberate later re-invite (host's Add-participant) rings again.
+        // Already IN this group call → re-invite echo; surfacing it would make
+        // the app busy-reject OUR OWN call (declineGroupCall while connected).
+        if (self._room && self._room.groupId === key) {
+          self._log('re-invite for group ' + key + ' swallowed (already in the call)');
+          return;
+        }
+        if (self._pendingIn[key]) return;
+        if (self._declined[key] && (Date.now() - self._declined[key]) < 15000) {
+          try { s.emit('declineGroupCall', { groupId: p.groupId }); } catch (e) {}
+          return;
+        }
+        delete self._declined[key];
+        self._pendingIn[key] = { group: true, groupId: p.groupId, roomId: p.roomId, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', name: p.name };
+        self._emit('incoming', {
+          callId: key,
+          from: { id: p.from && p.from.id != null ? String(p.from.id) : null, name: (p.from && p.from.name) || '' },
+          media: p.callType === 'video' ? 'video' : 'audio',
+          isGroup: true, groupId: key, groupName: p.name || null, members: []
+        });
+      });
+
+      // Both sides of a 1:1 get this once the callee accepts → join the room.
+      s.on('callAccepted', function (p) {
+        p = p || {};
+        var cid = p.callId != null ? String(p.callId) : '';
+        // Match ANY callId minted for this dial — the callee may have accepted
+        // an EARLIER redial/reassert id than the latest in _out; matching only
+        // _out.callId dropped the accept (caller kept ringing while the callee
+        // sat alone in the room). No cancelCall of sibling ids here: the relay
+        // would surface as 'cancelled' on a callee still holding them.
+        var mine = !!self._outIds[cid] || (self._out && self._out.callId === cid) || self._acceptedId === cid;
+        if (!mine) return;
+        self._out = null;
+        self._outIds = {};
+        self._acceptedId = null;
+        self._clearRetry();
+        self._media = p.callType === 'video' ? 'video' : 'audio';
+        self._room = { roomId: p.roomId, groupId: null, callId: String(p.callId), media: self._media, joined: false };
+        self._startMedia(p.serverUrl).catch(function (e) {
+          self._log('media start failed: ' + (e && e.message));
+          self._emit('error', { message: 'Could not connect the call media' });
+        });
+      });
+
+      s.on('callDeclined', function (p) {
+        var cid = p && p.callId != null ? String(p.callId) : '';
+        if (self._room) return; // live call — a stale sibling-id decline can't kill it
+        if ((self._out && self._out.callId === cid) || self._outIds[cid]) {
+          self._out = null;
+          self._outIds = {};
+          self._clearRetry();
+          self._emit('rejected', {});
+        }
+      });
+      s.on('callCancelled', function (p) {
+        var key = p && p.callId != null ? String(p.callId) : null;
+        if (key && self._pendingIn[key]) { delete self._pendingIn[key]; self._emit('cancelled', {}); }
+      });
+      s.on('callEnded', function (p) {
+        // callEnded on an UN-ANSWERED outgoing dial is not a user action — it's
+        // the server's disconnect-grace sweep deleting the callee's stale
+        // registration ALONG WITH our pending call (killed app whose old socket
+        // expired mid-ring). Ending here cut the caller right when the callee
+        // answered. Drop the dead id and keep re-dialing; the signaling ring
+        // window bounds the loop.
+        if (!self._room && !self._acceptedId && self._out && self._dialTarget) {
+          var deadId = p && p.callId != null ? String(p.callId) : self._out.callId;
+          delete self._outIds[deadId];
+          self._out = null;
+          self._lastDialAt = 0; // let the next tick redial immediately
+          self._log('SFU call leg ' + deadId + ' ended pre-answer (grace sweep) — re-arming dial loop');
+          self._armRetry(function () { return self._dial1to1Tick(self._dialTarget); });
+          return;
+        }
+        // SCOPE to the current call (parity with the native SDK): the grace
+        // sweep also ends STALE 1:1 records from dead sessions — an unscoped
+        // handler let one of those kill a live (even GROUP) call.
+        var cid2 = p && p.callId != null ? String(p.callId) : null;
+        var mine2 = !!cid2 && (
+          (self._room && self._room.callId === cid2)
+          || self._acceptedId === cid2
+          || !!self._outIds[cid2]
+          || (self._out && self._out.callId === cid2)
+        );
+        if (!mine2) { self._log('callEnded ' + (cid2 || '?') + ' ignored (not current call)'); return; }
+        self._onRemoteEnded();
+      });
+      s.on('groupCallEnded', function (p) {
+        var gid = p && p.groupId != null ? String(p.groupId) : null;
+        if (gid && self._pendingIn[gid]) { delete self._pendingIn[gid]; self._emit('cancelled', {}); return; }
+        if (!self._room || !self._room.groupId || (gid && self._room.groupId !== gid)) {
+          self._log('groupCallEnded ' + (gid || '?') + ' ignored (not current call)');
+          return;
+        }
+        self._onRemoteEnded();
+      });
+      s.on('groupDeclined', function (p) {
+        var uid = p && p.userId != null ? String(p.userId) : null;
+        if (uid) self._groupJoined[uid] = true; // stop re-inviting them
+        self._log('group invite declined by ' + uid);
+      });
+      s.on('groupParticipantJoined', function (p) {
+        var u = p && p.user;
+        if (u && u.id != null) self._groupJoined[String(u.id)] = true;
+      });
+      s.on('callPromotedToGroup', function (p) {
+        if (self._room) { self._room.groupId = p && p.groupId != null ? String(p.groupId) : self._room.groupId; self._room.callId = null; }
+      });
+
+      s.on('newProducer', function (p) {
+        if (self._room && self._room.joined) {
+          self._consume(p).catch(function (e) { self._log('consume error: ' + (e && e.message)); });
+        } else if (self._room) {
+          // Both sides join the room simultaneously — the peer can produce while
+          // WE are still building transports. Dropping the event here left the
+          // call connected-but-SILENT (no remote audio, "awaaz nahi aa rahi").
+          // Queue it; _joinRoom drains the queue the moment we are ready.
+          self._log('newProducer queued (join in progress) from ' + (p && p.peerId));
+          self._pendingProducers.push(p);
+        }
+      });
+      s.on('peerLeft', function (p) {
+        var pid = p && p.peerId != null ? String(p.peerId) : null;
+        // Stale-room poison guard (parity with the native SDK): the server
+        // broadcasts peerLeft into OLD rooms this socket never unsubscribed
+        // from — only honor it for a live/pending room, never for our own id.
+        if (!pid || pid === self.userId) return;
+        if (!self._room) { self._log('peerLeft ' + pid + ' ignored (no room — stale)'); return; }
+        // Room-scoped filter (parity with native SDK): a stale room's peerLeft
+        // between the same two users carries the same peerId — only the
+        // server-stamped roomId can tell it apart from the live call's.
+        var evRoom = p && p.roomId != null ? String(p.roomId) : null;
+        if (evRoom && String(self._room.roomId) !== evRoom) {
+          self._log('peerLeft ' + pid + ' ignored (room ' + evRoom + ' != current ' + self._room.roomId + ')');
+          return;
+        }
+        self._dropPeer(pid);
+        self._emit('peerleft', { id: pid });
+      });
+      s.on('producerClosed', function (p) {
+        var pid = p && p.producerId;
+        if (!pid) return;
+        delete self._consumed[pid];
+        Object.keys(self._consumers).forEach(function (cid) {
+          var c = self._consumers[cid];
+          if (c && c.producerId === pid) {
+            var peerId = (c.appData && c.appData.peerId) || (p.peerId != null ? String(p.peerId) : null);
+            var streamKey = (c.appData && c.appData.streamKey) || peerId;
+            var stream = streamKey ? self._peerStreams[streamKey] : null;
+            if (stream) { try { stream.removeTrack(c.track); } catch (e) {} }
+            try { c.close(); } catch (e) {}
+            delete self._consumers[cid];
+            // A closed screen producer removes the whole screen tile (a normal
+            // camera/mic close just leaves its tile black/silent like before).
+            if (streamKey && streamKey.indexOf('#screen') >= 0) {
+              delete self._peerStreams[streamKey];
+              self._emit('streamremoved', { peerId: peerId, source: 'screen' });
+            }
+          }
+        });
+      });
+      s.on('consumerClosed', function (p) {
+        var cid = p && p.consumerId;
+        var c = cid ? self._consumers[cid] : null;
+        if (c) {
+          delete self._consumed[c.producerId];
+          try { c.close(); } catch (e) {}
+          delete self._consumers[cid];
+        }
+      });
+      s.on('activeSpeaker', function (p) {
+        self._emit('activespeaker', { peerId: p && p.peerId != null ? String(p.peerId) : null });
+      });
+    };
+
+    CallingSDK.prototype._onRemoteEnded = function () {
+      if (!this._room && !this._acceptedId && !this._out) return;
+      this._clearRetry();
+      this._acceptedId = null;
+      this._acceptedFrom = null;
+      this._out = null;
+      this._outIds = {};
+      this._dialTarget = null;
+      // leaveRoom even on a REMOTE end — the server keeps this socket's room
+      // membership until leaveRoom/disconnect, and a stale membership makes the
+      // NEXT call's joinRoom fail with "already in a room".
+      this._teardownMedia(true);
+      this._emit('ended', {});
+    };
+
+    // ---- outgoing ----
+    CallingSDK.prototype.startCall = function (to, media) {
+      var self = this;
+      var targets = (Array.isArray(to) ? to : [to]).map(String).filter(Boolean);
+      self._media = media === 'video' ? 'video' : 'audio';
+      if (!targets.length) return Promise.reject(new Error('no callee'));
+      self._outIds = {};        // fresh dial — never inherit a previous dial's ids
+      self._acceptedFrom = null;
+      return self._capture().then(function () {
+        if (targets.length > 1) return self._startGroup(targets);
+        return self._start1to1(targets[0]);
+      });
+    };
+
+    CallingSDK.prototype._start1to1 = function (target) {
+      var self = this;
+      self._dialTarget = target;
+      return self._reqDial('callUser', { toUserId: target, callType: self._media }).then(function (res) {
+        var cid = String(res.callId);
+        self._out = { callId: cid, roomId: res.roomId, to: target };
+        self._outIds[cid] = true;
+        self._lastDialAt = Date.now();
+        // Ring REASSERT: a "successful" callUser is NOT proof the callee heard
+        // it — during the server's reconnect grace a killed app's stale
+        // registration accepts the call and incomingCall goes to a DEAD socket.
+        // Keep re-dialing (fresh callId each time; the callee dedupes by peer)
+        // until callAccepted / callDeclined / hangup / ring-window end.
+        self._armRetry(function () { return self._dial1to1Tick(target); });
+        return { callId: cid, offline: [] };
+      }).catch(function (e) {
+        var msg = String((e && e.message) || '').toLowerCase();
+        if (msg.indexOf('offline') >= 0 || msg.indexOf('not found') >= 0) {
+          // Callee not registered on the media server yet (app closed / engine
+          // cold). The app-socket ring + FCM push wake them; keep REDIALING here
+          // so the WebRTC leg exists the moment their engine registers. The ring
+          // window / RN hangup bounds the loop.
+          self._log('callee offline on media server — arming redial loop');
+          self._armRetry(function () { return self._dial1to1Tick(target); });
+          return { callId: null, offline: [target] };
+        }
+        if (msg.indexOf('busy') >= 0) return { callId: null, offline: [] };
+        throw e;
+      });
+    };
+
+    // One retry-loop tick for a 1:1 dial — REDIAL while the callee is offline
+    // on the media server, then RE-ASSERT the ring every REASSERT_MS after a
+    // success in case the last incomingCall hit a dead grace-period socket.
+    CallingSDK.prototype._dial1to1Tick = function (target) {
+      var self = this;
+      if (self._room || self._acceptedId) return Promise.resolve(true); // connected/answered — stop
+      if (self._out && (Date.now() - self._lastDialAt) < REASSERT_MS) return Promise.resolve(false);
+      return self._req('callUser', { toUserId: target, callType: self._media }).then(function (res) {
+        // Answered while this request was in flight — never resurrect dial
+        // state over a live call (the fresh id is harmless server-side).
+        if (self._room || self._acceptedId) return true;
+        var cid = String(res.callId);
+        var isReassert = !!self._out;
+        self._out = { callId: cid, roomId: res.roomId, to: target };
+        self._outIds[cid] = true;
+        self._lastDialAt = Date.now();
+        self._log((isReassert ? 'ring reassert' : 'redial') + ' ok — callId ' + cid);
+        return false; // keep looping until answered/declined/window end
+      }).catch(function () { return false; });
+    };
+
+    CallingSDK.prototype._startGroup = function (targets) {
+      var self = this;
+      return self._reqDial('startGroupCall', { callType: self._media, inviteeIds: targets }).then(function (res) {
+        var gid = String(res.groupId);
+        self._room = { roomId: res.roomId, groupId: gid, callId: null, media: self._media, joined: false };
+        self._groupInvitees = targets.slice();
+        self._groupJoined = {};
+        // Re-invite members who have not joined/declined yet — an invitee woken
+        // by the push registers on the media server AFTER the original invite
+        // was sent, and the server does not re-deliver it on its own.
+        self._armRetry(function () { return self._reinviteGroup(gid); });
+        // Host joins the room right away; media errors surface as 'error'.
+        self._startMedia(res.serverUrl).catch(function (e) {
+          self._log('group media start failed: ' + (e && e.message));
+          self._emit('error', { message: 'Could not connect the call media' });
+        });
+        return { callId: gid, offline: [] };
+      });
+    };
+
+    CallingSDK.prototype._reinviteGroup = function (gid) {
+      var self = this;
+      if (!self._room || self._room.groupId !== gid) return Promise.resolve(true);
+      var missing = (self._groupInvitees || []).filter(function (id) { return !self._groupJoined[id]; });
+      if (!missing.length) return Promise.resolve(true);
+      return self._req('inviteToGroupCall', { groupId: gid, inviteeIds: missing })
+        .then(function () { return false; })
+        .catch(function () { return false; });
+    };
+
+    CallingSDK.prototype._armRetry = function (fn) {
+      var self = this;
+      self._clearRetry();
+      self._retryUntil = Date.now() + RETRY_WINDOW_MS;
+      self._retryTimer = setInterval(function () {
+        if (Date.now() > self._retryUntil) { self._clearRetry(); return; }
+        Promise.resolve().then(fn).then(function (done) { if (done) self._clearRetry(); }).catch(function () {});
+      }, RETRY_MS);
+    };
+    CallingSDK.prototype._clearRetry = function () {
+      if (this._retryTimer) { clearInterval(this._retryTimer); this._retryTimer = null; }
+    };
+
+    // Ring MORE members into the live group call (Add participant). They get
+    // incomingGroupCall like any invitee; the re-invite loop covers members
+    // whose engine registers late (push-woken app).
+    CallingSDK.prototype.inviteToGroup = function (ids) {
+      var self = this;
+      var list = (ids || []).map(String).filter(Boolean);
+      if (!list.length) return Promise.resolve();
+      if (!self._room || !self._room.groupId) return Promise.reject(new Error('not in a group call'));
+      var gid = self._room.groupId;
+      list.forEach(function (id) {
+        if (self._groupInvitees.indexOf(id) < 0) self._groupInvitees.push(id);
+        delete self._groupJoined[id]; // re-invite even someone who declined earlier
+      });
+      self._armRetry(function () { return self._reinviteGroup(gid); });
+      self._log('inviting ' + list.length + ' more member(s) into group ' + gid);
+      return self._req('inviteToGroupCall', { groupId: gid, inviteeIds: list });
+    };
+
+    // Stop re-inviting ONE member (declined over the app signal / ring window
+    // closed for them). Marks them resolved so _reinviteGroup skips them.
+    CallingSDK.prototype.stopInviting = function (id) {
+      if (id != null) this._groupJoined[String(id)] = true;
+    };
+
+    // ---- incoming ----
+    CallingSDK.prototype.accept = function (callId, media, opts) {
+      var self = this;
+      opts = opts || {};
+      var key = String(callId);
+      var p = self._pendingIn[key];
+      if (!p) {
+        // No pending entry. A KNOWN 1:1 (the app reconciled the real callId but
+        // this SDK instance lost/never had the ring — engine restart mid-ring,
+        // or the ring hit a dead grace socket) is accepted DIRECTLY: acceptCall
+        // only needs the callId. Falling into joinGroupCall with a 1:1 id made
+        // the call cut the instant the user accepted.
+        if (opts.isGroup === false) {
+          self._log('accept: no pending entry for 1:1 ' + key + ' — accepting directly');
+          self._media = media === 'video' ? 'video' : 'audio';
+          self._acceptedFrom = opts.peerId != null ? String(opts.peerId) : null;
+          self._acceptedId = key;
+          return self._capture().then(function () {
+            return self._reqDial('acceptCall', { callId: key });
+          });
+        }
+        // Group ids are joinable directly; a stale id fails at the server and
+        // surfaces as a clean accept error.
+        self._log('accept: no pending entry for ' + key + ' — trying joinGroupCall directly');
+        delete self._declined[key];
+        self._media = media === 'video' ? 'video' : self._media;
+        return self._capture().then(function () {
+          return self._reqDial('joinGroupCall', { groupId: key }).then(function (res) {
+            self._media = res.callType === 'video' ? 'video' : self._media;
+            self._room = { roomId: res.roomId, groupId: key, callId: null, media: self._media, joined: false };
+            self._groupInvitees = [];
+            self._groupJoined = {};
+            return self._startMedia(res.serverUrl);
+          });
+        });
+      }
+      self._media = p.media === 'video' ? 'video' : 'audio';
+      return self._capture().then(function () {
+        delete self._pendingIn[key];
+        if (p.group) {
+          return self._reqDial('joinGroupCall', { groupId: p.groupId }).then(function (res) {
+            self._media = res.callType === 'video' ? 'video' : self._media;
+            self._room = { roomId: res.roomId, groupId: String(p.groupId), callId: null, media: self._media, joined: false };
+            self._groupInvitees = [];
+            self._groupJoined = {};
+            return self._startMedia(res.serverUrl);
+          });
+        }
+        // 1:1 — the server answers with callAccepted (to both sides), which
+        // carries roomId + serverUrl; media starts in that handler.
+        self._acceptedFrom = p.from && p.from.id != null ? String(p.from.id) : (opts.peerId != null ? String(opts.peerId) : null);
+        // Drop sibling reassert entries from the same caller quietly (same
+        // logical call, different minted ids) — a later hangup must not decline
+        // them, which the caller would read as a rejection.
+        if (self._acceptedFrom) {
+          Object.keys(self._pendingIn).forEach(function (k) {
+            var q = self._pendingIn[k];
+            if (q && !q.group && q.from && String(q.from.id) === self._acceptedFrom) delete self._pendingIn[k];
+          });
+        }
+        self._acceptedId = key;
+        return self._reqDial('acceptCall', { callId: key });
+      });
+    };
+
+    CallingSDK.prototype.reject = function (callId) {
+      var key = String(callId);
+      var p = this._pendingIn[key];
+      delete this._pendingIn[key];
+      // Remember the declined peer so their ring reasserts (fresh callIds) are
+      // quietly declined instead of ghost-re-ringing.
+      if (p && !p.group && p.from && p.from.id != null) this._declinedPeer[String(p.from.id)] = Date.now();
+      try {
+        if (p && p.group) { this._declined[key] = Date.now(); this._socket && this._socket.emit('declineGroupCall', { groupId: p.groupId }); }
+        else this._socket && this._socket.emit('declineCall', { callId: key });
+      } catch (e) {}
+    };
+
+    // ---- teardown ----
+    CallingSDK.prototype.hangup = function () {
+      var self = this;
+      self._clearRetry();
+      // Decline anything still pending — covers an RN reject that never knew the
+      // media-server callId (app-socket-only ring).
+      Object.keys(self._pendingIn).forEach(function (key) {
+        var p = self._pendingIn[key];
+        try {
+          if (p.group) { self._declined[key] = Date.now(); self._socket && self._socket.emit('declineGroupCall', { groupId: p.groupId }); }
+          else self._socket && self._socket.emit('declineCall', { callId: key });
+        } catch (e) {}
+      });
+      self._pendingIn = {};
+      try {
+        if (self._room && self._room.groupId) self._socket && self._socket.emit('leaveGroupCall', { groupId: self._room.groupId });
+        else if (self._room && self._room.callId) self._socket && self._socket.emit('endCall', { callId: self._room.callId });
+        else if (self._acceptedId) self._socket && self._socket.emit('endCall', { callId: self._acceptedId });
+        else {
+          // Cancel EVERY id minted for this dial (redials + reasserts), not
+          // just the latest — stale server entries otherwise ring/linger.
+          var outIds = Object.keys(self._outIds);
+          if (self._out && outIds.indexOf(self._out.callId) < 0) outIds.push(self._out.callId);
+          outIds.forEach(function (cid) { try { self._socket && self._socket.emit('cancelCall', { callId: cid }); } catch (e) {} });
+        }
+      } catch (e) {}
+      self._acceptedId = null;
+      self._acceptedFrom = null;
+      self._out = null;
+      self._outIds = {};
+      self._dialTarget = null;
+      self._teardownMedia(true);
+    };
+
+    CallingSDK.prototype.disconnect = function () {
+      this._clearRetry();
+      this._acceptedId = null;
+      this._acceptedFrom = null;
+      this._out = null;
+      this._outIds = {};
+      this._dialTarget = null;
+      this._teardownMedia(false);
+      if (this._socket) { try { this._socket.removeAllListeners(); this._socket.disconnect(); } catch (e) {} }
+      this._socket = null;
+      this._registered = false;
+    };
+
+    CallingSDK.prototype._teardownMedia = function (leaveRoom) {
+      var self = this;
+      try { if (leaveRoom && self._socket && self._room && self._room.joined) self._socket.emit('leaveRoom'); } catch (e) {}
+      Object.keys(self._producers).forEach(function (k) { try { self._producers[k].close(); } catch (e) {} });
+      self._producers = {};
+      Object.keys(self._consumers).forEach(function (k) { try { self._consumers[k].close(); } catch (e) {} });
+      self._consumers = {};
+      self._consumed = {};
+      self._peerStreams = {};
+      try { self._sendTransport && self._sendTransport.close(); } catch (e) {}
+      try { self._recvTransport && self._recvTransport.close(); } catch (e) {}
+      self._sendTransport = self._recvTransport = null;
+      self._device = null;
+      if (self._localStream) { try { self._localStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} }
+      self._localStream = null;
+      if (self._screenStream) { try { self._screenStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {} }
+      self._screenStream = null;
+      self._room = null;
+      self._pendingProducers = [];
+      self._mediaDown = false;
+      self._groupInvitees = [];
+      self._groupJoined = {};
+    };
+
+    // ---- local media ----
+    // Capture is NEVER allowed to fail the call. On a LOCKED iPhone the app is
+    // woken in the BACKGROUND by a CallKit answer, and WKWebView refuses/hangs
+    // getUserMedia until CallKit's audio session is fully active (or the user
+    // unlocks). A single failed attempt used to reject accept() → RN got
+    // 'Could not connect the call media' → the just-answered call was torn down
+    // ("accept karte hi cut"); a HANGING attempt kept the CallKit timer running
+    // with the room never joined ("duration but no call"). Instead: a few quick
+    // retries, video→audio-only fallback, then PROCEED WITHOUT local media —
+    // the room joins, the remote audio plays (playback works backgrounded),
+    // and ensureLocalAudio() produces the mic the moment capture recovers.
+    CallingSDK.prototype._capture = function () {
+      var self = this;
+      if (self._localStream && self._localStream.active) return Promise.resolve(self._localStream);
+      var wantVideo = self._media === 'video';
+      var attempt = function (constraints) {
+        return navigator.mediaDevices.getUserMedia(constraints);
+      };
+      var tryOnce = function () {
+        if (!wantVideo) return attempt({ audio: true, video: false });
+        // Some cameras/WebViews reject a facingMode constraint outright
+        // (NotFound/Overconstrained) even though a camera exists — retry plain,
+        // then fall back to audio-only (a video call can upgrade later).
+        return attempt({ audio: true, video: { facingMode: self._facing } })
+          .catch(function (e) {
+            self._log('getUserMedia facingMode failed (' + (e && e.name) + ') — retrying without constraint');
+            return attempt({ audio: true, video: true });
+          })
+          .catch(function (e) {
+            self._log('getUserMedia video failed (' + (e && e.name) + ') — falling back to audio-only');
+            return attempt({ audio: true, video: false });
+          });
+      };
+      var attemptsLeft = 3;
+      var run = function () {
+        return tryOnce().catch(function (e) {
+          attemptsLeft -= 1;
+          if (attemptsLeft <= 0) throw e;
+          self._log('getUserMedia failed (' + (e && e.name) + ') — retrying (' + attemptsLeft + ' left)');
+          return new Promise(function (res) { setTimeout(res, 1200); }).then(run);
+        });
+      };
+      return run().then(function (stream) {
+        self._localStream = stream;
+        self._emit('localstream', stream);
+        return stream;
+      }).catch(function (e) {
+        self._log('getUserMedia gave up (' + (e && e.name) + ') — continuing WITHOUT local media (locked/background capture)');
+        self._localStream = new MediaStream();
+        self._emit('localstream', self._localStream);
+        return self._localStream;
+      });
+    };
+
+    // Produce the outbound mic LATE — for a call that had to join without local
+    // media (locked-phone answer) or lost its producer. Re-tried by the glue
+    // watchdog + restartAudio until capture succeeds. Idempotent & re-entrant.
+    CallingSDK.prototype.ensureLocalAudio = function () {
+      var self = this;
+      if (self._ensuringAudio) return Promise.resolve(false);
+      if (!self._room || !self._room.joined || !self._sendTransport) return Promise.resolve(false);
+      if (self._producers.mic) return Promise.resolve(false);
+      var liveTrack = null;
+      try {
+        (self._localStream ? self._localStream.getAudioTracks() : []).forEach(function (t) {
+          if (t.readyState === 'live') liveTrack = t;
+        });
+      } catch (e) {}
+      self._ensuringAudio = true;
+      var get = liveTrack
+        ? Promise.resolve(liveTrack)
+        : navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
+          var t = (s.getAudioTracks() || [])[0];
+          if (!self._localStream) self._localStream = new MediaStream();
+          try {
+            (self._localStream.getAudioTracks() || []).forEach(function (old) {
+              try { old.stop(); } catch (e) {}
+              try { self._localStream.removeTrack(old); } catch (e) {}
+            });
+            if (t) self._localStream.addTrack(t);
+          } catch (e) {}
+          return t;
+        });
+      return get.then(function (track) {
+        if (!track) throw new Error('no audio track');
+        return self._sendTransport.produce({ track: track, appData: { source: 'mic' } })
+          .then(function (pr) {
+            self._producers.mic = pr;
+            self._log('mic produced (late capture recovery)');
+            return true;
+          });
+      }).catch(function (e) {
+        self._log('ensureLocalAudio failed: ' + ((e && e.name) || (e && e.message) || 'error'));
+        return false;
+      }).then(function (ok) { self._ensuringAudio = false; return ok; });
+    };
+
+    // ---- mediasoup room pipeline ----
+    CallingSDK.prototype._startMedia = function (serverUrl) {
+      var self = this;
+      var pre = Promise.resolve();
+      if (serverUrl && serverUrl !== self._serverUrl) pre = self._migrate(serverUrl);
+      return pre.then(function () { return self._capture(); }).then(function () { return self._joinRoom(); });
+    };
+
+    CallingSDK.prototype._joinRoom = function () {
+      var self = this;
+      var room = self._room;
+      if (!room) return Promise.reject(new Error('no room'));
+      var joinRes = null;
+      // Defensive: drop any stale server-side room membership (a missed cleanup
+      // path would otherwise brick every future joinRoom). Idempotent no-op when
+      // not in a room.
+      try { self._socket && self._socket.emit('leaveRoom'); } catch (e) {}
+      return self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, token: self._token || undefined }).then(function (res) {
+        joinRes = res || {};
+        self._device = new window.mediasoupClient.Device();
+        return self._device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
+      }).then(function () {
+        return self._req('setRtpCapabilities', { rtpCapabilities: self._device.rtpCapabilities });
+      }).then(function () {
+        return self._req('createWebRtcTransport', { direction: 'send' });
+      }).then(function (sp) {
+        // Server-provided iceServers win; the app-supplied fallback fills in
+        // when the media server sends none (STUN/TURN for cross-NAT relay).
+        var ice = (joinRes.iceServers && joinRes.iceServers.length) ? joinRes.iceServers : (self._fallbackIceServers || []);
+        self._sendTransport = self._device.createSendTransport(Object.assign({}, sp, { iceServers: ice }));
+        self._wireTransport(self._sendTransport);
+        return self._req('createWebRtcTransport', { direction: 'recv' });
+      }).then(function (rp) {
+        var ice2 = (joinRes.iceServers && joinRes.iceServers.length) ? joinRes.iceServers : (self._fallbackIceServers || []);
+        self._recvTransport = self._device.createRecvTransport(Object.assign({}, rp, { iceServers: ice2 }));
+        self._wireTransport(self._recvTransport);
+        return self._produceLocal();
+      }).then(function () {
+        room.joined = true;
+        // Consume everything: producers that existed at join time PLUS any
+        // newProducer events that raced our transport setup (queued above).
+        var queued = self._pendingProducers;
+        self._pendingProducers = [];
+        var list = (joinRes.existingProducers || []).concat(queued);
+        self._log('room joined — producers up, consuming ' + list.length + ' (existing+queued)');
+        return list.reduce(function (chain, p) {
+          return chain.then(function () {
+            return self._consume(p).catch(function (e) { self._log('consume failed: ' + (e && e.message)); });
+          });
+        }, Promise.resolve());
+      });
+    };
+
+    CallingSDK.prototype._wireTransport = function (t) {
+      var self = this;
+      t.on('connect', function (args, cb, eb) {
+        self._req('connectTransport', { transportId: t.id, dtlsParameters: args.dtlsParameters }).then(cb).catch(eb);
+      });
+      if (t.direction === 'send') {
+        t.on('produce', function (args, cb, eb) {
+          self._req('produce', { transportId: t.id, kind: args.kind, rtpParameters: args.rtpParameters, appData: args.appData })
+            .then(function (r) { cb({ id: r.id }); }).catch(eb);
+        });
+      }
+      t.on('connectionstatechange', function (state) {
+        self._log('transport ' + t.direction + ' → ' + state);
+        if (state === 'failed' || state === 'disconnected') {
+          self._emitDown('ice:' + state);
+          if (self._socket && self._socket.connected) self._restartIceOn(t);
+        } else if (state === 'connected') {
+          self._emitUp('ice:connected');
+        }
+      });
+    };
+
+    CallingSDK.prototype._produceLocal = function () {
+      var self = this;
+      var chain = Promise.resolve();
+      var audio = self._localStream ? self._localStream.getAudioTracks()[0] : null;
+      if (audio && !self._producers.mic) {
+        chain = chain.then(function () {
+          return self._sendTransport.produce({ track: audio, appData: { source: 'mic' } })
+            .then(function (pr) { self._producers.mic = pr; });
+        });
+      }
+      if (self._media === 'video') {
+        var video = self._localStream ? self._localStream.getVideoTracks()[0] : null;
+        if (video && !self._producers.camera) {
+          chain = chain.then(function () {
+            var codecs = (self._device.rtpCapabilities && self._device.rtpCapabilities.codecs) || [];
+            var vp8 = null;
+            for (var i = 0; i < codecs.length; i++) {
+              if (String(codecs[i].mimeType).toLowerCase() === 'video/vp8') { vp8 = codecs[i]; break; }
+            }
+            var opts = { track: video, encodings: CAM_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 1000 }, appData: { source: 'camera' } };
+            if (vp8) opts.codec = vp8;
+            return self._sendTransport.produce(opts).then(function (pr) { self._producers.camera = pr; });
+          });
+        }
+      }
+      return chain;
+    };
+
+    CallingSDK.prototype._consume = function (p) {
+      var self = this;
+      var producerId = p && p.producerId;
+      var peerId = p && p.peerId != null ? String(p.peerId) : 'peer';
+      // A peer's screen goes into its OWN stream/tile (key peerId#screen) so it
+      // shows alongside their camera instead of replacing it.
+      var source = (p && p.source) || (p && p.appData && p.appData.source) || null;
+      var isScreen = source === 'screen';
+      var streamKey = isScreen ? (peerId + '#screen') : peerId;
+      if (!producerId || self._consumed[producerId]) return Promise.resolve();
+      if (!self._recvTransport || !self._device) return Promise.resolve();
+      self._consumed[producerId] = true;
+      return self._req('consume', {
+        transportId: self._recvTransport.id, producerId: producerId, rtpCapabilities: self._device.rtpCapabilities
+      }).then(function (params) {
+        return self._recvTransport.consume({ id: params.id, producerId: params.producerId, kind: params.kind, rtpParameters: params.rtpParameters });
+      }).then(function (consumer) {
+        self._consumers[consumer.id] = consumer;
+        consumer.appData = consumer.appData || {};
+        consumer.appData.peerId = peerId;
+        consumer.appData.streamKey = streamKey;
+        var stream = self._peerStreams[streamKey];
+        if (!stream) { stream = new MediaStream(); self._peerStreams[streamKey] = stream; }
+        // Replace any older track of the same kind (camera re-produce etc.).
+        stream.getTracks().forEach(function (t) {
+          if (t.kind === consumer.track.kind && t !== consumer.track) { try { stream.removeTrack(t); } catch (e) {} }
+        });
+        stream.addTrack(consumer.track);
+        return self._req('resumeConsumer', { consumerId: consumer.id }).then(function () {
+          self._groupJoined[peerId] = true;
+          self._log('consuming ' + consumer.track.kind + (isScreen ? ' (screen)' : '') + ' from ' + peerId);
+          self._emit('stream', { peerId: peerId, stream: stream, source: source });
+        });
+      }).catch(function (e) {
+        delete self._consumed[producerId];
+        throw e;
+      });
+    };
+
+    CallingSDK.prototype._dropPeer = function (peerId) {
+      var self = this;
+      Object.keys(self._consumers).forEach(function (cid) {
+        var c = self._consumers[cid];
+        if (c && c.appData && c.appData.peerId === peerId) {
+          delete self._consumed[c.producerId];
+          try { c.close(); } catch (e) {}
+          delete self._consumers[cid];
+        }
+      });
+      delete self._peerStreams[peerId];
+      delete self._peerStreams[peerId + '#screen'];
+    };
+
+    // ---- reconnection / network resilience ----
+    CallingSDK.prototype._emitDown = function (why) {
+      if (this._mediaDown) return;
+      this._mediaDown = true;
+      this._log('media DOWN (' + why + ')');
+      this._emit('disconnected', { reason: why });
+    };
+    CallingSDK.prototype._emitUp = function (why) {
+      if (!this._mediaDown) return;
+      this._mediaDown = false;
+      this._log('media UP (' + why + ')');
+      this._emit('connected', { reason: why });
+    };
+
+    CallingSDK.prototype._resume = function () {
+      var self = this;
+      var room = self._room;
+      if (!room) return;
+      self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, resume: true, token: self._token || undefined }).then(function (res) {
+        if (res && res.resumed) {
+          self.restartIce();
+          (res.existingProducers || []).forEach(function (p) { self._consume(p).catch(function () {}); });
+          self._emitUp('resume');
+          self._log('call resumed after reconnect');
+          return null;
+        }
+        // Grace expired server-side — rebuild the media pipeline from scratch on
+        // the same room (fresh transports + producers), like a page-refresh rejoin.
+        self._log('resume not available — rebuilding media pipeline');
+        Object.keys(self._producers).forEach(function (k) { try { self._producers[k].close(); } catch (e) {} });
+        self._producers = {};
+        Object.keys(self._consumers).forEach(function (k) { try { self._consumers[k].close(); } catch (e) {} });
+        self._consumers = {};
+        self._consumed = {};
+        self._peerStreams = {};
+        try { self._sendTransport && self._sendTransport.close(); } catch (e) {}
+        try { self._recvTransport && self._recvTransport.close(); } catch (e) {}
+        self._sendTransport = self._recvTransport = null;
+        self._device = null;
+        room.joined = false;
+        return self._joinRoom().then(function () {
+          self._emitUp('rejoin');
+          self._log('call rejoined after reconnect');
+        });
+      }).catch(function (e) {
+        self._log('resume failed: ' + (e && e.message));
+        // Leave the reconnecting state up; the next socket reconnect retries, and
+        // RN's reconnect watchdog bounds the wait.
+      });
+    };
+
+    CallingSDK.prototype.restartIce = function () {
+      var self = this;
+      [self._sendTransport, self._recvTransport].forEach(function (t) { if (t) self._restartIceOn(t); });
+    };
+    CallingSDK.prototype._restartIceOn = function (t) {
+      var self = this;
+      self._req('restartIce', { transportId: t.id }).then(function (r) {
+        return t.restartIce({ iceParameters: r.iceParameters });
+      }).then(function () {
+        self._log('ICE restarted ' + t.direction);
+      }).catch(function (e) {
+        self._log('ICE restart failed ' + t.direction + ': ' + (e && e.message));
+      });
+    };
+
+    // ---- in-call controls ----
+    CallingSDK.prototype.toggleMic = function (on) {
+      var p = this._producers.mic;
+      if (!p) return;
+      if (on) { this._req('resumeProducer', { producerId: p.id }).catch(function () {}); try { p.resume(); } catch (e) {} }
+      else { this._req('pauseProducer', { producerId: p.id }).catch(function () {}); try { p.pause(); } catch (e) {} }
+    };
+
+    CallingSDK.prototype.toggleCamera = function (on) {
+      var self = this;
+      var p = self._producers.camera;
+      if (!p) {
+        // Camera ON during an AUDIO call = WhatsApp-style upgrade to video:
+        // capture the camera now and produce it into the live room.
+        if (on && self._room && self._room.joined && self._sendTransport) {
+          self._upgradeToVideo().catch(function (e) {
+            self._log('video upgrade failed: ' + (e && e.message));
+            self._emit('mediaupgradefailed', { message: (e && e.message) || 'Could not start the camera' });
+          });
+        }
+        return;
+      }
+      if (on) { self._req('resumeProducer', { producerId: p.id }).catch(function () {}); try { p.resume(); } catch (e) {} }
+      else { self._req('pauseProducer', { producerId: p.id }).catch(function () {}); try { p.pause(); } catch (e) {} }
+    };
+
+    // Mid-call AUDIO → VIDEO upgrade: capture the camera, add it to the local
+    // stream (the self-preview <video> element updates live) and produce it.
+    CallingSDK.prototype._upgradeToVideo = function () {
+      var self = this;
+      if (self._producers.camera) return Promise.resolve();
+      return navigator.mediaDevices.getUserMedia({ video: { facingMode: self._facing } })
+        .catch(function (e) {
+          self._log('upgrade facingMode capture failed (' + (e && e.name) + ') — retrying without constraint');
+          return navigator.mediaDevices.getUserMedia({ video: true });
+        })
+        .then(function (stream) {
+          var track = stream.getVideoTracks()[0];
+          if (!track) {
+            try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+            throw new Error('No camera track');
+          }
+          if (self._localStream) {
+            try { self._localStream.addTrack(track); } catch (e) {}
+          } else {
+            self._localStream = stream;
+          }
+          self._media = 'video';
+          if (self._room) self._room.media = 'video';
+          return self._produceLocal().then(function () {
+            self._log('call upgraded to video (camera producing)');
+            self._emit('mediaupgraded', { media: 'video' });
+          });
+        });
+    };
+
+    CallingSDK.prototype.switchCamera = function () {
+      var self = this;
+      var next = self._facing === 'user' ? 'environment' : 'user';
+      return navigator.mediaDevices.getUserMedia({ video: { facingMode: next } }).then(function (stream) {
+        var newTrack = stream.getVideoTracks()[0];
+        if (!newTrack) throw new Error('no camera track');
+        var apply = self._producers.camera
+          ? self._producers.camera.replaceTrack({ track: newTrack })
+          : Promise.resolve();
+        return Promise.resolve(apply).then(function () {
+          if (self._localStream) {
+            self._localStream.getVideoTracks().forEach(function (t) {
+              if (t !== newTrack) {
+                try { t.stop(); } catch (e) {}
+                try { self._localStream.removeTrack(t); } catch (e) {}
+              }
+            });
+            try { self._localStream.addTrack(newTrack); } catch (e) {}
+          }
+          stream.getTracks().forEach(function (t) { if (t !== newTrack) { try { t.stop(); } catch (e) {} } });
+          self._facing = next;
+          self._emit('camerachanged', { facingMode: next });
+          return next;
+        });
+      });
+    };
+
+    // ---- screen share ----
+    // Sends the device screen as a second producer ({source:'screen'}, VP8,
+    // single layer, contentHint 'detail' for sharp text). Requires
+    // getDisplayMedia — available on desktop browsers; most mobile WebViews do
+    // not expose it (we reject with err.unsupported so RN can explain).
+    CallingSDK.prototype.startScreenShare = function () {
+      var self = this;
+      if (self._producers.screen) return Promise.resolve();
+      if (!self._room || !self._room.joined || !self._sendTransport) {
+        return Promise.reject(new Error('Screen share needs a connected call'));
+      }
+      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+        var uerr = new Error('Screen sharing is not supported on this device');
+        uerr.unsupported = true;
+        return Promise.reject(uerr);
+      }
+      return navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 15, max: 30 } },
+        audio: false
+      }).then(function (stream) {
+        var track = stream.getVideoTracks()[0];
+        if (!track) {
+          try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+          throw new Error('No screen track');
+        }
+        try { if ('contentHint' in track) track.contentHint = 'detail'; } catch (e) {}
+        var codecs = (self._device && self._device.rtpCapabilities && self._device.rtpCapabilities.codecs) || [];
+        var vp8 = null;
+        for (var i = 0; i < codecs.length; i++) {
+          if (String(codecs[i].mimeType).toLowerCase() === 'video/vp8') { vp8 = codecs[i]; break; }
+        }
+        var opts = { track: track, appData: { source: 'screen' } };
+        if (vp8) opts.codec = vp8;
+        return self._sendTransport.produce(opts).then(function (pr) {
+          self._producers.screen = pr;
+          self._screenStream = stream;
+          // System/browser "Stop sharing" ends the track → tear down cleanly.
+          track.onended = function () { self.stopScreenShare(); };
+          self._log('screen share producing');
+          self._emit('screenshare', { on: true });
+        }).catch(function (e) {
+          try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (er) {}
+          throw e;
+        });
+      });
+    };
+
+    CallingSDK.prototype.stopScreenShare = function () {
+      var self = this;
+      var p = self._producers.screen;
+      if (!p) return Promise.resolve();
+      delete self._producers.screen;
+      self._req('closeProducer', { producerId: p.id }).catch(function () {});
+      try { p.close(); } catch (e) {}
+      if (self._screenStream) {
+        try { self._screenStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+        self._screenStream = null;
+      }
+      self._log('screen share stopped');
+      self._emit('screenshare', { on: false });
+      return Promise.resolve();
+    };
+
+    // Swap the outbound mic track (glue's interruption recovery re-capture).
+    CallingSDK.prototype.replaceAudioTrack = function (newTrack) {
+      var p = this._producers.mic;
+      if (p) { try { p.replaceTrack({ track: newTrack }); } catch (e) {} }
+    };
+
+    CallingSDK.prototype.queryPresence = function (ids) {
+      var self = this;
+      var list = (ids || []).map(String);
+      var build = function (users) {
+        var online = {};
+        (users || []).forEach(function (u) { if (u && u.id != null) online[String(u.id)] = true; });
+        var map = {};
+        list.forEach(function (id) { map[id] = !!online[id]; });
+        return map;
+      };
+      return self._req('getUsers', {}).then(function (r) {
+        if (r && r.users) self._users = r.users;
+        return build(self._users);
+      }).catch(function () { return build(self._users); });
+    };
+
+    window.CallingSDK = CallingSDK;
+  })();
+  </script>
   <script>
   (function () {
     var remotes = document.getElementById('remotes');
@@ -329,6 +1546,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
     // TODO(audit APP-12): add native audio-focus/telephony interruption handling.
     var recapturing = false;
     var lastRecaptureMs = 0;
+    var lastEnsureAudioMs = 0; // cooldown for the late-mic (locked answer) retry
     function replaceAudioTrackOnSenders(newTrack) {
       // Try the common SDK/peer-connection surfaces to swap the outbound audio
       // track. Any that don't exist are skipped; at least one usually matches.
@@ -445,8 +1663,12 @@ export const buildCallEngineHtml = () => `<!doctype html>
     function relayout() {
       var n = Object.keys(tiles).length;
       remotes.className = '';
+      // Column count scales with the group size (up to 32 participants):
+      // 1 → full stage, 2-4 → 2 cols, 5-9 → 3 cols, 10+ → 4 cols.
       if (n <= 1) remotes.classList.add('count-1');
-      else remotes.classList.add('cols-2');
+      else if (n <= 4) remotes.classList.add('cols-2');
+      else if (n <= 9) remotes.classList.add('cols-3');
+      else remotes.classList.add('cols-4');
       var isVideo = currentMedia === 'video';
       // Self-view fills the screen when there is no remote yet (outgoing preview)
       // OR when the user has tapped to swap (self = main feed); otherwise it's the
@@ -480,6 +1702,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
       if (tiles[id]) return tiles[id];
       var wrap = document.createElement('div');
       wrap.className = 'rtile';
+      wrap.id = id; // addressable: '<peerId>' camera/mic tile, 'scr-<peerId>' screen tile
       var v = document.createElement('video');
       v.autoplay = true; v.playsInline = true; v.muted = false;
       // The moment the element actually starts playing audible media, tell RN to
@@ -552,6 +1775,41 @@ export const buildCallEngineHtml = () => `<!doctype html>
     }
     function playAllRemotes() {
       Object.keys(tiles).forEach(function (id) { playWithSound(tiles[id].video); });
+    }
+
+    // ---- CallKit audio-session recovery (iOS) ----
+    // Answering via CallKit (or CallKit reporting the caller's connected call)
+    // re-activates the process-global audio session UNDERNEATH WebKit. Tracks
+    // captured/attached BEFORE that switch keep readyState 'live' but their
+    // audio units are dead — the mic sends silence and remote playback is mute,
+    // and the interruption watchdog below can't see it (nothing is 'paused' or
+    // 'ended'). RN sends 'restartAudio' on CallKit's didActivateAudioSession
+    // (and as a post-connect safety net): force-rebuild BOTH directions —
+    // re-capture the mic (fresh getUserMedia → producer.replaceTrack) and
+    // re-attach every remote stream so WebKit rebuilds its playback pipeline
+    // under the now-active CallKit session. Idempotent; safe to run repeatedly.
+    function restartAudioPipeline() {
+      if (!call) { logToRN('restartAudio skipped — no live call'); return; }
+      logToRN('restartAudio — rebuilding mic + remote playback (CallKit session)');
+      // Locked-phone answer joined WITHOUT a mic producer (capture was refused
+      // in the background) — produce it now that the audio session is live.
+      try {
+        if (typeof call.ensureLocalAudio === 'function') {
+          call.ensureLocalAudio().then(function (ok) { if (ok) enableLocalMic(micWanted); });
+        }
+      } catch (e) {}
+      try { lastRecaptureMs = 0; } catch (e) {}
+      try { recaptureMic(); } catch (e) {}
+      try {
+        Object.keys(tiles).forEach(function (id) {
+          var v = tiles[id] && tiles[id].video;
+          if (!v || !v.srcObject) return;
+          // Detach + re-attach: a plain play() on an un-paused element is a
+          // no-op and never rebuilds the dead audio unit.
+          try { var s = v.srcObject; v.srcObject = null; v.srcObject = s; } catch (e) {}
+          playWithSound(v);
+        });
+      } catch (e) {}
     }
 
     function applyLocalMirror() {
@@ -627,10 +1885,14 @@ export const buildCallEngineHtml = () => `<!doctype html>
       call.on('stream', function (data) {
         var peerId = data && data.peerId;
         var stream = data && data.stream;
-        var t = tileFor(peerId);
+        // A peer's SCREEN share renders as its own tile beside their camera.
+        var isScreen = data && data.source === 'screen';
+        var tileKey = isScreen ? ('scr-' + peerId) : peerId;
+        var t = tileFor(tileKey);
+        try { t.wrap.dataset.peer = String(peerId || ''); } catch (e) {}
         try { t.video.srcObject = stream; } catch (e) {}
-        // Keep the remote stream for the recording mix; wire it in if recording.
-        if (peerId && stream) { remoteStreams[String(peerId)] = stream; recAddStream(stream); }
+        // Keep the remote stream for the recording mix (screen has no audio).
+        if (peerId && stream && !isScreen) { remoteStreams[String(peerId)] = stream; recAddStream(stream); }
         // Re-assert our local mic is enabled now the call has connected — covers
         // any SDK path that may have left the track disabled during negotiation,
         // so the other side always hears us.
@@ -650,7 +1912,29 @@ export const buildCallEngineHtml = () => `<!doctype html>
           } catch (e) {}
         }
         playWithSound(t.video);
-        post('stream', { peerId: peerId ? String(peerId) : null });
+        // The 'video' flag tells RN a VISUAL feed arrived — in an audio call it
+        // upgrades the UI to the video stage (peer turned camera on / screen).
+        var hasVideo = false;
+        try { hasVideo = !!(stream && stream.getVideoTracks && stream.getVideoTracks().length); } catch (e) {}
+        post('stream', {
+          peerId: peerId ? String(peerId) : null,
+          video: hasVideo,
+          source: (data && data.source) || null,
+        });
+      });
+      // WE upgraded an audio call to video (camera turned on mid-call). Flip the
+      // engine into video mode: show the self-preview (its <video> already holds
+      // the localStream, which just gained the camera track) and relayout.
+      call.on('mediaupgraded', function () {
+        currentMedia = 'video';
+        enableLocalCamera(true);
+        try { localWrap.classList.remove('hidden'); } catch (e) {}
+        relayout();
+        logToRN('audio call upgraded to VIDEO (self camera on)');
+        post('mediaUpgraded', { media: 'video' });
+      });
+      call.on('mediaupgradefailed', function (d) {
+        post('mediaUpgradeFailed', { message: (d && d.message) || 'Could not start the camera' });
       });
       call.on('incoming', function (info) {
         info = info || {};
@@ -679,8 +1963,17 @@ export const buildCallEngineHtml = () => `<!doctype html>
       });
       call.on('peerleft', function (data) {
         var id = (data && data.id) ? String(data.id) : null;
-        if (id) removeTile(id);
+        if (id) { removeTile(id); removeTile('scr-' + id); }
         post('peerleft', { id: id });
+      });
+      // A peer stopped sharing their screen — drop just the screen tile.
+      call.on('streamremoved', function (data) {
+        if (data && data.source === 'screen' && data.peerId) removeTile('scr-' + String(data.peerId));
+      });
+      // Our own share started/stopped from INSIDE the SDK (e.g. the system
+      // "Stop sharing" chip) — keep RN's button state in sync.
+      call.on('screenshare', function (data) {
+        post(data && data.on ? 'screenShareStarted' : 'screenShareStopped', {});
       });
       call.on('ended', function () { post('ended', {}); });
       call.on('rejected', function (info) { post('rejected', info || {}); });
@@ -707,6 +2000,11 @@ export const buildCallEngineHtml = () => `<!doctype html>
       });
       call.on('error', function (err) {
         post('error', { message: (err && err.message) ? err.message : 'call error' });
+      });
+      // Who is talking right now (SFU audio-level observer) — forwarded so the
+      // RN group UI can highlight the active speaker; RN ignores it otherwise.
+      call.on('activespeaker', function (data) {
+        post('activeSpeaker', { peerId: (data && data.peerId) || null });
       });
       // ---- mid-call media-layer connection state (network resilience) ----
       // Forward the peer-connection's up/down transitions to RN so it can show a
@@ -791,6 +2089,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
       try {
         switch (cmd) {
           case 'connect': {
+            logToRN('engine build 2026-07-13c (reassert+direct-accept)');
             if (typeof CallingSDK === 'undefined') {
               post('connectError', { message: 'CallingSDK failed to load' });
               return;
@@ -808,19 +2107,45 @@ export const buildCallEngineHtml = () => `<!doctype html>
             }
             resetTiles();
             logToRN('connecting to ' + (msg.url || '${SDK_ORIGIN}'));
-            call = new CallingSDK({ url: msg.url || '${SDK_ORIGIN}', token: msg.token, debug: !!msg.debug });
+            call = new CallingSDK({
+              url: msg.url || '${SDK_ORIGIN}', token: msg.token,
+              userId: msg.userId, name: msg.name, debug: !!msg.debug,
+              iceServers: msg.iceServers || null,
+            });
             wireEvents();
             Promise.resolve(call.connect()).then(function () {
               logToRN('engine connected — SDK ready');
-              post('engineReady', {});
+              post('engineReady', {
+                // Whether THIS WebView can capture the screen (desktop browsers
+                // yes; most mobile WebViews no — receive always works).
+                screenShare: !!(navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function'),
+              });
             }).catch(function (e) {
               logToRN('connect failed: ' + (e && e.message));
+              // Drop the half-connected instance so a later CONNECT retry starts
+              // clean, and a startCall can never fire into a dead SDK.
+              try { call && call.disconnect && call.disconnect(); } catch (er) {}
+              call = null;
               post('connectError', { message: (e && e.message) ? e.message : 'connect failed' });
             });
             break;
           }
+          case 'ping': {
+            // Liveness probe for ensureConnected: report whether an SDK instance
+            // exists and its signalling socket is actually connected right now.
+            var alive = !!(call && call._socket && call._socket.connected);
+            post('pong', { ref: msg.ref, hasCall: !!call, connected: alive });
+            break;
+          }
           case 'startCall': {
-            if (!call) { post('startCallError', { ref: msg.ref, message: 'not connected' }); return; }
+            if (!call) {
+              // No SDK instance — the page reloaded (or connect failed) while RN
+              // still thought the engine was ready. Tell RN the engine is down so
+              // it reconnects for the next attempt, then fail this dial clearly.
+              post('connectError', { message: 'engine had no SDK at dial time' });
+              post('startCallError', { ref: msg.ref, message: 'Call engine restarting — please try again' });
+              return;
+            }
             var targets = toIdList(msg.to);
             // ALWAYS pass an array — even for a 1:1 call — exactly like the working
             // reference (call.startCall of [].concat(to)). Passing a bare id for 1:1
@@ -850,7 +2175,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
             wantSpeaker = !!msg.speaker;
             if (msg.media) currentMedia = (msg.media === 'video') ? 'video' : 'audio';
             logToRN('accept → callId=' + msg.callId + ' media=' + currentMedia + ' speaker=' + wantSpeaker);
-            if (call) Promise.resolve(call.accept(msg.callId))
+            if (call) Promise.resolve(call.accept(msg.callId, msg.media, { isGroup: msg.isGroup, peerId: msg.peerId }))
               .then(function () {
                 // Mic (and camera for a video call) ON immediately after answering.
                 enableLocalMic(true);
@@ -889,6 +2214,39 @@ export const buildCallEngineHtml = () => `<!doctype html>
             }).catch(function(){});
             break;
           }
+          case 'inviteToGroup': {
+            if (!call) break;
+            Promise.resolve(call.inviteToGroup(msg.ids || []))
+              .then(function () { logToRN('group invite sent'); })
+              .catch(function (e) { logToRN('group invite failed: ' + (e && e.message)); });
+            break;
+          }
+          case 'stopInvite': {
+            if (call && msg.id) { try { call.stopInviting(msg.id); } catch (e) {} }
+            break;
+          }
+          case 'toggleScreen': {
+            if (!call) { post('screenShareError', { message: 'Call engine not connected' }); break; }
+            if (msg.on) {
+              Promise.resolve(call.startScreenShare()).catch(function (e) {
+                var name = e && e.name;
+                // User cancelled the OS/browser share picker → quiet reset.
+                if (name === 'NotAllowedError' || name === 'AbortError') {
+                  logToRN('screen share cancelled by user');
+                  post('screenShareStopped', { cancelled: true });
+                  return;
+                }
+                logToRN('screen share failed: ' + (e && e.message));
+                post('screenShareError', {
+                  message: (e && e.message) ? e.message : 'Screen share failed',
+                  unsupported: !!(e && e.unsupported),
+                });
+              });
+            } else {
+              Promise.resolve(call.stopScreenShare()).catch(function () { post('screenShareStopped', {}); });
+            }
+            break;
+          }
           case 'queryPresence': {
             if (!call) { post('presenceResult', { ref: msg.ref, map: {} }); return; }
             Promise.resolve(call.queryPresence(msg.ids || [])).then(function (map) {
@@ -897,6 +2255,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
             break;
           }
           case 'resumeAudio': { playAllRemotes(); break; }
+          case 'restartAudio': { restartAudioPipeline(); break; }
           case 'setSpeaker': { wantSpeaker = !!msg.on; applySpeakerPreference(); break; }
           case 'restartIce': {
             // Network changed (wifi↔cellular) mid-call — ask the SDK to renegotiate
@@ -941,6 +2300,17 @@ export const buildCallEngineHtml = () => `<!doctype html>
           var t = tiles[ids[i]];
           var v = t && t.video;
           if (v && v.srcObject && v.paused) { try { v.play().catch(function () {}); } catch (e) {} }
+        }
+        // 1b) Locked-phone answer: the room was joined WITHOUT a mic producer
+        //     (background WKWebView refused capture). Keep trying to produce it —
+        //     capture starts working once CallKit's session is fully active or
+        //     the user unlocks. ensureLocalAudio is idempotent + self-gating.
+        if (call && typeof call.ensureLocalAudio === 'function'
+            && Date.now() - lastEnsureAudioMs > 3000) {
+          lastEnsureAudioMs = Date.now();
+          try {
+            call.ensureLocalAudio().then(function (ok) { if (ok) enableLocalMic(micWanted); });
+          } catch (e) {}
         }
         // 2) Local (outgoing) mic — an interruption can leave the captured track
         //    disabled even though the user wants it ON; re-enable it (only while the

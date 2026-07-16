@@ -2,13 +2,21 @@ import * as Contacts from 'expo-contacts';
 import { Platform } from 'react-native';
 import contactHasher from '../Redux/Services/Contact/ContactHasher';
 import ContactDatabase from './ContactDatabase';
+import { suspendAppLock, resumeAppLock } from './appLockGuard';
 
 /**
  * Request contacts permission. Returns true if granted.
+ * Wrapped in the app-lock suspend guard — the OS permission dialog backgrounds
+ * the app on many devices, and the return trip must not re-trigger the lock.
  */
 export const requestContactsPermission = async () => {
-  const { status } = await Contacts.requestPermissionsAsync();
-  return status === 'granted';
+  suspendAppLock();
+  try {
+    const { status } = await Contacts.requestPermissionsAsync();
+    return status === 'granted';
+  } finally {
+    resumeAppLock();
+  }
 };
 
 /**
@@ -57,6 +65,11 @@ export const findInDeviceContacts = async (normalizedPhone) => {
  * Returns { success, contactId, error }.
  */
 export const saveToDeviceContacts = async ({ firstName, lastName, phone, imageUri } = {}) => {
+  // The whole flow (permission dialog + system "Create contact" form) leaves
+  // the app — suspend the app lock for the round trip so the user isn't
+  // dumped on the lock screen after saving a contact.
+  suspendAppLock();
+  try {
   const granted = await requestContactsPermission();
   if (!granted) {
     return { success: false, error: 'permission_denied' };
@@ -123,6 +136,9 @@ export const saveToDeviceContacts = async ({ firstName, lastName, phone, imageUr
     } catch (innerErr) {
       return { success: false, error: innerErr?.message || err?.message || 'save_failed' };
     }
+  }
+  } finally {
+    resumeAppLock();
   }
 };
 

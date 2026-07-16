@@ -33,7 +33,7 @@ const ReplyPreviewBox = React.memo(function ReplyPreviewBox({
       ? (MEDIA_LABELS[msgType] || replyTarget.text || 'Media')
       : (replyTarget.text || '');
 
-  const accentColor = isMe ? (chatColor || '#25D366') : '#6B8AFF';
+  const accentColor = isMe ? (chatColor || '#03b0a2') : '#6B8AFF';
   const bgColor = isDarkMode ? '#1E2D36' : '#E8EDF2';
   const textColor = isDarkMode ? 'rgba(255,255,255,0.7)' : 'rgba(0,0,0,0.6)';
 

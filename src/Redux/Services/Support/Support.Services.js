@@ -13,7 +13,7 @@ export const SUPPORT_CATEGORIES = [
 export const SUPPORT_STATUS_META = {
   open: { label: 'Open', color: '#2D9BF0' },
   in_progress: { label: 'In Progress', color: '#F5A623' },
-  resolved: { label: 'Resolved', color: '#00A884' },
+  resolved: { label: 'Resolved', color: '#03b0a2' },
   closed: { label: 'Closed', color: '#8696A0' },
 };
 

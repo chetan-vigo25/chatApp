@@ -10,6 +10,8 @@ import { useTheme } from '../../contexts/ThemeContext';
 import {
   getUserSettings,
   updateUserSettings,
+  updateAppLock,
+  readAppLockScope,
 } from '../../Redux/Services/Profile/Settings.Services';
 import {
   clearDeletedChatConfig,
@@ -52,9 +54,10 @@ export default function TwoStepPassword({ navigation }) {
         const settings = await getUserSettings();
         if (!alive) return;
         const chat = settings?.chat || {};
-        const two = chat.twoStep || {};
-        setEnabled(!!two.enabled);
-        setHasPassword(!!two.hasPassword);
+        // This device's lock only — the website's lock lives in its own scope.
+        const two = readAppLockScope(settings);
+        setEnabled(two.enabled);
+        setHasPassword(two.hasPassword);
         setHasDeletedPassword(
           typeof chat.hasDeletedPassword === 'boolean'
             ? chat.hasDeletedPassword
@@ -121,9 +124,7 @@ export default function TwoStepPassword({ navigation }) {
             onPress: async () => {
               setBusy(true);
               try {
-                await updateUserSettings({
-                  chat: { twoStep: { enabled: false, password: null } },
-                });
+                await updateAppLock({ enabled: false, password: null });
                 // Disabling 2-step orphans the deleted-chats password — clear it too.
                 await clearDeletedPasswordIfSet();
                 setEnabled(false);
@@ -169,9 +170,7 @@ export default function TwoStepPassword({ navigation }) {
     }
     setSubmitting(true);
     try {
-      await updateUserSettings({
-        chat: { twoStep: { enabled: true, password: trimmed } },
-      });
+      await updateAppLock({ enabled: true, password: trimmed });
       setHasPassword(true);
       setPwd('');
       setConfirmPwd('');
@@ -210,9 +209,7 @@ export default function TwoStepPassword({ navigation }) {
               // Reset is the RECOVERY path (e.g. forgotten password): clear the
               // password AND disable app lock, so the user isn't locked out on the
               // next launch/foreground and can use the app right away.
-              await updateUserSettings({
-                chat: { twoStep: { enabled: false, password: null } },
-              });
+              await updateAppLock({ enabled: false, password: null });
               // Reset the deleted-chats password too — it depended on this one.
               await clearDeletedPasswordIfSet();
               setEnabled(false);
@@ -289,8 +286,9 @@ export default function TwoStepPassword({ navigation }) {
         </Text>
         <Text style={[styles.heroBody, { color: subText }]}>
           When enabled, you'll be asked for this password every time the app
-          launches or returns from the background. Different from your
-          chat delete password.
+          launches or returns from the background. It applies to this mobile app
+          only — the web app has its own separate lock — and it must differ from
+          your chat delete password.
         </Text>
       </View>
     </Animated.View>

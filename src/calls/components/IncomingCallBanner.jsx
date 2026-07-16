@@ -9,6 +9,7 @@ import { useTheme } from '../../contexts/ThemeContext';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { CALL_STATUS } from '../state/callMachine';
 import CallAvatar from './CallAvatar';
+import nativeCall from '../services/nativeCallService';
 
 /**
  * WhatsApp-style compact incoming-call heads-up banner.
@@ -43,10 +44,15 @@ export default function IncomingCallBanner() {
   // A foreground call is presented ONLY via the OS push notification, so the
   // in-app banner stays hidden for it (notificationOnly).
   const notificationOnly = !!call?.notificationOnly;
+  // iOS + CallKit: the SYSTEM call banner/screen is the one and only ring UI —
+  // never stack this in-app banner on top of it. Two ring UIs at once let the
+  // user answer in-app while CallKit kept ringing (dead audio session, banner
+  // stuck). The CallKit answer flows back into the app via onAnswer.
+  const callKitRings = Platform.OS === 'ios' && nativeCall.isAvailable();
   // Only ring as a banner: an unanswered incoming call that hasn't been expanded
   // to the full-screen ring screen.
   const visible = status === CALL_STATUS.INCOMING && !accepted
-    && !call?.incomingExpanded && !notificationOnly;
+    && !call?.incomingExpanded && !notificationOnly && !callKitRings;
 
   const translateY = useRef(new Animated.Value(-220)).current;
   useEffect(() => {
@@ -160,6 +166,6 @@ const styles = StyleSheet.create({
     borderRadius: 22,
   },
   decline: { backgroundColor: '#EA0038' },
-  accept: { backgroundColor: '#00A884' },
+  accept: { backgroundColor: '#03b0a2' },
   btnText: { color: '#fff', fontFamily: 'Roboto-Medium', fontSize: 15 },
 });

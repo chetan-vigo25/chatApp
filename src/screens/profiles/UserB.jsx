@@ -823,7 +823,7 @@ const styles = StyleSheet.create({
     width: 11,
     height: 11,
     borderRadius: 6,
-    backgroundColor: '#25D366',
+    backgroundColor: '#03b0a2',
     borderWidth: 2,
     borderColor: 'rgba(255,255,255,0.9)',
   },

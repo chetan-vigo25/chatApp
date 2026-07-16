@@ -8,7 +8,7 @@ import { apiCall } from '../../Config/Https';
  *   -> { data: { token, callBaseUrl, ringDurationSec } }
  */
 
-let cached = null; // { token, callBaseUrl, ringDurationSec, fetchedAt }
+let cached = null; // { token, callBaseUrl, ringDurationSec, iceServers, fetchedAt }
 // Last backend-provided ring duration (seconds). Kept across token-cache clears
 // so it survives reconnects; null until the first successful mint.
 let serverRingSec = null;
@@ -61,6 +61,9 @@ export const getCallToken = async ({ force = false } = {}) => {
     token: data.token,
     callBaseUrl: data.callBaseUrl,
     ringDurationSec: serverRingSec,
+    // Backend-configured STUN/TURN fallback for the engine's mediasoup
+    // transports (used when the media server's joinRoom returns none).
+    iceServers: Array.isArray(data.iceServers) && data.iceServers.length ? data.iceServers : null,
     fetchedAt: Date.now(),
   };
   if (__DEV__) console.log('[CALL][APP][token] ✓ minted', { callBaseUrl: cached.callBaseUrl, ringDurationSec: cached.ringDurationSec, tokenLen: String(data.token).length });

@@ -37,7 +37,7 @@ function StatusThumb({ status, style }) {
   }
   if (statusType === 'text') {
     return (
-      <View style={[style, styles.thumbText, { backgroundColor: status.bgColor || '#075e54' }]}>
+      <View style={[style, styles.thumbText, { backgroundColor: status.bgColor || '#026158' }]}>
         <Text style={styles.thumbTextBody} numberOfLines={3}>
           {status.textContent}
         </Text>
@@ -408,9 +408,9 @@ export default function StatusList({ navigation }) {
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
-      {/* Large title — WhatsApp "Updates" page */}
+      {/* Large title — WhatsApp-style status page */}
       <View style={styles.header}>
-        <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>Updates</Text>
+        <Text style={[styles.headerTitle, { color: theme.colors.primaryTextColor }]}>Status</Text>
       </View>
 
       <FlatList

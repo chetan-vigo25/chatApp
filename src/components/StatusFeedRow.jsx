@@ -5,7 +5,7 @@
  * Ring colours:
  *   • Unseen  → purple (#8B5CF6) border  (install expo-linear-gradient for true gradient)
  *   • Viewed  → muted gray (#94A3B8) border
- *   • Own     → green (#25D366) border when has status, plain when none
+ *   • Own     → green (#03b0a2) border when has status, plain when none
  *
  * Usage:
  *   <StatusFeedRow navigation={navigation} />
@@ -35,7 +35,7 @@ import useContactDirectory from '../hooks/useContactDirectory';
 
 const RING_UNSEEN   = '#8B5CF6'; // purple
 const RING_VIEWED   = '#94A3B8'; // muted gray
-const RING_OWN      = '#25D366'; // green
+const RING_OWN      = '#03b0a2'; // green
 const AVATAR_SIZE   = 54;
 const RING_WIDTH    = 2.5;
 const ITEM_WIDTH    = 72;

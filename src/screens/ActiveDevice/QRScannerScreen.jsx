@@ -186,7 +186,7 @@ export default function QRScannerScreen({ navigation }) {
             {/* Loading overlay */}
             {isLinking && (
               <View style={styles.scanOverlay}>
-                <ActivityIndicator size="large" color="#25D366" />
+                <ActivityIndicator size="large" color="#03b0a2" />
                 <Text style={styles.linkingText}>Linking device...</Text>
               </View>
             )}
@@ -322,33 +322,33 @@ const styles = StyleSheet.create({
     left: 0,
     borderTopWidth: CORNER_WIDTH,
     borderLeftWidth: CORNER_WIDTH,
-    borderColor: '#25D366',
+    borderColor: '#03b0a2',
   },
   topRight: {
     top: 0,
     right: 0,
     borderTopWidth: CORNER_WIDTH,
     borderRightWidth: CORNER_WIDTH,
-    borderColor: '#25D366',
+    borderColor: '#03b0a2',
   },
   bottomLeft: {
     bottom: 0,
     left: 0,
     borderBottomWidth: CORNER_WIDTH,
     borderLeftWidth: CORNER_WIDTH,
-    borderColor: '#25D366',
+    borderColor: '#03b0a2',
   },
   bottomRight: {
     bottom: 0,
     right: 0,
     borderBottomWidth: CORNER_WIDTH,
     borderRightWidth: CORNER_WIDTH,
-    borderColor: '#25D366',
+    borderColor: '#03b0a2',
   },
   scanLine: {
     width: '100%',
     height: 2,
-    backgroundColor: '#25D366',
+    backgroundColor: '#03b0a2',
   },
   scanOverlay: {
     ...StyleSheet.absoluteFillObject,

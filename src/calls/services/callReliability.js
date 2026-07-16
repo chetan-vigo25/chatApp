@@ -17,7 +17,7 @@
  */
 import { Platform, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { isIgnoringBatteryOptimizations } from '../../../modules/expo-call-ui';
+import { isIgnoringBatteryOptimizations, requestDisableBatteryOptimization } from '../../../modules/expo-call-ui';
 
 // Fired by the Settings entry to force-open the reliability sheet on demand,
 // bypassing the snooze / "don't show again" gating (the auto-prompt respects
@@ -29,6 +29,7 @@ export const openCallReliability = () => {
 
 const PERMA_OFF_KEY = '@call/reliability/permaOff';
 const SNOOZE_UNTIL_KEY = '@call/reliability/snoozeUntil';
+const AUTO_ASKED_KEY = '@call/reliability/autoAsked';
 
 // How long a dismissal quiets the prompt before it may reappear (only if the
 // exemption is still missing).
@@ -60,6 +61,29 @@ export const shouldOfferReliability = async () => {
   }
 };
 
+// First-entry auto-request: fire the SYSTEM battery-optimization dialog
+// directly (the small OS "Allow app to run in background?" prompt) instead of
+// showing our own onboarding card — ONCE per install. Grant → calls ring
+// forever, user never sees our card. Deny → we snooze the card too, so the
+// user isn't nagged again right away (Settings can always reopen it).
+// Returns true when the system dialog was fired (caller must NOT also show
+// the custom card in that case).
+export const maybeAutoRequestBackground = async () => {
+  if (Platform.OS !== 'android') return false;
+  if (isBackgroundAllowed()) return false;
+  try {
+    const asked = await AsyncStorage.getItem(AUTO_ASKED_KEY);
+    if (asked === 'true') return false;
+    await AsyncStorage.setItem(AUTO_ASKED_KEY, 'true');
+    // Quiet the custom card for the snooze window — the system dialog IS the ask.
+    await snoozeReliability();
+    requestDisableBatteryOptimization();
+    return true;
+  } catch (_) {
+    return false;
+  }
+};
+
 // "Remind me later" — quiet the prompt for SNOOZE_DAYS.
 export const snoozeReliability = async () => {
   try { await AsyncStorage.setItem(SNOOZE_UNTIL_KEY, String(Date.now() + SNOOZE_MS)); } catch (_) {}
@@ -74,6 +98,8 @@ export const dismissReliabilityForever = async () => {
 // (and a future revoke can re-offer). Best-effort.
 export const clearReliabilityFlags = async () => {
   try {
-    await AsyncStorage.multiRemove([PERMA_OFF_KEY, SNOOZE_UNTIL_KEY]);
+    // AUTO_ASKED_KEY too — if the exemption is later revoked, the first-entry
+    // system dialog may fire once again instead of the custom card.
+    await AsyncStorage.multiRemove([PERMA_OFF_KEY, SNOOZE_UNTIL_KEY, AUTO_ASKED_KEY]);
   } catch (_) {}
 };

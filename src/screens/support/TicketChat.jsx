@@ -115,7 +115,7 @@ export default function TicketChat({ navigation, route }) {
     const mine = item.senderRole === "user";
     return (
       <View style={[styles.bubbleRow, { justifyContent: mine ? "flex-end" : "flex-start" }]}>
-        <View style={[styles.bubble, mine ? { backgroundColor: isDarkMode ? "#005C4B" : "#D9FDD3" } : { backgroundColor: adminBubble }]}>
+        <View style={[styles.bubble, mine ? { backgroundColor: isDarkMode ? "#03574f" : "#d5f5f2" } : { backgroundColor: adminBubble }]}>
           {!mine && <Text style={[styles.senderName, { color: accent }]}>{item.senderName || "Support"}</Text>}
           {item.mediaUrl ? (
             item.mediaType === "image" ? (

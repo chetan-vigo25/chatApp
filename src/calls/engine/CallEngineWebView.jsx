@@ -1,4 +1,4 @@
-import React, { forwardRef, useMemo } from 'react';
+import React, { forwardRef, useMemo, useRef, useCallback } from 'react';
 import { WebView } from 'react-native-webview';
 import { buildCallEngineHtml, CALL_ENGINE_BASE_URL } from './callEngineHtml';
 import { parseEngineEvent } from './protocol';
@@ -12,10 +12,28 @@ import { parseEngineEvent } from './protocol';
  */
 const CallEngineWebView = forwardRef(function CallEngineWebView({ onEvent, style }, ref) {
   const html = useMemo(() => buildCallEngineHtml(), []);
+  // Keep our own handle alongside the forwarded ref so the process-gone
+  // handlers below can reload this exact WebView instance.
+  const innerRef = useRef(null);
+  const setRefs = useCallback((node) => {
+    innerRef.current = node;
+    if (typeof ref === 'function') ref(node);
+    else if (ref) ref.current = node;
+  }, [ref]);
+  // The OS can kill a parked/backgrounded WebView renderer (Android) or content
+  // process (iOS). Without an explicit reload the engine page is simply GONE —
+  // every later call fails with 'not connected' until the app restarts. Reload
+  // brings the page back; its 'engine html loaded' log then makes CallProvider
+  // reset the stale ready flag and reconnect the SDK.
+  const reload = useCallback(() => {
+    try { innerRef.current && innerRef.current.reload(); } catch (_) {}
+  }, []);
 
   return (
     <WebView
-      ref={ref}
+      ref={setRefs}
+      onRenderProcessGone={reload}
+      onContentProcessDidTerminate={reload}
       source={{ html, baseUrl: CALL_ENGINE_BASE_URL }}
       originWhitelist={['https://*', 'http://*']}
       style={style}

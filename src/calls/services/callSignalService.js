@@ -36,10 +36,24 @@ export const cancelCall = ({ callId, toUserIds }) => {
   return emitSocketEvent('call:cancel', { callId, toUserIds });
 };
 
-export const acceptCallSignal = ({ callId, callerId }) => {
+// Emit `call:accept` and resolve with the server ack. The ack matters: the
+// server attributes the accept to the real signaling call via the callee's busy
+// record — an ack of `{ callId: null }` (or `ok:false`) means the server could
+// NOT attribute it (busy record not written yet / socket session still binding
+// on a cold boot), so the caller would keep hearing RINGING even though the
+// callee answered. Callers use this to retry. A no-ack timeout resolves
+// optimistically so an old server can never block the call.
+const ACCEPT_ACK_TIMEOUT_MS = 4000;
+export const acceptCallSignal = ({ callId, callerId }) => new Promise((resolve) => {
+  let settled = false;
+  const done = (res) => { if (!settled) { settled = true; resolve(res || { ok: true, timedOut: true }); } };
   if (__DEV__) console.log('[CALL][APP][signal] → emit call:accept', { callId, callerId });
-  return emitSocketEvent('call:accept', { callId, callerId });
-};
+  emitSocketEvent('call:accept', { callId, callerId }, (res) => {
+    if (__DEV__) console.log('[CALL][APP][signal] ← call:accept ACK', res);
+    done(res);
+  });
+  setTimeout(() => done({ ok: true, timedOut: true }), ACCEPT_ACK_TIMEOUT_MS);
+});
 
 export const rejectCallSignal = ({ callId, callerId }) => {
   if (__DEV__) console.log('[CALL][APP][signal] → emit call:reject', { callId, callerId });

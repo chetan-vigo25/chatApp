@@ -67,7 +67,7 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
   // bubbles in ChatScreen so a custom Appearance accent applies here too —
   // when no custom accent is set, fall back to WhatsApp's outgoing green.
   const bubbleColor = isOutgoing
-    ? ((chatColor && chatColor !== '#00A884') ? chatColor : '#005C4B')
+    ? ((chatColor && chatColor !== '#03b0a2') ? chatColor : '#03574f')
     : (isDarkMode ? theme.colors.cardBackground : '#ffffff');
   const onBubble = isOutgoing ? '#ffffff' : theme.colors.primaryTextColor;
   const onBubbleSoft = isOutgoing ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;

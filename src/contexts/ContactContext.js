@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState } from 'react';
 import * as Contacts from 'expo-contacts';
+import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
 
 const ContactContext = createContext();
 
@@ -8,19 +9,26 @@ export const ContactProvider = ({ children }) => {
   const [permissionStatus, setPermissionStatus] = useState(null);
 
   const askPermissionAndLoadContacts = async () => {
-    const { status } = await Contacts.requestPermissionsAsync();
-    setPermissionStatus(status);
-  
-    if (status === 'granted') {
-      const { data } = await Contacts.getContactsAsync({
-        fields: [Contacts.Fields.PhoneNumbers],
-      });
-  
-      const contactsWithNumbers = data.filter(
-        contact => contact.phoneNumbers && contact.phoneNumbers.length > 0
-      );
-  
-      setContacts(contactsWithNumbers);
+    // The permission dialog backgrounds the app on many devices — suspend the
+    // app lock so fetching contacts doesn't bounce the user to the lock screen.
+    suspendAppLock();
+    try {
+      const { status } = await Contacts.requestPermissionsAsync();
+      setPermissionStatus(status);
+
+      if (status === 'granted') {
+        const { data } = await Contacts.getContactsAsync({
+          fields: [Contacts.Fields.PhoneNumbers],
+        });
+
+        const contactsWithNumbers = data.filter(
+          contact => contact.phoneNumbers && contact.phoneNumbers.length > 0
+        );
+
+        setContacts(contactsWithNumbers);
+      }
+    } finally {
+      resumeAppLock();
     }
   };
 

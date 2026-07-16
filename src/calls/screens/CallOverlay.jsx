@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar,
 } from 'react-native';
@@ -17,6 +17,7 @@ import IncomingCallCard from '../components/IncomingCallCard';
 import CallParticipantsGrid from '../components/CallParticipantsGrid';
 import PulsingRing from '../components/PulsingRing';
 import CallMiniBanner from '../components/CallMiniBanner';
+import AddParticipantSheet from '../components/AddParticipantSheet';
 
 const END_TEXT = {
   completed: 'Call ended',
@@ -30,11 +31,15 @@ const END_TEXT = {
 export default function CallOverlay() {
   const {
     call, accept, reject, hangup,
-    toggleMic, toggleCamera, switchCamera, toggleSpeaker, resumeAudio,
+    toggleMic, toggleCamera, switchCamera, toggleScreenShare, toggleSpeaker, resumeAudio,
     minimize, maximize,
+    inviteMoreToCall,
     audioRouteSupported,
     lockedCall, leaveToLock,
   } = useCall();
+
+  // Mid-call "Add participant" member picker (group calls).
+  const [showAddSheet, setShowAddSheet] = useState(false);
 
   const insets = useSafeAreaInsets();
   const { theme, isDarkMode } = useTheme();
@@ -88,6 +93,46 @@ export default function CallOverlay() {
     || (status === CALL_STATUS.INCOMING && accepted);
 
   const minimized = !!call?.minimized;
+
+  // What the group roster grid actually SHOWS:
+  //  • receiver, once answered → ONLY people actually connected (no own tile,
+  //    no "Connecting…" ghosts for members who never picked up);
+  //  • caller (and the pre-answer incoming ring) → the invited roster, with
+  //    "Ringing…" until each member joins — the ring-window sweep removes
+  //    non-answerers so nothing rings forever.
+  // Names are resolved through the device contact directory (roster entries
+  // from the socket payload only carry ids).
+  const gridParticipants = (() => {
+    if (!isGroup) return call?.participants || {};
+    const all = call?.participants || {};
+    const receiverConnectedOnly = call?.direction === 'incoming'
+      && (accepted0 || status === CALL_STATUS.ACTIVE);
+    const out = {};
+    Object.values(all).forEach((p) => {
+      if (!p || !p.id) return;
+      if (receiverConnectedOnly && !p.joined) return;
+      const generic = !p.name || p.name === 'Member' || p.name === 'Unknown';
+      const name = generic ? (resolveName(p.id, p.name, null) || p.name || 'Member') : p.name;
+      out[p.id] = name === p.name ? p : { ...p, name };
+    });
+    return out;
+  })();
+
+  // "Add participant" is available on a LIVE group call (host ringing included —
+  // the host is already in the room while others ring).
+  const canAddParticipants = isGroup
+    && (status === CALL_STATUS.ACTIVE || accepted || status === CALL_STATUS.OUTGOING);
+  const addSheet = canAddParticipants ? (
+    <AddParticipantSheet
+      visible={showAddSheet}
+      onClose={() => setShowAddSheet(false)}
+      groupId={call?.groupId}
+      // Live roster only (joined or still ringing) — NOT the original invite
+      // list, so a member who declined/missed/dropped can be re-added.
+      existingIds={Object.keys(call?.participants || {})}
+      onInvite={(members) => inviteMoreToCall?.(members)}
+    />
+  ) : null;
   // The minimize affordance shows once a call is connecting/active or dialing
   // out (same gate as the controls) — NOT on an unanswered incoming ring, which
   // stays full-screen with Accept/Decline like WhatsApp.
@@ -225,6 +270,15 @@ export default function CallOverlay() {
               <Text style={styles.videoSub}>{subtitle}</Text>
             )}
           </View>
+          {canAddParticipants ? (
+            <TouchableOpacity
+              onPress={() => setShowAddSheet(true)}
+              style={styles.minBtn}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            >
+              <Ionicons name="person-add" size={22} color="#fff" />
+            </TouchableOpacity>
+          ) : null}
         </View>
 
         {call?.needsUnmuteGesture ? (
@@ -234,17 +288,21 @@ export default function CallOverlay() {
           </TouchableOpacity>
         ) : null}
 
+        {addSheet}
+
         <View style={[styles.videoControls, { paddingBottom: insets.bottom + 22 }]} pointerEvents="box-none">
           <CallControls
             isVideo
             forceDark
             micOn={call?.micOn}
             cameraOn={call?.cameraOn}
+            screenSharing={call?.screenSharing}
             speakerOn={call?.speakerOn}
             speakerSupported={audioRouteSupported}
             onToggleMic={toggleMic}
             onToggleCamera={toggleCamera}
             onSwitchCamera={switchCamera}
+            onToggleScreenShare={toggleScreenShare}
             onToggleSpeaker={toggleSpeaker}
             onHangup={hangup}
           />
@@ -272,6 +330,18 @@ export default function CallOverlay() {
         </TouchableOpacity>
       ) : null}
 
+      {/* Add participant (group calls) — mirrors the minimize button, top-right. */}
+      {canAddParticipants ? (
+        <TouchableOpacity
+          onPress={() => setShowAddSheet(true)}
+          style={[styles.addFloating, { top: insets.top + 6, backgroundColor: minBtnBg }]}
+          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        >
+          <Ionicons name="person-add" size={22} color={minBtnIcon} />
+        </TouchableOpacity>
+      ) : null}
+      {addSheet}
+
       {showIncomingActions && !isGroup ? (
         <IncomingCallCard peer={peer} displayName={peerDisplayName} media={call?.media} onAccept={accept} onReject={reject} />
       ) : isGroup ? (
@@ -281,7 +351,11 @@ export default function CallOverlay() {
             <Text style={[styles.subtitle, { color: onBgSoft }]}>{subtitle}</Text>
             <Text style={[styles.groupName, { color: onBg }]} numberOfLines={1}>{groupTitle}</Text>
             <View style={styles.gridWrap}>
-              <CallParticipantsGrid participants={call?.participants} ringing={ringing} />
+              <CallParticipantsGrid
+                participants={gridParticipants}
+                ringing={ringing}
+                activeSpeakerId={call?.activeSpeakerId || null}
+              />
             </View>
             {mediaConnected ? (
               <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
@@ -301,11 +375,13 @@ export default function CallOverlay() {
                 isVideo={isVideo}
                 micOn={call?.micOn}
                 cameraOn={call?.cameraOn}
+                screenSharing={call?.screenSharing}
                 speakerOn={call?.speakerOn}
                 speakerSupported={audioRouteSupported}
                 onToggleMic={toggleMic}
                 onToggleCamera={toggleCamera}
                 onSwitchCamera={switchCamera}
+                onToggleScreenShare={toggleScreenShare}
                 onToggleSpeaker={toggleSpeaker}
                 onHangup={hangup}
               />
@@ -368,11 +444,13 @@ export default function CallOverlay() {
                 isVideo={isVideo}
                 micOn={call?.micOn}
                 cameraOn={call?.cameraOn}
+                screenSharing={call?.screenSharing}
                 speakerOn={call?.speakerOn}
                 speakerSupported={audioRouteSupported}
                 onToggleMic={toggleMic}
                 onToggleCamera={toggleCamera}
                 onSwitchCamera={switchCamera}
+                onToggleScreenShare={toggleScreenShare}
                 onToggleSpeaker={toggleSpeaker}
                 onHangup={hangup}
               />
@@ -476,6 +554,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 6,
+  },
+  addFloating: {
+    position: 'absolute',
+    right: 14,
+    zIndex: 2,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   minimizeFloating: {
     position: 'absolute',

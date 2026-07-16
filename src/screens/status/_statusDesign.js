@@ -5,7 +5,7 @@
  * Editorial dark / warm restraint:
  *  - real on-device serif for display (no font download)
  *  - hairline rules + small-caps section labels
- *  - WhatsApp green stays the primary action; coral is the single accent
+ *  - The brand teal stays the primary action; coral is the single accent
  *    used for the heart + unseen pulse so attention pops
  */
 import { Platform } from 'react-native';

@@ -6,7 +6,7 @@ import {
 import { FontAwesome6, Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '../../contexts/ThemeContext';
-import { getUserSettings } from '../../Redux/Services/Profile/Settings.Services';
+import { getUserSettings, readAppLockScope } from '../../Redux/Services/Profile/Settings.Services';
 
 export default function ChatPrivacy({ navigation }) {
   const { theme, isDarkMode } = useTheme();
@@ -40,9 +40,10 @@ export default function ChatPrivacy({ navigation }) {
               ? chat.hasDeletedPassword
               : !!chat.deletedPassword;
           setHasPassword(flag);
-          const two = chat.twoStep || {};
-          setTwoStepEnabled(!!two.enabled);
-          setHasTwoStepPwd(!!two.hasPassword);
+          // This device's app lock only — the website carries its own.
+          const two = readAppLockScope(settings);
+          setTwoStepEnabled(two.enabled);
+          setHasTwoStepPwd(two.hasPassword);
         } catch {
           /* keep last state */
         } finally {

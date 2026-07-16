@@ -95,7 +95,7 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     backgroundColor: '#222',
   },
-  tabActive: { backgroundColor: '#25D366' },
+  tabActive: { backgroundColor: '#03b0a2' },
   tabText: { color: '#bbb', fontSize: 12 },
   tabTextActive: { color: '#fff', fontFamily: 'Roboto-Bold' },
   cell: { width: '33.33%', aspectRatio: 1, padding: 1 },

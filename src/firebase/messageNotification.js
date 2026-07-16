@@ -49,6 +49,24 @@ const getNotifee = () => {
 
 export const isMessageGroupingAvailable = () => Platform.OS === 'android' && !!getNotifee();
 
+// notifee rejects the whole displayNotification call if ANY `data` value is not
+// a string (the canonical model carries boolean `isGroup`, numeric `timestamp`)
+// — and a rejected call means the notification is NEVER SHOWN. Coerce
+// everything: primitives via String(), objects via JSON.stringify, drop
+// null/undefined. Tap consumers already parse strings (isTruthyString handles
+// 'true'/'false'; Number() handles numeric strings).
+const toNotifeeData = (obj = {}) => {
+  const out = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === null || value === undefined || typeof value === 'function') continue;
+    if (typeof value === 'string') out[key] = value;
+    else if (typeof value === 'object') {
+      try { out[key] = JSON.stringify(value); } catch (_) { /* skip unserializable */ }
+    } else out[key] = String(value);
+  }
+  return out;
+};
+
 const loadMessages = async (chatId) => {
   try {
     const raw = await AsyncStorage.getItem(STORE_PREFIX + chatId);
@@ -104,11 +122,11 @@ export const displayGroupedMessage = async (data) => {
       id: `msg-${chatId}`,
       title: convoTitle,
       body: text,
-      data: { ...(data || {}), type: 'message' },
+      data: { ...toNotifeeData(data), type: 'message' },
       android: {
         channelId: CHANNEL_ID,
         smallIcon: 'notification_icon',
-        color: '#00A884',
+        color: '#03b0a2',
         importance: AndroidImportance.HIGH,
         visibility: AndroidVisibility.PRIVATE,
         pressAction: { id: 'default', launchActivity: 'default' },
@@ -149,7 +167,7 @@ const ensureGroupSummary = async (notifee, AndroidImportance, AndroidVisibility)
       android: {
         channelId: CHANNEL_ID,
         smallIcon: 'notification_icon',
-        color: '#00A884',
+        color: '#03b0a2',
         importance: AndroidImportance.HIGH,
         visibility: AndroidVisibility.PRIVATE,
         groupId: ANDROID_GROUP_KEY,

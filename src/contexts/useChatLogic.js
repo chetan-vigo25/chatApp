@@ -899,8 +899,8 @@ export default function useChatLogic({ navigation, route }) {
 
   // Color helper
   const pastelColors = [
-    "#833AB4", "#1DB954", "#128C7E", "#075E54", "#777737",
-    "#F56040", "#34B7F1", "#25D366", "#FF5A5F", "#3A3A3A",
+    "#833AB4", "#1DB954", "#02958a", "#026158", "#777737",
+    "#F56040", "#34B7F1", "#03b0a2", "#FF5A5F", "#3A3A3A",
     "#FF0000", "#00A699",
   ];
   const getUserColor = useCallback((str) => {
@@ -1578,10 +1578,18 @@ export default function useChatLogic({ navigation, route }) {
       // several seconds; gating the spinner on it (the old behavior) made an
       // already-cached chat appear to "load" for 15s. Messages render from
       // SQLite immediately; live sync catches up in the background.
+      //
+      // EXCEPT when local is EMPTY: the on-open network fetch (STEP 4) is then
+      // the real source, and clearing here flashed "No messages yet" for the
+      // whole fetch round-trip (fresh install / fresh login) before history
+      // popped in. Keep the loading state; the fetch/sync response handlers
+      // clear it (with the 12s timed-out retry UI as the offline backstop).
       localLoadPromise
-        .then(() => {
-          setIsLoadingInitial(false);
-          setIsLoadingFromLocal(false);
+        .then((count) => {
+          if (Number(count) > 0 || ChatCache.hasMessages(generatedChatId)) {
+            setIsLoadingInitial(false);
+            setIsLoadingFromLocal(false);
+          }
         })
         .catch(() => {
           setIsLoadingInitial(false);
@@ -1591,10 +1599,26 @@ export default function useChatLogic({ navigation, route }) {
       // ═══════════════════════════════════════════════════════════
       // STEP 3: BACKGROUND — Socket setup + queued tasks (parallel with step 2)
       // ═══════════════════════════════════════════════════════════
-      // Fetch full group details (fire-and-forget, updates members map when done)
+      // Fetch full group details (background, updates members map when done).
+      // NOT fire-and-forget: a member who was JUST added can race server-side
+      // membership propagation — the first viewGroup then rejects
+      // (NOT_GROUP_MEMBER), and with the error swallowed currentGroup never
+      // populated, leaving the group header/member map empty. Retry with a
+      // short backoff before giving up; retries are silent (no toast spam).
       if (isGrpInit) {
         const grpId = chatData.groupId || chatData.group?._id;
-        if (grpId) dispatch(viewGroup({ groupId: grpId })).catch(() => {});
+        if (grpId) {
+          const fetchGroupDetails = (attempt) => {
+            dispatch(viewGroup({ groupId: grpId, silent: attempt > 0 }))
+              .unwrap()
+              .catch(() => {
+                if (attempt < 2) {
+                  setTimeout(() => fetchGroupDetails(attempt + 1), 1500 * (attempt + 1));
+                }
+              });
+          };
+          fetchGroupDetails(0);
+        }
       }
 
       // Run all queued tasks + socket setup in parallel with SQLite load
@@ -1698,8 +1722,13 @@ export default function useChatLogic({ navigation, route }) {
         }, 400);
       }
 
-      setIsLoadingInitial(false);
-      setIsLoadingFromLocal(false);
+      // Empty-local chats stay in the loading state until the network fetch
+      // responds (or the 12s retry UI takes over) — see the localLoadPromise
+      // comment above. Everything else is done loading here.
+      if (localCount > 0 || ChatCache.hasMessages(generatedChatId)) {
+        setIsLoadingInitial(false);
+        setIsLoadingFromLocal(false);
+      }
       initialLoadDoneRef.current = true;
     } catch (error) {
       console.error("initializeChat error", error);
@@ -1722,7 +1751,12 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       // Paint whatever SQLite already has, immediately — the user waits on this.
-      refreshMessagesFromDB(true);
+      // AWAITED: the caller clears the loading state when this promise chain
+      // resolves, and clearing before the rows were actually in React state
+      // dropped the skeleton onto a blank/"No messages yet" frame for the whole
+      // DB-read duration — the "loads again and again" first-open flash. On a
+      // re-open the cache path above already painted, so this await is ~free.
+      try { await refreshMessagesFromDB(true); } catch {}
 
       // Restore PREVIOUS messages that exist only in the AsyncStorage backup
       // (the legacy/pre-SQLite per-chat store, or history SQLite somehow lost)
@@ -2761,7 +2795,10 @@ export default function useChatLogic({ navigation, route }) {
 
     if (immediate) {
       if (refreshTimerRef.current) { clearTimeout(refreshTimerRef.current); refreshTimerRef.current = null; }
-      doRefresh();
+      // Return the promise so first-paint callers can await the ACTUAL paint —
+      // clearing the loading flag before this resolved flashed the empty state
+      // between skeleton-hide and the messages landing in state.
+      return doRefresh();
     } else {
       if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
       refreshTimerRef.current = setTimeout(doRefresh, 50);
@@ -3972,6 +4009,9 @@ export default function useChatLogic({ navigation, route }) {
           senderId: currentUserIdRef.current,
           text: firstFwd?.text || source?.text || 'Forwarded message',
           messageId: firstFwd?.messageId || firstFwd?._id,
+          // Carry the real type so a forwarded photo/video previews as
+          // "📷 Photo" instead of empty text (lastMessageType drives the preview).
+          messageType: firstFwd?.messageType || firstFwd?.type || 'text',
           createdAt: firstFwd?.createdAt || new Date().toISOString(),
           ...(chatData?.chatType === 'group' || chatData?.isGroup
             ? { groupId: chatData.groupId || chatData.group?._id || chatIdRef.current }
@@ -4712,6 +4752,11 @@ export default function useChatLogic({ navigation, route }) {
       loadMoreInFlightRef.current = false;
       fetchOlderCursorRef.current = null;
       isHardReloadingRef.current = false;
+      // The on-open fetch for an empty-local chat keeps the initial loading
+      // state on until this response (initializeChat leaves it armed) — clear
+      // it now whether history arrived or the chat is genuinely empty.
+      setIsLoadingInitial(false);
+      setIsLoadingFromLocal(false);
     };
     registerSocketHandler('message:fetch:response', onMessageFetchResponse);
 
@@ -4757,6 +4802,10 @@ export default function useChatLogic({ navigation, route }) {
       setIsLoadingMore(false);
       setIsRefreshing(false);
       loadMoreInFlightRef.current = false;
+      // Same contract as message:fetch:response: an empty-local on-open fetch
+      // leaves the initial loading state armed until the server answers.
+      setIsLoadingInitial(false);
+      setIsLoadingFromLocal(false);
     };
     registerSocketHandler('message:sync:response', onMessageSyncResponse);
     // Also handle group sync response with the same logic

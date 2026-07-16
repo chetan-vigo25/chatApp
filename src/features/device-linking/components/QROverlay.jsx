@@ -10,7 +10,7 @@ const SCAN_SIZE = SCREEN_WIDTH * 0.72;
 const CORNER_SIZE = 36;
 const CORNER_WIDTH = 4;
 const CORNER_RADIUS = 18;
-const ACCENT = '#00A884';
+const ACCENT = '#03b0a2';
 
 export default function QROverlay({ scanLineAnim, showScanLine = true }) {
   const translateY = scanLineAnim

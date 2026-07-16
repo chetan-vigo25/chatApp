@@ -151,7 +151,12 @@ export default function ForwardMessageScreen({ navigation, route }) {
           // The ORIGINAL sender (not the forwarder). The server sets the canonical
           // forwardedFrom and echoes it back; we never claim the current user as
           // the original sender. Use the source message's sender if we have it.
-          const originalSender = msg?.forwardedFrom || msg?.senderId || null;
+          // Only a real Mongo ObjectId may go on the wire — the backend persists
+          // it as an ObjectId ref, so a tempId/UUID must degrade to null.
+          const rawOriginalSender = msg?.forwardedFrom || msg?.senderId || null;
+          const originalSender = (rawOriginalSender && /^[a-f0-9]{24}$/i.test(String(rawOriginalSender)))
+            ? String(rawOriginalSender)
+            : null;
 
           const sendPayload = isGroup
             ? {
@@ -161,6 +166,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 mediaUrl: msg.mediaUrl || '',
                 mediaMeta: msg.mediaMeta || {},
                 isForwarded: true,
+                // Original-sender ref (when known) so the server can persist the
+                // canonical forwardedFrom and every receiver renders the label.
+                ...(originalSender ? { forwardedFrom: originalSender } : {}),
                 tempId,
                 // Explicit idempotency key (tempId is only the legacy alias):
                 // the server dedupes on (chatId, clientMessageId), so a retry
@@ -179,6 +187,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 mediaUrl: msg.mediaUrl || '',
                 mediaMeta: msg.mediaMeta || {},
                 isForwarded: true,
+                ...(originalSender ? { forwardedFrom: originalSender } : {}),
                 chatId: chatIdForCache,
                 senderId: currentUserId,
                 senderName: currentUserName,

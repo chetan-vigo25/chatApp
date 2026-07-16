@@ -1,7 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
 import { DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
+import { getSocket, isSocketConnected, subscribeSocketState } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
@@ -1321,6 +1321,18 @@ const reducer = (state, action) => {
           lastMessage,
           lastMessageAt,
           lastMessageSender: message.senderId || existing?.lastMessageSender || null,
+          // CRITICAL: buildLastMessageDisplay reads `chat.lastMessageType` with
+          // PRIORITY over lastMessage.type. Leaving the previous message's type
+          // here made the list keep rendering the SECOND-LAST message's preview
+          // ("📞 Voice call" / "📷 Photo") after sending a new text — the
+          // "chat list shows old message after send" bug.
+          lastMessageType: message.messageType || message.type || 'text',
+          // Same for the edited flag — a fresh outgoing message must not
+          // inherit " (edited)" from the previous last message.
+          lastMessageEdited: false,
+          // Keep the sort key in lockstep with the new activity (mirrors the
+          // INCOMING_MESSAGE path) so the row reorders on the send itself.
+          timestamp: lastMessageAt,
         },
       };
 
@@ -1531,7 +1543,7 @@ const reducer = (state, action) => {
         const update = normalizeChatListUpdate(rawUpdate);
         if (!update) return;
 
-        const { chatId: rawUpdateChatId, type, item, timestamp, readerId } = update;
+        const { chatId: rawUpdateChatId, type, item, timestamp, readerId, reason } = update;
         const itemPeerUserId = getPeerUserId(item);
         const aliasChatId = findChatIdByPeer(nextMap, itemPeerUserId, rawUpdateChatId);
         // For group chats, resolve the chatId if it doesn't directly match a key in chatMap
@@ -1692,9 +1704,24 @@ const reducer = (state, action) => {
             const existingStatus = normalizeMessageDeliveryStatus(existing?.lastMessage?.status)
               || normalizeMessageDeliveryStatus(existing?.lastMessageStatus)
               || null;
+            // GROUP aggregate patches (reason 'group.message.*') carry the
+            // server-computed all-recipients status in item.lastMessage.status
+            // and NO readerId — the readerId gate above (built for 1:1
+            // self-read acks) silently dropped them, so a group row's tick
+            // never turned blue in the list. Trust the aggregate when it
+            // targets the row's current last message (the backend only bumps
+            // the summary on a messageId match, mirrored here).
+            const aggStatusRaw = item?.lastMessage?.status || item?.lastMessageStatus || null;
+            const aggMsgId = normalizeId(item?.lastMessage?.messageId || item?.messageId);
+            const existingLmId = getMessageIdentifier(existing?.lastMessage || {});
+            const isGroupAggregate = String(reason || '').startsWith('group.')
+              && aggStatusRaw
+              && (!aggMsgId || !existingLmId || String(aggMsgId) === String(existingLmId));
             const nextStatus = isPeerRead
               ? (pickHighestMessageStatus(existing?.lastMessage?.status, 'read') || 'read')
-              : existingStatus;
+              : (isGroupAggregate
+                ? (pickHighestMessageStatus(existing?.lastMessage?.status, aggStatusRaw) || existingStatus)
+                : existingStatus);
             const lastMessage = {
               ...(existing?.lastMessage || {}),
               status: nextStatus,
@@ -2115,11 +2142,21 @@ const reducer = (state, action) => {
           messageId,
           serverMessageId: messageId,
           createdAt: lastMessageAt,
+          // A NEW message starts its own tick clock. The spread above kept the
+          // PREVIOUS last message's status (often 'read'), so a fresh outgoing
+          // group message rendered an instant blue tick in the list and the row
+          // never showed the real sent→delivered→read progression.
+          status: 'sent',
+          isDeleted: false,
         },
         lastMessageAt: preserveGrpDelete ? (existing.lastMessageAt || lastMessageAt) : lastMessageAt,
         timestamp: preserveGrpDelete ? (existing.timestamp || existing.lastMessageAt || lastMessageAt) : lastMessageAt,
         lastMessageType: preserveGrpDelete ? existing.lastMessageType : (messageType || 'text'),
         lastMessageSender: preserveGrpDelete ? existing.lastMessageSender : (senderId || null),
+        // Same staleness: the row-level alias is what ChatList reads FIRST
+        // (item.lastMessageStatus || item.lastMessage.status) — left over from
+        // the previous message it kept the old tick on the new preview.
+        lastMessageStatus: preserveGrpDelete ? existing.lastMessageStatus : 'sent',
       };
 
       // Increment unread if not the active chat — skip if preserving a delete
@@ -3062,7 +3099,11 @@ export function RealtimeChatProvider({ children }) {
       // sees their own chat preview update 90ms late, which feels janky.
       // Other chats keep the 90ms batch to coalesce burst updates.
       const incomingChatId = normalizeId(payload?.chatId);
-      const activeChatId = state.activeChatId ? normalizeId(state.activeChatId) : null;
+      // stateRef, NOT state — this closure is created once at attach time, so
+      // `state.activeChatId` is frozen at its initial value (null) and the
+      // instant-flush path would never trigger.
+      const liveActiveChatId = stateRef.current?.activeChatId;
+      const activeChatId = liveActiveChatId ? normalizeId(liveActiveChatId) : null;
       if (incomingChatId && activeChatId && incomingChatId === activeChatId) {
         flushChatListUpdates();
         return;
@@ -3923,7 +3964,7 @@ export function RealtimeChatProvider({ children }) {
       if (!isEveryoneDel) return;
 
       const deletedBy = normalizeId(source?.deletedBy || source?.senderId || source?.userId);
-      const placeholderText = deletedBy && deletedBy === state.currentUserId
+      const placeholderText = deletedBy && deletedBy === stateRef.current?.currentUserId
         ? 'You deleted this message'
         : 'This message was deleted';
 
@@ -3936,12 +3977,13 @@ export function RealtimeChatProvider({ children }) {
       // Persist message deletion to SQLite
       ChatDatabase.markMessageDeleted(messageId, deletedBy, placeholderText).catch(() => {});
 
-      // Update SQLite chats row if this was the last message
-      ChatDatabase.updateChatLastMessage(chatId, {
-        text: placeholderText,
-        type: 'system',
-        isDeleted: true,
-      }).catch(() => {});
+      // Update the SQLite chats row ONLY if the deleted message is the current
+      // last message (guarded inside markChatLastMessageDeleted). The old
+      // unguarded updateChatLastMessage call rewrote the preview, nulled
+      // last_message_id, and bumped last_message_at to "now" for deletes of
+      // OLDER messages too — wrong preview + wrong chat ordering on next cold
+      // start for every group member.
+      ChatDatabase.markChatLastMessageDeleted(chatId, messageId, placeholderText).catch(() => {});
     };
     socket.on('group:message:deleted', onGroupMessageDeleteForChatList);
 
@@ -4047,29 +4089,52 @@ export function RealtimeChatProvider({ children }) {
 
     // ─── GROUP MEMBER MANAGEMENT LISTENERS ───
 
-    // Broadcast: member was added to the group
+    // Broadcast: member was added to the group.
+    // Two server shapes land here: the room broadcast `group:member:added`
+    // carries a single `addedUserId`, while the sender ack
+    // `group:member:add:success` carries `addedMembers: [{ userId, role }]`.
+    // (`userId` is kept as a fallback for older payloads.)
     const onGroupMemberAdded = (payload) => {
       const data = payload?.data || payload;
       const groupId = normalizeId(data?.groupId);
-      const userId = normalizeId(data?.userId);
-      if (!groupId || !userId) return;
-      const memberName = data?.username || data?.fullName || data?.name || '';
+      if (!groupId) return;
+      const added = [];
+      const singleId = normalizeId(data?.addedUserId || data?.userId);
+      if (singleId) {
+        added.push({
+          userId: singleId,
+          username: data?.username || data?.fullName || data?.name || '',
+        });
+      }
+      if (Array.isArray(data?.addedMembers)) {
+        data.addedMembers.forEach((m) => {
+          const id = normalizeId(m?.userId || m);
+          if (id && !added.some((x) => x.userId === id)) {
+            added.push({ userId: id, username: m?.username || m?.fullName || '' });
+          }
+        });
+      }
+      if (!added.length) return;
       // Membership-only update (member list / count). The "X added Y" chat-thread
       // + chat-list line is delivered by the server as a durable system message
       // on `group:message:received`, so we do NOT inject an ephemeral one here
       // (it would duplicate the persisted line and vanish on reload).
-      dispatch({
-        type: 'GROUP_MEMBER_JOINED',
-        payload: { groupId, userId, username: memberName, timestamp: data?.timestamp },
+      added.forEach(({ userId, username }) => {
+        dispatch({
+          type: 'GROUP_MEMBER_JOINED',
+          payload: { groupId, userId, username, timestamp: data?.timestamp },
+        });
+        // If the current user is the one being (re-)added, clear the inactive /
+        // removed flags so messaging + receiving are re-enabled. Without this the
+        // "you're no longer a member" banner would persist after an admin re-adds
+        // a member who had previously left or been removed, incoming messages
+        // would be dropped, and `chat:list:update` for the group would stay
+        // suppressed by `removedChatIds` — the group opens BLANK. This mirrors
+        // the membership-ENDED dispatch in `onGroupRemoved`.
+        if (userId === normalizeId(currentUserIdRef.current)) {
+          dispatch({ type: 'GROUP_MEMBERSHIP_RESTORED', payload: { groupId } });
+        }
       });
-      // If the current user is the one being (re-)added, clear the inactive /
-      // removed flags so messaging + receiving are re-enabled. Without this the
-      // "you're no longer a member" banner would persist after an admin re-adds
-      // a member who had previously left or been removed. This mirrors the
-      // membership-ENDED dispatch in `onGroupRemoved`.
-      if (userId === normalizeId(currentUserIdRef.current)) {
-        dispatch({ type: 'GROUP_MEMBERSHIP_RESTORED', payload: { groupId } });
-      }
     };
 
     // Broadcast: member was removed (kicked) from the group
@@ -4533,8 +4598,20 @@ export function RealtimeChatProvider({ children }) {
     tryAttach();
     intervalId = setInterval(tryAttach, 800);
 
+    // The interval above stops after the FIRST successful attach, but the
+    // socket module replaces its io() instance on relogin, account-state
+    // reset, and the reauth fallback in reconnectSocket. Listeners bound to
+    // the dead instance never fire again — chat list frozen until app
+    // restart. Re-run tryAttach on every socket-state transition; the guard
+    // inside attachSocketListeners makes this a no-op unless the instance
+    // actually changed, and detaches from the old one before rebinding.
+    const unsubscribeSocketState = subscribeSocketState(() => {
+      tryAttach();
+    });
+
     return () => {
       disposed = true;
+      unsubscribeSocketState();
       if (intervalId) clearInterval(intervalId);
       if (chatListUpdateFlushRef.current) {
         clearTimeout(chatListUpdateFlushRef.current);

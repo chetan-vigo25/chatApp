@@ -83,6 +83,24 @@ let voipToken = '';
 const socketStateSubscribers = new Set();
 const pendingEmitQueue = [];
 const MAX_PENDING_EMIT = 200;
+// True only between the server's `authenticated` success for THIS connection
+// and the next disconnect. The server binds socket.userId ASYNCHRONOUSLY after
+// our `authenticate` emit (JWT + Redis + Mongo), so anything emitted in that
+// window is rejected with NOT_AUTHENTICATED and silently lost — including
+// `notification:device:register`, which is how the backend learns this
+// device's FCM token. A dropped registration = no push for this device until
+// the next reconnect. All app-level emits must wait for this flag.
+let isSocketAuthenticated = false;
+// Compat valve: if a server never sends `authenticated` (older backend), the
+// queue must not stay blocked forever — flush anyway after this delay.
+const AUTH_FLUSH_FALLBACK_MS = 8000;
+let authFlushFallbackTimer = null;
+const clearAuthFlushFallback = () => {
+  if (authFlushFallbackTimer) {
+    clearTimeout(authFlushFallbackTimer);
+    authFlushFallbackTimer = null;
+  }
+};
 
 const socketState = {
   status: 'idle',
@@ -116,7 +134,7 @@ const getDeviceInfoPayload = (deviceData) => ({
 });
 
 const flushPendingEmitQueue = () => {
-  if (!socket || !socket.connected || reauthPromise || pendingEmitQueue.length === 0) return;
+  if (!socket || !socket.connected || !isSocketAuthenticated || reauthPromise || pendingEmitQueue.length === 0) return;
 
   while (pendingEmitQueue.length > 0) {
     const queued = pendingEmitQueue.shift();
@@ -274,12 +292,17 @@ const emitDeviceRegister = () => {
   // Send as soon as we have EITHER a regular push token or a VoIP token — the
   // VoIP token is what powers incoming-call CallKit pushes and must reach the
   // backend even if the standard APNs/FCM token hasn't arrived yet.
-  if (!socket || !socket.connected || !deviceId || (!pushToken && !voipToken)) {
+  // Auth-gated: a pre-auth register is rejected server-side (NOT_AUTHENTICATED)
+  // and silently lost — the session then has NO fcmToken and gets NO pushes.
+  // The `authenticated` handler re-runs emitDeviceEvents(), so a skip here is
+  // always retried once auth lands.
+  if (!socket || !socket.connected || !isSocketAuthenticated || !deviceId || (!pushToken && !voipToken)) {
     // Dev visibility: a silent skip here means the backend never learns this
     // device's push/VoIP token → killed-app calls can NEVER ring. Log why.
     if (__DEV__) {
       console.log('📲 device register SKIPPED', {
         socketConnected: !!(socket && socket.connected),
+        socketAuthenticated: isSocketAuthenticated,
         hasDeviceId: !!deviceId,
         hasPushToken: !!pushToken,
         hasVoipToken: !!voipToken,
@@ -617,6 +640,12 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
       connected: !!socket?.connected,
       lastError: null,
     });
+    // A successful reauthenticate re-bound this socket's session server-side —
+    // it counts as authenticated even though no 'authenticated' event fires.
+    isSocketAuthenticated = !!socket?.connected;
+    // Re-register the device's push/VoIP token on the re-bound session (a
+    // pre-reauth register would have been dropped NOT_AUTHENTICATED).
+    if (isSocketAuthenticated) emitDeviceEvents();
     flushPendingEmitQueue();
   })()
     .catch(async (error) => {
@@ -651,6 +680,7 @@ const attachCoreSocketListeners = (navigation) => {
 
   socket.on('connect', () => {
     console.log('✅ socket connected', { socketId: socket?.id });
+    isSocketAuthenticated = false;
     updateSocketState({
       status: 'connected',
       connected: true,
@@ -670,21 +700,33 @@ const attachCoreSocketListeners = (navigation) => {
       socket.emit('token:validate', { token: authToken });
     }
 
-    if (!reauthPromise) {
-      emitDeviceEvents();
-      flushPendingEmitQueue();
-    }
-
-    // We're live and (re)authenticating → announce active + start heartbeat. Only
-    // do so when foregrounded; a background reconnect should not resurrect us.
-    if (AppState.currentState === 'active') {
-      socket.emit('presence:active');
-      startPresenceHeartbeat();
-    }
+    // Everything else (device/push-token registration, queued emits, presence
+    // announce + heartbeat) waits for the server's `authenticated` success —
+    // the server binds socket.userId asynchronously, and anything sent before
+    // that is rejected NOT_AUTHENTICATED and lost (a lost device register =
+    // this device never receives push notifications until the next reconnect).
+    clearAuthFlushFallback();
+    authFlushFallbackTimer = setTimeout(() => {
+      authFlushFallbackTimer = null;
+      if (socket && socket.connected && !isSocketAuthenticated && !reauthPromise) {
+        // Server never confirmed auth (older backend?) — unblock the queue so
+        // outgoing messages aren't stuck forever. flushPendingEmitQueue still
+        // refuses to run mid-reauth.
+        isSocketAuthenticated = true;
+        emitDeviceEvents();
+        flushPendingEmitQueue();
+        if (AppState.currentState === 'active') {
+          socket.emit('presence:active');
+          startPresenceHeartbeat();
+        }
+      }
+    }, AUTH_FLUSH_FALLBACK_MS);
   });
 
   socket.on('disconnect', (reason) => {
     console.log('🔌 socket disconnected', { reason });
+    isSocketAuthenticated = false;
+    clearAuthFlushFallback();
     stopPresenceHeartbeat();
     updateSocketState({
       status: 'disconnected',
@@ -742,7 +784,8 @@ const attachCoreSocketListeners = (navigation) => {
       lastConnectedAt: Date.now(),
       lastError: null,
     });
-    flushPendingEmitQueue();
+    // No flush here — 'connect' fires alongside 'reconnect' and the queue is
+    // flushed once the server confirms `authenticated` for the new connection.
   });
 
   socket.on('reconnect_failed', () => {
@@ -751,6 +794,9 @@ const attachCoreSocketListeners = (navigation) => {
 
   socket.on('authenticated', (response) => {
     if (response?.status === true) {
+      // The server has bound socket.userId — app-level emits are now safe.
+      isSocketAuthenticated = true;
+      clearAuthFlushFallback();
       sessionId = String(response?.data?.sessionId || sessionId || '');
       if (sessionId) {
         AsyncStorage.setItem(STORAGE_KEYS.SESSION_ID, sessionId).catch(() => {});
@@ -767,7 +813,16 @@ const attachCoreSocketListeners = (navigation) => {
         const setBlocked = pr.setBlocked || (pr.actions && pr.actions.setBlocked);
         if (store?.dispatch && setBlocked) store.dispatch(setBlocked(isBlocked));
       } catch (e) {}
+      // Post-auth work, previously fired on 'connect' where the server's async
+      // session-bind raced it (NOT_AUTHENTICATED drops): register this device's
+      // push token, flush emits queued while offline/authenticating, and
+      // announce foreground presence.
       emitDeviceEvents();
+      flushPendingEmitQueue();
+      if (AppState.currentState === 'active') {
+        socket.emit('presence:active');
+        startPresenceHeartbeat();
+      }
       return;
     }
 
@@ -1009,7 +1064,11 @@ export const subscribeSocketState = (callback) => {
 };
 
 export const emitSocketEvent = (event, payload = {}, ack = undefined, { queueIfOffline = true } = {}) => {
-  if (socket && socket.connected && !reauthPromise) {
+  // Emits are held until the server has confirmed `authenticated` for this
+  // connection — a pre-auth emit is rejected NOT_AUTHENTICATED and lost.
+  // Queued events flush from the 'authenticated' handler (or the compat
+  // fallback timer if the server never confirms).
+  if (socket && socket.connected && isSocketAuthenticated && !reauthPromise) {
     socket.emit(event, payload, ack);
     return true;
   }
@@ -1065,7 +1124,11 @@ export const initSocket = async (deviceInfo, navigation) => {
       transports: ['websocket', 'polling'],
       auth: authPayload,
       reconnection: true,
-      reconnectionAttempts: 10,
+      // Never give up reconnecting. The old cap (10 attempts ≈ a minute of bad
+      // network) permanently killed signaling — calls/messages went silent until
+      // the next cold start even though the app looked "online". Backoff below
+      // keeps retries cheap; the media socket already retries forever.
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 7000,
       timeout: 12000,

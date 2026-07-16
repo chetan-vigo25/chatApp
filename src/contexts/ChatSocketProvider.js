@@ -351,9 +351,13 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
     };
 
     // Helper: update single message status in local storage, with anti-downgrade.
+    // `newStatus: null` = append-only mode — merge the per-recipient receipt
+    // (readBy/deliveredTo) WITHOUT touching the scalar tick. Group receipts use
+    // it: one member's read must not flip the whole bubble; only the backend's
+    // all-recipients aggregate may advance a group tick.
     const STATUS_RANK = { sent: 1, delivered: 2, seen: 3, read: 4 };
     const advanceLocalStatus = async (chatId, messageId, newStatus, extras = {}) => {
-      if (!chatId || !messageId || !newStatus) return;
+      if (!chatId || !messageId || (!newStatus && !extras.forceMerge)) return;
       const localKey = getChatMessagesKey(chatId);
       if (!localKey) return;
       try {
@@ -397,7 +401,7 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
 
         // Mirror to SQLite (anti-downgrade handled inside updateMessageStatus)
         try {
-          await ChatDB.updateMessageStatus(messageId, newStatus);
+          if (newStatus) await ChatDB.updateMessageStatus(messageId, newStatus);
           if (extras._appendReader || extras._appendDelivered) {
             const target = updated.find((m) => String(m?.serverMessageId || m?.id || m?.tempId) === String(messageId));
             if (target) {
@@ -463,26 +467,56 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       }
     };
 
-    // Group: a member delivered a message
+    // ── Group receipts — WhatsApp tick semantics ────────────────────────
+    // A single member's receipt must NOT flip the bubble: gray ✓✓ only when
+    // ALL recipients have it, blue only when ALL have read. The backend
+    // recomputes that and ships it as `aggregate` {allDelivered, allRead}
+    // (single receipt) or `aggregateStatuses` {messageId → status} (bulk).
+    // Per-member receipts are still appended locally — they feed the
+    // Message Info breakdown — but the scalar tick advances ONLY off the
+    // aggregate. (The old blind advance here also poisoned SQLite, so the
+    // premature blue tick survived reloads.)
+    const groupAggregateStatus = (source, mid) => {
+      const fromBulk = source?.aggregateStatuses?.[String(mid)];
+      if (fromBulk === 'read' || fromBulk === 'delivered' || fromBulk === 'seen') return fromBulk;
+      const agg = source?.aggregate;
+      if (agg?.allRead) return 'read';
+      if (agg?.allDelivered) return 'delivered';
+      return null;
+    };
+
+    // Group: a member delivered a message (sender-directed; carries aggregate)
     const onGroupDeliveredReceipt = async (payload) => {
       const source = payload?.data || payload || {};
-      const { groupId, messageId, deliveredTo } = source;
+      const { groupId, messageId, deliveredAt } = source;
+      const memberId = source?.userId
+        || (typeof source?.deliveredTo === 'string' ? source.deliveredTo : null);
       if (!groupId || !messageId) return;
-      await advanceLocalStatus(String(groupId), messageId, 'delivered', {
-        _appendDelivered: deliveredTo ? { userId: deliveredTo, deliveredAt: new Date().toISOString() } : undefined,
-        forceMerge: !!deliveredTo,
+      await advanceLocalStatus(String(groupId), messageId, groupAggregateStatus(source, messageId), {
+        _appendDelivered: memberId ? { userId: memberId, deliveredAt: deliveredAt || new Date().toISOString() } : undefined,
+        forceMerge: !!memberId,
       });
     };
 
-    // Group: a member read a message
+    // Group: a member read a message. Handles BOTH the room broadcast
+    // (group:message:read — {readBy: userId}, NO aggregate → append only)
+    // and the sender-directed update (group:message:read:update —
+    // {userId, messageIds, aggregate|aggregateStatuses} → may advance tick).
     const onGroupRead = async (payload) => {
       const source = payload?.data || payload || {};
-      const { groupId, messageId, readBy, readAt } = source;
-      if (!groupId || !messageId) return;
-      await advanceLocalStatus(String(groupId), messageId, 'read', {
-        _appendReader: readBy ? { userId: readBy, readAt: readAt || new Date().toISOString() } : undefined,
-        forceMerge: !!readBy,
-      });
+      const { groupId, readAt } = source;
+      const memberId = source?.userId
+        || (typeof source?.readBy === 'string' ? source.readBy : null);
+      const messageIds = Array.isArray(source?.messageIds)
+        ? source.messageIds
+        : [source?.messageId].filter(Boolean);
+      if (!groupId || messageIds.length === 0) return;
+      for (const mid of messageIds) {
+        await advanceLocalStatus(String(groupId), mid, groupAggregateStatus(source, mid), {
+          _appendReader: memberId ? { userId: memberId, readAt: readAt || new Date().toISOString() } : undefined,
+          forceMerge: !!memberId,
+        });
+      }
     };
 
     // Handle message:read:all:response — mark all messages as read in local storage
@@ -658,7 +692,9 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:read:bulk:ack', onReadBulkAck);
       socket.off('message:delivered:bulk:ack', onDeliveredBulkAck);
       socket.off('group:message:delivered:receipt', onGroupDeliveredReceipt);
+      socket.off('group:message:delivered:update', onGroupDeliveredReceipt);
       socket.off('group:message:read', onGroupRead);
+      socket.off('group:message:read:update', onGroupRead);
 
       socket.on('message:new', handleNewMessage);
       socket.on('message:delete:everyone:response', onDeleteEveryoneResponse);
@@ -678,7 +714,9 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.on('message:read:bulk:ack', onReadBulkAck);
       socket.on('message:delivered:bulk:ack', onDeliveredBulkAck);
       socket.on('group:message:delivered:receipt', onGroupDeliveredReceipt);
+      socket.on('group:message:delivered:update', onGroupDeliveredReceipt);
       socket.on('group:message:read', onGroupRead);
+      socket.on('group:message:read:update', onGroupRead);
     };
 
     const detachMessageListeners = () => {
@@ -701,7 +739,9 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
       socket.off('message:read:bulk:ack', onReadBulkAck);
       socket.off('message:delivered:bulk:ack', onDeliveredBulkAck);
       socket.off('group:message:delivered:receipt', onGroupDeliveredReceipt);
+      socket.off('group:message:delivered:update', onGroupDeliveredReceipt);
       socket.off('group:message:read', onGroupRead);
+      socket.off('group:message:read:update', onGroupRead);
     };
 
     const onSocketConnect = () => attachMessageListeners();

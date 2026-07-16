@@ -533,7 +533,7 @@ export default function GroupInfo({ navigation, route }) {
             <Ionicons name="chatbubble" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Message</Text>
           </TouchableOpacity>
-          {/* <TouchableOpacity
+          <TouchableOpacity
             onPress={() => startGroupCall('audio')}
             disabled={callBusy}
             activeOpacity={0.7}
@@ -541,8 +541,8 @@ export default function GroupInfo({ navigation, route }) {
           >
             <Ionicons name="call" size={21} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Audio</Text>
-          </TouchableOpacity> */}
-          {/* <TouchableOpacity
+          </TouchableOpacity>
+          <TouchableOpacity
             onPress={() => startGroupCall('video')}
             disabled={callBusy}
             activeOpacity={0.7}
@@ -550,7 +550,7 @@ export default function GroupInfo({ navigation, route }) {
           >
             <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Video</Text>
-          </TouchableOpacity> */}
+          </TouchableOpacity>
         </View>
 
         {/* ═══ DESCRIPTION CARD ═══ */}

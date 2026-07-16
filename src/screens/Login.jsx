@@ -113,7 +113,7 @@ export default function Login({ navigation }) {
   const dialCode = (selectedCountry?.code || '+1').replace('+', '');
 
   // WhatsApp palette
-  const accent = isDarkMode ? '#00A884' : '#008069';
+  const accent = isDarkMode ? '#03b0a2' : '#028578';
   const link = isDarkMode ? '#53BDEB' : '#027EB5';
   const bg = isDarkMode ? '#000000' : '#FFFFFF';
   const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';

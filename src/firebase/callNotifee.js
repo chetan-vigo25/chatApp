@@ -84,6 +84,19 @@ const getExpoNotifications = () => {
 // A full-screen call notifier exists on Android if EITHER backend is present.
 export const isNotifeeCallAvailable = () => Platform.OS === 'android' && (isCallUi() || !!getNotifee());
 
+// notifee requires EVERY notification.data value to be a string — one null
+// (e.g. callerImage for an avatar-less caller) or number in the payload makes
+// displayNotification throw and the whole notification fall back/vanish.
+// Drop null/undefined, stringify the rest.
+const strData = (obj) => {
+  const out = {};
+  Object.entries(obj || {}).forEach(([k, v]) => {
+    if (v === null || v === undefined) return;
+    out[k] = typeof v === 'string' ? v : String(v);
+  });
+  return out;
+};
+
 // Normalise a backend call payload → the FCM-style `data` shape CallProvider's
 // push handlers expect, then fire the right CALL_PUSH_EVENT.
 const emitCallAction = (action, data) => {
@@ -119,25 +132,82 @@ const emitCallAction = (action, data) => {
 // shown for the whole CONNECTED call. CallStyle.forOngoingCall is only available
 // via the native ExpoCallUi backend; notifee can't render it, so this no-ops when
 // the native module is absent (the in-app CallOverlay still shows everything).
+const ONGOING_CHANNEL_ID = 'ongoing_calls';
+const ONGOING_NOTIF_ID = 'ongoing-call';
+let _ongoingChannelReady = false;
+
 export const startOngoingCallNotification = (call) => {
-  if (!isCallUi() || !call?.callId) return;
-  try {
-    getCallUi().startOngoingCall({
-      callId: String(call.callId),
-      callerName: call.callerName || 'Ongoing call',
-      callerImage: call.callerImage || null,
-      callType: call.callType === 'video' ? 'video' : 'audio',
-      startedAt: call.startedAt || 0,
-      state: call.state === 'ringing' ? 'ringing' : 'ongoing',
-    });
-  } catch (err) {
-    console.warn('[callNotif] startOngoingCall failed:', err?.message);
+  if (!call?.callId) return;
+  if (isCallUi()) {
+    try {
+      getCallUi().startOngoingCall({
+        callId: String(call.callId),
+        callerName: call.callerName || 'Ongoing call',
+        callerImage: call.callerImage || null,
+        callType: call.callType === 'video' ? 'video' : 'audio',
+        startedAt: call.startedAt || 0,
+        state: call.state === 'ringing' ? 'ringing' : 'ongoing',
+      });
+    } catch (err) {
+      console.warn('[callNotif] startOngoingCall failed:', err?.message);
+    }
+    return;
   }
+  // notifee FALLBACK (build without the native CallStyle module): a plain
+  // silent ongoing notification. Not a foreground service, so it can post even
+  // when the call connected in the BACKGROUND (where Android 12+ forbids a
+  // mic-FGS start) — guaranteeing the user always has a "return to the call"
+  // handle: body tap → app forward + call screen, Hang up → ends the call.
+  if (Platform.OS !== 'android') return;
+  const notifee = getNotifee();
+  if (!notifee || !_consts) return;
+  (async () => {
+    try {
+      const { AndroidImportance, AndroidVisibility } = _consts;
+      if (!_ongoingChannelReady) {
+        await notifee.createChannel({
+          id: ONGOING_CHANNEL_ID,
+          name: 'Ongoing calls',
+          description: 'Persistent notification while a call is in progress',
+          importance: AndroidImportance.LOW, // silent — the call is already audible
+          visibility: AndroidVisibility.PUBLIC,
+        });
+        _ongoingChannelReady = true;
+      }
+      const connected = call.state !== 'ringing' && !!call.startedAt;
+      await notifee.displayNotification({
+        id: ONGOING_NOTIF_ID,
+        title: call.callerName || 'Ongoing call',
+        body: connected
+          ? `Ongoing ${call.callType === 'video' ? 'video' : 'voice'} call — tap to return`
+          : 'Calling…',
+        data: { type: 'call', kind: 'ongoing', callId: String(call.callId) },
+        android: {
+          channelId: ONGOING_CHANNEL_ID,
+          ongoing: true,
+          autoCancel: false,
+          onlyAlertOnce: true,
+          showTimestamp: connected,
+          timestamp: connected ? call.startedAt : undefined,
+          showChronometer: connected,
+          pressAction: { id: 'ongoing', launchActivity: 'default' },
+          actions: [{ title: 'Hang up', pressAction: { id: 'hangup' } }],
+        },
+      });
+    } catch (err) {
+      console.warn('[callNotif] ongoing fallback failed:', err?.message);
+    }
+  })();
 };
 
 export const stopOngoingCallNotification = () => {
-  if (!isCallUi()) return;
-  try { getCallUi().stopOngoingCall(); } catch (_) { /* best-effort */ }
+  if (isCallUi()) {
+    try { getCallUi().stopOngoingCall(); } catch (_) { /* best-effort */ }
+    return;
+  }
+  const notifee = getNotifee();
+  if (!notifee) return;
+  try { notifee.cancelNotification(ONGOING_NOTIF_ID).catch(() => {}); } catch (_) { /* */ }
 };
 
 // ===== lock-screen security (Android) =====
@@ -259,11 +329,11 @@ export const displayIncomingCallNotifee = async (data) => {
       id: notifId(call.callId),
       title: call.callerName || 'Incoming call',
       body: isVideo ? '📹 Incoming video call' : '📞 Incoming voice call',
-      data: { ...(data || {}), type: 'call' },
+      data: strData({ ...(data || {}), type: 'call' }),
       android: {
         channelId,
         smallIcon: 'notification_icon',
-        color: '#00A884',
+        color: '#03b0a2',
         // Round caller photo, like WhatsApp. Falls back to no avatar when the
         // sender has no image — notifee ignores an undefined largeIcon.
         ...(call.callerImage ? { largeIcon: call.callerImage, circularLargeIcon: true } : {}),
@@ -388,11 +458,11 @@ export const displayMissedCallNotification = async (data = {}) => {
         id: missedNotifId(callId),
         title,
         body,
-        data: tapData,
+        data: strData(tapData),
         android: {
           channelId,
           smallIcon: 'notification_icon',
-          color: '#00A884',
+          color: '#03b0a2',
           ...(data.callerImage ? { largeIcon: data.callerImage, circularLargeIcon: true } : {}),
           importance: AndroidImportance.DEFAULT,
           visibility: AndroidVisibility.PUBLIC,
@@ -541,6 +611,20 @@ const routeNotifeeEvent = (eventType, detail, { launched } = {}) => {
 
   if (data?.type !== 'call') return null;
   const actionId = detail?.pressAction?.id;
+  // Ongoing-call fallback notification (kind:'ongoing'): body tap returns the
+  // user to the live call screen; Hang up ends it. Never route these into the
+  // incoming-ring handlers — they'd try to build a ringing state over a LIVE call.
+  if (data?.kind === 'ongoing') {
+    if (eventType === EventType.ACTION_PRESS && actionId === 'hangup') {
+      emitCallAction('hangup', data);
+      return 'hangup';
+    }
+    if (eventType === EventType.PRESS || launched) {
+      emitCallAction('ongoing', data);
+      return 'ongoing';
+    }
+    return null;
+  }
   if (eventType === EventType.ACTION_PRESS && actionId === 'decline') {
     cancelIncomingCallNotifee(data.callId);
     emitCallAction('decline', data);

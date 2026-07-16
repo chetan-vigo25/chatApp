@@ -56,7 +56,7 @@ const VISIBILITY_OPTIONS = [
 
 // Animated upload progress bar — smooth fill, glowing leading cap, and a
 // looping shimmer sweep. Pure RN Animated (no extra deps).
-function UploadProgressBar({ percent = 0, color = '#25D366', trackWidth = 0 }) {
+function UploadProgressBar({ percent = 0, color = '#03b0a2', trackWidth = 0 }) {
   const fill = useRef(new Animated.Value(0)).current;
   const shimmer = useRef(new Animated.Value(0)).current;
 
@@ -137,7 +137,7 @@ export default function StatusPreview({ navigation, route }) {
     statusType = 'image',
     caption: initialCaption = '',
     textContent = '',
-    backgroundColor = '#075e54',
+    backgroundColor = '#026158',
     linkUrl = '',
     ogData = null,
     filtersApplied = [],
@@ -404,7 +404,7 @@ export default function StatusPreview({ navigation, route }) {
 
             <UploadProgressBar
               percent={progress.percent || 0}
-              color={theme.colors.themeColor || '#25D366'}
+              color={theme.colors.themeColor || '#03b0a2'}
               trackWidth={Math.min(SW - 2 * STATUS_SPACE.gutter - 44, 316)}
             />
             <Text style={styles.postingPercent}>{progress.percent || 0}%</Text>

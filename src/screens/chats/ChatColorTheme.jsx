@@ -13,14 +13,14 @@ const { width: SCREEN_W } = Dimensions.get('window');
 const COLOR_CARD_W = 88;
 const COLOR_CARD_GAP = 12;
 
-// Curated, cohesive palette. #00A884 (the WhatsApp brand green) leads as the
+// Curated, cohesive palette. #03b0a2 (the brand teal) leads as the
 // default so the out-of-the-box selection always resolves to a swatch.
 // Row 1-2: bold/vivid accents. Row 3: soft, muted tones (gentler accents that
 // still keep white text legible on sent bubbles & buttons).
-const DEFAULT_ACCENT = '#00A884';
+const DEFAULT_ACCENT = '#03b0a2';
 const ACCENT_COLORS = [
   // Bold
-  '#00A884', '#128C7E', '#075E54', '#25D366',
+  '#03b0a2', '#02958a', '#026158', '#05d3c2',
   '#0099A8', '#34B7F1', '#0084FF', '#6C5CE7',
   '#9B59B6', '#E84393', '#FF6B6B', '#F2994A',
   // Soft / muted

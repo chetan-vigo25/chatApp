@@ -4,11 +4,11 @@ import { Appearance } from 'react-native';
 
 const ThemeContext = createContext();
 
-// Brand color — WhatsApp's modern in-app accent green (#00A884): the same teal-green
-// WhatsApp uses for its FAB, send button, links, active tabs and read context.
+// Brand color — the product logo teal (#03b0a2), used everywhere WhatsApp uses its
+// accent green: FAB, send button, links, active tabs and read context.
 // Single source of truth for the primary/accent color across modes. It is also the
-// default `chatColor`, so outgoing message bubbles are WhatsApp-green out of the box.
-const BRAND = '#00A884';
+// default `chatColor`, so outgoing message bubbles are brand-teal out of the box.
+const BRAND = '#03b0a2';
 
 // Roboto is the app-wide font family (matches the bottom tab bar and the
 // overwhelming majority of screens). Exposed so any component reading

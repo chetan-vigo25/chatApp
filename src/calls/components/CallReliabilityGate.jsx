@@ -11,6 +11,7 @@ import {
 import {
   shouldOfferReliability, snoozeReliability, dismissReliabilityForever,
   clearReliabilityFlags, isBackgroundAllowed, RELIABILITY_OPEN_EVENT,
+  maybeAutoRequestBackground,
 } from '../services/callReliability';
 
 /**
@@ -38,8 +39,18 @@ export default function CallReliabilityGate() {
     evaluatingRef.current = true;
     try {
       const offer = await shouldOfferReliability();
-      setVisible(offer);
-      if (!offer && isBackgroundAllowed()) clearReliabilityFlags();
+      if (offer) {
+        // First entry: fire the OS's own "allow background activity" dialog
+        // directly instead of our onboarding card — the user grants it in one
+        // tap with no in-app interruption. The card only ever auto-shows later
+        // (post-snooze) if the exemption is still missing; Settings can always
+        // open it manually.
+        const systemDialogFired = await maybeAutoRequestBackground();
+        setVisible(!systemDialogFired);
+      } else {
+        setVisible(false);
+        if (isBackgroundAllowed()) clearReliabilityFlags();
+      }
     } finally {
       evaluatingRef.current = false;
     }

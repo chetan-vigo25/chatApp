@@ -36,7 +36,7 @@ import { suspendAppLock, resumeAppLock } from '../../services/appLockGuard';
 const { width: SCREEN_W } = Dimensions.get('window');
 
 const BG_COLORS = [
-  '#075e54', '#128C7E', '#25D366', '#FF6B6B',
+  '#026158', '#02958a', '#03b0a2', '#FF6B6B',
   '#C44569', '#F8B500', '#6C5CE7', '#00B894',
   '#2d3436', '#e17055', '#0984e3', '#fd79a8',
 ];

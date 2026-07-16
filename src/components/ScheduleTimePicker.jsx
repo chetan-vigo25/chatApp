@@ -64,7 +64,7 @@ export default function ScheduleTimePicker({ visible, onClose, onSchedule, theme
   const bg = theme?.colors?.cardBackground || '#1F2C34';
   const textColor = theme?.colors?.primaryTextColor || '#E9EDEF';
   const subColor = theme?.colors?.placeHolderTextColor || '#8696A0';
-  const accent = theme?.colors?.themeColor || '#00A884';
+  const accent = theme?.colors?.themeColor || '#03b0a2';
 
   return (
     <Modal transparent visible={visible} animationType="fade" onRequestClose={onClose}>

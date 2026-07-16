@@ -23,11 +23,11 @@ import Svg, {
 } from 'react-native-svg';
 
 // Vivid packet colours — green, sky, amber, violet, pink.
-const PACKET_COLORS = ['#25D366', '#34B7F1', '#FFB400', '#AB6BFF', '#FF5E7E'];
+const PACKET_COLORS = ['#03b0a2', '#34B7F1', '#FFB400', '#AB6BFF', '#FF5E7E'];
 
 export default function DeviceLinkArt({
   size = 230,
-  accent = '#00A884',
+  accent = '#03b0a2',
   accentDark = '#017A68',
   dark = true,
   animated = true,

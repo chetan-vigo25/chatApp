@@ -382,7 +382,7 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     borderRadius: 30,
   },
-  scanningDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#00A884' },
+  scanningDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#03b0a2' },
   scanningText: { fontFamily: 'Roboto-Medium', fontSize: 13.5, color: '#fff' },
 
   errorContainer: {
@@ -402,7 +402,7 @@ const styles = StyleSheet.create({
   errorButtons: { flexDirection: 'row', gap: 12, marginTop: 18 },
   retryBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
-    backgroundColor: '#00A884',
+    backgroundColor: '#03b0a2',
     paddingHorizontal: 22, paddingVertical: 11, borderRadius: 40,
   },
   retryText: { fontFamily: 'Roboto-SemiBold', fontSize: 14, color: '#fff' },

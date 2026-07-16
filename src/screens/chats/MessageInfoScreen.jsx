@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -16,6 +16,7 @@ import { Ionicons } from '@expo/vector-icons';
 import moment from 'moment';
 import { useTheme } from '../../contexts/ThemeContext';
 import { getMessageInfo } from '../../Redux/Services/Chat/Chat.Services';
+import { getSocket } from '../../Redux/Services/Socket/socket';
 
 const READ_BLUE = '#53BDEB';
 const GRAY_LIGHT = '#8696A0';
@@ -35,6 +36,17 @@ const previewLabelFor = (preview) => {
     contact: '👤 Contact',
   };
   return map[type] || `[${type}]`;
+};
+
+// WhatsApp-style receipt time: "today at 3:42 pm" / "yesterday at 9:10 am" /
+// "Jul 12, 2026 at 8:05 pm" — matches the Message info screen in WhatsApp.
+const formatReceiptTime = (ts) => {
+  if (!ts) return '—';
+  const m = moment(ts);
+  if (!m.isValid()) return '—';
+  if (m.isSame(moment(), 'day')) return `today at ${m.format('h:mm a')}`;
+  if (m.isSame(moment().subtract(1, 'day'), 'day')) return `yesterday at ${m.format('h:mm a')}`;
+  return m.format('MMM D, YYYY [at] h:mm a');
 };
 
 const Tick = ({ status, size = 16, isDarkMode }) => {
@@ -65,7 +77,7 @@ const ReceiptRow = ({ user, timestamp, palette }) => {
           {fullName}
         </Text>
         <Text style={[styles.rowTime, { color: palette.subtleText }]}>
-          {timestamp ? moment(timestamp).format('ddd, MMM D · hh:mm A') : '—'}
+          {formatReceiptTime(timestamp)}
         </Text>
       </View>
     </View>
@@ -97,7 +109,7 @@ export default function MessageInfoScreen() {
       text: c.primaryTextColor || (isDarkMode ? '#FFFFFF' : '#111B21'),
       subtleText: c.placeHolderTextColor || (isDarkMode ? '#AEBAC1' : '#667781'),
       divider: c.borderColor || (isDarkMode ? '#2A3942' : '#E9EDEF'),
-      brand: c.themeColor || '#25D366',
+      brand: c.themeColor || '#03b0a2',
       onBrand: c.textWhite || '#ffffff',
     };
   }, [theme, isDarkMode]);
@@ -133,6 +145,49 @@ export default function MessageInfoScreen() {
     setRefreshing(true);
     load();
   }, [load]);
+
+  // Live refresh: while this screen is open, a receipt for THIS message
+  // (someone read/delivered it) re-fetches the lists so the "Read by" /
+  // "Delivered to" sections update in place instead of needing pull-to-refresh.
+  const refetchTimerRef = useRef(null);
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket || !messageId) return undefined;
+
+    const scheduleRefetch = () => {
+      if (refetchTimerRef.current) return; // coalesce receipt bursts
+      refetchTimerRef.current = setTimeout(() => {
+        refetchTimerRef.current = null;
+        load();
+      }, 600);
+    };
+
+    const onReceipt = (payload) => {
+      const source = payload?.data || payload || {};
+      const ids = Array.isArray(source?.messageIds)
+        ? source.messageIds
+        : [source?.messageId].filter(Boolean);
+      if (ids.some((mid) => String(mid) === String(messageId))) scheduleRefetch();
+    };
+
+    const EVENTS = [
+      'group:message:read',
+      'group:message:read:update',
+      'group:message:delivered:receipt',
+      'group:message:delivered:update',
+      'message:read',
+      'message:delivered',
+      'message:read:bulk:ack',
+    ];
+    EVENTS.forEach((ev) => socket.on(ev, onReceipt));
+    return () => {
+      EVENTS.forEach((ev) => socket.off(ev, onReceipt));
+      if (refetchTimerRef.current) {
+        clearTimeout(refetchTimerRef.current);
+        refetchTimerRef.current = null;
+      }
+    };
+  }, [messageId, load]);
 
   const isGroup = info?.chatType === 'group';
   const readers = useMemo(() => info?.readBy || [], [info]);

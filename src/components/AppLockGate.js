@@ -15,10 +15,14 @@ import {
   verifyDeletedPassword,
   getUserSettings,
   updateUserSettings,
+  updateAppLock,
+  readAppLockScope,
 } from '../Redux/Services/Profile/Settings.Services';
 import { navigationRef } from '../Redux/Services/navigationService';
 import { TWO_STEP_ENABLED_KEY } from '../screens/profiles/TwoStepPassword';
 import { isAppLockSuspended } from '../services/appLockGuard';
+import { useCall } from '../calls/useCall';
+import { CALL_STATUS } from '../calls/state/callMachine';
 import { getDeletedChatConfig, clearDeletedChatConfig, DELETED_PWD_SET_KEY } from '../utils/deletedChatConfig';
 import { executeDeletedChatPurge } from '../utils/deletedChatExecutor';
 
@@ -39,6 +43,7 @@ export default function AppLockGate() {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
   const { removeChat } = useRealtimeChat();
+  const { call } = useCall();
   const [enabled, setEnabled] = useState(false);
   const [locked, setLocked] = useState(false);
   const [pwd, setPwd] = useState('');
@@ -73,6 +78,25 @@ export default function AppLockGate() {
   const cooldownLeftMs = Math.max(0, lockoutUntil - now);
   const inCooldown = cooldownLeftMs > 0;
   const cooldownSeconds = Math.ceil(cooldownLeftMs / 1000);
+
+  // ---- call bypass ----
+  // A LIVE call must never sit under the lock modal (Modal always wins over the
+  // in-hierarchy CallOverlay): answering from CallKit/notification foregrounds
+  // the app, the AppState handler arms `locked`, and without this the user
+  // stared at the password screen while the call ran blind. While the call UI
+  // genuinely COVERS the whole screen we keep `locked` armed but suppress the
+  // modal — the app itself stays unreachable behind the full-screen call UI.
+  // The moment that stops being true the armed modal reappears instantly:
+  //  • call ends (ENDED shows the lock right away — "call cut → lock"),
+  //  • user minimizes the call (PiP/banner would expose the app → lock shows;
+  //    the call keeps running behind it).
+  // An unanswered collapsed ring (notification-only) never suppresses — the
+  // app would be exposed otherwise.
+  const callCoversScreen = !!call
+    && !call.minimized
+    && (call.status === CALL_STATUS.OUTGOING
+      || call.status === CALL_STATUS.ACTIVE
+      || (call.status === CALL_STATUS.INCOMING && (call.accepted || call.incomingExpanded)));
 
   // Tick once a second while the cooldown is active so the countdown updates.
   useEffect(() => {
@@ -129,8 +153,10 @@ export default function AppLockGate() {
       try {
         const settings = await getUserSettings();
         if (!alive) return;
-        const two = settings?.chat?.twoStep || {};
-        const twoOn = !!two.enabled && !!two.hasPassword;
+        // Only this platform's lock arms the phone — a lock set on the website
+        // lives in its own scope and must not gate the app.
+        const two = readAppLockScope(settings);
+        const twoOn = two.enabled && two.hasPassword;
         const delOn = !!settings?.chat?.hasDeletedPassword;
         const isOn = twoOn || delOn;
         setEnabled(isOn);
@@ -212,12 +238,14 @@ export default function AppLockGate() {
   }, [enabled]);
 
   // While locked, swallow the hardware back button — there's no escape
-  // until the right password is entered.
+  // until the right password is entered. Not while a full-screen call
+  // suppresses the modal: back must keep working for the call UI
+  // (CallOverlay's own handler minimizes / returns to lock).
   useEffect(() => {
-    if (!locked && !purging) return undefined;
+    if ((!locked && !purging) || (callCoversScreen && !purging)) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => true);
     return () => sub.remove();
-  }, [locked, purging]);
+  }, [locked, purging, callCoversScreen]);
 
   const shake = useCallback(() => {
     Animated.sequence([
@@ -228,9 +256,10 @@ export default function AppLockGate() {
     ]).start();
   }, [shakeAnim]);
 
-  // Play the entrance reveal each time the lock screen comes up.
+  // Play the entrance reveal each time the lock screen comes up — including
+  // when it reappears the moment a call ends (suppression lifting).
   useEffect(() => {
-    if (locked && !purging) {
+    if (locked && !purging && !callCoversScreen) {
       entranceAnim.setValue(0);
       Animated.timing(entranceAnim, {
         toValue: 1,
@@ -238,7 +267,7 @@ export default function AppLockGate() {
         useNativeDriver: true,
       }).start();
     }
-  }, [locked, purging, entranceAnim]);
+  }, [locked, purging, callCoversScreen, entranceAnim]);
 
   // Gently pulse the loader badge while the purge runs.
   useEffect(() => {
@@ -307,8 +336,8 @@ export default function AppLockGate() {
         if (purge) {
           // 1) Reset the deleted-chats password (single-use).
           try { await updateUserSettings({ chat: { deletedPassword: null } }); } catch {}
-          // 2) Promote the entered password to the 2-step password.
-          try { await updateUserSettings({ chat: { twoStep: { enabled: true, password: candidate } } }); } catch {}
+          // 2) Promote the entered password to this platform's app-lock password.
+          try { await updateAppLock({ enabled: true, password: candidate }); } catch {}
           try { await AsyncStorage.setItem(TWO_STEP_ENABLED_KEY, '1'); } catch {}
           try { await AsyncStorage.setItem(DELETED_PWD_SET_KEY, '0'); } catch {}
           await clearDeletedChatConfig();
@@ -403,6 +432,9 @@ export default function AppLockGate() {
   };
 
   if (!locked && !purging) return null;
+  // Full-screen call is up → stay armed but invisible (see callCoversScreen).
+  // Never suppress the purge loader: it only runs post-unlock and must hold.
+  if (callCoversScreen && !purging) return null;
 
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;

@@ -110,14 +110,21 @@ const REGISTER_CALL = '    RNVoipPushNotificationManager.voipRegistration()';
 // struct failed to register, so PushKit hit doesNotRecognizeSelector → SIGABRT.
 const PUSHKIT_METHODS = `
   // MARK: - PushKit (VoIP) — added by withIosVoip config plugin
+
+  // UUIDs already reported to CallKit this process — dedupes an APNs double
+  // delivery / backend retry of the SAME call (the backend mints one stable
+  // uuid per callId), which would otherwise hit reportNewIncomingCall twice
+  // and error inside CallKit. Small ring buffer; process-lifetime only.
+  private static var voipReportedUuids: [String] = []
+
   public func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
     RNVoipPushNotificationManager.didUpdate(pushCredentials, forType: type.rawValue)
   }
- 
+
   public func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
     // No-op: a new token is delivered via didUpdate when one becomes available.
   }
- 
+
   public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
     let dict = payload.dictionaryPayload
     // CallKit requires an RFC4122 UUID — reporting anything else gets the app
@@ -130,16 +137,33 @@ const PUSHKIT_METHODS = `
       ?? UUID().uuidString
     let callerName = (dict["callerName"] as? String) ?? "Incoming call"
     let hasVideo = ((dict["callType"] as? String) ?? "audio") == "video"
- 
+
+    // Duplicate delivery of a call CallKit is already ringing → complete and
+    // bail; a second reportNewIncomingCall on the same UUID only errors. Still
+    // forward to JS so its state can reconcile. (A payload with a malformed /
+    // missing uuid falls through on a fresh random UUID and is never deduped.)
+    if AppDelegate.voipReportedUuids.contains(uuid) {
+      RNVoipPushNotificationManager.didReceiveIncomingPush(with: payload, forType: type.rawValue)
+      completion()
+      return
+    }
+    AppDelegate.voipReportedUuids.append(uuid)
+    if AppDelegate.voipReportedUuids.count > 8 {
+      AppDelegate.voipReportedUuids.removeFirst()
+    }
+
     // MUST report to CallKit synchronously here (iOS 13+), or the app is killed.
+    // Holding/DTMF are OFF: the WebView engine has no hold or keypad path, so
+    // advertising them puts dead buttons on the CallKit screen (and a Hold from
+    // the OS would silently break the call's audio session).
     RNCallKeep.reportNewIncomingCall(
       uuid,
       handle: callerName,
       handleType: "generic",
       hasVideo: hasVideo,
       localizedCallerName: callerName,
-      supportsHolding: true,
-      supportsDTMF: true,
+      supportsHolding: false,
+      supportsDTMF: false,
       supportsGrouping: false,
       supportsUngrouping: false,
       fromPushKit: true,

@@ -45,7 +45,7 @@ const MentionSuggestionItem = React.memo(function MentionSuggestionItem({
       {member.profileImage ? (
         <Image source={{ uri: member.profileImage }} style={styles.avatar} />
       ) : (
-        <View style={[styles.avatarFallback, { backgroundColor: member.color || '#128C7E' }]}>
+        <View style={[styles.avatarFallback, { backgroundColor: member.color || '#02958a' }]}>
           <Text style={styles.avatarInitial}>
             {(member.displayName || '?')[0].toUpperCase()}
           </Text>
@@ -192,7 +192,7 @@ export function useMentions(groupMembers, currentUserId) {
   // Build members list from groupMembersMap (excluding current user)
   const membersList = useMemo(() => {
     if (!groupMembers) return [];
-    const avatarColors = ['#25D366', '#128C7E', '#0EA5FF', '#F43F5E', '#8B5CF6', '#F97316', '#06B6D4', '#EC4899'];
+    const avatarColors = ['#03b0a2', '#02958a', '#0EA5FF', '#F43F5E', '#8B5CF6', '#F97316', '#06B6D4', '#EC4899'];
     return Object.entries(groupMembers)
       .filter(([id]) => id !== currentUserId)
       .map(([id, info], idx) => ({

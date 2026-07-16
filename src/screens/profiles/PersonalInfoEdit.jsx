@@ -125,7 +125,7 @@ export default function PersonalInfoEdit({ navigation, route }) {
   const onHeader = isDarkMode ? theme.colors.primaryTextColor : '#FFFFFF';
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
-  const themeColor = theme.colors.themeColor || '#00A884';
+  const themeColor = theme.colors.themeColor || '#03b0a2';
   const underlineIdle = isDarkMode ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.18)';
   const showCharCount = field !== 'email' && field !== 'mobile';
   const remaining = meta.maxLength - charCount;

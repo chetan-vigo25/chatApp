@@ -39,7 +39,7 @@ function LinkPreviewCard({ url, isMyMessage, theme, isDarkMode, onOpen }) {
   const cardBg = isMyMessage
     ? 'rgba(255,255,255,0.15)'
     : (isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)');
-  const accent = theme?.colors?.themeColor || '#25D366';
+  const accent = theme?.colors?.themeColor || '#03b0a2';
 
   const imageUri = !imgError && data.image ? toSecureMediaUri(data.image) : null;
 

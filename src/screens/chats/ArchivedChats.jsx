@@ -50,7 +50,7 @@ export default function ArchivedChats({ navigation }) {
   const sheetBgAnim = useRef(new Animated.Value(0)).current;
 
   const getUserColor = (str) => {
-    const colors = ['#833AB4', '#1DB954', '#128C7E', '#075E54', '#777737', '#F56040', '#34B7F1', '#25D366'];
+    const colors = ['#833AB4', '#1DB954', '#02958a', '#026158', '#777737', '#F56040', '#34B7F1', '#03b0a2'];
     if (!str) return colors[0];
     let hash = 0;
     for (let i = 0; i < (str || '').length; i++) {

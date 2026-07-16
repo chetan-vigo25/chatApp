@@ -583,7 +583,7 @@ export default function StatusViewer({ navigation, route }) {
     switch (statusType) {
       case 'text':
         return (
-          <View style={[styles.textContent, { backgroundColor: currentStatus.bgColor || '#075e54' }]}>
+          <View style={[styles.textContent, { backgroundColor: currentStatus.bgColor || '#026158' }]}>
             <Text style={styles.textBody}>{currentStatus.textContent}</Text>
           </View>
         );
@@ -677,7 +677,7 @@ export default function StatusViewer({ navigation, route }) {
         // Fallback: show textContent if present, otherwise loading indicator
         if (currentStatus?.textContent) {
           return (
-            <View style={[styles.textContent, { backgroundColor: currentStatus.bgColor || '#075e54' }]}>
+            <View style={[styles.textContent, { backgroundColor: currentStatus.bgColor || '#026158' }]}>
               <Text style={styles.textBody}>{currentStatus.textContent}</Text>
             </View>
           );
@@ -800,7 +800,7 @@ export default function StatusViewer({ navigation, route }) {
               <Text style={styles.headerName}>{displayName}</Text>
               {isBroadcast && (
                 <View style={styles.headerVerified}>
-                  <Ionicons name="checkmark-circle" size={15} color="#00A884" />
+                  <Ionicons name="checkmark-circle" size={15} color="#03b0a2" />
                 </View>
               )}
             </View>
@@ -1101,7 +1101,7 @@ export default function StatusViewer({ navigation, route }) {
                     style={[
                       styles.replyContextThumbImg,
                       styles.replyContextThumbFallback,
-                      { backgroundColor: currentStatus?.bgColor || '#075e54' },
+                      { backgroundColor: currentStatus?.bgColor || '#026158' },
                     ]}
                   >
                     <Ionicons name="chatbubble-ellipses" size={14} color="#fff" />
@@ -1414,8 +1414,8 @@ const styles = StyleSheet.create({
   },
   replySend: {
     width: 44, height: 44, borderRadius: 22,
-    backgroundColor: '#25D366', alignItems: 'center', justifyContent: 'center',
-    shadowColor: '#25D366', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.35, shadowRadius: 6,
+    backgroundColor: '#03b0a2', alignItems: 'center', justifyContent: 'center',
+    shadowColor: '#03b0a2', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.35, shadowRadius: 6,
     elevation: 4,
   },
 });
