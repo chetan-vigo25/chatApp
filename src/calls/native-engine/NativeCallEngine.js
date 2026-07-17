@@ -1,5 +1,5 @@
 import { CMD, EVT } from '../engine/protocol';
-import { ensureWebrtcGlobals, audioSessionDidActivate } from './webrtcGlobals';
+import { ensureWebrtcGlobals, audioSessionDidActivate, getWebrtc } from './webrtcGlobals';
 import NativeCallingSDK from './NativeCallingSDK';
 import * as AudioRoute from './AudioRoute';
 import * as registry from './streamRegistry';
@@ -18,9 +18,13 @@ import * as registry from './streamRegistry';
  * pipeline rebuild. Speaker routing = AudioRoute (InCallManager);
  * video rendering = streamRegistry → NativeVideoStage (RTCView).
  *
- * Screen share: unsupported (parity with today's mobile WebView). Recording:
- * unsupported on-device — the admin "Listen Live" pipeline moves server-side
- * (mediasoup recording REST), per the migration plan's R1 decision.
+ * Screen share: NATIVE via react-native-webrtc getDisplayMedia — real on
+ * Android (MediaProjection + the library's bundled foreground service; the
+ * WebView engine could never do this, Android WebView has no getDisplayMedia).
+ * iOS rejects without a ReplayKit broadcast extension → reported `unsupported`
+ * and the UI shows the "not supported" alert. Recording: unsupported on-device
+ * — the admin "Listen Live" pipeline moves server-side (mediasoup recording
+ * REST), per the migration plan's R1 decision.
  */
 const toIdList = (to) => {
   if (to == null) return [];
@@ -85,8 +89,22 @@ class NativeCallEngine {
         case CMD.CONNECT: { this._connect(msg); return; }
 
         case CMD.PING: {
-          const alive = !!(this._sdk && this._sdk._socket && this._sdk._socket.connected);
-          this._post(EVT.PONG, { ref: msg.ref, hasCall: !!this._sdk, connected: alive });
+          // The client-side "connected" flag LIES on a half-open socket
+          // (backgrounded device, NAT idle drop): the server keeps emitting
+          // rings into the dead socket while this side never reconnects — the
+          // callee accepted but their engine never heard the SFU ring (stuck
+          // "Connecting…" → 30s watchdog). So pong only reports connected
+          // after a REAL server round trip (1.5s bound — inside the provider's
+          // 2s ping window); a dead socket reports connected:false and
+          // ensureConnected rebuilds the connection.
+          const sdk = this._sdk;
+          if (!sdk || !sdk._socket || !sdk._socket.connected) {
+            this._post(EVT.PONG, { ref: msg.ref, hasCall: !!sdk, connected: false });
+            return;
+          }
+          sdk.verifyAlive(1500).then((ok) => {
+            this._post(EVT.PONG, { ref: msg.ref, hasCall: true, connected: !!ok });
+          });
           return;
         }
 
@@ -239,8 +257,19 @@ class NativeCallEngine {
           return;
 
         case CMD.TOGGLE_SCREEN: {
-          if (msg.on) this._post(EVT.SCREEN_SHARE_ERROR, { message: 'Screen sharing is not available on this device yet', unsupported: true });
-          else this._post(EVT.SCREEN_SHARE_STOPPED, {});
+          if (!this._sdk) { this._post(EVT.CMD_ERROR, { cmd: c, message: 'not connected' }); return; }
+          if (msg.on) {
+            this._sdk.startScreenShare()
+              .then(() => this._post(EVT.SCREEN_SHARE_STARTED, {}))
+              .catch((e) => this._post(EVT.SCREEN_SHARE_ERROR, {
+                message: (e && e.message) || 'Could not share the screen',
+                unsupported: !!(e && e.unsupported),
+              }));
+          } else {
+            this._sdk.stopScreenShare()
+              .then(() => this._post(EVT.SCREEN_SHARE_STOPPED, {}))
+              .catch(() => this._post(EVT.SCREEN_SHARE_STOPPED, {}));
+          }
           return;
         }
 
@@ -268,6 +297,40 @@ class NativeCallEngine {
       this._post(EVT.CONNECT_ERROR, { message: 'react-native-webrtc native module unavailable (rebuild the dev client)' });
       return;
     }
+    // REUSE a live, registered SDK when the identity + server are unchanged.
+    // The old unconditional teardown dropped the PRE-WARMED socket at every
+    // call start (server logs: connected → disconnected → connected) and
+    // burned ~1s re-handshaking before joinRoom — and a CONNECT arriving
+    // during a LIVE call killed the call outright. A token refresh doesn't
+    // need a reconnect: the token is only read at joinRoom time.
+    {
+      const sdk = this._sdk;
+      const reuseUrl = String(url || '').replace(/\/+$/, '');
+      if (sdk && sdk._socket && sdk._socket.connected && sdk._registered
+          && String(sdk.userId) === String(userId || sdk.userId)
+          && sdk.url === reuseUrl) {
+        if (typeof token === 'string' && token.split('.').length === 3) sdk._token = token;
+        if (Array.isArray(iceServers) && iceServers.length) sdk._fallbackIceServers = iceServers;
+        // `connected` can lie on a backgrounded app (half-open TCP) — verify
+        // with a real round trip before trusting the socket; the probe doubles
+        // as a registration refresh. Dead → fall through to a fresh build.
+        sdk.verifyAlive(2500).then((ok) => {
+          if (this._sdk !== sdk) return; // superseded meanwhile
+          if (ok) {
+            this._log('connect: reusing live engine socket (identity unchanged, probe ok)');
+            this._post(EVT.ENGINE_READY, { screenShare: this._screenShareSupported() });
+          } else {
+            this._log('connect: reuse probe FAILED — rebuilding the engine socket');
+            this._connectFresh({ url, token, userId, name, iceServers });
+          }
+        });
+        return;
+      }
+    }
+    this._connectFresh({ url, token, userId, name, iceServers });
+  }
+
+  _connectFresh({ url, token, userId, name, iceServers }) {
     // Tear down any PREVIOUS instance first (token refresh / re-login) so only
     // the fresh instance is ever wired — a stale one could post ghost events
     // for a dead call (WebView glue APP-7 rule).
@@ -286,7 +349,7 @@ class NativeCallEngine {
     Promise.resolve(sdk.connect()).then(() => {
       if (this._sdk !== sdk) return; // superseded by a newer connect
       this._log('engine connected — SDK ready');
-      this._post(EVT.ENGINE_READY, { screenShare: false });
+      this._post(EVT.ENGINE_READY, { screenShare: this._screenShareSupported() });
     }).catch((e) => {
       this._log(`connect failed: ${e && e.message}`);
       if (this._sdk === sdk) { try { sdk.disconnect(); } catch (_) {} this._sdk = null; }
@@ -294,8 +357,21 @@ class NativeCallEngine {
     });
   }
 
+  // Whether THIS device can CAPTURE the screen (receiving always works).
+  // Android: react-native-webrtc ships getDisplayMedia (MediaProjection).
+  // iOS: needs a ReplayKit broadcast extension the app doesn't bundle.
+  _screenShareSupported() {
+    const webrtc = getWebrtc();
+    return !!(webrtc && webrtc.mediaDevices && typeof webrtc.mediaDevices.getDisplayMedia === 'function');
+  }
+
   /** Port of the WebView glue's wireEvents() — SDK events → EVT posts. */
   _wireEvents(sdk) {
+    // System-initiated share stop (status-bar chip / OS notification) — the
+    // SDK mirrors the ended track as a clean stop; reflect it in the UI flag.
+    sdk.on('screenshare', (p) => {
+      this._post(p && p.on ? EVT.SCREEN_SHARE_STARTED : EVT.SCREEN_SHARE_STOPPED, {});
+    });
     sdk.on('localstream', (stream) => {
       const micCount = this._enableLocalMic(true);
       let camCount = 0;

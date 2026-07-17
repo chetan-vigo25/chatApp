@@ -84,6 +84,16 @@ export default function CallOverlay() {
   const connecting = accepted
     && status !== CALL_STATUS.ACTIVE
     && status !== CALL_STATUS.ENDED;
+  // WhatsApp UX: the TIMER shows the moment either side answers (answeredAt is
+  // stamped at accept on both sides), not only when remote media lands — the
+  // accepted→media gap no longer flashes "Connecting…" at the user. This is a
+  // PRESENTATION change only: the state machine stays media-driven (ACTIVE =
+  // real media, per the media-driven rule), the 30s connect watchdog still
+  // fails the call honestly if media never arrives, and a mid-call drop still
+  // replaces the timer with "Reconnecting…".
+  const timerRunning = (mediaConnected || (accepted && !!call?.answeredAt))
+    && status !== CALL_STATUS.ENDED
+    && !call?.reconnecting;
   // Show the incoming Accept/Decline card only until the user answers.
   const showIncomingActions = status === CALL_STATUS.INCOMING && !accepted;
   // A ring pulse while genuinely ringing (stops once either side has answered).
@@ -199,11 +209,11 @@ export default function CallOverlay() {
     if (call?.reconnecting && status !== CALL_STATUS.ENDED && call?.answeredAt) {
       return 'Reconnecting…';
     }
-    // Answered (accept signal / tap) but remote media hasn't arrived yet → the
-    // honest indicator is "Connecting…", NOT a running timer. The timer only shows
-    // once status === ACTIVE (real media), so a call to an unreachable/offline peer
-    // that was accepted-then-dropped never reads as connected.
-    if (connecting) return 'Connecting…';
+    // Answered but remote media hasn't arrived: the running TIMER (timerRunning)
+    // covers this gap now — "Connecting…" only remains as a defensive fallback
+    // for an accepted call that somehow has no answeredAt to count from. A call
+    // that never connects still fails via the connect watchdog.
+    if (connecting && !timerRunning) return 'Connecting…';
     if (status === CALL_STATUS.OUTGOING) {
       if (isGroup) return call?.callId ? 'Ringing…' : 'Calling group…';
       return call?.callId ? 'Ringing…' : 'Calling…';
@@ -235,7 +245,7 @@ export default function CallOverlay() {
         groupName={call?.groupName}
         media={call?.media}
         statusText={subtitle || ''}
-        showTimer={mediaConnected}
+        showTimer={timerRunning}
         answeredAt={call?.answeredAt}
         micOn={call?.micOn}
         onToggleMic={toggleMic}
@@ -264,7 +274,7 @@ export default function CallOverlay() {
             <Text style={styles.videoName} numberOfLines={1}>{groupTitle}</Text>
             {isGroup ? (
               <Text style={styles.videoSub}>{joined + 1} in call</Text>
-            ) : mediaConnected ? (
+            ) : timerRunning ? (
               <CallTimer startMs={call?.answeredAt} />
             ) : (
               <Text style={styles.videoSub}>{subtitle}</Text>
@@ -357,7 +367,7 @@ export default function CallOverlay() {
                 activeSpeakerId={call?.activeSpeakerId || null}
               />
             </View>
-            {mediaConnected ? (
+            {timerRunning ? (
               <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
             ) : null}
           </View>
@@ -421,7 +431,7 @@ export default function CallOverlay() {
               </View>
             </View>
             <Text style={[styles.name, { color: onBg }]} numberOfLines={1}>{peerDisplayName}</Text>
-            {mediaConnected ? (
+            {timerRunning ? (
               <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
             ) : (
               <View style={styles.mediaRow}>

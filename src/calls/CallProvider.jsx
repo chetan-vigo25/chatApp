@@ -49,7 +49,7 @@ import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // build (required for the ExpoCallUi CallStyle notification anyway), enabling
 // cold-start Answer replay (consumeInitialNotifeeCall) and dismissing the
 // incoming-call notification once answered/ended (cancelIncomingCallNotifee).
-import { CALL_PUSH_EVENTS, isStaleCallPush } from '../firebase/callEvents';
+import { CALL_PUSH_EVENTS, isStaleCallPush, callPushAgeMs, AGED_CALL_PUSH_MS } from '../firebase/callEvents';
 import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall, displayIncomingCallNotifee,
   startOngoingCallNotification, stopOngoingCallNotification,
@@ -409,9 +409,17 @@ export const CallProvider = ({ children }) => {
       // that combination is what actually moves WebView call audio.
       applyAudioRoute(on);
       sendCmd({ cmd: CMD.SET_SPEAKER, on });
+    } else if (isNativeCallEngine()) {
+      // iOS native engine: AudioRoute.start() picks a route from the media type
+      // and CallKit's session activation can silently override it — neither
+      // consults the BUTTON. Assert the button's route explicitly (including an
+      // explicit OFF — the engine start path only ever forced speaker ON), so a
+      // 1:1 voice call can never open loud on the speaker while the button
+      // shows earpiece. The engine's speakerResult echo confirms it back.
+      sendCmd({ cmd: CMD.SET_SPEAKER, on });
     }
-    // iOS: the native engine routes via InCallManager at call start (audio →
-    // earpiece, video → speaker) and the WebView engine is OS-routed — no-op.
+    // iOS WebView engine: OS-routed — no-op (SET_SPEAKER there only flips
+    // audioRouteSupported and would disable the button).
   }, [applyAudioRoute, sendCmd]);
 
   // ---- iOS audio session (the "no sound on iOS" fix) ----
@@ -518,8 +526,11 @@ export const CallProvider = ({ children }) => {
   // OUTGOING whose peer hasn't joined). EVERY other state stops it — making "no
   // ringing after answer/reject/end" structural. Only ever STOPS (never starts).
   useEffect(() => {
+    // Outgoing: `accepted` (callee answered, media still connecting) already
+    // ends the ring phase — ringback must fall silent at "Connecting…", not
+    // keep ringing until the remote stream lands.
     const ringing = (state.status === CALL_STATUS.INCOMING && !state.accepted)
-      || (state.status === CALL_STATUS.OUTGOING && !state.remoteJoined);
+      || (state.status === CALL_STATUS.OUTGOING && !state.accepted && !state.remoteJoined);
     if (!ringing) stopRinging();
   }, [state.status, state.accepted, state.remoteJoined, stopRinging]);
 
@@ -853,6 +864,21 @@ export const CallProvider = ({ children }) => {
         return true;
       }
 
+      // Video call with the mic granted but the CAMERA denied → don't kill the
+      // call over the optional half: continue as a VOICE call (callers treat
+      // the 'audio-fallback' return as granted + downgrade media to 'audio').
+      // Only a missing mic is fatal — there is no call without audio.
+      if (isVideo && mic.granted && !cam.granted) {
+        if (__DEV__) console.log('[CALL][APP][perm] camera denied, mic ok → AUDIO FALLBACK');
+        Alert.alert(
+          'Camera unavailable',
+          cam.canAskAgain
+            ? 'Camera permission was not granted — continuing as a voice call.'
+            : 'Camera access is blocked in Settings — continuing as a voice call.',
+        );
+        return 'audio-fallback';
+      }
+
       // Not allowed. If the OS won't prompt anymore (canAskAgain === false), the
       // only way to enable it is from app Settings — offer to open them. A plain
       // deny (canAskAgain still true) just informs them; retrying re-asks.
@@ -896,8 +922,15 @@ export const CallProvider = ({ children }) => {
     // Remember this call's ids briefly: the peer engine's offline-redial /
     // group re-invite loop can still deliver a late media-server 'incoming' for
     // it, which must be auto-declined — never re-ring a finished call.
+    // Also remember the PEER of a 1:1 that ended UN-ANSWERED (declined/missed):
+    // declining deletes the media-server call record, so the caller's still-armed
+    // redial loop can mint a FRESH callId in the next tick — an id the ids-guard
+    // can't know. That fresh ring for the same logical call re-rang the callee
+    // right after they cut it ("decline karte hi dusri call aa gayi").
     recentEndedRef.current = {
       ids: [stateRef.current.callId, stateRef.current.signalId].filter(Boolean).map(String),
+      peerId: (!stateRef.current.isGroup && !stateRef.current.answeredAt && stateRef.current.peer?.id)
+        ? String(stateRef.current.peer.id) : null,
       ts: Date.now(),
     };
     stopRinging();
@@ -1297,6 +1330,23 @@ export const CallProvider = ({ children }) => {
             sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
             break;
           }
+          // Same-peer guard for a 1:1 we JUST declined/missed un-answered: the
+          // caller's redial loop can re-ring with a FRESH callId (the decline
+          // deleted the old record) for ~1 tick before their app processes our
+          // rejection — auto-decline it, it's the same call, not a new one. The
+          // window is short (8s) so a genuine deliberate call-back still rings.
+          // Only while nothing else is going on: if a NEW backend ring from the
+          // same peer already built INCOMING state, this engine event is its
+          // reconcile — never decline that.
+          const fromId = payload?.from?.id != null ? String(payload.from.id) : null;
+          if (fromId && !payload?.isGroup
+            && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
+            && re.peerId === fromId
+            && Date.now() - re.ts < 8000) {
+            if (__DEV__) console.log('[CALL][APP] redial-loop re-ring from just-declined peer — auto-declining', payload?.callId);
+            if (payload?.callId) sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
+            break;
+          }
         }
         // Reconcile: the call socket already raised this incoming (we showed the
         // ringing UI from the backend `call:incoming` signal). This WebRTC event
@@ -1345,7 +1395,13 @@ export const CallProvider = ({ children }) => {
           chatId: isGroup ? null : deriveChatId(myId, peer.id),
           nowMs: Date.now(),
         });
-        startRinging('incoming');
+        // iOS with CallKit: displayIncomingCall below makes CALLKIT the ringer —
+        // it plays the system ringtone/vibration AND respects the silent switch
+        // and Focus modes. Also starting the in-app expo-av ringtone here (the
+        // app-socket path already gates this; this engine path didn't) DOUBLE-
+        // RANG the device and, worse, played through the silent switch
+        // (playsInSilentModeIOS) — a phone on silent still rang out loud.
+        if (!(Platform.OS === 'ios' && nativeCall.isAvailable())) startRinging('incoming');
         armRingTimeout();
         // Surface a native OS incoming-call screen if CallKeep is wired up.
         if (payload?.callId) {
@@ -1448,7 +1504,18 @@ export const CallProvider = ({ children }) => {
         // there (that's also why toggleSpeaker skips CMD.SET_SPEAKER on Android).
         const supported = Platform.OS === 'android' ? true : (payload?.supported !== false);
         setAudioRouteSupported(supported);
-        if (typeof payload?.speaker === 'boolean') {
+        if (typeof payload?.speaker === 'boolean'
+          && payload.speaker !== stateRef.current.speakerOn) {
+          // Mismatched echo right after a user tap = a STALE confirmation of the
+          // PREVIOUS command (fast double-tap) — flipping the button back here
+          // was part of the "press speaker many times to regain control" bug.
+          // The user's taps queue their own SET_SPEAKER commands; the last one
+          // wins and its echo will match. Outside the tap window a mismatch is
+          // a genuine engine-side route change → reflect it on the button.
+          if (Date.now() - speakerToggleTsRef.current < 1500) {
+            if (__DEV__) console.log('[CALL][APP][audio] stale speakerResult during tap window — ignored', payload.speaker);
+            break;
+          }
           dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: payload.speaker });
         }
         break;
@@ -1686,6 +1753,9 @@ export const CallProvider = ({ children }) => {
     // The prompt + any "open Settings" guidance is handled inside
     // ensureMediaPermissions; just abort the call if it wasn't granted.
     if (!permOk) return;
+    // Camera denied but mic granted → the whole dial proceeds as a VOICE call
+    // (ring payload, engine capture, UI — everything keys off `media`).
+    if (permOk === 'audio-fallback') media = 'audio';
 
     // iOS: arm the play-and-record audio session BEFORE the SDK captures media, so
     // call audio is heard even with the silent switch on (no-op on Android).
@@ -1733,6 +1803,11 @@ export const CallProvider = ({ children }) => {
     // WebRTC dial (no callId → the callee never connects → no camera/mic).
     if (endedRef.current) {
       if (__DEV__) console.log('[CALL][APP][startCall] ABORT after ring — call was cancelled/ended');
+      // The instant hang-up's call:cancel may have raced this ring's server-side
+      // setup (cancel processed first → nothing to cancel then). The ring ack
+      // has LANDED now, so server state exists — re-send the cancel; idempotent
+      // (tombstone) server-side. Without this the callee rang a dead call.
+      cancelCall({ callId: signalId, toUserIds: peerIds });
       return;
     }
 
@@ -1744,7 +1819,12 @@ export const CallProvider = ({ children }) => {
         type: ACT.ENDED,
         reason: 'busy',
         nowMs: Date.now(),
-        message: isGroup ? 'Everyone is busy on another call' : 'User is busy on another call',
+        // glare = we dialed each other at once and their call won the tie-break;
+        // their ring lands here in a moment (engine reassert ≤5s), so say that
+        // instead of "busy". This path already skips finalizeEnd, so no
+        // recentEndedRef mark can auto-decline their incoming ring.
+        message: isGroup ? 'Everyone is busy on another call'
+          : (ack.glare ? 'They are calling you — answer their call' : 'User is busy on another call'),
       });
       if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
       resetTimerRef.current = setTimeout(() => { endedRef.current = false; dispatch({ type: ACT.RESET }); }, END_MESSAGE_LINGER_MS);
@@ -1823,6 +1903,12 @@ export const CallProvider = ({ children }) => {
     // ensureMediaPermissions already showed the prompt / Settings guidance; if
     // it wasn't granted, decline the incoming call cleanly.
     if (!permOk) { finalizeEnd('rejected', 'Permission denied'); return; }
+    // Camera denied but mic granted on a VIDEO call → answer as a VOICE call
+    // instead of declining. effMedia drives this accept synchronously; the
+    // SET_FLAG keeps state.media in step for the UI and the pendingAccept
+    // reconcile path (which re-reads state later).
+    const effMedia = permOk === 'audio-fallback' ? 'audio' : snap.media;
+    if (effMedia !== snap.media) dispatch({ type: ACT.SET_FLAG, key: 'media', value: effMedia });
     // iOS + CallKit: this accept may have originated OUTSIDE the CallKit screen
     // (in-app banner / notification replay / pending-accept flush). Answer the
     // CallKit call NOW — that dismisses the still-ringing CallKit banner and
@@ -1868,6 +1954,12 @@ export const CallProvider = ({ children }) => {
         if (live.status === CALL_STATUS.ENDED || live.status === CALL_STATUS.IDLE) return;
         try {
           const ack = await acceptCallSignal({ callId: live.signalId || null, callerId: live.peer?.id || null });
+          // Server says this call is DEAD (tombstoned by a cancel/timeout that
+          // this device missed — queued push, out-of-order cancel): end NOW
+          // instead of running a fake timer until the 30s watchdog. The
+          // server's companion call:ended event covers this too; both are
+          // idempotent through endedRef.
+          if (ack?.ended) { finalizeEnd('completed', 'Call already ended'); return; }
           if (ack?.answeredElsewhere) return;
           const unattributed = ack && !ack.timedOut && (ack.ok === false || ack.callId === null);
           if (!unattributed) return; // attributed (or optimistic no-ack) — done
@@ -1877,15 +1969,26 @@ export const CallProvider = ({ children }) => {
     })();
 
     // Video / group calls answer on the loudspeaker; a 1:1 voice call on the earpiece.
-    const wantSpeaker = snap.media === 'video' || snap.isGroup;
+    const wantSpeaker = effMedia === 'video' || snap.isGroup;
 
     // The callee only wakes the engine on the ring — that connect can still be
     // in flight (or have failed) when the user taps Accept. So on accept we
     // re-fetch a fresh calling-service token (GET /call/token) and CONNECT if the
     // engine isn't already up, guaranteeing a live WebRTC session before we
     // answer. This is what makes "accept" reliably connect rather than hang.
-    const ready = await ensureConnected();
+    let ready = await ensureConnected();
     if (__DEV__) console.log('[CALL][APP][accept] STEP 4 ensureConnected (engine ready?)', { ready });
+    if (!ready) {
+      // A CallKit/banner answer often runs with the app still BACKGROUNDED — the
+      // engine socket can be cold/half-open and the first connect attempt can
+      // lose that race. One retry before failing: ending here tears the call
+      // down on BOTH sides ("banner se pick karte hi call cut"), so a second
+      // attempt is far cheaper than a dead call. The call:accept signal already
+      // went out, so the caller is on "Connecting…" — still inside the 30 s
+      // connect watchdog either way.
+      if (__DEV__) console.log('[CALL][APP][accept] engine connect failed — retrying once');
+      ready = await ensureConnected();
+    }
     if (!ready) { finalizeEnd('failed', 'Could not connect the call'); return; }
 
     // Re-read state: the WebRTC `incoming` (carrying the real callId) may have
@@ -1898,7 +2001,7 @@ export const CallProvider = ({ children }) => {
       // (video tracks for a video call, audio-only otherwise); `speaker` only
       // routes audio output.
       if (__DEV__) console.log('[CALL][APP][accept] STEP 5a callId known → engine CMD.ACCEPT', { callId: cur.callId, speaker: wantSpeaker });
-      sendCmd({ cmd: CMD.ACCEPT, callId: cur.callId, media: cur.media, speaker: wantSpeaker, isGroup: !!cur.isGroup, peerId: cur.peer?.id || null });
+      sendCmd({ cmd: CMD.ACCEPT, callId: cur.callId, media: effMedia, speaker: wantSpeaker, isGroup: !!cur.isGroup, peerId: cur.peer?.id || null });
       // The SDK's accept acquires local media before answering; watch for a hang.
       armMediaWatchdog();
     } else {
@@ -1945,8 +2048,10 @@ export const CallProvider = ({ children }) => {
     // media/cameraOn flags flip on the engine's mediaUpgraded confirmation
     // (getUserMedia can still fail/be denied).
     if (next && snap.media === 'audio') {
+      // Upgrading TO video needs the camera itself — 'audio-fallback' (camera
+      // denied, mic ok) means the upgrade specifically cannot happen.
       const ok = await ensureMediaPermissions('video');
-      if (!ok) return;
+      if (ok !== true) return;
       sendCmd({ cmd: CMD.TOGGLE_CAMERA, on: true });
       return;
     }
@@ -2019,9 +2124,14 @@ export const CallProvider = ({ children }) => {
     return invitees.length;
   }, [sendCmd, myId, armGroupRingSweep]);
 
+  // Set on every user Speaker tap: speakerResult echoes inside this window may
+  // be STALE (a fast double-tap's first echo landing after the second tap) and
+  // must not flip the button back — the button leads, the engine converges.
+  const speakerToggleTsRef = useRef(0);
   const toggleSpeaker = useCallback(() => {
     const next = !stateRef.current.speakerOn;
     if (__DEV__) console.log('[CALL][APP] toggleSpeaker →', next ? 'LOUDSPEAKER' : 'earpiece');
+    speakerToggleTsRef.current = Date.now();
     // Always flip the button state immediately so it's a reliable toggle.
     dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: next });
     if (Platform.OS === 'android') {
@@ -2044,6 +2154,30 @@ export const CallProvider = ({ children }) => {
     sendCmd({ cmd: CMD.RESUME_AUDIO });
   }, [sendCmd]);
 
+  // Force the HARDWARE route to match the speaker BUTTON — the button is the
+  // single source of truth, the hardware follows it, never the other way round.
+  // Called after every event that can silently reset the OS route (CallKit
+  // didActivateAudioSession, interruption end, foreground return): those were
+  // the "audio is loud but the speaker button shows off, and it takes several
+  // taps to regain control" desyncs — the OS flipped the route, the button
+  // never knew. Android = both layers (expo-av OS mode + engine setSinkId);
+  // iOS native engine = InCallManager via CMD.SET_SPEAKER (an EXPLICIT off is
+  // now asserted too — the engine previously only ever forced speaker ON).
+  // iOS WebView engine stays OS-routed (SET_SPEAKER there would only flip
+  // audioRouteSupported and disable the button).
+  const reassertSpeakerRoute = useCallback(() => {
+    const s = stateRef.current;
+    if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
+    const on = !!s.speakerOn;
+    if (__DEV__) console.log('[CALL][APP][audio] re-asserting route to match button →', on ? 'LOUDSPEAKER' : 'earpiece');
+    if (Platform.OS === 'android') {
+      applyAudioRoute(on);
+      sendCmd({ cmd: CMD.SET_SPEAKER, on });
+    } else if (isNativeCallEngine()) {
+      sendCmd({ cmd: CMD.SET_SPEAKER, on });
+    }
+  }, [applyAudioRoute, sendCmd]);
+
   // Re-assert the call's audio session + route + remote playback + mic. Called when
   // the app returns to foreground AND when CallKit (re)activates the audio session
   // (didActivateAudioSession) — both are moments iOS may have torn down or replaced
@@ -2054,13 +2188,16 @@ export const CallProvider = ({ children }) => {
     if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
     try {
       if (Platform.OS === 'ios') await configureIOSAudioSession();
-      else if (audioRouteAppliedRef.current) await applyAudioRoute(s.speakerOn);
     } catch (_) { /* best-effort */ }
+    // Route re-assert (both platforms): the session swap that brought us here is
+    // exactly the moment the OS may have silently moved audio to the loudspeaker
+    // while the button still says earpiece (or vice versa).
+    reassertSpeakerRoute();
     resumeAudio();
     // An interruption / session swap can leave the local track disabled — re-assert
     // the mic so it matches the button state.
     sendCmd({ cmd: CMD.TOGGLE_MIC, on: s.micOn !== false });
-  }, [configureIOSAudioSession, applyAudioRoute, resumeAudio, sendCmd]);
+  }, [configureIOSAudioSession, reassertSpeakerRoute, resumeAudio, sendCmd]);
 
   // Force-rebuild the engine's WHOLE audio pipeline (fresh mic getUserMedia →
   // producer.replaceTrack + re-attach every remote stream). Needed when CallKit
@@ -2172,6 +2309,30 @@ export const CallProvider = ({ children }) => {
     const callerId = payload?.from?.id ? String(payload.from.id) : null;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 0 call:incoming signal (app socket) ═════', { callerId, currentStatus: snap.status, payload });
     if (!callerId) return;
+    // A ring for a call we JUST ended/declined — a late VoIP push (APNs queued
+    // it while the device was unreachable), a socket re-ring, or the caller's
+    // redial-loop reassert. The ENGINE 'incoming' path has these guards; this
+    // app-socket/push path lacked them, so the dead call re-rang full CallKit
+    // and answering it hit a server record that no longer exists ("cut karte
+    // hi wahi call wapas — pick karo to disconnect"). Same windows as the
+    // engine guard: exact ids 60s; same-peer un-answered 8s (short enough that
+    // a deliberate call-back still rings). Dismiss every native surface the
+    // push may already have raised (the AppDelegate must report each VoIP push
+    // to CallKit, so the dead ring is up before JS sees the payload).
+    {
+      const re = recentEndedRef.current;
+      const pid = payload?.callId ? String(payload.callId) : null;
+      const idHit = !!(pid && re.ids.includes(pid) && Date.now() - re.ts < 60000);
+      const peerHit = !payload?.isGroup
+        && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
+        && re.peerId === callerId && Date.now() - re.ts < 8000;
+      if (idHit || peerHit) {
+        if (__DEV__) console.log('[CALL][APP] incoming for a just-ended call — dismissing, not re-ringing', { callId: pid, idHit, peerHit });
+        cancelAllIncomingCallNotifee();
+        nativeCall.dismissIncoming(pid, payload?.uuid || null);
+        return;
+      }
+    }
     // Blocked relationship → never ring (I blocked them, or they blocked me). The
     // backend should drop these, but enforce client-side too so a blocked contact
     // can never reach me even if a stray push/signal arrives. Silent (no reject) so
@@ -2361,10 +2522,33 @@ export const CallProvider = ({ children }) => {
     if (ids.length === 0) return true;
     return ids.includes(pid);
   };
+  // Terminal signal for a call whose JS state never built (or already reset) —
+  // but the NATIVE ring can still be up: the iOS AppDelegate reports every VoIP
+  // push to CallKit before JS stages INCOMING, and the Android CallStyle
+  // notification rings on its own. matchesCurrent() returning false used to
+  // drop these signals entirely, leaving the device RINGING/VIBRATING with no
+  // call UI anywhere ("device vibrate but call ui not show"). Silence the
+  // native surfaces and remember the id so a late push can't re-ring it.
+  // Guarded to IDLE/ENDED so a mismatched id can never touch a LIVE call.
+  const dismissGhostRing = useCallback((payload) => {
+    const pid = payload?.callId ? String(payload.callId) : null;
+    if (!pid) return;
+    const st = stateRef.current.status;
+    if (st !== CALL_STATUS.IDLE && st !== CALL_STATUS.ENDED) return;
+    if (__DEV__) console.log('[CALL][APP] terminal signal for un-staged call — dismissing native ring', { callId: pid });
+    cancelAllIncomingCallNotifee();
+    nativeCall.dismissIncoming(pid, payload?.uuid || null);
+    const re = recentEndedRef.current;
+    recentEndedRef.current = (Date.now() - re.ts < 60000)
+      // Fresh guard window: merge the id, KEEP the earlier ts (extending it
+      // would stretch the same-peer 8s window and could eat a genuine redial).
+      ? { ...re, ids: [...re.ids, pid].slice(-6) }
+      : { ids: [pid], peerId: null, ts: Date.now() };
+  }, []);
   const onSignalCancelled = useCallback((payload) => {
-    if (!matchesCurrent(payload)) return;
+    if (!matchesCurrent(payload)) { dismissGhostRing(payload); return; }
     finalizeEnd(stateRef.current.direction === 'incoming' ? 'missed' : 'cancelled');
-  }, [finalizeEnd]);
+  }, [finalizeEnd, dismissGhostRing]);
   const onSignalRejected = useCallback((payload) => {
     if (!matchesCurrent(payload)) return;
     const snap = stateRef.current;
@@ -2378,7 +2562,7 @@ export const CallProvider = ({ children }) => {
     finalizeEnd('rejected');
   }, [finalizeEnd, removeGroupParticipant]);
   const onSignalEnded = useCallback((payload) => {
-    if (!matchesCurrent(payload)) return;
+    if (!matchesCurrent(payload)) { dismissGhostRing(payload); return; }
     const snap = stateRef.current;
     if (snap.isGroup) {
       const by = payload?.by != null ? String(payload.by) : null;
@@ -2394,7 +2578,7 @@ export const CallProvider = ({ children }) => {
       return;
     }
     finalizeEnd('completed');
-  }, [finalizeEnd, removeGroupParticipant]);
+  }, [finalizeEnd, removeGroupParticipant, dismissGhostRing]);
   // Caller-only safety net: the server says the callee is unreachable (logged
   // out / deactivated / deleted / blocked / no active session). The ring ack
   // usually catches this first; this covers the case where the event lands after
@@ -2429,7 +2613,7 @@ export const CallProvider = ({ children }) => {
   // could double-end or ring past the server's window. Honour the server signal:
   // an outgoing call ends as "No answer"; an un-accepted incoming becomes missed.
   const onSignalTimeout = useCallback((payload) => {
-    if (!matchesCurrent(payload)) return;
+    if (!matchesCurrent(payload)) { dismissGhostRing(payload); return; }
     const snap = stateRef.current;
     // Group call where someone already JOINED: the server ring window closing
     // only clears the still-unanswered members — the live call continues.
@@ -2441,7 +2625,7 @@ export const CallProvider = ({ children }) => {
     }
     if (snap.direction === 'outgoing') finalizeEnd('cancelled', 'No answer');
     else if (snap.direction === 'incoming' && !snap.answeredAt) finalizeEnd('missed');
-  }, [finalizeEnd, removeGroupParticipant]);
+  }, [finalizeEnd, removeGroupParticipant, dismissGhostRing]);
 
   // Multi-device dismissal (XR-1 / APP-4). Another device on THIS account handled
   // the call, or the caller cancelled — dismiss the ring on THIS device. finalizeEnd
@@ -2612,6 +2796,26 @@ export const CallProvider = ({ children }) => {
     if (data?._voip && data?.uuid && data?.callId) {
       nativeCall.registerCallUuid(data.callId, data.uuid);
     }
+    // AGED (but not stale) push: it sat queued in FCM/APNs while the device was
+    // offline/airplane — the call may ALREADY be cancelled, and its cancel push
+    // can arrive out of order behind it (FCM guarantees no cross-message
+    // ordering). Don't ring a maybe-dead call: ask the SERVER instead — the
+    // pending pull is authoritative (every terminal path removes the record).
+    // A genuinely live invite re-rings via the pull's call:incoming within a
+    // round trip; a dead one stays silent, and the pull's authoritative-empty
+    // sweep dismisses the CallKit ring the AppDelegate already reported (the
+    // uuid was just bound above). This is what stops "B airplane se wapas aaya
+    // to A ki kati hui purani call bajne lagi" — while a fresh push (the live
+    // path, seconds old) still rings instantly.
+    {
+      const age = callPushAgeMs(data);
+      if (Number.isFinite(age) && age > AGED_CALL_PUSH_MS) {
+        if (__DEV__) console.log('[CALL][APP] aged call push — verifying with server before ringing', { callId: data?.callId, ageSec: Math.round(age / 1000) });
+        cancelAllIncomingCallNotifee();
+        pullStillRingingInvites();
+        return;
+      }
+    }
     // A push-driven ring means the app wasn't foreground (or it's a full-screen
     // intent launch) → bring up the full-screen incoming screen.
     const expand = !!data?._fullScreen || AppState.currentState !== 'active';
@@ -2759,6 +2963,7 @@ export const CallProvider = ({ children }) => {
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = {
     accept, reject, hangup, toggleMic, reassertCallAudio, restartEngineAudio, pullStillRingingInvites,
+    reassertSpeakerRoute,
   };
   onEngineEventRef.current = onEngineEvent;
 
@@ -2890,6 +3095,10 @@ export const CallProvider = ({ children }) => {
         actionsRef.current.restartEngineAudio && actionsRef.current.restartEngineAudio();
         setTimeout(() => {
           actionsRef.current.restartEngineAudio && actionsRef.current.restartEngineAudio();
+          // CallKit's activation can override the output route AFTER our first
+          // re-assert (reassertCallAudio above) — assert the button's route once
+          // more when the rebuilt audio pipeline has settled.
+          actionsRef.current.reassertSpeakerRoute && actionsRef.current.reassertSpeakerRoute();
         }, 1200);
       },
       // CallKit released the session (call ended / interruption began). Without

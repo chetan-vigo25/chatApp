@@ -22,7 +22,6 @@ import {
   LayoutAnimation,
   UIManager,
   PanResponder,
-  useWindowDimensions,
   StyleSheet,
   DeviceEventEmitter
 } from "react-native";
@@ -45,7 +44,6 @@ import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { BlurView } from 'expo-blur';
-import Svg, { Defs, LinearGradient as SvgLinearGradient, Stop, Rect as SvgRect } from 'react-native-svg';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
@@ -74,6 +72,7 @@ import ReactionDetailSheet from '../../components/ReactionDetailSheet';
 import SaveContactBanner from '../../components/SaveContactBanner';
 import useSaveContact from '../../hooks/useSaveContact';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import ContactDatabase from '../../services/ContactDatabase';
 import * as ScreenCapture from 'expo-screen-capture';
 import LinkPreviewCard from '../../components/LinkPreviewCard';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
@@ -93,49 +92,35 @@ const RICH_PARSE_CACHE_LIMIT = 500;
 const MEDIA_PANEL_SHEET_HEIGHT = 360;
 const AUDIO_RECORDING_MAX_MS = 120000;
 
-// WhatsApp-style attachment tiles: solid two-tone gradient discs with a white
-// glyph. `grad` is [topColor, bottomColor] for the vertical gradient fill.
+// WhatsApp-style attachment tiles: flat neutral circles with a colored glyph
+// (current WhatsApp Android attachment sheet look). `color` is the icon tint.
+// Location uses the brand teal instead of WhatsApp's green (brand rule).
 const MEDIA_PANEL_OPTIONS = [
-  { key: 'gallery', label: 'Gallery', icon: 'images', iconFamily: 'Ionicons', grad: ['#C13BCB', '#8A2BE6'], color: '#A431D8' },
-  { key: 'camera', label: 'Camera', icon: 'camera', iconFamily: 'Ionicons', grad: ['#FF5E7E', '#F0264B'], color: '#F73A5C' },
-  { key: 'video', label: 'Video', icon: 'videocam', iconFamily: 'Ionicons', grad: ['#FF7A59', '#F4452B'], color: '#F75A3A' },
-  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', grad: ['#7E72FF', '#5B43E8'], color: '#6B57F0' },
-  { key: 'audio', label: 'Audio', icon: 'headset', iconFamily: 'Ionicons', grad: ['#FFA836', '#FF7A00'], color: '#FF8A1B' },
-  { key: 'contact', label: 'Contact', icon: 'person', iconFamily: 'Ionicons', grad: ['#37A4FF', '#137FE8'], color: '#1E8FF5' },
-  { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', grad: ['#3BD17A', '#16A34A'], color: '#23B85F' },
+  { key: 'gallery', label: 'Gallery', icon: 'images', iconFamily: 'Ionicons', color: '#AC44CF' },
+  { key: 'camera', label: 'Camera', icon: 'camera', iconFamily: 'Ionicons', color: '#E4487D' },
+  { key: 'video', label: 'Video', icon: 'videocam', iconFamily: 'Ionicons', color: '#F0644C' },
+  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', color: '#7C63F4' },
+  { key: 'audio', label: 'Audio', icon: 'headset', iconFamily: 'Ionicons', color: '#F2913D' },
+  { key: 'contact', label: 'Contact', icon: 'person', iconFamily: 'Ionicons', color: '#0795DC' },
+  { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', color: '#03b0a2' },
 ];
 
-// WhatsApp-style attachment tile — a vertical gradient ROUNDED SQUARE (squircle)
-// with a white glyph centred on top. Drop shadow tinted to the tile colour gives
-// the lift. (Previously a circle; switched to the squircle to match WhatsApp's
-// current attachment sheet.)
-function GradientDisc({ id, grad = ['#888', '#666'], color = '#777', icon, size = 54 }) {
-  const gid = `mediaDisc-${id}`;
-  const radius = Math.round(size * 0.30); // squircle corner radius
+// WhatsApp-style attachment tile — a flat circle on a slightly elevated neutral
+// surface with the colored glyph centred on top (no gradients, no tinted
+// shadows — matches WhatsApp's current attachment sheet).
+function AttachOptionDisc({ color = '#777', icon, size = 56, bg }) {
   return (
     <View
       style={{
         width: size,
         height: size,
+        borderRadius: size / 2,
+        backgroundColor: bg,
         alignItems: 'center',
         justifyContent: 'center',
-        shadowColor: color,
-        shadowOpacity: 0.35,
-        shadowRadius: 6,
-        shadowOffset: { width: 0, height: 3 },
-        elevation: 4,
       }}
     >
-      <Svg width={size} height={size} style={StyleSheet.absoluteFill}>
-        <Defs>
-          <SvgLinearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
-            <Stop offset="0" stopColor={grad[0]} />
-            <Stop offset="1" stopColor={grad[1]} />
-          </SvgLinearGradient>
-        </Defs>
-        <SvgRect x="0" y="0" width={size} height={size} rx={radius} ry={radius} fill={`url(#${gid})`} />
-      </Svg>
-      <Ionicons name={icon} size={Math.round(size * 0.44)} color="#fff" />
+      <Ionicons name={icon} size={Math.round(size * 0.46)} color={color} />
     </View>
   );
 }
@@ -1146,7 +1131,6 @@ export default function ChatScreen({ navigation, route }) {
 
   const { theme, chatColor, isDarkMode } = useTheme();
   const { isConnected, networkType } = useNetwork();
-  const { width: windowWidth } = useWindowDimensions();
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   // Frame-synced keyboard height from react-native-keyboard-controller. Tracks the
   // native keyboard 1:1 on iOS + Android (60fps, no jump). `height` is negative
@@ -1228,9 +1212,6 @@ export default function ChatScreen({ navigation, route }) {
     }, {})
   ).current;
 
-  const mediaOptionsColumns = windowWidth >= 640 ? 4 : 3;
-  const mediaPanelWidth = Math.min(windowWidth - 20, 560);
-  
   const viewabilityConfig = useRef({ 
     itemVisiblePercentThreshold: 12,
     minimumViewTime: 80
@@ -2804,6 +2785,8 @@ export default function ChatScreen({ navigation, route }) {
   }, [recordingDurationMs]);
 
   const mediaPanelClosingRef = useRef(false);
+  // Location share can take several seconds for a GPS fix — surface progress.
+  const [fetchingLocation, setFetchingLocation] = useState(false);
 
   const closeMediaPanelAnimated = useCallback((afterClose) => {
     if (mediaPanelClosingRef.current) return;
@@ -2934,15 +2917,34 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
 
-      const position = await Promise.race([
-        Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('location timeout')), 12000)),
-      ]);
+      const servicesEnabled = await Location.hasServicesEnabledAsync();
+      if (!servicesEnabled) {
+        Alert.alert('Location is off', 'Please turn on your device location (GPS) and try again.');
+        return;
+      }
 
-      const latitude = Number(position?.coords?.latitude || 0);
-      const longitude = Number(position?.coords?.longitude || 0);
+      setFetchingLocation(true);
+
+      // Fresh fix first; GPS can take a while on a cold start (indoors,
+      // airplane-mode toggle), so fall back to the last known position rather
+      // than failing outright.
+      let position = null;
+      try {
+        position = await Promise.race([
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced, mayShowUserSettingsDialog: true }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('location timeout')), 20000)),
+        ]);
+      } catch (_err) {
+        position = await Location.getLastKnownPositionAsync({ maxAge: 5 * 60 * 1000 });
+      }
+
+      const latitude = Number(position?.coords?.latitude);
+      const longitude = Number(position?.coords?.longitude);
       if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-        Alert.alert('Error', 'Could not read your device location.');
+        Alert.alert(
+          'Location unavailable',
+          'Could not get your current location. Move to an open area or check that GPS is on, then try again.'
+        );
         return;
       }
 
@@ -2964,6 +2966,8 @@ export default function ChatScreen({ navigation, route }) {
     } catch (error) {
       console.error('share location error', error);
       Alert.alert('Error', 'Unable to fetch current location.');
+    } finally {
+      setFetchingLocation(false);
     }
   }, [isConnected, sendLocationMessage]);
 
@@ -2979,6 +2983,22 @@ export default function ChatScreen({ navigation, route }) {
       const permission = await Contacts.requestPermissionsAsync();
       if (permission.status !== 'granted') {
         Alert.alert('Permission required', 'Contacts permission is required to share a contact.');
+        return;
+      }
+
+      // Contacts must be synced (fetched) at least once before sharing —
+      // otherwise the registered-user lookup below has nothing to match against.
+      let syncedCount = 0;
+      try {
+        syncedCount = await ContactDatabase.getContactCount();
+      } catch (_err) {
+        syncedCount = 0;
+      }
+      if (!syncedCount) {
+        Alert.alert(
+          'Contacts not fetched',
+          'Please fetch your contacts first, then share a contact. Open the New Chat screen to sync your contacts.'
+        );
         return;
       }
 
@@ -3015,31 +3035,24 @@ export default function ChatScreen({ navigation, route }) {
         }
       }
 
-      // Check if this contact is registered in the app
-      // Try to find in existing chat list or matched contacts
+      // Check if this contact is registered in the app — match against the
+      // synced contact directory in SQLite (source of truth for contact sync).
       let isRegistered = false;
       let registeredUserId = null;
       let registeredProfileImage = '';
-
-      // Check from chatData list in useChatLogic (via allMessages sender/receiver IDs won't help)
-      // We'll use the API discover approach — but for simplicity, check local storage for synced contacts
       try {
-        const syncedRaw = await AsyncStorage.getItem('@matched_contacts');
-        if (syncedRaw) {
-          const contacts = JSON.parse(syncedRaw);
-          if (Array.isArray(contacts)) {
-            const normalizedPhone = phoneClean.replace(/^\+/, '');
-            const found = contacts.find(c => {
-              if (!c) return false;
-              const cPhone = (c.mobileFormatted || c.mobile?.number || c.phone || '').replace(/[\s\-()+ ]/g, '');
-              return cPhone && (normalizedPhone.endsWith(cPhone) || cPhone.endsWith(normalizedPhone));
-            });
-            if (found && (found.type === 'registered' || found.userId)) {
-              isRegistered = true;
-              registeredUserId = found.userId || found._id || null;
-              registeredProfileImage = found.profileImage || found.profilePicture || '';
-            }
-          }
+        const registeredRows = await ContactDatabase.loadRegisteredContacts();
+        const pickedDigits = phoneClean.replace(/\D/g, '');
+        const found = (registeredRows || []).find((c) => {
+          if (!c) return false;
+          const cDigits = String(c.normalizedPhone || c.phone || c.mobileFormatted || '').replace(/\D/g, '');
+          // endsWith both ways survives country-code / local-format differences.
+          return cDigits && pickedDigits && (pickedDigits.endsWith(cDigits) || cDigits.endsWith(pickedDigits));
+        });
+        if (found && (found.userId || found.type === 'registered')) {
+          isRegistered = true;
+          registeredUserId = found.userId || null;
+          registeredProfileImage = found.profileImage || found.profilePicture || '';
         }
       } catch (e) {
         // Ignore lookup errors
@@ -3201,12 +3214,12 @@ export default function ChatScreen({ navigation, route }) {
     ]).start();
 
     Animated.stagger(
-      26,
+      20,
       mediaOptionEntryAnims.map((anim) =>
         Animated.spring(anim, {
           toValue: 1,
-          damping: 14,
-          stiffness: 240,
+          damping: 11,
+          stiffness: 280,
           mass: 0.7,
           useNativeDriver: true,
         }),
@@ -6413,6 +6426,32 @@ export default function ChatScreen({ navigation, route }) {
           </TouchableOpacity>
         </Modal>
 
+        {/* Location share progress — a GPS fix can take several seconds */}
+        {fetchingLocation && (
+          <View
+            pointerEvents="none"
+            style={{
+              position: 'absolute',
+              bottom: 96,
+              alignSelf: 'center',
+              flexDirection: 'row',
+              alignItems: 'center',
+              gap: 8,
+              paddingHorizontal: 14,
+              paddingVertical: 9,
+              borderRadius: 20,
+              backgroundColor: isDarkMode ? 'rgba(31,44,51,0.96)' : 'rgba(11,20,26,0.85)',
+              zIndex: 60,
+              elevation: 8,
+            }}
+          >
+            <ActivityIndicator size="small" color="#ffffff" />
+            <Text style={{ color: '#ffffff', fontSize: 13, fontFamily: 'Roboto-Regular' }}>
+              Getting your current location…
+            </Text>
+          </View>
+        )}
+
         {/* Media options overlay — no Modal, no BlurView, lightweight */}
         {showMediaOptions && (
           <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, zIndex: 50 }} pointerEvents="box-none">
@@ -6437,35 +6476,37 @@ export default function ChatScreen({ navigation, route }) {
               {...mediaPanelPanResponder.panHandlers}
               style={{
                 position: 'absolute',
-                bottom: Platform.OS === 'ios' ? 14 : 10,
+                bottom: 0,
+                left: 0,
+                right: 0,
                 alignSelf: 'center',
-                width: mediaPanelWidth,
-                borderRadius: 22,
+                maxWidth: 640,
+                width: '100%',
+                borderTopLeftRadius: 26,
+                borderTopRightRadius: 26,
                 overflow: 'hidden',
-                backgroundColor: isDarkMode ? '#233138' : '#FFFFFF',
-                borderWidth: StyleSheet.hairlineWidth,
-                borderColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+                backgroundColor: theme.colors.cardBackground,
                 transform: [{ translateY: mediaSheetAnim }],
                 shadowColor: '#000',
                 shadowOpacity: isDarkMode ? 0.45 : 0.18,
                 shadowRadius: 18,
-                shadowOffset: { width: 0, height: 8 },
+                shadowOffset: { width: 0, height: -6 },
                 elevation: 14,
               }}
             >
               {/* Grip handle — tap-outside, swipe-down, or grip all dismiss. */}
-              <View style={{ alignItems: 'center', paddingTop: 9, paddingBottom: 4 }}>
-                <View style={{ width: 38, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? 'rgba(233,237,239,0.28)' : 'rgba(0,0,0,0.16)' }} />
+              <View style={{ alignItems: 'center', paddingTop: 10, paddingBottom: 4 }}>
+                <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? 'rgba(233,237,239,0.28)' : 'rgba(0,0,0,0.16)' }} />
               </View>
 
               <View
                 style={{
                   flexDirection: 'row',
                   flexWrap: 'wrap',
-                  paddingHorizontal: 6,
-                  paddingTop: 10,
-                  paddingBottom: Platform.OS === 'ios' ? 26 : 20,
-                  rowGap: 20,
+                  paddingHorizontal: 8,
+                  paddingTop: 14,
+                  paddingBottom: Platform.OS === 'ios' ? 34 : 24,
+                  rowGap: 22,
                 }}
               >
                 {MEDIA_PANEL_OPTIONS.map((item, idx) => {
@@ -6479,8 +6520,8 @@ export default function ChatScreen({ navigation, route }) {
                         alignItems: 'center',
                         opacity: entry,
                         transform: [
-                          { scale: Animated.multiply(press, entry.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1] })) },
-                          { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) },
+                          { scale: Animated.multiply(press, entry.interpolate({ inputRange: [0, 1], outputRange: [0.45, 1] })) },
+                          { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [14, 0] }) },
                         ],
                       }}
                     >
@@ -6492,12 +6533,12 @@ export default function ChatScreen({ navigation, route }) {
                         accessibilityRole="button"
                         accessibilityLabel={item.label}
                       >
-                        <GradientDisc id={item.key} grad={item.grad} color={item.color} icon={item.icon} size={54} />
+                        <AttachOptionDisc color={item.color} icon={item.icon} size={56} bg={theme.colors.surface} />
                         <Text
                           style={{
                             marginTop: 8,
-                            fontSize: 12,
-                            color: isDarkMode ? '#AEBAC1' : '#54656F',
+                            fontSize: 12.5,
+                            color: theme.colors.secondaryTextColor,
                             fontFamily: 'Roboto-Regular',
                             textAlign: 'center',
                           }}

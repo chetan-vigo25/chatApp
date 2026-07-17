@@ -73,7 +73,8 @@ export default class NativeCallingSDK {
     this._sendTransport = null;
     this._recvTransport = null;
     this._localStream = null;
-    this._producers = {};       // 'mic' | 'camera' -> Producer
+    this._screenStream = null;  // getDisplayMedia stream while sharing
+    this._producers = {};       // 'mic' | 'camera' | 'screen' -> Producer
     this._consumers = {};       // consumerId -> Consumer
     this._consumed = {};        // producerId -> true
     this._peerStreams = {};     // streamKey (peerId | peerId#screen) -> MediaStream
@@ -132,7 +133,11 @@ export default class NativeCallingSDK {
   }
 
   _reqDial(event, data) {
-    return this._waitSocket(6000).then(() => this._req(event, data));
+    // 12s: a CallKit/killed-app answer boots the engine COLD — socket connect
+    // + register can exceed the old 6s on a weak network, and the timeout
+    // rejected acceptCall with 'not connected' → the just-answered call was
+    // torn down ("pick karte hi cut"). The ring window (30s+) bounds this.
+    return this._waitSocket(12000).then(() => this._req(event, data));
   }
 
   // ---- connection ----
@@ -181,6 +186,31 @@ export default class NativeCallingSDK {
       if (this._room && this._room.joined) this._emitDown(`signal:${reason}`);
     });
     this._wire(s);
+  }
+
+  // Round-trip liveness probe for the CONNECT-reuse path. A backgrounded app's
+  // socket can be HALF-OPEN: `connected` still reads true client-side while the
+  // TCP path is dead — reusing it would strand the next dial/accept until the
+  // 10s request timeout. `register` doubles as the probe: it is idempotent
+  // server-side and re-asserts the lobby registration (clearing any pending
+  // disconnect-grace timer for this session) — so a successful probe also
+  // REFRESHES our registration. Resolves true/false, never rejects.
+  verifyAlive(ms) {
+    return new Promise((resolve) => {
+      const s = this._socket;
+      if (!s || !s.connected) { resolve(false); return; }
+      const t = setTimeout(() => resolve(false), ms || 2500);
+      try {
+        s.emit('register', { name: this.name, sessionId: this.userId }, (res) => {
+          clearTimeout(t);
+          if (res && res.users) this._users = res.users;
+          resolve(!(res && res.error));
+        });
+      } catch (_) {
+        clearTimeout(t);
+        resolve(false);
+      }
+    });
   }
 
   // Cluster room-affinity: move the socket to the server that owns the room.
@@ -275,6 +305,31 @@ export default class NativeCallingSDK {
       this._acceptedId = null;
       this._clearRetry();
       this._media = p.callType === 'video' ? 'video' : 'audio';
+      // Caller pre-joined this room during the ring → the media pipeline is
+      // already up (or building). Promote it: bind the callId, un-pause the
+      // producers (privacy hold ends at accept). The callee consumes our
+      // existing producer the moment they join — no caller-side work left.
+      const pre = this._room && this._room.preAnswer;
+      if (pre && String(this._room.roomId) === String(p.roomId)
+        && (!p.serverUrl || p.serverUrl === this._serverUrl)) {
+        this._room.callId = String(p.callId);
+        this._room.media = this._media;
+        this._room.preAnswer = false;
+        ['mic', 'camera'].forEach((k) => {
+          const pr = this._producers[k];
+          if (pr && !pr.closed) {
+            try { pr.resume(); } catch (_) {}
+            this._req('resumeProducer', { producerId: pr.id }).catch(() => {});
+          }
+        });
+        this._log('accepted — pre-joined room promoted (media already warm)');
+        return;
+      }
+      if (pre) {
+        // Pre-joined a STALE room (redial re-minted / cluster moved the room) —
+        // drop the warm-up and join the real one from scratch.
+        this._teardownMedia(true);
+      }
       this._room = { roomId: p.roomId, groupId: null, callId: String(p.callId), media: this._media, joined: false };
       this._startMedia(p.serverUrl).catch((e) => {
         this._log(`media start failed: ${e && e.message}`);
@@ -284,13 +339,17 @@ export default class NativeCallingSDK {
 
     s.on('callDeclined', (p) => {
       const cid = p && p.callId != null ? String(p.callId) : '';
-      if (this._room) return; // live call — a stale sibling-id decline can't kill it
+      // A PRE-ANSWER room is only the ring-time warm-up — a decline must still
+      // end the dial (and tear the warm-up down); only a LIVE room shields
+      // against stale sibling-id declines.
+      if (this._room && !this._room.preAnswer) return;
       if ((this._out && this._out.callId === cid) || this._outIds[cid]) {
         // No sibling cancelCall here either (see callAccepted) — a WebView
         // callee holding a sibling in pendingIn would surface 'cancelled'.
         this._out = null;
         this._outIds = {};
         this._clearRetry();
+        if (this._room && this._room.preAnswer) this._teardownMedia(true);
         this._emit('rejected', {});
       }
     });
@@ -306,12 +365,14 @@ export default class NativeCallingSDK {
       // before) the callee answered on CallKit. Drop the dead id and keep
       // re-dialing — the fresh registration the callee is booting right now
       // will receive the next ring; the signaling ring window bounds the loop.
-      if (!this._room && !this._acceptedId && this._out && this._dialTarget) {
+      if ((!this._room || this._room.preAnswer) && !this._acceptedId && this._out && this._dialTarget) {
         const deadId = p && p.callId != null ? String(p.callId) : this._out.callId;
         delete this._outIds[deadId];
         this._out = null;
         this._lastDialAt = 0; // let the next tick redial immediately
         this._log(`SFU call leg ${deadId} ended pre-answer (grace sweep) — re-arming dial loop`);
+        // The pre-joined warm-up room (if any) stays up; the tick re-points it
+        // when the redial mints a different roomId.
         this._armRetry(() => this._dial1to1Tick(this._dialTarget));
         return;
       }
@@ -479,11 +540,17 @@ export default class NativeCallingSDK {
       // Ring REASSERT: a "successful" callUser is NOT proof the callee heard it —
       // during the server's reconnect grace a killed app's stale registration
       // accepts the call and incomingCall goes to a DEAD socket. Keep re-dialing
-      // (each mints a fresh callId; the callee's SDK swallows duplicates) until
-      // callAccepted / callDeclined / hangup / the ring window ends. This is the
-      // fix for "callee accepts on CallKit but the call cuts — their engine
-      // never received the SFU ring".
+      // (the server reuses the same callId/roomId for a live dial; the callee's
+      // SDK swallows duplicates) until callAccepted / callDeclined / hangup /
+      // the ring window ends. This is the fix for "callee accepts on CallKit
+      // but the call cuts — their engine never received the SFU ring".
       this._armRetry(() => this._dial1to1Tick(target));
+      // Warm the media path WHILE the callee's phone rings: join the room,
+      // build both transports and produce the mic PAUSED (no audio leaves this
+      // device until the accept). On accept the callee finds our producer in
+      // existingProducers and consumes instantly — the whole caller-side join +
+      // send handshake is off the post-accept critical path.
+      this._preJoinOut(res.roomId);
       return { callId: cid, offline: [] };
     }).catch((e) => {
       const msg = String((e && e.message) || '').toLowerCase();
@@ -508,21 +575,72 @@ export default class NativeCallingSDK {
   //    time; the callee dedupes by peer). callAccepted/callDeclined/hangup
   //    clear the loop; _retryUntil (ring window) bounds it.
   _dial1to1Tick(target) {
-    if (this._room || this._acceptedId) return Promise.resolve(true); // connected/answered — stop
+    // A PRE-ANSWER room is the ring-time warm-up, not a live call — the loop
+    // must keep re-asserting through it.
+    if ((this._room && !this._room.preAnswer) || this._acceptedId) return Promise.resolve(true);
     if (this._out && (Date.now() - this._lastDialAt) < REASSERT_MS) return Promise.resolve(false);
     return this._req('callUser', { toUserId: target, callType: this._media }).then((res) => {
       // The call may have been ANSWERED while this request was in flight —
       // never resurrect dial state over a live call (the id becomes harmless
       // server-side garbage; the callee dedupes/declines it).
-      if (this._room || this._acceptedId) return true;
+      if ((this._room && !this._room.preAnswer) || this._acceptedId) return true;
+      // HUNG UP while this dial was in flight (instant cancel): hangup() had no
+      // minted id to cancel yet, so without this the freshly created lobby
+      // record lived on — the callee rang a DEAD call for the whole window and
+      // the record was re-delivered if they reconnected within it ("A ne turant
+      // kaata phir bhi B par ring aati rahi"). Cancel it NOW and stop. A new
+      // dial to the SAME target falls through safely (the lobby REASSERT-reuses
+      // this very record for it).
+      if (!this._dialTarget || String(this._dialTarget) !== String(target)) {
+        this._log('dial cancelled while in flight — cancelling minted id ' + String(res.callId));
+        try { this._socket && this._socket.emit('cancelCall', { callId: String(res.callId) }); } catch (_) {}
+        return true;
+      }
       const cid = String(res.callId);
       const isReassert = !!this._out;
       this._out = { callId: cid, roomId: res.roomId, to: target };
       this._outIds[cid] = true;
       this._lastDialAt = Date.now();
       this._log(`${isReassert ? 'ring reassert' : 'redial'} ok — callId ${cid}`);
+      // Keep the warm-up aligned with the dial: first success pre-joins; a NEW
+      // roomId (the grace sweep deleted the old record and this redial minted a
+      // fresh call) re-points the warm-up at the room the callee will accept.
+      if (!this._room) this._preJoinOut(res.roomId);
+      else if (this._room.preAnswer && String(this._room.roomId) !== String(res.roomId)) {
+        this._teardownMedia(true);
+        this._preJoinOut(res.roomId);
+      }
       return false; // keep looping until answered/declined/window end
     }).catch(() => false);
+  }
+
+  // Ring-time warm-up for an outgoing 1:1: join the room + build transports +
+  // produce the mic PAUSED while the callee is still ringing. Privacy: nothing
+  // is audible until callAccepted resumes the producer. Failure is non-fatal —
+  // the accept path simply joins from scratch as before.
+  _preJoinOut(roomId) {
+    if (!roomId || this._room || this._acceptedId) return;
+    const room = {
+      roomId: String(roomId), groupId: null, callId: null, media: this._media, joined: false, preAnswer: true,
+    };
+    this._room = room;
+    this._log(`pre-joining room ${roomId} during ring (caller warm-up)`);
+    this._startMedia(null).catch((e) => {
+      this._log(`pre-join failed (${e && e.message})`);
+      if (this._room !== room) return; // superseded by a re-pre-join / teardown
+      if (room.preAnswer) {
+        // Still ringing — drop the half-built pipeline; accept joins fresh.
+        this._teardownMedia(true);
+      } else if (!room.joined) {
+        // Promoted (accepted) while this join was failing — rebuild for real.
+        this._teardownMedia(true);
+        this._room = { roomId: room.roomId, groupId: null, callId: room.callId, media: this._media, joined: false };
+        this._startMedia(null).catch((e2) => {
+          this._log(`media start failed: ${e2 && e2.message}`);
+          this._emit('error', { message: 'Could not connect the call media' });
+        });
+      }
+    });
   }
 
   _startGroup(targets) {
@@ -581,6 +699,25 @@ export default class NativeCallingSDK {
     if (id != null) this._groupJoined[String(id)] = true;
   }
 
+  // acceptCall with bounded retries. The user's ANSWER must not die with one
+  // lost frame on a flapping socket (field repro: engine registered + got the
+  // ring, but the single-shot acceptCall never reached the lobby → both sides
+  // stuck "Connecting…" until the watchdog). acceptCall is idempotent
+  // server-side; retries stop the moment the call is answered (callAccepted
+  // set _room) or torn down.
+  _acceptWithRetry(callId) {
+    const attempt = (n) => this._reqDial('acceptCall', { callId }).catch((e) => {
+      if (n >= 2) throw e;
+      if (!this._acceptedId || this._room) throw e; // ended, or already answered meanwhile
+      this._log(`acceptCall attempt ${n + 1} failed (${e && e.message}) — retrying`);
+      return new Promise((r) => setTimeout(r, 1500 * (n + 1))).then(() => {
+        if (!this._acceptedId || this._room) return {}; // resolved while we waited
+        return attempt(n + 1);
+      });
+    });
+    return attempt(0);
+  }
+
   // ---- incoming ----
   accept(callId, media, opts = {}) {
     const key = String(callId);
@@ -596,47 +733,58 @@ export default class NativeCallingSDK {
         this._media = media === 'video' ? 'video' : 'audio';
         this._acceptedFrom = opts.peerId != null ? String(opts.peerId) : null;
         this._acceptedId = key;
-        return this._capture().then(() => this._reqDial('acceptCall', { callId: key }));
+        // Capture runs CONCURRENTLY with acceptCall — getUserMedia (slow on a
+        // cold mic) used to sit between the user's tap and the caller even
+        // LEARNING the call was answered. _capture is memoized, so the join
+        // pipeline reuses this same attempt.
+        return Promise.all([
+          this._capture(),
+          this._acceptWithRetry(key),
+        ]).then(([, ack]) => ack);
       }
       // Group ids are joinable directly.
       this._log(`accept: no pending entry for ${key} — trying joinGroupCall directly`);
       delete this._declined[key];
       this._media = media === 'video' ? 'video' : this._media;
-      return this._capture().then(() => this._reqDial('joinGroupCall', { groupId: key }).then((res) => {
+      this._capture().catch(() => {}); // kick off; _startMedia awaits the memoized attempt
+      return this._reqDial('joinGroupCall', { groupId: key }).then((res) => {
         this._media = res.callType === 'video' ? 'video' : this._media;
         this._room = { roomId: res.roomId, groupId: key, callId: null, media: this._media, joined: false };
         this._groupInvitees = [];
         this._groupJoined = {};
         return this._startMedia(res.serverUrl);
-      }));
+      });
     }
     this._media = p.media === 'video' ? 'video' : 'audio';
-    return this._capture().then(() => {
-      delete this._pendingIn[key];
-      if (p.group) {
-        return this._reqDial('joinGroupCall', { groupId: p.groupId }).then((res) => {
-          this._media = res.callType === 'video' ? 'video' : this._media;
-          this._room = { roomId: res.roomId, groupId: String(p.groupId), callId: null, media: this._media, joined: false };
-          this._groupInvitees = [];
-          this._groupJoined = {};
-          return this._startMedia(res.serverUrl);
-        });
-      }
-      // 1:1 — the server answers with callAccepted (both sides), which carries
-      // roomId + serverUrl; media starts in that handler.
-      this._acceptedFrom = p.from && p.from.id != null ? String(p.from.id) : (opts.peerId != null ? String(opts.peerId) : null);
-      // Drop sibling reassert entries from the same caller quietly (same
-      // logical call, different minted ids) — a later hangup must not decline
-      // them, which the caller would read as a rejection.
-      if (this._acceptedFrom) {
-        Object.keys(this._pendingIn).forEach((k) => {
-          const q = this._pendingIn[k];
-          if (q && !q.group && q.from && String(q.from.id) === this._acceptedFrom) delete this._pendingIn[k];
-        });
-      }
-      this._acceptedId = key;
-      return this._reqDial('acceptCall', { callId: key });
-    });
+    delete this._pendingIn[key];
+    if (p.group) {
+      this._capture().catch(() => {}); // concurrent with the join round trip
+      return this._reqDial('joinGroupCall', { groupId: p.groupId }).then((res) => {
+        this._media = res.callType === 'video' ? 'video' : this._media;
+        this._room = { roomId: res.roomId, groupId: String(p.groupId), callId: null, media: this._media, joined: false };
+        this._groupInvitees = [];
+        this._groupJoined = {};
+        return this._startMedia(res.serverUrl);
+      });
+    }
+    // 1:1 — the server answers with callAccepted (both sides), which carries
+    // roomId + serverUrl; media starts in that handler.
+    this._acceptedFrom = p.from && p.from.id != null ? String(p.from.id) : (opts.peerId != null ? String(opts.peerId) : null);
+    // Drop sibling reassert entries from the same caller quietly (same
+    // logical call, different minted ids) — a later hangup must not decline
+    // them, which the caller would read as a rejection.
+    if (this._acceptedFrom) {
+      Object.keys(this._pendingIn).forEach((k) => {
+        const q = this._pendingIn[k];
+        if (q && !q.group && q.from && String(q.from.id) === this._acceptedFrom) delete this._pendingIn[k];
+      });
+    }
+    this._acceptedId = key;
+    // acceptCall goes out IMMEDIATELY; capture (the slow part) overlaps it.
+    return Promise.all([
+      this._capture(),
+      this._acceptWithRetry(key),
+    ]).then(([, ack]) => ack);
   }
 
   reject(callId) {
@@ -666,7 +814,13 @@ export default class NativeCallingSDK {
     try {
       if (this._room && this._room.groupId) this._socket && this._socket.emit('leaveGroupCall', { groupId: this._room.groupId });
       else if (this._room && this._room.callId) this._socket && this._socket.emit('endCall', { callId: this._room.callId });
-      else if (this._acceptedId) this._socket && this._socket.emit('endCall', { callId: this._acceptedId });
+      else if (this._acceptedId) {
+        this._socket && this._socket.emit('endCall', { callId: this._acceptedId });
+        // Hangup in the answered-but-not-joined window: the caller's dial loop
+        // may re-ring on the pre-answer callEnded — quietly decline those
+        // reasserts instead of ghost-re-ringing.
+        if (this._acceptedFrom) this._declinedPeer[this._acceptedFrom] = Date.now();
+      }
       else {
         // Cancel EVERY id minted for this dial (redials + reasserts), not just
         // the latest — stale server entries otherwise ring/linger.
@@ -697,7 +851,17 @@ export default class NativeCallingSDK {
   }
 
   _teardownMedia(leaveRoom) {
-    try { if (leaveRoom && this._socket && this._room && this._room.joined) this._socket.emit('leaveRoom'); } catch (_) {}
+    this._clearRecovery();
+    // Invalidate any in-flight getUserMedia so its late stream can't become a
+    // leaked _localStream after this teardown.
+    this._capGen = (this._capGen || 0) + 1;
+    this._capturing = null;
+    this._producingLocal = false;
+    // leaveRoom whenever a room EXISTS, not only when `joined` flipped — a
+    // teardown racing an in-flight joinRoom otherwise leaves a ghost peer in
+    // the room server-side (socket.io orders the frames, so the server sees
+    // join → leave cleanly; leaveRoom on a never-joined socket is a no-op).
+    try { if (leaveRoom && this._socket && this._room) this._socket.emit('leaveRoom'); } catch (_) {}
     Object.keys(this._producers).forEach((k) => { try { this._producers[k].close(); } catch (_) {} });
     this._producers = {};
     Object.keys(this._consumers).forEach((k) => { try { this._consumers[k].close(); } catch (_) {} });
@@ -711,6 +875,8 @@ export default class NativeCallingSDK {
     this._device = null;
     if (this._localStream) { try { this._localStream.getTracks().forEach((t) => t.stop()); } catch (_) {} }
     this._localStream = null;
+    if (this._screenStream) { try { this._screenStream.getTracks().forEach((t) => t.stop()); } catch (_) {} }
+    this._screenStream = null;
     this._room = null;
     this._pendingProducers = [];
     this._pendingStreamEmits = [];
@@ -722,6 +888,13 @@ export default class NativeCallingSDK {
   // ---- local media ----
   _capture() {
     if (this._localStream) return Promise.resolve(this._localStream);
+    // In-flight memo: accept()/startMedia run capture CONCURRENTLY with
+    // signalling, so a second caller shares the same getUserMedia attempt
+    // (two parallel captures = two mic handles, one leaked).
+    if (this._capturing) return this._capturing;
+    // Generation guard: a hangup during a slow capture must not let the late
+    // stream resurrect itself as _localStream (leaked mic after teardown).
+    const gen = this._capGen || 0;
     const webrtc = getWebrtc();
     if (!webrtc) return Promise.reject(new Error('react-native-webrtc unavailable'));
     const { mediaDevices } = webrtc;
@@ -749,19 +922,35 @@ export default class NativeCallingSDK {
           return mediaDevices.getUserMedia({ audio: true, video: false });
         });
     }
-    return attempt
+    this._capturing = attempt
       .then((stream) => {
+        this._capturing = null;
+        if ((this._capGen || 0) !== gen) {
+          try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+          throw new Error('capture aborted (call torn down)');
+        }
         this._localStream = stream;
         this._emit('localstream', stream);
         return stream;
+      }, (e) => {
+        this._capturing = null;
+        throw e;
       });
+    return this._capturing;
   }
 
   // ---- room media ----
   _startMedia(serverUrl) {
     let pre = Promise.resolve();
     if (serverUrl && serverUrl !== this._serverUrl) pre = this._migrate(serverUrl);
-    return pre.then(() => this._capture()).then(() => this._joinRoom());
+    return pre.then(() => {
+      // Kick capture but DON'T serialize the room join behind it — the join
+      // handshake (several round trips + ICE/DTLS) runs while getUserMedia
+      // warms up; _produceLocal awaits the memoized capture when it needs the
+      // tracks (and surfaces its failure there).
+      this._capture().catch(() => {});
+      return this._joinRoom();
+    });
   }
 
   _joinRoom() {
@@ -776,29 +965,49 @@ export default class NativeCallingSDK {
       joinRes = res || {};
       this._device = this._makeDevice();
       return this._device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
-    }).then(() => this._req('setRtpCapabilities', { rtpCapabilities: this._device.rtpCapabilities }))
-      .then(() => this._req('createWebRtcTransport', { direction: 'send' }))
-      .then((sp) => {
+    }).then(() => (
+      // These three server round trips are independent of each other — batch
+      // them instead of paying three sequential RTTs on the connect path.
+      Promise.all([
+        this._req('setRtpCapabilities', { rtpCapabilities: this._device.rtpCapabilities }),
+        this._req('createWebRtcTransport', { direction: 'send' }),
+        this._req('createWebRtcTransport', { direction: 'recv' }),
+      ])
+    ))
+      .then(([, sp, rp]) => {
+        // Torn down (hangup/remote end) while the join round trips were in
+        // flight — building transports / re-capturing on the dead state would
+        // leak a mic and mark a stale room joined.
+        if (this._room !== room) throw new Error('call torn down during join');
         const ice = (joinRes.iceServers && joinRes.iceServers.length) ? joinRes.iceServers : (this._fallbackIceServers || []);
         this._sendTransport = this._device.createSendTransport({ ...sp, iceServers: ice });
         this._wireTransport(this._sendTransport);
-        return this._req('createWebRtcTransport', { direction: 'recv' });
-      })
-      .then((rp) => {
-        const ice = (joinRes.iceServers && joinRes.iceServers.length) ? joinRes.iceServers : (this._fallbackIceServers || []);
         this._recvTransport = this._device.createRecvTransport({ ...rp, iceServers: ice });
         this._wireTransport(this._recvTransport);
-        return this._produceLocal();
-      })
-      .then(() => {
         room.joined = true;
         const queued = this._pendingProducers;
         this._pendingProducers = [];
         const list = (joinRes.existingProducers || []).concat(queued);
-        this._log(`room joined — producers up, consuming ${list.length} (existing+queued)`);
-        return list.reduce((chain, p) => chain.then(() => (
+        this._log(`room joined — producing + consuming ${list.length} (existing+queued)`);
+        // All consumes fire CONCURRENTLY (each is an independent consume +
+        // resumeConsumer pair; mediasoup-client serializes what it must
+        // internally) — the old serial chain made every extra producer add a
+        // full round trip before the first audio could flow.
+        const consumeAll = Promise.all(list.map((p) => (
           this._consume(p).catch((e) => this._log(`consume failed: ${e && e.message}`))
-        )), Promise.resolve());
+        )));
+        // Produce (send-side ICE/DTLS) and consume (recv-side ICE/DTLS) in
+        // PARALLEL — serializing them stacked the two handshakes back to back,
+        // which was most of the "Connecting…" wait after an answer. Local
+        // produce first awaits the (memoized) capture for its tracks.
+        this._producingLocal = true;
+        const produceAll = this._capture()
+          .then(() => this._produceLocal())
+          .then(
+            (v) => { this._producingLocal = false; return v; },
+            (e) => { this._producingLocal = false; throw e; },
+          );
+        return Promise.all([produceAll, consumeAll]);
       });
   }
 
@@ -839,12 +1048,23 @@ export default class NativeCallingSDK {
     });
   }
 
+  // Producers created during a PRE-ANSWER warm-up start PAUSED — nothing is
+  // audible/visible to anyone until callAccepted promotes the room and resumes
+  // them. (A consumer of a paused producer receives silence, so even a client
+  // that joined the room early hears nothing.)
+  _pauseIfPreAnswer(pr) {
+    if (this._room && this._room.preAnswer && pr && !pr.closed) {
+      try { pr.pause(); } catch (_) {}
+      this._req('pauseProducer', { producerId: pr.id }).catch(() => {});
+    }
+  }
+
   _produceLocal() {
     let chain = Promise.resolve();
     const audio = this._localStream ? this._localStream.getAudioTracks()[0] : null;
     if (audio && !this._producers.mic) {
       chain = chain.then(() => this._sendTransport.produce({ track: audio, appData: { source: 'mic' } })
-        .then((pr) => { this._producers.mic = pr; }));
+        .then((pr) => { this._producers.mic = pr; this._pauseIfPreAnswer(pr); }));
     }
     if (this._media === 'video') {
       const video = this._localStream ? this._localStream.getVideoTracks()[0] : null;
@@ -859,7 +1079,7 @@ export default class NativeCallingSDK {
             appData: { source: 'camera' },
           };
           if (vp8) opts.codec = vp8;
-          return this._sendTransport.produce(opts).then((pr) => { this._producers.camera = pr; });
+          return this._sendTransport.produce(opts).then((pr) => { this._producers.camera = pr; this._pauseIfPreAnswer(pr); });
         });
       }
     }
@@ -941,14 +1161,42 @@ export default class NativeCallingSDK {
     if (this._mediaDown) return;
     this._mediaDown = true;
     this._log(`media DOWN (${why})`);
+    // Keep RETRYING the recovery, not just the single restartIce fired by the
+    // state-change handler: a mid-call NAT rebind / network flap often needs a
+    // second or third ICE restart once the path settles — one failed attempt
+    // used to leave the call stuck on "Reconnecting…" until the watchdog cut
+    // it ("kuch der baad Connecting… dikhta hai").
+    this._armRecovery();
     this._emit('disconnected', { reason: why });
   }
 
   _emitUp(why) {
     if (!this._mediaDown) return;
     this._mediaDown = false;
+    this._clearRecovery();
     this._log(`media UP (${why})`);
     this._emit('connected', { reason: why });
+  }
+
+  _armRecovery() {
+    this._clearRecovery();
+    this._recoverUntil = Date.now() + 30000; // provider watchdog owns the final verdict
+    this._recoverTimer = setInterval(() => {
+      if (!this._mediaDown || !this._room || Date.now() > this._recoverUntil) {
+        this._clearRecovery();
+        return;
+      }
+      if (this._socket && this._socket.connected) {
+        this._log('media recovery tick — restarting ICE');
+        this.restartIce();
+      }
+      // Socket down → socket.io's reconnect + the 'connect' handler's _resume()
+      // own the recovery; this loop resumes ICE restarts once it's back.
+    }, 3000);
+  }
+
+  _clearRecovery() {
+    if (this._recoverTimer) { clearInterval(this._recoverTimer); this._recoverTimer = null; }
   }
 
   _resume() {
@@ -1057,7 +1305,11 @@ export default class NativeCallingSDK {
       //    mic is legal there), so _capture() downgraded to audio-only and each
       //    side saw only ONE video tile. The app re-sends toggleCamera(on) on
       //    foreground; this path captures + produces the camera then.
-      if (on && this._room && this._room.joined && this._sendTransport) {
+      // While the join pipeline's own capture→produce is still in flight, let
+      // it land first (it produces the camera for a video call itself — racing
+      // it here made a duplicate camera producer).
+      if (on && this._room && this._room.joined && this._sendTransport
+          && !this._capturing && !this._producingLocal) {
         this._upgradeToVideo().catch((e) => {
           this._log(`video upgrade failed: ${e && e.message}`);
           this._emit('mediaupgradefailed', { message: (e && e.message) || 'Could not start the camera' });
@@ -1140,6 +1392,72 @@ export default class NativeCallingSDK {
           this._emit('mediaupgraded', { media: 'video' });
         });
       });
+  }
+
+  // ---- screen share ----
+  // Android: react-native-webrtc implements getDisplayMedia natively via
+  // MediaProjection + its own bundled foreground service (WhatsApp-style
+  // whole-screen capture — needs FOREGROUND_SERVICE_MEDIA_PROJECTION in the
+  // app manifest). iOS: whole-screen capture needs a ReplayKit broadcast
+  // extension the app doesn't ship, so getDisplayMedia rejects → reported as
+  // `unsupported` and the UI shows the "not supported" alert. Receiving a
+  // peer's shared screen works everywhere regardless.
+  startScreenShare() {
+    if (this._producers.screen && !this._producers.screen.closed) return Promise.resolve(true);
+    if (!this._room || !this._room.joined || !this._sendTransport) {
+      return Promise.reject(new Error('not in a connected call'));
+    }
+    const webrtc = getWebrtc();
+    const md = webrtc && webrtc.mediaDevices;
+    if (!md || typeof md.getDisplayMedia !== 'function') {
+      const e = new Error("Screen sharing isn't supported on this device");
+      e.unsupported = true;
+      return Promise.reject(e);
+    }
+    return md.getDisplayMedia({ video: true }).then((stream) => {
+      const track = stream.getVideoTracks()[0];
+      if (!track) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        throw new Error('no screen track');
+      }
+      this._screenStream = stream;
+      return this._sendTransport.produce({ track, appData: { source: 'screen' } }).then((pr) => {
+        this._producers.screen = pr;
+        // The OS "stop sharing" affordance (status-bar chip / notification)
+        // ends the track underneath us — mirror it as a clean stop so the UI
+        // flag and the remote tile both clear.
+        pr.on('trackended', () => {
+          this.stopScreenShare().catch(() => {});
+          this._emit('screenshare', { on: false });
+        });
+        this._log('screen share started (native capture)');
+        return true;
+      });
+    }).catch((e) => {
+      if (this._screenStream) {
+        try { this._screenStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        this._screenStream = null;
+      }
+      // A user cancelling the OS capture prompt is a normal outcome, not a
+      // device limitation — only flag `unsupported` when the API is missing.
+      throw e;
+    });
+  }
+
+  stopScreenShare() {
+    const pr = this._producers.screen;
+    delete this._producers.screen;
+    if (pr && !pr.closed) {
+      // closeProducer tells the SFU to broadcast producerClosed so every peer
+      // drops the `<peerId>#screen` tile immediately.
+      this._req('closeProducer', { producerId: pr.id }).catch(() => {});
+      try { pr.close(); } catch (_) {}
+    }
+    if (this._screenStream) {
+      try { this._screenStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      this._screenStream = null;
+    }
+    return Promise.resolve(!!pr);
   }
 
   switchCamera() {

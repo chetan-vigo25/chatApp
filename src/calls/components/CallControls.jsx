@@ -110,8 +110,6 @@ export default function CallControls({
               palette={palette}
               onPress={onToggleCamera}
             />
-            {/* Screen share — temporarily disabled (per request). Re-enable by
-                uncommenting; the engine/handler wiring is untouched.
             <CircleButton
               icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
               lib="mci"
@@ -121,7 +119,6 @@ export default function CallControls({
               palette={palette}
               onPress={onToggleScreenShare}
             />
-            */}
             <CircleButton
               icon={speakerOn ? 'volume-high' : 'volume-medium'}
               active={speakerOn}
@@ -152,8 +149,6 @@ export default function CallControls({
               palette={palette}
               onPress={onToggleCamera}
             />
-            {/* Screen share — temporarily disabled (per request). Re-enable by
-                uncommenting; the engine/handler wiring is untouched.
             <CircleButton
               icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
               lib="mci"
@@ -163,7 +158,6 @@ export default function CallControls({
               palette={palette}
               onPress={onToggleScreenShare}
             />
-            */}
           </>
         )}
 

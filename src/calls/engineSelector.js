@@ -15,4 +15,17 @@ import { Platform } from 'react-native';
  */
 export const CALL_NATIVE_ENGINE_IOS = true;
 
-export const isNativeCallEngine = () => CALL_NATIVE_ENGINE_IOS && Platform.OS === 'ios';
+// Android on the native engine (react-native-webrtc). OFF by default — Android
+// stays on the proven WebView engine until this is deliberately flipped. What
+// flipping gains on Android: real SCREEN SHARE (Android System WebView has no
+// getDisplayMedia, so the WebView engine can never share; react-native-webrtc
+// captures natively via MediaProjection + its bundled foreground service —
+// needs the FOREGROUND_SERVICE_MEDIA_PROJECTION permission already added to
+// app.json, i.e. a prebuild). Same protocol.js surface — flipping back is the
+// entire rollback story, OTA-able.
+export const CALL_NATIVE_ENGINE_ANDROID = false;
+
+export const isNativeCallEngine = () => (
+  (CALL_NATIVE_ENGINE_IOS && Platform.OS === 'ios')
+  || (CALL_NATIVE_ENGINE_ANDROID && Platform.OS === 'android')
+);

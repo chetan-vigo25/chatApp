@@ -46,4 +46,24 @@ export const isStaleCallPush = (data) => {
   return false;
 };
 
+// A push older than this but not yet STALE is "AGED": it sat queued in
+// FCM/APNs while the device was offline/airplane/Doze. The call it announces
+// may already be cancelled — and the cancel push can arrive out of order — so
+// an aged push is VERIFIED against the server's pending list before ringing
+// (CallProvider.onPushIncoming) instead of trusted blindly. Fresh pushes
+// (the normal live path) ring instantly, well under this threshold.
+export const AGED_CALL_PUSH_MS = 12 * 1000;
+
+// Age of a call push in ms — backend sent-at `ts`, else the dial time embedded
+// in the signaling callId; NaN when neither is available (fail-open: treat as
+// fresh, ring rather than swallow).
+export const callPushAgeMs = (data) => {
+  const now = Date.now();
+  const ts = Number(data && data.ts);
+  if (Number.isFinite(ts) && ts > 0) return now - ts;
+  const dialTs = callIdDialTime(data && data.callId);
+  if (Number.isFinite(dialTs) && dialTs > 0) return now - dialTs;
+  return NaN;
+};
+
 export default CALL_PUSH_EVENTS;
