@@ -8,7 +8,6 @@ import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useCall } from '../useCall';
 import { useTheme } from '../../contexts/ThemeContext';
 import useContactDirectory from '../../hooks/useContactDirectory';
-import { navigateToChat } from '../../Redux/Services/navigationService';
 import { CALL_STATUS, joinedCount } from '../state/callMachine';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import CallAvatar from '../components/CallAvatar';
@@ -360,19 +359,6 @@ export default function CallOverlay() {
           media={call?.media}
           onAccept={accept}
           onReject={reject}
-          // WhatsApp's Message action: pass on the call and land in the chat
-          // thread to reply by text (decline + deep-link to the conversation).
-          onMessage={() => {
-            reject();
-            if (call?.chatId) {
-              navigateToChat({
-                chatId: call.chatId,
-                chatType: 'private',
-                chatName: peerDisplayName,
-                chatAvatar: peer?.avatar || '',
-              });
-            }
-          }}
         />
       ) : isGroup ? (
         // ----- GROUP (audio, or pre-video ringing/ended) -----
@@ -534,8 +520,10 @@ const styles = StyleSheet.create({
     marginBottom: 26,
   },
   avatarStack: { alignItems: 'center', justifyContent: 'center' },
+  // Content is the 170dp avatar + 3 padding + 3 border per side (182dp box) —
+  // the radius must be half of THAT or the ring renders as a rounded square.
   avatarWrap: {
-    borderRadius: 80,
+    borderRadius: 91,
     borderWidth: 3,
     borderColor: 'rgba(255,255,255,0.16)',
     padding: 3,

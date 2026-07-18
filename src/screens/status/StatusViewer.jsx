@@ -39,6 +39,12 @@ import { profileDetail } from '../../Redux/Reducer/Profile/Profile.reducer';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 
 const { width: SW, height: SH } = Dimensions.get('window');
+// Full-SCREEN height (incl. system bars). The keyboard's endCoordinates.screenY
+// is measured in full-screen coordinates, so deriving keyboard height as
+// (screenY − top) must use the SCREEN height — not the window height, which in
+// Android edge-to-edge mode is smaller and made (window − screenY) go negative
+// → kbHeight clamped to 0 → the composer never lifted ("input box bottom pe").
+const SCREEN_H = Dimensions.get('screen').height;
 const STORY_DURATION = 5000;
 const VIDEO_MAX_MS   = 30000;
 const PROGRESS_H     = 3;
@@ -135,13 +141,42 @@ export default function StatusViewer({ navigation, route }) {
     };
   }, [navigation]);
 
+  // Attached for the SCREEN's lifetime — deliberately NOT gated on showReply.
+  // The reply input autoFocuses, so the keyboard's show event can fire before
+  // a showReply-gated effect had attached its listener; the missed event left
+  // kbHeight at 0 and the composer sat hidden BEHIND the keyboard ("keyboard
+  // khul gaya par input box bottom pe hi reh gaya").
   useEffect(() => {
-    if (!showReply) { setKbHeight(0); return; }
-    const showEvt = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
-    const hideEvt = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
-    const sub1 = Keyboard.addListener(showEvt, (e) => setKbHeight(e?.endCoordinates?.height ?? 0));
-    const sub2 = Keyboard.addListener(hideEvt, () => setKbHeight(0));
-    return () => { sub1.remove(); sub2.remove(); };
+    const onShow = (e) => {
+      const coords = e?.endCoordinates;
+      // Prefer the reported height, but ALSO derive it from screenY (FULL-screen
+      // height − keyboard top): Android in edge-to-edge mode reports height 0
+      // for some translucent-Modal configurations, and screenY still holds.
+      // Must use SCREEN_H (not window height SH) — screenY is in full-screen
+      // coords, so window − screenY under-counted / went negative in edge-to-edge
+      // and the lift collapsed to 0.
+      const derived = coords?.screenY != null ? SCREEN_H - coords.screenY : 0;
+      setKbHeight(Math.max(0, coords?.height ?? 0, derived));
+    };
+    const onHide = () => setKbHeight(0);
+    const subs = [];
+    if (Platform.OS === 'ios') {
+      subs.push(Keyboard.addListener('keyboardWillShow', onShow));
+      subs.push(Keyboard.addListener('keyboardWillHide', onHide));
+    }
+    // Android only emits the did* pair; kept on iOS too as a safety net for a
+    // will* event missed during a modal presentation transition.
+    subs.push(Keyboard.addListener('keyboardDidShow', onShow));
+    subs.push(Keyboard.addListener('keyboardDidHide', onHide));
+    return () => subs.forEach((s) => s.remove());
+  }, []);
+  // Opening the composer while the keyboard is ALREADY up (e.g. it never
+  // animated away between two replies) fires no new show event — seed the
+  // offset from the live keyboard metrics so the sheet starts lifted.
+  useEffect(() => {
+    if (!showReply) return;
+    const m = typeof Keyboard.metrics === 'function' ? Keyboard.metrics() : null;
+    if (m && m.height > 0) setKbHeight(m.height);
   }, [showReply]);
   const [hearts, setHearts]               = useState([]);
   // Mute toggle for video / audio statuses (top-right speaker icon). Default

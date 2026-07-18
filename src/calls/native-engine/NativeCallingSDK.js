@@ -498,6 +498,27 @@ export default class NativeCallingSDK {
         delete this._consumers[cid];
       }
     });
+    // Peer paused/resumed their CAMERA producer (camera toggled off/on — the
+    // producer stays alive, frames just stop, so the tile would freeze). Relay
+    // it so the UI can show the avatar instead, WhatsApp style. Mic pauses are
+    // filtered by kind; screen shares by streamKey. NOTE: the caller's
+    // pre-answer privacy hold pauses/resumes through here too — the resume at
+    // accept simply confirms "camera on", which the UI already assumes.
+    const peerVideoPause = (p, paused) => {
+      const pid = p && p.producerId;
+      if (!pid) return;
+      Object.keys(this._consumers).forEach((cid) => {
+        const c = this._consumers[cid];
+        if (c && c.producerId === pid && c.kind === 'video') {
+          const peerId = c.appData && c.appData.peerId != null ? String(c.appData.peerId) : null;
+          const streamKey = (c.appData && c.appData.streamKey) || peerId;
+          if (streamKey && String(streamKey).indexOf('#screen') >= 0) return;
+          this._emit('peervideo', { peerId, on: !paused });
+        }
+      });
+    };
+    s.on('producerPaused', (p) => peerVideoPause(p, true));
+    s.on('producerResumed', (p) => peerVideoPause(p, false));
     s.on('activeSpeaker', (p) => {
       this._emit('activespeaker', { peerId: p && p.peerId != null ? String(p.peerId) : null });
     });
@@ -1095,11 +1116,15 @@ export default class NativeCallingSDK {
     if (!producerId || this._consumed[producerId]) return Promise.resolve();
     if (!this._recvTransport || !this._device) return Promise.resolve();
     this._consumed[producerId] = true;
+    let consumedPaused = false; // producer already paused when we consumed (camera was off)
     return this._req('consume', {
       transportId: this._recvTransport.id, producerId, rtpCapabilities: this._device.rtpCapabilities,
-    }).then((params) => this._recvTransport.consume({
-      id: params.id, producerId: params.producerId, kind: params.kind, rtpParameters: params.rtpParameters,
-    })).then((consumer) => {
+    }).then((params) => {
+      consumedPaused = !!params.producerPaused;
+      return this._recvTransport.consume({
+        id: params.id, producerId: params.producerId, kind: params.kind, rtpParameters: params.rtpParameters,
+      });
+    }).then((consumer) => {
       this._consumers[consumer.id] = consumer;
       consumer.appData = consumer.appData || {};
       consumer.appData.peerId = peerId;
@@ -1118,6 +1143,12 @@ export default class NativeCallingSDK {
       return this._req('resumeConsumer', { consumerId: consumer.id }).then(() => {
         this._groupJoined[peerId] = true;
         this._log(`consuming ${consumer.track.kind}${isScreen ? ' (screen)' : ''} from ${peerId}`);
+        // Joined while the peer's camera was ALREADY paused (camera off before
+        // we consumed) — no producerPaused event will come, so seed the state
+        // from the consume response.
+        if (consumer.kind === 'video' && !isScreen && consumedPaused) {
+          this._emit('peervideo', { peerId, on: false });
+        }
         this._emitStreamWhenLive({ peerId, stream, source });
       });
     }).catch((e) => {

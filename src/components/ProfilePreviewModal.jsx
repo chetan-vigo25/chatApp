@@ -102,10 +102,11 @@ export default function ProfilePreviewModal({
   const initial = (name || '?').charAt(0).toUpperCase();
 
   const showMessage = typeof onMessage === 'function';
-  // Groups get call/video too (group call rings all members); only broadcast
-  // channels never show them. Callers control availability via the callbacks.
-  const showCall = typeof onCall === 'function' && !isBroadcast;
-  const showVideo = typeof onVideo === 'function' && !isBroadcast;
+  // Call/video: 1-1 only. GROUP CALLS TEMPORARILY DISABLED (was: groups also
+  // showed them, ringing all members) — re-enable by dropping the `&& !isGroup`
+  // guards below. Broadcast channels never show call actions.
+  const showCall = typeof onCall === 'function' && !isBroadcast && !isGroup;
+  const showVideo = typeof onVideo === 'function' && !isBroadcast && !isGroup;
   const showInfo = typeof onInfo === 'function';
   const hasActions = showMessage || showCall || showVideo || showInfo;
 

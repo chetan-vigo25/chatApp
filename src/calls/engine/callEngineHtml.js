@@ -127,6 +127,20 @@ export const buildCallEngineHtml = () => `<!doctype html>
   #localWrap.solo .camoff-badge svg { width:52px; height:52px; }
   #localWrap.solo .camoff-text { font-size:16px; }
 
+  /* REMOTE camera-off overlay: the peer's circular profile photo centered on a
+     dark card over their tile (WhatsApp look). Sized relative to the tile so it
+     works both full-bleed and as the swapped corner PiP. */
+  .camoff-avatar {
+    width:42%; max-width:150px; aspect-ratio:1/1;
+    border-radius:50%; object-fit:cover; background:#3b4a54;
+  }
+  .camoff-letter {
+    width:42%; max-width:150px; aspect-ratio:1/1;
+    border-radius:50%; background:#3b4a54;
+    display:flex; align-items:center; justify-content:center;
+    color:#fff; font:600 34px/1 -apple-system, Roboto, system-ui, sans-serif;
+  }
+
   .hidden { display:none !important; }
 </style>
 </head>
@@ -615,6 +629,24 @@ export const buildCallEngineHtml = () => `<!doctype html>
           delete self._consumers[cid];
         }
       });
+      // Peer paused/resumed their CAMERA producer (camera off/on without
+      // closing it — the tile would just freeze). Relay so the UI can swap the
+      // tile for the avatar. Mic pauses filtered by kind, screens by streamKey.
+      var peerVideoPause = function (p, paused) {
+        var pid = p && p.producerId;
+        if (!pid) return;
+        Object.keys(self._consumers).forEach(function (cid) {
+          var c = self._consumers[cid];
+          if (c && c.producerId === pid && c.kind === 'video') {
+            var peerId = (c.appData && c.appData.peerId != null) ? String(c.appData.peerId) : null;
+            var streamKey = (c.appData && c.appData.streamKey) || peerId;
+            if (streamKey && String(streamKey).indexOf('#screen') >= 0) return;
+            self._emit('peervideo', { peerId: peerId, on: !paused });
+          }
+        });
+      };
+      s.on('producerPaused', function (p) { peerVideoPause(p, true); });
+      s.on('producerResumed', function (p) { peerVideoPause(p, false); });
       s.on('activeSpeaker', function (p) {
         self._emit('activespeaker', { peerId: p && p.peerId != null ? String(p.peerId) : null });
       });
@@ -1285,9 +1317,11 @@ export const buildCallEngineHtml = () => `<!doctype html>
       if (!producerId || self._consumed[producerId]) return Promise.resolve();
       if (!self._recvTransport || !self._device) return Promise.resolve();
       self._consumed[producerId] = true;
+      var consumedPaused = false; // producer already paused when we consumed (camera was off)
       return self._req('consume', {
         transportId: self._recvTransport.id, producerId: producerId, rtpCapabilities: self._device.rtpCapabilities
       }).then(function (params) {
+        consumedPaused = !!params.producerPaused;
         return self._recvTransport.consume({ id: params.id, producerId: params.producerId, kind: params.kind, rtpParameters: params.rtpParameters });
       }).then(function (consumer) {
         self._consumers[consumer.id] = consumer;
@@ -1304,6 +1338,11 @@ export const buildCallEngineHtml = () => `<!doctype html>
         return self._req('resumeConsumer', { consumerId: consumer.id }).then(function () {
           self._groupJoined[peerId] = true;
           self._log('consuming ' + consumer.track.kind + (isScreen ? ' (screen)' : '') + ' from ' + peerId);
+          // Peer's camera was ALREADY off when we consumed — no producerPaused
+          // event will come, so seed the state from the consume response.
+          if (consumer.kind === 'video' && !isScreen && consumedPaused) {
+            self._emit('peervideo', { peerId: peerId, on: false });
+          }
           self._emit('stream', { peerId: peerId, stream: stream, source: source });
         });
       }).catch(function (e) {
@@ -1689,6 +1728,8 @@ export const buildCallEngineHtml = () => `<!doctype html>
     var currentMedia = 'audio';// 'audio' | 'video' for the active call
     var tiles = {};            // peerId -> { wrap, video }
     var remoteStreams = {};    // peerId -> remote MediaStream (for the recording mix)
+    var peerMeta = {};         // peerId -> { name, avatar } (RN-provided, for the camoff overlay)
+    var remoteCamOff = {};     // peerId -> true while their camera producer is paused
     var currentSinkId = '';    // last applied audio output device id
     var wantSpeaker = false;   // RN-requested routing preference
 
@@ -1960,6 +2001,8 @@ export const buildCallEngineHtml = () => `<!doctype html>
       wrap.appendChild(v);
       remotes.appendChild(wrap);
       tiles[id] = { wrap: wrap, video: v };
+      // Their camera was already off before the tile existed (pause landed first).
+      applyRemoteCamOff(id);
       relayout();
       return tiles[id];
     }
@@ -1976,9 +2019,51 @@ export const buildCallEngineHtml = () => `<!doctype html>
       }
     }
 
+    // ---- REMOTE camera-off overlay (WhatsApp look) ----
+    // While a peer's camera producer is paused their tile would just freeze —
+    // draw their circular avatar (RN supplies it via the peerMeta cmd) or an
+    // initial-letter circle over the tile instead. Overlay is a child of the
+    // tile wrap, so it follows the tile through swap/PiP/removal for free.
+    function camoffLetterEl(meta) {
+      var d = document.createElement('div');
+      d.className = 'camoff-letter';
+      var n = (meta && meta.name) ? String(meta.name).trim() : '';
+      d.textContent = n ? n.charAt(0).toUpperCase() : '?';
+      return d;
+    }
+    function applyRemoteCamOff(peerId) {
+      var id = String(peerId || '');
+      var t = tiles[id];
+      if (!t) return;
+      var existing = t.wrap.querySelector('.camoff');
+      if (!remoteCamOff[id]) {
+        if (existing) { try { existing.remove(); } catch (e) {} }
+        return;
+      }
+      if (existing) return;
+      var ov = document.createElement('div');
+      ov.className = 'camoff';
+      var meta = peerMeta[id] || {};
+      if (meta.avatar) {
+        var img = document.createElement('img');
+        img.className = 'camoff-avatar';
+        img.alt = '';
+        img.onerror = function () {
+          try { ov.replaceChild(camoffLetterEl(meta), img); } catch (e) {}
+        };
+        img.src = meta.avatar;
+        ov.appendChild(img);
+      } else {
+        ov.appendChild(camoffLetterEl(meta));
+      }
+      t.wrap.appendChild(ov);
+    }
+
     function clearTiles() {
       Object.keys(tiles).forEach(removeTile);
       tiles = {};
+      remoteCamOff = {};
+      peerMeta = {};
       relayout();
     }
 
@@ -2236,6 +2321,18 @@ export const buildCallEngineHtml = () => `<!doctype html>
         localFacing = data.facingMode || localFacing;
         applyLocalMirror();
         post('camerachanged', { facingMode: localFacing });
+      });
+      // Peer camera paused/resumed (camera off/on mid-call) — overlay their
+      // avatar on THEIR tile only (self tile untouched), and relay to RN.
+      call.on('peervideo', function (data) {
+        data = data || {};
+        var pvId = data.peerId != null ? String(data.peerId) : null;
+        if (pvId) {
+          if (data.on === false) remoteCamOff[pvId] = true;
+          else delete remoteCamOff[pvId];
+          applyRemoteCamOff(pvId);
+        }
+        post('peervideo', { peerId: pvId, on: data.on !== false });
       });
       call.on('peerfacing', function (data) {
         data = data || {};
@@ -2509,6 +2606,22 @@ export const buildCallEngineHtml = () => `<!doctype html>
             if (call) Promise.resolve(call.switchCamera()).then(function (facing) {
               localFacing = facing || localFacing; applyLocalMirror();
             }).catch(function(){});
+            break;
+          }
+          case 'peerMeta': {
+            // 1:1 peer identity for the remote camera-off overlay.
+            if (msg.peerId != null) {
+              var pmId = String(msg.peerId);
+              peerMeta[pmId] = { name: msg.name || '', avatar: msg.avatar || '' };
+              // Rebuild an already-showing overlay so a late avatar upgrades
+              // the letter fallback.
+              var pmT = tiles[pmId];
+              if (pmT) {
+                var pmOv = pmT.wrap.querySelector('.camoff');
+                if (pmOv) { try { pmOv.remove(); } catch (e) {} }
+                applyRemoteCamOff(pmId);
+              }
+            }
             break;
           }
           case 'inviteToGroup': {

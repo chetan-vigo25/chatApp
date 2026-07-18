@@ -5584,14 +5584,9 @@ export default function ChatScreen({ navigation, route }) {
                   peer={chatData.peerUser}
                   chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
                 />
-              ) : (
-                <GroupCallButtons
-                  peers={groupCallPeers}
-                  groupId={chatData.chatId || chatData?._id || route?.params?.chatId}
-                  groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
-                  groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
-                />
-              )}
+              ) : null /* GROUP CALLS TEMPORARILY DISABLED — re-enable by restoring
+                 <GroupCallButtons peers={groupCallPeers} groupId={...}
+                 groupName={...} groupAvatar={...} /> here. */}
               {isChatMuted && (
                 <View style={{ marginRight: 8 }}>
                   <Ionicons name="notifications-off" size={20} color={theme.colors.placeHolderTextColor} />

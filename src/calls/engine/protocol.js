@@ -39,6 +39,11 @@ export const CMD = {
   SET_SPEAKER: 'setSpeaker',
   START_RECORDING: 'startRecording',
   STOP_RECORDING: 'stopRecording',
+  // 1:1 peer identity for in-stage placeholders ({ peerId, name, avatar }) —
+  // the WebView engine draws the peer's circular avatar over their tile while
+  // their camera is off (peervideo). The native engine renders tiles in RN
+  // (props on NativeVideoStage) and ignores this.
+  PEER_META: 'peerMeta',
   // Ask the SDK to restart ICE (renegotiate transport) after a network change —
   // e.g. wifi↔cellular — so a live call recovers its media path instead of hanging.
   RESTART_ICE: 'restartIce',
@@ -65,6 +70,9 @@ export const EVT = {
   PRESENCE: 'presence',
   CAMERACHANGED: 'camerachanged',
   PEERFACING: 'peerfacing',
+  // Peer paused/resumed their camera producer mid-call (camera off/on without
+  // closing it) — { peerId, on }. The UI swaps the frozen tile for the avatar.
+  PEER_VIDEO: 'peervideo',
   // SFU active-speaker relay — { peerId } of whoever is currently talking (null
   // when nobody is). Both engines already emit it; the group UI highlights the tile.
   ACTIVE_SPEAKER: 'activeSpeaker',

@@ -107,7 +107,6 @@ export default function StatusCustomise({ navigation, route }) {
 
   const currentItem   = items[selectedIndex];
   const currentFilter = FILTERS.find(f => f.id === (filters[selectedIndex] || 'none')) || FILTERS[0];
-  const currentCaption = captions[selectedIndex] || '';
   const currentOverlay = textOverlays[selectedIndex] || '';
 
   // ── Fetch OG on mount if link ─────────────────────────────────────────
@@ -254,15 +253,9 @@ export default function StatusCustomise({ navigation, route }) {
         ) : null}
       </View>
 
-      {/* Caption input (floated above the toolbar) */}
-      <TextInput
-        style={styles.floatCaption}
-        placeholder="Add a caption…"
-        placeholderTextColor="rgba(255,255,255,0.5)"
-        value={currentCaption}
-        onChangeText={v => setCaptions(c => ({ ...c, [selectedIndex]: v }))}
-        maxLength={500}
-      />
+      {/* Caption input intentionally REMOVED from the Customise screen — the
+          caption is added on the next screen (StatusPreview). Filters + the
+          text-overlay tool stay here. */}
 
       {/* Toolbar */}
       <View style={styles.toolbar}>
@@ -288,7 +281,7 @@ export default function StatusCustomise({ navigation, route }) {
             onPress={() => {
               Alert.prompt
                 ? Alert.prompt('Add text overlay', '', v => setTextOverlays(t => ({ ...t, [selectedIndex]: v })))
-                : Alert.alert('Text overlay', 'Use the caption field below for text.');
+                : Alert.alert('Text overlay', 'You can add a caption on the next screen.');
             }}
           >
             <MaterialCommunityIcons name="format-text" size={22} color="#fff" />

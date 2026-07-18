@@ -14,6 +14,10 @@ export const ENDPOINTS = {
 export const SOCKET_EVENTS = {
   LINK_REQUEST: 'device:link:request',
   LINK_SUCCESS: 'device:link:success',
+  // A linked device logged out / was unlinked elsewhere (e.g. the web session
+  // logged out) — the backend broadcasts this to the account's OTHER devices so
+  // this list drops it in realtime instead of waiting for a refetch.
+  DEVICE_UNLINKED: 'device:unlinked',
   SOCKET_ERROR: 'socket:error',
 };
 
@@ -35,7 +39,7 @@ export const ERROR_MESSAGES = {
   [ERROR_CODES.SESSION_INVALID_STATUS]: 'This QR code has already been used.',
   [ERROR_CODES.USER_INACTIVE]: 'Your account is inactive or blocked. Please contact support.',
   [ERROR_CODES.INVALID_SIGNATURE]: 'Device verification failed. Please try again.',
-  [ERROR_CODES.MAX_DEVICES_REACHED]: 'You have reached the maximum of 5 linked devices. Please unlink a device first.',
+  [ERROR_CODES.MAX_DEVICES_REACHED]: 'You have reached the maximum of 4 linked devices. Please remove a previous session to link a new one.',
   [ERROR_CODES.DEVICE_NOT_FOUND]: 'Device not found. It may have already been unlinked.',
 };
 

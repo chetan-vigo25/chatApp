@@ -410,6 +410,15 @@ class NativeCallEngine {
       if (data && data.streamKey) registry.refreshRemote(String(data.streamKey));
     });
 
+    // Peer camera paused/resumed (producer pause — the tile would just freeze).
+    // Relay to RN so CallOverlay can cover the stage with the peer's avatar.
+    sdk.on('peervideo', (data = {}) => {
+      this._post(EVT.PEER_VIDEO, {
+        peerId: data.peerId != null ? String(data.peerId) : null,
+        on: data.on !== false,
+      });
+    });
+
     sdk.on('mediaupgraded', () => {
       this._currentMedia = 'video';
       this._camWanted = true;

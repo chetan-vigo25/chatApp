@@ -64,9 +64,22 @@ export default function useDeviceLinking() {
       console.log(`${TAG} <<<< device:link:request (echo) >>>>`, JSON.stringify(data, null, 2));
     };
 
+    // A linked device logged out / was unlinked elsewhere — drop it from the
+    // list in realtime so a logged-out web session disappears immediately
+    // (no manual refresh needed).
+    const onDeviceUnlinked = (data) => {
+      console.log(`${TAG} <<<< device:unlinked >>>>`, JSON.stringify(data, null, 2));
+      const goneId = data?.deviceId != null ? String(data.deviceId) : null;
+      if (!goneId) return;
+      setLinkedDevices((prev) => prev.filter(
+        (d) => String(d.deviceId || d._id || d.sessionId || '') !== goneId
+      ));
+    };
+
     socket.on(SOCKET_EVENTS.LINK_SUCCESS, onLinkSuccess);
     socket.on(SOCKET_EVENTS.SOCKET_ERROR, onSocketError);
     socket.on(SOCKET_EVENTS.LINK_REQUEST, onDeviceLinkRequest);
+    socket.on(SOCKET_EVENTS.DEVICE_UNLINKED, onDeviceUnlinked);
 
     // Debug catch-all — only if socket.onAny exists (socket.io-client v4+)
     let debugOnAny = null;
@@ -85,6 +98,7 @@ export default function useDeviceLinking() {
         socket.off(SOCKET_EVENTS.LINK_SUCCESS, onLinkSuccess);
         socket.off(SOCKET_EVENTS.SOCKET_ERROR, onSocketError);
         socket.off(SOCKET_EVENTS.LINK_REQUEST, onDeviceLinkRequest);
+        socket.off(SOCKET_EVENTS.DEVICE_UNLINKED, onDeviceUnlinked);
         if (debugOnAny && typeof socket.offAny === 'function') {
           socket.offAny(debugOnAny);
         }

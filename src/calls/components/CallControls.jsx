@@ -9,9 +9,12 @@ import { useTheme } from '../../contexts/ThemeContext';
  * large rounded card):
  *
  *   voice → [ Speaker ] [ Video ] [ Mute ]
- *           [  Share  ] [  End  ]
- *   video → [ Flip ] [ Camera ] [ Mute ]
- *           [ Speaker ] [ Share ] [ End ]
+ *           [  End  ]
+ *   video → [ Flip ] [ Camera ] [ Mute ] [ Speaker ] [ End ]
+ *           (single compact row, no labels — WhatsApp video-call style)
+ *
+ * Screen share is temporarily hidden from both layouts (props still accepted
+ * so callers don't break) — re-add shareBtn to the rows to bring it back.
  *
  * A translucent chip is the idle state; a filled chip is the toggled-active
  * state (muted, speaker on, camera off, sharing). The red round button always
@@ -23,21 +26,25 @@ import { useTheme } from '../../contexts/ThemeContext';
  * card then re-renders in the video layout. Share = screen share; where the
  * engine can't capture, tapping surfaces a clear "not supported" alert.
  */
-function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, palette, onPress }) {
+function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, compact, palette, onPress }) {
   const Icon = lib === 'mci' ? MaterialIcons : Ionicons;
   const bg = danger ? '#EA0038' : active ? palette.activeBg : palette.idleBg;
   let color = danger ? '#ffffff' : active ? palette.activeIcon : palette.idleIcon;
   if (disabled) color = palette.disabledIcon;
   return (
-    <View style={styles.btnWrap}>
+    <View style={compact ? styles.btnWrapCompact : styles.btnWrap}>
       <TouchableOpacity
         activeOpacity={disabled ? 1 : 0.8}
         onPress={disabled ? undefined : onPress}
-        style={[styles.circle, danger && styles.circleDanger, { backgroundColor: bg }]}
+        style={[
+          compact ? styles.circleCompact : styles.circle,
+          danger && (compact ? styles.circleDangerCompact : styles.circleDanger),
+          { backgroundColor: bg },
+        ]}
       >
-        <Icon name={icon} size={danger ? 30 : 24} color={color} />
+        <Icon name={icon} size={compact ? (danger ? 26 : 22) : (danger ? 30 : 24)} color={color} />
       </TouchableOpacity>
-      {!!label && (
+      {!!label && !compact && (
         <Text style={[styles.label, { color: palette.label }]} numberOfLines={1}>{label}</Text>
       )}
     </View>
@@ -85,37 +92,29 @@ export default function CallControls({
       label: 'rgba(11,20,26,0.7)',
     };
 
-  const speakerBtn = (
+  const speakerBtn = (compact) => (
     <CircleButton
       icon={speakerOn ? 'volume-high' : 'volume-medium'}
       active={speakerOn}
       disabled={!speakerSupported}
       label={speakerSupported ? 'Speaker' : 'Auto'}
+      compact={compact}
       palette={palette}
       onPress={onToggleSpeaker}
     />
   );
-  const muteBtn = (
+  const muteBtn = (compact) => (
     <CircleButton
       icon={micOn ? 'mic' : 'mic-off'}
       active={!micOn}
       label={micOn ? 'Mute' : 'Unmute'}
+      compact={compact}
       palette={palette}
       onPress={onToggleMic}
     />
   );
-  const shareBtn = (
-    <CircleButton
-      icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
-      lib="mci"
-      active={screenSharing}
-      label={screenSharing ? 'Sharing' : 'Share'}
-      palette={palette}
-      onPress={onToggleScreenShare}
-    />
-  );
-  const endBtn = (
-    <CircleButton icon="call-end" lib="mci" danger label="End" palette={palette} onPress={onHangup} />
+  const endBtn = (compact) => (
+    <CircleButton icon="call-end" lib="mci" danger label="End" compact={compact} palette={palette} onPress={onHangup} />
   );
 
   return (
@@ -125,36 +124,30 @@ export default function CallControls({
       style={[styles.card, { backgroundColor: palette.cardBg }]}
     >
       {isVideo ? (
-        <>
-          <View style={styles.row}>
-            <CircleButton icon="camera-reverse" label="Flip" palette={palette} onPress={onSwitchCamera} />
-            <CircleButton
-              icon={cameraOn ? 'videocam' : 'videocam-off'}
-              active={!cameraOn}
-              label={cameraOn ? 'Camera' : 'Camera off'}
-              palette={palette}
-              onPress={onToggleCamera}
-            />
-            {muteBtn}
-          </View>
-          <View style={styles.row}>
-            {speakerBtn}
-            {shareBtn}
-            {endBtn}
-          </View>
-        </>
+        <View style={styles.rowCompact}>
+          <CircleButton icon="camera-reverse" compact palette={palette} onPress={onSwitchCamera} />
+          <CircleButton
+            icon={cameraOn ? 'videocam' : 'videocam-off'}
+            active={!cameraOn}
+            compact
+            palette={palette}
+            onPress={onToggleCamera}
+          />
+          {muteBtn(true)}
+          {speakerBtn(true)}
+          {endBtn(true)}
+        </View>
       ) : (
         <>
           <View style={styles.row}>
-            {speakerBtn}
+            {speakerBtn(false)}
             {/* Camera ON upgrades the voice call to a video call (WhatsApp
                 style — the card then switches to the video layout). */}
             <CircleButton icon="videocam" label="Video" palette={palette} onPress={onToggleCamera} />
-            {muteBtn}
+            {muteBtn(false)}
           </View>
           <View style={styles.row}>
-            {shareBtn}
-            {endBtn}
+            {endBtn(false)}
           </View>
         </>
       )}
@@ -179,13 +172,28 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     width: '100%',
   },
+  rowCompact: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    width: '100%',
+    paddingHorizontal: 4,
+  },
   btnWrap: { alignItems: 'center', flexShrink: 1, minWidth: 84 },
+  btnWrapCompact: { alignItems: 'center' },
   circle: {
     width: 56, height: 56, borderRadius: 28,
     alignItems: 'center', justifyContent: 'center',
   },
+  circleCompact: {
+    width: 44, height: 44, borderRadius: 22,
+    alignItems: 'center', justifyContent: 'center',
+  },
   circleDanger: {
     width: 60, height: 60, borderRadius: 30,
+  },
+  circleDangerCompact: {
+    width: 50, height: 50, borderRadius: 25,
   },
   label: {
     fontFamily: 'Roboto-Regular',

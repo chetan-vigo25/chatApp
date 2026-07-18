@@ -10,7 +10,7 @@ import CallAvatar from './CallAvatar';
  * Incoming-call screen body — WhatsApp style:
  *   top    → caller NAME (big, centered) + app/call-type line (+ number if known)
  *   middle → large round avatar
- *   bottom → [ Decline ]   [ animated SWIPE-UP-TO-ACCEPT ]   [ Message ]
+ *   bottom → [ Decline ]   [ animated SWIPE-UP-TO-ACCEPT ]
  *
  * The green Accept button both TAPS and SWIPES UP (drag past the threshold =
  * accept), with three chevrons rippling upward above it — the WhatsApp
@@ -21,15 +21,13 @@ import CallAvatar from './CallAvatar';
 const SWIPE_ACCEPT_DY = -70; // drag this far up = accept
 
 export default function IncomingCallCard({
-  peer, displayName, media, onAccept, onReject, onMessage,
+  peer, displayName, media, onAccept, onReject,
 }) {
   const isVideo = media === 'video';
   const { theme, isDarkMode } = useTheme();
   const c = theme.colors;
   const onBg = isDarkMode ? '#FFFFFF' : c.primaryTextColor;
   const onBgSoft = isDarkMode ? 'rgba(255,255,255,0.8)' : c.secondaryTextColor;
-  const sideBtnBg = isDarkMode ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.07)';
-  const sideBtnIcon = isDarkMode ? '#FFFFFF' : c.primaryTextColor;
 
   // ---- swipe-up-to-accept ----
   const dragY = useRef(new Animated.Value(0)).current;
@@ -132,17 +130,6 @@ export default function IncomingCallCard({
           </Animated.View>
           <Text style={[styles.actionLabel, { color: onBgSoft }]}>Swipe up to accept</Text>
         </View>
-
-        <View style={styles.actionItem}>
-          <TouchableOpacity
-            activeOpacity={0.85}
-            onPress={onMessage}
-            style={[styles.sideBtn, { backgroundColor: sideBtnBg }]}
-          >
-            <MaterialIcons name="chat" size={26} color={sideBtnIcon} />
-          </TouchableOpacity>
-          <Text style={[styles.actionLabel, { color: onBgSoft }]}>Message</Text>
-        </View>
       </View>
     </View>
   );
@@ -165,7 +152,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'flex-end',
     width: '100%',
-    paddingHorizontal: 36,
+    paddingHorizontal: 48,
   },
   actionItem: { alignItems: 'center', gap: 10, minWidth: 86 },
   chevrons: { alignItems: 'center', marginBottom: 2, gap: -6 },

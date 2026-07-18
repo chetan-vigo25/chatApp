@@ -1,5 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
-import { DeviceEventEmitter } from 'react-native';
+import { AppState, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getSocket, isSocketConnected, subscribeSocketState } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
@@ -2530,6 +2530,10 @@ export function RealtimeChatProvider({ children }) {
   currentUserIdRef.current = state.currentUserId;
   const stateRef = useRef(state);
   stateRef.current = state;
+  // Bridge: hydrateChats is declared AFTER attachSocketListeners (which needs
+  // it for the connect/foreground chat-list reconcile). Kept current via the
+  // assignment right after hydrateChats' definition.
+  const hydrateChatsRef = useRef(null);
 
   const clearTypingTimer = useCallback((chatId) => {
     const timer = typingTimersRef.current[chatId];
@@ -3496,7 +3500,40 @@ export function RealtimeChatProvider({ children }) {
     // single round-trip. Covers the offline-then-online case the user
     // described (User B was offline; new messages should sync into SQLite
     // and appear instantly on reopen).
+    // Chat-LIST reconcile: the seq catchup below only covers chats we already
+    // know about — a BRAND-NEW chat (first message from an unknown sender)
+    // whose chat:list:update was missed while the app was killed/frozen would
+    // never appear until a full relogin. Pull the server's chat-list summary
+    // over the socket and merge it (HYDRATE_CHATS + ChatCache.setChats both
+    // merge, never wipe) so the list shows every chat with its latest recent
+    // message the moment it's opened. Throttled — this walks summaries
+    // server-side, so once per 30s is plenty.
+    let lastListReconcileAt = 0;
+    const reconcileChatList = () => {
+      const now = Date.now();
+      if (now - lastListReconcileAt < 30000) return;
+      lastListReconcileAt = now;
+      try {
+        let settled = false;
+        const finish = (response) => {
+          if (settled) return;
+          settled = true;
+          try { socket.off('chat:list:response', finish); } catch {}
+          clearTimeout(timer);
+          const payload = response?.data || response || {};
+          const chats = Array.isArray(payload?.chats) ? payload.chats : null;
+          if (chats && chats.length > 0) {
+            try { hydrateChatsRef.current?.(chats); } catch {}
+          }
+        };
+        const timer = setTimeout(() => finish(null), 20000);
+        socket.on('chat:list:response', finish);
+        socket.emit('chat:list', {}, finish);
+      } catch { /* best-effort */ }
+    };
+
     const onConnectCatchup = async () => {
+      reconcileChatList();
       try {
         // Source the chat list from BOTH the persistent DB and the live in-memory
         // map (via stateRef — NOT the stale `state` captured when this effect was
@@ -3633,6 +3670,23 @@ export function RealtimeChatProvider({ children }) {
     };
     socket.on('connect', onConnectCatchup);
     if (socket.connected) onConnectCatchup();
+    // Foreground catchup: coming back to the app with the socket still
+    // "connected" (the OS froze JS but the TCP conn survived) fires NO
+    // reconnect event — any message:new dropped while frozen would stay
+    // missing until the next real reconnect. Run the same delta catchup on
+    // every background→active transition (throttled; it's a cheap no-op when
+    // nothing was missed) so the chat list is fresh the moment it's opened.
+    let lastFgCatchupAt = 0;
+    let prevAppState = AppState.currentState;
+    const fgCatchupSub = AppState.addEventListener('change', (next) => {
+      const cameForeground = /inactive|background/.test(prevAppState || '') && next === 'active';
+      prevAppState = next;
+      if (!cameForeground || !socket.connected) return;
+      const now = Date.now();
+      if (now - lastFgCatchupAt < 5000) return;
+      lastFgCatchupAt = now;
+      onConnectCatchup();
+    });
     // Hydrate mutes from the server on (re)connect — mute is a server-owned
     // per-user setting; mute:sync:response reconciles the local chat rows.
     const onConnectMuteSync = () => { try { socket.emit('mute:sync'); } catch { /* non-fatal */ } };
@@ -4472,6 +4526,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
       () => socket.off('connect', onConnectCatchup),
+      () => { try { fgCatchupSub.remove(); } catch (_) { /* */ } },
       () => socket.off('connect', onConnectMuteSync),
       () => socket.off('message:delivered', onMessageDelivered),
       () => socket.off('message:seen', onMessageSeen),
@@ -4819,6 +4874,7 @@ export function RealtimeChatProvider({ children }) {
       console.warn('[RealtimeChat] SQLite sync after hydrate error:', err);
     }
   }, [subscribePresenceForChats]);
+  hydrateChatsRef.current = hydrateChats;
 
   const deferDispatch = useCallback((action) => {
     // Guard against render-phase updates from consuming components.

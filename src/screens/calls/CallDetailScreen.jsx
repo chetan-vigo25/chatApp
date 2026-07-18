@@ -120,7 +120,7 @@ export default function CallDetailScreen() {
   const { theme } = useTheme();
   const navigation = useNavigation();
   const route = useRoute();
-  const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall } = useCall();
+  const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
   const { resolveName, directory } = useContactDirectory();
 
   const {
@@ -325,22 +325,30 @@ export default function CallDetailScreen() {
               <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Message</Text>
             </TouchableOpacity>
           ) : null}
-          <TouchableOpacity
-            style={[styles.actionBtn, { backgroundColor: c.surface }]}
-            activeOpacity={0.75}
-            onPress={() => redial('audio')}
-          >
-            <Ionicons name="call" size={21} color={c.themeColor} />
-            <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Audio</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.actionBtn, { backgroundColor: c.surface }]}
-            activeOpacity={0.75}
-            onPress={() => redial('video')}
-          >
-            <Ionicons name="videocam" size={21} color={c.themeColor} />
-            <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Video</Text>
-          </TouchableOpacity>
+          {/* GROUP CALLS TEMPORARILY DISABLED — 1-1 redial only. Re-enable
+              group redial by dropping the `!isGroup &&` guards below. */}
+          {!isGroup ? (
+            <TouchableOpacity
+              style={[styles.actionBtn, { backgroundColor: c.surface }, callBusy && { opacity: 0.4 }]}
+              activeOpacity={0.75}
+              disabled={callBusy}
+              onPress={() => redial('audio')}
+            >
+              <Ionicons name="call" size={21} color={c.themeColor} />
+              <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Audio</Text>
+            </TouchableOpacity>
+          ) : null}
+          {!isGroup ? (
+            <TouchableOpacity
+              style={[styles.actionBtn, { backgroundColor: c.surface }, callBusy && { opacity: 0.4 }]}
+              activeOpacity={0.75}
+              disabled={callBusy}
+              onPress={() => redial('video')}
+            >
+              <Ionicons name="videocam" size={21} color={c.themeColor} />
+              <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Video</Text>
+            </TouchableOpacity>
+          ) : null}
           {!isGroup && peerId ? (
             <TouchableOpacity
               style={[styles.actionBtn, { backgroundColor: c.surface }]}
@@ -440,9 +448,10 @@ export default function CallDetailScreen() {
                     </View>
                     <TouchableOpacity
                       onPress={() => redial(call.media)}
+                      disabled={callBusy}
                       activeOpacity={0.6}
                       hitSlop={styles.hit}
-                      style={styles.eventCallBtn}
+                      style={[styles.eventCallBtn, callBusy && { opacity: 0.4 }]}
                     >
                       <Ionicons
                         name={call.media === 'video' ? 'videocam-outline' : 'call-outline'}

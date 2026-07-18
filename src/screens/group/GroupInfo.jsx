@@ -533,24 +533,8 @@ export default function GroupInfo({ navigation, route }) {
             <Ionicons name="chatbubble" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Message</Text>
           </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => startGroupCall('audio')}
-            disabled={callBusy}
-            activeOpacity={0.7}
-            style={[styles.quickBtn, { backgroundColor: cardBg }, callBusy && styles.quickBtnDisabled]}
-          >
-            <Ionicons name="call" size={21} color={theme.colors.themeColor} />
-            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Audio</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => startGroupCall('video')}
-            disabled={callBusy}
-            activeOpacity={0.7}
-            style={[styles.quickBtn, { backgroundColor: cardBg }, callBusy && styles.quickBtnDisabled]}
-          >
-            <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
-            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Video</Text>
-          </TouchableOpacity>
+          {/* GROUP CALLS TEMPORARILY DISABLED — re-enable by restoring the
+              Audio + Video quick-action buttons here (onPress startGroupCall). */}
         </View>
 
         {/* ═══ DESCRIPTION CARD ═══ */}

@@ -8,6 +8,7 @@ import {
 import Constants from 'expo-constants';
 import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
 import { useCameraPermissions } from 'expo-camera';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as ScreenCapture from 'expo-screen-capture';
 import { MaterialIcons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -93,6 +94,20 @@ const getRingTimeoutMs = () => clampRingSec(getServerRingDurationSec() || ENV_RI
 // on "Connecting…" forever. 30s ≈ WhatsApp's "couldn't connect" window.
 const CONNECT_TIMEOUT_MS = 30000;
 
+// How long to wait for the engine's `localstream` (getUserMedia succeeded)
+// before declaring the mic/camera unreachable. Was 10s — too tight: a cold
+// mic, a deferred video-camera capture (background/CallKit answer), a loaded
+// device, or a slow media socket routinely exceed 10s on a HEALTHY call, so
+// the old value killed calls right at accept/dial. 20s keeps the net without
+// the false kill; the connect watchdog (30s) still ends a truly dead call.
+const MEDIA_WATCHDOG_MS = 20000;
+
+// Same-peer redial guard: after we decline/miss a 1:1 UN-answered, auto-decline
+// a re-ring from the SAME peer for this long (the caller's redial loop mints a
+// fresh callId the ids-guard can't know, and re-rings within ~1-2s). Kept SHORT
+// so a genuine deliberate call-back rings — 8s ate too many real callbacks.
+const PEER_REDIAL_GUARD_MS = 4000;
+
 // After the media layer drops mid-call (network blip / ICE failed), how long to
 // wait for it to recover (auto ICE-restart + the SDK's own reconnect) before
 // giving up and ending the call as "Connection lost". 45s: strictly LONGER than
@@ -149,6 +164,11 @@ export const CallProvider = ({ children }) => {
   const myName = user?.fullName || user?.name || '';
 
   const [state, dispatch] = useReducer(callReducer, initialCallState);
+  // Flips the instant a call-start begins (before the async permission/connect
+  // awaits and the START_OUTGOING dispatch). Folded into `callBusy` so EVERY
+  // call button in the app dims immediately on the first tap, instead of only
+  // after the outgoing state commits. Cleared when startCall settles/aborts.
+  const [starting, setStarting] = useState(false);
   const [engineReady, setEngineReady] = useState(false);
   const [presenceMap, setPresenceMap] = useState({}); // { userId: bool }
   // Whether the platform supports app-controlled audio output routing (Android
@@ -164,6 +184,14 @@ export const CallProvider = ({ children }) => {
   const stateRef = useRef(state);
   const engineReadyRef = useRef(false);
   const endedRef = useRef(false);
+  // Synchronous re-entrancy guard for startCall. `callBusy`/`stateRef.status`
+  // only flip to non-IDLE AFTER the START_OUTGOING dispatch commits — but
+  // startCall has several `await`s (permissions, audio session, connect) BEFORE
+  // that dispatch, during which a rapid double-tap on ANY call button (chat
+  // header, profile sheet, call logs, chat list, …) would pass the async guard
+  // twice and fire two dials. This ref is set the instant startCall begins and
+  // cleared when it finishes/aborts, so a second tap in that window is dropped.
+  const startingRef = useRef(false);
   const connectingRef = useRef(false);
   const htmlReadyRef = useRef(false);      // engine WebView HTML/SDK loaded
   const pendingConnectRef = useRef(null);  // { token, url } queued before HTML was ready
@@ -188,6 +216,15 @@ export const CallProvider = ({ children }) => {
   // can deliver a late 'incoming' for it; auto-decline instead of ghost-re-ringing.
   const recentEndedRef = useRef({ ids: [], ts: 0 });
   const pushAcceptPendingRef = useRef(false); // Accept tapped on a call push → answer once INCOMING is committed
+  // The call THIS device just accepted (id + ts). A `call:cancelled-elsewhere`
+  // with reason answered_elsewhere for this same call is our OWN win echoing on
+  // a duplicate socket — it must not end the call. deviceIdRef is loaded async
+  // from AsyncStorage and can still be null on a cold-start push/CallKit accept
+  // (so the winnerDeviceId guard can't fire), and the call hasn't reached
+  // ACTIVE+remoteJoined yet (so that guard can't fire either) — this ref is the
+  // reliable third discriminator. Cleared when we genuinely lose (accept ack
+  // says answeredElsewhere) or the call ends.
+  const myAcceptedCallRef = useRef({ id: null, ts: 0 });
   // CallKit End tapped BEFORE the ring state committed (cold boot: decline on
   // the lock-screen CallKit UI while the VoIP replay / pending pull is still in
   // flight). Timestamp (not bool) so the flush effect only honors a FRESH
@@ -255,6 +292,25 @@ export const CallProvider = ({ children }) => {
     if (state.status && state.status !== CALL_STATUS.IDLE && state.status !== CALL_STATUS.ENDED) {
       Keyboard.dismiss();
     }
+  }, [state.status]);
+
+  // ---- keep the screen ON while a call is live (iOS + Android) ----
+  // Ringing (either direction) or connected: the device must not dim/auto-lock
+  // mid-call, WhatsApp-style. Tagged so it never releases someone else's
+  // keep-awake hold (e.g. dev mode's). The effect cleanup releases it on every
+  // status change/unmount — activation right after is idempotent — so ENDED/
+  // IDLE always land with the hold released and the normal screen timeout
+  // back. The proximity sensor's screen-off during earpiece voice calls is an
+  // OS behavior on top and stays untouched.
+  useEffect(() => {
+    const live = state.status === CALL_STATUS.OUTGOING
+      || state.status === CALL_STATUS.INCOMING
+      || state.status === CALL_STATUS.ACTIVE;
+    if (!live) return undefined;
+    try { activateKeepAwakeAsync('call').catch(() => {}); } catch (_) {}
+    return () => {
+      try { deactivateKeepAwake('call').catch(() => {}); } catch (_) {}
+    };
   }, [state.status]);
 
   // ---- active-call ongoing foreground service (Android) ----
@@ -914,6 +970,7 @@ export const CallProvider = ({ children }) => {
     // a leaked flag would auto-accept the NEXT incoming call without a tap.
     pushAcceptPendingRef.current = false;
     nativeEndPendingRef.current = 0;
+    myAcceptedCallRef.current = { id: null, ts: 0 };
     clearRingTimeout();
     clearMediaWatchdog();
     clearConnectWatchdog();
@@ -1181,10 +1238,16 @@ export const CallProvider = ({ children }) => {
       mediaWatchdogRef.current = null;
       const snap = stateRef.current;
       if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
-      if (__DEV__) console.log('[CALL] media watchdog — no localstream in 10s (getUserMedia/mic blocked or call service unreachable)');
+      // Only a genuinely stuck capture should die here. A cold mic, a video
+      // call whose camera capture is deferred (background/CallKit answer →
+      // retried on foreground), a device under load, or a slow media socket
+      // can legitimately take >10s — the old 10s cut killed healthy calls at
+      // accept/dial. 20s keeps the safety net without the false kill; the 30s
+      // connect watchdog still backstops a truly dead call.
+      if (__DEV__) console.log('[CALL] media watchdog — no localstream in 20s (getUserMedia/mic blocked or call service unreachable)');
       Alert.alert('Call problem', 'Could not access the microphone. Check the app’s microphone permission and try again.');
       finalizeEnd('failed', 'Microphone unavailable');
-    }, 10000);
+    }, MEDIA_WATCHDOG_MS);
   }, [clearMediaWatchdog, finalizeEnd]);
 
   // Arm the post-answer connect watchdog. Fires once if an ANSWERED call hasn't
@@ -1334,15 +1397,17 @@ export const CallProvider = ({ children }) => {
           // caller's redial loop can re-ring with a FRESH callId (the decline
           // deleted the old record) for ~1 tick before their app processes our
           // rejection — auto-decline it, it's the same call, not a new one. The
-          // window is short (8s) so a genuine deliberate call-back still rings.
-          // Only while nothing else is going on: if a NEW backend ring from the
-          // same peer already built INCOMING state, this engine event is its
-          // reconcile — never decline that.
+          // window is SHORT (PEER_REDIAL_GUARD_MS) so a genuine deliberate
+          // call-back still rings — the ghost re-ring from the caller's redial
+          // loop lands within ~1-2s, a real callback is slower. Only while
+          // nothing else is going on: if a NEW backend ring from the same peer
+          // already built INCOMING state, this engine event is its reconcile —
+          // never decline that.
           const fromId = payload?.from?.id != null ? String(payload.from.id) : null;
           if (fromId && !payload?.isGroup
             && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
             && re.peerId === fromId
-            && Date.now() - re.ts < 8000) {
+            && Date.now() - re.ts < PEER_REDIAL_GUARD_MS) {
             if (__DEV__) console.log('[CALL][APP] redial-loop re-ring from just-declined peer — auto-declining', payload?.callId);
             if (payload?.callId) sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
             break;
@@ -1458,6 +1523,18 @@ export const CallProvider = ({ children }) => {
         // A VISUAL feed arrived (peer's camera or screen share) while this side
         // is on the audio UI → upgrade to the video stage so it's visible.
         if (payload?.video) upgradeUiToVideo(false);
+        // WebView engine: hand the stage the 1:1 peer's identity so it can draw
+        // their circular avatar over THEIR tile while their camera is off
+        // (peervideo). Idempotent; the native engine ignores this cmd (its
+        // tiles get the peer via NativeVideoStage props instead).
+        if (!snap.isGroup && snap.peer?.id) {
+          sendCmd({
+            cmd: CMD.PEER_META,
+            peerId: String(snap.peer.id),
+            name: snap.peer.name || '',
+            avatar: snap.peer.avatar || '',
+          });
+        }
         // CallKit knows this call by its SIGNALING id (displayIncomingCall / the
         // VoIP push's registered uuid) — snap.callId is the later WebRTC id, whose
         // uuidForCall would mint a fresh uuid CallKit has never seen (no-op).
@@ -1539,6 +1616,15 @@ export const CallProvider = ({ children }) => {
         dispatch({ type: ACT.CAMERA_CHANGED, facingMode: payload?.facingMode });
         break;
       }
+      // Peer's camera paused/resumed mid-call (camera off/on — the video tile
+      // would just freeze). 1:1 only: CallOverlay covers the stage with the
+      // peer's avatar while it's off, WhatsApp style. undefined = camera on.
+      case 'peervideo': {
+        if (!stateRef.current.isGroup) {
+          dispatch({ type: ACT.SET_FLAG, key: 'remoteCameraOn', value: payload?.on !== false });
+        }
+        break;
+      }
       case 'peerfacing': break;
       // Whoever the SFU currently hears. Both engines relayed this already, but
       // nothing consumed it, so the group grid could never show who was talking.
@@ -1589,15 +1675,17 @@ export const CallProvider = ({ children }) => {
         Alert.alert('Camera', payload?.message || 'Could not start the camera.');
         break;
       }
-      // The engine's accept failed at the server (e.g. the caller cancelled in
-      // the same instant, or the pending call is gone). Fail fast instead of
-      // sitting on "Connecting…" until the 30s connect watchdog.
+      // The engine's accept failed (the retrying accept exhausted its tries).
+      // Do NOT end the call instantly: on a reconnecting / half-open media
+      // socket the engine can throw `not connected` 3× within ~4.5s on an
+      // otherwise-HEALTHY answered call — killing it here was a "answer →
+      // instantly dead" bug. A GENUINE dead accept (caller cancelled, pending
+      // gone) still ends promptly via the server's call:ended/cancelled signal;
+      // when no such signal comes, the 30s connect watchdog (already armed at
+      // accept) ends it cleanly. Either way the call gets its chance to connect.
       case 'cmdError': {
         if (payload?.cmd === 'accept') {
-          const snap = stateRef.current;
-          if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED && !snap.remoteJoined) {
-            finalizeEnd('failed', 'Could not connect the call');
-          }
+          if (__DEV__) console.log('[CALL][APP] cmdError:accept — letting connect watchdog / server signal decide (no instant end)');
         }
         break;
       }
@@ -1745,6 +1833,16 @@ export const CallProvider = ({ children }) => {
       if (__DEV__) console.log('[CALL][APP][startCall] ABORT — already in a call', { status: stateRef.current.status });
       return;
     }
+    // SYNCHRONOUS re-entrancy guard — blocks a second tap that lands during the
+    // pre-dispatch await window (permissions/connect), when the async guards
+    // above still read IDLE. Cleared in the finally below on every exit path.
+    if (startingRef.current) {
+      if (__DEV__) console.log('[CALL][APP][startCall] ABORT — a start is already in progress (double-tap)');
+      return;
+    }
+    startingRef.current = true;
+    setStarting(true); // instant visual disable on all call buttons (via callBusy)
+    try {
 
     // Mic/camera permission MUST be granted before the SDK's getUserMedia runs,
     // else startCall hangs (no callId, no audio).
@@ -1883,6 +1981,13 @@ export const CallProvider = ({ children }) => {
     peers.forEach((p) => {
       notifyIncomingCall({ peerId: p.id, media, callId: signalId });
     });
+    } finally {
+      // Release the synchronous start-lock. By now either the call is live
+      // (state.status === OUTGOING → callBusy/stateRef guard blocks re-taps) or
+      // we aborted (back to IDLE), so it's safe to allow the next start.
+      startingRef.current = false;
+      setStarting(false);
+    }
   }, [ensureConnected, ensureMediaPermissions, configureIOSAudioSession, myId, sendCmd, startRinging, stopRinging, armRingTimeout, armMediaWatchdog, armGroupRingSweep]);
 
   const startAudioCall = useCallback((peer, chatId) => startCall(peer, 'audio', { chatId }), [startCall]);
@@ -1896,6 +2001,15 @@ export const CallProvider = ({ children }) => {
     const snap = stateRef.current;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 1 accept tapped ═════', { status: snap.status, callId: snap.callId, signalId: snap.signalId, media: snap.media, isGroup: snap.isGroup, peer: snap.peer, awaitingEngine: snap.awaitingEngine });
     if (snap.status !== CALL_STATUS.INCOMING) return;
+    // The user TAPPED accept — the ring is over. Stop the no-answer timer and
+    // the ringtone RIGHT NOW, before the (awaited) permission prompt and iOS
+    // audio-session setup. Otherwise, on a first-ever call the OS mic/camera
+    // dialog blocks here while the ring timeout keeps running and fires
+    // `missed` — the call "auto-misses" with the permission dialog still up,
+    // exactly as the user is about to grant it. clearRingTimeout is idempotent
+    // (re-called below is harmless).
+    clearRingTimeout();
+    stopRinging();
     // Mic/camera must be granted before the SDK's accept runs getUserMedia, else
     // the answer hangs with no media. If denied, decline the call cleanly.
     const permOk = await ensureMediaPermissions(snap.media);
@@ -1929,6 +2043,9 @@ export const CallProvider = ({ children }) => {
     // with the signaling id, which may differ from the live WebRTC id, so a
     // by-id cancel can miss. Only one incoming call exists at a time.
     cancelAllIncomingCallNotifee();
+    // Mark THIS call as one we accepted, so a stray answered_elsewhere echo on
+    // a duplicate socket can't end it before deviceId loads / ACTIVE is reached.
+    myAcceptedCallRef.current = { id: String(snap.signalId || snap.callId || ''), ts: Date.now() };
     dispatch({ type: ACT.ACCEPT, nowMs: Date.now() });
     // The ring timeout is now cleared, so from here a stalled connect would hang
     // forever — arm the connect watchdog to fail cleanly if we never reach ACTIVE
@@ -1960,7 +2077,9 @@ export const CallProvider = ({ children }) => {
           // server's companion call:ended event covers this too; both are
           // idempotent through endedRef.
           if (ack?.ended) { finalizeEnd('completed', 'Call already ended'); return; }
-          if (ack?.answeredElsewhere) return;
+          // We genuinely LOST a multi-device race — clear our accepted marker so
+          // the companion `call:cancelled-elsewhere` is allowed to dismiss us.
+          if (ack?.answeredElsewhere) { myAcceptedCallRef.current = { id: null, ts: 0 }; return; }
           const unattributed = ack && !ack.timedOut && (ack.ok === false || ack.callId === null);
           if (!unattributed) return; // attributed (or optimistic no-ack) — done
           if (__DEV__) console.log('[CALL][APP][accept] call:accept not attributed by server — retrying', { attempt, ack });
@@ -2315,17 +2434,18 @@ export const CallProvider = ({ children }) => {
     // app-socket/push path lacked them, so the dead call re-rang full CallKit
     // and answering it hit a server record that no longer exists ("cut karte
     // hi wahi call wapas — pick karo to disconnect"). Same windows as the
-    // engine guard: exact ids 60s; same-peer un-answered 8s (short enough that
-    // a deliberate call-back still rings). Dismiss every native surface the
-    // push may already have raised (the AppDelegate must report each VoIP push
-    // to CallKit, so the dead ring is up before JS sees the payload).
+    // engine guard: exact ids 60s; same-peer un-answered PEER_REDIAL_GUARD_MS
+    // (short enough that a deliberate call-back still rings). Dismiss every
+    // native surface the push may already have raised (the AppDelegate must
+    // report each VoIP push to CallKit, so the dead ring is up before JS sees
+    // the payload).
     {
       const re = recentEndedRef.current;
       const pid = payload?.callId ? String(payload.callId) : null;
       const idHit = !!(pid && re.ids.includes(pid) && Date.now() - re.ts < 60000);
       const peerHit = !payload?.isGroup
         && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
-        && re.peerId === callerId && Date.now() - re.ts < 8000;
+        && re.peerId === callerId && Date.now() - re.ts < PEER_REDIAL_GUARD_MS;
       if (idHit || peerHit) {
         if (__DEV__) console.log('[CALL][APP] incoming for a just-ended call — dismissing, not re-ringing', { callId: pid, idHit, peerHit });
         cancelAllIncomingCallNotifee();
@@ -2646,6 +2766,16 @@ export const CallProvider = ({ children }) => {
       // call (remote media flowing), an "answered elsewhere" dismissal can only
       // be stale — the answer-lock would have blocked our accept otherwise.
       if (snap.status === CALL_STATUS.ACTIVE && snap.remoteJoined) return;
+      // Cold-start guard: THIS device accepted this very call moments ago and
+      // deviceId hasn't loaded yet (push/CallKit cold boot) — the dismiss is our
+      // own win echoing on a duplicate socket. If we had actually LOST, the
+      // accept ack cleared this marker (answeredElsewhere) and we fall through.
+      const mine = myAcceptedCallRef.current;
+      const pid = String(payload?.callId || '');
+      if (mine.id && (!pid || pid === mine.id) && (Date.now() - mine.ts) < 15000) {
+        if (__DEV__) console.log('[CALL][APP] answered_elsewhere ignored — this device accepted it (cold-start echo)');
+        return;
+      }
       finalizeEnd('completed');
       return;
     }
@@ -3047,12 +3177,17 @@ export const CallProvider = ({ children }) => {
           // CallKit, so keep pulling until the ring commits. If nothing commits
           // within the window, clear the stuck CallKit call instead of leaving
           // a dead "connected" call the app never joined.
+          // Keep pulling for ~40s (was ~20s): a genuinely slow cold boot on a
+          // weak network — auth restore + socket bind + engine connect — can
+          // exceed 20s, and giving up early ended the CallKit call the user
+          // actually answered. 40s ≈ the server ring window, so we stay patient
+          // for the whole time the call could still be ringing.
           let tries = 0;
           const iv = setInterval(() => {
             tries += 1;
             const cur = stateRef.current;
             if (cur.status !== CALL_STATUS.IDLE || !pushAcceptPendingRef.current) { clearInterval(iv); return; }
-            if (tries > 10) {
+            if (tries > 20) {
               clearInterval(iv);
               pushAcceptPendingRef.current = false;
               nativeCall.endAllCalls();
@@ -3152,7 +3287,9 @@ export const CallProvider = ({ children }) => {
     // active) — used to disable the audio/video call buttons everywhere so a
     // second call can't be started over a live one. ENDED is included because
     // the call is still tearing down and the start path is still blocked.
-    callBusy: state.status !== CALL_STATUS.IDLE,
+    // `starting` covers the pre-dispatch await window so buttons dim on the
+    // FIRST tap (before the outgoing state commits), not a beat later.
+    callBusy: state.status !== CALL_STATUS.IDLE || starting,
     startAudioCall,
     startVideoCall,
     startGroupAudioCall,
@@ -3208,7 +3345,11 @@ export const CallProvider = ({ children }) => {
           {...(videoPip ? pipPanHandlers : {})}
         >
           {isNativeCallEngine() ? (
-            <NativeVideoStage />
+            <NativeVideoStage
+              peer={state.peer}
+              cameraOn={state.cameraOn !== false}
+              remoteCameraOn={state.isGroup ? true : state.remoteCameraOn !== false}
+            />
           ) : (
             <CallEngineWebView
               ref={webRef}

@@ -19,6 +19,9 @@ import useDeviceLinking from '../hooks/useDeviceLinking';
 import DeviceListItem from '../components/DeviceListItem';
 import DeviceLinkArt from '../components/DeviceLinkArt';
 
+// Max companion devices linked at once — must match backend MAX_LINKED_DEVICES.
+const MAX_LINKED_DEVICES = 4;
+
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
   else Alert.alert('', message);
@@ -111,6 +114,10 @@ export default function LinkedDevicesScreen({ navigation }) {
   );
 
   const count = linkedDevices?.length || 0;
+  // Max 4 active linked devices at once (matches the backend MAX_LINKED_DEVICES).
+  // At the cap the "Link a device" button is disabled and a warning tells the
+  // user to remove one first.
+  const atLimit = count >= MAX_LINKED_DEVICES;
 
   const ListHeader = (
     <View>
@@ -127,14 +134,27 @@ export default function LinkedDevicesScreen({ navigation }) {
         <Text style={[styles.learnMore, { color: linkBlue }]}>Learn more</Text>
       </TouchableOpacity>
 
-      {/* Link a device button */}
+      {/* Link a device button — disabled at the 4-device cap */}
       <TouchableOpacity
-        onPress={() => navigation.navigate('QRScanner')}
-        activeOpacity={0.85}
-        style={[styles.linkBtn, { backgroundColor: brand }]}
+        onPress={() => { if (!atLimit) navigation.navigate('QRScanner'); }}
+        activeOpacity={atLimit ? 1 : 0.85}
+        disabled={atLimit}
+        style={[styles.linkBtn, { backgroundColor: atLimit ? theme.colors.borderColor : brand }]}
       >
-        <Text style={[styles.linkBtnText, { color: theme.colors.textWhite }]}>Link a device</Text>
+        <Text style={[styles.linkBtnText, { color: atLimit ? subText : theme.colors.textWhite }]}>
+          Link a device
+        </Text>
       </TouchableOpacity>
+
+      {/* Cap warning */}
+      {atLimit && (
+        <View style={[styles.limitWarn, { backgroundColor: isDarkMode ? 'rgba(234,67,53,0.12)' : 'rgba(234,67,53,0.08)' }]}>
+          <Ionicons name="warning-outline" size={18} color="#E5533D" style={styles.limitWarnIcon} />
+          <Text style={[styles.limitWarnText, { color: primaryText }]}>
+            You’ve reached the maximum of {MAX_LINKED_DEVICES} linked devices. Please remove a previous session to link a new one.
+          </Text>
+        </View>
+      )}
 
       {/* Divider */}
       <View style={[styles.divider, { backgroundColor: dividerClr }]} />
@@ -246,6 +266,21 @@ const styles = StyleSheet.create({
     fontSize: 16.5,
     color: '#0B141A',
     letterSpacing: 0.2,
+  },
+
+  limitWarn: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 12,
+  },
+  limitWarnIcon: { marginTop: 1, marginRight: 8 },
+  limitWarnText: {
+    flex: 1,
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13.5,
+    lineHeight: 19,
   },
 
   divider: {

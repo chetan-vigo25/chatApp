@@ -24,7 +24,7 @@ const fmtDuration = (sec) => {
 
 export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
   const { theme, isDarkMode, chatColor } = useTheme();
-  const { startAudioCall, startVideoCall } = useCall();
+  const { startAudioCall, startVideoCall, callBusy } = useCall();
 
   const payload = msg?.payload || {};
   const media = payload.media === 'video' ? 'video' : 'audio';
@@ -89,6 +89,7 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
       <TouchableOpacity
         activeOpacity={0.85}
         onPress={onCallBack}
+        disabled={callBusy}
         style={[
           styles.bubble,
           isOutgoing ? styles.bubbleOut : styles.bubbleIn,

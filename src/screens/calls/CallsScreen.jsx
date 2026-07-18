@@ -185,7 +185,7 @@ const appendCallId = (group, it) => {
 export default function CallsScreen({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const {
-    startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall,
+    startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall, callBusy,
   } = useCall();
   const { resolveName, refresh: refreshContacts } = useContactDirectory();
 
@@ -509,12 +509,18 @@ export default function CallsScreen({ navigation }) {
               >
                 {isSelected && <Ionicons name="checkmark" size={15} color="#fff" />}
               </View>
+            ) : g.isGroup ? (
+              /* GROUP CALLS TEMPORARILY DISABLED — no redial button on group
+                 call-log rows. Re-enable by removing this `g.isGroup ? null :`
+                 branch so groups get the same redial button as 1-1. */
+              null
             ) : (
               <TouchableOpacity
                 onPress={() => redial(g, g.media)}
+                disabled={callBusy}
                 activeOpacity={0.6}
                 hitSlop={styles.hit}
-                style={styles.callBtnRight}
+                style={[styles.callBtnRight, callBusy && { opacity: 0.4 }]}
               >
                 <Ionicons
                   name={isVideo ? 'videocam' : 'call'}

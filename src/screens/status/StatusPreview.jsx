@@ -24,7 +24,7 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View, Text, Image, TouchableOpacity, StyleSheet,
   ScrollView, TextInput, ActivityIndicator, Alert,
-  Platform, FlatList, Dimensions, BackHandler, Animated, Easing, KeyboardAvoidingView,
+  Platform, FlatList, Dimensions, BackHandler, Animated, Easing, Keyboard,
 } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
@@ -37,6 +37,10 @@ import useStatusSettings from '../../hooks/useStatusSettings';
 import { STATUS_TYPE, STATUS_SPACE, STATUS_RADIUS } from './_statusDesign';
 
 const { width: SW } = Dimensions.get('window');
+// Full-SCREEN height (incl. system bars) — the keyboard's endCoordinates.screenY
+// is in full-screen coords, so deriving keyboard height from it must use the
+// SCREEN height, not the window height (smaller in Android edge-to-edge mode).
+const SCREEN_H = Dimensions.get('screen').height;
 
 // Backend enum: ['all', 'contacts', 'except', 'only']
 const VISIBILITY_OPTIONS = [
@@ -156,6 +160,32 @@ export default function StatusPreview({ navigation, route }) {
   const flatRef = useRef(null);
   const abortRef = useRef(null);
   const postingRef = useRef(false);
+
+  // ── Keyboard lift for the caption composer ────────────────────────────────
+  // KeyboardAvoidingView did NOTHING on Android (behavior was undefined) and in
+  // edge-to-edge mode adjustResize is unreliable, so the caption input stayed
+  // hidden behind the keyboard ("caption box upar nahi jata"). Track the height
+  // ourselves and push the absolute bottom bar up by it — works on both
+  // platforms regardless of windowSoftInputMode / edge-to-edge.
+  const [kbHeight, setKbHeight] = useState(0);
+  useEffect(() => {
+    const onShow = (e) => {
+      const coords = e?.endCoordinates;
+      // Prefer the reported height; fall back to full-SCREEN − keyboard top
+      // (Android edge-to-edge reports height 0 in some configs, screenY holds).
+      const derived = coords?.screenY != null ? SCREEN_H - coords.screenY : 0;
+      setKbHeight(Math.max(0, coords?.height ?? 0, derived));
+    };
+    const onHide = () => setKbHeight(0);
+    const subs = [];
+    if (Platform.OS === 'ios') {
+      subs.push(Keyboard.addListener('keyboardWillShow', onShow));
+      subs.push(Keyboard.addListener('keyboardWillHide', onHide));
+    }
+    subs.push(Keyboard.addListener('keyboardDidShow', onShow));
+    subs.push(Keyboard.addListener('keyboardDidHide', onHide));
+    return () => subs.forEach((s) => s.remove());
+  }, []);
 
   const totalItems = items.length;
 
@@ -470,9 +500,11 @@ export default function StatusPreview({ navigation, route }) {
       )}
 
       {/* ── Bottom composer: caption + visibility + send (WhatsApp style) ── */}
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={styles.bottomWrap}
+      {/* Lift the absolute bar above the keyboard via the tracked height (see
+          the kbHeight effect) — reliable on Android + iOS + edge-to-edge, which
+          KeyboardAvoidingView was not. */}
+      <View
+        style={[styles.bottomWrap, kbHeight > 0 && { bottom: kbHeight, paddingBottom: 12 }]}
         pointerEvents="box-none"
       >
         {/* Caption pill */}
@@ -518,7 +550,7 @@ export default function StatusPreview({ navigation, route }) {
             )}
           </TouchableOpacity>
         </View>
-      </KeyboardAvoidingView>
+      </View>
     </View>
   );
 }

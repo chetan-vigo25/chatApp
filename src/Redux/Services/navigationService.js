@@ -1,4 +1,4 @@
-import { createNavigationContainerRef } from '@react-navigation/native';
+import { createNavigationContainerRef, StackActions } from '@react-navigation/native';
 
 export const navigationRef = createNavigationContainerRef();
 
@@ -7,12 +7,30 @@ const navigationStateListeners = new Set();
 
 const normalizeId = (value) => {
   if (value == null) return null;
-  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  if (typeof value === 'string' || typeof value === 'number') {
+    const s = String(value).trim();
+    // Push/notifee data is a string map — a stringified empty value must not
+    // count as a real id (it would misroute the tap, e.g. open a 1-1 chat as
+    // a group because groupId === 'null').
+    if (!s || s === 'null' || s === 'undefined') return null;
+    return s;
+  }
   if (typeof value === 'object') {
     const candidate = value?._id || value?.id || value?.userId || value?.$oid || null;
     return candidate == null ? null : String(candidate);
   }
   return null;
+};
+
+// Boolean-ish flags arriving from a notification tap are STRINGS ("false",
+// "true") — notifee/FCM data payloads are string maps. `!!"false"` is true, so
+// naive truthiness misclassifies every 1-1 message as a broadcast/channel and
+// opens it read-only with the channel header. Parse explicitly.
+const isTruthyFlag = (value) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value === 1;
+  if (typeof value !== 'string') return false;
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
 };
 
 export function getCurrentRouteSnapshot() {
@@ -74,21 +92,42 @@ export function subscribeNavigationSnapshot(listener) {
   };
 }
 
+// Routes where a chat-navigation intent must WAIT, not fire. On a cold tap-
+// launch the container becomes ready while Splash is still checking auth; if we
+// navigate('ChatScreen') then, Splash's follow-up `reset({routes:[ChatList]})`
+// WIPES the chat off the stack and the tap lands on the chat list instead of
+// the chat. Same for the first-time SyncScreen and the whole login flow. Hold
+// the intent and keep retrying until the app has settled on a main route.
+const PRE_MAIN_ROUTES = new Set([
+  'Splash', 'SyncScreen', 'UserAgree', 'Login', 'LoginEmail', 'Otp',
+  'AccountStatus', 'NoInternet',
+]);
+
 // Navigate to a chat from a tapped push notification. The push `data` carries
 // { chatId, chatType, groupId, senderId, senderName, profileImage, senderMobile,
 // groupName }. On a COLD launch the nav container isn't mounted yet, so retry
-// until it's ready (best-effort, ~8s) instead of dropping the intent.
+// until it's ready (best-effort, ~30s — first-time sync can take a while)
+// instead of dropping the intent.
 export function navigateToChat(data = {}, attempt = 0) {
   const chatId = normalizeId(data?.chatId || data?.groupId);
   if (!chatId) return false;
 
   if (!navigationRef.isReady()) {
-    if (attempt < 40) setTimeout(() => navigateToChat(data, attempt + 1), 200);
+    if (attempt < 150) setTimeout(() => navigateToChat(data, attempt + 1), 200);
     return false;
   }
 
-  const isBroadcast = data?.chatType === 'broadcast' || !!data?.isBroadcast || data?.kind === 'broadcast';
-  const isGroup = data?.chatType === 'group' || !!data?.groupId;
+  // Container ready but the app is still on Splash / sync / login — navigating
+  // now would be reset away a moment later. Park the intent and retry.
+  const curName = navigationRef.getCurrentRoute()?.name || null;
+  if (curName && PRE_MAIN_ROUTES.has(curName)) {
+    if (attempt < 150) setTimeout(() => navigateToChat(data, attempt + 1), 200);
+    return false;
+  }
+
+  const isBroadcast = data?.chatType === 'broadcast' || isTruthyFlag(data?.isBroadcast) || data?.kind === 'broadcast';
+  const isGroup = !isBroadcast
+    && (data?.chatType === 'group' || isTruthyFlag(data?.isGroup) || !!normalizeId(data?.groupId));
   const item = isBroadcast
     ? {
         chatId,
@@ -123,6 +162,16 @@ export function navigateToChat(data = {}, attempt = 0) {
       };
 
   try {
+    // Already inside a ChatScreen? Tapping a notification for the SAME chat is
+    // a no-op; for a DIFFERENT chat, PUSH a fresh instance — `navigate` would
+    // just mutate the open screen's params and risk showing chat A's messages
+    // under chat B's header while its state catches up.
+    const active = getActiveChatFromRoute(navigationRef.getCurrentRoute());
+    if (active.routeName === 'ChatScreen') {
+      if (active.chatId && String(active.chatId) === String(chatId)) return true;
+      navigationRef.dispatch(StackActions.push('ChatScreen', { chatId, item }));
+      return true;
+    }
     navigationRef.navigate('ChatScreen', { chatId, item });
     return true;
   } catch {

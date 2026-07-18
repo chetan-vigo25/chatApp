@@ -16,7 +16,6 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../../contexts/ThemeContext';
-import { Menu } from 'react-native-paper';
 import { useDispatch, useSelector } from 'react-redux';
 import { chatListData } from '../../Redux/Reducer/Chat/Chat.reducer';
 import { useFocusEffect } from '@react-navigation/native';
@@ -278,6 +277,22 @@ export default function ChatList({ navigation }) {
   const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall } = useCall();
 
   const [visible, setVisible] = useState(false);
+  // Overflow (3-dots) menu anchor. Custom Modal dropdown replaces the flaky
+  // react-native-paper Menu, which got STUCK on rapid taps (options stopped
+  // appearing). We measure the button and pin the dropdown under it.
+  const menuBtnRef = useRef(null);
+  const [menuPos, setMenuPos] = useState({ top: 0, right: 12 });
+  const openHeaderMenu = useCallback(() => {
+    const node = menuBtnRef.current;
+    if (node && node.measureInWindow) {
+      node.measureInWindow((x, y, w, h) => {
+        setMenuPos({ top: y + h + 6, right: Math.max(8, SCREEN_WIDTH - (x + w)) });
+        setVisible(true);
+      });
+    } else {
+      setVisible(true);
+    }
+  }, []);
   const [refreshing, setRefreshing] = useState(false);
   // timeTick drives the 30s relative-time refresh. With memoized rows it must be
   // threaded into renderItem so visible rows re-render and recompute "Today" /
@@ -1496,40 +1511,18 @@ export default function ChatList({ navigation }) {
         </View>
 
         <View style={styles.headerRight}>
-          <Menu
-            visible={visible}
-            onDismiss={() => setVisible(false)}
-            contentStyle={[styles.menuContent, { backgroundColor: theme.colors.cardBackground }]}
-            anchor={(
-              <TouchableOpacity
-                onPress={() => setVisible(true)}
-                activeOpacity={0.6}
-                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-                style={styles.headerBtn}
-              >
-                <Ionicons name="ellipsis-vertical" size={22} color={theme.colors.iconColor} />
-              </TouchableOpacity>
-            )}
+          {/* Custom overflow menu — a Modal dropdown, NOT react-native-paper's
+              Menu, which got stuck on rapid taps and stopped opening. This
+              anchor just measures + opens; the dropdown lives in a Modal below. */}
+          <TouchableOpacity
+            ref={menuBtnRef}
+            onPress={openHeaderMenu}
+            activeOpacity={0.6}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            style={styles.headerBtn}
           >
-            <Menu.Item
-              onPress={() => { navigation.navigate('ProfileTab'); setVisible(false); }}
-              title="Profile"
-              titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
-              leadingIcon={() => <Ionicons name="person-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            />
-            <Menu.Item
-              onPress={() => { navigation.navigate('SettingsTab'); setVisible(false); }}
-              title="Settings"
-              titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
-              leadingIcon={() => <Ionicons name="settings-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            />
-            <Menu.Item
-              onPress={() => { navigation.navigate('LinkDevice'); setVisible(false); }}
-              title="Linked Devices"
-              titleStyle={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}
-              leadingIcon={() => <Ionicons name="qr-code-outline" size={18} color={theme.colors.placeHolderTextColor} />}
-            />
-          </Menu>
+            <Ionicons name="ellipsis-vertical" size={22} color={theme.colors.iconColor} />
+          </TouchableOpacity>
         </View>
       </View>
       )}
@@ -1577,6 +1570,45 @@ export default function ChatList({ navigation }) {
       >
         <Ionicons name="chatbubble-ellipses" size={24} color="#fff" />
       </TouchableOpacity>
+
+      {/* ─── HEADER OVERFLOW (3-dots) DROPDOWN ─── */}
+      {/* Modal-based so it NEVER gets stuck the way react-native-paper's Menu
+          did on rapid taps. Backdrop closes it; each item closes + navigates.
+          Background follows the theme (cardBackground). */}
+      <Modal animationType="fade" transparent visible={visible} onRequestClose={() => setVisible(false)}>
+        <TouchableOpacity activeOpacity={1} onPress={() => setVisible(false)} style={StyleSheet.absoluteFill}>
+          <View
+            style={[
+              styles.headerMenuCard,
+              {
+                top: menuPos.top,
+                right: menuPos.right,
+                backgroundColor: theme.colors.cardBackground,
+                borderColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+              },
+            ]}
+          >
+            {[
+              { label: 'Profile', icon: 'person-outline', route: 'ProfileTab' },
+              { label: 'Settings', icon: 'settings-outline', route: 'SettingsTab' },
+              { label: 'Linked Devices', icon: 'qr-code-outline', route: 'LinkDevice' },
+            ].map((it, i) => (
+              <TouchableOpacity
+                key={it.route}
+                activeOpacity={0.6}
+                onPress={() => { setVisible(false); navigation.navigate(it.route); }}
+                style={[
+                  styles.headerMenuItem,
+                  i > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)' },
+                ]}
+              >
+                <Ionicons name={it.icon} size={18} color={theme.colors.placeHolderTextColor} style={styles.headerMenuIcon} />
+                <Text style={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}>{it.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+        </TouchableOpacity>
+      </Modal>
 
       {/* ─── ACTION SHEET MODAL ─── */}
       <Modal animationType="none" transparent visible={actionSheetVisible} onRequestClose={closeActionMenu}>
@@ -1937,6 +1969,28 @@ const styles = StyleSheet.create({
   menuItemText: {
     fontFamily: 'Roboto-Medium',
     fontSize: 14,
+  },
+  // Custom header overflow dropdown (Modal-anchored under the 3-dots button).
+  headerMenuCard: {
+    position: 'absolute',
+    minWidth: 196,
+    borderRadius: 16,
+    paddingVertical: 4,
+    borderWidth: StyleSheet.hairlineWidth,
+    elevation: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.18,
+    shadowRadius: 16,
+  },
+  headerMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 13,
+  },
+  headerMenuIcon: {
+    marginRight: 14,
   },
 
   // ─── DELETE PROGRESS OVERLAY ───
