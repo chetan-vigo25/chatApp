@@ -8,6 +8,7 @@ import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useCall } from '../useCall';
 import { useTheme } from '../../contexts/ThemeContext';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import { navigateToChat } from '../../Redux/Services/navigationService';
 import { CALL_STATUS, joinedCount } from '../state/callMachine';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import CallAvatar from '../components/CallAvatar';
@@ -353,7 +354,26 @@ export default function CallOverlay() {
       {addSheet}
 
       {showIncomingActions && !isGroup ? (
-        <IncomingCallCard peer={peer} displayName={peerDisplayName} media={call?.media} onAccept={accept} onReject={reject} />
+        <IncomingCallCard
+          peer={peer}
+          displayName={peerDisplayName}
+          media={call?.media}
+          onAccept={accept}
+          onReject={reject}
+          // WhatsApp's Message action: pass on the call and land in the chat
+          // thread to reply by text (decline + deep-link to the conversation).
+          onMessage={() => {
+            reject();
+            if (call?.chatId) {
+              navigateToChat({
+                chatId: call.chatId,
+                chatType: 'private',
+                chatName: peerDisplayName,
+                chatAvatar: peer?.avatar || '',
+              });
+            }
+          }}
+        />
       ) : isGroup ? (
         // ----- GROUP (audio, or pre-video ringing/ended) -----
         <>
@@ -422,23 +442,29 @@ export default function CallOverlay() {
       ) : (
         // ----- 1:1 (audio, or pre-video ringing/ended) -----
         <>
-          <View style={styles.identity}>
-            <Text style={[styles.subtitle, { color: onBgSoft }]}>{subtitle}</Text>
+          {/* WhatsApp-style header: NAME centered at the top, with the status
+              line under it — "Ringing…" (or Calling…/Reconnecting…/ended text)
+              until the call is ANSWERED, then ONLY the running timer. Never
+              both at once. */}
+          <View style={styles.header}>
+            <Text style={[styles.headerName, { color: onBg }]} numberOfLines={1}>{peerDisplayName}</Text>
+            {timerRunning ? (
+              <CallTimer startMs={call?.answeredAt} style={[styles.headerStatus, { color: onBgSoft }]} />
+            ) : (
+              <Text style={[styles.headerStatus, { color: onBgSoft }]}>
+                {subtitle || (isVideo ? 'Video call' : 'Voice call')}
+              </Text>
+            )}
+          </View>
+
+          {/* Large centered avatar (WhatsApp active-call stage). */}
+          <View style={styles.avatarStage}>
             <View style={styles.avatarStack}>
-              <PulsingRing size={140} active={ringing} color={ringColor} />
+              <PulsingRing size={170} active={ringing} color={ringColor} />
               <View style={[styles.avatarWrap, { borderColor: avatarBorder }]}>
-                <CallAvatar uri={peer?.avatar} name={peer?.name} id={peer?.id} size={140} />
+                <CallAvatar uri={peer?.avatar} name={peer?.name} id={peer?.id} size={170} />
               </View>
             </View>
-            <Text style={[styles.name, { color: onBg }]} numberOfLines={1}>{peerDisplayName}</Text>
-            {timerRunning ? (
-              <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
-            ) : (
-              <View style={styles.mediaRow}>
-                <Ionicons name={isVideo ? 'videocam' : 'call'} size={15} color={onBgSoft} />
-                <Text style={[styles.mediaText, { color: onBgSoft }]}>{isVideo ? 'Video call' : 'Voice call'}</Text>
-              </View>
-            )}
           </View>
 
           {call?.needsUnmuteGesture && status === CALL_STATUS.ACTIVE ? (
@@ -486,6 +512,21 @@ const styles = StyleSheet.create({
     elevation: 999,
   },
   identity: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 40 },
+  // WhatsApp-style 1:1 active-call header: name centered at the top (between
+  // the floating minimize / add-participant corner buttons), status/timer under.
+  header: { alignItems: 'center', paddingTop: 14, paddingHorizontal: 64 },
+  headerName: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 22,
+    textAlign: 'center',
+    maxWidth: '100%',
+  },
+  headerStatus: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 14,
+    marginTop: 5,
+  },
+  avatarStage: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   subtitle: {
     color: 'rgba(255,255,255,0.75)',
     fontFamily: 'Roboto-Medium',

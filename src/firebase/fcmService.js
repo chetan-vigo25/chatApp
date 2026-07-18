@@ -6,7 +6,7 @@ import { setPushToken } from '../Redux/Services/Socket/socket';
 import { navigateToChat, getCurrentRouteSnapshot, getActiveChatFromRoute } from '../Redux/Services/navigationService';
 import { CALL_PUSH_EVENTS, isStaleCallPush } from './callEvents';
 import { displayIncomingCallNotifee, cancelIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
-import { isAvailable as isNativeCallKitAvailable } from '../calls/services/nativeCallService';
+import { isAvailable as isNativeCallKitAvailable, dismissIncoming as dismissCallKitIncoming } from '../calls/services/nativeCallService';
 import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
 import { buildNotificationModel } from './notificationModel';
 import { claimNotification } from './notificationDedupe';
@@ -259,7 +259,14 @@ const presentIncomingCallNotification = async (data) => {
 // iOS presents the call via scheduleNotificationAsync, not notifee). Used by the
 // `call_cancel` push so the caller hanging up clears the callee's notification on
 // both platforms.
-const dismissIncomingCallNotification = async (callId) => {
+const dismissIncomingCallNotification = async (callId, uuid = null) => {
+  // iOS: the RING itself is a CALLKIT call (the VoIP push reported it natively)
+  // — clearing notifications alone left CallKit RINGING/VIBRATING the full
+  // window after the caller hung up ("instant cut kiya phir bhi meri side
+  // call aati rahi"). End the CallKit ring first, as remote-ended, so iOS
+  // dismisses it exactly like a caller hang-up. Uses the push's uuid when
+  // carried; falls back to the uuid the VoIP push registered in the JS map.
+  try { dismissCallKitIncoming(callId, uuid); } catch (_) { /* CallKit backend */ }
   try { await cancelIncomingCallNotifee(callId); } catch (_) { /* android backend */ }
   try {
     const presented = await Notifications.getPresentedNotificationsAsync();
@@ -795,7 +802,7 @@ export const registerBackgroundHandler = () => {
       // (a killed/backgrounded callee never got the call:cancelled socket event,
       // so without this the ringing notification lingers / arrives for a dead call).
       if (remoteMessage?.data?.type === 'call_cancel') {
-        await dismissIncomingCallNotification(remoteMessage.data.callId);
+        await dismissIncomingCallNotification(remoteMessage.data.callId, remoteMessage.data.uuid || null);
         return;
       }
 
@@ -866,7 +873,7 @@ export const initializeNotifications = () => {
     if (!(await hasActiveSession())) return;
     // Caller hung up / timed out → dismiss the incoming-call notification.
     if (remoteMessage?.data?.type === 'call_cancel') {
-      dismissIncomingCallNotification(remoteMessage.data.callId).catch(() => {});
+      dismissIncomingCallNotification(remoteMessage.data.callId, remoteMessage.data.uuid || null).catch(() => {});
       return;
     }
     // A call push in the foreground → drive the live ringing overlay directly

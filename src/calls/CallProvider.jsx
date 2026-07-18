@@ -2683,6 +2683,18 @@ export const CallProvider = ({ children }) => {
         // truth — sweeping on it killed the CallKit call the user had JUST
         // answered on a cold boot (app opened to nothing, caller kept ringing).
         if (ack?.ok === false || ack?.timedOut) return;
+        // The user has ALREADY ANSWERED a CallKit call the server says does not
+        // exist (an instant-cancel's ring outlived the call on this device):
+        // end it NOW. The old flow left them on a fake "connected" CallKit call
+        // for up to 20s (the answer-pending pull loop) before the delayed sweep
+        // below ran. Clearing the flag also stops that loop on its next tick,
+        // and the server's missed-call push/log still shows it as MISSED.
+        if (pushAcceptPendingRef.current) {
+          if (__DEV__) console.log('[CALL][APP] answered CallKit call is DEAD (server-authoritative) — ending immediately');
+          pushAcceptPendingRef.current = false;
+          nativeCall.endAllCalls();
+          return;
+        }
         // Server-truth reconcile: NOTHING is ringing for us. Any CallKit call
         // iOS is still showing is a GHOST — a VoIP-rung call whose cancel never
         // reached the killed/locked app (Apple forbids a VoIP cancel push), or a

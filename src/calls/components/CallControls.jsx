@@ -5,47 +5,40 @@ import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 
 /**
- * Bottom control bar for an active call — WhatsApp style.
+ * Bottom control card for an active call — WhatsApp style (two rows inside a
+ * large rounded card):
  *
- * Buttons sit inside a frosted, rounded pill. A translucent button is the
- * default/"on" state; a filled button is the toggled-active state (muted,
- * speaker on, camera off). The red round button always ends the call.
+ *   voice → [ Speaker ] [ Video ] [ Mute ]
+ *           [  Share  ] [  End  ]
+ *   video → [ Flip ] [ Camera ] [ Mute ]
+ *           [ Speaker ] [ Share ] [ End ]
  *
- * Theme-aware: on the opaque (audio) call screen the pill blends with the
- * current light/dark theme. `forceDark` keeps it light-on-dark when it floats
- * over a live video feed (which is always dark), regardless of app theme.
+ * A translucent chip is the idle state; a filled chip is the toggled-active
+ * state (muted, speaker on, camera off, sharing). The red round button always
+ * ends the call. Theme-aware: the card blends with the light/dark theme;
+ * `forceDark` keeps it light-on-dark when floating over a live video feed
+ * (which is always dark) regardless of app theme.
  *
- * Layout (matches WhatsApp):
- *   voice call → [ Speaker ] [ Video ] [ Share ] [ Mute ] [ End ]
- *   video call → [ Flip ] [ Camera ] [ Share ] [ Speaker ] [ Mute ] [ End ]
- *
- * Video (voice bar) turns the camera on mid-call, upgrading the voice call to a
- * video call for both sides — the bar then re-renders in the video layout.
- *
- * Speaker toggles the audio route: ON = loudspeaker (loud), OFF = earpiece
- * (normal, follows the device volume) — same on both call types.
- *
- * Share = screen share. Availability depends on the WebView exposing
- * getDisplayMedia — where it doesn't, tapping shows a clear "not supported"
- * alert (the engine reports it); RECEIVING a peer's shared screen always works.
+ * Video (on the voice layout) upgrades the call to video for both sides — the
+ * card then re-renders in the video layout. Share = screen share; where the
+ * engine can't capture, tapping surfaces a clear "not supported" alert.
  */
-function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, small, palette, onPress }) {
+function CircleButton({ icon, lib = 'ion', label, active, danger, disabled, palette, onPress }) {
   const Icon = lib === 'mci' ? MaterialIcons : Ionicons;
   const bg = danger ? '#EA0038' : active ? palette.activeBg : palette.idleBg;
   let color = danger ? '#ffffff' : active ? palette.activeIcon : palette.idleIcon;
   if (disabled) color = palette.disabledIcon;
-  const size = danger ? 32 : small ? 22 : 25;
   return (
     <View style={styles.btnWrap}>
       <TouchableOpacity
         activeOpacity={disabled ? 1 : 0.8}
         onPress={disabled ? undefined : onPress}
-        style={[styles.circle, small && styles.circleSmall, danger && styles.circleDanger, { backgroundColor: bg }]}
+        style={[styles.circle, danger && styles.circleDanger, { backgroundColor: bg }]}
       >
-        <Icon name={icon} size={size} color={color} />
+        <Icon name={icon} size={danger ? 30 : 24} color={color} />
       </TouchableOpacity>
       {!!label && (
-        <Text style={[styles.label, { color: palette.label }]}>{label}</Text>
+        <Text style={[styles.label, { color: palette.label }]} numberOfLines={1}>{label}</Text>
       )}
     </View>
   );
@@ -71,17 +64,19 @@ export default function CallControls({
 
   // A toggled-on button is a high-contrast filled chip; an idle button is a
   // translucent chip. Light theme flips the contrast so icons stay legible on
-  // the light wallpaper.
+  // the light wallpaper. The card itself is the WhatsApp bottom-sheet surface.
   const palette = dark
     ? {
+      cardBg: 'rgba(17,25,31,0.86)',
       activeBg: '#ffffff',
       activeIcon: '#0B141A',
-      idleBg: 'rgba(255,255,255,0.18)',
+      idleBg: 'rgba(255,255,255,0.14)',
       idleIcon: '#ffffff',
       disabledIcon: 'rgba(255,255,255,0.4)',
       label: 'rgba(255,255,255,0.85)',
     }
     : {
+      cardBg: 'rgba(255,255,255,0.82)',
       activeBg: '#0B141A',
       activeIcon: '#ffffff',
       idleBg: 'rgba(0,0,0,0.07)',
@@ -90,132 +85,111 @@ export default function CallControls({
       label: 'rgba(11,20,26,0.7)',
     };
 
+  const speakerBtn = (
+    <CircleButton
+      icon={speakerOn ? 'volume-high' : 'volume-medium'}
+      active={speakerOn}
+      disabled={!speakerSupported}
+      label={speakerSupported ? 'Speaker' : 'Auto'}
+      palette={palette}
+      onPress={onToggleSpeaker}
+    />
+  );
+  const muteBtn = (
+    <CircleButton
+      icon={micOn ? 'mic' : 'mic-off'}
+      active={!micOn}
+      label={micOn ? 'Mute' : 'Unmute'}
+      palette={palette}
+      onPress={onToggleMic}
+    />
+  );
+  const shareBtn = (
+    <CircleButton
+      icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
+      lib="mci"
+      active={screenSharing}
+      label={screenSharing ? 'Sharing' : 'Share'}
+      palette={palette}
+      onPress={onToggleScreenShare}
+    />
+  );
+  const endBtn = (
+    <CircleButton icon="call-end" lib="mci" danger label="End" palette={palette} onPress={onHangup} />
+  );
+
   return (
-    <BlurView intensity={dark ? 32 : 40} tint={dark ? 'dark' : 'light'} style={styles.bar}>
-      <View style={styles.row}>
-        {isVideo ? (
-          <>
-            <CircleButton
-              icon="camera-reverse"
-              label="Flip"
-              small
-              palette={palette}
-              onPress={onSwitchCamera}
-            />
+    <BlurView
+      intensity={dark ? 30 : 40}
+      tint={dark ? 'dark' : 'light'}
+      style={[styles.card, { backgroundColor: palette.cardBg }]}
+    >
+      {isVideo ? (
+        <>
+          <View style={styles.row}>
+            <CircleButton icon="camera-reverse" label="Flip" palette={palette} onPress={onSwitchCamera} />
             <CircleButton
               icon={cameraOn ? 'videocam' : 'videocam-off'}
               active={!cameraOn}
               label={cameraOn ? 'Camera' : 'Camera off'}
-              small
               palette={palette}
               onPress={onToggleCamera}
             />
-            <CircleButton
-              icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
-              lib="mci"
-              active={screenSharing}
-              label={screenSharing ? 'Sharing' : 'Share'}
-              small
-              palette={palette}
-              onPress={onToggleScreenShare}
-            />
-            <CircleButton
-              icon={speakerOn ? 'volume-high' : 'volume-medium'}
-              active={speakerOn}
-              disabled={!speakerSupported}
-              label={speakerSupported ? 'Speaker' : 'Auto'}
-              small
-              palette={palette}
-              onPress={onToggleSpeaker}
-            />
-          </>
-        ) : (
-          <>
-            <CircleButton
-              icon={speakerOn ? 'volume-high' : 'volume-medium'}
-              active={speakerOn}
-              disabled={!speakerSupported}
-              label={speakerSupported ? 'Speaker' : 'Auto'}
-              small
-              palette={palette}
-              onPress={onToggleSpeaker}
-            />
-            {/* Camera ON upgrades the voice call to a video call (WhatsApp style —
-                the bar then switches to the video layout). */}
-            <CircleButton
-              icon="videocam"
-              label="Video"
-              small
-              palette={palette}
-              onPress={onToggleCamera}
-            />
-            <CircleButton
-              icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
-              lib="mci"
-              active={screenSharing}
-              label={screenSharing ? 'Sharing' : 'Share'}
-              small
-              palette={palette}
-              onPress={onToggleScreenShare}
-            />
-          </>
-        )}
-
-        <CircleButton
-          icon={micOn ? 'mic' : 'mic-off'}
-          active={!micOn}
-          label={micOn ? 'Mute' : 'Unmute'}
-          small
-          palette={palette}
-          onPress={onToggleMic}
-        />
-
-        <CircleButton
-          icon="call-end"
-          lib="mci"
-          danger
-          label="End"
-          palette={palette}
-          onPress={onHangup}
-        />
-      </View>
+            {muteBtn}
+          </View>
+          <View style={styles.row}>
+            {speakerBtn}
+            {shareBtn}
+            {endBtn}
+          </View>
+        </>
+      ) : (
+        <>
+          <View style={styles.row}>
+            {speakerBtn}
+            {/* Camera ON upgrades the voice call to a video call (WhatsApp
+                style — the card then switches to the video layout). */}
+            <CircleButton icon="videocam" label="Video" palette={palette} onPress={onToggleCamera} />
+            {muteBtn}
+          </View>
+          <View style={styles.row}>
+            {shareBtn}
+            {endBtn}
+          </View>
+        </>
+      )}
     </BlurView>
   );
 }
 
 const styles = StyleSheet.create({
-  bar: {
+  card: {
     alignSelf: 'center',
-    borderRadius: 36,
+    borderRadius: 32,
     overflow: 'hidden',
-    paddingVertical: 16,
-    paddingHorizontal: 8,
+    paddingVertical: 18,
+    paddingHorizontal: 14,
     width: '92%',
     maxWidth: 440,
+    gap: 18,
   },
   row: {
     flexDirection: 'row',
     justifyContent: 'space-evenly',
-    alignItems: 'flex-end',
+    alignItems: 'flex-start',
     width: '100%',
   },
-  // Sized so the 6-button video bar (Flip · Camera · Share · Speaker · Mute ·
-  // End) fits even on narrow (~320dp) screens without clipping (`circleSmall`);
-  // the 3-button voice bar keeps the roomier 54dp circles.
-  btnWrap: { alignItems: 'center', flexShrink: 1 },
+  btnWrap: { alignItems: 'center', flexShrink: 1, minWidth: 84 },
   circle: {
-    width: 54, height: 54, borderRadius: 27,
+    width: 56, height: 56, borderRadius: 28,
     alignItems: 'center', justifyContent: 'center',
   },
-  circleSmall: {
-    width: 46, height: 46, borderRadius: 23,
-  },
   circleDanger: {
-    width: 58, height: 58, borderRadius: 29,
+    width: 60, height: 60, borderRadius: 30,
   },
   label: {
     fontFamily: 'Roboto-Regular',
-    fontSize: 11.5,
+    fontSize: 12,
     marginTop: 8,
   },
 });
