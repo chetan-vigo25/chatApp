@@ -1351,10 +1351,11 @@ export default function ChatList({ navigation }) {
   const pinnedSearchAndFilters = (
     <View style={[styles.pinnedHeaderWrap, { backgroundColor: theme.colors.background }]}>
       <View style={[styles.searchBar, { backgroundColor: isDarkMode ? '#1F2C3380' : '#f0f2f5' }]}>
-        <Ionicons name="search" size={18} color={theme.colors.iconColor} />
+        <Ionicons name="search" size={17} color={theme.colors.iconColor} />
         <TextInput
           placeholder="Search"
-          placeholderTextColor={theme.colors.placeHolderTextColor}
+          // Darker/higher-contrast placeholder than the default muted grey.
+          placeholderTextColor={isDarkMode ? '#9AA9B2' : '#54656F'}
           value={searchQuery}
           onChangeText={setSearchQuery}
           style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
@@ -1557,7 +1558,7 @@ export default function ChatList({ navigation }) {
             initialNumToRender={10}
             maxToRenderPerBatch={8}
             updateCellsBatchingPeriod={50}
-            getItemLayout={(_, index) => ({ length: 76, offset: 76 * index, index })}
+            getItemLayout={(_, index) => ({ length: 64, offset: 64 * index, index })}
           />
         )}
       </View>
@@ -2079,14 +2080,14 @@ const styles = StyleSheet.create({
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 24,
-    paddingHorizontal: 16,
-    height: 46,
-    gap: 12,
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    height: 40,
+    gap: 10,
   },
   searchInput: {
     flex: 1,
-    fontSize: 15,
+    fontSize: 14,
     fontFamily: 'Roboto-Regular',
     paddingVertical: 0,
     height: '100%',

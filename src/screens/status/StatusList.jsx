@@ -349,7 +349,24 @@ export default function StatusList({ navigation }) {
     ? c.allViewed
     : (c.allViewed || (c.statuses || []).every(s => viewedStatusIds.includes(String(s._id))));
 
-  const groups = (broadcastGroup ? [broadcastGroup, ...(contactStatuses || [])] : (contactStatuses || []))
+  // Dedupe broadcasts out of the contact feed. An official/broadcast status is
+  // authored by an admin with visibility 'all', so when that admin is also one
+  // of the viewer's contacts the SAME status comes back inside the normal
+  // `/feed` group too — and would render twice (once under "Official Updates",
+  // once under the admin's contact row). Strip broadcast ids from contact
+  // groups and drop any group that becomes empty. (Text broadcasts are the
+  // common case, which is why the user saw text-only statuses doubled.)
+  const broadcastIds = new Set(liveBroadcasts.map(b => String(b._id)));
+  const dedupedContacts = (contactStatuses || [])
+    .map(c => {
+      const statuses = (c.statuses || []).filter(s => !broadcastIds.has(String(s._id)));
+      return statuses.length === (c.statuses || []).length
+        ? c
+        : { ...c, statuses, count: statuses.length };
+    })
+    .filter(c => (c.statuses || []).length > 0);
+
+  const groups = (broadcastGroup ? [broadcastGroup, ...dedupedContacts] : dedupedContacts)
     .slice()
     .sort((a, b) => new Date(b.latestAt) - new Date(a.latestAt));
   const recent = groups.filter(c => !isAllViewed(c));
@@ -374,7 +391,7 @@ export default function StatusList({ navigation }) {
   const renderRow = ({ item }) => {
     switch (item._t) {
       case 'statusHeader':
-        return <Text style={[styles.statusHeader, { color: theme.colors.primaryTextColor }]}>Status</Text>;
+        return ""; // <Text style={[styles.statusHeader, { color: theme.colors.primaryTextColor }]}></Text>;
       case 'mystatus':
         return renderMyStatus();
       case 'label':

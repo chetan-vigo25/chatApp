@@ -3,8 +3,8 @@ import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import SegmentedRing from './SegmentedRing';
 
-const AVATAR_SIZE = 52;
-const RING_SIZE   = 58; // outer ring diameter — leaves a small gap around the avatar
+const AVATAR_SIZE = 44; // smaller chat-list avatar (was 52 → 48 → 44)
+const RING_SIZE   = 50; // outer ring diameter — leaves a small gap around the avatar
 const RING_STROKE = 2.5;
 // Default (no-photo) avatar: muted person icon.
 const DEFAULT_AVATAR_ICON   = '#8696A0';
@@ -107,7 +107,7 @@ const ChatCard = ({
                   <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={[styles.avatarImage, { borderColor: theme.colors.border }]} />
                 ) : (
                   <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName), borderColor: theme.colors.border }]}>
-                    <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={22} color="#fff" />
+                    <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={18} color="#fff" />
                   </View>
                 )
               ) : item?.peerUser?.profileImage ? (
@@ -124,7 +124,7 @@ const ChatCard = ({
                     { backgroundColor: theme.colors.cardBackground || 'transparent', borderColor: theme.colors.border },
                   ]}
                 >
-                  <Ionicons name="person" size={28} color={DEFAULT_AVATAR_ICON} />
+                  <Ionicons name="person" size={24} color={DEFAULT_AVATAR_ICON} />
                 </View>
               )}
               {/* Online indicator (not for groups / channels) */}
@@ -215,10 +215,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
-    paddingVertical: 11,
+    // 44px avatar + 2×10 padding = 64 → tighter rows. MUST stay in sync with
+    // the list's getItemLayout row height in ChatList.jsx, or scroll math drifts.
+    paddingVertical: 10,
   },
 
-  // Avatar — fixed 52px slot so row height (and getItemLayout) is unchanged
+  // Avatar — fixed 44px slot so row height (and getItemLayout) is unchanged
   // whether or not the peer has a status. The ring draws as an absolute overlay
   // that overflows ~3px into the row padding, so it never grows the row.
   avatarTouch: {
@@ -288,14 +290,14 @@ const styles = StyleSheet.create({
   // Content
   contentWrap: {
     flex: 1,
-    marginLeft: 13,
+    marginLeft: 12,
     justifyContent: 'center',
   },
   topRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 3,
+    marginBottom: 2,
   },
   nameWrap: {
     flex: 1,
@@ -304,9 +306,10 @@ const styles = StyleSheet.create({
     marginRight: 10,
   },
   nameText: {
-    fontSize: 16.5,
-    fontFamily: 'Roboto-Medium',
-    textTransform: 'capitalize',
+    // Chat-list title: slightly bold, matches the Settings screen name
+    // (Roboto-SemiBold). Original case preserved, no extra letter-spacing.
+    fontSize: 15.5,
+    fontFamily: 'Roboto-SemiBold',
     flexShrink: 1,
     letterSpacing: 0,
   },
@@ -314,9 +317,10 @@ const styles = StyleSheet.create({
     marginLeft: 4,
   },
   timeText: {
+    // WhatsApp timestamp: ~12sp REGULAR weight (lighter than the name), no
+    // letter-spacing. Colour is applied inline (green when unread).
     fontSize: 12,
-    fontFamily: 'Roboto-Medium',
-    letterSpacing: 0.2,
+    fontFamily: 'Roboto-Regular',
   },
   bottomRow: {
     flexDirection: 'row',
@@ -333,7 +337,7 @@ const styles = StyleSheet.create({
   previewText: {
     fontSize: 14,
     flexShrink: 1,
-    lineHeight: 19,
+    lineHeight: 22,
     fontFamily: 'Roboto-Regular',
   },
   metaWrap: {

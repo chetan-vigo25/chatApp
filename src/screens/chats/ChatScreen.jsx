@@ -204,12 +204,10 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   chatColor,
   text,
   pendingMedia,
-  inputHeight,
   isInputFocused,
   isSearching,
   showEmojiPanel,
   onTextChange,
-  onInputContentSizeChange,
   onSelectionChange,
   onFocus,
   onBlur,
@@ -230,7 +228,6 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
 
   const sendAnim = useRef(new Animated.Value(hasContent ? 1 : 0)).current;
   const attachAnim = useRef(new Animated.Value(showAttachment ? 1 : 0)).current;
-  const inputAnimHeight = useRef(new Animated.Value(Math.max(36, inputHeight || 36))).current;
   const submitScale = useRef(new Animated.Value(1)).current;
 
   useEffect(() => {
@@ -248,14 +245,6 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
       useNativeDriver: false,
     }).start();
   }, [attachAnim, showAttachment]);
-
-  useEffect(() => {
-    Animated.timing(inputAnimHeight, {
-      toValue: Math.max(36, Number(inputHeight || 36)),
-      duration: 80,
-      useNativeDriver: false,
-    }).start();
-  }, [inputAnimHeight, inputHeight]);
 
   const handlePressInSubmit = () => {
     Animated.timing(submitScale, {
@@ -326,12 +315,11 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
             <Entypo name={showEmojiPanel ? "keyboard" : "emoji-happy"} size={22} color={iconColor} />
           </TouchableOpacity>
 
-          <Animated.View
+          <View
             style={{
               flex: 1,
-              minHeight: 34,
-              maxHeight: 104,
-              height: inputAnimHeight,
+              minHeight: 40,
+              maxHeight: 120,
               justifyContent: 'center',
               paddingLeft: 2,
               paddingRight: 2,
@@ -390,27 +378,29 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                 value={text}
                 onChangeText={onTextChange}
                 multiline
-                onContentSizeChange={onInputContentSizeChange}
                 onSelectionChange={onSelectionChange}
                 onFocus={onFocus}
                 onBlur={onBlur}
                 placeholderTextColor={placeholderColor}
                 editable={!isSearching}
-                scrollEnabled={Number(inputHeight || 0) >= 108}
+                // Auto-grow is handled NATIVELY by multiline + minHeight/maxHeight
+                // (no JS per-keystroke height loop, which caused typing lag). The
+                // field grows up to maxHeight then scrolls internally.
+                scrollEnabled
+                textAlignVertical="center"
                 accessibilityLabel="Message input"
                 style={{
-                  flex: 1,
                   fontSize: 15,
                   color: inputTextColor,
                   fontFamily: 'Roboto-Regular',
-                  minHeight: 32,
-                  maxHeight: 96,
-                  paddingTop: Platform.OS === 'ios' ? 5 : 2,
-                  paddingBottom: Platform.OS === 'ios' ? 5 : 2,
+                  minHeight: 40,
+                  maxHeight: 120,
+                  paddingTop: Platform.OS === 'ios' ? 6 : 4,
+                  paddingBottom: Platform.OS === 'ios' ? 6 : 4,
                 }}
               />
             )}
-          </Animated.View>
+          </View>
 
           <Animated.View
             style={{
@@ -1161,7 +1151,6 @@ export default function ChatScreen({ navigation, route }) {
   // Draggable peer-details bottom sheet (opened by tapping the header avatar)
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [newMessagesCount, setNewMessagesCount] = useState(0);
-  const [inputHeight, setInputHeight] = useState(34);
   const [showEmojiPanel, setShowEmojiPanel] = useState(false);
   const [activeEmojiSection, setActiveEmojiSection] = useState('recent');
   const [recentEmojis, setRecentEmojis] = useState(['😀', '😂', '❤️', '👍', '🔥', '🙏']);
@@ -2468,12 +2457,6 @@ export default function ChatScreen({ navigation, route }) {
       handleTextChange(editingMessage.text || '');
     }
   }, [editingMessage]);
-
-  // Input handling
-  const handleInputContentSizeChange = (event) => {
-    const nextHeight = Math.max(34, Math.min(108, event?.nativeEvent?.contentSize?.height || 34));
-    setInputHeight(nextHeight);
-  };
 
   const emojiSectionsMeta = useMemo(() => ([
     { key: 'recent', label: 'Recent', icon: 'time-outline' },
@@ -5081,7 +5064,12 @@ export default function ChatScreen({ navigation, route }) {
                       onOpen={handleOpenLink}
                     />
                   )}
-                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                  {/* Non-wrapping row: the text shrinks (wraps internally) so the
+                      meta always keeps its intrinsic width and tucks onto the
+                      bottom-right of the last line. A wrapping row + marginLeft
+                      'auto' meta mislaid the time on short outgoing bubbles
+                      (time+ticks is wide), overlapping the text. */}
+                  <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
                     <View style={{ flexShrink: 1 }}>
                       {renderRichMessageText(msg, isMyMessage, messageKey)}
                     </View>
@@ -5197,7 +5185,16 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+
+  // FlatList extraData for media rows. Its identity changes only when one of
+  // the download/upload/failed maps changes, which is exactly when a mounted
+  // media cell must re-render (e.g. a finished download replacing the blurred
+  // placeholder with the local file:// image).
+  const mediaRenderExtra = useMemo(
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia]
+  );
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -5757,6 +5754,13 @@ export default function ChatScreen({ navigation, route }) {
             data={messages}
             keyExtractor={getMessageKey}
             renderItem={renderChatsItem}
+            // Download/upload state lives OUTSIDE the `messages` array (in
+            // useChatLogic + local failedLocalMedia), so a completed download
+            // doesn't change any item's identity. Without extraData the
+            // already-mounted media row is never re-rendered and the freshly
+            // downloaded file:// image stays blank until the row is recycled.
+            // Feed those state maps in so VirtualizedList re-renders the cell.
+            extraData={mediaRenderExtra}
             inverted
             keyboardShouldPersistTaps="handled"
             contentContainerStyle={{
@@ -6101,12 +6105,10 @@ export default function ChatScreen({ navigation, route }) {
             chatColor={chatColor}
             text={text}
             pendingMedia={editingMessage ? null : pendingMedia}
-            inputHeight={inputHeight}
             isInputFocused={isInputFocused}
             isSearching={isSearching}
             showEmojiPanel={showEmojiPanel}
             onTextChange={handleTextChangeWithMentions}
-            onInputContentSizeChange={handleInputContentSizeChange}
             onSelectionChange={isGroupChat ? handleMentionSelectionChange : undefined}
             onFocus={() => { setIsInputFocused(true); setShowEmojiPanel(false); }}
             onBlur={() => setIsInputFocused(false)}
