@@ -218,11 +218,12 @@ export default function AddUser({ navigation }) {
     }).start();
   }, []);
 
-  useEffect(() => {
-    // Only load cached contacts from SQLite on mount — no server sync.
-    // Server sync only happens when the user taps the refresh button.
-    loadContacts().catch((err) => console.warn('Failed to load contacts:', err));
-  }, []);
+  // NOTE: no explicit loadContacts() on mount here — useContactSync's own
+  // bootstrap effect already loads cached contacts from SQLite once on mount
+  // (server sync only runs on the Refresh button). Calling loadContacts() here
+  // too ran the full-table load a SECOND time on mount, which re-applied the
+  // list and made the screen visibly blink 2-3 times. The bootstrap load is the
+  // single source now.
 
   useEffect(() => {
     if (!discoverResponse) return;

@@ -7,6 +7,7 @@ import {
   initSocket, disconnectSocket, setupAppStateListener,
   emitLogoutCurrentDevice, clearLocalStorageAndDisconnect,
 } from '../Redux/Services/Socket/socket';
+import { isAppLockSuspended } from '../services/appLockGuard';
 
 const AuthContext = createContext({});
 export const useAuth = () => useContext(AuthContext);
@@ -17,6 +18,11 @@ export const AuthProvider = ({ children }) => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
 
   const appState = useRef(AppState.currentState);
+  // True only once the app has REALLY been to the background since the last
+  // foreground. Lets us ignore transient `inactive` blips — a permission /
+  // contacts / image-picker prompt fires background→inactive→active without the
+  // user leaving the app, and we must NOT treat that as a fresh foreground.
+  const wasBackgrounded = useRef(false);
   const navigationRef = useRef(null);
   // Unsubscribe for setupAppStateListener — torn down on logout and re-registered
   // exactly once (previously discarded → leaked/duplicate listeners reconnecting
@@ -120,16 +126,42 @@ export const AuthProvider = ({ children }) => {
     checkLoginStatus();
   }, []);
 
-  // Foreground → quick re-check & socket recovery
+  // Foreground → quick re-check & socket recovery.
+  //
+  // IMPORTANT: only act on a GENUINE background→active trip. Previously this
+  // fired on every `inactive`→`active` too, so opening the contacts permission
+  // dialog / picker (which backgrounds the app for a moment) re-ran the full
+  // checkLoginStatus() → setUser(new object) + initSocket() on EVERY contact
+  // fetch/refresh. That heavy re-init on a trivial excursion is what made the
+  // app churn/flash back to the Splash on returning. We now:
+  //   • record `wasBackgrounded` only on a real `background` transition,
+  //   • ignore the bare `inactive`→`active` round-trip, and
+  //   • skip entirely when the app lock is suspended (an intentional in-app
+  //     excursion like the contacts/image picker — same guard AppLockGate uses).
   useEffect(() => {
     const subscription = AppState.addEventListener('change', async (nextAppState) => {
-      if (appState.current.match(/inactive|background/) && nextAppState === 'active') {
+      if (nextAppState === 'background') {
+        wasBackgrounded.current = true;
+        appState.current = nextAppState;
+        return;
+      }
+
+      if (nextAppState === 'active' && wasBackgrounded.current) {
+        wasBackgrounded.current = false;
+        appState.current = nextAppState;
+
+        // Intentional in-app excursion (contacts/image/document picker, camera):
+        // the return trip is not a real foreground — don't re-init anything.
+        if (isAppLockSuspended()) return;
+
         console.log('App returned to foreground');
         const accessToken = await AsyncStorage.getItem('accessToken');
         if (accessToken) {
           await checkLoginStatus(); // will also re-init socket if needed
         }
+        return;
       }
+
       appState.current = nextAppState;
     });
 

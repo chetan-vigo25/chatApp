@@ -226,8 +226,29 @@ export const useContactSync = () => {
   const firstPaintDoneRef = useRef(false);
   const fullAppliedRef = useRef(false);
 
+  // Content signature of the last list we pushed to state. Guards against
+  // re-applying an identical list (mount does head-paint → full-load, and a
+  // duplicate/socket-triggered reload re-reads the same rows). Each apply builds
+  // a brand-new array, so without this guard the FlatList rebuilt every time and
+  // the screen visibly BLINKED 2-3 times while contacts loaded. We include the
+  // fields the UI actually renders (id, registration/userId, name, type) so a
+  // real change — e.g. a contact flipping to registered via `contact:registered`
+  // — still re-applies, while a no-op reload is skipped.
+  const lastAppliedSigRef = useRef('');
+  const contactsSignature = (list) => {
+    let sig = String(list.length);
+    for (let i = 0; i < list.length; i++) {
+      const c = list[i];
+      sig += `|${c.id || c._id || c.originalPhone || ''}:${c.userId || ''}:${c.type || ''}:${c.fullName || c.name || ''}`;
+    }
+    return sig;
+  };
+
   const applyContactsToState = useCallback((all) => {
     if (!mountedRef.current) return;
+    const sig = contactsSignature(all);
+    if (sig === lastAppliedSigRef.current) return; // identical list → skip re-render
+    lastAppliedSigRef.current = sig;
     setMatchedContacts(all);
     setMatchedRegistered(all.filter(c => c.type === 'registered' || !!c.userId));
     setMatchedUnregistered(all.filter(c => c.type !== 'registered' && !c.userId));
@@ -263,10 +284,29 @@ export const useContactSync = () => {
         ContactDatabase.getSyncMetadata(),
       ]);
 
+      // Idempotent updates: applyFromDB runs on every refresh — including the
+      // "nothing changed" path. Blindly setting a NEW Date()/metadata object each
+      // time changed the state reference even when the value was identical, which
+      // rebuilt `listData` (it depends on lastSyncTime) and re-rendered the whole
+      // FlatList → the screen BLINKED on every refresh. Only push state when the
+      // value actually changed; a real sync (new timestamp) still updates once.
       if (mountedRef.current) {
-        setLastSyncSessionId(sessionId);
-        setLastSyncTime(lastSync ? new Date(lastSync) : null);
-        setSyncMetadata(metadata || {});
+        setLastSyncSessionId((prev) => (prev === sessionId ? prev : sessionId));
+        setLastSyncTime((prev) => {
+          const nextTs = lastSync ? new Date(lastSync).getTime() : 0;
+          const prevTs = prev ? prev.getTime() : 0;
+          if (prevTs === nextTs) return prev;
+          return lastSync ? new Date(lastSync) : null;
+        });
+        setSyncMetadata((prev) => {
+          const next = metadata || {};
+          const prevKeys = Object.keys(prev || {});
+          const nextKeys = Object.keys(next);
+          if (prevKeys.length === nextKeys.length && nextKeys.every((k) => prev[k] === next[k])) {
+            return prev;
+          }
+          return next;
+        });
       }
 
       return all;
@@ -287,7 +327,21 @@ export const useContactSync = () => {
     // the app lock so a contact fetch never bounces to the lock screen.
     suspendAppLock();
     try {
-      const { status } = await Contacts.requestPermissionsAsync();
+      // Check the CURRENT permission first with getPermissionsAsync(), which is a
+      // pure query and launches NOTHING. Calling requestPermissionsAsync()
+      // unconditionally (the old behaviour) re-launched the system permission
+      // activity on EVERY fetch/refresh — even when already granted — which
+      // backgrounds→foregrounds the app and made the Select Contact screen
+      // visibly BLINK once each time. Only request when we don't already hold it.
+      let status;
+      try {
+        ({ status } = await Contacts.getPermissionsAsync());
+      } catch {
+        status = undefined;
+      }
+      if (status !== 'granted') {
+        ({ status } = await Contacts.requestPermissionsAsync());
+      }
       if (status !== 'granted') return [];
       const { data } = await Contacts.getContactsAsync({
         fields: [Contacts.Fields.PhoneNumbers],
@@ -359,7 +413,12 @@ export const useContactSync = () => {
       AsyncStorage.setItem(STORAGE_KEYS.E164_CACHE, JSON.stringify(nextCache)).catch(() => {});
     }
 
-    if (mountedRef.current) setHashedContacts(valid);
+    // NOTE: intentionally NOT calling setHashedContacts here. getE164Contacts runs
+    // on EVERY refresh and returns `valid` straight to its callers (runDeltaSync /
+    // runFullSync). Nothing renders the `hashedContacts` state, so setting it just
+    // built a fresh array each refresh and forced one extra re-render — which
+    // re-rendered the contact rows and flashed their avatars (the remaining single
+    // blink on refresh). Removed; callers use the returned value directly.
     return valid;
   }, [readFreshDeviceContacts]);
 
@@ -876,13 +935,17 @@ export const useContactSync = () => {
       throw new Error('Offline - refresh queued');
     }
 
-    // Re-read device contacts fresh (picks up any newly added numbers)
-    try { await askPermissionAndLoadContacts?.(); } catch {}
+    // NOTE: no askPermissionAndLoadContacts() here. runFullSync/runDeltaSync both
+    // call getE164Contacts() → readFreshDeviceContacts(), which already re-reads
+    // the device phonebook fresh (picking up newly added numbers). The extra call
+    // read the WHOLE phonebook a second time AND wrote it into ContactContext's
+    // `deviceContacts` state — re-rendering every consumer of that context and
+    // making the Select Contact screen visibly BLINK on each refresh. Removed.
 
     const initialDone = await ContactDatabase.isInitialSyncDone();
     if (!initialDone) return runFullSync({ reason: 'pull_to_refresh_first', silent: false });
     return runDeltaSync({ reason: 'pull_to_refresh', silent: false });
-  }, [isConnected, runFullSync, runDeltaSync, askPermissionAndLoadContacts]);
+  }, [isConnected, runFullSync, runDeltaSync]);
 
   // ─── PUBLIC: processContacts ───
 
