@@ -435,7 +435,7 @@ const styles = StyleSheet.create({
   contactAbout: { fontFamily: 'Roboto-Regular', fontSize: 13 },
 
   // ─── STEP 2: INPUTS ───
-  inputSection: { paddingHorizontal: 16 },
+  inputSection: { paddingHorizontal: 12 },
   inputRow: {
     flexDirection: 'row', alignItems: 'center', borderBottomWidth: 1, paddingVertical: 10,
   },
@@ -443,7 +443,7 @@ const styles = StyleSheet.create({
   charCount: { fontFamily: 'Roboto-Regular', fontSize: 12, marginLeft: 8 },
 
   // ─── STEP 2: MEMBERS PREVIEW ───
-  membersPreview: { paddingHorizontal: 16, paddingTop: 24 },
+  membersPreview: { paddingHorizontal: 12, paddingTop: 24 },
   membersTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 12, letterSpacing: 0.5, marginBottom: 12 },
   membersGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 12 },
   memberChip: { alignItems: 'center', width: 60 },

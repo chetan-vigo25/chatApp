@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Image } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 const MEDIA_LABELS = {
@@ -11,6 +11,26 @@ const MEDIA_LABELS = {
   document: '📎 Document',
   location: '📍 Location',
   contact: '👤 Contact',
+  album: '🖼 Album',
+};
+
+// A video FILE fed into <Image> paints black — only real posters qualify.
+const isVideoFileUrl = (u) =>
+  /\.(mp4|mov|m4v|webm|mkv|avi|3gp)(\?|$)/i.test(String(u || '')) ||
+  /\/uploads\/chat\/video\//i.test(String(u || ''));
+
+// Small media thumb for the strip. This runs on the SENDER'S device, so
+// local file:// uris are fine for images; videos need a poster URL.
+const resolveThumb = (target) => {
+  const type = (target?.type || target?.mediaType || 'text').toLowerCase();
+  const first = Array.isArray(target?.mediaItems) && target.mediaItems.length
+    ? target.mediaItems[0]
+    : null;
+  const candidates = first
+    ? [first.mediaThumbnailUrl, first.localUri, first.mediaUrl]
+    : [target?.mediaThumbnailUrl, target?.localUri, target?.previewUrl, target?.mediaUrl];
+  if (!['image', 'photo', 'video', 'album'].includes(type)) return null;
+  return candidates.find((u) => u && !isVideoFileUrl(u)) || null;
 };
 
 const ReplyPreviewBox = React.memo(function ReplyPreviewBox({
@@ -32,6 +52,7 @@ const ReplyPreviewBox = React.memo(function ReplyPreviewBox({
     : isMedia
       ? (MEDIA_LABELS[msgType] || replyTarget.text || 'Media')
       : (replyTarget.text || '');
+  const thumbUri = replyTarget.isDeleted ? null : resolveThumb(replyTarget);
 
   const accentColor = isMe ? (chatColor || '#03b0a2') : '#6B8AFF';
   const bgColor = isDarkMode ? '#1E2D36' : '#E8EDF2';
@@ -57,6 +78,9 @@ const ReplyPreviewBox = React.memo(function ReplyPreviewBox({
           {previewText}
         </Text>
       </View>
+      {thumbUri ? (
+        <Image source={{ uri: thumbUri }} style={styles.thumb} resizeMode="cover" />
+      ) : null}
       <TouchableOpacity
         onPress={onClose}
         style={styles.closeBtn}
@@ -95,6 +119,13 @@ const styles = StyleSheet.create({
   previewText: {
     fontSize: 14,
     fontFamily: 'Roboto-Regular',
+  },
+  thumb: {
+    width: 42,
+    height: 42,
+    borderRadius: 6,
+    marginRight: 4,
+    backgroundColor: 'rgba(0,0,0,0.2)',
   },
   closeBtn: {
     padding: 10,

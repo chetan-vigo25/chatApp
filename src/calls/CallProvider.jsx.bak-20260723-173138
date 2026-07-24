@@ -19,12 +19,6 @@ import CallEngineWebView from './engine/CallEngineWebView';
 import { isNativeCallEngine } from './engineSelector';
 import nativeEngine from './native-engine/NativeCallEngine';
 import { audioSessionDidActivate, audioSessionDidDeactivate } from './native-engine/webrtcGlobals';
-// AudioRoute wraps react-native-incall-manager. It lives under native-engine/ for
-// historical reasons but is NOT native-engine-only: on Android the WebView engine
-// needs it just as much (see applyInitialCallRoute) — it is what puts the device
-// into MODE_IN_COMMUNICATION. The module is platform-guarded and lazily requires
-// the lib, so importing it here is safe on every engine/platform combination.
-import * as AudioRoute from './native-engine/AudioRoute';
 import NativeVideoStage from './native-engine/NativeVideoStage';
 import CallOverlay from './screens/CallOverlay';
 // In-app incoming-call banner temporarily disabled (OS notification handles
@@ -467,33 +461,9 @@ export const CallProvider = ({ children }) => {
     initialRouteAppliedRef.current = true;
     const on = !!stateRef.current.speakerOn;
     if (Platform.OS === 'android') {
-      // ── Put Android into its CALL audio mode — do this FIRST ───────────────
-      // InCallManager.start() is what sets MODE_IN_COMMUNICATION: the voice
-      // audio path (small playout buffers), hardware AEC/NS/AGC, STREAM_VOICE_CALL
-      // and call audio focus. Without it the WebView's WebRTC audio runs on the
-      // MEDIA/playback path, whose deep buffers make latency ACCUMULATE (audio
-      // arriving seconds late) while the software AEC fights the missing hardware
-      // one (choppy/robotic). That is the whole reason the same call is smooth in
-      // Chrome and broken in the app: Chrome's WebRTC stack sets this mode itself,
-      // the embedded Android System WebView does not — the host app must.
-      //
-      // Previously this ran ONLY on the native engine (NativeCallEngine), which is
-      // iOS-only today (CALL_NATIVE_ENGINE_ANDROID = false), so Android never got
-      // a call audio session at all. See the TODO(audit APP-12) note in
-      // engine/callEngineHtml.js and PHASE_1_AUDIT.md §57.
-      //
-      // ONE owner of the global audio state. When InCallManager is present it
-      // owns BOTH the mode and the routing; expo-av must not also drive it —
-      // setAudioModeAsync re-applies its own mode on every call and would fight
-      // MODE_IN_COMMUNICATION (the same two-owners hazard the iOS notes below
-      // describe, where each reconfigure killed the WebView's live mic track).
-      // expo-av stays only as the FALLBACK for a build where the native module
-      // isn't linked, so the Speaker button can never become a no-op.
-      AudioRoute.start({ video: stateRef.current.media === 'video' });
-      if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(on);
-      else applyAudioRoute(on);
-      // Either way the engine still needs setSinkId: that re-routes the WebView's
-      // WebRTC <audio> element, which is what actually carries the call audio.
+      // Same pair as the Speaker toggle: OS audio mode + engine setSinkId —
+      // that combination is what actually moves WebView call audio.
+      applyAudioRoute(on);
       sendCmd({ cmd: CMD.SET_SPEAKER, on });
     } else if (isNativeCallEngine()) {
       // iOS native engine: AudioRoute.start() picks a route from the media type
@@ -562,13 +532,6 @@ export const CallProvider = ({ children }) => {
   const resetAudioRoute = useCallback(async () => {
     // Next call must re-apply its own initial route (earpiece vs speaker).
     initialRouteAppliedRef.current = false;
-    // Release the call audio session (Android WebView engine — the iOS native
-    // engine stops it from its own hangup path). This MUST run before the
-    // `audioRouteAppliedRef` early-return further down: AudioRoute keeps a
-    // module-level `started` flag that only stop() clears, so a skipped stop
-    // makes the NEXT call's start() a silent no-op — i.e. one missed teardown
-    // would permanently drop us back to the broken media-path audio.
-    if (Platform.OS === 'android') AudioRoute.stop();
     if (Platform.OS === 'ios') {
       // Native engine: AudioRoute.stop() (engine hangup/ended path) releases
       // routing; expo-av never configured anything to undo.
@@ -1333,12 +1296,7 @@ export const CallProvider = ({ children }) => {
       dispatch({ type: ACT.SET_FLAG, key: 'media', value: 'video' });
       if (!snap.speakerOn) {
         dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: true });
-        // Single-owner rule (see applyInitialCallRoute): expo-av must not re-apply
-        // its own audio mode mid-call once InCallManager holds the session.
-        if (Platform.OS === 'android') {
-          if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(true);
-          else applyAudioRoute(true);
-        }
+        if (Platform.OS === 'android') applyAudioRoute(true);
         sendCmd({ cmd: CMD.SET_SPEAKER, on: true });
       }
     }
@@ -2302,10 +2260,7 @@ export const CallProvider = ({ children }) => {
       // call audio, so expo-av alone often left the sound on the loudspeaker
       // regardless of the toggle. A 'speakerResult: unsupported' no longer disables
       // the button (audioRouteSupported is forced true on Android), so it's safe.
-      // Route through whichever owns the session — same single-owner rule as
-      // applyInitialCallRoute (expo-av only when InCallManager isn't linked).
-      if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(next);
-      else applyAudioRoute(next);
+      applyAudioRoute(next);
       sendCmd({ cmd: CMD.SET_SPEAKER, on: next });
     } else {
       // iOS/desktop: best-effort via the engine's setSinkId.
@@ -2335,12 +2290,7 @@ export const CallProvider = ({ children }) => {
     const on = !!s.speakerOn;
     if (__DEV__) console.log('[CALL][APP][audio] re-asserting route to match button →', on ? 'LOUDSPEAKER' : 'earpiece');
     if (Platform.OS === 'android') {
-      // Re-assert through the session owner. Also re-arms the call audio mode if
-      // something (a telephony interruption, another app grabbing focus) knocked
-      // us back to MODE_NORMAL mid-call — AudioRoute.start() is guarded, so this
-      // only re-applies routing when the session is already up.
-      if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(on);
-      else applyAudioRoute(on);
+      applyAudioRoute(on);
       sendCmd({ cmd: CMD.SET_SPEAKER, on });
     } else if (isNativeCallEngine()) {
       sendCmd({ cmd: CMD.SET_SPEAKER, on });

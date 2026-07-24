@@ -331,7 +331,26 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
       if (config.signal && externalAbortHandler) {
         config.signal.removeEventListener('abort', externalAbortHandler);
       }
-      return xhrUpload({ method, url, headers, formData, config });
+      try {
+        return await xhrUpload({ method, url, headers, formData, config });
+      } catch (xhrError) {
+        // Mirror the fetch path's 401 handling so progress uploads don't fail
+        // on an expired access token: refresh once, then retry the upload.
+        if (xhrError?.response?.status === 401 && !config._retry) {
+          const refreshed = await refreshAccessToken({ force: true });
+          const newToken = refreshed?.accessToken;
+          if (!newToken) throw xhrError;
+          return apiCallForm(method, endpoint, formData, {
+            ...config,
+            _retry: true,
+            headers: {
+              ...(config.headers || {}),
+              Authorization: `Bearer ${newToken}`,
+            },
+          });
+        }
+        throw xhrError;
+      }
     }
 
     const fetchOptions = {

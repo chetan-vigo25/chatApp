@@ -237,7 +237,7 @@ const styles = StyleSheet.create({
   attachName: { flex: 1, fontFamily: "Roboto-Regular", fontSize: 12 },
   composerRow: { flexDirection: "row", alignItems: "flex-end", gap: 6 },
   attachBtn: { width: 40, height: 44, alignItems: "center", justifyContent: "center" },
-  input: { flex: 1, maxHeight: 110, minHeight: 44, borderRadius: 22, paddingHorizontal: 16, paddingTop: 11, paddingBottom: 11, fontFamily: "Roboto-Regular", fontSize: 15 },
+  input: { flex: 1, maxHeight: 110, minHeight: 44, borderRadius: 22, paddingHorizontal: 12, paddingTop: 11, paddingBottom: 11, fontFamily: "Roboto-Regular", fontSize: 15 },
   sendBtn: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center" },
   closedBar: { padding: 16, alignItems: "center" },
   closedText: { fontFamily: "Roboto-Regular", fontSize: 13 },

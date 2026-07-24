@@ -272,7 +272,7 @@ const styles = StyleSheet.create({
 
   topBar: {
     height: 56,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
   },

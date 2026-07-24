@@ -131,7 +131,7 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, paddingHorizontal: 40 },
   emptyTitle: { fontFamily: "Roboto-SemiBold", fontSize: 17, marginTop: 6 },
   emptyText: { fontFamily: "Roboto-Regular", fontSize: 13.5, textAlign: "center", lineHeight: 19 },
-  listContent: { paddingHorizontal: 16, paddingBottom: 30, paddingTop: 4 },
+  listContent: { paddingHorizontal: 12, paddingBottom: 30, paddingTop: 4 },
   card: { borderRadius: 16, padding: 14, marginBottom: 10 },
   cardTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 8 },
   typeWrap: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1 },

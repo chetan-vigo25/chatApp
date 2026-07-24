@@ -472,7 +472,7 @@ const styles = StyleSheet.create({
   // ── Header ────────────────────────────────────────────────────────────────
   header: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: Platform.OS === 'ios' ? 52 : 18,
     paddingBottom: 10,
   },
@@ -482,7 +482,7 @@ const styles = StyleSheet.create({
   },
   continueBtn: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
-    borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8,
+    borderRadius: 20, paddingHorizontal: 12, paddingVertical: 8,
   },
   continueBtnText: { color: '#fff', fontSize: 14, fontFamily: 'Roboto-Bold' },
 

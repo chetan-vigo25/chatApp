@@ -540,9 +540,19 @@ class LocalStorageService {
   }
 
   async getPendingDownloads() {
+    // NOTE: 'paused' rows are intentionally excluded — boot-time hydration must
+    // NOT auto-resume a download the user explicitly paused. They surface via
+    // getPausedDownloads() and resume only on user tap.
     const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
     return Object.values(queueMap || {})
       .filter((item) => ['pending', 'downloading', 'failed'].includes(item?.status))
+      .sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
+  }
+
+  async getPausedDownloads() {
+    const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
+    return Object.values(queueMap || {})
+      .filter((item) => item?.status === 'paused')
       .sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
   }
 

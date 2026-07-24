@@ -325,7 +325,7 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 10,
     paddingBottom: 12,
     gap: 12,
@@ -434,7 +434,7 @@ const styles = StyleSheet.create({
   actionBar: {
     position: 'absolute',
     left: 0, right: 0, bottom: 0,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 12,
     paddingBottom: 16,
     borderTopWidth: StyleSheet.hairlineWidth,

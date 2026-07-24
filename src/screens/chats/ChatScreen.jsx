@@ -23,7 +23,8 @@ import {
   UIManager,
   PanResponder,
   StyleSheet,
-  DeviceEventEmitter
+  DeviceEventEmitter,
+  BackHandler
 } from "react-native";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
@@ -52,9 +53,9 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import Reanimated, { useAnimatedStyle } from 'react-native-reanimated';
 import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
+import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
-import { mediaDownloadSigned, toSecureMediaUri } from '../../utils/mediaService';
+import { mediaDownloadSigned, toSecureMediaUri, mediaResolve } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
@@ -66,6 +67,8 @@ import StatusReplyPreview from '../../components/StatusReplyPreview';
 import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import LocationBubble from '../../components/LocationBubble';
 import AlbumMessage from '../../components/AlbumMessage';
+import UploadRing from '../../components/UploadRing';
+import BlurGateImage from '../../components/BlurGateImage';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
@@ -696,7 +699,7 @@ const AudioSeekBar = React.memo(function AudioSeekBar({
           while playing). Message time + ticks come from the media time overlay. */}
       <Text style={{ color: subColor, fontSize: 11, fontFamily: 'Roboto-Regular', marginTop: 1 }}>
         {isDownloading
-          ? `${Math.round((progress || 0) * 100)}%`
+          ? 'Downloading…'
           : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
             ? 'Failed'
             : shownPosLabel}
@@ -843,7 +846,7 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
           <Pressable
             onPress={() => Linking.openURL(`tel:${fullPhone}`).catch(() => {})}
-            style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 16, borderBottomWidth: 0.5, borderBottomColor: borderColor }}
+            style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 12, borderBottomWidth: 0.5, borderBottomColor: borderColor }}
           >
             <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: accentColor + '15', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
               <Ionicons name="call-outline" size={18} color={accentColor} />
@@ -879,6 +882,52 @@ const ChatMenuItem = ({ label, sublabel, onPress, theme, isDanger = false }) => 
   </TouchableOpacity>
 );
 
+// Received-media privacy gate: see components/BlurGateImage.jsx — a constant
+// heavy blur layer cross-faded out by real download progress (a DYNAMIC
+// blurRadius re-blurs the bitmap every tick and visibly blinks; opacity on the
+// native driver glides). Sender's own and downloaded media render ungated.
+
+// WhatsApp-style failed-transfer RETRY affordance (uploads + downloads): a
+// white ↻ on a dark disc with a brand-teal ring. Tap re-runs the failed
+// upload (retryFailedMediaMessage via resendMessage) or re-enqueues the
+// download. Paused transfers are NOT failed — they keep their ▶ ring.
+const retryStyles = StyleSheet.create({
+  overlay: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.25)',
+  },
+  center: {
+    alignItems: 'center',
+  },
+  disc: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderWidth: 2,
+    borderColor: '#03b0a2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  label: {
+    marginTop: 6,
+    color: '#fff',
+    fontSize: 10,
+    fontFamily: 'Roboto-Medium',
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: 10,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    overflow: 'hidden',
+  },
+});
+
 const chatMenuStyles = StyleSheet.create({
   // Popover container — fills the screen so taps outside dismiss
   popoverRoot: {
@@ -913,7 +962,7 @@ const chatMenuStyles = StyleSheet.create({
 
   // Menu item rows — text-only, WhatsApp-style compact list
   menuItem: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 12,
     borderRadius: 10,
     marginHorizontal: 4,
@@ -1179,6 +1228,9 @@ export default function ChatScreen({ navigation, route }) {
   const [visibleMessageKeys, setVisibleMessageKeys] = useState({});
   const thumbnailCacheRef = useRef({});
   const thumbnailLoadInFlightRef = useRef(new Set());
+  // mediaIds already asked of user/media/resolve for a missing video poster —
+  // one shot per screen mount, so a null server answer can't loop requests.
+  const thumbnailResolveTriedRef = useRef(new Set());
   const [, setThumbnailCacheVersion] = useState(0);
   const lastScrollStateRef = useRef({ isAtLatest: true, isAtTop: false, showScrollButton: false });
   const visibleMapRef = useRef({});
@@ -1355,13 +1407,24 @@ export default function ChatScreen({ navigation, route }) {
     };
   };
 
-  const getServerThumbnailUrl = (msg) => (
-    msg?.mediaThumbnailUrl ||
-    msg?.thumbnailUrl ||
-    msg?.previewUrl ||
-    msg?.mediaUrl ||
-    null
-  );
+  const isVideoMessage = (msg) =>
+    msg?.type === 'video' || msg?.mediaType === 'video' || msg?.messageType === 'video';
+
+  // A video FILE url is not a poster — feeding an .mp4 into <Image> paints a
+  // black box. Used to reject bad fallbacks/poisoned cache entries for videos.
+  const isLikelyVideoFileUrl = (url) =>
+    /\.(mp4|mov|m4v|webm|mkv|avi|3gp)(\?|$)/i.test(String(url || '')) ||
+    /\/uploads\/chat\/video\//i.test(String(url || ''));
+
+  const getServerThumbnailUrl = (msg) => {
+    const thumb = msg?.mediaThumbnailUrl || msg?.thumbnailUrl || null;
+    if (thumb) return thumb;
+    // Videos must NOT fall back to the media file itself (black box). Legacy
+    // messages without a poster get one via the mediaResolve fallback in
+    // primeThumbnailCacheForMessage instead.
+    if (isVideoMessage(msg)) return null;
+    return msg?.previewUrl || msg?.mediaUrl || null;
+  };
 
   const resolveCachedThumbnailUrl = (msg) => {
     const mediaId = getResolvedMediaId(msg);
@@ -1446,12 +1509,33 @@ export default function ChatScreen({ navigation, route }) {
 
     thumbnailLoadInFlightRef.current.add(mediaId);
     try {
+      const isVideo = isVideoMessage(msg);
       const cached = await localStorageService.getThumbnailReference(mediaId);
       let resolved = cached?.thumbnailUrl || null;
+      // Older builds cached the video FILE url as the "thumbnail" (the old
+      // mediaUrl fallback) — that renders black. Treat it as a cache miss.
+      if (resolved && isVideo && isLikelyVideoFileUrl(resolved)) {
+        resolved = null;
+      }
       if (!resolved) {
         resolved = getServerThumbnailUrl(msg);
         if (resolved) {
           await localStorageService.saveThumbnailReference(mediaId, resolved, resolveMediaInfo(msg).mediaType).catch(() => {});
+        }
+      }
+
+      // Legacy videos: the message row (and SQLite) predates server thumbnails,
+      // so no poster URL exists locally. Ask the server — resolve re-issues
+      // fresh URLs AND lazily generates the missing thumbnail for old uploads.
+      if (!resolved && isVideo && !thumbnailResolveTriedRef.current.has(mediaId)) {
+        thumbnailResolveTriedRef.current.add(mediaId);
+        const map = await mediaResolve([mediaId]);
+        const entry = map?.[mediaId];
+        const item = Array.isArray(entry?.items) ? entry.items[0] : entry;
+        const remoteThumb = item?.thumbnailUrl || null;
+        if (remoteThumb && !isLikelyVideoFileUrl(remoteThumb)) {
+          resolved = remoteThumb;
+          await localStorageService.saveThumbnailReference(mediaId, resolved, 'video').catch(() => {});
         }
       }
 
@@ -1582,7 +1666,10 @@ export default function ChatScreen({ navigation, route }) {
     }
 
     const state = resolveMediaState(msg);
-    if (state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING) {
+    if (
+      state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING ||
+      state?.status === MEDIA_DOWNLOAD_STATUS.PAUSED
+    ) {
       return Math.max(0, Math.min(1, Number(state?.progress || 0) / 100));
     }
 
@@ -1597,6 +1684,26 @@ export default function ChatScreen({ navigation, route }) {
       }
     }
     return 0;
+  };
+
+  // ===== WhatsApp-style pause/resume/cancel wiring =====
+  // Uploads are keyed by the optimistic bubble's tempId (== the persisted
+  // media_upload_queue row + socket clientMessageId).
+  const isUploadPausedFor = (msg) => Boolean(pausedUploads?.[String(msg?.tempId || msg?.id || '')]);
+
+  // Downloads are keyed by the resolved mediaId (same key MediaDownloadManager
+  // uses). Resume goes back through the normal tap-to-download flow — the
+  // persisted resumeData continues from the partial bytes.
+  const handlePauseDownload = (msg) => {
+    const mediaId = getResolvedMediaId(msg);
+    if (mediaId) mediaDownloadManager.pause(mediaId).catch(() => {});
+  };
+  const handleResumeDownload = (msg) => {
+    handleDownloadWithPersistence(msg);
+  };
+  const handleCancelDownload = (msg) => {
+    const mediaId = getResolvedMediaId(msg);
+    if (mediaId) mediaDownloadManager.cancel(mediaId).catch(() => {});
   };
 
   const {
@@ -1645,6 +1752,10 @@ export default function ChatScreen({ navigation, route }) {
     downloadProgress,
     uploadProgress,
     mediaDownloadStates,
+    pausedUploads,
+    pauseMediaUpload,
+    resumeMediaUpload,
+    cancelMediaUpload,
     markMediaRemovedLocally,
     resendMessage,
     isPeerTyping,
@@ -1828,6 +1939,21 @@ export default function ChatScreen({ navigation, route }) {
   const [reactionDetailModal, setReactionDetailModal] = useState({ visible: false, reactions: null, selectedEmoji: null, messageId: null });
   const reactionScaleAnims = useRef({}).current;
 
+  // Hardware/gesture back while the selection toolbar (or floating reaction
+  // row) is up dismisses ONLY the selection — never the screen itself
+  // (WhatsApp parity). Falls through to normal navigation otherwise.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if ((selectedMessage?.length || 0) > 0 || reactionMsgId) {
+        clearSelectedMessages?.();
+        setReactionMsgId(null);
+        return true;
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [selectedMessage, reactionMsgId, clearSelectedMessages]);
+
   // Resolve userId to display name — saved contact name (matched by id / phone
   // hash) first, then member/peer name, then phone number.
   const getReactionUserName = useCallback((userId) => {
@@ -1847,10 +1973,22 @@ export default function ChatScreen({ navigation, route }) {
     thumbnailUri: null,
     type: 'image',
     message: null,
-    isDownloaded: false
+    isDownloaded: false,
+    // Album swipe pages: [{ uri, type, item }] + the active page index.
+    albumItems: null,
+    albumIndex: 0,
   });
+  const albumPagerRef = useRef(null);
   const [viewerSavedToast, setViewerSavedToast] = useState(false);
   const viewerToastTimer = useRef(null);
+  // Viewer save/share fetch state: large files take a while to pull from the
+  // server — the download icon becomes a spinner and a center ring shows the
+  // REAL byte progress until the file is local. `forIndex` pins the overlay to
+  // the album page the download STARTED on — swiping to another item must not
+  // carry the ring along with it.
+  const [viewerDownload, setViewerDownload] = useState({ active: false, progress: 0, forIndex: null });
+  // Abort function for the viewer's in-flight save/share fetch (✕ on the ring).
+  const viewerDownloadCancelRef = useRef(null);
 
   // Media handling functions
   const verifyFileExists = async (uri) => {
@@ -1865,7 +2003,13 @@ export default function ChatScreen({ navigation, route }) {
     }
   };
 
-  const resolveFileForOpen = async (msg) => {
+  // onProgress?(0..1) — reports REAL byte progress while the file has to be
+  // fetched from the server (large videos take a while; the viewer shows a
+  // ring). Local-file hits return instantly and never call it.
+  // registerCancel?(fn) — hands the caller an abort function: stops the
+  // in-flight transfer, deletes the partial file, and resolveFileForOpen
+  // returns null without trying further URLs.
+  const resolveFileForOpen = async (msg, onProgress = null, registerCancel = null) => {
     // 1. Collect all possible local file URIs
     const candidates = [
       resolveDownloadedUri(msg),
@@ -1887,8 +2031,70 @@ export default function ChatScreen({ navigation, route }) {
     // 2. Try signed download URL from API first (most reliable)
     const mediaId = msg?.mediaId || msg?.serverMessageId || msg?.id;
     const fileName = msg?.mediaMeta?.fileName || msg?.payload?.file?.name || msg?.text || `file_${Date.now()}`;
-    const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    let safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    // Gallery save (createAssetAsync) REQUIRES a file extension — caption/
+    // timestamp fallback names have none. Derive one from the media URL path,
+    // else from the mime type, so the cached file is always saveable.
+    if (!/\.[A-Za-z0-9]{2,5}$/.test(safeName)) {
+      const urlExtMatch = uniqueCandidates
+        .map((u) => /\.([A-Za-z0-9]{2,5})$/.exec(String(u || '').split('?')[0]))
+        .find(Boolean);
+      const ext = (urlExtMatch && urlExtMatch[1]) || extensionFromMime(getMimeType(msg)) || 'bin';
+      safeName += `.${ext}`;
+    }
     const dest = `${FileSystem.cacheDirectory}${safeName}`;
+
+    // Byte-progress download (createDownloadResumable exposes progress;
+    // downloadAsync doesn't). Non-2xx bodies are deleted, not returned.
+    let cancelRequested = false;
+    let activeResumable = null;
+    if (typeof registerCancel === 'function') {
+      registerCancel(() => {
+        cancelRequested = true;
+        try {
+          const stop = activeResumable?.cancelAsync || activeResumable?.pauseAsync;
+          stop?.call(activeResumable)?.catch?.(() => {});
+        } catch { /* best-effort */ }
+        FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => {});
+      });
+    }
+    const downloadWithProgress = async (url) => {
+      if (cancelRequested) return null;
+      const resumable = FileSystem.createDownloadResumable(url, dest, {}, (dp) => {
+        if (typeof onProgress !== 'function') return;
+        const written = Number(dp?.totalBytesWritten || 0);
+        // Unknown size arrives as -1 (NOT 0) — `|| fallback` misses it and the
+        // ring never moved. Only a POSITIVE expected size counts; otherwise
+        // fall back to the known file size from the message metadata.
+        const expected = Number(dp?.totalBytesExpectedToWrite);
+        const total = Number.isFinite(expected) && expected > 0
+          ? expected
+          : Number(msg?.mediaMeta?.fileSize || msg?.payload?.file?.size || msg?.fileSize || 0);
+        if (total > 0 && written >= 0) {
+          try { onProgress(Math.max(0, Math.min(1, written / total))); } catch { /* UI only */ }
+        }
+      });
+      activeResumable = resumable;
+      let result = null;
+      try {
+        result = await resumable.downloadAsync();
+      } catch (e) {
+        if (cancelRequested) return null;
+        throw e;
+      } finally {
+        activeResumable = null;
+      }
+      if (cancelRequested) {
+        try { await FileSystem.deleteAsync(result?.uri || dest, { idempotent: true }); } catch { /* best-effort */ }
+        return null;
+      }
+      const httpStatus = Number(result?.status || 0);
+      if (httpStatus && (httpStatus < 200 || httpStatus >= 300)) {
+        try { await FileSystem.deleteAsync(result?.uri || dest, { idempotent: true }); } catch { /* best-effort */ }
+        return null;
+      }
+      return result;
+    };
 
     if (mediaId && isConnected) {
       try {
@@ -1900,7 +2106,7 @@ export default function ChatScreen({ navigation, route }) {
           responseData?.mediaUrl ||
           responseData?.previewUrl || null;
         if (signedUrl && (signedUrl.startsWith('http://') || signedUrl.startsWith('https://'))) {
-          const result = await FileSystem.downloadAsync(toSecureMediaUri(signedUrl), dest);
+          const result = await downloadWithProgress(toSecureMediaUri(signedUrl));
           if (result?.uri && await verifyFileExists(result.uri)) {
             console.log('✅ [resolveFileForOpen] Downloaded via signed URL');
             return result.uri;
@@ -1922,8 +2128,9 @@ export default function ChatScreen({ navigation, route }) {
     const allServerUrls = [...new Set([...serverUrls, ...extraUrls])];
 
     for (const url of allServerUrls) {
+      if (cancelRequested) break;
       try {
-        const result = await FileSystem.downloadAsync(toSecureMediaUri(url), dest);
+        const result = await downloadWithProgress(toSecureMediaUri(url));
         if (result?.uri && await verifyFileExists(result.uri)) {
           console.log('✅ [resolveFileForOpen] Downloaded via direct URL');
           return result.uri;
@@ -1937,6 +2144,39 @@ export default function ChatScreen({ navigation, route }) {
   // ── MIME / extension helpers ──
   const getMimeType = (msg) => {
     return msg?.mimeType || msg?.mediaMeta?.mimeType || msg?.payload?.file?.type || msg?.mediaMeta?.type || 'application/octet-stream';
+  };
+
+  const extensionFromMime = (mime) => {
+    const m = String(mime || '').toLowerCase().split(';')[0];
+    const map = {
+      'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
+      'image/webp': 'webp', 'image/heic': 'heic', 'image/heif': 'heif', 'image/bmp': 'bmp',
+      'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
+      'video/x-matroska': 'mkv', 'video/3gpp': '3gp', 'video/x-msvideo': 'avi',
+      'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav',
+      'audio/ogg': 'ogg', 'application/pdf': 'pdf',
+    };
+    if (map[m]) return map[m];
+    const tail = m.split('/')[1] || '';
+    return /^[a-z0-9]{2,5}$/.test(tail) ? tail : null;
+  };
+
+  // ExpoMediaLibrary.createAssetAsync rejects paths without an extension
+  // ("Could not get the file's extension"). Files cached before the dest-name
+  // fix (or named from a caption) can be extension-less — copy those to a
+  // properly-suffixed cache name before handing them to the gallery.
+  const ensureSaveableFileUri = async (uri, msg) => {
+    if (!uri) return null;
+    const bare = String(uri).split('?')[0];
+    if (/\.[A-Za-z0-9]{2,5}$/.test(bare)) return uri;
+    const nameExt = /\.([A-Za-z0-9]{2,5})$/.exec(String(msg?.mediaMeta?.fileName || ''));
+    const typeExt = isVideoMessage(msg) ? 'mp4'
+      : (msg?.type === 'image' || msg?.mediaType === 'image' || msg?.mediaType === 'photo') ? 'jpg'
+      : null;
+    const ext = (nameExt && nameExt[1]) || extensionFromMime(getMimeType(msg)) || typeExt || 'bin';
+    const dest = `${FileSystem.cacheDirectory}save_${Date.now()}.${ext}`;
+    await FileSystem.copyAsync({ from: uri, to: dest });
+    return dest;
   };
 
   const isAudioMime = (mime) => {
@@ -2214,7 +2454,7 @@ export default function ChatScreen({ navigation, route }) {
         if (perm.status !== 'granted') return;
       }
 
-      await MediaLibrary.createAssetAsync(localUri);
+      await MediaLibrary.createAssetAsync(await ensureSaveableFileUri(localUri, msg));
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
     } catch (error) {
@@ -2310,22 +2550,55 @@ export default function ChatScreen({ navigation, route }) {
     }
   };
 
-  const openMediaViewer = (msg, uri, type = 'image') => {
+  const openMediaViewer = (msg, uri, type = 'image', album = null) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     const isDownloaded = !!resolveDownloadedUri(msg);
-    
+
     setLocalMediaViewer({
       visible: true,
       uri: uri || (isDownloaded ? resolveDownloadedUri(msg) : msg.mediaUrl),
       thumbnailUri: msg.mediaThumbnailUrl || msg.previewUrl,
       type: type,
       message: msg,
-      isDownloaded: isDownloaded
+      isDownloaded: isDownloaded,
+      albumItems: album?.items?.length > 1 ? album.items : null,
+      albumIndex: album?.index || 0,
     });
   };
 
+  // Album viewer: the header actions (share / save) must act on the PAGE the
+  // user is looking at, not the album's first item.
+  const viewerActiveMessage = () => {
+    const lm = localMediaViewer;
+    const page = lm.albumItems?.[lm.albumIndex];
+    if (!page) return lm.message;
+    const it = page.item || {};
+    return {
+      ...(lm.message || {}),
+      mediaId: it.mediaId || null,
+      mediaUrl: it.mediaUrl || null,
+      mediaThumbnailUrl: it.mediaThumbnailUrl || null,
+      localUri: it.localUri || null,
+      mediaMeta: it.mediaMeta || lm.message?.mediaMeta,
+      type: page.type,
+      mediaType: page.type,
+    };
+  };
+
+  const viewerGoTo = (idx) => {
+    const lm = localMediaViewer;
+    if (!lm.albumItems || idx < 0 || idx >= lm.albumItems.length) return;
+    try { albumPagerRef.current?.scrollToIndex({ index: idx, animated: true }); } catch { /* best-effort */ }
+    setLocalMediaViewer((prev) => ({
+      ...prev,
+      albumIndex: idx,
+      uri: prev.albumItems?.[idx]?.uri || prev.uri,
+      type: prev.albumItems?.[idx]?.type || prev.type,
+    }));
+  };
+
   const closeLocalMediaViewer = () => {
-    setLocalMediaViewer(prev => ({ ...prev, visible: false }));
+    setLocalMediaViewer(prev => ({ ...prev, visible: false, albumItems: null, albumIndex: 0 }));
     setViewerSavedToast(false);
     if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
   };
@@ -2698,6 +2971,7 @@ export default function ChatScreen({ navigation, route }) {
   // ReplyBubble carries its OWN replyToMessageId — the user can keep
   // tapping back through the chain. When the parent is older than the
   // currently-loaded `messages` window, this paginates older messages in.
+  const navigateToReplyParentRef = useRef(null);
   const navigateToReplyParent = useCallback(async (originalMsgId, depth = 0) => {
     if (!originalMsgId) return;
     const idStr = String(originalMsgId);
@@ -2712,16 +2986,17 @@ export default function ChatScreen({ navigation, route }) {
 
     let idx = findIdx(messages);
 
-    // Not in current window? Try paging older messages in — once. Depth cap
-    // prevents an infinite loop if the parent really doesn't exist locally.
-    if (idx === -1 && hasMoreMessages && depth < 4) {
+    // Not in current window? Try paging older messages in — once per depth.
+    // Depth cap prevents an infinite loop if the parent doesn't exist locally.
+    // CRITICAL: recurse through the REF, not the closure — this instance's
+    // `messages`/`hasMoreMessages` are frozen from the tap-time render, so
+    // calling ourselves directly would re-search the OLD list forever and
+    // navigation silently died for any message outside the loaded window.
+    if (idx === -1 && hasMoreMessages && depth < 8) {
       try {
         await loadMoreMessages();
       } catch {}
-      // Try again with the (possibly) updated list. Note: messages is a
-      // closure capture, so re-derive via state setter or call setImmediate.
-      // The simplest robust path: requestAnimationFrame + recurse with depth+1.
-      requestAnimationFrame(() => navigateToReplyParent(originalMsgId, depth + 1));
+      requestAnimationFrame(() => navigateToReplyParentRef.current?.(originalMsgId, depth + 1));
       return;
     }
 
@@ -2759,6 +3034,8 @@ export default function ChatScreen({ navigation, route }) {
       }, 3000);
     }
   }, [messages, hasMoreMessages, loadMoreMessages]);
+  // Fresh-closure handle for the pagination recursion above.
+  navigateToReplyParentRef.current = navigateToReplyParent;
 
   const recordingDurationLabel = useMemo(() => {
     const totalSec = Math.max(0, Math.floor(recordingDurationMs / 1000));
@@ -2841,7 +3118,8 @@ export default function ChatScreen({ navigation, route }) {
       const asset = result.assets?.[0];
       if (!asset?.uri) return;
 
-      setPendingMedia({
+      // No preview stage — captured photo uploads immediately (user rule).
+      sendMedia({
         file: {
           uri: asset.uri,
           name: asset.fileName || `camera_${Date.now()}.jpg`,
@@ -2849,14 +3127,14 @@ export default function ChatScreen({ navigation, route }) {
           size: asset.fileSize || 0,
         },
         type: 'image',
-      });
+      }).catch(() => {});
     } catch (error) {
       console.error('camera capture error', error);
       Alert.alert('Error', 'Unable to open camera right now.');
     } finally {
       resumeAppLock();
     }
-  }, [setPendingMedia]);
+  }, [sendMedia]);
 
   const handleAudioPick = useCallback(async () => {
     // Document picker backgrounds the app; suspend the app lock for the round trip.
@@ -2870,7 +3148,8 @@ export default function ChatScreen({ navigation, route }) {
       const asset = result.assets?.[0];
       if (!asset?.uri) return;
 
-      setPendingMedia({
+      // No preview stage — picked audio uploads immediately (user rule).
+      sendMedia({
         file: {
           uri: asset.uri,
           name: asset.name || `audio_${Date.now()}`,
@@ -2878,14 +3157,14 @@ export default function ChatScreen({ navigation, route }) {
           size: asset.size || 0,
         },
         type: 'audio',
-      });
+      }).catch(() => {});
     } catch (error) {
       console.error('audio picker error', error);
       Alert.alert('Error', 'Unable to pick audio file.');
     } finally {
       resumeAppLock();
     }
-  }, [setPendingMedia]);
+  }, [sendMedia]);
 
   const handleShareLocation = useCallback(async () => {
     try {
@@ -3426,7 +3705,7 @@ export default function ChatScreen({ navigation, route }) {
       </View>
       <View style={{
         backgroundColor: isDarkMode ? 'rgba(25,40,55,0.75)' : 'rgba(225,230,236,0.75)',
-        paddingHorizontal: 16,
+        paddingHorizontal: 12,
         paddingVertical: 8,
         borderRadius: 8,
         alignItems: 'center',
@@ -3919,19 +4198,25 @@ export default function ChatScreen({ navigation, route }) {
   const renderMediaOverlay = ({ msg, status, progress, isVideo = false }) => {
     const mediaInfo = resolveMediaInfo(msg);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
+    const isDownloadPaused = status === MEDIA_DOWNLOAD_STATUS.PAUSED;
     const isFailed = status === MEDIA_DOWNLOAD_STATUS.FAILED;
 
     return (
       <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' }}>
         {/* WhatsApp-style download button */}
-        {isDownloading ? (
+        {(isDownloading || isDownloadPaused) ? (
           <View style={{ alignItems: 'center' }}>
-            <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' }}>
-              <ActivityIndicator size="small" color="#fff" />
-            </View>
+            <UploadRing
+              percent={Math.round((progress || 0) * 100)}
+              size={48}
+              paused={isDownloadPaused}
+              onPause={() => handlePauseDownload(msg)}
+              onResume={() => handleResumeDownload(msg)}
+              onCancel={() => handleCancelDownload(msg)}
+            />
             <View style={{ backgroundColor: 'rgba(0,0,0,0.55)', borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3, marginTop: 6 }}>
               <Text style={{ color: '#fff', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
-                {Math.round(progress * 100)}%
+                {mediaInfo.sizeLabel}
               </Text>
             </View>
           </View>
@@ -3976,8 +4261,23 @@ export default function ChatScreen({ navigation, route }) {
         // double blue tick — WhatsApp blue #53BDEB
         return <Ionicons name="checkmark-done" size={11} color="#53BDEB" style={{ marginLeft: 3 }} />;
       }
-      if (msg?.status === 'failed') {
-        return <Ionicons name="alert-circle" size={11} color="#FF8A80" style={{ marginLeft: 3 }} />;
+      if (msg?.status === 'failed' || msg?.status === 'cancelled') {
+        // Tap-to-retry: re-runs the failed/cancelled upload+send (resendMessage
+        // routes not-yet-uploaded media through retryFailedMediaMessage; a
+        // parked chunked session resumes from the server offset).
+        return (
+          <TouchableOpacity
+            onPress={() => resendMessage(msg)}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <Ionicons
+              name="refresh-circle"
+              size={13}
+              color={msg?.status === 'cancelled' ? '#03b0a2' : '#FF8A80'}
+              style={{ marginLeft: 3 }}
+            />
+          </TouchableOpacity>
+        );
       }
       return null;
     };
@@ -4007,6 +4307,20 @@ export default function ChatScreen({ navigation, route }) {
     );
   };
 
+  // Long-press on a media bubble (image/video/file/album) opens the SAME
+  // actions as any other bubble: message selected → top toolbar (reply,
+  // forward, delete, info, …) + floating reaction row. Media-file specific
+  // actions (share / save) live in the fullscreen viewer's header.
+  const openMessageActionsFor = (msg) => {
+    const key = getMessageKey(msg);
+    if (!key) return;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setReactionMsgId((prev) => (prev === key ? null : key));
+    if (!selectedMessage.includes(key)) {
+      handleToggleSelectMessages(key);
+    }
+  };
+
   const renderImageMessage = (msg, isMyMessage, progress, messageKey, downloadState) => {
     const imageStyle = getAdaptiveMediaStyle(msg, 200, 220);
     const sendingProgress = resolveUploadProgress(msg);
@@ -4033,10 +4347,9 @@ export default function ChatScreen({ navigation, route }) {
     };
     const shouldRenderThumbnail = Boolean(imageSource);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
-    // Blur: full (20) before download, reduces progressively during download, 0 when done
-    const blurAmount = (!isMyMessage && !downloaded && shouldRenderThumbnail)
-      ? (isDownloading ? Math.round(20 * (1 - Math.min(1, progress))) : 20)
-      : 0;
+    // Privacy gate: BlurGateImage cross-fades a constant-blur layer out with
+    // real download progress (dynamic blurRadius blinked — not animatable).
+    const isGated = !isMyMessage && !downloaded;
 
     const animationStyle = getMediaAnimationStyle(messageKey, !isMyMessage && shouldRenderThumbnail);
 
@@ -4067,25 +4380,21 @@ export default function ChatScreen({ navigation, route }) {
           if (!isConnected) return;
           handleDownloadWithPersistence(msg);
         }}
-        onLongPress={() => {
-          if (!downloaded || !downloadedUri) return;
-          Alert.alert('Image Options', 'Choose an action', [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Share', onPress: () => handleShareMedia(msg) },
-            { text: 'Save to Gallery', onPress: () => handleSaveToGallery(msg) },
-            { text: 'Delete', onPress: () => handleDeleteMedia(msg), style: 'destructive' },
-          ]);
-        }}
+        onLongPress={() => openMessageActionsFor(msg)}
+        delayLongPress={300}
         activeOpacity={0.9}
         style={{ borderRadius: 12, overflow: 'hidden' }}
       >
         <Animated.View style={animationStyle}>
           {shouldRenderThumbnail ? (
-            <Image
-              source={{ uri: imageSource }}
+            <BlurGateImage
+              uri={imageSource}
               style={imageStyle}
               resizeMode="cover"
-              blurRadius={blurAmount}
+              gated={isGated}
+              active={isDownloading}
+              paused={status === MEDIA_DOWNLOAD_STATUS.PAUSED}
+              progress={progress}
               onError={onImageLoadError}
             />
           ) : (
@@ -4095,10 +4404,32 @@ export default function ChatScreen({ navigation, route }) {
           )}
         </Animated.View>
 
-        {isMyMessage && msg.status === 'sending' && (
-          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.32)', alignItems: 'center', justifyContent: 'center' }}>
-            <ActivityIndicator size="small" color="#fff" />
-            <Text style={{ color: '#fff', fontSize: 11, marginTop: 4 }}>{Math.round((sendingProgress || 0.05) * 100)}%</Text>
+        {isMyMessage && (msg.status === 'sending' || msg.status === 'uploading') && (
+          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.25)', alignItems: 'center', justifyContent: 'center' }}>
+            <UploadRing
+              percent={(sendingProgress || 0.02) * 100}
+              size={48}
+              paused={isUploadPausedFor(msg)}
+              onPause={() => pauseMediaUpload(msg)}
+              onResume={() => resumeMediaUpload(msg)}
+              onCancel={() => cancelMediaUpload(msg)}
+            />
+          </View>
+        )}
+
+        {isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled') && (
+          <View style={retryStyles.overlay}>
+            <TouchableOpacity
+              onPress={() => resendMessage(msg)}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              style={retryStyles.center}
+              activeOpacity={0.8}
+            >
+              <View style={retryStyles.disc}>
+                <Ionicons name="refresh" size={22} color="#fff" />
+              </View>
+              <Text style={retryStyles.label}>Retry</Text>
+            </TouchableOpacity>
           </View>
         )}
 
@@ -4117,9 +4448,7 @@ export default function ChatScreen({ navigation, route }) {
     const thumbnailSource = toSecureMediaUri(resolveCachedThumbnailUrl(msg));
     const shouldRenderThumbnail = Boolean(thumbnailSource || downloaded);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
-    const videoBlurAmount = (!isMyMessage && !downloaded && Boolean(thumbnailSource))
-      ? (isDownloading ? Math.round(20 * (1 - Math.min(1, progress))) : 20)
-      : 0;
+    const isVideoGated = !isMyMessage && !downloaded;
     const animationStyle = getMediaAnimationStyle(`${messageKey}_video`, !isMyMessage && shouldRenderThumbnail);
 
     return (
@@ -4132,25 +4461,21 @@ export default function ChatScreen({ navigation, route }) {
           if (!isConnected) return;
           handleDownloadWithPersistence(msg);
         }}
-        onLongPress={() => {
-          if (!downloaded || !downloadedUri) return;
-          Alert.alert('Video Options', 'Choose an action', [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Share', onPress: () => handleShareMedia(msg) },
-            { text: 'Save to Gallery', onPress: () => handleSaveToGallery(msg) },
-            { text: 'Delete', onPress: () => handleDeleteMedia(msg), style: 'destructive' },
-          ]);
-        }}
+        onLongPress={() => openMessageActionsFor(msg)}
+        delayLongPress={300}
         activeOpacity={0.9}
         style={[videoStyle, { overflow: 'hidden', backgroundColor: '#000' }]}
       >
         <Animated.View style={animationStyle}>
           {thumbnailSource && shouldRenderThumbnail ? (
-            <Image
-              source={{ uri: thumbnailSource }}
+            <BlurGateImage
+              uri={thumbnailSource}
               style={videoStyle}
               resizeMode="cover"
-              blurRadius={videoBlurAmount}
+              gated={isVideoGated}
+              active={isDownloading}
+              paused={status === MEDIA_DOWNLOAD_STATUS.PAUSED}
+              progress={progress}
             />
           ) : (
             <View style={[videoStyle, { alignItems: 'center', justifyContent: 'center', backgroundColor: theme.colors.menuBackground }]}>
@@ -4160,17 +4485,33 @@ export default function ChatScreen({ navigation, route }) {
         </Animated.View>
 
         {(isMyMessage || downloaded) && (
-          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' }}>
-            <View style={{ backgroundColor: 'rgba(0,0,0,0.5)', width: 52, height: 52, borderRadius: 26, alignItems: 'center', justifyContent: 'center' }}>
-              {isMyMessage && msg.status === 'sending' ? (
-                <>
-                  <ActivityIndicator size="small" color="#fff" />
-                  <Text style={{ color: '#fff', fontSize: 9, marginTop: 3 }}>{Math.round((sendingProgress || 0.05) * 100)}%</Text>
-                </>
-              ) : (
+          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: isMyMessage && (msg.status === 'sending' || msg.status === 'uploading') ? 'rgba(0,0,0,0.25)' : 'transparent' }}>
+            {isMyMessage && (msg.status === 'sending' || msg.status === 'uploading') ? (
+              <UploadRing
+                percent={(sendingProgress || 0.02) * 100}
+                size={48}
+                paused={isUploadPausedFor(msg)}
+                onPause={() => pauseMediaUpload(msg)}
+                onResume={() => resumeMediaUpload(msg)}
+                onCancel={() => cancelMediaUpload(msg)}
+              />
+            ) : isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled') ? (
+              <TouchableOpacity
+                onPress={() => resendMessage(msg)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                style={retryStyles.center}
+                activeOpacity={0.8}
+              >
+                <View style={retryStyles.disc}>
+                  <Ionicons name="refresh" size={22} color="#fff" />
+                </View>
+                <Text style={retryStyles.label}>Retry</Text>
+              </TouchableOpacity>
+            ) : (
+              <View style={{ backgroundColor: 'rgba(0,0,0,0.5)', width: 52, height: 52, borderRadius: 26, alignItems: 'center', justifyContent: 'center' }}>
                 <Ionicons name="play" size={26} color="#fff" />
-              )}
-            </View>
+              </View>
+            )}
           </View>
         )}
 
@@ -4183,6 +4524,8 @@ export default function ChatScreen({ navigation, route }) {
   const renderAudioMessage = (msg, isMyMessage, progress, downloadState) => {
     const dlStatus = normalizeDownloadStatus(downloadState?.status);
     const downloaded = isMediaDownloaded(msg);
+    const sendingProgress = resolveUploadProgress(msg);
+    const isUploading = isMyMessage && (msg.status === 'sending' || msg.status === 'uploading');
     const mediaInfo = resolveMediaInfo(msg);
     const msgKey = msg?.serverMessageId || msg?.id || msg?.tempId;
     const isThisPlaying = playingAudioId === msgKey;
@@ -4204,6 +4547,7 @@ export default function ChatScreen({ navigation, route }) {
     const durLabel = totalMs > 0 ? formatMs(totalMs) : '--:--';
 
     const isDownloading = dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
+    const isDownloadPausedState = dlStatus === MEDIA_DOWNLOAD_STATUS.PAUSED;
     // Received voice notes STREAM from the remote URL (WhatsApp-style) — no need
     // to download first, so the play button shows immediately.
     const remoteAudioUrl = toSecureMediaUri(msg?.mediaUrl);
@@ -4227,14 +4571,23 @@ export default function ChatScreen({ navigation, route }) {
           : (chatData?.peerUser?.profileImage || chatData?.peerUser?.profilePicture || null));
     const avatarUri = rawAvatar ? toSecureMediaUri(rawAvatar) : null;
 
+    const uploadFailed = isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled');
+
     const handleTap = () => {
       if (msg.status === 'sending') return;
+      if (uploadFailed) {
+        // Retry the failed/cancelled upload (re-runs the persisted queue row —
+        // a parked chunked session resumes from the server's receivedBytes).
+        resendMessage(msg);
+        return;
+      }
       if (canPlay) {
         handlePlayAudio(msg);
         return;
       }
       if (isDownloading) return;
       if (!isConnected) return;
+      // Also the tap-to-retry path for FAILED downloads (re-enqueues).
       handleDownloadWithPersistence(msg);
     };
 
@@ -4273,14 +4626,34 @@ export default function ChatScreen({ navigation, route }) {
           {/* Play/Pause/Download button */}
           <TouchableOpacity onPress={handleTap} activeOpacity={0.7}
             style={{ width: 38, height: 38, borderRadius: 19, backgroundColor: iconBg, alignItems: 'center', justifyContent: 'center' }}>
-            {isDownloading || msg.status === 'sending'
-              ? <ActivityIndicator size="small" color={iconColor} />
-              : <Ionicons
-                  name={canPlay ? (isPlaying ? 'pause' : 'play') : 'cloud-download'}
-                  size={canPlay ? 21 : 18}
-                  color={iconColor}
-                  style={canPlay && !isPlaying ? { marginLeft: 2 } : undefined}
+            {isUploading
+              ? <UploadRing
+                  percent={(sendingProgress || 0.02) * 100}
+                  size={36}
+                  paused={isUploadPausedFor(msg)}
+                  onPause={() => pauseMediaUpload(msg)}
+                  onResume={() => resumeMediaUpload(msg)}
+                  onCancel={() => cancelMediaUpload(msg)}
                 />
+              : uploadFailed
+                ? <Ionicons name="refresh" size={20} color={iconColor} />
+                : (isDownloading || isDownloadPausedState)
+                  ? <UploadRing
+                      percent={Math.round((progress || 0) * 100)}
+                      size={36}
+                      paused={isDownloadPausedState}
+                      onPause={() => handlePauseDownload(msg)}
+                      onResume={() => handleResumeDownload(msg)}
+                      onCancel={() => handleCancelDownload(msg)}
+                    />
+                  : <Ionicons
+                      name={canPlay
+                        ? (isPlaying ? 'pause' : 'play')
+                        : (dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED ? 'refresh' : 'cloud-download')}
+                      size={canPlay ? 21 : 18}
+                      color={iconColor}
+                      style={canPlay && !isPlaying ? { marginLeft: 2 } : undefined}
+                    />
             }
           </TouchableOpacity>
 
@@ -4320,6 +4693,7 @@ export default function ChatScreen({ navigation, route }) {
     }
 
     const isDownloading = dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
+    const isDownloadPausedState = dlStatus === MEDIA_DOWNLOAD_STATUS.PAUSED;
 
     // File icon based on extension
     const ext = getExtFromName(fileName);
@@ -4334,6 +4708,13 @@ export default function ChatScreen({ navigation, route }) {
     const handleFileTap = async () => {
       if (msg.status === 'sending') return;
 
+      // "Failed/Cancelled • Tap to retry" — actually retry the upload instead
+      // of falling through to share (which has no file to share yet).
+      if (isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled')) {
+        resendMessage(msg);
+        return;
+      }
+
       if (isMyMessage || downloaded) {
         await handleShareMedia(msg);
         return;
@@ -4345,20 +4726,11 @@ export default function ChatScreen({ navigation, route }) {
       handleDownloadWithPersistence(msg);
     };
 
-    const senderReady = isMyMessage && msg.status !== 'sending' && msg.status !== 'failed';
-    const fileReady = downloaded || senderReady;
-
     return (
       <TouchableOpacity
         onPress={handleFileTap}
-        onLongPress={() => {
-          if (!fileReady) return;
-          Alert.alert('File Options', 'Choose an action', [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Share', onPress: () => openFileWithSharing(resolveDownloadedUri(msg) || msg?.localUri || '', msg) },
-            { text: 'Delete', onPress: () => handleDeleteMedia(msg), style: 'destructive' },
-          ]);
-        }}
+        onLongPress={() => openMessageActionsFor(msg)}
+        delayLongPress={300}
         style={{
           width: Math.min(320, MAX_MEDIA_BUBBLE_WIDTH),
           borderRadius: 12,
@@ -4374,9 +4746,27 @@ export default function ChatScreen({ navigation, route }) {
         activeOpacity={0.85}
       >
         <View style={{ width: 42, height: 42, borderRadius: 10, backgroundColor: fileIconColor + '20', alignItems: 'center', justifyContent: 'center' }}>
-          {isDownloading || msg.status === 'sending'
-            ? <ActivityIndicator size="small" color={fileIconColor} />
-            : <Ionicons name={fileIcon} size={24} color={fileIconColor} />}
+          {isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled')
+            ? <Ionicons name="refresh" size={24} color={fileIconColor} />
+            : isMyMessage && (msg.status === 'sending' || msg.status === 'uploading')
+            ? <UploadRing
+                percent={(sendingProgress || 0.02) * 100}
+                size={38}
+                paused={isUploadPausedFor(msg)}
+                onPause={() => pauseMediaUpload(msg)}
+                onResume={() => resumeMediaUpload(msg)}
+                onCancel={() => cancelMediaUpload(msg)}
+              />
+            : (isDownloading || isDownloadPausedState)
+              ? <UploadRing
+                  percent={Math.round((progress || 0) * 100)}
+                  size={38}
+                  paused={isDownloadPausedState}
+                  onPause={() => handlePauseDownload(msg)}
+                  onResume={() => handleResumeDownload(msg)}
+                  onCancel={() => handleCancelDownload(msg)}
+                />
+              : <Ionicons name={fileIcon} size={24} color={fileIconColor} />}
         </View>
 
         <View style={{ flex: 1 }}>
@@ -4384,8 +4774,8 @@ export default function ChatScreen({ navigation, route }) {
             {fileName}
           </Text>
 
-          {/* Download progress bar */}
-          {isDownloading && (
+          {/* Download progress bar (kept visible, frozen, while paused) */}
+          {(isDownloading || isDownloadPausedState) && (
             <View style={{ height: 3, borderRadius: 3, backgroundColor: 'rgba(0,0,0,0.08)', marginTop: 4, marginBottom: 2, overflow: 'hidden' }}>
               <View style={{ width: `${Math.round(Math.max(5, progress * 100))}%`, height: 3, borderRadius: 3, backgroundColor: fileIconColor }} />
             </View>
@@ -4393,18 +4783,22 @@ export default function ChatScreen({ navigation, route }) {
 
           <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 10, marginTop: 2 }}>
             {msg.status === 'sending'
-              ? `Uploading ${Math.round((sendingProgress || 0.05) * 100)}%`
+              ? (isUploadPausedFor(msg) ? 'Upload paused' : 'Uploading…')
               : msg.status === 'failed'
                 ? 'Failed • Tap to retry'
+                : msg.status === 'cancelled'
+                ? 'Cancelled • Tap to retry'
                 : isMyMessage
                   ? `${mediaInfo.sizeLabel} • Tap to open`
                   : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
                     ? 'Download failed • Tap to retry'
-                    : isDownloading
-                      ? `${Math.round(progress * 100)}% downloading...`
-                      : dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED
-                        ? `${mediaInfo.sizeLabel} • Tap to open`
-                        : `${mediaInfo.sizeLabel} • Tap to download`}
+                    : isDownloadPausedState
+                      ? 'Paused • Tap to resume'
+                      : isDownloading
+                        ? 'Downloading…'
+                        : dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED
+                          ? `${mediaInfo.sizeLabel} • Tap to open`
+                          : `${mediaInfo.sizeLabel} • Tap to download`}
           </Text>
           {!isConnected && !downloaded && !isMyMessage && (
             <Text style={{ color: '#D97706', fontSize: 10, marginTop: 2 }}>Offline</Text>
@@ -4986,13 +5380,36 @@ export default function ChatScreen({ navigation, route }) {
 
               // Always try to resolve a thumbnail for image/video quotes from the
               // original message (preview data alone doesn't carry the URL).
+              // Match EVERY id form the app stores — replies created on other
+              // devices carry the server uuid, local ones the temp/client id.
               const quotedOriginal = messages.find(m =>
                 sameId(m.serverMessageId, msg.replyToMessageId) ||
                 sameId(m.id, msg.replyToMessageId) ||
-                sameId(m.tempId, msg.replyToMessageId)
+                sameId(m.tempId, msg.replyToMessageId) ||
+                sameId(m.clientMessageId, msg.replyToMessageId) ||
+                sameId(m.messageId, msg.replyToMessageId)
               );
               if (quotedOriginal && !quotedOriginal.isDeleted) {
-                replyThumb = quotedOriginal.mediaThumbnailUrl || quotedOriginal.previewUrl || quotedOriginal.mediaUrl || null;
+                const qType = quotedOriginal.type || quotedOriginal.mediaType;
+                if (!replyType || replyType === 'text') replyType = qType || replyType;
+                // Album quotes: first item's poster represents the album.
+                const firstItem = Array.isArray(quotedOriginal.mediaItems) && quotedOriginal.mediaItems.length
+                  ? quotedOriginal.mediaItems[0]
+                  : null;
+                const candidates = firstItem
+                  ? [firstItem.mediaThumbnailUrl, firstItem.localUri, firstItem.mediaUrl]
+                  : [quotedOriginal.mediaThumbnailUrl, quotedOriginal.previewUrl, quotedOriginal.mediaUrl];
+                // Never use a video FILE as the quote thumb — <Image> paints it black.
+                replyThumb = candidates.find((u) => u && !isLikelyVideoFileUrl(u))
+                  // Videos without a baked poster: the primed thumbnail cache
+                  // (mediaResolve fallback) usually has one by now.
+                  || thumbnailCacheRef.current[getResolvedMediaId(quotedOriginal)]
+                  || null;
+              }
+              // Persisted snapshot (message carries its own poster URL) — works
+              // even when the quoted original isn't in the loaded window.
+              if (!replyThumb && msg.replyPreviewThumbnail) {
+                replyThumb = msg.replyPreviewThumbnail;
               }
 
               // If reply preview data is missing, look up the original message
@@ -5035,7 +5452,7 @@ export default function ChatScreen({ navigation, route }) {
                   replyPreviewType={replyType}
                   replySenderName={replySName}
                   replySenderId={replySId}
-                  replyThumbnailUrl={replyThumb}
+                  replyThumbnailUrl={replyThumb ? toSecureMediaUri(replyThumb) : null}
                   currentUserId={currentUserId}
                   isMyMessage={isMyMessage}
                   chatColor={chatColor}
@@ -5100,14 +5517,34 @@ export default function ChatScreen({ navigation, route }) {
                 <AlbumMessage
                   message={msg}
                   isMine={isMyMessage}
-                  onPressItem={(item) => {
+                  onLongPressItem={() => openMessageActionsFor(msg)}
+                  uploadPaused={isUploadPausedFor(msg)}
+                  uploadCancelled={isMyMessage && msg.status === 'cancelled'}
+                  onPauseUpload={() => pauseMediaUpload(msg)}
+                  onResumeUpload={() => resumeMediaUpload(msg)}
+                  onCancelUpload={() => cancelMediaUpload(msg)}
+                  onRetryUpload={() => resendMessage(msg)}
+                  onPressItem={(item, index) => {
                     if (item?.uploadStatus === 'uploading' || item?.uploadStatus === 'pending') return;
                     const uri = item?.localUri || item?.mediaUrl || item?.mediaThumbnailUrl;
                     if (!uri) return;
+                    // Build swipeable pages from EVERY visual album item (the
+                    // viewer pages left/right through the whole album).
+                    const pages = (msg.mediaItems || [])
+                      .map((it, i) => ({
+                        uri: it?.localUri || it?.mediaUrl || null,
+                        type: it?.fileCategory === 'video' ? 'video' : 'image',
+                        item: it,
+                        srcIndex: i,
+                        visual: it?.fileCategory === 'image' || it?.fileCategory === 'video',
+                      }))
+                      .filter((p) => p.visual && p.uri);
+                    const startIdx = Math.max(0, pages.findIndex((p) => p.srcIndex === index));
                     openMediaViewer(
                       { ...msg, mediaUrl: item.mediaUrl || uri, mediaThumbnailUrl: item.mediaThumbnailUrl, localUri: item.localUri || null, mediaMeta: item.mediaMeta },
                       uri,
-                      item.fileCategory === 'video' ? 'video' : 'image'
+                      item.fileCategory === 'video' ? 'video' : 'image',
+                      { items: pages, index: startIdx }
                     );
                   }}
                 />
@@ -5266,7 +5703,7 @@ export default function ChatScreen({ navigation, route }) {
         <View style={{ paddingVertical: 16, alignItems: "center", paddingHorizontal: 30 }}>
           {isGrpFooter ? (
             <View style={{ alignItems: 'center', gap: 6 }}>
-              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 16, paddingVertical: 6, borderRadius: 10 }}>
+              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 }}>
                 <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
                   {creatorName
                     ? `${creatorName} created group "${chatData?.chatName || chatData?.groupName || 'this group'}"`
@@ -5274,7 +5711,7 @@ export default function ChatScreen({ navigation, route }) {
                   {groupCreatedDate ? ` on ${groupCreatedDate}` : ''}
                 </Text>
               </View>
-              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 16, paddingVertical: 6, borderRadius: 10 }}>
+              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 }}>
                 <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
                   Messages and calls are end-to-end encrypted. Only people in this chat can read, listen to, or share them.
                 </Text>
@@ -5401,7 +5838,15 @@ export default function ChatScreen({ navigation, route }) {
           chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
           isPeerTyping={isPeerTyping}
           fallbackStatusText={renderStatusText()}
-          onBack={() => navigation.goBack()}
+          onBack={() => {
+            // Selection toolbar up → back only clears the selection (WhatsApp).
+            if ((selectedMessage?.length || 0) > 0 || reactionMsgId) {
+              clearSelectedMessages?.();
+              setReactionMsgId(null);
+              return;
+            }
+            navigation.goBack();
+          }}
           // Broadcast: tapping the header/avatar opens the channel info page.
           onPressProfile={handleOpenContactInfo}
           onPressAvatar={handleOpenContactInfo}
@@ -6141,7 +6586,7 @@ export default function ChatScreen({ navigation, route }) {
               horizontal
               showsHorizontalScrollIndicator={false}
               style={{ flexGrow: 0, height: 44 }}
-              contentContainerStyle={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 18 }}
+              contentContainerStyle={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, gap: 18 }}
             >
               {emojiSectionsMeta.map((section) => {
                 const active = section.key === activeEmojiSection;
@@ -6202,7 +6647,7 @@ export default function ChatScreen({ navigation, route }) {
             <View style={{
               flexDirection: 'row',
               justifyContent: 'flex-end',
-              paddingHorizontal: 16,
+              paddingHorizontal: 12,
               paddingBottom: Platform.OS === 'ios' ? 20 : 8,
               paddingTop: 4,
               borderTopWidth: 0.5,
@@ -6578,6 +7023,7 @@ export default function ChatScreen({ navigation, route }) {
                 {localMediaViewer.message?.time && (
                   <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: 'Roboto-Regular' }}>
                     {localMediaViewer.message?.date ? `${localMediaViewer.message.date} • ${localMediaViewer.message.time}` : localMediaViewer.message.time}
+                    {localMediaViewer.albumItems?.length > 1 ? `   •   ${localMediaViewer.albumIndex + 1} / ${localMediaViewer.albumItems.length}` : ''}
                   </Text>
                 )}
               </View>
@@ -6586,14 +7032,24 @@ export default function ChatScreen({ navigation, route }) {
                 {/* Share */}
                 <TouchableOpacity
                   onPress={async () => {
-                    const msg = localMediaViewer.message;
+                    if (viewerDownload.active) return;
+                    const msg = viewerActiveMessage();
+                    const forIndex = localMediaViewer.albumItems ? localMediaViewer.albumIndex : null;
+                    setViewerDownload({ active: true, progress: 0, forIndex });
                     try {
-                      const localUri = await resolveFileForOpen(msg);
+                      const localUri = await resolveFileForOpen(
+                        msg,
+                        (p) => setViewerDownload({ active: true, progress: p, forIndex }),
+                        (cancelFn) => { viewerDownloadCancelRef.current = cancelFn; }
+                      );
                       if (localUri && await Sharing.isAvailableAsync()) {
                         await Sharing.shareAsync(localUri);
                       }
                     } catch (e) {
                       console.error('Share error:', e);
+                    } finally {
+                      viewerDownloadCancelRef.current = null;
+                      setViewerDownload({ active: false, progress: 0, forIndex: null });
                     }
                   }}
                   style={{ padding: 8 }}
@@ -6603,10 +7059,17 @@ export default function ChatScreen({ navigation, route }) {
                 {/* Save to gallery — one tap, no repeat permission prompt */}
                 <TouchableOpacity
                   onPress={async () => {
-                    const msg = localMediaViewer.message;
+                    if (viewerDownload.active) return;
+                    const msg = viewerActiveMessage();
+                    const forIndex = localMediaViewer.albumItems ? localMediaViewer.albumIndex : null;
+                    setViewerDownload({ active: true, progress: 0, forIndex });
                     try {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      const localUri = await resolveFileForOpen(msg);
+                      const localUri = await resolveFileForOpen(
+                        msg,
+                        (p) => setViewerDownload({ active: true, progress: p, forIndex }),
+                        (cancelFn) => { viewerDownloadCancelRef.current = cancelFn; }
+                      );
                       if (!localUri) return;
                       // Check existing permission first — only prompt if undetermined
                       let perm = await MediaLibrary.getPermissionsAsync();
@@ -6614,49 +7077,167 @@ export default function ChatScreen({ navigation, route }) {
                         perm = await MediaLibrary.requestPermissionsAsync();
                         if (perm.status !== 'granted') return;
                       }
-                      await MediaLibrary.createAssetAsync(localUri);
+                      await MediaLibrary.createAssetAsync(await ensureSaveableFileUri(localUri, msg));
                       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                       setViewerSavedToast(true);
                       if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
                       viewerToastTimer.current = setTimeout(() => setViewerSavedToast(false), 2000);
                     } catch (e) {
                       console.error('Save error:', e);
+                    } finally {
+                      viewerDownloadCancelRef.current = null;
+                      setViewerDownload({ active: false, progress: 0, forIndex: null });
                     }
                   }}
                   style={{ padding: 8 }}
                 >
-                  <Ionicons name="download-outline" size={22} color="#fff" />
+                  {viewerDownload.active && (viewerDownload.forIndex == null || viewerDownload.forIndex === localMediaViewer.albumIndex) ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Ionicons name="download-outline" size={22} color="#fff" />
+                  )}
                 </TouchableOpacity>
               </View>
             </View>
 
-            {/* ── Image with pinch & double-tap zoom ── */}
-            {localMediaViewer.type === 'image' && localMediaViewer.uri && (
-              <GestureHandlerRootView style={{ flex: 1 }}>
-                <ImageZoom
-                  uri={toSecureMediaUri(localMediaViewer.uri)}
-                  minScale={1}
-                  maxScale={5}
-                  doubleTapScale={3}
-                  minPanPointers={1}
-                  isSingleTapEnabled
-                  isDoubleTapEnabled
-                  style={{ flex: 1 }}
-                  resizeMode="contain"
+            {/* ── Album: horizontal swipe pager across every visual item ── */}
+            {localMediaViewer.albumItems?.length ? (
+              <View style={{ flex: 1 }}>
+                <FlatList
+                  ref={albumPagerRef}
+                  data={localMediaViewer.albumItems}
+                  horizontal
+                  pagingEnabled
+                  initialScrollIndex={localMediaViewer.albumIndex}
+                  getItemLayout={(d, i) => ({ length: SCREEN_WIDTH, offset: SCREEN_WIDTH * i, index: i })}
+                  keyExtractor={(p, i) => `album_page_${i}`}
+                  showsHorizontalScrollIndicator={false}
+                  onMomentumScrollEnd={(e) => {
+                    const count = localMediaViewer.albumItems.length;
+                    const idx = Math.max(0, Math.min(count - 1, Math.round(e.nativeEvent.contentOffset.x / SCREEN_WIDTH)));
+                    if (idx !== localMediaViewer.albumIndex) {
+                      setLocalMediaViewer((prev) => ({
+                        ...prev,
+                        albumIndex: idx,
+                        uri: prev.albumItems?.[idx]?.uri || prev.uri,
+                        type: prev.albumItems?.[idx]?.type || prev.type,
+                      }));
+                    }
+                  }}
+                  renderItem={({ item: page, index }) => (
+                    <View style={{ width: SCREEN_WIDTH, height: '100%' }}>
+                      {page.type === 'video' ? (
+                        index === localMediaViewer.albumIndex ? (
+                          <Video
+                            source={{ uri: toSecureMediaUri(page.uri) }}
+                            style={{ width: '100%', height: '100%' }}
+                            useNativeControls
+                            resizeMode={ResizeMode.CONTAIN}
+                            shouldPlay
+                          />
+                        ) : (
+                          <View style={{ flex: 1, backgroundColor: '#000' }} />
+                        )
+                      ) : (
+                        <GestureHandlerRootView style={{ flex: 1 }}>
+                          {/* minPanPointers=2 → one-finger drag pages the album,
+                              two-finger pan moves a zoomed image */}
+                          <ImageZoom
+                            uri={toSecureMediaUri(page.uri)}
+                            minScale={1}
+                            maxScale={5}
+                            doubleTapScale={3}
+                            minPanPointers={2}
+                            isSingleTapEnabled
+                            isDoubleTapEnabled
+                            style={{ flex: 1 }}
+                            resizeMode="contain"
+                          />
+                        </GestureHandlerRootView>
+                      )}
+                    </View>
+                  )}
                 />
-              </GestureHandlerRootView>
+                {localMediaViewer.albumIndex > 0 && (
+                  <TouchableOpacity
+                    onPress={() => viewerGoTo(localMediaViewer.albumIndex - 1)}
+                    style={{ position: 'absolute', left: 8, top: '50%', marginTop: -20, width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.45)', alignItems: 'center', justifyContent: 'center' }}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <Ionicons name="chevron-back" size={24} color="#fff" />
+                  </TouchableOpacity>
+                )}
+                {localMediaViewer.albumIndex < localMediaViewer.albumItems.length - 1 && (
+                  <TouchableOpacity
+                    onPress={() => viewerGoTo(localMediaViewer.albumIndex + 1)}
+                    style={{ position: 'absolute', right: 8, top: '50%', marginTop: -20, width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.45)', alignItems: 'center', justifyContent: 'center' }}
+                    hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+                  >
+                    <Ionicons name="chevron-forward" size={24} color="#fff" />
+                  </TouchableOpacity>
+                )}
+              </View>
+            ) : (
+              <>
+                {/* ── Image with pinch & double-tap zoom ── */}
+                {localMediaViewer.type === 'image' && localMediaViewer.uri && (
+                  <GestureHandlerRootView style={{ flex: 1 }}>
+                    <ImageZoom
+                      uri={toSecureMediaUri(localMediaViewer.uri)}
+                      minScale={1}
+                      maxScale={5}
+                      doubleTapScale={3}
+                      minPanPointers={1}
+                      isSingleTapEnabled
+                      isDoubleTapEnabled
+                      style={{ flex: 1 }}
+                      resizeMode="contain"
+                    />
+                  </GestureHandlerRootView>
+                )}
+
+                {/* ── Video player ── */}
+                {localMediaViewer.type === 'video' && localMediaViewer.uri && (
+                  <Video
+                    ref={ref => { videoRefs.current[localMediaViewer.uri] = ref; }}
+                    source={{ uri: toSecureMediaUri(localMediaViewer.uri) }}
+                    style={{ width: '100%', height: '100%' }}
+                    useNativeControls
+                    resizeMode={ResizeMode.CONTAIN}
+                    shouldPlay
+                  />
+                )}
+              </>
             )}
 
-            {/* ── Video player ── */}
-            {localMediaViewer.type === 'video' && localMediaViewer.uri && (
-              <Video
-                ref={ref => { videoRefs.current[localMediaViewer.uri] = ref; }}
-                source={{ uri: toSecureMediaUri(localMediaViewer.uri) }}
-                style={{ width: '100%', height: '100%' }}
-                useNativeControls
-                resizeMode={ResizeMode.CONTAIN}
-                shouldPlay
-              />
+            {/* ── Save/share fetch progress: ring with REAL byte progress.
+                Pinned to the album page it started on — swiping away hides it
+                (the download keeps running); swiping back shows it again. ── */}
+            {viewerDownload.active
+              && (viewerDownload.forIndex == null || viewerDownload.forIndex === localMediaViewer.albumIndex) && (
+              <View
+                pointerEvents="box-none"
+                style={{
+                  position: 'absolute', left: 0, right: 0, top: 0, bottom: 0,
+                  alignItems: 'center', justifyContent: 'center', zIndex: 25,
+                }}
+              >
+                <View style={{
+                  backgroundColor: 'rgba(0,0,0,0.65)', borderRadius: 16,
+                  paddingHorizontal: 22, paddingVertical: 18,
+                  alignItems: 'center', gap: 10,
+                }}>
+                  {/* ✕ in the ring aborts the fetch and deletes the partial file */}
+                  <UploadRing
+                    percent={Math.max(2, viewerDownload.progress * 100)}
+                    size={52}
+                    onCancel={() => viewerDownloadCancelRef.current?.()}
+                  />
+                  <Text style={{ color: '#fff', fontSize: 12, fontFamily: 'Roboto-Medium' }}>
+                    Downloading…
+                  </Text>
+                </View>
+              </View>
             )}
 
             {/* ── Saved toast ── */}

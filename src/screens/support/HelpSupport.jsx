@@ -89,7 +89,7 @@ const styles = StyleSheet.create({
   headerBackBtn: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
   headerTitle: { flex: 1, fontFamily: "Roboto-Bold", fontSize: 22, letterSpacing: -0.3 },
   headerSpacer: { width: 40 },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40, paddingTop: 6 },
+  scrollContent: { paddingHorizontal: 12, paddingBottom: 40, paddingTop: 6 },
   intro: { fontFamily: "Roboto-Regular", fontSize: 13.5, lineHeight: 19, marginBottom: 16, marginHorizontal: 4 },
   sectionCard: { borderRadius: 16, overflow: "hidden" },
   menuItem: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingVertical: 13, gap: 14, minHeight: 62 },

@@ -791,7 +791,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 13,
   },
   menuItemText: { fontSize: 15, fontFamily: 'Roboto-Medium' },
@@ -873,7 +873,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 36,
+    paddingHorizontal: 12,
     paddingBottom: 60,
   },
   emptyIcon: {

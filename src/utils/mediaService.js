@@ -3,6 +3,8 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import { Platform, Alert, Linking } from 'react-native';
 import { apiCall } from '../Config/Https';
+import { BACKEND_URL } from '@env';
+import { uploadFileInChunks, CHUNKED_UPLOAD_THRESHOLD } from './chunkedUpload';
 
 // Define all directories - using FileSystem.documentDirectory for compatibility
 export const APP_FOLDER = 'TalksTry';
@@ -34,18 +36,69 @@ export const normalizeUri = (uri) => {
   return uri;
 };
 
-// Make a REMOTE media URL safe to load in <Image>/<Video>.
-// iOS App Transport Security blocks cleartext http:// (Android debug allows it
-// via usesCleartextTraffic), so remote media loads on Android but silently
-// fails on iOS. Upgrade http→https (and protocol-relative //host → https://).
-// Local URIs (file://, content://, ph://, assets-library://, data:) and existing
-// https URLs are returned unchanged — so this is a safe no-op when not needed.
+// Current backend ORIGIN (scheme + host[:port]) from the build-time env —
+// e.g. "http://192.168.1.37:5000" locally, "https://backend.talkstry.com" live.
+const BACKEND_ORIGIN = (() => {
+  try {
+    const m = String(BACKEND_URL || '').match(/^(https?:\/\/[^/]+)/i);
+    return m ? m[1].replace(/\/+$/, '') : '';
+  } catch {
+    return '';
+  }
+})();
+
+const isDevOrLanHost = (host) => {
+  const h = String(host || '').toLowerCase();
+  return (
+    h === 'localhost' ||
+    h === '127.0.0.1' ||
+    h.endsWith('.local') ||
+    /^10\./.test(h) ||
+    /^192\.168\./.test(h) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+  );
+};
+
+// Make a REMOTE media URL safe to load in <Image>/<Video> in the CURRENT env.
+//
+// 1. Relative server paths ("/uploads/…") → absolutized against the current
+//    backend origin. The server bakes FILE_BASE_URL into mediaUrl at upload
+//    time; if that env was missing, clients receive a bare relative path which
+//    normalizeUri would wrongly turn into file:///uploads/… (black preview).
+// 2. Our-backend media URLs baked with a DEV/LAN host (messages uploaded while
+//    the server env pointed at http://192.168.x.x:5000) are remapped onto the
+//    current backend origin — a receiver on the live env can't reach the
+//    sender's LAN. Only private/LAN hosts with an /uploads/ path are remapped;
+//    public hosts (S3, CDN, link previews) are never touched. When the app IS
+//    running against that same LAN env, origin matches and nothing changes.
+// 3. iOS App Transport Security blocks cleartext http:// (Android debug allows
+//    it via usesCleartextTraffic), so remote media loads on Android but
+//    silently fails on iOS. Upgrade http→https for real public hosts (and
+//    protocol-relative //host → https://). LAN/dev hosts stay http — they have
+//    no TLS and forcing https would break local media.
+// Local URIs (file://, content://, ph://, assets-library://, data:) and
+// existing correct https URLs are returned unchanged — safe no-op.
 export const toSecureMediaUri = (uri) => {
   if (!uri || typeof uri !== 'string') return uri;
-  const u = uri.trim();
+  let u = uri.trim();
 
   // Protocol-relative → https
   if (/^\/\//.test(u)) return `https:${u}`;
+
+  // Relative server media path → current backend origin. Only server media
+  // paths — anything else relative is ambiguous and left alone.
+  if (BACKEND_ORIGIN && /^\/?uploads\//i.test(u)) {
+    return `${BACKEND_ORIGIN}${u.startsWith('/') ? '' : '/'}${u}`;
+  }
+
+  // Absolute URL pointing at OUR media (/uploads/) on a dev/LAN host that is
+  // NOT the current backend → remap onto the current backend origin so media
+  // sent against a local env still loads on the live env (and vice versa).
+  const absMatch = u.match(/^https?:\/\/([^/:]+)(?::\d+)?(\/uploads\/.*)$/i);
+  if (absMatch && BACKEND_ORIGIN && isDevOrLanHost(absMatch[1])) {
+    const remapped = `${BACKEND_ORIGIN}${absMatch[2]}`;
+    if (remapped !== u) return remapped;
+  }
 
   const httpMatch = u.match(/^http:\/\/([^/:]+)/i);
   if (httpMatch) {
@@ -53,15 +106,7 @@ export const toSecureMediaUri = (uri) => {
     // *.local) are http-only — forcing them to https makes the request fail
     // and the media never loads. Leave those untouched; only upgrade real
     // public hosts (iOS ATS blocks cleartext http to those).
-    const host = httpMatch[1].toLowerCase();
-    const isLocalHost =
-      host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host.endsWith('.local') ||
-      /^10\./.test(host) ||
-      /^192\.168\./.test(host) ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(host);
-    if (isLocalHost) return u;
+    if (isDevOrLanHost(httpMatch[1])) return u;
     return u.replace(/^http:\/\//i, 'https://');
   }
 
@@ -315,10 +360,14 @@ export const downloadRemoteToReceived = async (remoteUrl, filename, onProgress =
     // Ensure directories exist
     await initializeAppDirectories();
 
-    // Determine file type from URL or filename
-    const urlExt = remoteUrl.split('?')[0].split('.').pop()?.toLowerCase();
-    const nameExt = filename.split('.').pop()?.toLowerCase();
-    const ext = urlExt || nameExt || 'bin';
+    // Determine file type from URL or filename. Only accept a REAL trailing
+    // extension — split('.').pop() on a dot-less string returns the whole
+    // segment, which then breaks MediaLibrary saves downstream.
+    const extOf = (s) => {
+      const m = /\.([A-Za-z0-9]{2,5})$/.exec(String(s || '').split('?')[0]);
+      return m ? m[1].toLowerCase() : null;
+    };
+    const ext = extOf(remoteUrl) || extOf(filename) || 'bin';
     
     let destDir = RECEIVED_DIR;
     if (['jpg', 'jpeg', 'png', 'gif', 'webp'].includes(ext)) {
@@ -355,6 +404,15 @@ export const downloadRemoteToReceived = async (remoteUrl, filename, onProgress =
     );
 
     const result = await downloadResumable.downloadAsync();
+
+    // Non-2xx responses still write their body to disk (an error page saved as
+    // media renders as a black preview) — delete and fail instead.
+    const httpStatus = Number(result?.status || 0);
+    if (httpStatus && (httpStatus < 200 || httpStatus >= 300)) {
+      try { await FileSystem.deleteAsync(result.uri || destination, { idempotent: true }); } catch { /* best-effort */ }
+      throw new Error(`Download failed (HTTP ${httpStatus})`);
+    }
+
     const finalUri = normalizeUri(result.uri);
 
     if (saveToLibrary) {
@@ -404,8 +462,57 @@ export const saveFileToMediaLibrary = async (localUri, albumName = APP_FOLDER) =
   }
 };
 
-// Upload media file
-export const uploadMediaFile = async ({ file, chatId, dispatch, mediaUploadAction }) => {
+// Ask the server whether it already stores these exact bytes (sha256 hex).
+// Returns the same-shaped media data an upload would, or null.
+export async function mediaExistsByHash({ hash, fileName = null, chatId = null }) {
+  if (!hash) return null;
+  try {
+    const response = await apiCall('POST', 'user/media/exists', { hash, fileName, chatId }, { silent: true });
+    const data = response?.data || {};
+    if (data?.exists) return data;
+    return null;
+  } catch {
+    return null; // dedupe is best-effort — fall back to a normal upload
+  }
+}
+
+// Re-resolve fresh media URLs for stale signed URLs (401/403/410 on download).
+// ids: array of mediaId or messageId strings. Returns the response data map.
+export async function mediaResolve(ids = []) {
+  const list = (Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean);
+  if (!list.length) return null;
+  try {
+    const response = await apiCall('POST', 'user/media/resolve', { ids: list }, { silent: true });
+    return response?.data || null;
+  } catch {
+    return null;
+  }
+}
+
+// Upload media file.
+// Extra options (all optional, legacy callers unaffected):
+//   onUploadProgress({ loaded, total }) — REAL byte progress (XHR / chunk offsets)
+//   sourceHash                          — sha256 of the file bytes; when the server
+//                                         already has them the upload is skipped
+//   chunkSession / onChunkSession       — resume state for large-file chunked
+//                                         uploads (persisted by the caller)
+//   signal                              — AbortSignal; aborting it stops the
+//                                         direct XHR upload (pause/cancel)
+//   isPaused                            — () => bool, polled between chunks by
+//                                         the chunked-session path
+export const uploadMediaFile = async ({
+  file,
+  chatId,
+  dispatch,
+  mediaUploadAction,
+  onUploadProgress = null,
+  sourceHash = null,
+  chunkSession = null,
+  onChunkSession = null,
+  timeoutMs = null,
+  signal = null,
+  isPaused = null,
+}) => {
   try {
     if (!file || !dispatch || !mediaUploadAction) {
       throw new Error('Missing params for uploadMediaFile');
@@ -421,6 +528,40 @@ export const uploadMediaFile = async ({ file, chatId, dispatch, mediaUploadActio
       throw new Error(`Unsupported upload URI format: ${persistentUri}`);
     }
 
+    // Dedupe: skip the upload entirely when the server already has these bytes.
+    if (sourceHash) {
+      const existing = await mediaExistsByHash({ hash: sourceHash, fileName: file.name || null, chatId });
+      if (existing) {
+        if (typeof onUploadProgress === 'function' && file.size) {
+          try { onUploadProgress({ loaded: file.size, total: file.size }); } catch {}
+        }
+        return {
+          payload: { statusCode: 200, success: true, data: existing },
+          localUri: persistentUri,
+          deduplicated: true,
+        };
+      }
+    }
+
+    // Large files go through the resumable chunked-session endpoints instead
+    // of a single multipart POST (which can't survive a connection drop).
+    const fileSize = Number(file.size || 0);
+    if (fileSize > CHUNKED_UPLOAD_THRESHOLD) {
+      const response = await uploadFileInChunks({
+        uri: persistentUri,
+        name: file.name || `file_${Date.now()}`,
+        mimeType: file.type || 'application/octet-stream',
+        fileSize,
+        chatId,
+        sourceHash,
+        onProgress: onUploadProgress,
+        onSession: onChunkSession,
+        session: chunkSession,
+        isPaused,
+      });
+      return { payload: response, localUri: persistentUri };
+    }
+
     const formData = new FormData();
     formData.append('file', {
       uri: persistentUri,
@@ -430,8 +571,45 @@ export const uploadMediaFile = async ({ file, chatId, dispatch, mediaUploadActio
 
     if (chatId) formData.append('chatId', chatId);
 
-    const action = await dispatch(mediaUploadAction(formData));
-    
+    const action = await dispatch(
+      (typeof onUploadProgress === 'function' || timeoutMs || signal)
+        ? mediaUploadAction({
+            formData,
+            ...(typeof onUploadProgress === 'function' ? { onUploadProgress } : {}),
+            ...(timeoutMs ? { timeout: timeoutMs } : {}),
+            ...(signal ? { signal } : {}),
+          })
+        : mediaUploadAction(formData)
+    );
+
+    // Admin-configured per-category limits can sit BELOW the chunked
+    // threshold (e.g. video capped at 10MB) — the plain multipart route then
+    // 400s with "File size exceeds NMB limit". Large video/documents are what
+    // the resumable session path exists for, so retry there instead of
+    // failing the send (the session endpoints allow video/document up to the
+    // chunked cap by design).
+    const plainPayload = action?.payload;
+    const plainMsg = String(plainPayload?.message || plainPayload?.error || '');
+    const sizeRejected = (plainPayload?.statusCode === 400 || plainPayload?.status === 400)
+      && /size exceeds .*limit/i.test(plainMsg);
+    const mime = String(file.type || '');
+    const chunkableCategory = mime.startsWith('video') || (!mime.startsWith('image') && !mime.startsWith('audio'));
+    if (sizeRejected && chunkableCategory && fileSize > 0) {
+      const response = await uploadFileInChunks({
+        uri: persistentUri,
+        name: file.name || `file_${Date.now()}`,
+        mimeType: file.type || 'application/octet-stream',
+        fileSize,
+        chatId,
+        sourceHash,
+        onProgress: onUploadProgress,
+        onSession: onChunkSession,
+        session: chunkSession,
+        isPaused,
+      });
+      return { payload: response, localUri: persistentUri };
+    }
+
     // Return both server response and local URI
     return {
       ...action,
@@ -439,6 +617,39 @@ export const uploadMediaFile = async ({ file, chatId, dispatch, mediaUploadActio
     };
   } catch (err) {
     const message = String(err?.message || err || 'upload failed');
+    // Intentional stops (user hit pause/cancel) are control flow, not
+    // failures — rethrow silently so callers keep their paused handling and
+    // the console doesn't scream ERROR at a working pause button.
+    if (/upload (paused|cancelled)/i.test(message)) {
+      throw err;
+    }
+    // Same size-limit fallback when the thunk REJECTED instead of returning
+    // a payload (transport-level 400 handling differs across axios versions).
+    if (/size exceeds .*limit/i.test(message)) {
+      const mime = String(file?.type || '');
+      const chunkable = mime.startsWith('video') || (!mime.startsWith('image') && !mime.startsWith('audio'));
+      const size = Number(file?.size || 0);
+      if (chunkable && size > 0) {
+        try {
+          const persistentUri = await copyToAppFolder(file.uri, file.name, SENT_DIR);
+          const response = await uploadFileInChunks({
+            uri: persistentUri,
+            name: file.name || `file_${Date.now()}`,
+            mimeType: file.type || 'application/octet-stream',
+            fileSize: size,
+            chatId,
+            sourceHash,
+            onProgress: onUploadProgress,
+            onSession: onChunkSession,
+            session: chunkSession,
+            isPaused,
+          });
+          return { payload: response, localUri: persistentUri };
+        } catch {
+          // fall through to the normal error path below
+        }
+      }
+    }
     console.error('❌ uploadMediaFile failed:', {
       message,
       fileUri: file?.uri,

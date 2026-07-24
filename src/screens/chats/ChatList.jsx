@@ -52,6 +52,15 @@ const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 const DEBUG_CHAT_SOURCE = true;
 const cllog = (...args) => { if (DEBUG_CHAT_SOURCE) console.log('[CHAT-SOURCE]', ...args); };
 
+// iOS: presenting a Modal (or Alert) while another Modal is still dismissing
+// wedges UIKit's presentation stack — every touch dies and the app looks hung
+// (the reported "delete a chat → device stuck" freeze). Always let the outgoing
+// modal finish dismissing before presenting the next one. Android has no such
+// race, so the delay is 0 there and behavior is unchanged.
+const MODAL_TRANSITION_MS = Platform.OS === 'ios' ? 450 : 0;
+const afterModalDismiss = (fn) => setTimeout(fn, MODAL_TRANSITION_MS);
+const waitModalDismiss = () => new Promise((resolve) => setTimeout(resolve, MODAL_TRANSITION_MS));
+
 const MUTE_OPTIONS = [
   { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
   { key: '1w', label: '1 week', icon: 'calendar-week', duration: 7 * 24 * 60 * 60 * 1000 },
@@ -969,7 +978,11 @@ export default function ChatList({ navigation }) {
       closeActionMenu();
       return;
     }
-    setMuteSheetVisible(true);
+    // Dismiss the action-sheet Modal before presenting the mute sheet —
+    // presenting one Modal over another mid-transition freezes touches on iOS.
+    // (selectedChatItem is kept — only closeActionMenu clears it.)
+    setActionSheetVisible(false);
+    afterModalDismiss(() => setMuteSheetVisible(true));
   }, [selectedChatItem, unmuteChat, closeActionMenu]);
 
   const onSelectMuteDuration = useCallback((duration) => {
@@ -1063,9 +1076,11 @@ export default function ChatList({ navigation }) {
 
   const onDeleteChat = useCallback(() => {
     setDeleteForEveryone(false);
-    setDeleteModalVisible(true);
+    // Dismiss the sheet Modal(s) FIRST, then present the confirm Modal once the
+    // dismissal has settled — a same-tick swap freezes all touches on iOS.
     setActionSheetVisible(false);
     setMuteSheetVisible(false);
+    afterModalDismiss(() => setDeleteModalVisible(true));
   }, []);
 
   const closeDeleteModal = useCallback(() => {
@@ -1114,7 +1129,13 @@ export default function ChatList({ navigation }) {
       setSelectedChatItem(null);
     } catch (error) {
       console.error('Chat delete failed', error);
-      Alert.alert('Delete Chat', 'Could not delete this chat right now. Please try again.');
+      // Close the confirm Modal before alerting — an Alert racing a visible/
+      // dismissing Modal is another iOS touch-freeze path.
+      setDeleteModalVisible(false);
+      setDeleteForEveryone(false);
+      afterModalDismiss(() =>
+        Alert.alert('Delete Chat', 'Could not delete this chat right now. Please try again.')
+      );
     } finally {
       setIsDeletingChat(false);
     }
@@ -1132,11 +1153,17 @@ export default function ChatList({ navigation }) {
     }
 
     setIsBulkDeleting(true);
+    // Dismiss the confirm Modal fully before presenting the progress Modal —
+    // a same-tick swap wedges UIKit on iOS and freezes all touches.
     setBulkDeleteModalVisible(false);
+    await waitModalDismiss();
     setBulkDeleteProgress({ visible: true, label: `Deleting ${normalizedIds.length} chat${normalizedIds.length === 1 ? '' : 's'}...` });
 
     let serverDeletedIds = [];
     let serverFailed = [];
+    // Alerts are DEFERRED until the progress Modal has closed — alerting while
+    // a Modal is visible/dismissing is the same iOS touch-freeze race.
+    let pendingAlert = null;
     try {
       // 1. Server delete (Kafka publish happens server-side as part of this call).
       //    The response tells us EXACTLY which chats were deleted server-side.
@@ -1197,17 +1224,21 @@ export default function ChatList({ navigation }) {
       // 3. Surface partial server failures explicitly
       if (serverFailed.length > 0) {
         const failedNames = serverFailed.map((f) => f?.chatId).filter(Boolean).join(', ');
-        Alert.alert(
+        pendingAlert = [
           'Some chats not deleted',
-          `Deleted ${serverDeletedIds.length} chat(s). ${serverFailed.length} could not be deleted${failedNames ? ` (${failedNames})` : ''}. Please try again.`
-        );
+          `Deleted ${serverDeletedIds.length} chat(s). ${serverFailed.length} could not be deleted${failedNames ? ` (${failedNames})` : ''}. Please try again.`,
+        ];
       }
     } catch (error) {
       console.error('Bulk chat delete failed', error);
-      Alert.alert('Delete Chats', error?.message || 'Could not delete the selected chats. Please try again.');
+      pendingAlert = ['Delete Chats', error?.message || 'Could not delete the selected chats. Please try again.'];
     } finally {
       setBulkDeleteProgress({ visible: false, label: '' });
       setIsBulkDeleting(false);
+    }
+    if (pendingAlert) {
+      const [title, message] = pendingAlert;
+      afterModalDismiss(() => Alert.alert(title, message));
     }
   }, [selectedChatIds, isBulkDeleting, applyChatClearedPreview, removeChat, exitSelectionMode]);
 
@@ -1909,7 +1940,7 @@ const styles = StyleSheet.create({
   // ─── HEADER ───
   header: {
     flexDirection: 'row',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 10,
     paddingBottom: 8,
     justifyContent: 'space-between',
@@ -1987,7 +2018,7 @@ const styles = StyleSheet.create({
   headerMenuItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 13,
   },
   headerMenuIcon: {
@@ -2050,12 +2081,12 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   listHeaderWrap: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 4,
     paddingBottom: 4,
   },
   pinnedHeaderWrap: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 4,
     paddingBottom: 6,
   },
@@ -2207,7 +2238,7 @@ const styles = StyleSheet.create({
   sheetCard: {
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingBottom: 30,
   },
   sheetHandle: {
@@ -2310,7 +2341,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 13,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     borderRadius: 14,
     gap: 12,
   },

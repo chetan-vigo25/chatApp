@@ -1104,7 +1104,7 @@ const styles = StyleSheet.create({
   newContactBtn: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 12,
     gap: 14,
   },
@@ -1165,7 +1165,7 @@ const styles = StyleSheet.create({
   sectionEmptyText: {
     fontFamily: 'Roboto-Regular',
     fontSize: 13,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 12,
   },
 
@@ -1173,7 +1173,7 @@ const styles = StyleSheet.create({
   contactRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 10,
     gap: 14,
     height: CONTACT_ROW_HEIGHT,
@@ -1232,7 +1232,7 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   inviteBtn: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: 18,
     alignItems: 'center',

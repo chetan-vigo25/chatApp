@@ -156,7 +156,7 @@ const styles = StyleSheet.create({
   headerBackBtn: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
   headerTitle: { flex: 1, fontFamily: "Roboto-Bold", fontSize: 22, letterSpacing: -0.3 },
   headerSpacer: { width: 40 },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40, paddingTop: 6 },
+  scrollContent: { paddingHorizontal: 12, paddingBottom: 40, paddingTop: 6 },
   label: { fontFamily: "Roboto-Medium", fontSize: 13, marginBottom: 8, marginTop: 16, marginLeft: 4 },
   input: { borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 14, paddingVertical: 12, fontFamily: "Roboto-Regular", fontSize: 15 },
   textarea: { minHeight: 120, textAlignVertical: "top", paddingTop: 12 },

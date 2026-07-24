@@ -276,7 +276,7 @@ const styles = StyleSheet.create({
   },
   emptyRow: {
     paddingVertical: 10,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
   },
   emptyOwn: {
     alignItems: 'center',

@@ -506,7 +506,7 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 12,
     gap: 12,
@@ -525,7 +525,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 1,
   },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40 },
+  scrollContent: { paddingHorizontal: 12, paddingBottom: 40 },
 
   // Hero
   heroWrap: { position: 'relative', marginTop: 4, marginBottom: 22 },
@@ -612,7 +612,7 @@ const styles = StyleSheet.create({
   detailTextWrap: {
     flex: 1,
     paddingVertical: 14,
-    paddingRight: 16,
+    paddingRight: 12,
   },
   detailLabel: {
     fontFamily: 'Roboto-Regular',
@@ -721,7 +721,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 16,
-    paddingRight: 16,
+    paddingRight: 12,
     gap: 10,
   },
   rowLabel: {

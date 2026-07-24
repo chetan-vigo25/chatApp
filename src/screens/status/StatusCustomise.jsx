@@ -375,7 +375,7 @@ const styles = StyleSheet.create({
     bottom: Platform.OS === 'ios' ? 170 : 150,
     left: 16, right: 16,
     backgroundColor: 'rgba(0,0,0,0.5)',
-    borderRadius: 20, paddingHorizontal: 16, paddingVertical: 8,
+    borderRadius: 20, paddingHorizontal: 12, paddingVertical: 8,
     color: '#fff', fontSize: 14, fontFamily: 'Roboto-Regular',
   },
 

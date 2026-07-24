@@ -809,7 +809,7 @@ const styles = StyleSheet.create({
 
   // Grouped inset card (WhatsApp)
   gCard: { marginHorizontal: 10, marginTop: 12, borderRadius: 14, overflow: 'hidden', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(128,128,128,0.18)' },
-  gCardPad: { paddingHorizontal: 16, paddingVertical: 14 },
+  gCardPad: { paddingHorizontal: 12, paddingVertical: 14 },
   gSectionLabel: { fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.8, marginTop: 16, marginBottom: 4, paddingHorizontal: 22 },
   rowDivider: { height: StyleSheet.hairlineWidth, marginLeft: 62 },
 
@@ -828,10 +828,10 @@ const styles = StyleSheet.create({
   membersSection: { paddingTop: 8 },
   membersSectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 20, paddingBottom: 6 },
   sectionTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 12, letterSpacing: 0.5 },
-  addMemberRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, gap: 14 },
+  addMemberRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 12, gap: 14 },
   addMemberIcon: { width: 46, height: 46, borderRadius: 23, alignItems: 'center', justifyContent: 'center' },
   addMemberText: { fontFamily: 'Roboto-Medium', fontSize: 15, flex: 1 },
-  memberRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, gap: 12 },
+  memberRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 10, gap: 12 },
   memberAvatar: { width: 48, height: 48, borderRadius: 24, alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
   memberAvatarText: { color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 18 },
   ownerStar: { position: 'absolute', bottom: 0, right: 0, width: 16, height: 16, borderRadius: 8, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: '#fff' },
@@ -843,7 +843,7 @@ const styles = StyleSheet.create({
 
   // Actions
   actionsSection: { paddingVertical: 6 },
-  actionRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 13, gap: 14 },
+  actionRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 13, gap: 14 },
   actionIcon: { width: 40, height: 40, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   actionLabel: { fontFamily: 'Roboto-Medium', fontSize: 15, flex: 1 },
 

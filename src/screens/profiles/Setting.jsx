@@ -331,7 +331,7 @@ const styles = StyleSheet.create({
   headerSpacer: { width: 40 },
 
   scrollContent: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingBottom: 40,
     paddingTop: 4,
   },
@@ -384,7 +384,7 @@ const styles = StyleSheet.create({
   menuItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 14,
     gap: 16,
     minHeight: 58,

@@ -1263,7 +1263,7 @@ const styles = StyleSheet.create({
   // bright media without darkening the whole bottom band.
   ownerSummary: {
     flexDirection: 'row', alignItems: 'center', gap: 18,
-    paddingVertical: 10, paddingHorizontal: 16,
+    paddingVertical: 10, paddingHorizontal: 12,
     backgroundColor: 'rgba(0,0,0,0.45)',
     borderRadius: 999,
   },

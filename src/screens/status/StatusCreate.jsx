@@ -12,9 +12,10 @@
  *   text   → inline text composer
  *   link   → link URL input
  *
- * After capturing/selecting media, navigates to StatusCustomise for editing,
- * then StatusPreview for the final post step. Text statuses skip Customise and
- * go directly to StatusPreview.
+ * After capturing/selecting media (camera/gallery) OR composing text, navigates
+ * DIRECTLY to StatusPreview — the single screen that holds caption, audience,
+ * in-screen rotate, multi-item swipe and send (no intermediate editor screen).
+ * Only link statuses still route via StatusCustomise (it fetches the OG preview).
  *
  * Media selection deliberately uses ImagePicker's system gallery (Android Photo
  * Picker / iOS PHPicker) rather than an in-app MediaLibrary grid: the system
@@ -103,7 +104,15 @@ export default function StatusCreate({ navigation, route }) {
       const check = validateMediaList([item]);
       if (!check.ok) return Alert.alert('Cannot use this media', check.message);
 
-      navigation.navigate('StatusCustomise', { items: [item] });
+      // Straight to the single preview screen (crop/caption/audience/send all
+      // live there) — no intermediate Customise screen.
+      navigation.navigate('StatusPreview', {
+        items: [item],
+        statusType: item.type,
+        caption: '',
+        filtersApplied: [],
+        visibility: 'contacts',
+      });
     } catch (err) {
       Alert.alert('Camera error', err?.message || 'Could not open camera');
     } finally {
@@ -143,7 +152,15 @@ export default function StatusCreate({ navigation, route }) {
       const check = validateMediaList(items);
       if (!check.ok) return Alert.alert('Cannot use this media', check.message);
 
-      navigation.navigate('StatusCustomise', { items });
+      // Straight to the single preview screen — swipe between the picked items,
+      // one caption + one send. No intermediate Customise screen.
+      navigation.navigate('StatusPreview', {
+        items,
+        statusType: items[0].type,
+        caption: '',
+        filtersApplied: [],
+        visibility: 'contacts',
+      });
     } catch (err) {
       Alert.alert('Gallery error', err?.message || 'Could not open gallery');
     } finally {
@@ -361,7 +378,7 @@ export default function StatusCreate({ navigation, route }) {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   header: {
-    paddingBottom: 16, paddingHorizontal: 16,
+    paddingBottom: 16, paddingHorizontal: 12,
     flexDirection: 'row', alignItems: 'center',
   },
   backBtn: { marginRight: 14 },
@@ -382,14 +399,14 @@ const styles = StyleSheet.create({
   // Header
   addHeader: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, paddingVertical: 12,
+    paddingHorizontal: 12, paddingVertical: 12,
   },
   addHeaderTitle: { flex: 1, textAlign: 'center', fontSize: 20, fontFamily: 'Roboto-Medium' },
 
   // Option cards (2×2 grid)
   optionGrid: {
     flexDirection: 'row', flexWrap: 'wrap',
-    paddingHorizontal: 16, paddingTop: 8,
+    paddingHorizontal: 12, paddingTop: 8,
     justifyContent: 'space-between',
     rowGap: 12,
   },
@@ -403,7 +420,7 @@ const styles = StyleSheet.create({
   // Text status
   textScreen:    { flex: 1 },
   textHeader:    {
-    paddingTop: 10, paddingHorizontal: 16, paddingBottom: 8,
+    paddingTop: 10, paddingHorizontal: 12, paddingBottom: 8,
     flexDirection: 'row', alignItems: 'center',
   },
   textHeaderSide:  { flex: 1, justifyContent: 'center' },
@@ -418,7 +435,7 @@ const styles = StyleSheet.create({
   },
   charCount:     { color: 'rgba(255,255,255,0.7)', fontSize: 12, fontFamily: 'Roboto-Medium', alignSelf: 'flex-end', paddingRight: 22, paddingBottom: 8 },
   palette:       { flexGrow: 0, marginBottom: 16 },
-  paletteContent:{ paddingHorizontal: 16, alignItems: 'center' },
+  paletteContent:{ paddingHorizontal: 12, alignItems: 'center' },
   colorDotWrap:  {
     width: 44, height: 44, borderRadius: 22,
     alignItems: 'center', justifyContent: 'center',

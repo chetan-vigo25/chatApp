@@ -3,9 +3,9 @@ import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import SegmentedRing from './SegmentedRing';
 
-const AVATAR_SIZE = 44; // smaller chat-list avatar (was 52 → 48 → 44)
-const RING_SIZE   = 50; // outer ring diameter — leaves a small gap around the avatar
-const RING_STROKE = 2.5;
+const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
+const RING_SIZE   = 53; // outer ring diameter — leaves a small gap around the avatar
+const RING_STROKE = 2;
 // Default (no-photo) avatar: muted person icon.
 const DEFAULT_AVATAR_ICON   = '#8696A0';
 // Thinnest device hairline around every chat-list avatar. The COLOR is taken from
@@ -214,7 +214,7 @@ const styles = StyleSheet.create({
   card: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     // 44px avatar + 2×10 padding = 64 → tighter rows. MUST stay in sync with
     // the list's getItemLayout row height in ChatList.jsx, or scroll math drifts.
     paddingVertical: 10,

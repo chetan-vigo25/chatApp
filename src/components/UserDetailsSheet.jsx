@@ -356,7 +356,7 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     borderWidth: StyleSheet.hairlineWidth,
     paddingVertical: 14,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
   },
   infoValue: {
     fontFamily: 'Roboto-Regular',

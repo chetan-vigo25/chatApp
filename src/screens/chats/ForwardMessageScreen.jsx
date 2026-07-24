@@ -468,7 +468,7 @@ const styles = StyleSheet.create({
   listContent: { paddingBottom: 100 },
   chatRow: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 16, paddingVertical: 10, gap: 14,
+    paddingHorizontal: 12, paddingVertical: 10, gap: 14,
   },
   avatarWrap: {
     width: 48, height: 48, borderRadius: 24,

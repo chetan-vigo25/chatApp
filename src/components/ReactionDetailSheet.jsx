@@ -286,7 +286,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   list: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
   },
   listContent: {
     paddingTop: 8,

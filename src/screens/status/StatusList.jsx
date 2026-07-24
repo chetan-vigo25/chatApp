@@ -542,7 +542,7 @@ const styles = StyleSheet.create({
 
   // ── Empty state ──────────────────────────────────────────────────────────
   emptyContainer: {
-    paddingHorizontal: 30, paddingTop: 80,
+    paddingHorizontal: 12, paddingTop: 80,
     alignItems: 'center',
   },
   emptyIcon: {

@@ -76,11 +76,23 @@ export const chatMessage = createAsyncThunk(
 
 
 // Send midia upload
+// Accepts either a bare FormData (legacy) or { formData, onUploadProgress, timeout, signal }
+// so callers can get REAL byte-level upload progress from the XHR path (and
+// abort it for pause/cancel via the AbortSignal).
 export const mediaUpload = createAsyncThunk(
   'chat/mediaUpload',
   async (payload, { rejectWithValue }) => {
     try {
-      const response = await chatServices.mediaUpload(payload);
+      const isWrapped = payload && typeof payload === 'object' && payload.formData;
+      const formData = isWrapped ? payload.formData : payload;
+      const config = isWrapped
+        ? {
+            ...(typeof payload.onUploadProgress === 'function' ? { onUploadProgress: payload.onUploadProgress } : {}),
+            ...(payload.timeout ? { timeout: payload.timeout } : {}),
+            ...(payload.signal ? { signal: payload.signal } : {}),
+          }
+        : {};
+      const response = await chatServices.mediaUpload(formData, config);
       // console.log("✅ Media upload response:", response);
       return response;
  

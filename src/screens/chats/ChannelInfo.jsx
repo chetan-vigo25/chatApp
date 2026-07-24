@@ -133,7 +133,7 @@ const styles = StyleSheet.create({
   root: { flex: 1 },
   header: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    paddingHorizontal: 16, paddingVertical: 14, borderBottomWidth: 0.5,
+    paddingHorizontal: 12, paddingVertical: 14, borderBottomWidth: 0.5,
   },
   headerTitle: { fontSize: 17, fontFamily: 'Roboto-Medium' },
   brandWrap: { alignItems: 'center', paddingVertical: 28, paddingHorizontal: 24 },
@@ -147,12 +147,12 @@ const styles = StyleSheet.create({
   },
   badgeText: { fontSize: 12.5, fontFamily: 'Roboto-Regular', marginLeft: 6 },
   notice: {
-    flexDirection: 'row', alignItems: 'center', marginHorizontal: 16,
+    flexDirection: 'row', alignItems: 'center', marginHorizontal: 12,
     paddingHorizontal: 14, paddingVertical: 12, borderRadius: 12, marginTop: 4,
   },
   noticeText: { flex: 1, fontSize: 13, fontFamily: 'Roboto-Regular', lineHeight: 18 },
   section: {
-    marginTop: 20, paddingHorizontal: 16, paddingVertical: 16,
+    marginTop: 20, paddingHorizontal: 12, paddingVertical: 16,
     borderTopWidth: 0.5, borderBottomWidth: 0.5,
   },
   sectionLabel: { fontSize: 13, fontFamily: 'Roboto-Medium', marginBottom: 6 },

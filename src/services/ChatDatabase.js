@@ -852,6 +852,11 @@ const rowToMsg = (row) => {
     replyPreviewType: row.reply_preview_type || pp?._replyPreviewType || null,
     replySenderName: row.reply_sender_name || pp?._replySenderName || null,
     replySenderId: row.reply_sender_id || pp?._replySenderId || null,
+    // Media-quote poster snapshot (payload-only — no dedicated column).
+    replyPreviewThumbnail: pp?.replyPreviewThumbnail
+      || pp?._replyPreviewThumbnail
+      || pp?.replyTo?.mediaThumbnailUrl
+      || null,
   };
   // Fix corrupted replyToMessageId stored as stringified object e.g. "{_id=abc, senderId=x, text=Hi}"
   if (msg.replyToMessageId && typeof msg.replyToMessageId === 'string' && msg.replyToMessageId.startsWith('{') && msg.replyToMessageId.includes('_id=')) {

@@ -13,6 +13,8 @@ import { shouldEmitReadAll } from '../utils/readAllThrottle';
 import OutboxWorker from '../services/OutboxWorker';
 import { useLocationTracking } from '../hooks/useLocationTracking';
 import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
+import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../services/MediaDownloadManager';
+import { shouldAutoDownloadNow, AUTO_DOWNLOAD_ENABLED } from '../services/autoDownloadSettings';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -22,6 +24,41 @@ const CHAT_LIST_SAVE_DEBOUNCE_MS = 300;
 // Per-chat mutation-delta cursor (edits/deletes applied while away). MUST match
 // the prefix in useChatLogic so both share one cursor per chat.
 const MUTATION_CURSOR_PREFIX = 'chat_mutation_cursor_';
+
+// AUTO-DOWNLOAD (background chats): when an incoming media message lands in a
+// chat that is NOT open, fetch it per the user's per-network auto-download
+// matrix. The open-chat path (useChatLogic.handleReceivedMessage) has its own
+// trigger; MediaDownloadManager dedupes by mediaId (in-flight map + local
+// cache) so the two paths never download twice. Fire-and-forget.
+const AUTO_DOWNLOAD_MSG_TYPES = new Set(['image', 'photo', 'video', 'audio', 'file', 'document']);
+const maybeAutoDownloadIncomingMedia = (rawSource) => {
+  (async () => {
+    // HARD GATE: auto-download is disabled — downloads start ONLY from an
+    // explicit user tap (belt over the shouldAutoDownloadNow master switch).
+    if (!AUTO_DOWNLOAD_ENABLED) return;
+    const src = (rawSource?.data && typeof rawSource.data === 'object' &&
+      (rawSource.data.mediaUrl || rawSource.data.mediaId || rawSource.data.messageId))
+      ? rawSource.data
+      : rawSource;
+    if (!src) return;
+
+    const messageType = String(src?.messageType || src?.type || src?.mediaType || '').toLowerCase();
+    if (!AUTO_DOWNLOAD_MSG_TYPES.has(messageType)) return;
+    if (!src?.mediaUrl && !src?.mediaId) return;
+
+    const allowed = await shouldAutoDownloadNow(messageType);
+    if (!allowed) return;
+
+    const stateKey = String(src?.mediaId || src?.messageId || src?._id || '');
+    const state = stateKey ? mediaDownloadManager.getState(stateKey) : null;
+    if (state && (
+      state.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED ||
+      state.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING
+    )) return;
+
+    await mediaDownloadManager.download(src, { chatId: src?.chatId || null });
+  })().catch(() => {});
+};
 
 const _getMutationCursor = async (chatId) => {
   try {
@@ -2721,6 +2758,11 @@ export function RealtimeChatProvider({ children }) {
           });
         }
 
+        // Auto-download incoming group media (background chats included).
+        if (!(grpSenderId && currentUserIdRef.current && String(grpSenderId) === String(currentUserIdRef.current))) {
+          maybeAutoDownloadIncomingMedia(source);
+        }
+
         dispatch({
           type: 'INCOMING_GROUP_MESSAGE',
           payload: {
@@ -2775,6 +2817,12 @@ export function RealtimeChatProvider({ children }) {
             handledPrivateMsgIdsRef.current.delete(v.value);
           }
         }
+      }
+
+      // Auto-download incoming media per the user's per-network matrix — this
+      // path also covers chats whose screen is not open.
+      if (!isSelf) {
+        maybeAutoDownloadIncomingMedia(source);
       }
 
       dispatch({ type: 'INCOMING_MESSAGE', payload: normalized });

@@ -348,7 +348,7 @@ const styles = StyleSheet.create({
   searchContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginHorizontal: 16,
+    marginHorizontal: 12,
     marginBottom: 8,
     borderRadius: 12,
     paddingHorizontal: 12,

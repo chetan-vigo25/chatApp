@@ -914,7 +914,7 @@ const styles = StyleSheet.create({
   // About
   aboutRow: {
     paddingVertical: 16,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
   },
   aboutText: {
     fontFamily: 'Roboto-Regular',
@@ -927,7 +927,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 14,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     gap: 6,
   },
   phoneValue: {

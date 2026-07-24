@@ -203,7 +203,7 @@ const styles = StyleSheet.create({
   searchWrap: {
     flexDirection: "row",
     alignItems: "center",
-    marginHorizontal: 16,
+    marginHorizontal: 12,
     marginVertical: 8,
     paddingHorizontal: 14,
     height: 44,
@@ -217,7 +217,7 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 12,
     gap: 14,
     borderBottomWidth: StyleSheet.hairlineWidth,
@@ -229,7 +229,7 @@ const styles = StyleSheet.create({
   name: { fontFamily: "Roboto-Medium", fontSize: 16 },
   meta: { fontFamily: "Roboto-Regular", fontSize: 13, marginTop: 3 },
   unblockBtn: {
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 7,
     borderRadius: 18,
     borderWidth: 1.4,

@@ -27,7 +27,9 @@ import {
   Platform, FlatList, Dimensions, BackHandler, Animated, Easing, Keyboard,
 } from 'react-native';
 import { Video, ResizeMode } from 'expo-av';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import StatusImageEditor from './StatusImageEditor';
 import { BlurView } from 'expo-blur';
 import { useDispatch } from 'react-redux';
 import { createStatus } from '../../Redux/Reducer/Status/Status.reducer';
@@ -137,7 +139,7 @@ const progressStyles = StyleSheet.create({
 
 export default function StatusPreview({ navigation, route }) {
   const {
-    items = [],
+    items: routeItems = [],
     statusType = 'image',
     caption: initialCaption = '',
     textContent = '',
@@ -151,6 +153,10 @@ export default function StatusPreview({ navigation, route }) {
   const { theme } = useTheme();
   const dispatch  = useDispatch();
   const { validateMediaList } = useStatusSettings();
+
+  // Local, mutable copy of the picked items so in-screen edits (rotate) can
+  // replace an item's file without going back to a separate editor screen.
+  const [items, setItems] = useState(routeItems);
 
   const [caption, setCaption]       = useState(initialCaption);
   const [visibility, setVisibility] = useState(initialVisibility);
@@ -188,6 +194,44 @@ export default function StatusPreview({ navigation, route }) {
   }, []);
 
   const totalItems = items.length;
+
+  // ── In-screen image editor (crop / rotate / text) ──────────────────────────
+  // Opens the current image item in StatusImageEditor and swaps in the edited
+  // file so the send uploads the edited version — all without leaving preview.
+  const [editorUri, setEditorUri] = useState(null);   // non-null → editor open
+  const [editorMode, setEditorMode] = useState('idle'); // which tool to open in
+  const [rotating, setRotating] = useState(false);
+
+  // Crop / Text open the in-place editor directly in that tool.
+  const openEditor = useCallback((mode) => {
+    const item = items[currentPreview];
+    if (item?.type === 'image') { setEditorMode(mode); setEditorUri(item.uri); }
+  }, [items, currentPreview]);
+
+  // Rotate is instant + in place — no editor surface at all.
+  const rotateInline = useCallback(async () => {
+    const idx = currentPreview;
+    const item = items[idx];
+    if (!item || item.type !== 'image' || rotating) return;
+    setRotating(true);
+    try {
+      const out = await manipulateAsync(item.uri, [{ rotate: 90 }], { compress: 0.92, format: SaveFormat.JPEG });
+      setItems((prev) => prev.map((it, i) =>
+        i === idx ? { ...it, uri: out.uri, width: out.width, height: out.height, mimeType: 'image/jpeg', fileSize: undefined } : it));
+    } catch (err) {
+      Alert.alert('Rotate failed', err?.message || 'Try again');
+    } finally { setRotating(false); }
+  }, [items, currentPreview, rotating]);
+
+  const applyEditedUri = useCallback((newUri) => {
+    const idx = currentPreview;
+    setEditorUri(null);
+    if (!newUri) return;
+    setItems((prev) => prev.map((it, i) =>
+      i === idx
+        ? { ...it, uri: newUri, mimeType: 'image/jpeg', fileSize: undefined, width: undefined, height: undefined }
+        : it));
+  }, [currentPreview]);
 
   // ── Abort handler ────────────────────────────────────────────────────────
   // Cancels the in-flight upload if user backs out or component unmounts.
@@ -483,6 +527,40 @@ export default function StatusPreview({ navigation, route }) {
           <Ionicons name="close" size={26} color="#fff" />
         </TouchableOpacity>
         <View style={styles.flex} />
+        {/* All edit options live right here on the preview (image items only):
+            crop + rotate + text. Rotate is instant; crop/text open the in-place
+            editor already in that tool — no separate screen. */}
+        {items[currentPreview]?.type === 'image' && (
+          <View style={styles.toolRow}>
+            <TouchableOpacity
+              onPress={() => openEditor('crop')}
+              style={styles.topBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="Crop image"
+            >
+              <MaterialCommunityIcons name="crop" size={22} color="#fff" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={rotateInline}
+              disabled={rotating}
+              style={styles.topBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="Rotate image"
+            >
+              {rotating
+                ? <ActivityIndicator color="#fff" size="small" />
+                : <MaterialCommunityIcons name="rotate-right" size={22} color="#fff" />}
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => openEditor('text')}
+              style={styles.topBtn}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              accessibilityLabel="Add text"
+            >
+              <MaterialCommunityIcons name="format-text" size={22} color="#fff" />
+            </TouchableOpacity>
+          </View>
+        )}
         {totalItems > 1 && (
           <View style={styles.counterPill}>
             <Text style={styles.counterText}>{currentPreview + 1}/{totalItems}</Text>
@@ -551,6 +629,15 @@ export default function StatusPreview({ navigation, route }) {
           </TouchableOpacity>
         </View>
       </View>
+
+      {/* In-screen image editor (crop / rotate / text) */}
+      <StatusImageEditor
+        visible={editorUri != null}
+        uri={editorUri}
+        initialMode={editorMode}
+        onCancel={() => setEditorUri(null)}
+        onDone={applyEditedUri}
+      />
     </View>
   );
 }
@@ -624,6 +711,7 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
     backgroundColor: 'rgba(0,0,0,0.35)',
   },
+  toolRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   counterPill: {
     paddingHorizontal: 12, paddingVertical: 6,
     borderRadius: 14, backgroundColor: 'rgba(0,0,0,0.45)',

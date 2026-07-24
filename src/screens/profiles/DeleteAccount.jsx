@@ -229,7 +229,7 @@ const styles = StyleSheet.create({
   headerBackBtn: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
   headerTitle: { flex: 1, fontFamily: "Roboto-Bold", fontSize: 22, letterSpacing: -0.3 },
   headerSpacer: { width: 40 },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40, paddingTop: 8 },
+  scrollContent: { paddingHorizontal: 12, paddingBottom: 40, paddingTop: 8 },
 
   lead: { fontFamily: "Roboto-SemiBold", fontSize: 18, lineHeight: 24, marginBottom: 4 },
   leadSub: { fontFamily: "Roboto-Regular", fontSize: 14, lineHeight: 19, marginBottom: 18 },
@@ -240,7 +240,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 15,
     minHeight: 54,
   },
@@ -270,7 +270,7 @@ const styles = StyleSheet.create({
   warnIconWrap: { alignItems: "center", marginTop: 8, marginBottom: 4 },
   warnCircle: { width: 78, height: 78, borderRadius: 39, alignItems: "center", justifyContent: "center" },
   warnCard: { marginTop: 16, paddingVertical: 6 },
-  warnRow: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, paddingVertical: 11 },
+  warnRow: { flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 12, paddingVertical: 11 },
   warnText: { fontFamily: "Roboto-Regular", fontSize: 15, flex: 1, lineHeight: 20 },
   disclaimer: {
     fontFamily: "Roboto-Regular",

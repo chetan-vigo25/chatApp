@@ -117,7 +117,7 @@ const styles = StyleSheet.create({
   emptyText: { fontFamily: "Roboto-Regular", fontSize: 13.5, textAlign: "center", lineHeight: 19 },
   emptyBtn: { marginTop: 10, paddingHorizontal: 28, paddingVertical: 12, borderRadius: 40 },
   emptyBtnText: { fontFamily: "Roboto-SemiBold", fontSize: 15, color: "#fff" },
-  listContent: { paddingHorizontal: 16, paddingBottom: 30, paddingTop: 4 },
+  listContent: { paddingHorizontal: 12, paddingBottom: 30, paddingTop: 4 },
   card: { borderRadius: 16, padding: 14, marginBottom: 10 },
   cardTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 6 },
   ticketNo: { fontFamily: "Roboto-SemiBold", fontSize: 13 },

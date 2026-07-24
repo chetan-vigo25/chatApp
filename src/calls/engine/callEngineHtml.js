@@ -173,6 +173,15 @@ export const buildCallEngineHtml = () => `<!doctype html>
     var RETRY_WINDOW_MS = 40000;
     var REASSERT_MS = 5000;       // min gap between ring reasserts after a successful dial
 
+    // Explicit voice-processing constraints — most WebViews default these ON,
+    // but relying on defaults left it device-dependent (echo/level complaints
+    // on some OEMs). Idempotent where already the default.
+    var AUDIO_CONS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+    // Opus voice tuning (WhatsApp-style): FEC hides packet loss (choppy-audio
+    // killer on weak networks), DTX stops sending during silence, MONO at a
+    // 32 kbps cap — voice needs no stereo/96k, and the lighter stream survives
+    // jittery mobile links far better (less loss = fewer robotic patches).
+    var MIC_CODEC_OPTIONS = { opusFec: true, opusDtx: true, opusStereo: false, opusMaxAverageBitrate: 32000 };
     // Camera simulcast: 3 layers; the SFU forwards the best fit per receiver.
     var CAM_ENCODINGS = [
       { scaleResolutionDownBy: 4, maxBitrate: 150000 },
@@ -290,6 +299,86 @@ export const buildCallEngineHtml = () => `<!doctype html>
         s.on('connect', onC);
       });
     };
+    // Retry-safe request for the pause/resume CONTROL PLANE. These commands are
+    // idempotent server-side but were fire-and-forget — a socket flap at the
+    // accept moment silently ate resumeProducer/resumeConsumer and the call sat
+    // CONNECTED BUT SILENT forever (a server-paused producer DROPS the client's
+    // RTP; a server-paused consumer forwards nothing). Waits for the auto-
+    // reconnecting socket between attempts.
+    CallingSDK.prototype._reqRetry = function (event, data, tries) {
+      var self = this;
+      var left = typeof tries === 'number' ? tries : 4;
+      var attempt = function () {
+        return self._waitSocket(4000).then(function () { return self._req(event, data); })
+          .catch(function (e) {
+            left -= 1;
+            if (left <= 0) { self._log(event + ' FAILED after retries: ' + (e && e.message)); throw e; }
+            return new Promise(function (r) { setTimeout(r, 800); }).then(attempt);
+          });
+      };
+      return attempt();
+    };
+
+    // STATE-CONVERGENT producer sync. NEVER retry a raw pause/resume command:
+    // a delayed pauseProducer retry (pre-answer privacy hold) can land AFTER
+    // the promote's resumeProducer and leave the server-side producer paused
+    // FOREVER — RTP silently dropped, total one-way silence. Every attempt
+    // re-reads pr.paused NOW and asserts that; after success it re-checks and
+    // converges if the state flipped mid-flight.
+    CallingSDK.prototype._syncProducerState = function (pr, tries) {
+      var self = this;
+      var left = typeof tries === 'number' ? tries : 4;
+      var attempt = function () {
+        if (!pr || pr.closed) return Promise.resolve();
+        var wantPaused = !!pr.paused;
+        var ev = wantPaused ? 'pauseProducer' : 'resumeProducer';
+        return self._waitSocket(4000).then(function () { return self._req(ev, { producerId: pr.id }); })
+          .then(function () {
+            // State flipped while the request was in flight → converge again.
+            if (!pr.closed && !!pr.paused !== wantPaused) return attempt();
+            return null;
+          })
+          .catch(function (e) {
+            left -= 1;
+            if (left <= 0) { self._log(ev + ' sync FAILED: ' + (e && e.message)); throw e; }
+            return new Promise(function (r) { setTimeout(r, 800); }).then(attempt);
+          });
+      };
+      return attempt();
+    };
+
+    // Produce the mic with the opus voice tuning; if a WebView rejects the
+    // codecOptions, fall back to a PLAIN produce — tuning must never be the
+    // reason a call has no audio at all.
+    CallingSDK.prototype._produceMic = function (track) {
+      var self = this;
+      return self._sendTransport.produce({ track: track, codecOptions: MIC_CODEC_OPTIONS, appData: { source: 'mic' } })
+        .catch(function (e) {
+          self._log('mic produce with codecOptions failed (' + (e && e.message) + ') — retrying plain');
+          return self._sendTransport.produce({ track: track, appData: { source: 'mic' } });
+        });
+    };
+
+    // After a reconnect the server may have missed pause/resume commands sent
+    // while the old socket was dying. LOCAL state is the source of truth —
+    // re-assert every producer's pause state and re-resume every consumer
+    // (all idempotent server-side). This is what heals a call that reconnected
+    // "successfully" but stayed one-way/both-way silent.
+    CallingSDK.prototype._reassertMediaState = function () {
+      var self = this;
+      Object.keys(self._producers || {}).forEach(function (k) {
+        var pr = self._producers[k];
+        if (!pr || pr.closed) return;
+        self._syncProducerState(pr, 3).catch(function () {});
+      });
+      Object.keys(self._consumers || {}).forEach(function (k) {
+        var c = self._consumers[k];
+        if (!c || c.closed) return;
+        self._reqRetry('resumeConsumer', { consumerId: c.id }, 3).catch(function () {});
+      });
+      self._log('media pause/resume state re-asserted after reconnect');
+    };
+
     CallingSDK.prototype._reqDial = function (event, data) {
       var self = this;
       // 12s: a CallKit/killed-app answer boots the engine COLD — socket connect
@@ -479,7 +568,10 @@ export const buildCallEngineHtml = () => `<!doctype html>
             var pr = self._producers[k];
             if (pr && !pr.closed) {
               try { pr.resume(); } catch (e) {}
-              self._req('resumeProducer', { producerId: pr.id }).catch(function () {});
+              // STATE-SYNC (not raw retry): this is the single message that
+              // un-mutes the caller for the whole call — and a stale queued
+              // pause must never be able to land after it.
+              self._syncProducerState(pr).catch(function () {});
             }
           });
           self._log('accepted — pre-joined room promoted (media already warm)');
@@ -869,7 +961,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
           if (n >= 2) throw e;
           if (!self._acceptedId || self._room) throw e; // ended, or already answered meanwhile
           self._log('acceptCall attempt ' + (n + 1) + ' failed (' + (e && e.message) + ') — retrying');
-          return new Promise(function (r) { setTimeout(r, 1500 * (n + 1)); }).then(function () {
+          return new Promise(function (r) { setTimeout(r, 800 * (n + 1)); }).then(function () {
             if (!self._acceptedId || self._room) return {}; // resolved while we waited
             return attempt(n + 1);
           });
@@ -1019,6 +1111,12 @@ export const buildCallEngineHtml = () => `<!doctype html>
     CallingSDK.prototype._teardownMedia = function (leaveRoom) {
       var self = this;
       self._clearRecovery();
+      // Drop any pending ICE-disconnected debounce timers (transports are
+      // about to close; a late fire would emitDown on a dead call).
+      if (self._softDown) {
+        for (var sdk in self._softDown) { try { clearTimeout(self._softDown[sdk]); } catch (e) {} }
+        self._softDown = {};
+      }
       // Invalidate any in-flight getUserMedia so its late stream can't become
       // a leaked _localStream after this teardown.
       self._capGen = (self._capGen || 0) + 1;
@@ -1076,18 +1174,18 @@ export const buildCallEngineHtml = () => `<!doctype html>
         return navigator.mediaDevices.getUserMedia(constraints);
       };
       var tryOnce = function () {
-        if (!wantVideo) return attempt({ audio: true, video: false });
+        if (!wantVideo) return attempt({ audio: AUDIO_CONS, video: false });
         // Some cameras/WebViews reject a facingMode constraint outright
         // (NotFound/Overconstrained) even though a camera exists — retry plain,
         // then fall back to audio-only (a video call can upgrade later).
-        return attempt({ audio: true, video: { facingMode: self._facing } })
+        return attempt({ audio: AUDIO_CONS, video: { facingMode: self._facing } })
           .catch(function (e) {
             self._log('getUserMedia facingMode failed (' + (e && e.name) + ') — retrying without constraint');
-            return attempt({ audio: true, video: true });
+            return attempt({ audio: AUDIO_CONS, video: true });
           })
           .catch(function (e) {
             self._log('getUserMedia video failed (' + (e && e.name) + ') — falling back to audio-only');
-            return attempt({ audio: true, video: false });
+            return attempt({ audio: AUDIO_CONS, video: false });
           });
       };
       var attemptsLeft = 3;
@@ -1140,7 +1238,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
       self._ensuringAudio = true;
       var get = liveTrack
         ? Promise.resolve(liveTrack)
-        : navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
+        : navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONS }).then(function (s) {
           var t = (s.getAudioTracks() || [])[0];
           if (!self._localStream) self._localStream = new MediaStream();
           try {
@@ -1154,7 +1252,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
         });
       return get.then(function (track) {
         if (!track) throw new Error('no audio track');
-        return self._sendTransport.produce({ track: track, appData: { source: 'mic' } })
+        return self._produceMic(track)
           .then(function (pr) {
             self._producers.mic = pr;
             self._log('mic produced (late capture recovery)');
@@ -1256,10 +1354,30 @@ export const buildCallEngineHtml = () => `<!doctype html>
       }
       t.on('connectionstatechange', function (state) {
         self._log('transport ' + t.direction + ' → ' + state);
-        if (state === 'failed' || state === 'disconnected') {
+        if (!self._softDown) self._softDown = {};
+        if (state === 'failed') {
+          // Hard failure — react immediately.
+          if (self._softDown[t.id]) { clearTimeout(self._softDown[t.id]); delete self._softDown[t.id]; }
           self._emitDown('ice:' + state);
           if (self._socket && self._socket.connected) self._restartIceOn(t);
+        } else if (state === 'disconnected') {
+          // SOFT state: ICE 'disconnected' frequently self-recovers in 1-2s on
+          // a radio blip. Reacting instantly flashed "Reconnecting…" and fired
+          // a needless ICE restart (renegotiation churn) on every blip. Only
+          // treat it as down if it PERSISTS past a short debounce; 'failed'
+          // above stays immediate.
+          if (self._softDown[t.id]) return;
+          self._softDown[t.id] = setTimeout(function () {
+            delete self._softDown[t.id];
+            if (!self._room) return; // torn down while we waited
+            var st = t.connectionState;
+            if (st === 'disconnected' || st === 'failed') {
+              self._emitDown('ice:disconnected');
+              if (self._socket && self._socket.connected) self._restartIceOn(t);
+            }
+          }, 2500);
         } else if (state === 'connected') {
+          if (self._softDown[t.id]) { clearTimeout(self._softDown[t.id]); delete self._softDown[t.id]; }
           self._emitUp('ice:connected');
         }
       });
@@ -1273,7 +1391,9 @@ export const buildCallEngineHtml = () => `<!doctype html>
       var self = this;
       if (self._room && self._room.preAnswer && pr && !pr.closed) {
         try { pr.pause(); } catch (e) {}
-        self._req('pauseProducer', { producerId: pr.id }).catch(function () {});
+        // State-sync: retries re-read pr.paused, so a slow pause attempt can
+        // NEVER land after the promote resume and mute the call forever.
+        self._syncProducerState(pr).catch(function () {});
       }
     };
 
@@ -1283,7 +1403,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
       var audio = self._localStream ? self._localStream.getAudioTracks()[0] : null;
       if (audio && !self._producers.mic) {
         chain = chain.then(function () {
-          return self._sendTransport.produce({ track: audio, appData: { source: 'mic' } })
+          return self._produceMic(audio)
             .then(function (pr) { self._producers.mic = pr; self._pauseIfPreAnswer(pr); });
         });
       }
@@ -1335,7 +1455,9 @@ export const buildCallEngineHtml = () => `<!doctype html>
           if (t.kind === consumer.track.kind && t !== consumer.track) { try { stream.removeTrack(t); } catch (e) {} }
         });
         stream.addTrack(consumer.track);
-        return self._req('resumeConsumer', { consumerId: consumer.id }).then(function () {
+        // RETRY-SAFE: a lost resumeConsumer left this stream server-paused —
+        // the call looked connected but this direction stayed silent forever.
+        return self._reqRetry('resumeConsumer', { consumerId: consumer.id }).then(function () {
           self._groupJoined[peerId] = true;
           self._log('consuming ' + consumer.track.kind + (isScreen ? ' (screen)' : '') + ' from ' + peerId);
           // Peer's camera was ALREADY off when we consumed — no producerPaused
@@ -1383,6 +1505,10 @@ export const buildCallEngineHtml = () => `<!doctype html>
       this._mediaDown = false;
       this._clearRecovery();
       this._log('media UP (' + why + ')');
+      // The break may have eaten in-flight pause/resume commands (mute state,
+      // promote un-mute, consumer resume) — re-assert from local truth so a
+      // recovered call never comes back half-silent.
+      if (why !== 'rejoin') this._reassertMediaState();
       this._emit('connected', { reason: why });
     };
 
@@ -1390,12 +1516,25 @@ export const buildCallEngineHtml = () => `<!doctype html>
       var self = this;
       self._clearRecovery();
       self._recoverUntil = Date.now() + 30000; // RN watchdog owns the final verdict
+      var downSince = Date.now();
+      var escalated = false;
       self._recoverTimer = setInterval(function () {
         if (!self._mediaDown || !self._room || Date.now() > self._recoverUntil) {
           self._clearRecovery();
           return;
         }
         if (self._socket && self._socket.connected) {
+          // ESCALATION: ~12s of failed ICE restarts on a LIVE socket means the
+          // transports themselves are wedged (NAT gave our ports away, DTLS
+          // stuck) — restartIce alone will never heal that. Rebuild the media
+          // pipeline in place: fresh transports on the same room reconnect in
+          // ~1s instead of the call dying at the watchdog.
+          if (!escalated && Date.now() - downSince > 12000) {
+            escalated = true;
+            self._log('recovery escalation — full media rebuild');
+            self._rebuildMedia().catch(function (e) { self._log('rebuild failed: ' + (e && e.message)); });
+            return;
+          }
           self._log('media recovery tick — restarting ICE');
           self.restartIce();
         }
@@ -1415,6 +1554,8 @@ export const buildCallEngineHtml = () => `<!doctype html>
       self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, resume: true, token: self._token || undefined }).then(function (res) {
         if (res && res.resumed) {
           self.restartIce();
+          // Heal any pause/resume command the dying socket ate mid-flap.
+          self._reassertMediaState();
           (res.existingProducers || []).forEach(function (p) { self._consume(p).catch(function () {}); });
           self._emitUp('resume');
           self._log('call resumed after reconnect');
@@ -1423,25 +1564,38 @@ export const buildCallEngineHtml = () => `<!doctype html>
         // Grace expired server-side — rebuild the media pipeline from scratch on
         // the same room (fresh transports + producers), like a page-refresh rejoin.
         self._log('resume not available — rebuilding media pipeline');
-        Object.keys(self._producers).forEach(function (k) { try { self._producers[k].close(); } catch (e) {} });
-        self._producers = {};
-        Object.keys(self._consumers).forEach(function (k) { try { self._consumers[k].close(); } catch (e) {} });
-        self._consumers = {};
-        self._consumed = {};
-        self._peerStreams = {};
-        try { self._sendTransport && self._sendTransport.close(); } catch (e) {}
-        try { self._recvTransport && self._recvTransport.close(); } catch (e) {}
-        self._sendTransport = self._recvTransport = null;
-        self._device = null;
-        room.joined = false;
-        return self._joinRoom().then(function () {
-          self._emitUp('rejoin');
-          self._log('call rejoined after reconnect');
-        });
+        return self._rebuildMedia();
       }).catch(function (e) {
         self._log('resume failed: ' + (e && e.message));
         // Leave the reconnecting state up; the next socket reconnect retries, and
         // RN's reconnect watchdog bounds the wait.
+      });
+    };
+
+    // Tear the transports/producers/consumers down and re-join the SAME room
+    // fresh. Used when a resume isn't possible (server grace expired) AND as
+    // the mid-call self-heal escalation: ICE restarts that keep failing mean
+    // the transports themselves are wedged — a fresh join re-negotiates
+    // everything in ~1s (WhatsApp-style recover-in-place, not drop-the-call).
+    CallingSDK.prototype._rebuildMedia = function () {
+      var self = this;
+      var room = self._room;
+      if (!room) return Promise.resolve();
+      Object.keys(self._producers).forEach(function (k) { try { self._producers[k].close(); } catch (e) {} });
+      self._producers = {};
+      Object.keys(self._consumers).forEach(function (k) { try { self._consumers[k].close(); } catch (e) {} });
+      self._consumers = {};
+      self._consumed = {};
+      self._peerStreams = {};
+      try { self._sendTransport && self._sendTransport.close(); } catch (e) {}
+      try { self._recvTransport && self._recvTransport.close(); } catch (e) {}
+      self._sendTransport = self._recvTransport = null;
+      self._device = null;
+      room.joined = false;
+      return self._joinRoom().then(function () {
+        if (self._room !== room) return; // torn down while rebuilding
+        self._emitUp('rejoin');
+        self._log('call rejoined after rebuild');
       });
     };
 
@@ -1464,8 +1618,10 @@ export const buildCallEngineHtml = () => `<!doctype html>
     CallingSDK.prototype.toggleMic = function (on) {
       var p = this._producers.mic;
       if (!p) return;
-      if (on) { this._req('resumeProducer', { producerId: p.id }).catch(function () {}); try { p.resume(); } catch (e) {} }
-      else { this._req('pauseProducer', { producerId: p.id }).catch(function () {}); try { p.pause(); } catch (e) {} }
+      // Local state first, then CONVERGENT sync (a lost/late request can
+      // never leave the server in the opposite mute state).
+      if (on) { try { p.resume(); } catch (e) {} } else { try { p.pause(); } catch (e) {} }
+      this._syncProducerState(p).catch(function () {});
     };
 
     CallingSDK.prototype.toggleCamera = function (on) {
@@ -1486,8 +1642,9 @@ export const buildCallEngineHtml = () => `<!doctype html>
         }
         return;
       }
-      if (on) { self._req('resumeProducer', { producerId: p.id }).catch(function () {}); try { p.resume(); } catch (e) {} }
-      else { self._req('pauseProducer', { producerId: p.id }).catch(function () {}); try { p.pause(); } catch (e) {} }
+      // Local state first, then CONVERGENT sync (see toggleMic).
+      if (on) { try { p.resume(); } catch (e) {} } else { try { p.pause(); } catch (e) {} }
+      self._syncProducerState(p).catch(function () {});
     };
 
     // Mid-call AUDIO → VIDEO upgrade: capture the camera, add it to the local
@@ -1876,7 +2033,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
       recapturing = true;
       logToRN('mic track ended — re-capturing via getUserMedia');
       try {
-        navigator.mediaDevices.getUserMedia({ audio: true }).then(function (ns) {
+        navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }).then(function (ns) {
           try {
             var nt = (ns.getAudioTracks() || [])[0];
             if (!nt) { recapturing = false; return; }

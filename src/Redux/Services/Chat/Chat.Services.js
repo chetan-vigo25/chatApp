@@ -133,10 +133,12 @@ export async function getMessageInfo({ messageId, chatId }) {
   }
 }
 
-export async function mediaUpload(formData) {
+// config supports { onUploadProgress, timeout, signal } — onUploadProgress
+// switches apiCallForm onto its XHR path so byte-level progress is real.
+export async function mediaUpload(formData, config = {}) {
     console.log("user/media/upload services",formData)
     try {
-      const response = await apiCallForm("POST","user/media/upload", formData);
+      const response = await apiCallForm("POST","user/media/upload", formData, config);
   
       if (response?.statusCode === 200) {
         return response;

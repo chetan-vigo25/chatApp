@@ -335,7 +335,7 @@ const styles = StyleSheet.create({
   listContent: { paddingBottom: 30 },
   listEmpty: { flexGrow: 1 },
 
-  row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16 },
+  row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12 },
   avatar: { width: 48, height: 48, borderRadius: 24 },
   rowText: { flex: 1, minWidth: 0, marginLeft: 14 },
   nameLine: { flexDirection: 'row', alignItems: 'center', marginBottom: 2 },

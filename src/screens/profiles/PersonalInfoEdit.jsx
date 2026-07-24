@@ -233,7 +233,7 @@ const styles = StyleSheet.create({
   },
   headerTitle: { flex: 1, fontFamily: 'Roboto-Medium', fontSize: 19, marginLeft: 6 },
 
-  body: { flex: 1, paddingHorizontal: 22, paddingTop: 26 },
+  body: { flex: 1, paddingHorizontal: 12, paddingTop: 26 },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',

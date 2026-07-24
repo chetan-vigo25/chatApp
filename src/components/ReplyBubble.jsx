@@ -10,6 +10,7 @@ const MEDIA_LABELS = {
   document: '📎 Document',
   location: '📍 Location',
   contact: '👤 Contact',
+  album: '🖼 Album',
 };
 
 const ReplyBubble = React.memo(function ReplyBubble({
@@ -32,8 +33,10 @@ const ReplyBubble = React.memo(function ReplyBubble({
   const msgType = (replyPreviewType || 'text').toLowerCase();
   const isMedia = msgType !== 'text' && msgType !== 'system';
   const isDeleted = replyPreviewText === 'This message was deleted';
-  // Small thumbnail only for image/video quotes that actually have a URL.
-  const showThumb = !isDeleted && (msgType === 'image' || msgType === 'photo' || msgType === 'video') && Boolean(replyThumbnailUrl);
+  // Small thumbnail only for visual quotes that actually have a URL.
+  const showThumb = !isDeleted
+    && (msgType === 'image' || msgType === 'photo' || msgType === 'video' || msgType === 'album')
+    && Boolean(replyThumbnailUrl);
   const displayText = isDeleted
     ? 'This message was deleted'
     : isMedia

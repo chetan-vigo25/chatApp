@@ -576,7 +576,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'center',
     gap: 10,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingBottom: 22,
   },
   actionBtn: {
@@ -676,7 +676,7 @@ const styles = StyleSheet.create({
   },
   modalConfirmText: { fontSize: 15, fontFamily: 'Roboto-SemiBold', color: '#fff' },
 
-  section: { paddingHorizontal: 16, marginBottom: 18 },
+  section: { paddingHorizontal: 12, marginBottom: 18 },
   sectionLabel: {
     fontSize: 13, fontFamily: 'Roboto-Medium',
     marginBottom: 8, marginLeft: 4, textTransform: 'none',

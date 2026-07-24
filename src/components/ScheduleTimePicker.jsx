@@ -195,7 +195,7 @@ const styles = StyleSheet.create({
   container: {
     borderTopLeftRadius: 20, borderTopRightRadius: 20,
     paddingTop: 20, paddingBottom: Platform.OS === 'ios' ? 44 : 40,
-    paddingHorizontal: 20,
+    paddingHorizontal: 12,
   },
   header: {
     flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 16,
@@ -220,7 +220,7 @@ const styles = StyleSheet.create({
   timeSeparator: { fontFamily: 'Roboto-SemiBold', fontSize: 24, marginHorizontal: 6, marginTop: 26 },
   periodWrap: { gap: 6, marginTop: 8 },
   periodBtn: {
-    paddingVertical: 10, paddingHorizontal: 16, borderRadius: 10, alignItems: 'center',
+    paddingVertical: 10, paddingHorizontal: 12, borderRadius: 10, alignItems: 'center',
   },
   periodText: { fontFamily: 'Roboto-SemiBold', fontSize: 14 },
   preview: { fontFamily: 'Roboto-Medium', fontSize: 13, textAlign: 'center', marginBottom: 16 },

@@ -35,10 +35,16 @@ export const compressImage = async (file, options = {}) => {
   const originalWidth = Number(file?.width || 0);
   const originalHeight = Number(file?.height || 0);
 
-  const resize =
-    originalWidth > 0 && originalHeight > 0
-      ? { width: Math.min(maxWidth, originalWidth), height: Math.min(maxHeight, originalHeight) }
-      : { width: maxWidth };
+  // Fit within maxWidth×maxHeight PRESERVING aspect ratio. Passing both width
+  // and height to manipulateAsync forces exact dimensions (distorts) — always
+  // hand it a single scaled dimension instead.
+  let resize;
+  if (originalWidth > 0 && originalHeight > 0) {
+    const scale = Math.min(1, maxWidth / originalWidth, maxHeight / originalHeight);
+    resize = { width: Math.max(1, Math.round(originalWidth * scale)) };
+  } else {
+    resize = { width: maxWidth };
+  }
 
   const result = await ImageManipulator.manipulateAsync(
     file.uri,

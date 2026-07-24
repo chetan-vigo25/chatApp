@@ -336,7 +336,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 1,
   },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40, paddingTop: 4 },
+  scrollContent: { paddingHorizontal: 12, paddingBottom: 40, paddingTop: 4 },
 
   // Preview
   previewWrap: {
@@ -591,7 +591,7 @@ const styles = StyleSheet.create({
   themeRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 14,
     gap: 16,
     minHeight: 60,
@@ -627,7 +627,7 @@ const styles = StyleSheet.create({
   accentHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 14,
     gap: 14,
   },

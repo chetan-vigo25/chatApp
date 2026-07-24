@@ -353,6 +353,6 @@ const styles = StyleSheet.create({
     fontSize: 11,
     textAlign: 'center',
     marginTop: 16,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
   },
 });

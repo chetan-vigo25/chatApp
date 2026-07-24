@@ -883,7 +883,7 @@ const styles = StyleSheet.create({
   sheetCard: {
     borderTopLeftRadius: 22,
     borderTopRightRadius: 22,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingBottom: 30,
   },
   sheetHandle: {
@@ -986,7 +986,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 13,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     borderRadius: 14,
     gap: 12,
   },
@@ -1118,7 +1118,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     right: 0,
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingVertical: 12,
     backgroundColor: 'rgba(0,0,0,0.4)',
   },

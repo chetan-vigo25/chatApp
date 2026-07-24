@@ -209,7 +209,7 @@ const styles = StyleSheet.create({
   header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 12,
     gap: 12,
@@ -228,7 +228,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 1,
   },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 40 },
+  scrollContent: { paddingHorizontal: 12, paddingBottom: 40 },
 
   heroWrap: { position: 'relative', marginTop: 4, marginBottom: 22 },
   heroHalo: {
@@ -297,7 +297,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingVertical: 16,
-    paddingRight: 16,
+    paddingRight: 12,
     gap: 10,
   },
   rowLabel: {

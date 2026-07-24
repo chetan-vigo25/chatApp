@@ -34,6 +34,22 @@ import {
   normalizeUri,
   uploadMediaFile,
 } from "../utils/mediaService";
+import { abortChunkSession } from '../utils/chunkedUpload';
+import {
+  pauseUpload as registryPauseUpload,
+  resumeUpload as registryResumeUpload,
+  cancelUpload as registryCancelUpload,
+  clearUploadFlags as registryClearUploadFlags,
+  isUploadPaused,
+  isUploadCancelled,
+  registerUploadAbort,
+  hydratePausedUploads,
+} from '../services/uploadPauseRegistry';
+import DownloadQueue from '../services/DownloadQueue';
+import autoDownloadSettings, { AUTO_DOWNLOAD_ENABLED } from '../services/autoDownloadSettings';
+import { compressImage } from '../utils/mediaCompressor';
+import { generateThumbnail } from '../utils/thumbnailGenerator';
+import { computeFileSha256, MAX_HASH_BYTES } from '../utils/fileHash';
 import SqliteWriter from "../services/SqliteWriter";
 import { pauseBackgroundSyncFor } from "../services/syncPriority";
 import { subscribeSessionReset, subscribeUserChanged } from "../services/sessionEvents";
@@ -217,6 +233,64 @@ const generateClientMessageId = () => (
   `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
 );
 
+// One-shot per app session: storage usage log + quota eviction + orphan cleanup.
+// Fired from the media bootstrap effect, never awaited on the startup path.
+let _storageHygieneRan = false;
+
+// One-shot per app session: resume downloads interrupted by an app kill.
+// (Re-running on every chat open would re-attempt permanently-failed rows.)
+let _downloadResumeRan = false;
+
+// Watchdog for an upload with REAL progress: scale with file size at a ~50KB/s
+// floor so a large upload that IS moving isn't killed at the old flat 30s.
+const uploadTimeoutForSize = (sizeBytes) => Math.max(
+  MEDIA_UPLOAD_TIMEOUT_MS,
+  Math.ceil(Number(sizeBytes || 0) / (50 * 1024)) * 1000
+);
+
+// Prepare an outgoing media file for upload:
+//   - images (except GIFs) are re-encoded via expo-image-manipulator, which both
+//     shrinks them AND strips EXIF (GPS etc.) — that re-encode is the point.
+//     Pass { hd: true } to skip compression and send the original.
+//   - the FINAL bytes are sha256-hashed (≤16MB only) so the server can dedupe
+//     via user/media/exists and receivers can verify integrity.
+// Video transcoding is intentionally NOT attempted (no ffmpeg dep — server side
+// handles it).
+const prepareOutgoingMediaFile = async (file, messageType, { hd = false } = {}) => {
+  let prepared = { ...file };
+  const type = String(messageType || '').toLowerCase();
+  const mime = String(file?.type || '').toLowerCase();
+  const isImage = type === 'image' || type === 'photo' || mime.startsWith('image/');
+  const isGif = mime.includes('gif');
+
+  if (isImage && !isGif && !hd) {
+    try {
+      const compressed = await compressImage(prepared);
+      if (compressed?.uri) {
+        // Re-encode outputs JPEG — keep the extension honest.
+        const baseName = String(prepared.name || `image_${Date.now()}`)
+          .replace(/\.(png|webp|heic|heif|jpeg|jpg)$/i, '');
+        prepared = { ...prepared, ...compressed, name: `${baseName}.jpg` };
+      }
+    } catch (error) {
+      console.warn('media compression failed — sending original', error?.message || error);
+    }
+  }
+
+  // Refresh size from disk (compression changed it; pickers sometimes omit it).
+  try {
+    const info = await FileSystem.getInfoAsync(prepared.uri, { size: true });
+    if (info?.exists && Number(info?.size || 0) > 0) {
+      prepared = { ...prepared, size: Number(info.size) };
+    }
+  } catch { /* keep picker-reported size */ }
+
+  // sha256 of the final bytes — computeFileSha256 self-limits to ≤16MB files.
+  const sourceHash = await computeFileSha256(prepared.uri, { maxBytes: MAX_HASH_BYTES });
+
+  return { file: prepared, sourceHash };
+};
+
 const extractFileName = (nameOrUri = '') => {
   const value = String(nameOrUri || '').trim();
   if (!value) return 'media';
@@ -236,6 +310,10 @@ const resolveUploadMediaId = (uploadData = {}) => {
 export default function useChatLogic({ navigation, route }) {
   const dispatch = useDispatch();
   const { isConnected, networkType } = useNetwork();
+  // Stable ref so long-lived callbacks (auto-download on message receive) read
+  // the CURRENT network type without re-memoizing on every network flip.
+  const networkTypeRef = useRef(networkType);
+  networkTypeRef.current = networkType;
   const { pickMedia, pickMediaMultiple } = useImage();
   const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, restoreGroupMembership, inactiveGroupIds } = useRealtimeChat();
   const { currentGroup } = useSelector((s) => s.group || {});
@@ -456,6 +534,10 @@ export default function useChatLogic({ navigation, route }) {
   const queuedMediaStatusRef = useRef([]);
   const queuedMediaUploadsRef = useRef([]);
   const mediaUploadQueueInFlightRef = useRef(false);
+  // tempIds with an upload currently running. Queue rows are persisted BEFORE
+  // the upload starts (kill-safety), so the reconnect flush must skip rows
+  // whose upload is still in flight or it would double-upload them.
+  const activeMediaUploadTempIdsRef = useRef(new Set());
   const flushQueuedMediaUploadsRef = useRef(async () => {});
   const mediaStatusInFlightRef = useRef(false);
   const mediaStatusProcessedRef = useRef(new Set());
@@ -539,6 +621,10 @@ export default function useChatLogic({ navigation, route }) {
   const [pendingMedia, setPendingMedia] = useState(null);
   const [downloadProgress, setDownloadProgress] = useState({});
   const [uploadProgress, setUploadProgress] = useState({});
+  // tempId -> true for uploads the user paused (mirrors the durable
+  // `paused: true` flag on the persisted media_upload_queue rows + the
+  // module-level uploadPauseRegistry, but as React state so bubbles re-render).
+  const [pausedUploads, setPausedUploads] = useState({});
   const [mediaDownloadStates, setMediaDownloadStates] = useState({});
   const [isChatMuted, setIsChatMuted] = useState(Boolean(item?.isMuted));
   const [muteUntil, setMuteUntil] = useState(item?.muteUntil || null);
@@ -631,10 +717,18 @@ export default function useChatLogic({ navigation, route }) {
       mediaThumbnailUrl: uploadData?.thumbnailUrl || uploadData?.previewUrl || '',
       mediaMeta: {
         fileName: resolvedFileName,
-        fileSize: uploadData?.sizeAfter || file?.size || null,
+        // Never null when the picked file reported a size — prep refreshes
+        // size from disk, and the server's sizeAfter wins when present.
+        fileSize: uploadData?.sizeAfter || uploadData?.fileSize || file?.size || file?.fileSize || null,
         mimeType: resolvedMimeType,
         width: uploadData?.width || null,
         height: uploadData?.height || null,
+        // Server-persisted integrity hashes — receivers verify contentHash
+        // after download; sourceHash enables upload dedupe on replays.
+        ...(uploadData?.contentHash ? { contentHash: uploadData.contentHash } : {}),
+        ...((uploadData?.sourceHash || file?.sourceHash)
+          ? { sourceHash: uploadData?.sourceHash || file?.sourceHash }
+          : {}),
       },
       status: 'sent',
       text: file?.name || '',
@@ -680,7 +774,23 @@ export default function useChatLogic({ navigation, route }) {
     try {
       const raw = await AsyncStorage.getItem(buildMediaUploadQueueStorageKey());
       const parsed = raw ? JSON.parse(raw) : [];
-      queuedMediaUploadsRef.current = Array.isArray(parsed) ? parsed : [];
+      const rows = Array.isArray(parsed) ? parsed : [];
+      queuedMediaUploadsRef.current = rows;
+
+      // Re-hydrate paused flags so a killed app comes back with the same
+      // uploads paused — and the flush loop keeps skipping them (no
+      // auto-resume until the user taps play).
+      const pausedIds = rows
+        .filter((row) => row?.paused === true && row?.tempId)
+        .map((row) => String(row.tempId));
+      if (pausedIds.length > 0) {
+        hydratePausedUploads(pausedIds);
+        setPausedUploads((prev) => {
+          const next = { ...prev };
+          pausedIds.forEach((id) => { next[id] = true; });
+          return next;
+        });
+      }
     } catch (error) {
       console.error('loadQueuedMediaUploads error', error);
       queuedMediaUploadsRef.current = [];
@@ -738,6 +848,23 @@ export default function useChatLogic({ navigation, route }) {
 
     if (cachedUpdated) {
       await persistMessagesForChatImmediate(targetChatId || chatIdRef.current, cachedUpdated);
+    } else {
+      // Download completed AFTER this screen unmounted (user navigated away
+      // mid-download): setState updaters never run on a dead instance, so
+      // patch the SQLite row directly — the bubble must show the downloaded
+      // media when the user returns, from persisted state alone.
+      try {
+        const existingRow = await ChatDatabase.getMessage(normalizedMessageId);
+        if (existingRow) {
+          const patched = applyPatch(existingRow);
+          if (patched !== existingRow) {
+            await ChatDatabase.upsertMessage({
+              ...patched,
+              chatId: patched.chatId || targetChatId || chatIdRef.current,
+            });
+          }
+        }
+      } catch { /* best-effort — LocalStorageService media record still covers the bubble */ }
     }
   }, [persistMessagesForChatImmediate]);
 
@@ -838,14 +965,70 @@ export default function useChatLogic({ navigation, route }) {
           };
         });
 
+        // RE-ATTACH to live transfers. Downloads are owned by the module-level
+        // MediaDownloadManager and keep running while this screen was away —
+        // the cached map above only knows COMPLETED/FAILED rows, so without
+        // this overlay an in-flight download rendered as NOT_DOWNLOADED on
+        // remount (the "download got cancelled" illusion). Live states win
+        // over persisted rows: DOWNLOADING/PAUSED come back with their real
+        // current progress, and a download that finished while the user was in
+        // another chat comes back DOWNLOADED with its localPath.
+        const liveStates = typeof mediaDownloadManager.getAllStates === 'function'
+          ? mediaDownloadManager.getAllStates()
+          : {};
+        Object.entries(liveStates).forEach(([mediaId, live]) => {
+          if (!mediaId || !live) return;
+          nextStates[String(mediaId)] = { ...live };
+          if (live.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && live.localPath) {
+            nextDownloaded[String(mediaId)] = live.localPath;
+          }
+        });
+
         setDownloadedMedia((prev) => ({ ...prev, ...nextDownloaded }));
-        setMediaDownloadStates((prev) => ({ ...prev, ...nextStates }));
+        // Merge order matters: `prev` may already hold FRESHER live progress
+        // from subscription events that fired between mount and this async
+        // bootstrap — never clobber a live DOWNLOADING entry with a stale row.
+        setMediaDownloadStates((prev) => {
+          const merged = { ...prev, ...nextStates };
+          Object.entries(prev).forEach(([mediaId, existing]) => {
+            if (
+              existing?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING &&
+              Number(existing?.updatedAt || 0) > Number(merged[mediaId]?.updatedAt || 0)
+            ) {
+              merged[mediaId] = existing;
+            }
+          });
+          return merged;
+        });
       } catch (error) {
         console.warn('media download bootstrap failed', error);
       }
     };
 
     bootstrap().catch(() => {});
+
+    // Resume interrupted downloads after an app kill: single-media downloads
+    // (MediaService.downloadToLocal) and album tiles (DownloadQueue) share the
+    // same persisted download-queue rows, so one hydratePending() re-drains
+    // everything left in 'pending' / 'downloading' / 'failed'. Called directly
+    // on the service — the old MediaContext that used to do this was never
+    // mounted (dead code, now removed). Once per app session.
+    if (!_downloadResumeRan) {
+      _downloadResumeRan = true;
+      DownloadQueue.hydratePending().catch(() => {});
+    }
+
+    // Storage hygiene — once per app session, fire-and-forget, never blocks
+    // startup: usage snapshot, LRU quota eviction, orphaned-record cleanup.
+    if (!_storageHygieneRan) {
+      _storageHygieneRan = true;
+      (async () => {
+        const usage = await localStorageService.getStorageUsage();
+        console.log('[MEDIA:STORAGE:USAGE]', usage);
+        await localStorageService.enforceStorageQuota();
+        await localStorageService.cleanupOrphanedMedia();
+      })().catch(() => {});
+    }
 
     const unsubscribe = mediaDownloadManager.subscribe((event) => {
       if (!mounted || !event?.mediaId) return;
@@ -1266,10 +1449,19 @@ export default function useChatLogic({ navigation, route }) {
       return true;
     });
 
-    // Skip setMessages if content hasn't actually changed — prevents unnecessary FlatList reconciliation
-    const fingerprint = deduped.map(m =>
-      `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}`
-    ).join('|');
+    // Skip setMessages if content hasn't actually changed — prevents unnecessary FlatList reconciliation.
+    // While a message is still sending, its upload progress MUST be part of the
+    // fingerprint: album uploads live-patch mediaItems[].uploadProgress on the
+    // allMessages row, and without this the gate swallowed every patch — the
+    // album's progress ring sat frozen for the whole bulk upload.
+    const fingerprint = deduped.map(m => {
+      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}`;
+      if (m.status !== 'sending' && m.status !== 'uploading') return base;
+      const itemsFp = Array.isArray(m.mediaItems)
+        ? m.mediaItems.map(i => `${i.uploadStatus || ''}${Math.round(Number(i.uploadProgress || 0))}`).join('.')
+        : '';
+      return `${base}:${Math.round(Number(m.uploadProgress || 0))}:${itemsFp}`;
+    }).join('|');
     if (fingerprint === lastMessagesFingerprintRef.current) return;
     lastMessagesFingerprintRef.current = fingerprint;
 
@@ -2180,6 +2372,13 @@ export default function useChatLogic({ navigation, route }) {
         || normalizedPayload?.replySenderId || normalizedPayload?._replySenderId
         || replyObj?.senderId || replyObj?.sender?._id || (typeof replyObj?.sender === 'string' ? replyObj.sender : null)
         || (apiMsg?.replyPreview?.senderId != null ? String(apiMsg.replyPreview.senderId) : null)
+        || null,
+      // Media-quote poster snapshot — renders the thumbnail even when the
+      // quoted original isn't in the loaded window.
+      replyPreviewThumbnail: apiMsg?.replyPreviewThumbnail
+        || normalizedPayload?.replyPreviewThumbnail
+        || replyObj?.mediaThumbnailUrl
+        || apiMsg?.replyPreview?.mediaThumbnailUrl
         || null,
       // Status reply / share — preserve both the id reference and the preview snapshot
       // so the chat bubble can render the preview pill and link back to the StatusViewer.
@@ -5899,6 +6098,21 @@ export default function useChatLogic({ navigation, route }) {
   const sendMessageViaSocket = useCallback((payload, tempId) => {
     return new Promise(async (resolve, reject) => {
       try {
+        // SAFETY NET (backend VALIDATION_ERROR fix): never emit a media
+        // message whose upload didn't complete. A "temp_*" mediaId is the
+        // optimistic placeholder — the real mediaId only exists after a
+        // successful upload. Blocks EVERY emit path (send, resend, offline
+        // replay) — the message stays local as 'failed' instead.
+        const outboundType = String(payload?.messageType || '').toLowerCase();
+        if (['image', 'video', 'audio', 'file', 'album'].includes(outboundType)) {
+          const outboundMediaId = String(payload?.mediaId || '');
+          const hasAlbumItems = Array.isArray(payload?.mediaItems) && payload.mediaItems.length > 0;
+          if (!hasAlbumItems && (!outboundMediaId || /^temp_/i.test(outboundMediaId))) {
+            updateMessageStatus(tempId, 'failed');
+            return reject(new Error('media upload incomplete — message kept local'));
+          }
+        }
+
         const isGroupPayload = payload?.chatType === 'group' || payload?.groupId;
         const isReplyPayload = Boolean(payload?.replyToMessageId);
         const isQuotePayload = Boolean(payload?.quotedMessageId && payload?.quotedText);
@@ -6037,12 +6251,29 @@ export default function useChatLogic({ navigation, route }) {
     const quotedText = currentReply
       ? (currentReply.isDeleted ? 'This message was deleted' : (currentReply.text || ''))
       : null;
+    // Media quote thumbnail: pick a SERVER http(s) poster (receivers can't
+    // load our local file:// paths, and a raw video URL paints black in
+    // <Image>). Albums are represented by their first item.
+    const replyThumbUrl = (() => {
+      if (!currentReply) return null;
+      const isVideoFileUrl = (u) =>
+        /\.(mp4|mov|m4v|webm|mkv|avi|3gp)(\?|$)/i.test(String(u || '')) ||
+        /\/uploads\/chat\/video\//i.test(String(u || ''));
+      const first = Array.isArray(currentReply.mediaItems) && currentReply.mediaItems.length
+        ? currentReply.mediaItems[0]
+        : null;
+      const cands = first
+        ? [first.mediaThumbnailUrl, first.mediaUrl]
+        : [currentReply.mediaThumbnailUrl, currentReply.previewUrl, currentReply.mediaUrl];
+      return cands.find((u) => u && /^https?:\/\//i.test(String(u)) && !isVideoFileUrl(u)) || null;
+    })();
     const replyMeta = currentReply ? {
       replyToMessageId: replyToMsgId,
       replyPreviewText: quotedText,
       replyPreviewType: currentReply.type || 'text',
       replySenderName: resolvedReplySenderName,
       replySenderId: currentReply.senderId || null,
+      ...(replyThumbUrl ? { replyPreviewThumbnail: replyThumbUrl } : {}),
     } : {};
 
     const payload = {
@@ -6069,11 +6300,13 @@ export default function useChatLogic({ navigation, route }) {
           messageType: currentReply?.type || 'text',
           senderId: currentReply?.senderId || null,
           senderName: resolvedReplySenderName || null,
+          mediaThumbnailUrl: replyThumbUrl || null,
         },
         replyPreviewText: quotedText || '',
         replyPreviewType: currentReply?.type || 'text',
         replySenderName: resolvedReplySenderName || null,
         replySenderId: currentReply?.senderId || null,
+        ...(replyThumbUrl ? { replyPreviewThumbnail: replyThumbUrl } : {}),
       }),
     };
 
@@ -6610,6 +6843,65 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, [sendTypingStatus, isLocalTyping, resetIdleTimer, emitPresenceActivity]);
 
+  // AUTO-DOWNLOAD MATRIX: when an incoming media message lands, download it
+  // automatically if the user's per-network settings allow that media type
+  // (autoDownloadSettings: wifi/cellular × image/video/audio/document).
+  // Albums queue each tile through DownloadQueue (same pipeline the tile UI
+  // subscribes to); single media goes through MediaDownloadManager so the
+  // bubble's download state updates live. Fire-and-forget — a failure just
+  // leaves the manual tap-to-download affordance in place.
+  const maybeAutoDownloadIncomingMedia = useCallback((message) => {
+    (async () => {
+      // HARD GATE: auto-download is disabled — downloads start ONLY from an
+      // explicit user tap. (Belt over the shouldAutoDownload master switch so
+      // no DownloadQueue.add / manager.download can fire from this auto path.)
+      if (!AUTO_DOWNLOAD_ENABLED) return;
+      const net = networkTypeRef.current;
+      if (!net || String(net).toLowerCase() === 'none') return;
+
+      const messageType = String(message?.type || message?.mediaType || message?.messageType || '').toLowerCase();
+
+      if (messageType === 'album' && Array.isArray(message?.mediaItems)) {
+        const parentMessageId = normalizeId(message?.serverMessageId || message?.messageId || message?.id) || null;
+        for (const item of message.mediaItems) {
+          const category = String(item?.fileCategory || 'file').toLowerCase();
+          const allowed = await autoDownloadSettings.shouldAutoDownload(net, category);
+          if (!allowed) continue;
+          const itemMediaId = normalizeId(item?.mediaId);
+          if (!itemMediaId) continue;
+          await DownloadQueue.add({
+            mediaId: itemMediaId,
+            chatId: normalizeId(message?.chatId) || chatIdRef.current,
+            messageType: category,
+            filename: item?.mediaMeta?.fileName || itemMediaId,
+            mediaUrl: item?.mediaUrl || null,
+            messageId: parentMessageId,
+            groupId: normalizeId(message?.groupId) || null,
+          });
+        }
+        return;
+      }
+
+      if (!isMediaMessageType(messageType)) return;
+      const allowed = await autoDownloadSettings.shouldAutoDownload(net, messageType);
+      if (!allowed) return;
+
+      const identity = resolveMediaIdentity(message);
+      if (!identity?.mediaId || !identity?.mediaUrl) return;
+      const existing = mediaDownloadManager.getState(identity.mediaId);
+      if (existing && (
+        existing.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED ||
+        existing.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING ||
+        // User-paused downloads stay paused — auto-download must not resume them.
+        existing.status === MEDIA_DOWNLOAD_STATUS.PAUSED
+      )) return;
+
+      await mediaDownloadManager.download(message, {
+        chatId: normalizeId(message?.chatId) || chatIdRef.current,
+      });
+    })().catch(() => {});
+  }, []);
+
   const handleReceivedMessage = useCallback(async (msg) => {
     resetIdleTimer();
 
@@ -6935,6 +7227,11 @@ export default function useChatLogic({ navigation, route }) {
       return merged;
     });
 
+    // Auto-download incoming media per the user's per-network matrix.
+    if (!isSelfMessage) {
+      maybeAutoDownloadIncomingMedia(receivedMessage);
+    }
+
     // Emit delivery receipt for incoming messages from others
     // Do NOT emit delivery for scheduled/processing/cancelled/failed messages
     const msgStatus = (msg?.status || receivedMessage?.status || '').toLowerCase();
@@ -6964,7 +7261,7 @@ export default function useChatLogic({ navigation, route }) {
       const changed = await ChatDatabase.updateMessageStatus(messageId, 'delivered');
       if (changed) refreshMessagesFromDB();
     }
-  }, [refreshMessagesFromDB, resetIdleTimer]);
+  }, [refreshMessagesFromDB, resetIdleTimer, maybeAutoDownloadIncomingMedia]);
 
   const handleDeleteMessage = useCallback(async (messageId, isDeletedForEveryone, options = {}) => {
     const normalizedMsgId = normalizeId(messageId);
@@ -6974,6 +7271,38 @@ export default function useChatLogic({ navigation, route }) {
     const isDeletedBySelf = deletedBy
       ? sameId(deletedBy, currentUserIdRef.current)
       : Boolean(options?._initiatedLocally);
+
+    // GENUINE upload-queue cleanup: deleting the message is now the ONLY way
+    // a parked (paused/cancelled) upload row and its server chunk session get
+    // discarded — cancel keeps both for resume-from-offset. Optimistic media
+    // rows use their tempId as the message id, so match on tempId.
+    try {
+      const uploadRows = [...(queuedMediaUploadsRef.current || [])];
+      const uploadRow = uploadRows.find((q) => q?.tempId && sameId(q.tempId, normalizedMsgId));
+      if (uploadRow) {
+        // Keep the registry cancelled flag set (no clear) so an in-flight
+        // sendMedia for this row settles quietly instead of re-queueing.
+        registryCancelUpload(uploadRow.tempId);
+        if (uploadRow?.chunkSession?.sessionId) {
+          abortChunkSession(uploadRow.chunkSession.sessionId).catch(() => {});
+        }
+        const remainingRows = uploadRows.filter((q) => q?.tempId !== uploadRow.tempId);
+        queuedMediaUploadsRef.current = remainingRows;
+        await persistMediaUploadQueue(remainingRows);
+        setPausedUploads((prev) => {
+          if (!prev[uploadRow.tempId]) return prev;
+          const next = { ...prev };
+          delete next[uploadRow.tempId];
+          return next;
+        });
+        setUploadProgress((prev) => {
+          if (!(uploadRow.tempId in prev)) return prev;
+          const next = { ...prev };
+          delete next[uploadRow.tempId];
+          return next;
+        });
+      }
+    } catch { /* cleanup is best-effort — never blocks the delete */ }
 
     // Check SQLite first — if already deleted, only refresh UI (no duplicate write)
     const existing = await ChatDatabase.getMessage(normalizedMsgId);
@@ -7042,6 +7371,7 @@ export default function useChatLogic({ navigation, route }) {
     refreshMessagesFromDB,
     registerDeletedTombstone,
     removeDeletedTombstone,
+    persistMediaUploadQueue,
   ]);
 
   // ─── RECONNECT MUTATION DELTA ───
@@ -7476,21 +7806,27 @@ export default function useChatLogic({ navigation, route }) {
       const effectiveChatId = normalizeId(msg?.chatId || msg?.groupId || chatIdRef.current);
       const eventKey = buildMediaStatusEventKey(effectiveChatId, mediaId);
 
+      // Keep any prior progress — resuming a paused download continues from
+      // its partial bytes, so the ring must not visually reset to 0.
       setMediaDownloadStates((prev) => ({
         ...prev,
         [mediaId]: {
           ...(prev[mediaId] || { mediaId }),
           status: MEDIA_DOWNLOAD_STATUS.DOWNLOADING,
-          progress: 0,
+          progress: Number(prev[mediaId]?.progress || 0),
           error: null,
           updatedAt: Date.now(),
         },
       }));
 
-      setDownloadProgress(prev => ({
-        ...prev,
-        [mediaId]: 0
-      }));
+      // Drop any stale transient entry — resolveMediaProgress then falls back
+      // to the media state's (preserved) progress until fresh bytes arrive.
+      setDownloadProgress(prev => {
+        if (!(mediaId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[mediaId];
+        return copy;
+      });
 
       const localUri = await mediaDownloadManager.download(
         {
@@ -7576,10 +7912,26 @@ export default function useChatLogic({ navigation, route }) {
       return localUri;
   
     } catch (error) {
+      const stoppedId = String(msg?.mediaId || msg?.serverMessageId || msg?.id || '');
+      const errText = String(error?.message || '');
+
+      // User pressed pause/cancel — not a failure. MediaDownloadManager
+      // already moved the item to PAUSED / NOT_DOWNLOADED and its state event
+      // updates mediaDownloadStates; just clear the transient progress entry.
+      if (/download paused|download cancelled/i.test(errText)) {
+        setDownloadProgress(prev => {
+          if (!stoppedId || !(stoppedId in prev)) return prev;
+          const copy = { ...prev };
+          delete copy[stoppedId];
+          return copy;
+        });
+        return null;
+      }
+
       console.log("❌ handleDownloadMedia error:", error);
       Alert.alert("Download failed", error?.message || "Unable to download media");
 
-      const failedId = String(msg?.mediaId || msg?.serverMessageId || msg?.id || '');
+      const failedId = stoppedId;
       if (failedId) {
         setMediaDownloadStates((prev) => ({
           ...prev,
@@ -7674,17 +8026,42 @@ export default function useChatLogic({ navigation, route }) {
       ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
     }
 
+    // KILL-SAFE: persist the upload intent BEFORE starting the upload — an app
+    // kill mid-upload used to lose the media entirely (rows were only enqueued
+    // on a CAUGHT network error). The row keeps the same tempId used for the
+    // optimistic bubble and as the socket clientMessageId, so the server's
+    // (chatId, clientMessageId) idempotency + local dedupe make replays safe.
+    if (!options?.fromQueue) {
+      const preQueue = [...(queuedMediaUploadsRef.current || [])];
+      const preIdx = preQueue.findIndex((item) => item?.tempId === tempId);
+      const preTask = {
+        tempId,
+        chatId: chatIdRef.current,
+        mediaObj: { ...mediaObj, file: { ...file, uri: localSourceUri } },
+        createdAt: timestamp,
+        retries: Number(preQueue[preIdx]?.retries || 0),
+        chunkSession: preQueue[preIdx]?.chunkSession || null,
+        ...(preQueue[preIdx]?.paused === true ? { paused: true } : {}),
+      };
+      if (preIdx >= 0) preQueue[preIdx] = preTask;
+      else preQueue.push(preTask);
+      queuedMediaUploadsRef.current = preQueue;
+      await persistMediaUploadQueue(preQueue);
+    }
+
     if (!isConnected) {
       const queue = [...(queuedMediaUploadsRef.current || [])];
       const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
       const queuedTask = {
         tempId,
+        chatId: chatIdRef.current,
         mediaObj: {
           ...mediaObj,
           file: { ...file, uri: localSourceUri },
         },
         createdAt: timestamp,
         retries: Number(queue[existingIndex]?.retries || 0),
+        chunkSession: queue[existingIndex]?.chunkSession || null,
       };
       if (existingIndex >= 0) queue[existingIndex] = queuedTask;
       else queue.push(queuedTask);
@@ -7707,44 +8084,104 @@ export default function useChatLogic({ navigation, route }) {
       return { success: false, queued: true, error: 'offline queued' };
     }
 
-    let uploadTick = 0;
-    const uploadTimer = setInterval(() => {
-      uploadTick += 1;
-      setUploadProgress((prev) => {
-        const current = Number(prev[tempId] || 0);
-        if (current >= 0.92) return prev;
-        const next = Math.min(0.92, current + 0.08);
-        return { ...prev, [tempId]: next };
-      });
-      if (uploadTick > 40) clearInterval(uploadTimer);
-    }, 250);
+    // Never start bytes for an upload the user paused — the kill-safe queue
+    // row stays parked (paused: true) until an explicit resume.
+    if (isUploadPaused(tempId)) {
+      return { success: false, paused: true };
+    }
 
-    setUploadProgress((prev) => ({ ...prev, [tempId]: 0.05 }));
+    // Continue the ring from the kept percent on cancel→retry / pause→resume
+    // (the chunked path reports the real server offset moments later anyway).
+    setUploadProgress((prev) => ({ ...prev, [tempId]: Math.max(0.02, Number(prev[tempId] || 0)) }));
+    activeMediaUploadTempIdsRef.current.add(tempId);
+
+    // Pause/cancel support: aborting this controller kills the direct XHR
+    // upload; the chunked path polls the registry between chunks instead.
+    const uploadAbortController = new AbortController();
+    const unregisterUploadAbort = registerUploadAbort(tempId, () => {
+      try { uploadAbortController.abort(); } catch { /* best-effort */ }
+    });
 
     try {
+      // Compress images (re-encode strips EXIF) + hash the final bytes for
+      // server-side dedupe. `hd` on the media object/options skips compression.
+      const prep = await prepareOutgoingMediaFile(
+        { ...file, uri: localSourceUri },
+        normalizedType,
+        { hd: Boolean(mediaObj?.hd || options?.hd) }
+      );
+      const uploadFile = { ...prep.file, uri: normalizeUri(prep.file.uri) };
+      const sourceHash = prep.sourceHash;
+
+      const uploadTimeoutMs = uploadTimeoutForSize(uploadFile.size);
+
       const uploadPromise = uploadMediaFile({
-        file: { ...file, uri: localSourceUri },
+        file: uploadFile,
         chatId: chatIdRef.current,
         dispatch,
         mediaUploadAction: mediaUpload,
+        sourceHash,
+        timeoutMs: uploadTimeoutMs,
+        // Chunked-session resume state (files > CHUNKED_UPLOAD_THRESHOLD): the
+        // queue row carries {sessionId, uri, offset} so an app restart resumes
+        // the session instead of restarting from byte 0.
+        chunkSession: options?.chunkSession
+          || (queuedMediaUploadsRef.current || []).find((q) => q?.tempId === tempId)?.chunkSession
+          || null,
+        // Pause/cancel: abort the direct XHR; stop the chunk loop cleanly
+        // between chunks (server session keeps receivedBytes for resume).
+        signal: uploadAbortController.signal,
+        isPaused: () => isUploadPaused(tempId) || isUploadCancelled(tempId),
+        onChunkSession: (sessionInfo) => {
+          const rows = [...(queuedMediaUploadsRef.current || [])];
+          const rowIdx = rows.findIndex((q) => q?.tempId === tempId);
+          if (rowIdx >= 0) {
+            rows[rowIdx] = { ...rows[rowIdx], chunkSession: sessionInfo };
+            queuedMediaUploadsRef.current = rows;
+            persistMediaUploadQueue(rows).catch(() => {});
+          }
+        },
+        // REAL byte-level progress (XHR upload / chunk offsets) — replaces the
+        // old fake setInterval ticker.
+        onUploadProgress: ({ loaded, total }) => {
+          if (!total) return;
+          const fraction = Math.max(0.02, Math.min(0.98, loaded / total));
+          setUploadProgress((prev) => ({ ...prev, [tempId]: fraction }));
+        },
       });
 
+      // Watchdog scaled with file size — must exceed the transport timeout
+      // passed down to the XHR/chunk path above.
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`upload timeout after ${MEDIA_UPLOAD_TIMEOUT_MS}ms`)), MEDIA_UPLOAD_TIMEOUT_MS);
+        setTimeout(() => reject(new Error(`upload timeout after ${uploadTimeoutMs}ms`)), uploadTimeoutMs);
       });
 
       const action = await Promise.race([uploadPromise, timeoutPromise]);
-      const uploadedLocalUri = normalizeUri(action?.localUri || localSourceUri);
+      const uploadedLocalUri = normalizeUri(action?.localUri || uploadFile.uri || localSourceUri);
       const payloadData = action?.payload || action;
       const success = payloadData && (payloadData.status === true || payloadData.statusCode === 200 || payloadData.success === true);
 
       if (!success) {
+        // An aborted direct XHR surfaces as a rejected thunk action (not a
+        // throw) — pause/cancel must not flip the bubble to 'failed'.
+        if (isUploadCancelled(tempId)) {
+          return { success: false, cancelled: true };
+        }
+        if (isUploadPaused(tempId)) {
+          const pausedQueue = [...(queuedMediaUploadsRef.current || [])];
+          const pausedIdx = pausedQueue.findIndex((item) => item?.tempId === tempId);
+          if (pausedIdx >= 0 && pausedQueue[pausedIdx]?.paused !== true) {
+            pausedQueue[pausedIdx] = { ...pausedQueue[pausedIdx], paused: true };
+            queuedMediaUploadsRef.current = pausedQueue;
+            await persistMediaUploadQueue(pausedQueue);
+          }
+          return { success: false, paused: true };
+        }
         setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
         setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
         return { success: false, error: payloadData?.message || 'upload failed' };
       }
 
-      clearInterval(uploadTimer);
       setUploadProgress((prev) => ({ ...prev, [tempId]: 1 }));
 
       const uploadResponse = payloadData;
@@ -7752,7 +8189,7 @@ export default function useChatLogic({ navigation, route }) {
       const deviceId = await getOrCreateDeviceId();
       const messagePayload = createMediaMessagePayload({
         uploadResponse: responseData,
-        file,
+        file: { ...uploadFile, sourceHash },
         messageType: type,
         chatType: chatData?.chatType || 'private',
         senderId: currentUserIdRef.current,
@@ -7780,6 +8217,12 @@ export default function useChatLogic({ navigation, route }) {
       const resolvedMediaUrl = uploadedPreviewUrl || uploadedLocalUri;
       const resolvedPreviewUrl = uploadedThumbnailUrl || uploadedPreviewUrl || uploadedLocalUri;
 
+      // Local thumbnail cache (images only — video thumbs need
+      // expo-video-thumbnails, which is not installed). Fire-and-forget.
+      generateThumbnail({ file: uploadFile, messageType: normalizedCategory })
+        .then((thumbUri) => (thumbUri ? localStorageService.saveThumbnail(mediaId, thumbUri) : null))
+        .catch(() => {});
+
       setAllMessages((prevMessages) => {
         const withoutTemp = prevMessages.filter((m) => m.tempId !== tempId && m.id !== tempId);
         const permanentMsg = {
@@ -7788,7 +8231,7 @@ export default function useChatLogic({ navigation, route }) {
           tempId,
           type: normalizedCategory,
           mediaType: normalizedCategory,
-          text: file.name || '',
+          text: uploadFile.name || file.name || '',
           mediaUrl: resolvedMediaUrl,
           mediaThumbnailUrl: resolvedPreviewUrl,
           previewUrl: resolvedPreviewUrl,
@@ -7808,7 +8251,7 @@ export default function useChatLogic({ navigation, route }) {
           synced: true,
           payload: {
             ...messagePayload,
-            file: { ...file, uri: uploadedLocalUri },
+            file: { ...uploadFile, uri: uploadedLocalUri },
             isMediaDownloaded: true,
             uploadQueued: false,
           },
@@ -7835,9 +8278,38 @@ export default function useChatLogic({ navigation, route }) {
       const queue = [...(queuedMediaUploadsRef.current || [])].filter((item) => item?.tempId !== tempId);
       queuedMediaUploadsRef.current = queue;
       await persistMediaUploadQueue(queue);
+      registryClearUploadFlags(tempId);
+      setPausedUploads((prev) => {
+        if (!prev[tempId]) return prev;
+        const next = { ...prev };
+        delete next[tempId];
+        return next;
+      });
       return { success: true, tempId, messageId: serverMessageId };
     } catch (err) {
       const message = String(err?.message || err || 'upload failed');
+
+      // Cancelled mid-flight: cancelMediaUpload already parked the queue row
+      // (cancelled: true, chunkSession kept for a later resume-from-offset)
+      // and marked the message 'cancelled' — swallow the abort quietly.
+      if (isUploadCancelled(tempId)) {
+        return { success: false, cancelled: true };
+      }
+
+      // Paused: NOT a failure. The bubble stays 'sending' with a paused ring,
+      // and the kill-safe queue row (persisted before upload started) gets a
+      // durable paused flag so a relaunch keeps it parked.
+      if (isUploadPaused(tempId)) {
+        const queue = [...(queuedMediaUploadsRef.current || [])];
+        const idx = queue.findIndex((item) => item?.tempId === tempId);
+        if (idx >= 0 && queue[idx]?.paused !== true) {
+          queue[idx] = { ...queue[idx], paused: true };
+          queuedMediaUploadsRef.current = queue;
+          await persistMediaUploadQueue(queue);
+        }
+        return { success: false, paused: true };
+      }
+
       const isNetworkFailure = /network request failed|timeout|aborted|socket not connected/i.test(message);
 
       console.error('❌ [SEND MEDIA] Error:', {
@@ -7852,18 +8324,24 @@ export default function useChatLogic({ navigation, route }) {
       setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
       setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
 
+      // The queue row was persisted BEFORE the upload started (kill-safe), so
+      // any failure — network or otherwise — leaves it in place for the
+      // reconnect flush / manual retry. Keep the chunk session on the row so a
+      // large upload resumes instead of restarting.
       if (isNetworkFailure) {
         const queue = [...(queuedMediaUploadsRef.current || [])];
         const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
         const nextRetries = Number((existingIndex >= 0 ? queue[existingIndex]?.retries : 0) || 0);
         const task = {
           tempId,
+          chatId: chatIdRef.current,
           mediaObj: {
             ...mediaObj,
             file: { ...file, uri: localSourceUri },
           },
           createdAt: timestamp,
           retries: nextRetries,
+          chunkSession: (existingIndex >= 0 ? queue[existingIndex]?.chunkSession : null) || null,
         };
         if (existingIndex >= 0) queue[existingIndex] = task;
         else queue.push(task);
@@ -7873,7 +8351,8 @@ export default function useChatLogic({ navigation, route }) {
 
       return { success: false, error: message };
     } finally {
-      clearInterval(uploadTimer);
+      unregisterUploadAbort();
+      activeMediaUploadTempIdsRef.current.delete(tempId);
       if (!options?.fromQueue) {
         setPendingMedia(null);
       }
@@ -7884,6 +8363,9 @@ export default function useChatLogic({ navigation, route }) {
       });
       setTimeout(() => {
         setUploadProgress((prev) => {
+          // Keep the frozen percent on a paused/cancelled ring — the retry
+          // continues from it.
+          if (isUploadPaused(tempId) || isUploadCancelled(tempId)) return prev;
           const next = { ...prev };
           delete next[tempId];
           return next;
@@ -8016,15 +8498,24 @@ export default function useChatLogic({ navigation, route }) {
       const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
       const task = {
         tempId,
+        chatId: chatIdRef.current,
         albumObj: { files: normFiles, caption, mediaGroupId },
         createdAt: timestamp,
         retries: Number((existingIndex >= 0 ? queue[existingIndex]?.retries : 0) || 0),
+        ...(existingIndex >= 0 && queue[existingIndex]?.paused === true ? { paused: true } : {}),
       };
       if (existingIndex >= 0) queue[existingIndex] = task;
       else queue.push(task);
       queuedMediaUploadsRef.current = queue;
       await persistMediaUploadQueue(queue);
     };
+
+    // KILL-SAFE: persist the album task BEFORE uploading so an app kill
+    // mid-upload replays it on next boot (same tempId → same clientMessageId →
+    // server + local dedupe stop duplicates).
+    if (!options?.fromQueue) {
+      await queueAlbumTask();
+    }
 
     if (!isConnected) {
       await queueAlbumTask();
@@ -8045,25 +8536,62 @@ export default function useChatLogic({ navigation, route }) {
     };
 
     setUploadProgress((prev) => ({ ...prev, [tempId]: 0.05 }));
+    // Overall = mean of per-tile REAL byte progress (done tiles count as 1).
     const refreshOverallProgress = () => {
       const total = liveItems.length || 1;
-      const done = liveItems.filter((i) => i.uploadStatus === 'done' || i.uploadStatus === 'failed').length;
-      setUploadProgress((prev) => ({ ...prev, [tempId]: Math.max(0.05, Math.min(0.98, done / total)) }));
+      const sum = liveItems.reduce((acc, i) => (
+        acc + (i.uploadStatus === 'done'
+          ? 1
+          : Math.max(0, Math.min(1, Number(i.uploadProgress || 0) / 100)))
+      ), 0);
+      setUploadProgress((prev) => ({ ...prev, [tempId]: Math.max(0.05, Math.min(0.98, sum / total)) }));
     };
 
+    const lastItemProgressAt = {};
     const uploadOne = async (index) => {
       const file = normFiles[index];
       const attempt = async () => {
-        const uploadPromise = uploadMediaFile({
+        // Compress images (EXIF strip) + hash final bytes for server dedupe.
+        const prep = await prepareOutgoingMediaFile(
           file,
-          chatId: chatIdRef.current,
-          dispatch,
-          mediaUploadAction: mediaUpload,
+          albumFileCategory(file.type),
+          { hd: Boolean(albumObj?.hd) }
+        );
+        const uploadTimeoutMs = uploadTimeoutForSize(prep.file?.size || file.size);
+        // Album pause/cancel is message-level (keyed by the album tempId) —
+        // every tile registers its own abort so one pause stops them all.
+        const tileAbortController = new AbortController();
+        const unregisterTileAbort = registerUploadAbort(tempId, () => {
+          try { tileAbortController.abort(); } catch { /* best-effort */ }
         });
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error(`upload timeout after ${MEDIA_UPLOAD_TIMEOUT_MS}ms`)), MEDIA_UPLOAD_TIMEOUT_MS);
-        });
-        const action = await Promise.race([uploadPromise, timeoutPromise]);
+        let action;
+        try {
+          const uploadPromise = uploadMediaFile({
+            file: prep.file,
+            chatId: chatIdRef.current,
+            dispatch,
+            mediaUploadAction: mediaUpload,
+            sourceHash: prep.sourceHash,
+            timeoutMs: uploadTimeoutMs,
+            signal: tileAbortController.signal,
+            isPaused: () => isUploadPaused(tempId) || isUploadCancelled(tempId),
+            // REAL byte progress per tile (throttled — patchItem re-renders the bubble).
+            onUploadProgress: ({ loaded, total }) => {
+              if (!total) return;
+              const now = Date.now();
+              if (loaded < total && now - (lastItemProgressAt[index] || 0) < 150) return;
+              lastItemProgressAt[index] = now;
+              patchItem(index, { uploadProgress: Math.round((loaded / total) * 100) });
+              refreshOverallProgress();
+            },
+          });
+          const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error(`upload timeout after ${uploadTimeoutMs}ms`)), uploadTimeoutMs);
+          });
+          action = await Promise.race([uploadPromise, timeoutPromise]);
+        } finally {
+          unregisterTileAbort();
+        }
         const payloadData = action?.payload || action;
         const ok = payloadData && (payloadData.status === true || payloadData.statusCode === 200 || payloadData.success === true);
         if (!ok) throw new Error(payloadData?.message || 'upload failed');
@@ -8074,12 +8602,16 @@ export default function useChatLogic({ navigation, route }) {
           mediaUrl: data?.previewUrl || data?.mediaUrl || '',
           mediaThumbnailUrl: data?.thumbnailUrl || data?.mediaThumbnailUrl || '',
           mediaMeta: {
-            fileName: file.name,
-            fileSize: data?.sizeAfter || file.size || null,
-            mimeType: file.type,
+            fileName: prep.file.name || file.name,
+            fileSize: data?.sizeAfter || prep.file.size || file.size || null,
+            mimeType: prep.file.type || file.type,
             width: data?.width || null,
             height: data?.height || null,
             duration: data?.duration || null,
+            ...(data?.contentHash ? { contentHash: data.contentHash } : {}),
+            ...((data?.sourceHash || prep.sourceHash)
+              ? { sourceHash: data?.sourceHash || prep.sourceHash }
+              : {}),
           },
         };
       };
@@ -8092,6 +8624,12 @@ export default function useChatLogic({ navigation, route }) {
           refreshOverallProgress();
           return item;
         } catch (err) {
+          // Paused/cancelled: not a failure — keep the tile in its pending
+          // state (ring stays up, frozen) and stop retrying immediately.
+          if (isUploadPaused(tempId) || isUploadCancelled(tempId)) {
+            patchItem(index, { uploadStatus: 'pending' });
+            return { error: 'upload paused', paused: true };
+          }
           if (tries === 0) {
             await new Promise((r) => setTimeout(r, 1000));
             continue;
@@ -8104,17 +8642,42 @@ export default function useChatLogic({ navigation, route }) {
       return { error: 'upload failed' };
     };
 
+    // Parked by the user — don't start any bytes until an explicit resume.
+    if (isUploadPaused(tempId)) {
+      return { success: false, paused: true };
+    }
+
+    activeMediaUploadTempIdsRef.current.add(tempId);
     try {
       const results = new Array(normFiles.length);
       let cursor = 0;
       const workerCount = Math.min(ALBUM_UPLOAD_CONCURRENCY, normFiles.length);
       await Promise.all(Array.from({ length: workerCount }, async () => {
         while (cursor < normFiles.length) {
+          // Paused/cancelled mid-album — stop pulling new files.
+          if (isUploadPaused(tempId) || isUploadCancelled(tempId)) break;
           const index = cursor;
           cursor += 1;
           results[index] = await uploadOne(index);
         }
       }));
+
+      if (isUploadCancelled(tempId)) {
+        return { success: false, cancelled: true };
+      }
+      if (isUploadPaused(tempId)) {
+        // Bubble stays 'sending'; the kill-safe queue row gets a durable
+        // paused flag. Finished tiles keep their server data — the resume
+        // re-run dedupes them via sourceHash and only uploads what's left.
+        const queue = [...(queuedMediaUploadsRef.current || [])];
+        const idx = queue.findIndex((item) => item?.tempId === tempId);
+        if (idx >= 0 && queue[idx]?.paused !== true) {
+          queue[idx] = { ...queue[idx], paused: true };
+          queuedMediaUploadsRef.current = queue;
+          await persistMediaUploadQueue(queue);
+        }
+        return { success: false, paused: true };
+      }
 
       const uploaded = results.filter((r) => r && !r.error);
       const failedCount = results.length - uploaded.length;
@@ -8184,9 +8747,22 @@ export default function useChatLogic({ navigation, route }) {
       const queue = [...(queuedMediaUploadsRef.current || [])].filter((item) => item?.tempId !== tempId);
       queuedMediaUploadsRef.current = queue;
       await persistMediaUploadQueue(queue);
+      registryClearUploadFlags(tempId);
+      setPausedUploads((prev) => {
+        if (!prev[tempId]) return prev;
+        const next = { ...prev };
+        delete next[tempId];
+        return next;
+      });
       return { success: true, tempId, failedCount };
     } catch (err) {
       const message = String(err?.message || err || 'album send failed');
+      if (isUploadCancelled(tempId)) {
+        return { success: false, cancelled: true };
+      }
+      if (isUploadPaused(tempId)) {
+        return { success: false, paused: true };
+      }
       setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
       setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
       if (/network request failed|timeout|aborted|socket not connected/i.test(message)) {
@@ -8194,9 +8770,13 @@ export default function useChatLogic({ navigation, route }) {
       }
       return { success: false, error: message };
     } finally {
+      activeMediaUploadTempIdsRef.current.delete(tempId);
       if (!options?.fromQueue) setPendingMedia(null);
       setTimeout(() => {
         setUploadProgress((prev) => {
+          // Keep the frozen percent on a paused/cancelled ring — the retry
+          // continues from it.
+          if (isUploadPaused(tempId) || isUploadCancelled(tempId)) return prev;
           const next = { ...prev };
           delete next[tempId];
           return next;
@@ -8222,11 +8802,50 @@ export default function useChatLogic({ navigation, route }) {
 
     mediaUploadQueueInFlightRef.current = true;
     try {
-      let working = [...queue];
+      // Track results by tempId and reconcile against the LIVE ref at the end.
+      // The old "snapshot in, snapshot out" write-back resurrected rows that
+      // the real upload removed while this flush was running — the zombie row
+      // then re-ran on the next flush (hash-dedup made it fast) and the album
+      // progress ring flashed back after the upload had already finished.
+      const doneIds = new Set();
+      const retryPatch = new Map();
       for (const item of queue) {
+        // Row already gone from the live queue (its upload finished while this
+        // flush was mid-pass) — never re-run it from the stale snapshot.
+        if (!(queuedMediaUploadsRef.current || []).some((q) => q?.tempId === item?.tempId)) {
+          continue;
+        }
+        // Skip rows whose upload is running RIGHT NOW — rows are persisted
+        // before the upload starts, so an active send would be double-run.
+        if (item?.tempId && activeMediaUploadTempIdsRef.current.has(item.tempId)) {
+          continue;
+        }
+        // Message already made it out (uploaded/acked) — the queue row is a
+        // leftover; drop it instead of re-uploading a sent album.
+        const existing = (allMessagesRef.current || []).find((m) => m?.tempId === item?.tempId);
+        if (existing && ['uploaded', 'sent', 'delivered', 'read'].includes(String(existing.status))) {
+          doneIds.add(item.tempId);
+          continue;
+        }
+        // User-paused AND user-cancelled rows stay parked (never auto-resumed
+        // by reconnect/boot flushes) — only an explicit retry/resume tap
+        // clears the flag; only message-delete discards the row.
+        if (
+          item?.paused === true ||
+          item?.cancelled === true ||
+          (item?.tempId && (isUploadPaused(item.tempId) || isUploadCancelled(item.tempId)))
+        ) {
+          continue;
+        }
+        // The queue is per-USER; sendMedia/sendMediaGroup send into
+        // chatIdRef.current. A row queued in another chat must wait for THAT
+        // chat's screen to flush it, or it would land in the wrong chat.
+        if (item?.chatId && !sameChatId(item.chatId, chatIdRef.current)) {
+          continue;
+        }
         const retries = Number(item?.retries || 0);
         if (retries >= MEDIA_UPLOAD_MAX_RETRIES) {
-          working = working.filter((q) => q?.tempId !== item?.tempId);
+          doneIds.add(item?.tempId);
           continue;
         }
 
@@ -8247,18 +8866,22 @@ export default function useChatLogic({ navigation, route }) {
             });
 
         if (result?.success) {
-          working = working.filter((q) => q?.tempId !== item?.tempId);
+          doneIds.add(item?.tempId);
+        } else if (result?.paused || result?.cancelled) {
+          // Parked mid-flush (paused OR reversibly cancelled) — keep the row
+          // as-is (park flag already persisted); parking never burns a retry.
         } else {
-          working = working.map((q) => (
-            q?.tempId === item?.tempId
-              ? { ...q, retries: retries + 1 }
-              : q
-          ));
+          retryPatch.set(item?.tempId, retries + 1);
         }
       }
 
-      queuedMediaUploadsRef.current = working;
-      await persistMediaUploadQueue(working);
+      // Reconcile against the LIVE queue (not this flush's snapshot) so rows
+      // added/removed by concurrent sends survive correctly.
+      const next = (queuedMediaUploadsRef.current || [])
+        .filter((q) => !doneIds.has(q?.tempId))
+        .map((q) => (retryPatch.has(q?.tempId) ? { ...q, retries: retryPatch.get(q.tempId) } : q));
+      queuedMediaUploadsRef.current = next;
+      await persistMediaUploadQueue(next);
     } catch (error) {
       console.error('flushQueuedMediaUploads error', error);
     } finally {
@@ -8268,13 +8891,210 @@ export default function useChatLogic({ navigation, route }) {
 
   flushQueuedMediaUploadsRef.current = flushQueuedMediaUploads;
 
+  // Manual retry for a FAILED media/album message (tap-to-retry). Re-runs the
+  // persisted upload-queue row when one exists (same tempId → same
+  // clientMessageId → server-side idempotency, plus chunk-session resume for
+  // large files); otherwise rebuilds the task from the message's local payload.
+  const retryFailedMediaMessage = useCallback(async (msg) => {
+    if (!msg) return { success: false, error: 'no message' };
+    const tempId = msg.tempId || msg.id;
+    if (!tempId) return { success: false, error: 'no tempId' };
+    if (activeMediaUploadTempIdsRef.current.has(tempId)) {
+      return { success: false, error: 'already uploading' };
+    }
+
+    // UN-PARK a paused/cancelled row before re-running: clear the in-memory
+    // registry flags AND the persisted row flags so the sendMedia guards and
+    // the flush loop stop skipping it. The row's chunkSession survives cancel,
+    // so the chunked path GETs the session status and resumes from the
+    // server's receivedBytes (direct uploads restart from 0).
+    registryResumeUpload(tempId);
+    setPausedUploads((prev) => {
+      if (!prev[tempId]) return prev;
+      const next = { ...prev };
+      delete next[tempId];
+      return next;
+    });
+    {
+      const rows = [...(queuedMediaUploadsRef.current || [])];
+      const rowIdx = rows.findIndex((q) => q?.tempId === tempId);
+      if (rowIdx >= 0 && (rows[rowIdx]?.paused === true || rows[rowIdx]?.cancelled === true)) {
+        rows[rowIdx] = { ...rows[rowIdx], paused: false, cancelled: false };
+        queuedMediaUploadsRef.current = rows;
+        await persistMediaUploadQueue(rows);
+      }
+    }
+
+    setAllMessages((prev) => prev.map((m) => (
+      (m.tempId === tempId || m.id === tempId) ? { ...m, status: 'sending' } : m
+    )));
+
+    const row = (queuedMediaUploadsRef.current || []).find((q) => q?.tempId === tempId);
+    const albumFiles = row?.albumObj?.files || msg?.payload?.albumFiles || null;
+    const singleFile = row?.mediaObj?.file || msg?.payload?.file || null;
+
+    const common = {
+      tempId,
+      skipLocalInsert: true,
+      fromQueue: Boolean(row),
+      createdAt: row?.createdAt || msg?.createdAt,
+    };
+
+    let result;
+    if (row?.albumObj || (Array.isArray(albumFiles) && albumFiles.length > 0)) {
+      result = await sendMediaGroup(
+        row?.albumObj || {
+          files: albumFiles,
+          caption: msg?.text || '',
+          mediaGroupId: msg?.mediaGroupId || msg?.payload?.mediaGroupId,
+        },
+        common
+      );
+    } else if (singleFile?.uri) {
+      result = await sendMedia(
+        row?.mediaObj || { file: singleFile, type: msg?.mediaType || msg?.type },
+        { ...common, chunkSession: row?.chunkSession || null }
+      );
+    } else {
+      result = { success: false, error: 'no local file to retry' };
+    }
+
+    if (!result?.success && !result?.paused && !result?.cancelled) {
+      setAllMessages((prev) => prev.map((m) => (
+        (m.tempId === tempId || m.id === tempId) ? { ...m, status: 'failed' } : m
+      )));
+    }
+    return result;
+  }, [sendMedia, sendMediaGroup, persistMediaUploadQueue]);
+
+  /* ========== WhatsApp-style upload PAUSE / RESUME / CANCEL ==========
+     Keyed by the optimistic bubble's tempId (== queue-row tempId == socket
+     clientMessageId). Pausing aborts in-flight bytes (XHR abort / chunk-loop
+     stop), keeps the bubble at status 'sending', and stamps a durable
+     `paused: true` on the persisted media_upload_queue row so an app kill +
+     relaunch comes back still paused (flush + boot hydration skip paused
+     rows). Resuming re-runs the SAME queue row: chunked uploads continue from
+     the server session's receivedBytes, direct uploads restart from 0. */
+  const resolveUploadPauseKey = (msg) => String(msg?.tempId || msg?.id || '');
+
+  const setQueueRowPaused = useCallback(async (tempId, paused) => {
+    const queue = [...(queuedMediaUploadsRef.current || [])];
+    const idx = queue.findIndex((item) => item?.tempId === tempId);
+    if (idx < 0) return false;
+    if (Boolean(queue[idx]?.paused) === Boolean(paused)) return true;
+    queue[idx] = { ...queue[idx], paused: Boolean(paused) };
+    queuedMediaUploadsRef.current = queue;
+    await persistMediaUploadQueue(queue);
+    return true;
+  }, [persistMediaUploadQueue]);
+
+  const pauseMediaUpload = useCallback(async (msg) => {
+    const tempId = resolveUploadPauseKey(msg);
+    if (!tempId) return { success: false };
+    registryPauseUpload(tempId); // flags + aborts in-flight bytes
+    setPausedUploads((prev) => (prev[tempId] ? prev : { ...prev, [tempId]: true }));
+    await setQueueRowPaused(tempId, true);
+    return { success: true };
+  }, [setQueueRowPaused]);
+
+  const resumeMediaUpload = useCallback(async (msg) => {
+    const tempId = resolveUploadPauseKey(msg);
+    if (!tempId) return { success: false };
+    registryResumeUpload(tempId);
+    setPausedUploads((prev) => {
+      if (!prev[tempId]) return prev;
+      const next = { ...prev };
+      delete next[tempId];
+      return next;
+    });
+    await setQueueRowPaused(tempId, false);
+    // Re-run through the existing retry flow — same tempId → same
+    // clientMessageId (server idempotency) + chunk-session resume.
+    return retryFailedMediaMessage(msg);
+  }, [setQueueRowPaused, retryFailedMediaMessage]);
+
+  const cancelMediaUpload = useCallback(async (msg) => {
+    const tempId = resolveUploadPauseKey(msg);
+    if (!tempId) return { success: false };
+    registryCancelUpload(tempId); // cancelled flag wins races + aborts bytes
+
+    // REVERSIBLE cancel (mirrors the web client's mediaOutboxWorker
+    // cancelMedia): KEEP the queue row — tempId, mediaObj/albumObj and the
+    // server chunkSession + offset stay intact — and do NOT abort the server
+    // session. The row is just PARKED with cancelled: true, which the flush
+    // loop and boot auto-resume skip exactly like paused rows. A later retry
+    // clears the flag and resumes the chunked session from the server's
+    // receivedBytes instead of restarting at byte 0. The only path that truly
+    // discards the row (and its server session) is deleting the message.
+    const queue = [...(queuedMediaUploadsRef.current || [])];
+    const idx = queue.findIndex((item) => item?.tempId === tempId);
+    if (idx >= 0) {
+      queue[idx] = { ...queue[idx], cancelled: true, paused: false };
+      queuedMediaUploadsRef.current = queue;
+      await persistMediaUploadQueue(queue);
+    }
+
+    setPausedUploads((prev) => {
+      if (!prev[tempId]) return prev;
+      const next = { ...prev };
+      delete next[tempId];
+      return next;
+    });
+    // NOTE: uploadProgress[tempId] is intentionally KEPT — the ring continues
+    // from the same percent when the upload is retried.
+
+    // Mark the local message cancelled — SQLite + UI (the ring is replaced by
+    // the ↻ retry affordance; the bubble keeps its local preview).
+    setAllMessages((prev) => {
+      const updated = prev.map((m) => (
+        (m.tempId === tempId || m.id === tempId) ? { ...m, status: 'cancelled' } : m
+      ));
+      saveMessagesToLocal(updated);
+      return updated;
+    });
+    return { success: true };
+  }, [persistMediaUploadQueue, saveMessagesToLocal]);
+
   const resendMessage = useCallback(async (msg) => {
     if (!msg) return;
-    if (msg.mediaUrl) {
-      const normalizedCategory = normalizeOutboundMessageType(
-        msg?.mediaType || msg?.type || msg?.fileCategory || 'file'
-      );
 
+    const normalizedCategory = normalizeOutboundMessageType(
+      msg?.mediaType || msg?.type || msg?.fileCategory || (msg.mediaUrl ? 'file' : 'text')
+    );
+    const isUploadedMediaCategory = ['image', 'video', 'audio', 'file', 'album'].includes(normalizedCategory);
+    const existingMeta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
+
+    // BUG FIX: a failed upload's optimistic row carries LOCAL preview URIs in
+    // mediaUrl and its tempId in id — the old `if (msg.mediaUrl)` gate happily
+    // re-emitted message:send with mediaId = "temp_media_…" and fileSize null
+    // (backend VALIDATION_ERROR). Only re-emit when the media actually
+    // finished uploading: a real (non temp_) mediaId AND a remote http(s)
+    // media URL. Anything else re-runs the UPLOAD via retryFailedMediaMessage.
+    const isTempIdValue = (value) => /^temp_/i.test(String(value || ''));
+    const candidateMediaId = String(
+      msg?.mediaId || existingMeta?.mediaId || msg?.serverMessageId || ''
+    );
+    const remoteMediaUrl = [msg?.serverMediaUrl, msg?.mediaUrl, msg?.previewUrl, msg?.payload?.mediaUrl]
+      .map((u) => String(u || ''))
+      .find((u) => /^https?:\/\//i.test(u)) || '';
+    const remoteThumbUrl = [
+      msg?.serverPreviewUrl,
+      msg?.mediaThumbnailUrl,
+      msg?.thumbnailUrl,
+      msg?.payload?.mediaThumbnailUrl,
+      msg?.payload?.thumbnailUrl,
+      msg?.previewUrl,
+    ]
+      .map((u) => String(u || ''))
+      .find((u) => /^https?:\/\//i.test(u)) || '';
+    const hasUploadedMedia = Boolean(candidateMediaId)
+      && !isTempIdValue(candidateMediaId)
+      && Boolean(remoteMediaUrl);
+
+    // Albums never take the re-emit shortcut — a correct album emit needs
+    // mediaItems[], which retryFailedMediaMessage → sendMediaGroup rebuilds
+    // (already-uploaded files dedupe server-side via sourceHash).
+    if (msg.mediaUrl && normalizedCategory !== 'album' && (!isUploadedMediaCategory || hasUploadedMedia)) {
       const deviceId = await getOrCreateDeviceId();
 
       const resolvedThumb =
@@ -8287,8 +9107,9 @@ export default function useChatLogic({ navigation, route }) {
         msg?.payload?.file?.previewUrl ||
         msg?.previewUrl ||
         msg?.mediaUrl;
-      const resolvedMediaUrl = msg?.mediaUrl || msg?.previewUrl || msg?.payload?.mediaUrl || '';
-      const existingMeta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
+      const resolvedMediaUrl = isUploadedMediaCategory
+        ? remoteMediaUrl
+        : (msg?.mediaUrl || msg?.previewUrl || msg?.payload?.mediaUrl || '');
       const messagePayload = {
         chatId: chatIdRef.current,
         chatType: chatData?.chatType || 'private',
@@ -8297,12 +9118,21 @@ export default function useChatLogic({ navigation, route }) {
         senderDeviceId: deviceId,
         receiverId: chatData.peerUser?._id || null,
         messageType: normalizedCategory,
-        mediaId: String(msg?.mediaId || existingMeta?.mediaId || msg?.serverMessageId || msg?.id || ''),
+        // Never fall back to msg.id here — for optimistic rows that IS the
+        // tempId, the exact leak this fix removes.
+        mediaId: isUploadedMediaCategory
+          ? candidateMediaId
+          : String(msg?.mediaId || existingMeta?.mediaId || msg?.serverMessageId || msg?.id || ''),
         mediaUrl: resolvedMediaUrl,
-        mediaThumbnailUrl: resolvedThumb || resolvedMediaUrl,
+        mediaThumbnailUrl: (isUploadedMediaCategory ? (remoteThumbUrl || remoteMediaUrl) : resolvedThumb) || resolvedMediaUrl,
         mediaMeta: {
           fileName: existingMeta?.fileName || msg?.text || extractFileName(resolvedMediaUrl),
-          fileSize: existingMeta?.fileSize || existingMeta?.sizeAfter || null,
+          // fileSize must never go out null — fall back to the picked file.
+          fileSize: existingMeta?.fileSize
+            || existingMeta?.sizeAfter
+            || msg?.payload?.file?.size
+            || msg?.payload?.file?.fileSize
+            || null,
           mimeType: existingMeta?.mimeType || msg?.payload?.file?.type || `application/${normalizedCategory}`,
           width: existingMeta?.width || null,
           height: existingMeta?.height || null,
@@ -8334,8 +9164,16 @@ export default function useChatLogic({ navigation, route }) {
       } catch (err) {
         console.warn('resendMessage failed', err);
       }
-    } else if (msg.payload && msg.payload.file) {
-      await sendMedia({ file: msg.payload.file, type: msg.type });
+    } else if (msg.payload && (msg.payload.file || msg.payload.albumFiles)) {
+      // Failed BEFORE upload finished (no real uploaded mediaId yet) — re-run
+      // the whole upload+send from the persisted queue row / local file, same
+      // tempId.
+      await retryFailedMediaMessage(msg);
+    } else if (isUploadedMediaCategory) {
+      // Media message with neither an uploaded mediaId NOR a local file to
+      // re-upload — nothing valid to emit. Keep it failed locally rather than
+      // sending an invalid payload (temp mediaId / null fileSize).
+      updateMessageStatus(msg.tempId || msg.id, 'failed');
     } else {
       await sendMessageViaSocket({
         chatId: chatIdRef.current,
@@ -8350,7 +9188,7 @@ export default function useChatLogic({ navigation, route }) {
     }
   }, [
     sendMessageViaSocket,
-    sendMedia,
+    retryFailedMediaMessage,
     chatData.peerUser,
     getOrCreateDeviceId,
     normalizeOutboundMessageType,
@@ -8692,26 +9530,27 @@ export default function useChatLogic({ navigation, route }) {
   const handlePickMedia = useCallback(async (type) => {
     try {
       closeMediaOptions();
-      // Gallery / video / document pickers allow WhatsApp-style multi-select.
-      // One file keeps the legacy single-media flow; several files stage an
-      // album (sent as ONE message with a media grid bubble).
+      // NO staging preview (user rule): picked media uploads IMMEDIATELY.
+      // One file → single media message; several files → ONE album message
+      // (grid bubble with the center progress ring). Fire-and-forget — the
+      // optimistic bubble appears instantly and the durable queue owns retries.
       if (typeof pickMediaMultiple === 'function' && (type === 'image' || type === 'video' || type === 'document')) {
         const files = await pickMediaMultiple(type);
         if (!files || !files.length) return;
         if (files.length === 1) {
-          setPendingMedia({ file: files[0], type });
+          sendMedia({ file: files[0], type }).catch((err) => console.warn('[sendMedia] pick-send error:', err?.message));
         } else {
-          setPendingMedia({ files, type, isAlbum: true });
+          sendMediaGroup({ files, caption: '' }).catch((err) => console.warn('[sendMediaGroup] pick-send error:', err?.message));
         }
         return;
       }
       const file = await pickMedia(type);
       if (!file) return;
-      setPendingMedia({ file, type });
+      sendMedia({ file, type }).catch((err) => console.warn('[sendMedia] pick-send error:', err?.message));
     } catch (err) {
       console.error("handlePickMedia error", err);
     }
-  }, [pickMedia, pickMediaMultiple]);
+  }, [pickMedia, pickMediaMultiple, sendMedia, sendMediaGroup]);
 
   // SQLite is the single source of truth — no in-memory dedup needed.
   // The periodic dedup cleanup runs via ChatDatabase.deduplicateChat() on chat open.
@@ -9033,6 +9872,7 @@ export default function useChatLogic({ navigation, route }) {
     sendLocationMessage, sendContactMessage,
     pendingMedia, setPendingMedia, sendMedia, sendMediaGroup, handlePickMedia, showMediaOptions, openMediaOptions, closeMediaOptions,
     mediaViewer, closeMediaViewer, handleDownloadMedia, downloadedMedia, downloadProgress, uploadProgress, mediaDownloadStates,
+    pausedUploads, pauseMediaUpload, resumeMediaUpload, cancelMediaUpload,
     markMediaRemovedLocally,
     retryMediaStatusUpdate, retryAllFailedMediaStatusUpdates,
     onRefresh, loadMoreMessages, isLoadingMore, isBackfilling, hasMoreMessages,
@@ -9042,7 +9882,7 @@ export default function useChatLogic({ navigation, route }) {
     clearChatForMe,
     clearChatForEveryone,
     markVisibleIncomingAsRead,
-    setMessages, saveMessagesToLocal, resendMessage,
+    setMessages, saveMessagesToLocal, resendMessage, retryFailedMediaMessage,
     editingMessage, startEditMessage, cancelEditMessage, submitEditMessage,
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,

@@ -1,10 +1,11 @@
 import * as FileSystem from 'expo-file-system/legacy';
-import mediaService from './MediaService';
+import mediaService, { isDownloadPausedError, isDownloadCancelledError } from './MediaService';
 import localStorageService from './LocalStorageService';
 
 export const MEDIA_DOWNLOAD_STATUS = {
   NOT_DOWNLOADED: 'NOT_DOWNLOADED',
   DOWNLOADING: 'DOWNLOADING',
+  PAUSED: 'PAUSED',
   DOWNLOADED: 'DOWNLOADED',
   FAILED: 'FAILED',
 };
@@ -146,6 +147,20 @@ class MediaDownloadManager {
     return this.stateById.get(String(mediaId)) || null;
   }
 
+  // Live snapshot of every tracked item. Downloads are OWNED by this
+  // module-level manager and keep running across navigation — only the
+  // screen-scoped React state resets on unmount. A remounting screen overlays
+  // this snapshot over the persisted map so bubbles RE-ATTACH to in-flight
+  // downloads (ring + real progress) instead of falling back to
+  // NOT_DOWNLOADED until the next progress event.
+  getAllStates() {
+    const map = {};
+    this.stateById.forEach((state, mediaId) => {
+      map[String(mediaId)] = { ...state };
+    });
+    return map;
+  }
+
   async rehydrate() {
     if (this.initialized) return;
     if (this.initPromise) return this.initPromise;
@@ -153,9 +168,12 @@ class MediaDownloadManager {
     this.initPromise = (async () => {
       await localStorageService.init();
 
-      const [allMedia, pending] = await Promise.all([
+      const [allMedia, pending, paused] = await Promise.all([
         localStorageService.getMediaFilesByChat(),
         localStorageService.getPendingDownloads(),
+        typeof localStorageService.getPausedDownloads === 'function'
+          ? localStorageService.getPausedDownloads()
+          : Promise.resolve([]),
       ]);
 
       allMedia.forEach((record = {}) => {
@@ -191,6 +209,13 @@ class MediaDownloadManager {
             status: MEDIA_DOWNLOAD_STATUS.DOWNLOADING,
             progress: Number(item?.progress || 0),
           });
+        } else if (queueStatus === 'paused') {
+          // Paused before the app was killed — keep it paused (the persisted
+          // pause snapshot in MediaService resumes it when the user taps play).
+          this.setState(mediaId, {
+            status: MEDIA_DOWNLOAD_STATUS.PAUSED,
+            progress: Number(item?.progress || 0),
+          });
         } else if (queueStatus === 'failed') {
           this.setState(mediaId, {
             status: MEDIA_DOWNLOAD_STATUS.FAILED,
@@ -203,6 +228,15 @@ class MediaDownloadManager {
             progress: 0,
           });
         }
+      });
+
+      (paused || []).forEach((item = {}) => {
+        const mediaId = normalizeId(item?.mediaId);
+        if (!mediaId) return;
+        this.setState(mediaId, {
+          status: MEDIA_DOWNLOAD_STATUS.PAUSED,
+          progress: Number(item?.progress || 0),
+        });
       });
 
       this.initialized = true;
@@ -276,6 +310,8 @@ class MediaDownloadManager {
             messageId: identity.messageId || message?.messageId || message?.serverMessageId || message?.id || null,
             groupId: identity.groupId || message?.groupId || null,
             mediaUrl: identity.mediaUrl || message?.mediaUrl || message?.previewUrl || message?.url || null,
+            expectedSize: Number(identity.mediaMeta?.fileSize || 0) || null,
+            expectedHash: identity.mediaMeta?.contentHash || null,
             onProgress: (progressPct) => {
               const normalized = Math.max(0, Math.min(100, Number(progressPct || 0)));
               this.setState(key, {
@@ -318,6 +354,26 @@ class MediaDownloadManager {
 
           return localPath;
         } catch (error) {
+          // Intentional stop — NOT a failure. Keep progress for the paused
+          // ring, don't retry, don't mark the media row FAILED.
+          if (isDownloadPausedError(error)) {
+            this.setState(key, {
+              status: MEDIA_DOWNLOAD_STATUS.PAUSED,
+              progress: Number(this.getState(key)?.progress || 0),
+              error: null,
+            });
+            throw error;
+          }
+          if (isDownloadCancelledError(error)) {
+            this.setState(key, {
+              status: MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+              progress: 0,
+              localPath: null,
+              error: null,
+            });
+            throw error;
+          }
+
           finalError = error;
 
           if (attempt < RETRY_LIMIT) {
@@ -356,6 +412,49 @@ class MediaDownloadManager {
 
     this.inFlight.set(key, run);
     return run;
+  }
+
+  /**
+   * Pause an in-flight download. MediaService.pauseDownload persists the
+   * resumable state (resumeData + fileUri) so resume() continues from the
+   * partial bytes — even after an app restart.
+   */
+  async pause(mediaId) {
+    if (!mediaId) return false;
+    const key = String(mediaId);
+    const paused = await mediaService.pauseDownload(key);
+    if (paused) {
+      this.setState(key, {
+        status: MEDIA_DOWNLOAD_STATUS.PAUSED,
+        progress: Number(this.getState(key)?.progress || 0),
+        error: null,
+      });
+    }
+    return paused;
+  }
+
+  /**
+   * Resume a paused download — just re-enter download(); downloadToLocal picks
+   * up the persisted pause snapshot and calls resumeAsync() on it.
+   */
+  async resume(message = {}, options = {}) {
+    return this.download(message, options);
+  }
+
+  /**
+   * Cancel a paused/in-flight download: deletes the partial file + snapshot
+   * and resets the item to the not-downloaded state (tap-to-download again).
+   */
+  async cancel(mediaId) {
+    if (!mediaId) return;
+    const key = String(mediaId);
+    await mediaService.cancelDownload(key);
+    this.setState(key, {
+      status: MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
+      progress: 0,
+      localPath: null,
+      error: null,
+    });
   }
 
   async getCachedMediaMap() {
