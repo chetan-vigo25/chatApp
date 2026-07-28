@@ -18,7 +18,7 @@ import {
   View, Text, Image, TouchableOpacity, StyleSheet,
   Dimensions, StatusBar, Alert, FlatList, TextInput,
   Platform, ActionSheetIOS,
-  Modal, ActivityIndicator, Animated, Linking, AppState, Keyboard,
+  Modal, ActivityIndicator, Animated, Easing, Linking, AppState, Keyboard,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -46,7 +46,6 @@ const { width: SW, height: SH } = Dimensions.get('window');
 // → kbHeight clamped to 0 → the composer never lifted ("input box bottom pe").
 const SCREEN_H = Dimensions.get('screen').height;
 const STORY_DURATION = 5000;
-const VIDEO_MAX_MS   = 30000;
 const PROGRESS_H     = 3;
 const HEART_COUNT    = 6;
 
@@ -108,7 +107,8 @@ export default function StatusViewer({ navigation, route }) {
   const [statuses, setStatuses]           = useState(initialStatuses);
   const [currentIndex, setCurrentIndex]   = useState(Math.min(startIndex, Math.max(0, initialStatuses.length - 1)));
   const [paused, setPaused]               = useState(false);
-  const [videoDuration, setVideoDuration] = useState(STORY_DURATION);
+  // Video playback errors fall back to a timed slide instead of hanging/skipping.
+  const [videoFailed, setVideoFailed]     = useState(false);
   const [showViewers, setShowViewers]     = useState(false);
   const [reportVisible, setReportVisible] = useState(false);
   const [activeTab, setActiveTab]         = useState('views'); // 'views' | 'likes'
@@ -210,6 +210,11 @@ export default function StatusViewer({ navigation, route }) {
   const currentThumbUrl =
     currentMediaItem?.thumbnailUrl || currentStatus?.thumbnailUrl
     || currentMediaItem?.mediaUrl || currentStatus?.mediaUrl || null;
+  // Video needs a REAL video url — a webp thumbnail fed into <Video> errors
+  // instantly, which is exactly the "video status gets skipped" bug.
+  const currentVideoUrl =
+    currentMediaItem?.mediaUrl || currentStatus?.mediaUrl || null;
+  const videoUnplayable = currentMediaType === 'video' && (!currentVideoUrl || videoFailed);
 
   // ── Progress bar ─────────────────────────────────────────────────────────
   const startProgress = useCallback((duration) => {
@@ -225,19 +230,33 @@ export default function StatusViewer({ navigation, route }) {
     });
   }, []);
 
+  // Video progress glide bookkeeping — the bar animates smoothly toward the
+  // end over the video's REMAINING time and re-syncs against the real
+  // playback position on every status update (buffering/seeks stay honest).
+  const videoSyncRef = useRef({ active: false, startedAt: 0, fromPos: 0, durMs: 0 });
+
   // Every slide starts "not loaded" so the bar waits for its own media.
-  useEffect(() => { setMediaLoaded(false); }, [currentIndex]);
+  useEffect(() => {
+    setMediaLoaded(false);
+    setVideoFailed(false);
+    animRef.current?.stop();
+    progressAnim.setValue(0);
+    videoSyncRef.current = { active: false, startedAt: 0, fromPos: 0, durMs: 0 };
+  }, [currentIndex]);
 
   useEffect(() => {
     if (pausedRef.current) {
       animRef.current?.stop();
       return;
     }
-    // Schema has no top-level `type` field on a Status — derive from the
-    // first media item's mediaType so videos actually run for their full
-    // duration instead of getting auto-skipped after STORY_DURATION.
     const isVideo = currentMediaType === 'video';
     const needsMedia = currentMediaType === 'image' || isVideo;
+    // A broken/missing video url falls back to a normal 5s timed slide (with
+    // the thumbnail showing) — never an instant skip, never a forever-hang.
+    if (isVideo && videoUnplayable) {
+      startProgress(STORY_DURATION);
+      return () => animRef.current?.stop();
+    }
     // WhatsApp behaviour: for image/video slides, DON'T advance the progress bar
     // until the media has actually loaded (onLoad / playback isLoaded). Hold it at
     // 0 so a slow-loading photo/video is never skipped over a blank screen.
@@ -247,9 +266,17 @@ export default function StatusViewer({ navigation, route }) {
       progressAnim.setValue(0);
       return;
     }
-    startProgress(isVideo ? videoDuration : STORY_DURATION);
+    if (isVideo) {
+      // Videos play to COMPLETION: the bar is driven by real playback
+      // (onPlaybackStatusUpdate glide) and the slide advances ONLY on
+      // didJustFinish. IMPORTANT: no animRef.stop() here and no cleanup —
+      // this effect re-runs on mediaLoaded/paused flips and used to kill the
+      // playback-driven animation the moment it started (bar looked frozen).
+      return undefined;
+    }
+    startProgress(STORY_DURATION);
     return () => animRef.current?.stop();
-  }, [currentIndex, paused, videoDuration, mediaLoaded]);
+  }, [currentIndex, paused, mediaLoaded, videoUnplayable, currentMediaType]);
 
   // Safe back — always works even if StatusViewer is the root screen
   const safeGoBack = useCallback(() => {
@@ -265,26 +292,40 @@ export default function StatusViewer({ navigation, route }) {
   // React may invoke the updater during render, which triggers
   // "Cannot update a component while rendering a different component"
   // and can also abort in-flight network requests (iOS surfaces this as ERR_NETWORK).
+  // Reset the bar SYNCHRONOUSLY with the index change. The index-reset
+  // useEffect runs AFTER the next paint, so navigating (especially BACK) left
+  // one frame where the new current segment rendered with the OLD progress
+  // value — the bar flashed full/partial and then jumped to 0 (broken-looking
+  // UI when tapping back through statuses).
+  const resetBarForSlideChange = useCallback(() => {
+    animRef.current?.stop();
+    progressAnim.setValue(0);
+    videoSyncRef.current = { active: false, startedAt: 0, fromPos: 0, durMs: 0 };
+  }, []);
+
   const goNext = useCallback(() => {
     setCurrentIndex(i => {
       if (i < statuses.length - 1) {
         Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        setVideoDuration(STORY_DURATION);
+        resetBarForSlideChange();
         return i + 1;
       }
       setTimeout(() => safeGoBack(), 0);
       return i;
     });
-  }, [statuses.length, safeGoBack]);
+  }, [statuses.length, safeGoBack, resetBarForSlideChange]);
 
   const goPrev = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setCurrentIndex(i => {
-      if (i > 0) { setVideoDuration(STORY_DURATION); return i - 1; }
+      if (i > 0) {
+        resetBarForSlideChange();
+        return i - 1;
+      }
       setTimeout(() => safeGoBack(), 0);
       return i;
     });
-  }, [safeGoBack]);
+  }, [safeGoBack, resetBarForSlideChange]);
 
   const pause  = useCallback(() => { pausedRef.current = true;  setPaused(true);  animRef.current?.stop(); }, []);
   const resume = useCallback(() => { pausedRef.current = false; setPaused(false); }, []);
@@ -562,15 +603,61 @@ export default function StatusViewer({ navigation, route }) {
   }, [replyText, currentStatus, dispatch, resume, user, userId, userName]);
 
   const onPlaybackStatusUpdate = useCallback((status) => {
-    if (status.isLoaded) {
-      // Video is ready → release the progress bar (WhatsApp behaviour).
-      setMediaLoaded(true);
-      if (status.durationMillis && videoDuration === STORY_DURATION) {
-        setVideoDuration(Math.min(status.durationMillis, VIDEO_MAX_MS));
+    if (!status.isLoaded) {
+      // Load error → flip to the timed-slide fallback (thumbnail + 5s),
+      // never a silent instant skip and never a stuck bar.
+      if (status.error) {
+        setVideoFailed(true);
+        setMediaLoaded(true);
+      }
+      return;
+    }
+    // Video is ready → release the hold (WhatsApp behaviour).
+    setMediaLoaded(true);
+
+    const durMs = Number(status.durationMillis || 0);
+    if (durMs > 0) {
+      const posMs = Number(status.positionMillis || 0);
+      const pos   = Math.max(0, Math.min(1, posMs / durMs));
+      const sync  = videoSyncRef.current;
+
+      if (status.isPlaying && !pausedRef.current && !status.didJustFinish) {
+        // Smooth glide: animate to 1 over the REMAINING video time, so the
+        // bar moves continuously in perfect proportion to the video's length.
+        // Re-anchor only when reality drifts (buffer stall, seek) — restarting
+        // the animation on every 250ms tick would stutter.
+        const expected = sync.active
+          ? sync.fromPos + (Date.now() - sync.startedAt) / sync.durMs
+          : -1;
+        if (!sync.active || Math.abs(expected - pos) > 0.06) {
+          animRef.current?.stop();
+          progressAnim.setValue(pos);
+          animRef.current = Animated.timing(progressAnim, {
+            toValue: 1,
+            duration: Math.max(50, durMs - posMs),
+            easing: Easing.linear,
+            useNativeDriver: false,
+          });
+          animRef.current.start();
+          videoSyncRef.current = { active: true, startedAt: Date.now(), fromPos: pos, durMs };
+        }
+      } else if (!status.didJustFinish) {
+        // Paused / buffering — freeze the bar at the honest position.
+        if (sync.active) {
+          animRef.current?.stop();
+          videoSyncRef.current.active = false;
+        }
+        progressAnim.setValue(pos);
       }
     }
-    if (status.didJustFinish) goNext();
-  }, [videoDuration, goNext]);
+
+    if (status.didJustFinish) {
+      animRef.current?.stop();
+      videoSyncRef.current.active = false;
+      progressAnim.setValue(1);
+      goNext();
+    }
+  }, [goNext]);
 
   // Guard: if statuses list becomes empty (e.g. all expired), go back.
   // Must be in useEffect — calling navigation during render causes the
@@ -655,20 +742,62 @@ export default function StatusViewer({ navigation, route }) {
           </View>
         );
       }
-      case 'video':
+      case 'video': {
+        const videoUrl = toSecureMediaUri(currentVideoUrl);
+        const thumbUrl = toSecureMediaUri(currentThumbUrl);
+        // Broken/missing video url → timed slide showing the poster (the
+        // progress effect runs the 5s fallback). Never feed a thumbnail into
+        // <Video> — it errors instantly and the slide got skipped.
+        if (!videoUrl || videoFailed) {
+          return (
+            <View style={styles.mediaContent}>
+              {thumbUrl ? (
+                <Image source={{ uri: thumbUrl }} style={StyleSheet.absoluteFill} resizeMode="contain" />
+              ) : null}
+              <View
+                style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}
+                pointerEvents="none"
+              >
+                <Ionicons name="videocam-off" size={42} color="rgba(255,255,255,0.8)" />
+              </View>
+            </View>
+          );
+        }
         return (
-          <Video
-            ref={videoRef}
-            source={{ uri: mediaUrl }}
-            style={styles.mediaContent}
-            resizeMode={ResizeMode.CONTAIN}
-            shouldPlay={!paused}
-            isLooping={false}
-            isMuted={isMuted}
-            onPlaybackStatusUpdate={onPlaybackStatusUpdate}
-            useNativeControls={false}
-          />
+          <View style={styles.mediaContent}>
+            {/* Poster blur-up while the video buffers — same as images. */}
+            {!mediaLoaded && thumbUrl ? (
+              <Image
+                source={{ uri: thumbUrl }}
+                style={StyleSheet.absoluteFill}
+                resizeMode="contain"
+                blurRadius={18}
+              />
+            ) : null}
+            <Video
+              ref={videoRef}
+              source={{ uri: videoUrl }}
+              style={styles.mediaContent}
+              resizeMode={ResizeMode.CONTAIN}
+              shouldPlay={!paused}
+              isLooping={false}
+              isMuted={isMuted}
+              progressUpdateIntervalMillis={250}
+              onPlaybackStatusUpdate={onPlaybackStatusUpdate}
+              onError={() => { setVideoFailed(true); setMediaLoaded(true); }}
+              useNativeControls={false}
+            />
+            {!mediaLoaded ? (
+              <View
+                style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}
+                pointerEvents="none"
+              >
+                <ActivityIndicator color="#fff" size="large" />
+              </View>
+            ) : null}
+          </View>
         );
+      }
       case 'audio':
         return (
           <View style={[styles.textContent, { backgroundColor: '#2d3436' }]}>

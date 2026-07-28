@@ -28,6 +28,18 @@ import { getWebrtc } from './webrtcGlobals';
 const RETRY_MS = 2500;
 const RETRY_WINDOW_MS = 40000;
 const REASSERT_MS = 5000; // min gap between ring reasserts after a successful dial
+// A _pendingIn entry older than this is garbage: no server ring outlives the
+// ring window (~40s). Entries normally die on callCancelled/accept/decline —
+// but a cancel that lands while OUR socket is down is lost forever, and the
+// stale entry then swallows EVERY future 1:1 ring from that peer via the
+// duplicate-ring dedupe ("call ek baar me nahi lagti"). Prune by age instead.
+const PENDING_IN_STALE_MS = 60000;
+// How long a 1:1 decline/hangup keeps auto-declining rings from that peer.
+// Only needs to cover IN-FLIGHT reassert ghosts (the caller stops re-ringing
+// the moment our decline/end reaches them; reassert cadence is 5s) — 15s was
+// so long it silently declined a GENUINE quick call-back from the same peer
+// ("call lagte hi declined", observed live: instant declineCall, no ring).
+const DECLINED_PEER_GUARD_MS = 4000;
 
 const CAM_ENCODINGS = [
   { scaleResolutionDownBy: 4, maxBitrate: 150000 },
@@ -47,17 +59,34 @@ const MIC_CODEC_OPTIONS = { opusFec: true, opusDtx: true, opusStereo: false, opu
 
 // Legacy token = base64(JSON { sub, name }); JWT mode carries identity in
 // explicit opts instead. Same fallback semantics as the reference.
+const b64ToJson = (b64) => {
+  const norm = String(b64 || '').replace(/-/g, '+').replace(/_/g, '/');
+  const pad = norm + '='.repeat((4 - (norm.length % 4)) % 4);
+  const raw = global.atob
+    ? global.atob(pad)
+    : Buffer.from(pad, 'base64').toString('binary');
+  const json = decodeURIComponent(Array.prototype.map.call(raw, (c) => (
+    `%${(`00${c.charCodeAt(0).toString(16)}`).slice(-2)}`
+  )).join(''));
+  return JSON.parse(json);
+};
+
 const decodeToken = (token) => {
+  const t = String(token || '');
   try {
-    const raw = global.atob
-      ? global.atob(String(token || ''))
-      : Buffer.from(String(token || ''), 'base64').toString('binary');
-    const json = decodeURIComponent(Array.prototype.map.call(raw, (c) => (
-      `%${(`00${c.charCodeAt(0).toString(16)}`).slice(-2)}`
-    )).join(''));
-    const obj = JSON.parse(json);
+    const obj = b64ToJson(t);
     if (obj && obj.sub) return { userId: String(obj.sub), name: obj.name || 'User' };
   } catch (_) { /* not a base64 envelope (JWT mode) */ }
+  // JWT mode: identity normally arrives via explicit opts.userId, but a
+  // caller with a broken/stale user object sends none — fall back to the
+  // JWT payload's sub so connect never fails on "missing user identity".
+  try {
+    const parts = t.split('.');
+    if (parts.length === 3) {
+      const obj = b64ToJson(parts[1]);
+      if (obj && obj.sub) return { userId: String(obj.sub), name: obj.name || 'User' };
+    }
+  } catch (_) { /* unreadable JWT payload */ }
   return null;
 };
 
@@ -248,6 +277,10 @@ export default class NativeCallingSDK {
     this._socket = s;
     this._serverUrl = url;
     s.on('connect', () => {
+      // Cancels sent while we were offline are gone for good — drop any ring
+      // entry old enough that its server-side call can no longer exist, so the
+      // duplicate-ring dedupe can't swallow the NEXT genuine ring on this peer.
+      this._prunePendingIn();
       this._req('register', { name: this.name, sessionId: this.userId }).then((res) => {
         this._users = (res && res.users) || [];
         this._registered = true;
@@ -303,10 +336,25 @@ export default class NativeCallingSDK {
     });
   }
 
+  // Drop _pendingIn entries past the ring window (see PENDING_IN_STALE_MS).
+  // Silent: the server call behind a stale entry is already dead, so there is
+  // no UI to dismiss and no decline worth sending.
+  _prunePendingIn() {
+    const now = Date.now();
+    Object.keys(this._pendingIn).forEach((k) => {
+      const q = this._pendingIn[k];
+      if (!q || !q.ts || (now - q.ts) > PENDING_IN_STALE_MS) {
+        this._log(`pruned stale pending ring ${k}`);
+        delete this._pendingIn[k];
+      }
+    });
+  }
+
   _wire(s) {
     s.on('users', (users) => { this._users = users || []; });
 
     s.on('incomingCall', (p = {}) => {
+      this._prunePendingIn();
       const key = String(p.callId);
       if (this._pendingIn[key]) return;
       const fromId = p.from && p.from.id != null ? String(p.from.id) : null;
@@ -327,13 +375,13 @@ export default class NativeCallingSDK {
         // Just declined this peer → quietly decline their reasserts too instead
         // of ghost-re-ringing (parity with the group _declined window).
         const dec = this._declinedPeer[fromId];
-        if (dec && (Date.now() - dec) < 15000) {
+        if (dec && (Date.now() - dec) < DECLINED_PEER_GUARD_MS) {
           try { s.emit('declineCall', { callId: key }); } catch (_) {}
           return;
         }
         delete this._declinedPeer[fromId];
       }
-      this._pendingIn[key] = { group: false, callId: key, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio' };
+      this._pendingIn[key] = { group: false, callId: key, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', ts: Date.now() };
       this._emit('incoming', {
         callId: key,
         from: { id: p.from && p.from.id != null ? String(p.from.id) : null, name: (p.from && p.from.name) || '' },
@@ -343,6 +391,7 @@ export default class NativeCallingSDK {
     });
 
     s.on('incomingGroupCall', (p = {}) => {
+      this._prunePendingIn();
       const key = String(p.groupId);
       // Already IN this group call → this is the host's re-invite loop echoing
       // (their engine hadn't marked us joined yet). Surfacing it would make the
@@ -357,7 +406,7 @@ export default class NativeCallingSDK {
         return;
       }
       delete this._declined[key];
-      this._pendingIn[key] = { group: true, groupId: p.groupId, roomId: p.roomId, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', name: p.name };
+      this._pendingIn[key] = { group: true, groupId: p.groupId, roomId: p.roomId, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', name: p.name, ts: Date.now() };
       this._emit('incoming', {
         callId: key,
         from: { id: p.from && p.from.id != null ? String(p.from.id) : null, name: (p.from && p.from.name) || '' },

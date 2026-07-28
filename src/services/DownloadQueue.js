@@ -45,6 +45,7 @@ class DownloadQueue {
       mediaUrl: item.mediaUrl || null,
       messageId: item.messageId || null,
       groupId: item.groupId || null,
+      fileSize: Number(item.fileSize || 0) || null,
     });
 
     this.queue.push({ ...item, mediaId });
@@ -62,6 +63,7 @@ class DownloadQueue {
       mediaUrl: item.mediaUrl || null,
       messageId: item.messageId || null,
       groupId: item.groupId || null,
+      fileSize: Number(item.fileSize || 0) || null,
       retries: Number(item.retries || 0),
     }));
 
@@ -94,6 +96,9 @@ class DownloadQueue {
         mediaUrl: item.mediaUrl || null,
         messageId: item.messageId || null,
         groupId: item.groupId || null,
+        // Content-Length fallback — without it a chunked/gzipped response
+        // reports total 0 and the tile/album ring never moves.
+        expectedSize: Number(item.fileSize || 0) || null,
         onProgress: async (progress) => {
           this._emit({ type: 'progress', mediaId, progress });
           await localStorageService.updateDownloadQueue(mediaId, { progress, status: 'downloading' });

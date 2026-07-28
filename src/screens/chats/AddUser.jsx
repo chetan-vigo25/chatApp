@@ -141,7 +141,12 @@ const ContactRow = memo(function ContactRow({
 export default function AddUser({ navigation }) {
   const { theme } = useTheme();
   const { startAudioCall, startVideoCall } = useCall();
-  const fadeAnim = useRef(new Animated.Value(0)).current;
+  // Start fully visible (was 0 → fade-in on mount). The entrance fade caused a
+  // full-screen flash whenever this screen remounted — e.g. returning from the
+  // system contacts-permission dialog (which backgrounds→foregrounds the app):
+  // the screen re-mounted, fadeAnim reset to 0, and the whole view flashed in.
+  // Painting at opacity 1 removes that flash; the screen just appears.
+  const fadeAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0)).current;
   const [searchQuery, setSearchQuery] = useState('');
@@ -210,13 +215,9 @@ export default function AddUser({ navigation }) {
     return Boolean(a && b && a === b);
   };
 
-  useEffect(() => {
-    Animated.timing(fadeAnim, {
-      toValue: 1,
-      duration: 250,
-      useNativeDriver: true,
-    }).start();
-  }, []);
+  // Entrance fade removed — the container now renders at opacity 1 from the
+  // first frame (see fadeAnim init) so a remount (e.g. after the permission
+  // dialog) never flashes the whole screen in.
 
   // NOTE: no explicit loadContacts() on mount here — useContactSync's own
   // bootstrap effect already loads cached contacts from SQLite once on mount

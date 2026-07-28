@@ -21,21 +21,18 @@
  *     allViewed,     // every status seen           → fully grey ring
  *   }
  */
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import {
   fetchStatusFeed,
   hydrateStatusFeed,
   hydrateViewedStatusIds,
-  addNewStatusFromSocket,
-  removeStatusFromSocket,
 } from '../Redux/Reducer/Status/Status.reducer';
-import { getSocket } from '../Redux/Services/Socket/socket';
+import { ensureStatusSocketListeners } from '../services/statusSocketWiring';
 
 export default function useStatusIndicators() {
   const dispatch = useDispatch();
   const { contactStatuses, viewedStatusIds } = useSelector((s) => s.status);
-  const socketRef = useRef(null);
 
   // ── Load: SQLite first (instant), then network refresh ──────────────────────
   useEffect(() => {
@@ -44,40 +41,11 @@ export default function useStatusIndicators() {
     dispatch(fetchStatusFeed());
   }, [dispatch]);
 
-  // ── Realtime: keep the feed live even when the Status tab isn't mounted ──────
+  // ── Realtime: keep the feed live even when the Status tab isn't mounted.
+  //    Shared, refcounted wiring — one listener set app-wide no matter how
+  //    many components consume status realtime. ──────────────────────────────
   useEffect(() => {
-    const attach = () => {
-      const socket = getSocket?.();
-      if (!socket || socketRef.current === socket) return undefined;
-
-      const onNew = (p) => dispatch(addNewStatusFromSocket(p));
-      const onGone = (p) => dispatch(removeStatusFromSocket(p));
-
-      // Canonical events use a colon; underscore variants are legacy aliases.
-      socket.on('status:new', onNew);
-      socket.on('new_status', onNew);
-      socket.on('status:deleted', onGone);
-      socket.on('status_deleted', onGone);
-      socket.on('status_expired', onGone);
-      socketRef.current = socket;
-
-      return () => {
-        socket.off('status:new', onNew);
-        socket.off('new_status', onNew);
-        socket.off('status:deleted', onGone);
-        socket.off('status_deleted', onGone);
-        socket.off('status_expired', onGone);
-      };
-    };
-
-    const cleanup = attach();
-    // The socket may connect slightly after this screen mounts — retry until set.
-    const interval = setInterval(() => { if (!socketRef.current) attach(); }, 2000);
-    return () => {
-      clearInterval(interval);
-      cleanup?.();
-      socketRef.current = null;
-    };
+    return ensureStatusSocketListeners(dispatch);
   }, [dispatch]);
 
   // ── Derive the userId → indicator map ───────────────────────────────────────

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { Platform, PermissionsAndroid } from 'react-native';
 import * as Contacts from 'expo-contacts';
 import { useContacts } from './ContactContext';
 import { useNetwork } from './NetworkContext';
@@ -8,6 +9,22 @@ import { useDeviceInfo } from './DeviceInfoContext';
 import contactHasher from '../Redux/Services/Contact/ContactHasher';
 import ContactDatabase from '../services/ContactDatabase';
 import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
+import { subscribeSessionReset } from '../services/sessionEvents';
+
+// Module-level warm cache of the last-applied contact list. It lives OUTSIDE the
+// hook so it survives the AddUser (Select Contact) screen unmount/remount. Each
+// time the screen re-opens, the hook seeds `matchedContacts` synchronously from
+// this cache and starts with isInitialLoading=false — so the list paints
+// instantly with content instead of flashing the full-screen spinner → list
+// swap (the "blink on contact fetch"). A background applyFromDB still refreshes
+// from SQLite; the signature guard skips the re-render when nothing changed.
+// Cleared on session reset so contacts never leak across account switches.
+let _contactsWarmCache = [];
+let _contactsWarmMeta = { lastSyncTime: null };
+subscribeSessionReset(() => {
+  _contactsWarmCache = [];
+  _contactsWarmMeta = { lastSyncTime: null };
+});
 
 const STORAGE_KEYS = {
   DEVICE_ID: '@device_id',
@@ -97,6 +114,20 @@ const dedupeByNumberOrId = (contacts = []) => {
   return list;
 };
 
+// Content signature of a contact list — used to skip re-applying an identical
+// list to state (which would rebuild the FlatList and flash). Includes only the
+// fields the UI renders, so a real change (e.g. a contact flipping to
+// registered) still differs. Module-level so it can seed the warm-cache guard
+// ref at hook init, before the hook body defines anything.
+const contactsSignatureOf = (list = []) => {
+  let sig = String(list.length);
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    sig += `|${c.id || c._id || c.originalPhone || ''}:${c.userId || ''}:${c.type || ''}:${c.fullName || c.name || ''}`;
+  }
+  return sig;
+};
+
 export const useContactSync = () => {
   const { contacts: deviceContacts = [], askPermissionAndLoadContacts } = useContacts();
   const { isConnected } = useNetwork();
@@ -110,18 +141,27 @@ export const useContactSync = () => {
   // sync is still streaming in the background) doesn't spawn a duplicate one.
   const fullSyncInProgressRef = useRef(false);
 
-  const [matchedContacts, setMatchedContacts] = useState([]);
-  const [matchedRegistered, setMatchedRegistered] = useState([]);
-  const [matchedUnregistered, setMatchedUnregistered] = useState([]);
+  // Seed synchronously from the module warm cache so a screen re-open paints the
+  // contact list instantly (no spinner→list flash). First open of the session
+  // has an empty cache and falls back to the normal spinner + SQLite load.
+  const _warm = _contactsWarmCache;
+  const [matchedContacts, setMatchedContacts] = useState(_warm);
+  const [matchedRegistered, setMatchedRegistered] = useState(
+    () => _warm.filter(c => c.type === 'registered' || !!c.userId)
+  );
+  const [matchedUnregistered, setMatchedUnregistered] = useState(
+    () => _warm.filter(c => c.type !== 'registered' && !c.userId)
+  );
   const [hashedContacts, setHashedContacts] = useState([]);
-  const [isInitialLoading, setIsInitialLoading] = useState(true); // true until first DB load completes
+  // Start NOT loading when the warm cache already has contacts to show.
+  const [isInitialLoading, setIsInitialLoading] = useState(_warm.length === 0);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isBackgroundRefreshing, setIsBackgroundRefreshing] = useState(false);
   const [isExpiredUpdating, setIsExpiredUpdating] = useState(false);
   const [error, setError] = useState(null);
-  const [lastSyncTime, setLastSyncTime] = useState(null);
+  const [lastSyncTime, setLastSyncTime] = useState(_contactsWarmMeta.lastSyncTime);
   const [discoverResponse, setDiscoverResponse] = useState(null);
   const [inviteResponse, setInviteResponse] = useState(null);
   const [lastSyncSessionId, setLastSyncSessionId] = useState(null);
@@ -223,8 +263,13 @@ export const useContactSync = () => {
   // First-paint guards: the head page is loaded exactly once per hook lifetime,
   // and never applied after a full-table load has already landed (a late head
   // page must not shrink an already-complete list back down to 100 rows).
-  const firstPaintDoneRef = useRef(false);
-  const fullAppliedRef = useRef(false);
+  // When the warm cache already seeded the full list, treat first-paint AND the
+  // full load as already applied for THIS instance — so applyFromDB doesn't
+  // repaint the head page (100 rows) over the already-shown full list (a shrink
+  // then grow that reads as a blink). The background full load still runs; its
+  // signature matches the seed, so applyContactsToState skips the re-render.
+  const firstPaintDoneRef = useRef(_warm.length > 0);
+  const fullAppliedRef = useRef(_warm.length > 0);
 
   // Content signature of the last list we pushed to state. Guards against
   // re-applying an identical list (mount does head-paint → full-load, and a
@@ -234,21 +279,17 @@ export const useContactSync = () => {
   // fields the UI actually renders (id, registration/userId, name, type) so a
   // real change — e.g. a contact flipping to registered via `contact:registered`
   // — still re-applies, while a no-op reload is skipped.
-  const lastAppliedSigRef = useRef('');
-  const contactsSignature = (list) => {
-    let sig = String(list.length);
-    for (let i = 0; i < list.length; i++) {
-      const c = list[i];
-      sig += `|${c.id || c._id || c.originalPhone || ''}:${c.userId || ''}:${c.type || ''}:${c.fullName || c.name || ''}`;
-    }
-    return sig;
-  };
+  // Seed the guard with the warm cache's signature so the first background
+  // applyFromDB (identical data) is skipped — no needless re-render on re-open.
+  const lastAppliedSigRef = useRef(_warm.length > 0 ? contactsSignatureOf(_warm) : '');
 
   const applyContactsToState = useCallback((all) => {
     if (!mountedRef.current) return;
-    const sig = contactsSignature(all);
+    const sig = contactsSignatureOf(all);
     if (sig === lastAppliedSigRef.current) return; // identical list → skip re-render
     lastAppliedSigRef.current = sig;
+    // Keep the module warm cache in sync so the NEXT screen open paints instantly.
+    _contactsWarmCache = all;
     setMatchedContacts(all);
     setMatchedRegistered(all.filter(c => c.type === 'registered' || !!c.userId));
     setMatchedUnregistered(all.filter(c => c.type !== 'registered' && !c.userId));
@@ -290,6 +331,9 @@ export const useContactSync = () => {
       // rebuilt `listData` (it depends on lastSyncTime) and re-rendered the whole
       // FlatList → the screen BLINKED on every refresh. Only push state when the
       // value actually changed; a real sync (new timestamp) still updates once.
+      // Keep the module warm meta in sync so the next screen open seeds the
+      // "Last sync" row too (no pop-in).
+      _contactsWarmMeta = { lastSyncTime: lastSync ? new Date(lastSync) : null };
       if (mountedRef.current) {
         setLastSyncSessionId((prev) => (prev === sessionId ? prev : sessionId));
         setLastSyncTime((prev) => {
@@ -340,7 +384,26 @@ export const useContactSync = () => {
         status = undefined;
       }
       if (status !== 'granted') {
-        ({ status } = await Contacts.requestPermissionsAsync());
+        if (Platform.OS === 'android') {
+          // Request via RN core PermissionsAndroid, NOT Contacts.requestPermissionsAsync().
+          // expo's request can route through a separate transparent permission
+          // activity, which stops→restarts MainActivity on return — and because
+          // MainActivity's theme is the splash theme (windowBackground = splash
+          // drawable), that restart FLASHES the splash for a frame (the "blink on
+          // first contact fetch"). PermissionsAndroid shows the dialog on the
+          // CURRENT activity (plain onPause→onResume), so nothing restarts/flashes.
+          try {
+            const res = await PermissionsAndroid.request(
+              PermissionsAndroid.PERMISSIONS.READ_CONTACTS
+            );
+            status = res === PermissionsAndroid.RESULTS.GRANTED ? 'granted' : 'denied';
+          } catch {
+            // Fall back to expo's request if the core module is somehow unavailable.
+            ({ status } = await Contacts.requestPermissionsAsync());
+          }
+        } else {
+          ({ status } = await Contacts.requestPermissionsAsync());
+        }
       }
       if (status !== 'granted') return [];
       const { data } = await Contacts.getContactsAsync({

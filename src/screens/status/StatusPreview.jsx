@@ -314,14 +314,27 @@ export default function StatusPreview({ navigation, route }) {
             type: item.mimeType || (item.type === 'video' ? `video/${ext}` : `image/${ext}`),
           });
 
-          const uploadRes = await statusServices.uploadStatusMedia(fd, {
-            signal: abortRef.current.signal,
-            // Videos can be much larger than the default 30s timeout allows.
-            timeoutMs: item.type === 'video' ? 300000 : 60000,
-            onProgress: (percent) => {
-              setProgress((p) => ({ ...p, percent }));
-            },
-          });
+          // One transient failure (network blip) used to kill the whole post
+          // — and orphan every already-uploaded item. Retry each item once
+          // before giving up; user aborts are never retried.
+          let uploadRes;
+          for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+              uploadRes = await statusServices.uploadStatusMedia(fd, {
+                signal: abortRef.current.signal,
+                // Videos can be much larger than the default 30s timeout allows.
+                timeoutMs: item.type === 'video' ? 300000 : 60000,
+                onProgress: (percent) => {
+                  setProgress((p) => ({ ...p, percent }));
+                },
+              });
+              break;
+            } catch (err) {
+              if (abortRef.current?.signal?.aborted || attempt === 1) throw err;
+              await new Promise((r) => setTimeout(r, 1200));
+              setProgress((p) => ({ ...p, percent: 0 }));
+            }
+          }
 
           if (abortRef.current?.signal?.aborted) {
             throw Object.assign(new Error('Upload cancelled'), { name: 'AbortError' });

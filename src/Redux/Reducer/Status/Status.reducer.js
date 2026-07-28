@@ -3,6 +3,11 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { statusServices } from '../../Services/Status/Status.Services';
 import ChatDatabase from '../../../services/ChatDatabase';
 
+// Debug-only logging — the old bare console.log instrumentation on every
+// view/react shipped to production builds.
+// eslint-disable-next-line no-console
+const devLog = (...args) => { if (__DEV__) console.log(...args); };
+
 // ── Persisted viewed-set ────────────────────────────────────────────────────
 // The server is authoritative (each /feed response stamps `isViewed`), but
 // we mirror it to AsyncStorage so rings render correctly on cold open BEFORE
@@ -61,14 +66,30 @@ export const fetchMyStatuses = createAsyncThunk(
 /** Feed — replaces fetchContactStatuses; returns grouped contacts array */
 export const fetchStatusFeed = createAsyncThunk(
   'status/fetchFeed',
-  async (_, { rejectWithValue }) => {
+  async (_, { rejectWithValue, dispatch }) => {
     try {
-      return await statusServices.getStatusFeed();
+      const result = await statusServices.getStatusFeed();
+      // We're clearly online — push any queued offline views to the server.
+      dispatch(flushPendingViews());
+      return result;
     } catch (error) {
       return rejectWithValue(toSerializableError(error));
     }
   }
 );
+
+// ── Client-side 24h expiry ──────────────────────────────────────────────────
+// The server excludes expired statuses, but SQLite-hydrated feeds and a
+// socket-down session kept dead rings alive indefinitely — nothing ever
+// compared `expiresAt` to the clock on-device.
+const isLiveStatus = (s) => {
+  const exp = s?.expiresAt ? new Date(s.expiresAt).getTime() : 0;
+  return !exp || exp > Date.now();
+};
+
+const filterLiveGroups = (groups) => (Array.isArray(groups) ? groups : [])
+  .map((g) => ({ ...g, statuses: (g.statuses || []).filter(isLiveStatus) }))
+  .filter((g) => (g.statuses || []).length > 0);
 
 // Legacy alias kept so existing code doesn't break
 export const fetchContactStatuses = fetchStatusFeed;
@@ -136,25 +157,69 @@ export const fetchStatusSettings = createAsyncThunk(
   }
 );
 
+// ── Offline view queue ──────────────────────────────────────────────────────
+// A view that fails to POST (offline / server hiccup) is queued durably and
+// flushed on the next successful feed fetch — views are never silently lost.
+const PENDING_VIEWS_KEY = 'status:pendingViews:v1';
+
+const readPendingViews = async () => {
+  try {
+    const raw = await AsyncStorage.getItem(PENDING_VIEWS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const queuePendingView = async (statusId) => {
+  try {
+    const pending = await readPendingViews();
+    if (!pending.some((p) => String(p.statusId) === String(statusId))) {
+      pending.push({ statusId: String(statusId), viewedAt: Date.now() });
+      await AsyncStorage.setItem(PENDING_VIEWS_KEY, JSON.stringify(pending.slice(-300)));
+    }
+  } catch { /* best effort */ }
+};
+
+export const flushPendingViews = createAsyncThunk(
+  'status/flushPendingViews',
+  async () => {
+    const pending = await readPendingViews();
+    if (!pending.length) return { flushed: 0 };
+    const stillPending = [];
+    for (const p of pending) {
+      try {
+        await statusServices.viewStatus(p.statusId);
+      } catch {
+        stillPending.push(p);
+      }
+    }
+    await AsyncStorage.setItem(PENDING_VIEWS_KEY, JSON.stringify(stillPending)).catch(() => {});
+    return { flushed: pending.length - stillPending.length };
+  }
+);
+
 export const viewStatusAction = createAsyncThunk(
   'status/view',
   async (statusId, { rejectWithValue }) => {
-    const startedAt = Date.now();
-    // eslint-disable-next-line no-console
-    console.log(`[status/view] → start statusId=${statusId} at ${new Date(startedAt).toISOString()}`);
     try {
       const response = await statusServices.viewStatus(statusId);
-      // eslint-disable-next-line no-console
-      console.log(`[status/view] ✓ ok    statusId=${statusId} took ${Date.now() - startedAt}ms`);
       return { ...response, statusId };
     } catch (error) {
-      // eslint-disable-next-line no-console
-      console.log(
-        `[status/view] ✗ fail  statusId=${statusId} took ${Date.now() - startedAt}ms ` +
-        `error=${error?.message || error?.code || String(error)}`
-      );
+      // Queue durably — the local viewed-set is still updated (rejected case)
+      // so the ring greys out; the server catches up on the next flush.
+      await queuePendingView(statusId);
       return rejectWithValue(toSerializableError(error));
     }
+  },
+  {
+    // DEDUPE AT THE SOURCE: the viewer fires this on every slide entry —
+    // without this check every re-open/back-tap re-POSTed the same view.
+    condition: (statusId, { getState }) => {
+      const viewed = getState()?.status?.viewedStatusIds || [];
+      return !viewed.includes(String(statusId));
+    },
   }
 );
 
@@ -163,7 +228,7 @@ export const reactToStatusAction = createAsyncThunk(
   async ({ statusId, reactionType }, { rejectWithValue }) => {
     const startedAt = Date.now();
     // eslint-disable-next-line no-console
-    console.log(
+    devLog(
       `[status/react] → start statusId=${statusId} type=${reactionType} ` +
       `at ${new Date(startedAt).toISOString()}`
     );
@@ -172,14 +237,14 @@ export const reactToStatusAction = createAsyncThunk(
       const took = Date.now() - startedAt;
       const data = response?.data || {};
       // eslint-disable-next-line no-console
-      console.log(
+      devLog(
         `[status/react] ✓ ok    statusId=${statusId} type=${reactionType} took ${took}ms ` +
         `myReaction=${data.myReaction} likes=${data.likeCount} dislikes=${data.dislikeCount}`
       );
       return { ...response, statusId, reactionType };
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.log(
+      devLog(
         `[status/react] ✗ fail  statusId=${statusId} type=${reactionType} took ${Date.now() - startedAt}ms ` +
         `error=${error?.message || error?.code || String(error)}`
       );
@@ -238,18 +303,18 @@ export const fetchStatusViewers = createAsyncThunk(
   async (statusId, { rejectWithValue }) => {
     const startedAt = Date.now();
     // eslint-disable-next-line no-console
-    console.log(`[status/viewers] → fetch list statusId=${statusId} at ${new Date(startedAt).toISOString()}`);
+    devLog(`[status/viewers] → fetch list statusId=${statusId} at ${new Date(startedAt).toISOString()}`);
     try {
       const res = await statusServices.getStatusViewers(statusId);
       const count = res?.data?.viewers?.length ?? 0;
       const total = res?.data?.viewCount ?? 0;
       // eslint-disable-next-line no-console
-      console.log("res?. view", res?.data)
-      console.log(`[status/viewers] ✓ ok statusId=${statusId} took ${Date.now() - startedAt}ms viewers=${count} total=${total}`);
+      devLog("res?. view", res?.data)
+      devLog(`[status/viewers] ✓ ok statusId=${statusId} took ${Date.now() - startedAt}ms viewers=${count} total=${total}`);
       return res;
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.log(`[status/viewers] ✗ fail statusId=${statusId} took ${Date.now() - startedAt}ms error=${error?.message || String(error)}`);
+      devLog(`[status/viewers] ✗ fail statusId=${statusId} took ${Date.now() - startedAt}ms error=${error?.message || String(error)}`);
       return rejectWithValue(toSerializableError(error));
     }
   }
@@ -260,18 +325,18 @@ export const fetchStatusLikers = createAsyncThunk(
   async (statusId, { rejectWithValue }) => {
     const startedAt = Date.now();
     // eslint-disable-next-line no-console
-    console.log(`[status/likers] → fetch list statusId=${statusId} at ${new Date(startedAt).toISOString()}`);
+    devLog(`[status/likers] → fetch list statusId=${statusId} at ${new Date(startedAt).toISOString()}`);
     try {
       const res = await statusServices.getStatusLikers(statusId);
       const total = res?.data?.total ?? res?.data?.likedBy?.length ?? 0;
       // eslint-disable-next-line no-console
-      console.log("res?.likes ", res?.data)
+      devLog("res?.likes ", res?.data)
 
-      console.log(`[status/likers] ✓ ok statusId=${statusId} took ${Date.now() - startedAt}ms likes=${total}`);
+      devLog(`[status/likers] ✓ ok statusId=${statusId} took ${Date.now() - startedAt}ms likes=${total}`);
       return res;
     } catch (error) {
       // eslint-disable-next-line no-console
-      console.log(`[status/likers] ✗ fail statusId=${statusId} took ${Date.now() - startedAt}ms error=${error?.message || String(error)}`);
+      devLog(`[status/likers] ✗ fail statusId=${statusId} took ${Date.now() - startedAt}ms error=${error?.message || String(error)}`);
       return rejectWithValue(toSerializableError(error));
     }
   }
@@ -560,7 +625,7 @@ const statusSlice = createSlice({
       .addCase(fetchMyStatuses.pending, (state) => { state.isLoading = true; })
       .addCase(fetchMyStatuses.fulfilled, (state, action) => {
         state.isLoading = false;
-        state.myStatuses = action.payload?.data || [];
+        state.myStatuses = (action.payload?.data || []).filter(isLiveStatus);
       })
       .addCase(fetchMyStatuses.rejected, (state) => { state.isLoading = false; })
 
@@ -568,7 +633,7 @@ const statusSlice = createSlice({
       .addCase(fetchStatusFeed.pending, (state) => { state.isLoading = true; })
       .addCase(fetchStatusFeed.fulfilled, (state, action) => {
         state.isLoading = false;
-        const data = action.payload?.data || [];
+        const data = filterLiveGroups(action.payload?.data || []);
         state.contactStatuses = data;
 
         // Rehydrate the viewed-set from each status's server-stamped `isViewed`
@@ -583,7 +648,9 @@ const statusSlice = createSlice({
             }
           }
         }
-        state.viewedStatusIds = Array.from(merged);
+        // Cap the set — statuses die in 24h, so anything beyond the most
+        // recent ~800 ids is guaranteed-expired noise (it grew unbounded).
+        state.viewedStatusIds = Array.from(merged).slice(-800);
         persistViewedIds(state.viewedStatusIds);
 
         // Recompute per-contact unseen counters using the merged set so the
@@ -604,7 +671,8 @@ const statusSlice = createSlice({
       // Hydrate the contact feed from SQLite on boot — only fills the gap before
       // the network /feed resolves; never clobbers a feed already in memory.
       .addCase(hydrateStatusFeed.fulfilled, (state, action) => {
-        const stored = Array.isArray(action.payload) ? action.payload : [];
+        // Expired statuses in the SQLite snapshot must not resurrect rings.
+        const stored = filterLiveGroups(Array.isArray(action.payload) ? action.payload : []);
         if (stored.length && state.contactStatuses.length === 0) {
           state.contactStatuses = stored;
         }
@@ -651,6 +719,7 @@ const statusSlice = createSlice({
         const statusId = action.payload?.statusId ? String(action.payload.statusId) : null;
         if (statusId && !state.viewedStatusIds.includes(statusId)) {
           state.viewedStatusIds.push(statusId);
+          state.viewedStatusIds = state.viewedStatusIds.slice(-800);
           persistViewedIds(state.viewedStatusIds);
         }
         // Update unseenCount in contactStatuses
@@ -665,6 +734,16 @@ const statusSlice = createSlice({
         // Mark a viewed broadcast so its "official" ring/badge reflects state
         const bc = state.broadcasts.find(b => String(b._id) === statusId);
         if (bc) bc.isViewed = true;
+      })
+      // Failed POST (offline): the view HAPPENED locally — grey the ring now;
+      // the durable pending-views queue syncs the server when back online.
+      .addCase(viewStatusAction.rejected, (state, action) => {
+        const statusId = action.meta?.arg ? String(action.meta.arg) : null;
+        if (statusId && !state.viewedStatusIds.includes(statusId)) {
+          state.viewedStatusIds.push(statusId);
+          state.viewedStatusIds = state.viewedStatusIds.slice(-800);
+          persistViewedIds(state.viewedStatusIds);
+        }
       })
 
       // React — reconcile with the server's canonical counts on success,

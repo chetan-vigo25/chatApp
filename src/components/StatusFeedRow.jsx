@@ -10,7 +10,7 @@
  * Usage:
  *   <StatusFeedRow navigation={navigation} />
  */
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect } from 'react';
 import {
   View,
   Text,
@@ -24,11 +24,10 @@ import { useDispatch, useSelector } from 'react-redux';
 import { Ionicons } from '@expo/vector-icons';
 import {
   fetchMyStatuses, fetchStatusFeed,
-  addNewStatusFromSocket, removeStatusFromSocket,
   hydrateViewedStatusIds,
 } from '../Redux/Reducer/Status/Status.reducer';
 import { useTheme } from '../contexts/ThemeContext';
-import { getSocket } from '../Redux/Services/Socket/socket';
+import { ensureStatusSocketListeners } from '../services/statusSocketWiring';
 import useContactDirectory from '../hooks/useContactDirectory';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -58,7 +57,6 @@ export default function StatusFeedRow({ navigation, style }) {
 
   const viewedSet = new Set(viewedStatusIds.map(String));
   const hasMyStatus = myStatuses && myStatuses.length > 0;
-  const socketRef = useRef(null);
 
   // ── Load feed on mount ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -69,41 +67,9 @@ export default function StatusFeedRow({ navigation, style }) {
     dispatch(fetchStatusFeed());
   }, [dispatch]);
 
-  // ── Socket listeners ───────────────────────────────────────────────────────
+  // ── Socket listeners (shared, refcounted — one set app-wide) ──────────────
   useEffect(() => {
-    const attach = () => {
-      const socket = getSocket?.();
-      if (!socket || socketRef.current === socket) return;
-
-      const onNew     = (p) => dispatch(addNewStatusFromSocket(p));
-      const onExpired = (p) => dispatch(removeStatusFromSocket(p));
-
-      // Backend canonical events use a colon (`status:new`, `status:deleted`).
-      // The underscore variants are legacy aliases kept so older server builds
-      // still notify the feed.
-      socket.on('status:new',     onNew);
-      socket.on('new_status',     onNew);
-      socket.on('status:deleted', onExpired);
-      socket.on('status_deleted', onExpired);
-      socket.on('status_expired', onExpired);
-      socketRef.current = socket;
-
-      return () => {
-        socket.off('status:new',     onNew);
-        socket.off('new_status',     onNew);
-        socket.off('status:deleted', onExpired);
-        socket.off('status_deleted', onExpired);
-        socket.off('status_expired', onExpired);
-      };
-    };
-
-    const cleanup = attach();
-    const interval = setInterval(() => { if (!socketRef.current) attach(); }, 2000);
-    return () => {
-      clearInterval(interval);
-      cleanup?.();
-      socketRef.current = null;
-    };
+    return ensureStatusSocketListeners(dispatch);
   }, [dispatch]);
 
   // ── Navigation handlers ────────────────────────────────────────────────────
@@ -213,8 +179,11 @@ export default function StatusFeedRow({ navigation, style }) {
           // for others — resolve from both, preferring the small thumbnailUrl.
           const firstSt  = (group.statuses || [])[0];
           const stItem   = firstSt?.mediaItems?.[0] || null;
+          const stType   = stItem?.mediaType || firstSt?.mediaType || null;
+          // Video: never fall back to the full mediaUrl (black box + full
+          // video download for a ring badge); images may as a legacy fallback.
           const stThumb  = stItem?.thumbnailUrl || firstSt?.thumbnailUrl
-            || stItem?.mediaUrl || firstSt?.mediaUrl || null;
+            || (stType !== 'video' ? (stItem?.mediaUrl || firstSt?.mediaUrl) : null) || null;
           const serverName = group.name || group.fullName || group.userName;
           const phone      = group.phone || group.number || group.mobile?.number || group.mobileNumber;
           // Saved contact name → phone number → server-provided name.

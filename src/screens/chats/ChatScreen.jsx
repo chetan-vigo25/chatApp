@@ -22,6 +22,7 @@ import {
   LayoutAnimation,
   UIManager,
   PanResponder,
+  Easing,
   StyleSheet,
   DeviceEventEmitter,
   BackHandler
@@ -45,6 +46,7 @@ import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { BlurView } from 'expo-blur';
+import { generateLocalVideoThumbnail } from '../../utils/thumbnailGenerator';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
 import { Video, ResizeMode, Audio } from 'expo-av';
@@ -200,6 +202,89 @@ const EMOJI_SECTIONS = {
     '🔆', '🔅', '⚠️', '🚸', '🔱', '⚜️', '🔰', '♻️', '✳️', '❇️', '💲', '💱', '©️', '®️',
   ],
 };
+
+// ── Fullscreen-viewer custom video controls (Android) ──────────────────────
+// The expo-av `useNativeControls` bar (ExoPlayer) is drawn at the very bottom of
+// the video surface, which — with the app rendering edge-to-edge — lands BEHIND
+// the Android navigation buttons. This WhatsApp-style bar replaces it: play/pause
+// + a draggable seek bar + time labels, lifted above the nav bar with
+// paddingBottom: insets.bottom. iOS keeps native controls (they respect the home
+// indicator already), so this only renders on Android.
+const fmtViewerTime = (ms) => {
+  const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const m = Math.floor(s / 60);
+  return `${m}:${String(s % 60).padStart(2, '0')}`;
+};
+
+const VideoViewerControls = React.memo(function VideoViewerControls({
+  isPlaying, positionMillis, durationMillis, onTogglePlay, onSeek, insetsBottom, accent,
+}) {
+  const [trackW, setTrackW] = useState(0);
+  const [dragRatio, setDragRatio] = useState(null);
+  const trackWRef = useRef(0);
+
+  const dur = durationMillis > 0 ? durationMillis : 0;
+  const liveRatio = dur > 0 ? Math.max(0, Math.min(1, positionMillis / dur)) : 0;
+  const ratio = dragRatio != null ? dragRatio : liveRatio;
+
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      // Keep the gesture on the seek bar so it never pages the album underneath.
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: (e) => {
+        const w = trackWRef.current;
+        if (w > 0) setDragRatio(Math.max(0, Math.min(1, e.nativeEvent.locationX / w)));
+      },
+      onPanResponderMove: (e) => {
+        const w = trackWRef.current;
+        if (w > 0) setDragRatio(Math.max(0, Math.min(1, e.nativeEvent.locationX / w)));
+      },
+      onPanResponderRelease: (e) => {
+        const w = trackWRef.current;
+        const r = w > 0 ? Math.max(0, Math.min(1, e.nativeEvent.locationX / w)) : 0;
+        setDragRatio(null);
+        onSeek(r);
+      },
+      onPanResponderTerminate: () => setDragRatio(null),
+    })
+  ).current;
+
+  const fill = `${Math.round(ratio * 100)}%`;
+  const accentColor = accent || '#25D366';
+
+  return (
+    <View
+      style={{
+        position: 'absolute', left: 0, right: 0, bottom: 0, zIndex: 30,
+        paddingBottom: (insetsBottom || 0) + 12, paddingTop: 12, paddingHorizontal: 14,
+        backgroundColor: 'rgba(0,0,0,0.35)',
+        flexDirection: 'row', alignItems: 'center',
+      }}
+    >
+      <TouchableOpacity onPress={onTogglePlay} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }} style={{ paddingRight: 12 }}>
+        <Ionicons name={isPlaying ? 'pause' : 'play'} size={26} color="#fff" />
+      </TouchableOpacity>
+      <Text style={{ color: '#fff', fontSize: 12, width: 42, fontVariant: ['tabular-nums'] }}>
+        {fmtViewerTime(ratio * dur)}
+      </Text>
+      <View
+        style={{ flex: 1, height: 28, justifyContent: 'center', marginHorizontal: 8 }}
+        onLayout={(ev) => { const w = ev.nativeEvent.layout.width; trackWRef.current = w; setTrackW(w); }}
+        {...pan.panHandlers}
+      >
+        <View style={{ height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.3)' }}>
+          <View style={{ height: 3, borderRadius: 2, width: fill, backgroundColor: accentColor }} />
+        </View>
+        <View style={{ position: 'absolute', left: Math.max(0, ratio * trackW - 7), width: 14, height: 14, borderRadius: 7, backgroundColor: accentColor }} />
+      </View>
+      <Text style={{ color: '#fff', fontSize: 12, width: 42, textAlign: 'right', fontVariant: ['tabular-nums'] }}>
+        {fmtViewerTime(dur)}
+      </Text>
+    </View>
+  );
+});
 
 const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   theme,
@@ -1231,6 +1316,12 @@ export default function ChatScreen({ navigation, route }) {
   // mediaIds already asked of user/media/resolve for a missing video poster —
   // one shot per screen mount, so a null server answer can't loop requests.
   const thumbnailResolveTriedRef = useRef(new Set());
+  // Freshly re-signed FULL media URLs (mediaId → url), populated when an inline
+  // preview's stored signed URL renders as an error (expired 403). In-memory
+  // only: one resolve attempt per media per screen mount (mediaHealTriedRef
+  // guards the loop), re-derived again on the next mount if still needed.
+  const resolvedFullUrlRef = useRef({});
+  const mediaHealTriedRef = useRef(new Set());
   const [, setThumbnailCacheVersion] = useState(0);
   const lastScrollStateRef = useRef({ isAtLatest: true, isAtTop: false, showScrollButton: false });
   const visibleMapRef = useRef({});
@@ -1417,12 +1508,20 @@ export default function ChatScreen({ navigation, route }) {
     /\/uploads\/chat\/video\//i.test(String(url || ''));
 
   const getServerThumbnailUrl = (msg) => {
+    if (isVideoMessage(msg)) {
+      // Own outgoing videos carry a locally extracted poster frame — it paints
+      // instantly (during upload too) and never expires; prefer it.
+      const localThumb = msg?.localThumbUri || msg?.payload?.localThumbUri || null;
+      if (localThumb) return localThumb;
+      const thumb = msg?.mediaThumbnailUrl || msg?.thumbnailUrl || null;
+      // Videos must NOT fall back to the media file itself (black box) —
+      // including legacy rows whose "thumbnail" IS the video url. Legacy
+      // messages without a poster get one via the mediaResolve fallback in
+      // primeThumbnailCacheForMessage instead.
+      return thumb && !isLikelyVideoFileUrl(thumb) ? thumb : null;
+    }
     const thumb = msg?.mediaThumbnailUrl || msg?.thumbnailUrl || null;
     if (thumb) return thumb;
-    // Videos must NOT fall back to the media file itself (black box). Legacy
-    // messages without a poster get one via the mediaResolve fallback in
-    // primeThumbnailCacheForMessage instead.
-    if (isVideoMessage(msg)) return null;
     return msg?.previewUrl || msg?.mediaUrl || null;
   };
 
@@ -1519,7 +1618,10 @@ export default function ChatScreen({ navigation, route }) {
       }
       if (!resolved) {
         resolved = getServerThumbnailUrl(msg);
-        if (resolved) {
+        // Persist only server urls — a file:// poster (locally extracted video
+        // frame) lives in the purgeable cache dir and must not be durably
+        // referenced; the message row itself carries it while it exists.
+        if (resolved && /^https?:\/\//i.test(resolved)) {
           await localStorageService.saveThumbnailReference(mediaId, resolved, resolveMediaInfo(msg).mediaType).catch(() => {});
         }
       }
@@ -1527,6 +1629,21 @@ export default function ChatScreen({ navigation, route }) {
       // Legacy videos: the message row (and SQLite) predates server thumbnails,
       // so no poster URL exists locally. Ask the server — resolve re-issues
       // fresh URLs AND lazily generates the missing thumbnail for old uploads.
+      // Videos with the file ON DEVICE (own sends, downloaded receives): extract
+      // the poster locally — instant, works offline, and covers rows whose
+      // localThumbUri was lost to an ack merge / SQLite reload / old build.
+      if (!resolved && isVideo) {
+        const localSrc = [
+          msg?.localUri,
+          msg?.payload?.file?.uri,
+          resolveDownloadedUri(msg),
+        ].find((u) => typeof u === 'string' && /^(file|content):\/\//i.test(u));
+        if (localSrc) {
+          const gen = await generateLocalVideoThumbnail(localSrc).catch(() => null);
+          if (gen) resolved = gen; // in-memory only — file:// never persisted
+        }
+      }
+
       if (!resolved && isVideo && !thumbnailResolveTriedRef.current.has(mediaId)) {
         thumbnailResolveTriedRef.current.add(mediaId);
         const map = await mediaResolve([mediaId]);
@@ -1547,6 +1664,38 @@ export default function ChatScreen({ navigation, route }) {
     } finally {
       thumbnailLoadInFlightRef.current.delete(mediaId);
     }
+  }, []);
+
+  // An inline preview's stored signed URL failed to load (expired → S3 403).
+  // The object still exists; only the URL died. Ask the server for a fresh one
+  // via user/media/resolve and swap it in. One shot per media per mount so a
+  // still-failing URL can't loop requests. In-memory (refs) — SQLite stays the
+  // source of truth and is re-hydrated fresh by the backend on the next sync.
+  const healExpiredMediaUrl = useCallback(async (msg) => {
+    const mediaId = getResolvedMediaId(msg);
+    if (!mediaId) return;
+    if (mediaHealTriedRef.current.has(mediaId)) return;
+    mediaHealTriedRef.current.add(mediaId);
+    try {
+      const map = await mediaResolve([mediaId]);
+      const entry = map?.[mediaId] || map?.[String(msg?.messageId)] || null;
+      const item = Array.isArray(entry?.items) ? entry.items[0] : entry;
+      const freshUrl = item?.mediaUrl || item?.previewUrl || null;
+      const freshThumb = item?.thumbnailUrl || null;
+      if (freshThumb && !isLikelyVideoFileUrl(freshThumb)) {
+        thumbnailCacheRef.current[mediaId] = freshThumb;
+        await localStorageService
+          .saveThumbnailReference(mediaId, freshThumb, resolveMediaInfo(msg).mediaType)
+          .catch(() => {});
+      }
+      if (freshUrl) {
+        resolvedFullUrlRef.current[mediaId] = freshUrl;
+        Image.prefetch(toSecureMediaUri(freshUrl)).catch(() => {});
+      }
+      if (freshUrl || freshThumb) {
+        setThumbnailCacheVersion((v) => v + 1);
+      }
+    } catch { /* best-effort — a broken preview simply stays broken */ }
   }, []);
 
   // IMPROVED: Better function to check if media is downloaded
@@ -1684,6 +1833,22 @@ export default function ChatScreen({ navigation, route }) {
       }
     }
     return 0;
+  };
+
+  // Is the FILE still being uploaded (bytes in flight), vs. merely awaiting the
+  // realtime ack? After a successful upload the message carries a real (non-temp)
+  // mediaId and/or a remote http mediaUrl; at that point sendMessageViaSocket
+  // flips the row back to 'sending' for the honest delivery clock — which must
+  // NOT re-show the upload progress ring. Only a row with no real media yet is
+  // genuinely still uploading.
+  const isMediaStillUploading = (msg) => {
+    if (!msg) return false;
+    if (msg.status !== 'sending' && msg.status !== 'uploading') return false;
+    const mediaId = String(msg.mediaId || msg.payload?.mediaId || '');
+    const hasRealMediaId = mediaId && !/^temp_/i.test(mediaId);
+    const url = String(msg.mediaUrl || msg.previewUrl || '');
+    const hasRemoteUrl = /^https?:\/\//i.test(url);
+    return !(hasRealMediaId || hasRemoteUrl);
   };
 
   // ===== WhatsApp-style pause/resume/cancel wiring =====
@@ -1979,6 +2144,11 @@ export default function ChatScreen({ navigation, route }) {
     albumIndex: 0,
   });
   const albumPagerRef = useRef(null);
+  // Fullscreen video playback state for the Android custom control bar (see
+  // VideoViewerControls). iOS uses native controls, so this stays idle there.
+  const [viewerVideoStatus, setViewerVideoStatus] = useState({
+    isPlaying: false, positionMillis: 0, durationMillis: 0, isLoaded: false,
+  });
   const [viewerSavedToast, setViewerSavedToast] = useState(false);
   const viewerToastTimer = useRef(null);
   // Viewer save/share fetch state: large files take a while to pull from the
@@ -2600,8 +2770,53 @@ export default function ChatScreen({ navigation, route }) {
   const closeLocalMediaViewer = () => {
     setLocalMediaViewer(prev => ({ ...prev, visible: false, albumItems: null, albumIndex: 0 }));
     setViewerSavedToast(false);
+    setViewerVideoStatus({ isPlaying: false, positionMillis: 0, durationMillis: 0, isLoaded: false });
     if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
   };
+
+  // ── Fullscreen video controls (Android custom bar) ──
+  // Playback status from the <Video> feeds the seek bar / play-pause icon.
+  const onViewerVideoStatus = useCallback((status) => {
+    if (!status?.isLoaded) {
+      setViewerVideoStatus((s) => (s.isLoaded ? { isPlaying: false, positionMillis: 0, durationMillis: 0, isLoaded: false } : s));
+      return;
+    }
+    setViewerVideoStatus({
+      isPlaying: !!status.isPlaying,
+      positionMillis: Number(status.positionMillis || 0),
+      durationMillis: Number(status.durationMillis || 0),
+      isLoaded: true,
+    });
+  }, []);
+
+  const viewerTogglePlay = useCallback(async () => {
+    const ref = videoRefs.current[localMediaViewer.uri];
+    if (!ref) return;
+    try {
+      const st = await ref.getStatusAsync();
+      if (st?.isLoaded && st.isPlaying) await ref.pauseAsync();
+      else await ref.playAsync();
+    } catch { /* best-effort */ }
+  }, [localMediaViewer.uri]);
+
+  const viewerSeek = useCallback(async (targetRatio) => {
+    const ref = videoRefs.current[localMediaViewer.uri];
+    if (!ref) return;
+    try {
+      const st = await ref.getStatusAsync();
+      const dur = Number(st?.durationMillis || 0);
+      if (dur > 0) {
+        const pos = Math.max(0, Math.min(dur, Math.round(targetRatio * dur)));
+        // Optimistically move the bar to the seeked spot RIGHT NOW. Without this
+        // the control cleared its drag ratio on release and snapped back to the
+        // last reported (stale) position until the next status update arrived —
+        // the "seek jumps backward then forward" glitch. The real status update
+        // then confirms this position a beat later.
+        setViewerVideoStatus((s) => ({ ...s, positionMillis: pos, durationMillis: dur }));
+        await ref.setPositionAsync(pos);
+      }
+    } catch { /* best-effort */ }
+  }, [localMediaViewer.uri]);
 
   // Scroll handling
   const handleScroll = (event) => {
@@ -3056,11 +3271,13 @@ export default function ChatScreen({ navigation, route }) {
       Animated.timing(mediaBackdropAnim, {
         toValue: 0,
         duration: 150,
+        easing: Easing.in(Easing.cubic),
         useNativeDriver: true,
       }),
       Animated.timing(mediaSheetAnim, {
         toValue: MEDIA_PANEL_SHEET_HEIGHT,
-        duration: 180,
+        duration: 200,
+        easing: Easing.in(Easing.cubic),
         useNativeDriver: true,
       }),
     ]).start(() => {
@@ -3075,6 +3292,9 @@ export default function ChatScreen({ navigation, route }) {
       closeMediaPanelAnimated();
       return;
     }
+    // An open keyboard collapsing AFTER the sheet mounts made the whole
+    // screen jump mid-animation — settle the layout first, then slide up.
+    Keyboard.dismiss();
     openMediaOptions();
   }, [showMediaOptions, closeMediaPanelAnimated, openMediaOptions]);
 
@@ -3125,6 +3345,8 @@ export default function ChatScreen({ navigation, route }) {
           name: asset.fileName || `camera_${Date.now()}.jpg`,
           type: asset.mimeType || 'image/jpeg',
           size: asset.fileSize || 0,
+          width: Number(asset.width) || undefined,
+          height: Number(asset.height) || undefined,
         },
         type: 'image',
       }).catch(() => {});
@@ -3399,12 +3621,14 @@ export default function ChatScreen({ navigation, route }) {
       Animated.parallel([
         Animated.timing(mediaSheetAnim, {
           toValue: 0,
-          duration: 150,
+          duration: 160,
+          easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
         }),
         Animated.timing(mediaBackdropAnim, {
           toValue: 1,
-          duration: 120,
+          duration: 140,
+          easing: Easing.out(Easing.cubic),
           useNativeDriver: true,
         }),
       ]).start();
@@ -3457,32 +3681,33 @@ export default function ChatScreen({ navigation, route }) {
 
     mediaBackdropAnim.setValue(0);
     mediaSheetAnim.setValue(MEDIA_PANEL_SHEET_HEIGHT);
-    // Tiles start hidden, then pop in with a brief stagger (WhatsApp reveal).
     mediaOptionEntryAnims.forEach((anim) => anim.setValue(0));
 
+    // ONE smooth ease-out slide (WhatsApp feel) — no springs anywhere in the
+    // open sequence: overshoot/bounce on the sheet or the tiles read as the
+    // screen "fluctuating".
     Animated.parallel([
       Animated.timing(mediaBackdropAnim, {
         toValue: 1,
-        duration: 150,
+        duration: 180,
+        easing: Easing.out(Easing.cubic),
         useNativeDriver: true,
       }),
-      Animated.spring(mediaSheetAnim, {
+      Animated.timing(mediaSheetAnim, {
         toValue: 0,
-        damping: 22,
-        stiffness: 300,
-        mass: 0.8,
+        duration: 240,
+        easing: Easing.out(Easing.cubic),
         useNativeDriver: true,
       }),
     ]).start();
 
     Animated.stagger(
-      20,
+      15,
       mediaOptionEntryAnims.map((anim) =>
-        Animated.spring(anim, {
+        Animated.timing(anim, {
           toValue: 1,
-          damping: 11,
-          stiffness: 280,
-          mass: 0.7,
+          duration: 160,
+          easing: Easing.out(Easing.quad),
           useNativeDriver: true,
         }),
       ),
@@ -3542,6 +3767,7 @@ export default function ChatScreen({ navigation, route }) {
     const isMine = latest?.senderType === 'self' || (currentUserId && latest?.senderId === currentUserId);
     if (!isMine && !isAtLatest) return;
 
+
     const pinToBottom = () => flatListRef?.current?.scrollToOffset?.({ offset: 0, animated: true });
     // Next frame so the freshly-inserted row is laid out first, then once more
     // shortly after to defeat maintainVisibleContentPosition nudging the new
@@ -3549,6 +3775,32 @@ export default function ChatScreen({ navigation, route }) {
     requestAnimationFrame(pinToBottom);
     setTimeout(pinToBottom, 120);
   }, [messages, isAtLatest, currentUserId, flatListRef]);
+
+  // OPEN-AT-NEWEST GUARANTEE. An inverted list opens at offset 0 (newest), but
+  // the initial hydration happens in waves — cached page paint, then the SQLite
+  // refresh, then history/delta sync inserting rows — and
+  // maintainVisibleContentPosition anchors to a row from an EARLIER wave, which
+  // can leave the view parked above the latest messages so the user has to
+  // scroll down on open. For a short window after the chat opens, keep pinning
+  // the list back to offset 0 (non-animated — this is initial positioning, not
+  // a scroll) every time the newest message changes. Once the window closes,
+  // the normal auto-scroll rules above own the position.
+  const openPinUntilRef = useRef(0);
+  const openPinChatId = String(chatData?.chatId || chatData?._id || route?.params?.chatId || '');
+  useEffect(() => {
+    openPinUntilRef.current = Date.now() + 2500;
+  }, [openPinChatId]);
+  useEffect(() => {
+    if (!messages?.length) return;
+    if (Date.now() > openPinUntilRef.current) return;
+    const pin = () => {
+      if (Date.now() > openPinUntilRef.current + 400) return;
+      flatListRef?.current?.scrollToOffset?.({ offset: 0, animated: false });
+    };
+    requestAnimationFrame(pin);
+    const t = setTimeout(pin, 250);
+    return () => clearTimeout(t);
+  }, [messages, flatListRef]);
 
   useEffect(() => {
     if (!messages?.length) {
@@ -4207,7 +4459,7 @@ export default function ChatScreen({ navigation, route }) {
         {(isDownloading || isDownloadPaused) ? (
           <View style={{ alignItems: 'center' }}>
             <UploadRing
-              percent={Math.round((progress || 0) * 100)}
+              percent={Math.max(2, Math.round((progress || 0) * 100))}
               size={48}
               paused={isDownloadPaused}
               onPause={() => handlePauseDownload(msg)}
@@ -4332,7 +4584,11 @@ export default function ChatScreen({ navigation, route }) {
     // Remote https URL (server thumbnail / full media) — the fallback when the
     // local downloaded file is missing or unreadable (common on the iOS
     // simulator after reinstalls, where the app container path goes stale).
-    const remoteImageSource = toSecureMediaUri(getServerThumbnailUrl(msg) || msg?.mediaUrl);
+    // A freshly re-signed URL (set by healExpiredMediaUrl after a 403) wins over
+    // the stored one, which may be an expired signed URL.
+    const healMediaId = getResolvedMediaId(msg);
+    const healedUrl = healMediaId ? resolvedFullUrlRef.current[healMediaId] : null;
+    const remoteImageSource = toSecureMediaUri(healedUrl || getServerThumbnailUrl(msg) || msg?.mediaUrl);
     const localImageSource = toSecureMediaUri(isMyMessage
       ? (msg.localUri || resolveCachedThumbnailUrl(msg) || msg.mediaUrl)
       : (downloadedUri || resolveCachedThumbnailUrl(msg)));
@@ -4342,8 +4598,13 @@ export default function ChatScreen({ navigation, route }) {
       : (localImageSource || remoteImageSource);
     const onImageLoadError = () => {
       if (!failedLocalMedia[messageKey] && remoteImageSource && imageSource !== remoteImageSource) {
+        // Step 1: fall back from the (missing/unreadable) local file to remote.
         setFailedLocalMedia(prev => (prev[messageKey] ? prev : { ...prev, [messageKey]: true }));
+        return;
       }
+      // Step 2: the remote (or only) source also errored — most likely an
+      // expired signed URL. Re-resolve a fresh one once and swap it in.
+      healExpiredMediaUrl(msg);
     };
     const shouldRenderThumbnail = Boolean(imageSource);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
@@ -4404,7 +4665,7 @@ export default function ChatScreen({ navigation, route }) {
           )}
         </Animated.View>
 
-        {isMyMessage && (msg.status === 'sending' || msg.status === 'uploading') && (
+        {isMyMessage && isMediaStillUploading(msg) && (
           <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.25)', alignItems: 'center', justifyContent: 'center' }}>
             <UploadRing
               percent={(sendingProgress || 0.02) * 100}
@@ -4445,6 +4706,7 @@ export default function ChatScreen({ navigation, route }) {
     const downloadedUri = downloaded ? resolveDownloadedUri(msg) : null;
     const status = normalizeDownloadStatus(downloadState?.status);
     const sendingProgress = resolveUploadProgress(msg);
+    const videoStillUploading = isMediaStillUploading(msg);
     const thumbnailSource = toSecureMediaUri(resolveCachedThumbnailUrl(msg));
     const shouldRenderThumbnail = Boolean(thumbnailSource || downloaded);
     const isDownloading = status === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
@@ -4478,15 +4740,23 @@ export default function ChatScreen({ navigation, route }) {
               progress={progress}
             />
           ) : (
-            <View style={[videoStyle, { alignItems: 'center', justifyContent: 'center', backgroundColor: theme.colors.menuBackground }]}>
-              <Ionicons name="videocam-outline" size={34} color={theme.colors.placeHolderTextColor} />
+            // No poster yet (local frame extracting / server thumbnail pending):
+            // frosted blur placeholder — never a bare icon box, so the bubble
+            // keeps its final look while the real thumbnail loads in.
+            <View style={[videoStyle, { alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(120,130,135,0.35)', overflow: 'hidden' }]}>
+              <BlurView
+                intensity={30}
+                tint="dark"
+                experimentalBlurMethod="dimezisBlurView"
+                style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 }}
+              />
             </View>
           )}
         </Animated.View>
 
         {(isMyMessage || downloaded) && (
-          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: isMyMessage && (msg.status === 'sending' || msg.status === 'uploading') ? 'rgba(0,0,0,0.25)' : 'transparent' }}>
-            {isMyMessage && (msg.status === 'sending' || msg.status === 'uploading') ? (
+          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: isMyMessage && videoStillUploading ? 'rgba(0,0,0,0.25)' : 'transparent' }}>
+            {isMyMessage && videoStillUploading ? (
               <UploadRing
                 percent={(sendingProgress || 0.02) * 100}
                 size={48}
@@ -4525,7 +4795,7 @@ export default function ChatScreen({ navigation, route }) {
     const dlStatus = normalizeDownloadStatus(downloadState?.status);
     const downloaded = isMediaDownloaded(msg);
     const sendingProgress = resolveUploadProgress(msg);
-    const isUploading = isMyMessage && (msg.status === 'sending' || msg.status === 'uploading');
+    const isUploading = isMyMessage && isMediaStillUploading(msg);
     const mediaInfo = resolveMediaInfo(msg);
     const msgKey = msg?.serverMessageId || msg?.id || msg?.tempId;
     const isThisPlaying = playingAudioId === msgKey;
@@ -4748,7 +5018,7 @@ export default function ChatScreen({ navigation, route }) {
         <View style={{ width: 42, height: 42, borderRadius: 10, backgroundColor: fileIconColor + '20', alignItems: 'center', justifyContent: 'center' }}>
           {isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled')
             ? <Ionicons name="refresh" size={24} color={fileIconColor} />
-            : isMyMessage && (msg.status === 'sending' || msg.status === 'uploading')
+            : isMyMessage && isMediaStillUploading(msg)
             ? <UploadRing
                 percent={(sendingProgress || 0.02) * 100}
                 size={38}
@@ -6904,7 +7174,9 @@ export default function ChatScreen({ navigation, route }) {
                 right: 0,
                 top: 0,
                 bottom: 0,
-                backgroundColor: 'rgba(0, 0, 0, 0.38)',
+                // Theme-aware scrim — light mode gets a gentler dim so the
+                // chat doesn't flash dark behind the sheet.
+                backgroundColor: isDarkMode ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0.28)',
                 opacity: mediaBackdropAnim,
               }}
             >
@@ -6914,20 +7186,20 @@ export default function ChatScreen({ navigation, route }) {
               />
             </Animated.View>
 
+            {/* WhatsApp-style FLOATING card: rounded on all corners with a
+                margin off the screen edges, sliding up as one solid piece. */}
             <Animated.View
               {...mediaPanelPanResponder.panHandlers}
               style={{
                 position: 'absolute',
-                bottom: 0,
-                left: 0,
-                right: 0,
+                bottom: Platform.OS === 'ios' ? 24 : 10,
+                left: 8,
+                right: 8,
                 alignSelf: 'center',
                 maxWidth: 640,
-                width: '100%',
-                borderTopLeftRadius: 26,
-                borderTopRightRadius: 26,
+                borderRadius: 24,
                 overflow: 'hidden',
-                backgroundColor: theme.colors.cardBackground,
+                backgroundColor: isDarkMode ? theme.colors.surface : theme.colors.cardBackground,
                 transform: [{ translateY: mediaSheetAnim }],
                 shadowColor: '#000',
                 shadowOpacity: isDarkMode ? 0.45 : 0.18,
@@ -6947,7 +7219,9 @@ export default function ChatScreen({ navigation, route }) {
                   flexWrap: 'wrap',
                   paddingHorizontal: 8,
                   paddingTop: 14,
-                  paddingBottom: Platform.OS === 'ios' ? 34 : 24,
+                  // Floating card clears the home bar via its own bottom
+                  // margin — no oversized inner padding needed.
+                  paddingBottom: 20,
                   rowGap: 22,
                 }}
               >
@@ -6961,9 +7235,11 @@ export default function ChatScreen({ navigation, route }) {
                         width: '25%',
                         alignItems: 'center',
                         opacity: entry,
+                        // Gentle fade + rise only — the old 0.45→1 scale pop
+                        // made the grid look like it was fluctuating on open.
                         transform: [
-                          { scale: Animated.multiply(press, entry.interpolate({ inputRange: [0, 1], outputRange: [0.45, 1] })) },
-                          { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [14, 0] }) },
+                          { scale: press },
+                          { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) },
                         ],
                       }}
                     >
@@ -6975,7 +7251,15 @@ export default function ChatScreen({ navigation, route }) {
                         accessibilityRole="button"
                         accessibilityLabel={item.label}
                       >
-                        <AttachOptionDisc color={item.color} icon={item.icon} size={56} bg={theme.colors.surface} />
+                        <AttachOptionDisc
+                          color={item.color}
+                          icon={item.icon}
+                          size={56}
+                          // Disc contrasts with the sheet in BOTH modes: dark
+                          // sheet (surface) gets darker discs (card), light
+                          // sheet (card/white) gets soft gray discs (surface).
+                          bg={isDarkMode ? theme.colors.cardBackground : theme.colors.surface}
+                        />
                         <Text
                           style={{
                             marginTop: 8,
@@ -7129,9 +7413,15 @@ export default function ChatScreen({ navigation, route }) {
                       {page.type === 'video' ? (
                         index === localMediaViewer.albumIndex ? (
                           <Video
+                            ref={ref => { videoRefs.current[page.uri] = ref; }}
                             source={{ uri: toSecureMediaUri(page.uri) }}
                             style={{ width: '100%', height: '100%' }}
-                            useNativeControls
+                            // iOS keeps native controls (they respect the home
+                            // indicator); Android uses the custom bar below so the
+                            // controls sit ABOVE the navigation buttons.
+                            useNativeControls={Platform.OS === 'ios'}
+                            onPlaybackStatusUpdate={Platform.OS === 'android' ? onViewerVideoStatus : undefined}
+                            progressUpdateIntervalMillis={250}
                             resizeMode={ResizeMode.CONTAIN}
                             shouldPlay
                           />
@@ -7202,12 +7492,31 @@ export default function ChatScreen({ navigation, route }) {
                     ref={ref => { videoRefs.current[localMediaViewer.uri] = ref; }}
                     source={{ uri: toSecureMediaUri(localMediaViewer.uri) }}
                     style={{ width: '100%', height: '100%' }}
-                    useNativeControls
+                    // iOS: native controls (respect the home indicator). Android:
+                    // custom bar below, lifted above the navigation buttons.
+                    useNativeControls={Platform.OS === 'ios'}
+                    onPlaybackStatusUpdate={Platform.OS === 'android' ? onViewerVideoStatus : undefined}
+                    progressUpdateIntervalMillis={250}
                     resizeMode={ResizeMode.CONTAIN}
                     shouldPlay
                   />
                 )}
               </>
+            )}
+
+            {/* ── Android custom video control bar (above the nav bar) ──
+                Only on Android + when the current item is a video. iOS keeps the
+                native controls, which already sit above the home indicator. */}
+            {Platform.OS === 'android' && localMediaViewer.type === 'video' && viewerVideoStatus.isLoaded && (
+              <VideoViewerControls
+                isPlaying={viewerVideoStatus.isPlaying}
+                positionMillis={viewerVideoStatus.positionMillis}
+                durationMillis={viewerVideoStatus.durationMillis}
+                onTogglePlay={viewerTogglePlay}
+                onSeek={viewerSeek}
+                insetsBottom={insets.bottom}
+                accent={theme.colors.themeColor}
+              />
             )}
 
             {/* ── Save/share fetch progress: ring with REAL byte progress.

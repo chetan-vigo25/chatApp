@@ -84,14 +84,13 @@ export default function CallOverlay() {
   const connecting = accepted
     && status !== CALL_STATUS.ACTIVE
     && status !== CALL_STATUS.ENDED;
-  // WhatsApp UX: the TIMER shows the moment either side answers (answeredAt is
-  // stamped at accept on both sides), not only when remote media lands — the
-  // accepted→media gap no longer flashes "Connecting…" at the user. This is a
-  // PRESENTATION change only: the state machine stays media-driven (ACTIVE =
-  // real media, per the media-driven rule), the 30s connect watchdog still
-  // fails the call honestly if media never arrives, and a mid-call drop still
-  // replaces the timer with "Reconnecting…".
-  const timerRunning = (mediaConnected || (accepted && !!call?.answeredAt))
+  // The TIMER starts only once the connection is COMPLETE (remote media
+  // flowing → status ACTIVE, counted from connectedAt). The accepted→media gap
+  // (ICE/DTLS, 1-8s on weak networks) shows "Connecting…" instead of a silent
+  // running timer — a ticking timer with no audio reads as "call is broken".
+  // The 30s connect watchdog still fails the call honestly if media never
+  // arrives, and a mid-call drop replaces the timer with "Reconnecting…".
+  const timerRunning = mediaConnected
     && status !== CALL_STATUS.ENDED
     && !call?.reconnecting;
   // Show the incoming Accept/Decline card only until the user answers.
@@ -209,10 +208,9 @@ export default function CallOverlay() {
     if (call?.reconnecting && status !== CALL_STATUS.ENDED && call?.answeredAt) {
       return 'Reconnecting…';
     }
-    // Answered but remote media hasn't arrived: the running TIMER (timerRunning)
-    // covers this gap now — "Connecting…" only remains as a defensive fallback
-    // for an accepted call that somehow has no answeredAt to count from. A call
-    // that never connects still fails via the connect watchdog.
+    // Answered but remote media hasn't arrived — the media path (ICE/DTLS,
+    // TURN fallback on strict networks) is still forming. A call that never
+    // connects still fails via the connect watchdog.
     if (connecting && !timerRunning) return 'Connecting…';
     if (status === CALL_STATUS.OUTGOING) {
       if (isGroup) return call?.callId ? 'Ringing…' : 'Calling group…';
@@ -246,7 +244,7 @@ export default function CallOverlay() {
         media={call?.media}
         statusText={subtitle || ''}
         showTimer={timerRunning}
-        answeredAt={call?.answeredAt}
+        answeredAt={call?.connectedAt || call?.answeredAt}
         micOn={call?.micOn}
         onToggleMic={toggleMic}
         onExpand={maximize}
@@ -275,7 +273,7 @@ export default function CallOverlay() {
             {isGroup ? (
               <Text style={styles.videoSub}>{joined + 1} in call</Text>
             ) : timerRunning ? (
-              <CallTimer startMs={call?.answeredAt} />
+              <CallTimer startMs={call?.connectedAt || call?.answeredAt} />
             ) : (
               <Text style={styles.videoSub}>{subtitle}</Text>
             )}
@@ -374,7 +372,7 @@ export default function CallOverlay() {
               />
             </View>
             {timerRunning ? (
-              <CallTimer startMs={call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
+              <CallTimer startMs={call?.connectedAt || call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
             ) : null}
           </View>
 
@@ -435,7 +433,7 @@ export default function CallOverlay() {
           <View style={styles.header}>
             <Text style={[styles.headerName, { color: onBg }]} numberOfLines={1}>{peerDisplayName}</Text>
             {timerRunning ? (
-              <CallTimer startMs={call?.answeredAt} style={[styles.headerStatus, { color: onBgSoft }]} />
+              <CallTimer startMs={call?.connectedAt || call?.answeredAt} style={[styles.headerStatus, { color: onBgSoft }]} />
             ) : (
               <Text style={[styles.headerStatus, { color: onBgSoft }]}>
                 {subtitle || (isVideo ? 'Video call' : 'Voice call')}

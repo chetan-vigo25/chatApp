@@ -130,6 +130,8 @@
       "./plugins/withNotificationServiceExtension",
       "./plugins/withIosVoip",
       "./plugins/withIosPrivacyScreen",
+      "./plugins/withSplashNoFlash",
+      "./plugins/withFmtConstevalFix",
       [
         "@config-plugins/react-native-webrtc",
         {

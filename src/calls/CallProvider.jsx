@@ -166,7 +166,11 @@ export const getBlockRelation = (peerId) => {
 
 export const CallProvider = ({ children }) => {
   const { user, isAuthenticated } = useAuth();
-  const myId = user?._id ? String(user._id) : null;
+  // Stored user shape varies by login era/platform (_id vs id vs userId) —
+  // an iOS build hit "missing user identity" because the persisted user
+  // object had no `_id`, so never depend on a single field name here.
+  const rawMyId = user?._id || user?.id || user?.userId || null;
+  const myId = rawMyId ? String(rawMyId) : null;
   const myName = user?.fullName || user?.name || '';
 
   const [state, dispatch] = useReducer(callReducer, initialCallState);
@@ -221,6 +225,12 @@ export const CallProvider = ({ children }) => {
   // Ids of the call that JUST ended — the engine's offline-redial/re-invite loop
   // can deliver a late 'incoming' for it; auto-decline instead of ghost-re-ringing.
   const recentEndedRef = useRef({ ids: [], ts: 0 });
+  // Synchronous record of the ring we JUST staged from the app-socket signal.
+  // React state (stateRef) lags the INCOMING dispatch by a tick — the engine's
+  // own 'incoming' for the same call can land inside that gap and read a stale
+  // IDLE, making the provider stage a duplicate instead of reconciling the
+  // engine callId (accept then hangs on pendingAccept — "Connecting…" forever).
+  const stagedIncomingRef = useRef({ peerId: null, ts: 0 });
   const pushAcceptPendingRef = useRef(false); // Accept tapped on a call push → answer once INCOMING is committed
   // The call THIS device just accepted (id + ts). A `call:cancelled-elsewhere`
   // with reason answered_elsewhere for this same call is our OWN win echoing on
@@ -347,8 +357,9 @@ export const CallProvider = ({ children }) => {
       callerName: label,
       callerImage: s.isGroup ? null : (s.peer?.avatar || null),
       callType: s.media === 'video' ? 'video' : 'audio',
-      // 0 while ringing → native shows "Calling…" with no duration timer.
-      startedAt: s.answeredAt || 0,
+      // 0 until media is CONNECTED → native shows "Calling…" with no duration
+      // timer; the timer starts at connectedAt, matching the in-app UI.
+      startedAt: s.connectedAt || 0,
       state: ringing ? 'ringing' : 'ongoing',
     };
   }, []);
@@ -379,7 +390,7 @@ export const CallProvider = ({ children }) => {
   }, [
     showOngoingNotif, buildOngoingPayload,
     state.signalId, state.callId, state.isGroup, state.direction, state.status,
-    state.groupName, state.peer, state.media, state.answeredAt,
+    state.groupName, state.peer, state.media, state.answeredAt, state.connectedAt,
   ]);
 
   // Self-heal: if the FGS start was rejected because the call only reached us while
@@ -804,11 +815,12 @@ export const CallProvider = ({ children }) => {
         pendingConnectRef.current = { token, url: callBaseUrl, userId: myId, name: myName, iceServers: iceServers || null };
         return;
       }
+      if (!myId) console.warn('[CALL][APP] CONNECT without local userId — engine will fall back to token sub', { userKeys: user ? Object.keys(user) : null });
       sendCmd({ cmd: CMD.CONNECT, token, url: callBaseUrl, userId: myId, name: myName, iceServers: iceServers || null });
     } catch (_) {
       connectingRef.current = false;
     }
-  }, [sendCmd, myId, myName]);
+  }, [sendCmd, myId, myName, user]);
 
   // Probe the engine's ACTUAL liveness (SDK instance + connected socket). A
   // parked WebView's renderer can be killed and the page reloaded, or the engine
@@ -1008,6 +1020,7 @@ export const CallProvider = ({ children }) => {
     pushAcceptPendingRef.current = false;
     nativeEndPendingRef.current = 0;
     myAcceptedCallRef.current = { id: null, ts: 0 };
+    stagedIncomingRef.current = { peerId: null, ts: 0 };
     clearRingTimeout();
     clearMediaWatchdog();
     clearConnectWatchdog();
@@ -1132,7 +1145,11 @@ export const CallProvider = ({ children }) => {
       // synthesized local id for an outgoing call cancelled before any id exists.
       const callId = snap.signalId || snap.callId
         || `local_${snap.direction || 'out'}_${snap.startedAt || Date.now()}`;
-      const durationSec = snap.answeredAt ? Math.max(0, Math.round((Date.now() - snap.answeredAt) / 1000)) : 0;
+      // Talk time counts from CONNECT (remote media), not accept — the ICE
+      // connecting gap is not conversation. answeredAt stays the fallback for
+      // logs from older sessions that never stamped connectedAt.
+      const durationStartMs = snap.connectedAt || snap.answeredAt;
+      const durationSec = durationStartMs ? Math.max(0, Math.round((Date.now() - durationStartMs) / 1000)) : 0;
       const isGroup = !!snap.isGroup;
       const participantIds = (snap.peers || []).map((p) => p.id).filter(Boolean);
       const chatId = isGroup ? null : (snap.chatId || deriveChatId(myId, snap.peer.id));
@@ -1458,8 +1475,18 @@ export const CallProvider = ({ children }) => {
         // Reconcile: the call socket already raised this incoming (we showed the
         // ringing UI from the backend `call:incoming` signal). This WebRTC event
         // carries the real callId needed to accept. Same logical call if we're
-        // INCOMING and awaiting the engine, or the caller matches.
-        if (snap.status === CALL_STATUS.INCOMING && (snap.awaitingEngine || (snap.peer?.id && String(payload?.from?.id) === String(snap.peer.id)))) {
+        // INCOMING and awaiting the engine, or the caller matches. ALSO honour
+        // the SYNCHRONOUS staged marker: stateRef can still read IDLE for a tick
+        // after the signal's INCOMING dispatch — without this, the engine event
+        // fell through to fresh staging, its dispatch was dropped by the reducer
+        // busy-guard, and the callId was lost (accept stuck on pendingAccept).
+        const stagedFresh = !payload?.isGroup
+          && stagedIncomingRef.current.peerId
+          && payload?.from?.id != null
+          && String(payload.from.id) === String(stagedIncomingRef.current.peerId)
+          && (Date.now() - stagedIncomingRef.current.ts) < 45000;
+        if ((snap.status === CALL_STATUS.INCOMING || stagedFresh)
+          && (snap.awaitingEngine || stagedFresh || (snap.peer?.id && String(payload?.from?.id) === String(snap.peer.id)))) {
           const realId = payload?.callId || null;
           if (__DEV__) console.log('[CALL] WebRTC incoming reconciled', { realId, pendingAccept: snap.pendingAccept });
           dispatch({ type: ACT.RECONCILE_CALLID, callId: realId, peer: payload?.from?.name ? { name: payload.from.name } : null });
@@ -1550,6 +1577,16 @@ export const CallProvider = ({ children }) => {
         clearReconnectWatchdog(); // a rejoined peer's fresh stream ends any "reconnecting" hold
         stopRinging();
         applyInitialCallRoute(); // earpiece for 1:1 voice, speaker only if speakerOn (once per call)
+        // Delayed route re-assert (belt to the audioResumed hook): the audio
+        // unit/element starts a beat after 'stream', and a route applied before
+        // it exists intermittently lands dead ("no audio until Speaker toggle").
+        // Idempotent + self-gated to a live answered call.
+        setTimeout(() => {
+          const cur = stateRef.current;
+          if (cur.status === CALL_STATUS.ACTIVE && !cur.reconnecting) {
+            actionsRef.current.reassertSpeakerRoute && actionsRef.current.reassertSpeakerRoute();
+          }
+        }, 1200);
         const snap = stateRef.current;
         if (snap.reconnecting) dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: false });
         const peerId = payload?.peerId ? String(payload.peerId) : null;
@@ -1685,6 +1722,14 @@ export const CallProvider = ({ children }) => {
         if (stateRef.current.needsUnmuteGesture) {
           dispatch({ type: ACT.NEEDS_UNMUTE, value: false });
         }
+        // Route re-assert at the exact moment audio starts (observed live:
+        // "no audio until the user toggles Speaker"). The initial route is
+        // applied at 'stream', but the audio unit/element often starts a beat
+        // LATER — a route applied before the audio path exists can land on a
+        // dead/inactive output, and the manual Speaker toggle "fixed" it only
+        // because it re-applied the same route. Do that re-apply automatically.
+        // Idempotent: the button stays the single source of truth.
+        actionsRef.current.reassertSpeakerRoute && actionsRef.current.reassertSpeakerRoute();
         break;
       }
       case 'presence': {
@@ -2572,6 +2617,7 @@ export const CallProvider = ({ children }) => {
     const notificationOnly = Platform.OS === 'android'
       && !opts.fromAccept && !fullScreenLaunch
       && !(AppState.currentState === 'active' && isDeviceLockedNow());
+    stagedIncomingRef.current = { peerId: isGroup ? null : callerId, ts: Date.now() };
     dispatch({
       type: ACT.INCOMING,
       callId: null,                       // WebRTC id arrives via the engine
@@ -3250,8 +3296,22 @@ export const CallProvider = ({ children }) => {
         // answerIncomingCall (in-app accept), or a stale replay. Arming the
         // pending flag here would auto-accept the NEXT incoming call.
       },
-      onEnd: () => {
+      onEnd: (endedCallId) => {
         const snap = stateRef.current;
+        // Id-aware guard (observed live): the CXEndCallAction echoes from the
+        // PREVIOUS call's finalizeEnd (endCall/endAllCalls) land 1-2s later —
+        // by then a NEW call from the same peer can already be ringing. The
+        // status checks below can't tell that echo from a real End tap on the
+        // new ring ("accept karte hi declined"), but the ids can: an end event
+        // carrying a callId that is NOT the current call's is a ghost — ignore.
+        // A null id (cold-start end before any mapping) keeps the old handling.
+        if (endedCallId) {
+          const ids = [snap.signalId, snap.callId].filter(Boolean).map(String);
+          if (ids.length && !ids.includes(String(endedCallId))) {
+            if (__DEV__) console.log('[CALL][APP] native end for a DIFFERENT call — ignored', { endedCallId, ids });
+            return;
+          }
+        }
         if (snap.status === CALL_STATUS.INCOMING) { actionsRef.current.reject && actionsRef.current.reject(); return; }
         // ENDED = the echo of OUR OWN teardown: finalizeEnd's endCall/endAllCalls
         // file CXEndCallActions whose 'endCall' events bounce back here after the

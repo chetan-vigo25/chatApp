@@ -76,6 +76,10 @@ export const initialCallState = {
   endReason: null,       // 'completed'|'rejected'|'cancelled'|'missed'|'failed'
   startedAt: null,
   answeredAt: null,
+  // First moment REAL remote media arrived (REMOTE_JOINED/PARTICIPANT_JOINED).
+  // The call timer counts from HERE, not from answeredAt — the accepted→media
+  // gap (ICE/DTLS, 1-8s on weak networks) must not be billed as talk time.
+  connectedAt: null,
   endedAt: null,
   errorMessage: null,
 };
@@ -169,6 +173,24 @@ export function callReducer(state, action) {
         callId, signalId, awaitingEngine, peer, peers, media, chatId, isGroup, groupId, groupName, nowMs,
         notificationOnly,
       } = action;
+      // Same-caller duplicate while ALREADY ringing = the sibling of the ring we
+      // staged (app-socket signal and engine 'incoming' land within ms of each
+      // other; the provider's stateRef can lag the first dispatch and stage
+      // instead of reconciling). MERGE the ids instead of dropping the action —
+      // dropping lost the engine callId, which left accept stuck on
+      // pendingAccept forever ("Connecting…" until the caller gave up).
+      if (state.status === CALL_STATUS.INCOMING
+          && !isGroup && !state.isGroup
+          && action.peer && state.peer
+          && String(action.peer.id) === String(state.peer.id)) {
+        const mergedCallId = state.callId || action.callId || null;
+        return {
+          ...state,
+          callId: mergedCallId,
+          signalId: state.signalId || action.signalId || null,
+          awaitingEngine: mergedCallId ? false : state.awaitingEngine,
+        };
+      }
       // Ignore a second incoming while busy.
       if (state.status !== CALL_STATUS.IDLE && state.status !== CALL_STATUS.ENDED) return state;
       const list = (peers && peers.length ? peers : (peer ? [peer] : [])).filter((p) => p && p.id);
@@ -225,6 +247,7 @@ export function callReducer(state, action) {
         status: CALL_STATUS.ACTIVE,
         remoteJoined: true,
         answeredAt: state.answeredAt || action.nowMs || null,
+        connectedAt: state.connectedAt || action.nowMs || null,
       };
     }
     case ACT.PARTICIPANT_JOINED: {
@@ -240,6 +263,7 @@ export function callReducer(state, action) {
         status: CALL_STATUS.ACTIVE,
         remoteJoined: true,
         answeredAt: state.answeredAt || action.nowMs || null,
+        connectedAt: state.connectedAt || action.nowMs || null,
         participants: {
           ...state.participants,
           [id]: {

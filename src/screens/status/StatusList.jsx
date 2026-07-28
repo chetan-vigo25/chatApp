@@ -6,8 +6,8 @@ import {
 import { useFocusEffect } from '@react-navigation/native';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
-import { fetchMyStatuses, fetchStatusFeed, addNewStatusFromSocket, removeStatusFromSocket, hydrateViewedStatusIds, fetchBroadcasts, hydrateBroadcasts, removeBroadcastFromSocket } from '../../Redux/Reducer/Status/Status.reducer';
-import { getSocket } from '../../Redux/Services/Socket/socket';
+import { fetchMyStatuses, fetchStatusFeed, hydrateViewedStatusIds, fetchBroadcasts, hydrateBroadcasts } from '../../Redux/Reducer/Status/Status.reducer';
+import { ensureStatusSocketListeners } from '../../services/statusSocketWiring';
 import { Ionicons, MaterialCommunityIcons, Feather } from '@expo/vector-icons';
 import SegmentedRing from '../../components/SegmentedRing';
 import { STATUS_ACCENT } from './_statusDesign';
@@ -29,8 +29,11 @@ function StatusThumb({ status, style }) {
   const firstItem  = status.mediaItems?.[0] || null;
   const statusType = firstItem?.mediaType || status.mediaType || status.type
     || (status.textContent ? 'text' : null);
+  // Video: NEVER fall back to mediaUrl — an .mp4 in <Image> paints black AND
+  // downloads the full video for a 56px ring. Image fallback stays (legacy
+  // statuses without server thumbs; new uploads all get a 320px webp thumb).
   const thumbUrl   = firstItem?.thumbnailUrl || status.thumbnailUrl
-    || firstItem?.mediaUrl || status.mediaUrl || null;
+    || (statusType !== 'video' ? (firstItem?.mediaUrl || status.mediaUrl) : null) || null;
 
   if ((statusType === 'image' || statusType === 'video') && thumbUrl) {
     return <Image source={{ uri: toSecureMediaUri(thumbUrl) }} style={[style, styles.thumbCover]} />;
@@ -113,7 +116,6 @@ export default function StatusList({ navigation }) {
   const { myStatuses, contactStatuses, viewedStatusIds, broadcasts, isLoading } = useSelector(state => state.status);
   const { user } = useSelector(state => state.authentication);
   const [refreshing, setRefreshing] = useState(false);
-  const socketListenerRef = useRef(null);
   const { resolveName, refresh: refreshContacts } = useContactDirectory();
 
   const loadData = useCallback(() => {
@@ -148,46 +150,10 @@ export default function StatusList({ navigation }) {
     setRefreshing(false);
   }, [dispatch, refreshContacts]);
 
-  // ── Socket: real-time status:new / status:deleted ──────────────────────────
+  // ── Socket: real-time status/broadcast events (shared, refcounted wiring —
+  //    one listener set app-wide instead of one per mounted component) ────────
   useEffect(() => {
-    const attachListeners = () => {
-      const socket = getSocket?.();
-      if (!socket || socketListenerRef.current === socket) return;
-
-      const onStatusNew = (payload) => {
-        // Admin broadcasts arrive on the same `status:new` channel but flagged.
-        if (payload?.isBroadcast || payload?.isOfficial || payload?.isAdminBroadcast) {
-          dispatch(fetchBroadcasts());
-          return;
-        }
-        dispatch(addNewStatusFromSocket(payload));
-      };
-      const onStatusDeleted = (payload) => dispatch(removeStatusFromSocket(payload));
-
-      // Dedicated official-broadcast channels
-      const onBroadcastNew = () => dispatch(fetchBroadcasts());
-      const onBroadcastUpdated = () => dispatch(fetchBroadcasts());
-      const onBroadcastDeleted = (payload) => dispatch(removeBroadcastFromSocket(payload));
-
-      socket.on('status:new', onStatusNew);
-      socket.on('status:deleted', onStatusDeleted);
-      socket.on('broadcast:new', onBroadcastNew);
-      socket.on('broadcast:updated', onBroadcastUpdated);
-      socket.on('broadcast:deleted', onBroadcastDeleted);
-      socketListenerRef.current = socket;
-
-      return () => {
-        socket.off('status:new', onStatusNew);
-        socket.off('status:deleted', onStatusDeleted);
-        socket.off('broadcast:new', onBroadcastNew);
-        socket.off('broadcast:updated', onBroadcastUpdated);
-        socket.off('broadcast:deleted', onBroadcastDeleted);
-      };
-    };
-
-    const cleanup = attachListeners();
-    const interval = setInterval(() => { if (!socketListenerRef.current) attachListeners(); }, 2000);
-    return () => { clearInterval(interval); if (cleanup) cleanup(); socketListenerRef.current = null; };
+    return ensureStatusSocketListeners(dispatch);
   }, [dispatch]);
   // ──────────────────────────────────────────────────────────────────────────
 

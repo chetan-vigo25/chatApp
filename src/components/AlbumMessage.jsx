@@ -1,7 +1,9 @@
 import React, { useMemo, useState, useRef, useCallback, useEffect } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { BlurView } from 'expo-blur';
 import { toSecureMediaUri, mediaResolve } from '../utils/mediaService';
+import { generateLocalVideoThumbnail } from '../utils/thumbnailGenerator';
 import useMediaDownload from '../hooks/useMediaDownload';
 import UploadRing from './UploadRing';
 import BlurGateImage from './BlurGateImage';
@@ -97,8 +99,25 @@ function Tile({
   const [resolvedThumb, setResolvedThumb] = useState(
     () => (mediaId && videoThumbCache.get(mediaId)) || null,
   );
+
+  // Video with the file ON DEVICE but no poster (localThumbUri lost to an ack
+  // merge / reload, or sent by an old build): extract the frame locally —
+  // instant and offline; beats a network resolve round-trip.
+  const [localGenThumb, setLocalGenThumb] = useState(null);
+  const localVideoSrc = isVideo && !item?.localThumbUri && !item?.mediaThumbnailUrl
+    ? [localUri, item?.localUri].find((u) => typeof u === 'string' && /^(file|content):\/\//i.test(u)) || null
+    : null;
   useEffect(() => {
-    if (!isVideo || item?.mediaThumbnailUrl || !mediaId) return undefined;
+    if (!localVideoSrc || localGenThumb) return undefined;
+    let alive = true;
+    generateLocalVideoThumbnail(localVideoSrc)
+      .then((thumb) => { if (alive && thumb) setLocalGenThumb(thumb); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [localVideoSrc, localGenThumb]);
+
+  useEffect(() => {
+    if (!isVideo || item?.mediaThumbnailUrl || item?.localThumbUri || !mediaId) return undefined;
     if (videoThumbCache.has(mediaId)) {
       const cached = videoThumbCache.get(mediaId);
       if (cached) setResolvedThumb(cached);
@@ -122,7 +141,7 @@ function Tile({
   // in <Image> paints black, downloaded or not); images use the local file
   // once present.
   const posterUri = isVideo
-    ? (item?.mediaThumbnailUrl || resolvedThumb || null)
+    ? (item?.localThumbUri || localGenThumb || item?.mediaThumbnailUrl || resolvedThumb || null)
     : (localUri || item?.mediaThumbnailUrl || item?.mediaUrl || null);
   const source = posterUri ? toSecureMediaUri(posterUri) : null;
 
@@ -132,6 +151,8 @@ function Tile({
     filename: item?.mediaMeta?.fileName || mediaId || `${index}`,
     mediaUrl: item?.mediaUrl || null,
     messageId,
+    // Ring math fallback for responses without Content-Length.
+    fileSize: Number(item?.mediaMeta?.fileSize || 0) || null,
   };
 
   // Report live state up so the album can render ONE aggregate ring.
@@ -181,12 +202,34 @@ function Tile({
           paused={downloadPaused}
           progress={Math.min(100, Number(progress || 0)) / 100}
         />
+      ) : isVisual(item) ? (
+        // Image/video with NO poster yet (local frame still extracting, or a
+        // legacy row awaiting the server thumbnail): a soft frosted placeholder
+        // instead of a filename tile — the real thumbnail swaps in when ready.
+        <View style={styles.blurTile}>
+          <BlurView
+            intensity={30}
+            tint="dark"
+            experimentalBlurMethod="dimezisBlurView"
+            style={StyleSheet.absoluteFill}
+          />
+          {/* Video tiles that are `available` already get a play glyph from
+              TileOverlay — don't double it up. */}
+          {!(available && item.fileCategory === 'video') && (
+            <View style={styles.blurGlyph}>
+              <Ionicons
+                name={item.fileCategory === 'video' ? 'play' : 'image'}
+                size={18}
+                color="rgba(255,255,255,0.9)"
+                style={item.fileCategory === 'video' ? styles.playIcon : null}
+              />
+            </View>
+          )}
+        </View>
       ) : (
         <View style={styles.fileTile}>
           <Ionicons
-            name={item.fileCategory === 'audio' ? 'musical-notes'
-              : item.fileCategory === 'video' ? 'videocam'
-              : 'document-text'}
+            name={item.fileCategory === 'audio' ? 'musical-notes' : 'document-text'}
             size={22}
             color="rgba(255,255,255,0.85)"
           />
@@ -462,6 +505,21 @@ const styles = StyleSheet.create({
   tileImage: {
     width: '100%',
     height: '100%',
+  },
+  blurTile: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(120,130,135,0.35)',
+    overflow: 'hidden',
+  },
+  blurGlyph: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   fileTile: {
     flex: 1,

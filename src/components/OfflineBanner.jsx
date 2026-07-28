@@ -1,23 +1,24 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Animated, Text, StyleSheet } from 'react-native';
+import { Animated, Easing, Text, View, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { useNetwork } from '../contexts/NetworkContext';
 
 // WhatsApp-style connectivity strip.
 //
-// Replaces the old full-screen NoInternet overlay that unmounted/covered the
-// chat UI when offline. This is a slim, NON-BLOCKING banner pinned under the
-// status bar: `pointerEvents="none"` lets every touch pass through to the
-// cached chats behind it, so the user keeps scrolling the list and opening
-// chats (all served from SQLite) while offline.
+// IN-FLOW (not an absolute overlay): rendered ABOVE RootNavigator in
+// AppContent's column, its animated HEIGHT pushes the whole app UI down —
+// the old absolute version sat ON TOP of the status bar + screen headers and
+// visually collapsed/covered them while offline. `pointerEvents="none"` keeps
+// every touch working; cached chats (SQLite) stay fully usable offline.
 //
 // Debounce: raw NetInfo `isConnected` flaps during request bursts. We only
 // paint "No internet connection" after the network has been DOWN for a grace
 // period (SHOW_DELAY), so transient blips never flash the strip. On reconnect
-// we show a brief "Connecting…" then auto-hide (HIDE_DELAY).
+// we show a brief teal "Connecting…" then smoothly collapse (HIDE_DELAY).
 const SHOW_DELAY = 2000;
-const HIDE_DELAY = 1200;
+const HIDE_DELAY = 1400;
+const STRIP_HEIGHT = 30;
 
 export default function OfflineBanner() {
   const { theme, isDarkMode } = useTheme();
@@ -27,7 +28,10 @@ export default function OfflineBanner() {
   // 'hidden' | 'offline' | 'connecting'
   const [state, setState] = useState('hidden');
   const timerRef = useRef(null);
-  const anim = useRef(new Animated.Value(0)).current;
+  // Animates the container HEIGHT (0 → status inset + strip) so the app UI
+  // slides down/up with the banner instead of being covered by it.
+  const heightAnim = useRef(new Animated.Value(0)).current;
+  const targetHeight = (insets.top || 0) + STRIP_HEIGHT;
 
   useEffect(() => {
     if (timerRef.current) {
@@ -54,25 +58,14 @@ export default function OfflineBanner() {
   }, [isConnected]);
 
   useEffect(() => {
-    Animated.timing(anim, {
-      toValue: state === 'hidden' ? 0 : 1,
-      duration: 200,
-      useNativeDriver: true,
+    // Height animates on the JS driver (layout prop) — smooth ease both ways.
+    Animated.timing(heightAnim, {
+      toValue: state === 'hidden' ? 0 : targetHeight,
+      duration: 260,
+      easing: state === 'hidden' ? Easing.in(Easing.cubic) : Easing.out(Easing.cubic),
+      useNativeDriver: false,
     }).start();
-  }, [state, anim]);
-
-  // Keep it mounted through the fade-out; nothing to render once fully hidden.
-  const [rendered, setRendered] = useState(false);
-  useEffect(() => {
-    if (state !== 'hidden') {
-      setRendered(true);
-      return undefined;
-    }
-    const id = setTimeout(() => setRendered(false), 220);
-    return () => clearTimeout(id);
-  }, [state]);
-
-  if (!rendered) return null;
+  }, [state, targetHeight, heightAnim]);
 
   const isConnecting = state === 'connecting';
   const backgroundColor = isConnecting
@@ -80,38 +73,42 @@ export default function OfflineBanner() {
     : (isDarkMode ? '#2A2A2A' : '#4A4A4A');
   const label = isConnecting ? 'Connecting…' : 'No internet connection';
 
+  // NOTE: no paddingTop on the animated container — in Yoga, padding acts as a
+  // MINIMUM size for the node, so `height: 0` + `paddingTop: insets.top` still
+  // rendered an insets.top-tall empty strip while hidden, pushing the whole app
+  // (headers, logo) down. Instead the label lives in an inner strip pinned to
+  // the BOTTOM of the container; the status-bar inset area is pure backdrop and
+  // the container truly collapses to 0 when hidden.
   return (
     <Animated.View
       pointerEvents="none"
       style={[
         styles.container,
         {
-          paddingTop: insets.top,
+          height: heightAnim,
           backgroundColor,
-          opacity: anim,
-          transform: [
-            {
-              translateY: anim.interpolate({
-                inputRange: [0, 1],
-                outputRange: [-8, 0],
-              }),
-            },
-          ],
         },
       ]}
     >
-      <Text style={styles.text}>{label}</Text>
+      {state !== 'hidden' ? (
+        <View style={styles.strip}>
+          <Text style={styles.text} numberOfLines={1}>{label}</Text>
+        </View>
+      ) : null}
     </Animated.View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
+    overflow: 'hidden',
+  },
+  strip: {
     position: 'absolute',
-    top: 0,
     left: 0,
     right: 0,
-    zIndex: 999,
+    bottom: 0,
+    height: STRIP_HEIGHT,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -119,6 +116,5 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 13,
     fontFamily: 'Roboto-Medium',
-    paddingVertical: 5,
   },
 });

@@ -497,25 +497,55 @@ export default function ChatList({ navigation }) {
   useFocusEffect(
     useCallback(() => {
       let active = true;
-      (async () => {
-        try {
-          const registered = await ContactDatabase.loadRegisteredContacts();
-          if (!active) return;
-          const map = {};
-          for (const c of registered) {
-            if (!c?.userId) continue;
-            const fullName = String(c.fullName || c.name || '').trim();
-            if (!fullName) continue;
-            map[String(c.userId)] = { fullName, profileImage: c.profileImage || c.profilePicture || null };
-          }
-          if (isSameContactMap(_contactMapCache, map)) return;
-          _contactMapCache = map;
-          setContactMap(map);
-        } catch (err) {
-          if (active && !_contactMapCache) setContactMap({});
+      let retryTimer = null;
+
+      const loadOnce = async () => {
+        const registered = await ContactDatabase.loadRegisteredContacts();
+        const map = {};
+        for (const c of registered || []) {
+          if (!c?.userId) continue;
+          const fullName = String(c.fullName || c.name || '').trim();
+          if (!fullName) continue;
+          map[String(c.userId)] = { fullName, profileImage: c.profileImage || c.profilePicture || null };
         }
-      })();
-      return () => { active = false; };
+        return map;
+      };
+
+      // COLD-START RACE FIX ("kabhi name, kabhi number"): on a cold open the
+      // ContactDatabase can still be initializing/syncing — the old one-shot
+      // read landed on an EMPTY table, cached {} and never retried, so rows
+      // showed phone numbers until a manual refresh. Retry with backoff until
+      // names arrive (or attempts run out), and NEVER overwrite a non-empty
+      // cached map with a transiently-empty read.
+      const run = async (attempt = 0) => {
+        let map = null;
+        try {
+          map = await loadOnce();
+        } catch { map = null; }
+        if (!active) return;
+
+        const gotNames = map && Object.keys(map).length > 0;
+        const haveNames = _contactMapCache && Object.keys(_contactMapCache).length > 0;
+
+        if (gotNames) {
+          if (!isSameContactMap(_contactMapCache, map)) {
+            _contactMapCache = map;
+            setContactMap(map);
+          }
+          return;
+        }
+        // Empty/failed read while we already have names → keep what we have.
+        if (haveNames) return;
+        // Nothing yet — retry (DB init / first contact sync still running).
+        if (attempt < 5) {
+          retryTimer = setTimeout(() => run(attempt + 1), Math.min(4000, 500 * 2 ** attempt));
+        } else if (!_contactMapCache) {
+          setContactMap({});
+        }
+      };
+
+      run();
+      return () => { active = false; if (retryTimer) clearTimeout(retryTimer); };
     }, [])
   );
 

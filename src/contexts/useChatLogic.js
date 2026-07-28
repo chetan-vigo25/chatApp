@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, AppState, Keyboard, Platform, DeviceEventEmitter } from "react-native";
+import { Alert, AppState, Keyboard, Platform, DeviceEventEmitter, Image } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as FileSystem from 'expo-file-system/legacy';
 import moment from "moment";
@@ -48,7 +48,7 @@ import {
 import DownloadQueue from '../services/DownloadQueue';
 import autoDownloadSettings, { AUTO_DOWNLOAD_ENABLED } from '../services/autoDownloadSettings';
 import { compressImage } from '../utils/mediaCompressor';
-import { generateThumbnail } from '../utils/thumbnailGenerator';
+import { generateThumbnail, generateLocalVideoThumbnail } from '../utils/thumbnailGenerator';
 import { computeFileSha256, MAX_HASH_BYTES } from '../utils/fileHash';
 import SqliteWriter from "../services/SqliteWriter";
 import { pauseBackgroundSyncFor } from "../services/syncPriority";
@@ -538,6 +538,12 @@ export default function useChatLogic({ navigation, route }) {
   // the upload starts (kill-safety), so the reconnect flush must skip rows
   // whose upload is still in flight or it would double-upload them.
   const activeMediaUploadTempIdsRef = useRef(new Set());
+  // Socket payloads for media whose HTTP upload finished but whose realtime
+  // emit hasn't been ack'd yet — keyed by tempId. The delivery watchdog re-emits
+  // from here (idempotent; server dedupes on clientMessageId) instead of showing
+  // a scary Retry for media that is already safely on the server.
+  const pendingMediaEmitRef = useRef({});
+  const mediaReemitTriedRef = useRef(new Set());
   const flushQueuedMediaUploadsRef = useRef(async () => {});
   const mediaStatusInFlightRef = useRef(false);
   const mediaStatusProcessedRef = useRef(new Set());
@@ -1278,9 +1284,13 @@ export default function useChatLogic({ navigation, route }) {
       if (queuedMediaStatusRef.current.length > 0) {
         flushQueuedMediaStatusUpdates();
       }
-      if (queuedMediaUploadsRef.current.length > 0) {
-        flushQueuedMediaUploadsRef.current();
-      }
+      // NOTE: media uploads are intentionally NOT auto-flushed on reconnect.
+      // A NetInfo false→true flap (common while a large video saturates the
+      // radio) used to re-run the whole upload for a media whose bytes were
+      // already on the server — the "same video re-uploads by itself a few
+      // seconds later" duplicate. Media now re-sends ONLY on an explicit Retry
+      // tap (resendMessage), which re-emits already-uploaded media without
+      // re-uploading. Offline-queued media shows 'failed' → user taps Retry.
     } else {
       setUserStatus("offline");
       if (reconnectTimeoutRef.current) {
@@ -1457,10 +1467,13 @@ export default function useChatLogic({ navigation, route }) {
     const fingerprint = deduped.map(m => {
       const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}`;
       if (m.status !== 'sending' && m.status !== 'uploading') return base;
+      // localThumbUri flags: locally extracted video posters land via async
+      // patches on sending rows — without them in the fingerprint the gate
+      // swallows the patch and the tile stays a placeholder until send done.
       const itemsFp = Array.isArray(m.mediaItems)
-        ? m.mediaItems.map(i => `${i.uploadStatus || ''}${Math.round(Number(i.uploadProgress || 0))}`).join('.')
+        ? m.mediaItems.map(i => `${i.uploadStatus || ''}${Math.round(Number(i.uploadProgress || 0))}${i.localThumbUri ? 't' : ''}`).join('.')
         : '';
-      return `${base}:${Math.round(Number(m.uploadProgress || 0))}:${itemsFp}`;
+      return `${base}:${Math.round(Number(m.uploadProgress || 0))}:${m.localThumbUri ? 't' : ''}:${itemsFp}`;
     }).join('|');
     if (fingerprint === lastMessagesFingerprintRef.current) return;
     lastMessagesFingerprintRef.current = fingerprint;
@@ -1858,7 +1871,9 @@ export default function useChatLogic({ navigation, route }) {
             resetIdleTimer();
             flushQueuedManualPresence();
             flushQueuedMediaStatusUpdates();
-            flushQueuedMediaUploadsRef.current();
+            // Media uploads are NOT auto-flushed on chat-init/socket-connect
+            // either — see the reconnect effect above. Manual Retry only, so a
+            // partially-uploaded / failed video never re-uploads on its own.
             presenceCheckInterval.current = setInterval(() => {
               if (isSocketConnected()) requestUserPresence();
               else checkAndReconnectSocket();
@@ -2927,6 +2942,36 @@ export default function useChatLogic({ navigation, route }) {
                 patch = { ...(patch || {}), reactions: prevMsg.reactions };
               }
             }
+
+            // NEVER demote an already-uploaded media message with a stale DB
+            // row. The post-upload permanent row is written through the async
+            // writer queue — a refresh racing that write reads the OLD
+            // optimistic row (no mediaId / items still 'uploading') and the
+            // upload ring + cancel icon flashed back onto a sent bubble for a
+            // moment. Media progress is monotonic: keep the in-memory fields
+            // whenever they are further along than what SQLite returned.
+            const prevMediaId = String(prevMsg.mediaId || '');
+            const dbMediaId = String(m.mediaId || '');
+            if (prevMediaId && !/^temp_/i.test(prevMediaId) && (!dbMediaId || /^temp_/i.test(dbMediaId))) {
+              patch = {
+                ...(patch || {}),
+                mediaId: prevMsg.mediaId,
+                mediaUrl: prevMsg.mediaUrl || m.mediaUrl,
+                previewUrl: prevMsg.previewUrl || m.previewUrl,
+                mediaThumbnailUrl: prevMsg.mediaThumbnailUrl || m.mediaThumbnailUrl,
+                ...(prevMsg.localThumbUri ? { localThumbUri: prevMsg.localThumbUri } : {}),
+              };
+            }
+            if (Array.isArray(prevMsg.mediaItems) && prevMsg.mediaItems.length
+                && Array.isArray(m.mediaItems) && m.mediaItems.length) {
+              const uploadedCount = (items) => items.filter((it) => {
+                const id = String(it?.mediaId || '');
+                return id && !/^temp_/i.test(id);
+              }).length;
+              if (uploadedCount(prevMsg.mediaItems) > uploadedCount(m.mediaItems)) {
+                patch = { ...(patch || {}), mediaItems: prevMsg.mediaItems };
+              }
+            }
             return patch ? { ...m, ...patch } : m;
           });
 
@@ -3003,6 +3048,62 @@ export default function useChatLogic({ navigation, route }) {
       refreshTimerRef.current = setTimeout(doRefresh, 50);
     }
   }, []);
+
+  // ── LOADER-STUCK BACKSTOP ──────────────────────────────────────────────────
+  // "First open shows a loader; back-and-reopen shows the messages." Several
+  // cold-start races can leave the loader up even though rows exist (or have
+  // just landed) in SQLite: the first read racing DB init / the background
+  // warm's write lock, or history fetched+persisted while this screen's paint
+  // path missed it. Whatever the variant, the contract is simple — WHILE the
+  // initial loader is visible, poll SQLite; the moment rows exist, paint them
+  // and drop the loader. Re-open needs no poll (cache path paints instantly).
+  useEffect(() => {
+    if (!isLoadingInitial) return undefined;
+    let alive = true;
+    let timer = null;
+    const startedAt = Date.now();
+    // The loader must NEVER be able to stay up forever. Two exits:
+    //  1. rows appear in SQLite → paint them, drop the loader (any time);
+    //  2. absolute deadline → drop the loader regardless. A chat that truly
+    //     has no rows shows the empty state; a DB stuck behind the first-sync
+    //     write lock longer than the deadline recovers on the next poll-driven
+    //     refresh instead of pinning a spinner. The old version capped the
+    //     POLLING at 15 tries and then gave up with the loader still up —
+    //     exactly the "loader never goes away" report.
+    const DEADLINE_MS = 10000;
+
+    const tick = async () => {
+      if (!alive) return;
+      const cid = chatIdRef.current;
+      if (cid) {
+        try {
+          const count = await ChatDatabase.getMessageCount(cid);
+          if (!alive) return;
+          if (Number(count) > 0) {
+            try { await refreshMessagesFromDB(true); } catch { /* retried below */ }
+            if (!alive) return;
+            setIsLoadingInitial(false);
+            setIsLoadingFromLocal(false);
+            return;
+          }
+        } catch { /* DB still initializing — keep polling */ }
+      }
+      if (Date.now() - startedAt >= DEADLINE_MS) {
+        // Hard stop: whatever is wedged (DB lock, init race, empty chat with a
+        // dead socket), stop showing a spinner. The screen falls through to
+        // the honest state (messages if a later refresh lands, else empty/
+        // retry UI) and every later write still repaints via the normal path.
+        setIsLoadingInitial(false);
+        setIsLoadingFromLocal(false);
+        return;
+      }
+      timer = setTimeout(tick, 700);
+    };
+
+    // First check immediately — don't make an already-ready DB wait 800ms.
+    tick();
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, [isLoadingInitial, refreshMessagesFromDB]);
 
   // A call ended → the calling layer wrote an in-thread "call" entry to SQLite.
   // Refresh if it belongs to the chat currently open.
@@ -7983,6 +8084,22 @@ export default function useChatLogic({ navigation, route }) {
     const shouldInsertLocal = !options?.skipLocalInsert;
 
     const isGrpMedia = chatData?.chatType === 'group' || chatData?.isGroup;
+    // Lock the bubble's shape from the picked file's OWN dimensions so it never
+    // resizes when the server's mediaMeta arrives after upload. Missing image
+    // dims are back-filled via Image.getSize right after insert (below).
+    const localMediaMeta = {
+      fileName: file.name || undefined,
+      fileSize: Number(file.size) || undefined,
+      mimeType: file.type || undefined,
+      width: Number(file.width || file.mediaWidth || mediaObj.width) || undefined,
+      height: Number(file.height || file.mediaHeight || mediaObj.height) || undefined,
+    };
+    // Videos must never use the video FILE uri as their "thumbnail" — an .mp4
+    // fed into <Image> paints a black box. A real poster frame is extracted
+    // locally right after insert (below) so the bubble shows it instantly.
+    let localVideoThumb = normalizedType === 'video'
+      ? (file.thumbnailUri || file.previewUri || null)
+      : null;
     const localMsg = {
       id: tempId,
       tempId,
@@ -7990,9 +8107,13 @@ export default function useChatLogic({ navigation, route }) {
       mediaType: normalizedType,
       text: file.name || '',
       mediaUrl: '',
-      mediaThumbnailUrl: localSourceUri,
-      previewUrl: localSourceUri,
+      mediaThumbnailUrl: normalizedType === 'video' ? localVideoThumb : localSourceUri,
+      previewUrl: normalizedType === 'video' ? localVideoThumb : localSourceUri,
+      localThumbUri: localVideoThumb,
       localUri: localSourceUri,
+      mediaMeta: localMediaMeta,
+      mediaWidth: localMediaMeta.width,
+      mediaHeight: localMediaMeta.height,
       time: moment(timestamp).format("hh:mm A"),
       date: moment(timestamp).format("YYYY-MM-DD"),
       senderId: currentUserIdRef.current,
@@ -8007,6 +8128,7 @@ export default function useChatLogic({ navigation, route }) {
         chatId: chatIdRef.current,
         file: { ...file, uri: localSourceUri },
         tempId,
+        ...(localVideoThumb ? { localThumbUri: localVideoThumb } : {}),
         isMediaDownloaded: true,
         uploadQueued: false,
       },
@@ -8024,6 +8146,47 @@ export default function useChatLogic({ navigation, route }) {
 
       // Write to SQLite in background (non-blocking)
       ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
+
+      // Back-fill intrinsic image dimensions when the picker didn't provide them,
+      // so the bubble locks its final shape immediately (no resize on upload).
+      if (normalizedType === 'image' && (!localMediaMeta.width || !localMediaMeta.height) && localSourceUri) {
+        Image.getSize(
+          localSourceUri,
+          (w, h) => {
+            if (!w || !h) return;
+            setAllMessages((prev) => prev.map((m) => (
+              m.tempId === tempId
+                ? { ...m, mediaWidth: w, mediaHeight: h, mediaMeta: { ...(m.mediaMeta || {}), width: w, height: h } }
+                : m
+            )));
+          },
+          () => { /* getSize failed — keep the fallback aspect */ },
+        );
+      }
+    }
+
+    // INSTANT VIDEO POSTER: extract a local frame so the bubble shows a real
+    // thumbnail from the first paint (not a videocam placeholder) — the server
+    // poster replaces/joins it after upload. Fire-and-forget; runs even for
+    // queue replays (shouldInsertLocal=false) since the bubble already exists.
+    if (normalizedType === 'video' && !localVideoThumb && localSourceUri) {
+      generateLocalVideoThumbnail(localSourceUri)
+        .then((thumbUri) => {
+          if (!thumbUri) return;
+          localVideoThumb = thumbUri;
+          setAllMessages((prev) => prev.map((m) => (
+            m.tempId === tempId
+              ? {
+                  ...m,
+                  localThumbUri: thumbUri,
+                  mediaThumbnailUrl: m.mediaThumbnailUrl || thumbUri,
+                  previewUrl: m.previewUrl || thumbUri,
+                  payload: { ...(m.payload || {}), localThumbUri: thumbUri },
+                }
+              : m
+          )));
+        })
+        .catch(() => {});
     }
 
     // KILL-SAFE: persist the upload intent BEFORE starting the upload — an app
@@ -8215,7 +8378,11 @@ export default function useChatLogic({ navigation, route }) {
 
       // For sender, always ensure mediaUrl/previewUrl are usable — fall back to localUri
       const resolvedMediaUrl = uploadedPreviewUrl || uploadedLocalUri;
-      const resolvedPreviewUrl = uploadedThumbnailUrl || uploadedPreviewUrl || uploadedLocalUri;
+      // Videos: the preview/thumbnail must be an IMAGE — server poster first,
+      // then the locally extracted frame; never the video file itself.
+      const resolvedPreviewUrl = normalizedCategory === 'video'
+        ? (uploadedThumbnailUrl || localVideoThumb || null)
+        : (uploadedThumbnailUrl || uploadedPreviewUrl || uploadedLocalUri);
 
       // Local thumbnail cache (images only — video thumbs need
       // expo-video-thumbnails, which is not installed). Fire-and-forget.
@@ -8235,6 +8402,7 @@ export default function useChatLogic({ navigation, route }) {
           mediaUrl: resolvedMediaUrl,
           mediaThumbnailUrl: resolvedPreviewUrl,
           previewUrl: resolvedPreviewUrl,
+          localThumbUri: localVideoThumb || null,
           localUri: uploadedLocalUri,
           serverMediaUrl: uploadedPreviewUrl,
           serverPreviewUrl: uploadedThumbnailUrl,
@@ -8252,6 +8420,7 @@ export default function useChatLogic({ navigation, route }) {
           payload: {
             ...messagePayload,
             file: { ...uploadFile, uri: uploadedLocalUri },
+            ...(localVideoThumb ? { localThumbUri: localVideoThumb } : {}),
             isMediaDownloaded: true,
             uploadQueued: false,
           },
@@ -8271,6 +8440,11 @@ export default function useChatLogic({ navigation, route }) {
         return sorted;
       });
 
+      // Stash the emit payload so the delivery watchdog can silently re-emit if
+      // this first ack is lost — the media is already uploaded, so the user must
+      // never see a Retry just because the realtime hop dropped.
+      pendingMediaEmitRef.current[tempId] = { ...messagePayload, tempId };
+      mediaReemitTriedRef.current.delete(tempId);
       await sendMessageViaSocket({ ...messagePayload, tempId }, tempId).catch((err) => {
         console.warn('media socket ack failed', err?.message || err);
       });
@@ -8372,26 +8546,64 @@ export default function useChatLogic({ navigation, route }) {
         });
       }, 900);
 
-      // Safety net: if the message is still stuck at 'sending'/'uploaded' after 5s,
-      // check if it has a serverMessageId and promote it to 'sent'
+      // Delivery watchdog (replaces the old optimistic 'sent' promotion, which
+      // faked a double-tick off the HTTP upload's messageId even when the socket
+      // emit never reached the server/receiver — the "sender shows sent but the
+      // receiver never gets it" bug). The HONEST 'sent' comes ONLY from the
+      // socket ack (onAck → reconcile in sendMessageViaSocket): an ack means the
+      // server stored+relayed the message, so the receiver will get it.
+      //
+      // Here we handle the OPPOSITE case: if the socket is CONNECTED but no ack
+      // arrived, the emit was lost → mark 'failed' so the user gets a manual
+      // Retry (which re-emits the already-uploaded media; the server dedupes on
+      // clientMessageId, so no duplicate). If we're OFFLINE, leave it 'sending' —
+      // the pending-emit queue replays it on reconnect. 'sent' outranks 'failed'
+      // in getMessageStatusPriority, so a late ack self-heals the bubble.
       setTimeout(() => {
         setAllMessages((prev) => {
           let changed = false;
           const updated = prev.map((m) => {
             if (m.tempId !== tempId) return m;
-            if ((m.status === 'sending' || m.status === 'uploaded') && m.serverMessageId) {
+            // Acked ('sent') or offline → nothing to do here (a late ack
+            // self-heals; reconnect replay handles the offline case).
+            if (m.status === 'sent' || !isSocketConnected()) return m;
+            // Did the FILE upload actually finish? A stashed emit payload is set
+            // only after a successful upload; a real (non-temp) mediaId is the
+            // durable signal. NOTE sendMessageViaSocket flips the row back to
+            // 'sending' post-upload for the delivery clock, so status alone can't
+            // tell "still uploading" from "uploaded, awaiting ack".
+            const realMediaId = String(m.mediaId || '');
+            const uploadDone = Boolean(pendingMediaEmitRef.current[tempId])
+              || (realMediaId && !/^temp_/i.test(realMediaId));
+            if (uploadDone) {
+              // Uploaded but no ack yet → the realtime emit was likely lost.
+              // Re-emit ONCE silently (server dedupes on clientMessageId) instead
+              // of showing a Retry for media that is already safely on the server.
+              const stashed = pendingMediaEmitRef.current[tempId];
+              if (stashed && !mediaReemitTriedRef.current.has(tempId)) {
+                mediaReemitTriedRef.current.add(tempId);
+                sendMessageViaSocket(stashed, tempId).catch(() => {});
+              }
+              return m;
+            }
+            // Upload never completed while online → a real failure the user
+            // should be able to retry.
+            if (m.status === 'sending' || m.status === 'uploading') {
               changed = true;
-              return { ...m, status: 'sent', synced: true };
+              return { ...m, status: 'failed' };
             }
             return m;
           });
+          // Watchdog fired — drop the stash/guard regardless (bounded memory).
+          delete pendingMediaEmitRef.current[tempId];
+          mediaReemitTriedRef.current.delete(tempId);
           if (changed) {
             saveMessagesToLocal(updated);
             return updated;
           }
           return prev;
         });
-      }, 5000);
+      }, 12000);
     }
   }, [
     isConnected,
@@ -8437,6 +8649,54 @@ export default function useChatLogic({ navigation, route }) {
     const isGrpMedia = chatData?.chatType === 'group' || chatData?.isGroup;
     const shouldInsertLocal = !options?.skipLocalInsert;
 
+    // REPLAY FAST-PATH: a reconnect/boot flush re-running an album whose files
+    // ALL uploaded already (only the socket ack was lost) must not re-run the
+    // upload pipeline — that reset every tile to 'uploading' and flashed the
+    // progress ring back onto an already-sent bubble. Just re-emit the send
+    // (server dedupes on clientMessageId) and clear the queue row.
+    if (options?.fromQueue) {
+      const existing = (allMessagesRef.current || []).find((m) => m?.tempId === tempId);
+      const doneItems = Array.isArray(existing?.mediaItems) ? existing.mediaItems : [];
+      const allUploaded = doneItems.length > 0 && doneItems.every((it) => {
+        const id = String(it?.mediaId || '');
+        return id && !/^temp_/i.test(id);
+      });
+      if (allUploaded) {
+        const clean = doneItems.map((it) => ({
+          mediaId: String(it.mediaId),
+          fileCategory: it.fileCategory || 'image',
+          mediaUrl: it.mediaUrl || '',
+          mediaThumbnailUrl: it.mediaThumbnailUrl || '',
+          mediaMeta: it.mediaMeta || {},
+        }));
+        const deviceId = await getOrCreateDeviceId();
+        const first = clean[0];
+        const replayPayload = {
+          chatId: chatIdRef.current,
+          chatType: chatData?.chatType || 'private',
+          senderId: currentUserIdRef.current,
+          senderDeviceId: deviceId,
+          receiverId: isGrpMedia ? null : (chatData.peerUser?._id || null),
+          ...(isGrpMedia && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
+          messageType: clean.length > 1 ? 'album' : (first.fileCategory === 'document' ? 'file' : first.fileCategory),
+          text: caption,
+          mediaGroupId,
+          mediaItems: clean,
+          mediaId: first.mediaId,
+          mediaUrl: first.mediaUrl,
+          mediaThumbnailUrl: first.mediaThumbnailUrl || first.mediaUrl,
+          mediaMeta: first.mediaMeta,
+          status: 'sent',
+          createdAt: timestamp,
+        };
+        await sendMessageViaSocket({ ...replayPayload, tempId }, tempId).catch(() => {});
+        const queue = [...(queuedMediaUploadsRef.current || [])].filter((q) => q?.tempId !== tempId);
+        queuedMediaUploadsRef.current = queue;
+        await persistMediaUploadQueue(queue);
+        return { success: true, tempId, failedCount: 0 };
+      }
+    }
+
     const normFiles = files.map((f) => ({ ...f, uri: normalizeUri(f.uri) }));
     let liveItems = normFiles.map((f) => ({
       mediaId: null,
@@ -8444,10 +8704,30 @@ export default function useChatLogic({ navigation, route }) {
       mediaUrl: null,
       mediaThumbnailUrl: null,
       localUri: f.uri,
+      // Local poster for video tiles — extracted below; tiles never feed the
+      // video file into <Image> (black box), so without this they'd show a
+      // videocam placeholder for the whole upload.
+      localThumbUri: f.thumbnailUri || f.previewUri || null,
       mediaMeta: { fileName: f.name, fileSize: f.size || null, mimeType: f.type },
       uploadStatus: 'pending',
       uploadProgress: 0,
     }));
+
+    // INSTANT VIDEO POSTERS: extract a local frame per video tile right away
+    // (fire-and-forget), patching both the live snapshot and the bubble.
+    liveItems.forEach((it, index) => {
+      if (it.fileCategory !== 'video' || it.localThumbUri || !it.localUri) return;
+      generateLocalVideoThumbnail(it.localUri)
+        .then((thumbUri) => {
+          if (!thumbUri) return;
+          liveItems = liveItems.map((item, i) => (i === index ? { ...item, localThumbUri: thumbUri } : item));
+          const snapshot = liveItems;
+          setAllMessages((prev) => prev.map((m) => (
+            m.tempId === tempId ? { ...m, mediaItems: snapshot } : m
+          )));
+        })
+        .catch(() => {});
+    });
 
     const localMsg = {
       id: tempId,
@@ -8740,9 +9020,30 @@ export default function useChatLogic({ navigation, route }) {
         return updated;
       });
 
+      // Stash for the delivery watchdog below — a lost ack on an already-
+      // uploaded album must re-emit silently, never re-run the uploads (the
+      // re-run reset tiles to 'uploading' and flashed the ring back).
+      pendingMediaEmitRef.current[tempId] = { ...messagePayload, tempId };
+      mediaReemitTriedRef.current.delete(tempId);
       await sendMessageViaSocket({ ...messagePayload, tempId }, tempId).catch((err) => {
         console.warn('album socket ack failed', err?.message || err);
       });
+
+      // Album delivery watchdog (mirror of the single-media one): if the ack
+      // hasn't reconciled in 12s while the socket is up, the emit was lost —
+      // re-emit ONCE (server dedupes on clientMessageId). Keeps the bubble off
+      // the stuck-'sending' state that made the reconnect flush re-run it.
+      setTimeout(() => {
+        const row = (allMessagesRef.current || []).find((m) => m?.tempId === tempId);
+        const stashed = pendingMediaEmitRef.current[tempId];
+        const acked = row && ['sent', 'delivered', 'read', 'seen'].includes(String(row.status));
+        if (row && !acked && isSocketConnected() && stashed && !mediaReemitTriedRef.current.has(tempId)) {
+          mediaReemitTriedRef.current.add(tempId);
+          sendMessageViaSocket(stashed, tempId).catch(() => {});
+        }
+        delete pendingMediaEmitRef.current[tempId];
+        mediaReemitTriedRef.current.delete(tempId);
+      }, 12000);
 
       const queue = [...(queuedMediaUploadsRef.current || [])].filter((item) => item?.tempId !== tempId);
       queuedMediaUploadsRef.current = queue;

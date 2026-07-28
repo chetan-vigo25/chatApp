@@ -1,4 +1,5 @@
 import React from 'react';
+import { View, StyleSheet } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import RootNavigator from '../navigations/RootNavigator';
@@ -27,12 +28,23 @@ export default function AppContent() {
   // and messages (served from SQLite) stay fully usable with no network. The old
   // full-screen NoInternet overlay covered that cached UI; it's kept as a
   // component/route for anywhere still referencing it, just no longer shown here.
+  // OfflineBanner is IN-FLOW above the navigator: its animated height pushes
+  // the whole app UI down while offline, instead of overlaying (and covering)
+  // the status bar + screen headers like the old absolute strip did.
   return (
     <SafeAreaProvider style={{ flex: 1, backgroundColor: theme.colors.background }}>
       <AppBannerHost />
-      <RootNavigator />
       <OfflineBanner />
+      <View style={styles.appBody}>
+        <RootNavigator />
+      </View>
       <StatusBar style={isDarkMode ? 'light' : 'dark'} />
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  appBody: {
+    flex: 1,
+  },
+});

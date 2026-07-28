@@ -45,7 +45,17 @@ const normalizePickedAsset = async (asset, mediaType) => {
     }
   }
 
-  return { uri: finalUri, name, type, size: asset.fileSize || asset.size || 0 };
+  // Include intrinsic dimensions (images + videos) so album/media bubbles lock
+  // their shape immediately and don't resize once the server mediaMeta lands.
+  return {
+    uri: finalUri,
+    name,
+    type,
+    size: asset.fileSize || asset.size || 0,
+    width: Number(asset.width) || undefined,
+    height: Number(asset.height) || undefined,
+    duration: Number(asset.duration) || undefined,
+  };
 };
 
 export const ImageProvider = ({ children }) => {
@@ -139,7 +149,18 @@ export const ImageProvider = ({ children }) => {
         }
       }
 
-      const file = { uri: finalUri, name, type, size: asset.fileSize || 0 };
+      // Carry the asset's intrinsic dimensions so the chat bubble can lock its
+      // shape immediately (no resize when the server's mediaMeta arrives). The
+      // picker provides width/height for both images and videos.
+      const file = {
+        uri: finalUri,
+        name,
+        type,
+        size: asset.fileSize || 0,
+        width: Number(asset.width) || undefined,
+        height: Number(asset.height) || undefined,
+        duration: Number(asset.duration) || undefined,
+      };
       setImage(file);
       return file;
     } catch (error) {

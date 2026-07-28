@@ -10,9 +10,11 @@
 //   onCancel  — active center glyph = ✕ when no onPause; while paused it also
 //               renders a small corner ✕ badge that cancels the transfer
 //   onResume  — pressed while paused (play triangle)
-import React from 'react';
-import { View, Text, StyleSheet, Pressable } from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, Pressable, Animated, Easing } from 'react-native';
 import Svg, { Circle, Rect, Path, Line } from 'react-native-svg';
+
+const AnimatedCircle = Animated.createAnimatedComponent(Circle);
 
 const THEME_PRIMARY = '#03b0a2'; // brand teal (never WhatsApp green)
 const HIT_SLOP = { top: 8, bottom: 8, left: 8, right: 8 };
@@ -31,8 +33,24 @@ export default function UploadRing({
   const strokeWidth = Math.max(2.5, size * 0.07);
   const radius = (size - strokeWidth) / 2;
   const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - clamped / 100);
   const fontSize = Math.max(8, Math.round(size * 0.23));
+
+  // Ease the arc toward each new percent instead of jumping — real transfer
+  // progress lands in chunky steps (per-chunk offsets, throttled patches) and
+  // an untweened arc looks stuttery. SVG props animate on the JS driver.
+  const animatedPercent = useRef(new Animated.Value(clamped)).current;
+  useEffect(() => {
+    Animated.timing(animatedPercent, {
+      toValue: clamped,
+      duration: 280,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: false,
+    }).start();
+  }, [clamped, animatedPercent]);
+  const dashOffset = animatedPercent.interpolate({
+    inputRange: [0, 100],
+    outputRange: [circumference, 0],
+  });
 
   const isPaused = Boolean(paused);
   const hasControls = Boolean(onPause || onResume || onCancel);
@@ -115,7 +133,7 @@ export default function UploadRing({
           fill="none"
         />
         {/* Progress arc — starts at 12 o'clock, dimmed while paused */}
-        <Circle
+        <AnimatedCircle
           cx={cx}
           cy={cy}
           r={radius}

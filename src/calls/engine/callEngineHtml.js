@@ -190,15 +190,30 @@ export const buildCallEngineHtml = () => `<!doctype html>
     ];
 
     // token = base64(JSON { sub, name }) minted by chat-backend (UTF-8 safe).
+    function b64ToJson(b64) {
+      var norm = String(b64 || '').replace(/-/g, '+').replace(/_/g, '/');
+      var pad = norm + '===='.slice(0, (4 - (norm.length % 4)) % 4);
+      var raw = atob(pad);
+      var json = decodeURIComponent(Array.prototype.map.call(raw, function (c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+      return JSON.parse(json);
+    }
     function decodeToken(token) {
+      var t = String(token || '');
       try {
-        var raw = atob(String(token || ''));
-        var json = decodeURIComponent(Array.prototype.map.call(raw, function (c) {
-          return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-        }).join(''));
-        var obj = JSON.parse(json);
+        var obj = b64ToJson(t);
         if (obj && obj.sub) return { userId: String(obj.sub), name: obj.name || 'User' };
       } catch (e) {}
+      // JWT mode fallback: read sub from the payload segment so a caller that
+      // failed to supply opts.userId still gets an identity.
+      try {
+        var parts = t.split('.');
+        if (parts.length === 3) {
+          var jw = b64ToJson(parts[1]);
+          if (jw && jw.sub) return { userId: String(jw.sub), name: jw.name || 'User' };
+        }
+      } catch (e2) {}
       return null;
     }
 
@@ -439,6 +454,9 @@ export const buildCallEngineHtml = () => `<!doctype html>
       self._socket = s;
       self._serverUrl = url;
       s.on('connect', function () {
+        // Cancels sent while we were offline are gone for good — drop stale
+        // rings so the dedupe can't swallow the next genuine ring on this peer.
+        self._prunePendingIn();
         self._req('register', { name: self.name, sessionId: self.userId }).then(function (res) {
           self._users = (res && res.users) || [];
           self._registered = true;
@@ -470,12 +488,30 @@ export const buildCallEngineHtml = () => `<!doctype html>
       });
     };
 
+    // Drop _pendingIn entries past the ring window (~40s server-side). Entries
+    // normally die on callCancelled/accept/decline — but a cancel that lands
+    // while OUR socket is down is lost forever, and the stale entry then
+    // swallows EVERY future 1:1 ring from that peer via the duplicate-ring
+    // dedupe. Silent: the server call behind a stale entry is already dead.
+    CallingSDK.prototype._prunePendingIn = function () {
+      var self = this;
+      var now = Date.now();
+      Object.keys(self._pendingIn).forEach(function (k) {
+        var q = self._pendingIn[k];
+        if (!q || !q.ts || (now - q.ts) > 60000) {
+          self._log('pruned stale pending ring ' + k);
+          delete self._pendingIn[k];
+        }
+      });
+    };
+
     CallingSDK.prototype._wire = function (s) {
       var self = this;
       s.on('users', function (users) { self._users = users || []; });
 
       s.on('incomingCall', function (p) {
         p = p || {};
+        self._prunePendingIn();
         var key = String(p.callId);
         if (self._pendingIn[key]) return;
         var fromId = p.from && p.from.id != null ? String(p.from.id) : null;
@@ -495,13 +531,16 @@ export const buildCallEngineHtml = () => `<!doctype html>
           // Just declined this peer → quietly decline their reasserts too
           // (parity with the group _declined window) instead of re-ringing.
           var dec = self._declinedPeer[fromId];
-          if (dec && (Date.now() - dec) < 15000) {
+          // 4s, not 15s: only in-flight reassert ghosts need swallowing (the
+          // caller stops re-ringing once our decline reaches them). 15s
+          // silently declined a GENUINE quick call-back from the same peer.
+          if (dec && (Date.now() - dec) < 4000) {
             try { s.emit('declineCall', { callId: key }); } catch (e) {}
             return;
           }
           delete self._declinedPeer[fromId];
         }
-        self._pendingIn[key] = { group: false, callId: key, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio' };
+        self._pendingIn[key] = { group: false, callId: key, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', ts: Date.now() };
         self._emit('incoming', {
           callId: key,
           from: { id: p.from && p.from.id != null ? String(p.from.id) : null, name: (p.from && p.from.name) || '' },
@@ -512,6 +551,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
 
       s.on('incomingGroupCall', function (p) {
         p = p || {};
+        self._prunePendingIn();
         var key = String(p.groupId);
         // The host re-invites not-yet-joined members (offline-wake support), so a
         // duplicate invite for a call we are already ringing is normal. A recent
@@ -529,7 +569,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
           return;
         }
         delete self._declined[key];
-        self._pendingIn[key] = { group: true, groupId: p.groupId, roomId: p.roomId, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', name: p.name };
+        self._pendingIn[key] = { group: true, groupId: p.groupId, roomId: p.roomId, from: p.from || {}, media: p.callType === 'video' ? 'video' : 'audio', name: p.name, ts: Date.now() };
         self._emit('incoming', {
           callId: key,
           from: { id: p.from && p.from.id != null ? String(p.from.id) : null, name: (p.from && p.from.name) || '' },

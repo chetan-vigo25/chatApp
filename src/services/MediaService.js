@@ -349,10 +349,23 @@ class MediaService {
     };
 
     const downloadKey = String(mediaId);
+    let lastProgress = 0;
     const onTaskProgress = (event) => {
-      const total = Number(event?.totalBytesExpectedToWrite || 0);
+      // Servers/proxies that stream without Content-Length report
+      // totalBytesExpectedToWrite as 0 OR -1 (-1 is truthy — never `||` it!),
+      // which left the ring stuck at 0% for the whole download ("no progress
+      // bar"). Fall back to the known file size from mediaMeta; if even that
+      // is missing, show asymptotic movement from written bytes so the ring
+      // always advances (jumps to 100 on completion).
+      const reported = Number(event?.totalBytesExpectedToWrite || 0);
       const written = Number(event?.totalBytesWritten || 0);
-      const progress = total > 0 ? (written / total) * 100 : 0;
+      const total = reported > 0 ? reported : Number(expectedSize || 0);
+      let progress = total > 0
+        ? Math.min(100, (written / total) * 100)
+        : (written > 0 ? (written / (written + 2 * 1024 * 1024)) * 100 : 0);
+      // Monotonic — a late chunk with a smaller estimate must never rewind the ring.
+      progress = Math.max(lastProgress, progress);
+      lastProgress = progress;
       if (typeof onProgress === 'function') onProgress(progress);
       localStorageService.updateDownloadQueue(mediaId, { status: 'downloading', progress }).catch(() => {});
     };

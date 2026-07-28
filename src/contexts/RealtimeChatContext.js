@@ -840,6 +840,18 @@ const reducer = (state, action) => {
           unreadCount,
           lastMessage: preserveLocal ? prevLastMsg : (incomingLastMsg || prevLastMsg),
           lastMessageEdited: preserveEdit ? true : (chat?.lastMessageEdited || prev?.lastMessageEdited || false),
+          // Keep type/sender IN LOCKSTEP with whichever lastMessage won.
+          // buildLastMessageDisplay reads `lastMessageType` with priority, so
+          // the bare `...chat` spread mixing the server's (older) type with a
+          // preserved local message — or a stale local type with a fresh server
+          // message — rendered the wrong/blank recent-summary on the row.
+          lastMessageType: preserveLocal
+            ? (prev?.lastMessageType || prevLastMsg?.type || prevLastMsg?.messageType || 'text')
+            : (chat?.lastMessageType || incomingLastMsg?.type || incomingLastMsg?.messageType
+                || (incomingLastMsg ? 'text' : (prev?.lastMessageType || 'text'))),
+          lastMessageSender: preserveLocal
+            ? (prev?.lastMessageSender || prevLastMsg?.senderId || null)
+            : (chat?.lastMessageSender || incomingLastMsg?.senderId || prev?.lastMessageSender || null),
           lastMessageAt: preserveLocal
             ? (prev?.lastMessageAt || prevLastMsg?.createdAt || chat?.lastMessageAt)
             : (chat?.lastMessageAt || prev?.lastMessageAt || chat?.lastMessage?.createdAt || prev?.lastMessage?.createdAt),

@@ -83,10 +83,10 @@ export default function useMediaDownload(mediaId) {
     };
   }, [mediaId]);
 
-  const requestDownload = useCallback(async ({ chatId, messageType, filename, mediaUrl, messageId, groupId } = {}) => {
+  const requestDownload = useCallback(async ({ chatId, messageType, filename, mediaUrl, messageId, groupId, fileSize } = {}) => {
     if (!mediaId) return;
     setError(null);
-    await downloadQueue.add({ mediaId, chatId, messageType, filename, mediaUrl, messageId, groupId });
+    await downloadQueue.add({ mediaId, chatId, messageType, filename, mediaUrl, messageId, groupId, fileSize });
   }, [mediaId]);
 
   const cancelDownload = useCallback(() => {
@@ -101,10 +101,10 @@ export default function useMediaDownload(mediaId) {
 
   // Resume needs the same descriptor as requestDownload — the byte-level
   // resume point itself is persisted inside MediaService.
-  const resumeDownload = useCallback(async ({ chatId, messageType, filename, mediaUrl, messageId, groupId } = {}) => {
+  const resumeDownload = useCallback(async ({ chatId, messageType, filename, mediaUrl, messageId, groupId, fileSize } = {}) => {
     if (!mediaId) return;
     setError(null);
-    await downloadQueue.resume({ mediaId, chatId, messageType, filename, mediaUrl, messageId, groupId });
+    await downloadQueue.resume({ mediaId, chatId, messageType, filename, mediaUrl, messageId, groupId, fileSize });
   }, [mediaId]);
 
   return useMemo(() => ({

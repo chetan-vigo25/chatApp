@@ -2,6 +2,8 @@ import { apiCall, apiCallForm } from '../../../Config/Https';
 import { Alert } from 'react-native';
 
 const showToast = (msg) => { if (msg) Alert.alert('', msg); };
+// eslint-disable-next-line no-console
+const devLog = (...args) => { if (__DEV__) console.log(...args); };
 const BASE = 'user/status';
 
 export const statusServices = {
@@ -20,7 +22,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return { data: [] };
     } catch (err) {
-      console.log('[getMyStatuses] silent failure:', err?.code || err?.message);
+      devLog('[getMyStatuses] silent failure:', err?.code || err?.message);
       return { data: [] };
     }
   },
@@ -33,7 +35,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return { data: [] };
     } catch (err) {
-      console.log('[getStatusFeed] silent failure:', err?.code || err?.message);
+      devLog('[getStatusFeed] silent failure:', err?.code || err?.message);
       return { data: [] };
     }
   },
@@ -50,7 +52,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return { data: { broadcasts: [] } };
     } catch (err) {
-      console.log('[getBroadcasts] silent failure:', err?.code || err?.message);
+      devLog('[getBroadcasts] silent failure:', err?.code || err?.message);
       return { data: { broadcasts: [] } };
     }
   },
@@ -61,7 +63,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return null;
     } catch (err) {
-      console.log('[getStatusById] silent failure:', err?.code || err?.message);
+      devLog('[getStatusById] silent failure:', err?.code || err?.message);
       return null;
     }
   },
@@ -143,7 +145,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return Promise.reject(response?.message);
     } catch (err) {
-      console.log('[viewStatus] silent failure:', err?.code || err?.message);
+      devLog('[viewStatus] silent failure:', err?.code || err?.message);
       return Promise.reject(err);
     }
   },
@@ -154,7 +156,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return Promise.reject(response?.message);
     } catch (err) {
-      console.log('[reactToStatus] silent failure:', err?.code || err?.message);
+      devLog('[reactToStatus] silent failure:', err?.code || err?.message);
       return Promise.reject(err);
     }
   },
@@ -203,7 +205,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return { data: { viewCount: 0, viewers: [] } };
     } catch (err) {
-      console.log('[getStatusViewers] silent failure:', err?.code || err?.message);
+      devLog('[getStatusViewers] silent failure:', err?.code || err?.message);
       return { data: { viewCount: 0, viewers: [] } };
     }
   },
@@ -216,7 +218,7 @@ export const statusServices = {
       if (response?.statusCode === 200) return response;
       return { data: { likedBy: [], total: 0 } };
     } catch (err) {
-      console.log('[getStatusLikers] silent failure:', err?.code || err?.message);
+      devLog('[getStatusLikers] silent failure:', err?.code || err?.message);
       return { data: { likedBy: [], total: 0 } };
     }
   },
