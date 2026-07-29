@@ -21,7 +21,13 @@ import { BACKEND_URL } from '@env';
 import { apiCall } from '../Config/Https';
 import { refreshAccessToken } from '../services/sessionManager';
 
-export const CHUNKED_UPLOAD_THRESHOLD = 48 * 1024 * 1024; // 48MB
+// 12MB (was 48MB). A single multipart POST cannot survive a connection drop —
+// a 35MB video on a flaky production uplink restarted from byte 0 on every
+// hiccup ("upload me bahut time"), while the chunked session resumes from the
+// server's receivedBytes. Anything big enough to take >~10s on a mobile uplink
+// belongs on the resumable path; small files keep the cheaper single POST
+// (which also runs server-side optimization).
+export const CHUNKED_UPLOAD_THRESHOLD = 12 * 1024 * 1024;
 
 const SESSION_BASE = 'user/media/upload/session';
 const MAX_CONSECUTIVE_CHUNK_FAILURES = 3;
@@ -52,11 +58,17 @@ const getAuthToken = async () => {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Base64 encodes 3 bytes as 4 chars — chunk reads must start on a multiple of
-// 3 or the decoded slice is garbage. Round the server's chunkSize down.
+// Use the server's chunkSize EXACTLY. The old version rounded it down to a
+// multiple of 3 "for base64 alignment" — but FileSystem.readAsStringAsync's
+// position/length are BYTE offsets (each chunk is independently base64-encoded
+// and independently decoded server-side), so alignment was never needed. The
+// rounding, however, BROKE S3 mode: S3 multipart requires every non-final part
+// to be exactly session.chunkSize bytes, and the server enforces it — a 5MB
+// (5242880, not divisible by 3) session made every aligned chunk PUT fail 400
+// ("Non-final chunks must be exactly N bytes") in production.
 const alignChunkSize = (raw) => {
-  const size = Number(raw || 0) > 0 ? Number(raw) : DEFAULT_CHUNK_SIZE;
-  return Math.max(3, size - (size % 3));
+  const size = Number(raw || 0);
+  return size > 0 ? Math.floor(size) : DEFAULT_CHUNK_SIZE;
 };
 
 const getSessionStatus = async (sessionId) => {
@@ -85,6 +97,13 @@ export const uploadFileInChunks = async ({
   fileSize,
   chatId = null,
   sourceHash = null,
+  // Deferred hash (chunked-size files skip the pre-upload hash stall): a
+  // promise resolving to the sha256 hex (or null). When it lands mid-upload,
+  // `dedupCheck(hash)` asks the server whether it already has these bytes —
+  // on a hit the session is aborted and the existing media returned, saving
+  // the remaining transfer.
+  sourceHashPromise = null,
+  dedupCheck = null,
   onProgress = null,
   onSession = null,
   session = null,
@@ -104,6 +123,7 @@ export const uploadFileInChunks = async ({
     try { onSession?.({ sessionId: null, uri, offset: 0 }); } catch { /* row patch is best-effort */ }
     return uploadFileInChunks({
       uri, name, mimeType, fileSize, chatId, sourceHash,
+      sourceHashPromise, dedupCheck,
       onProgress, onSession, session: null, isPaused, _freshRetry: true,
     });
   };
@@ -144,10 +164,23 @@ export const uploadFileInChunks = async ({
   }
 
   if (!sessionId) {
+    // Propose an adaptive chunk size (server clamps to its 5-64MB S3 window,
+    // fixed per session): ~6 chunks per file instead of a flat 5MB. Fewer
+    // chunks = fewer per-chunk costs (base64 bridge read + temp-file write +
+    // HTTP round trip ≈ 1-2s each on mobile). Capped at 8MB: each chunk rides
+    // the bridge as a base64 STRING (~1.37× the bytes) — a 16MB chunk meant a
+    // ~22MB JS string alloc + copy, a visible app FREEZE (and memory spike)
+    // per chunk. 8MB (~11MB string) keeps the stall under control while still
+    // halving the round-trips of the old flat 5MB.
+    const proposedChunkSize = Math.min(
+      8 * 1024 * 1024,
+      Math.max(DEFAULT_CHUNK_SIZE, Math.ceil(totalBytes / 6)),
+    );
     const initRes = await apiCall('POST', `${SESSION_BASE}/init`, {
       fileName: name || `file_${Date.now()}`,
       fileSize: totalBytes,
       mimeType: mimeType || 'application/octet-stream',
+      chunkSize: proposedChunkSize,
       ...(sourceHash ? { sourceHash } : {}),
       ...(chatId ? { chatId } : {}),
     }, { silent: true, retryOnNetwork: true });
@@ -170,9 +203,33 @@ export const uploadFileInChunks = async ({
   reportProgress(offset);
 
   const chunkUrl = buildAbsoluteUrl(`${SESSION_BASE}/${sessionId}/chunk`);
-  const tempChunkPath = `${FileSystem.cacheDirectory}chunk_upload_${sessionId}.bin`;
+  // Two alternating temp files so the NEXT chunk can be read+written while the
+  // current one is on the wire (see prepareChunk below).
+  const tempChunkPaths = [
+    `${FileSystem.cacheDirectory}chunk_upload_${sessionId}_a.bin`,
+    `${FileSystem.cacheDirectory}chunk_upload_${sessionId}_b.bin`,
+  ];
   let consecutiveFailures = 0;
   let consecutive409Recoveries = 0;
+
+  // Cut a chunk into a temp file. Returned promise is pre-guarded against
+  // unhandled rejection (a prefetch may be discarded after an offset re-sync).
+  const prepareChunk = (chunkOffset, slot) => {
+    const length = Math.min(chunkSize, totalBytes - chunkOffset);
+    const path = tempChunkPaths[slot];
+    const promise = (async () => {
+      const chunkB64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+        position: chunkOffset,
+        length,
+      });
+      await FileSystem.writeAsStringAsync(path, chunkB64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    })();
+    promise.catch(() => {});
+    return { offset: chunkOffset, length, path, slot, promise };
+  };
 
   const pauseRequested = () => {
     try { return typeof isPaused === 'function' && isPaused() === true; } catch { return false; }
@@ -185,6 +242,26 @@ export const uploadFileInChunks = async ({
     throw new Error('upload paused');
   }
 
+  // Mid-flight dedup: when the deferred hash lands, ask the server once
+  // whether it already has these bytes. `dedupHit` is checked between chunks;
+  // the pending session is aborted and the existing media returned. (When
+  // sourceHash was known up front, init already dedup'd — nothing to do.)
+  let dedupHit = null;
+  if (!sourceHash && sourceHashPromise && typeof dedupCheck === 'function') {
+    Promise.resolve(sourceHashPromise)
+      .then((hash) => (hash ? dedupCheck(hash) : null))
+      .then((existing) => { if (existing) dedupHit = existing; })
+      .catch(() => { /* dedup is best-effort — upload continues */ });
+  }
+
+  // Token cached across chunks (AsyncStorage read per chunk is wasted time);
+  // re-read only after a 401-triggered refresh.
+  let token = await getAuthToken();
+  // Prefetch state: the next chunk's temp file being cut while the current
+  // chunk PUTs. Only used when its offset still matches (409/failure re-syncs
+  // move `offset`, invalidating the prefetch — it's simply discarded).
+  let prefetch = null;
+
   try {
     while (offset < totalBytes) {
       if (pauseRequested()) {
@@ -192,22 +269,40 @@ export const uploadFileInChunks = async ({
         throw new Error('upload paused');
       }
 
-      const length = Math.min(chunkSize, totalBytes - offset);
+      if (dedupHit) {
+        // Server already has these bytes — stop transferring, drop the
+        // half-filled session, report done with the existing media.
+        abortChunkSession(sessionId).catch(() => {});
+        try { onSession?.({ sessionId: null, uri, offset: 0 }); } catch { /* best-effort */ }
+        reportProgress(totalBytes);
+        return { statusCode: 200, success: true, data: dedupHit, deduplicated: true };
+      }
 
-      const chunkB64 = await FileSystem.readAsStringAsync(uri, {
-        encoding: FileSystem.EncodingType.Base64,
-        position: offset,
-        length,
-      });
-      await FileSystem.writeAsStringAsync(tempChunkPath, chunkB64, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
+      let current;
+      if (prefetch && prefetch.offset === offset) {
+        current = prefetch;
+      } else {
+        // Stale prefetch (offset re-synced): let its write finish before
+        // cutting into the OTHER slot, so two writers never share a path.
+        if (prefetch) { try { await prefetch.promise; } catch { /* discarded */ } }
+        current = prepareChunk(offset, prefetch && prefetch.slot === 0 ? 1 : 0);
+      }
+      prefetch = null;
+      await current.promise;
+      const length = current.length;
 
-      const token = await getAuthToken();
+      // Pipeline: start cutting the NEXT chunk into the other temp slot while
+      // this chunk is on the wire — the base64 read/write cost (~1-2s/chunk)
+      // then overlaps network time instead of adding to it.
+      const nextOffset = offset + length;
+      if (nextOffset < totalBytes) {
+        prefetch = prepareChunk(nextOffset, current.slot === 0 ? 1 : 0);
+      }
+
       let result = null;
       let failed = false;
       try {
-        result = await FileSystem.uploadAsync(chunkUrl, tempChunkPath, {
+        result = await FileSystem.uploadAsync(chunkUrl, current.path, {
           httpMethod: 'PUT',
           uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
           headers: {
@@ -225,6 +320,7 @@ export const uploadFileInChunks = async ({
       if (!failed && status === 401) {
         // Expired token mid-upload — refresh once and retry this chunk.
         try { await refreshAccessToken({ force: true }); } catch {}
+        token = await getAuthToken();
         failed = true;
       }
 
@@ -280,7 +376,9 @@ export const uploadFileInChunks = async ({
       reportProgress(offset);
     }
   } finally {
-    FileSystem.deleteAsync(tempChunkPath, { idempotent: true }).catch(() => {});
+    for (const p of tempChunkPaths) {
+      FileSystem.deleteAsync(p, { idempotent: true }).catch(() => {});
+    }
   }
 
   let completeRes;
@@ -289,7 +387,10 @@ export const uploadFileInChunks = async ({
       'POST',
       `${SESSION_BASE}/${sessionId}/complete`,
       {},
-      { silent: true, retryOnNetwork: true }
+      // complete() triggers server-side assembly + full-file hashing (+ video
+      // poster extraction) — for a 100MB+ file that legitimately exceeds the
+      // 15s axios default, which would fail an upload whose bytes all landed.
+      { silent: true, retryOnNetwork: true, timeout: 180000 }
     );
   } catch (err) {
     const httpStatus = Number(err?.response?.status || err?.statusCode || 0);

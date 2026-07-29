@@ -22,7 +22,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
-import { Video, ResizeMode } from 'expo-av';
+import { Video, ResizeMode } from '../../components/ExpoAvVideoCompat';
 import { useDispatch, useSelector } from 'react-redux';
 import { Ionicons } from '@expo/vector-icons';
 import {
@@ -1049,8 +1049,7 @@ export default function StatusViewer({ navigation, route }) {
               onPress={() => { pause(); setShowReply(true); }}
               accessibilityLabel={`Reply to ${displayName}`}
             >
-              <Ionicons name="chevron-up" size={14} color="rgba(255,255,255,0.75)" style={{ marginRight: 6 }} />
-              <Text style={styles.replyPlaceholder}>Reply</Text>
+              <Text style={styles.replyPlaceholder}>Reply…</Text>
             </TouchableOpacity>
           ) : (
             <View style={styles.replyInputTrigger}>
@@ -1069,17 +1068,6 @@ export default function StatusViewer({ navigation, route }) {
                 size={28}
                 color={likeActive ? '#FF3B5C' : '#fff'}
               />
-            </TouchableOpacity>
-          )}
-          {/* Options (report / hide) make no sense for an official broadcast,
-              so the menu is removed for admin statuses. */}
-          {!isBroadcast && (
-            <TouchableOpacity
-              style={styles.reactBtn}
-              onPress={openOptions}
-              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
-            >
-              <Ionicons name="ellipsis-vertical" size={22} color="#fff" />
             </TouchableOpacity>
           )}
         </View>
@@ -1432,19 +1420,21 @@ const styles = StyleSheet.create({
   },
   reactBtn:          { alignItems: 'center', paddingHorizontal: 6 },
   reactCount:        { color: '#fff', fontSize: 11, marginTop: 2 },
-  // WhatsApp's status reply hint: chevron + "Reply" centred in a small pill.
+  // WhatsApp-style reply input: full-width rounded field with a left-aligned
+  // "Reply…" placeholder. It LOOKS like a TextInput; tapping it opens the
+  // composer modal whose real input autofocuses (keyboard slides up).
   replyInputTrigger: {
-    flex: 1, marginRight: 6, height: 42,
-    borderRadius: 22,
+    flex: 1, marginRight: 10, height: 44,
+    borderRadius: 24,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(255,255,255,0.45)',
-    backgroundColor: 'rgba(0,0,0,0.35)',
+    borderColor: 'rgba(255,255,255,0.35)',
+    backgroundColor: 'rgba(0,0,0,0.45)',
     flexDirection: 'row',
-    alignItems: 'center', justifyContent: 'center',
-    paddingHorizontal: 18,
+    alignItems: 'center', justifyContent: 'flex-start',
+    paddingHorizontal: 16,
   },
   replyPlaceholder: {
-    color: 'rgba(255,255,255,0.85)', fontSize: 14, fontFamily: 'Roboto-Medium',
+    color: 'rgba(255,255,255,0.7)', fontSize: 15, fontFamily: 'Roboto-Regular',
   },
   // Keeps the heart button pinned right when the reply trigger is hidden
   // (official admin broadcasts).

@@ -98,7 +98,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
   };
   const getChatAvatar = (chat) => {
     if (chat?.chatType === 'group') return chat.chatAvatar || chat.group?.avatar || chat.groupAvatar;
-    return chat?.peerUser?.profileImage;
+    // chatAvatar fallback: chat-list rows carry the peer's image as chatAvatar
+    // even when the local peerUser object wasn't hydrated with one.
+    return chat?.peerUser?.profileImage || chat?.chatAvatar;
   };
 
   // ─── FORWARD HANDLER ───

@@ -20,7 +20,7 @@ import {
   ScrollView, TextInput, Platform, Alert, ActivityIndicator,
   Dimensions, Switch,
 } from 'react-native';
-import { Video, ResizeMode } from 'expo-av';
+import { Video, ResizeMode } from '../../components/ExpoAvVideoCompat';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { statusServices } from '../../Redux/Services/Status/Status.Services';

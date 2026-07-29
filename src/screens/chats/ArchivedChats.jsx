@@ -413,7 +413,7 @@ export default function ArchivedChats({ navigation }) {
     : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
   const previewImage = isGroupItem
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
-    : selectedChatItem?.peerUser?.profileImage;
+    : (selectedChatItem?.peerUser?.profileImage || selectedChatItem?.chatAvatar);
   const previewAvatarColor = getUserColor(previewName);
   const headerBtnBg = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
 

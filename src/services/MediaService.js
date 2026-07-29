@@ -6,7 +6,7 @@ import { BACKEND_URL } from '@env';
 import { apiCall } from '../Config/Https';
 import localStorageService from './LocalStorageService';
 import { toSecureMediaUri, mediaResolve } from '../utils/mediaService';
-import { computeFileSha256, MAX_HASH_BYTES } from '../utils/fileHash';
+import { computeFileSha256 } from '../utils/fileHash';
 
 const API_PREFIX = 'user/media';
 
@@ -486,7 +486,12 @@ class MediaService {
       const expectedHashHex = expectedHash ? String(expectedHash).toLowerCase() : null;
       let hashVerified = false;
       if (expectedHashHex) {
-        const actualHash = await computeFileSha256(localPath, { maxBytes: MAX_HASH_BYTES });
+        // Verify cap stays at 16MB regardless of MAX_HASH_BYTES (which was
+        // raised to 64MB for pre-UPLOAD dedup): hashing a 35MB file AFTER the
+        // bytes land adds 5-15s to every big download for marginal benefit —
+        // big files fall through to the size check below instead.
+        const DOWNLOAD_VERIFY_MAX_BYTES = 16 * 1024 * 1024;
+        const actualHash = await computeFileSha256(localPath, { maxBytes: DOWNLOAD_VERIFY_MAX_BYTES });
         if (actualHash && actualHash.toLowerCase() !== expectedHashHex) {
           await failIntegrity('content hash mismatch');
         }
@@ -496,7 +501,19 @@ class MediaService {
         const info = await FileSystem.getInfoAsync(localPath, { size: true });
         const actualSize = Number(info?.size || 0);
         if (actualSize > 0 && actualSize !== Number(expectedSize)) {
-          await failIntegrity(`size mismatch (${actualSize} != ${expectedSize})`);
+          // mediaMeta.fileSize is the SENDER'S ORIGINAL byte count, but the
+          // server re-encodes images (optimization) so the stored blob is
+          // legitimately smaller — failing here deleted every optimized image
+          // and retry-looped it forever ("kuch media download nahi hoti").
+          // Without a hash, size can't distinguish optimization from
+          // truncation, so only reject the clearly-bogus case (a tiny file
+          // where something big was expected); otherwise keep the bytes —
+          // contentHash (when present) remains the authoritative check above.
+          if (actualSize < 1024 && Number(expectedSize) > 100 * 1024) {
+            await failIntegrity(`size mismatch (${actualSize} != ${expectedSize})`);
+          } else {
+            console.log('[MEDIA:DOWNLOAD:SIZE_DIFF_OK]', { mediaId, actualSize, expectedSize });
+          }
         }
       }
     } catch (err) {

@@ -161,7 +161,7 @@ const getReadDB = async () => {
       }
       await handle.getFirstAsync('SELECT 1');
       // busy_timeout only (mirrors the writer); never query_only — see above.
-      try { await handle.execAsync('PRAGMA busy_timeout = 5000;'); } catch {}
+      try { await handle.execAsync('PRAGMA busy_timeout = 10000;'); } catch {}
       _readDb = handle;
       return handle;
     } catch (e) {
@@ -373,10 +373,10 @@ const _initDB = async () => {
         // the shared connection, writes fail with "attempt to write a readonly
         // database". Force it OFF on the writer so a stale state can't brick it.
         'PRAGMA query_only = OFF;',
-        // busy_timeout makes SQLite block up to 5s for a write lock instead of
+        // busy_timeout makes SQLite block up to 10s for a write lock instead of
         // failing immediately with "database is locked" — critical for the
         // upsertMessages path where many batches contend on the WAL writer.
-        'PRAGMA busy_timeout = 5000;',
+        'PRAGMA busy_timeout = 10000;',
       ]) {
         try { await _db.execAsync(pragma); }
         catch (e) { console.warn(`[ChatDB] ${pragma} failed (non-fatal):`, e?.message); }
@@ -966,8 +966,15 @@ const cleanBeforeUpsert = async (db, msg) => {
   if (serverId) {
     await db.runAsync(`DELETE FROM messages WHERE server_message_id = $s AND id != $id`, { $s: serverId, $id: id });
   }
-  // 4. Content-based: delete temp/unconfirmed rows from same sender with same text within 30s
-  if (msg.senderId && msg.timestamp) {
+  // 4. Content-based: delete temp/unconfirmed rows from same sender with same text
+  //    within 30s. TEXT ONLY — media rows are captionless (text='') or share a
+  //    filename, so matching on text would delete a DIFFERENT in-flight upload's
+  //    row (duplicate/disappearing media). Media is deduped only by the
+  //    temp_id↔server_message_id link (#1/#2/#3/#5), which is exact and safe.
+  const isMediaMsg = ['image', 'video', 'audio', 'file', 'album'].includes(
+    String(msg.type || msg.mediaType || '')
+  );
+  if (!isMediaMsg && msg.senderId && msg.timestamp) {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       await db.runAsync(
@@ -1047,6 +1054,25 @@ const runExclusive = (task) => {
 // `withExclusiveTransactionAsync`) share the SAME chain. Now identical to
 // runExclusive; kept as a named alias for call-site clarity.
 const runExclusiveBatch = runExclusive;
+
+// Busy-retry wrapper for high-frequency single-statement writers (presence
+// cache, coalesced status flush). Even fully chained, a write can still catch
+// SQLITE_BUSY when another CONNECTION holds the lock past busy_timeout (the
+// reader's snapshot during a checkpoint, or the exclusive-tx dedicated
+// connection winding down). Those windows are milliseconds — retry with
+// backoff instead of surfacing a scary warn; only a persistent lock escalates.
+const _isBusyError = (e) => /database is locked|SQLITE_BUSY/i.test(String(e?.message || e || ''));
+const runExclusiveWithRetry = async (task, attempts = 3) => {
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await runExclusive(task);
+    } catch (e) {
+      if (i === attempts || !_isBusyError(e)) throw e;
+      await new Promise((r) => setTimeout(r, 200 * i));
+    }
+  }
+  return undefined;
+};
 
 // Run a multi-statement cache write as ONE atomic transaction, retrying on a
 // transient "database is locked".
@@ -1808,7 +1834,7 @@ const _flushStatusBuffer = async () => {
   }
 
   try {
-    await runExclusive(async () => {
+    await runExclusiveWithRetry(async () => {
       const db = await getDB();
       for (const [status, ids] of byStatus) {
         const tp = STATUS_PRIORITY[status] || 0;
@@ -2200,12 +2226,18 @@ const deduplicateChat = async (chatId) => {
       await db.runAsync(`DELETE FROM messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM messages WHERE chat_id = $c GROUP BY id) AND chat_id = $c`, { $c: chatId });
       // 2. Remove temp rows that have a server-confirmed version (by temp_id link)
       await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND server_message_id IS NULL AND temp_id IS NOT NULL AND temp_id IN (SELECT temp_id FROM messages WHERE chat_id = $c AND server_message_id IS NOT NULL)`, { $c: chatId });
-      // 3. Remove temp rows with a content-matching server row (30s window)
-      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND id LIKE 'temp_%' AND EXISTS (SELECT 1 FROM messages s WHERE s.chat_id = $c AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000)`, { $c: chatId });
-      // 4. Remove any remaining content duplicates (same sender + text within 30s), keep newest
+      // 3. Remove temp rows with a content-matching server row (30s window).
+      //    TEXT ONLY: media rows are captionless (text='') or share a filename, so a
+      //    content match would wrongly delete a DIFFERENT in-flight upload's bubble —
+      //    the "sending media disappears on chat reopen" bug. Media is deduped
+      //    reliably by the temp_id↔server_message_id link in #2 above, never by text.
+      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND id LIKE 'temp_%' AND type = 'text' AND EXISTS (SELECT 1 FROM messages s WHERE s.chat_id = $c AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000)`, { $c: chatId });
+      // 4. Remove any remaining content duplicates (same sender + text within 30s),
+      //    keep newest — TEXT ONLY, for the same reason as #3 (both the DELETE and the
+      //    keep-set are scoped to type='text' so no media row can ever be collapsed).
       await db.runAsync(`
-        DELETE FROM messages WHERE chat_id = $c AND rowid NOT IN (
-          SELECT MAX(rowid) FROM messages WHERE chat_id = $c
+        DELETE FROM messages WHERE chat_id = $c AND type = 'text' AND rowid NOT IN (
+          SELECT MAX(rowid) FROM messages WHERE chat_id = $c AND type = 'text'
           GROUP BY sender_id, text, CAST(timestamp / 30000 AS INTEGER)
         )
       `, { $c: chatId });
@@ -2245,15 +2277,21 @@ const closeDB = async () => {
 // WAL back into the main DB and TRUNCATEing it on a graceful exit makes that far
 // less likely. Call from an AppState 'background'/'inactive' handler and on
 // logout/session-reset. Best-effort: never throws.
+// SERIALIZED through the write chain: this used to run bare, so a background
+// transition mid-write checkpointed/closed the connection UNDER an in-flight
+// chained writer — the recurring "database is locked" on finalizeAsync during
+// reconnect storms (writes queued behind the flood met the checkpoint head-on).
 const closeCleanly = async () => {
-  _dbInitPromise = null;
-  // Close the reader first so the checkpoint/truncate on the primary isn't held
-  // back by an open read connection on the same WAL.
-  await _closeReadDB();
-  if (!_db) return;
-  try { await _db.execAsync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch {}
-  await _drainThenClose(_db);
-  _db = null;
+  await runExclusive(async () => {
+    _dbInitPromise = null;
+    // Close the reader first so the checkpoint/truncate on the primary isn't held
+    // back by an open read connection on the same WAL.
+    await _closeReadDB();
+    if (!_db) return;
+    try { await _db.execAsync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch {}
+    await _drainThenClose(_db);
+    _db = null;
+  }).catch(() => {});
 };
 
 // ─── CHATLIST (chats table) ──────────────────────────────
@@ -3020,7 +3058,7 @@ const upsertPresenceCache = async (userId, { status, lastSeen } = {}) => {
   // updates arrive at high frequency and were racing batch writes, throwing
   // "database is locked" under WAL contention.
   try {
-    await runExclusive(async () => {
+    await runExclusiveWithRetry(async () => {
       const db = await getDB();
       await db.runAsync(
         'INSERT OR REPLACE INTO presence_cache (user_id, status, last_seen, updated_at) VALUES (?, ?, ?, ?);',

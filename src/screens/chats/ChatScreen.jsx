@@ -49,7 +49,8 @@ import { BlurView } from 'expo-blur';
 import { generateLocalVideoThumbnail } from '../../utils/thumbnailGenerator';
 import * as Haptics from 'expo-haptics';
 import * as IntentLauncher from 'expo-intent-launcher';
-import { Video, ResizeMode, Audio } from 'expo-av';
+import { Audio } from 'expo-av';
+import { Video, ResizeMode } from '../../components/ExpoAvVideoCompat';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import Reanimated, { useAnimatedStyle } from 'react-native-reanimated';
@@ -220,12 +221,49 @@ const VideoViewerControls = React.memo(function VideoViewerControls({
   isPlaying, positionMillis, durationMillis, onTogglePlay, onSeek, insetsBottom, accent,
 }) {
   const [trackW, setTrackW] = useState(0);
-  const [dragRatio, setDragRatio] = useState(null);
+  const [labelMs, setLabelMs] = useState(0);
   const trackWRef = useRef(0);
+  const draggingRef = useRef(false);
+  // Single Animated value (0..1) that DRIVES the bar. Instead of hopping to each
+  // 250ms status update (visible stepping), we glide it continuously to the end
+  // over the remaining time while playing, and only re-anchor when reality drifts
+  // (a seek or buffer stall) — so the bar moves as smoothly as WhatsApp's.
+  const progress = useRef(new Animated.Value(0)).current;
 
   const dur = durationMillis > 0 ? durationMillis : 0;
-  const liveRatio = dur > 0 ? Math.max(0, Math.min(1, positionMillis / dur)) : 0;
-  const ratio = dragRatio != null ? dragRatio : liveRatio;
+
+  useEffect(() => {
+    if (draggingRef.current) return; // never fight an active drag
+    if (dur <= 0) { progress.stopAnimation(); progress.setValue(0); setLabelMs(0); return; }
+    const reported = Math.max(0, Math.min(1, positionMillis / dur));
+    setLabelMs(positionMillis);
+    progress.stopAnimation((currentVal) => {
+      const cur = typeof currentVal === 'number' ? currentVal : reported;
+      // Keep gliding from where the bar already is if it's tracking reality
+      // closely (avoids a tiny backward jitter every status tick); snap only on a
+      // real jump (seek / stall).
+      const startFrom = Math.abs(cur - reported) > 0.04 ? reported : cur;
+      progress.setValue(startFrom);
+      if (isPlaying) {
+        Animated.timing(progress, {
+          toValue: 1,
+          duration: Math.max(0, dur * (1 - startFrom)),
+          easing: Easing.linear,
+          useNativeDriver: false,
+        }).start();
+      }
+    });
+  }, [positionMillis, durationMillis, isPlaying, dur, progress]);
+
+  const applyX = (x) => {
+    const w = trackWRef.current;
+    if (w <= 0) return 0;
+    const r = Math.max(0, Math.min(1, x / w));
+    progress.stopAnimation();
+    progress.setValue(r);
+    if (dur > 0) setLabelMs(r * dur);
+    return r;
+  };
 
   const pan = useRef(
     PanResponder.create({
@@ -233,26 +271,20 @@ const VideoViewerControls = React.memo(function VideoViewerControls({
       onMoveShouldSetPanResponder: () => true,
       // Keep the gesture on the seek bar so it never pages the album underneath.
       onPanResponderTerminationRequest: () => false,
-      onPanResponderGrant: (e) => {
-        const w = trackWRef.current;
-        if (w > 0) setDragRatio(Math.max(0, Math.min(1, e.nativeEvent.locationX / w)));
-      },
-      onPanResponderMove: (e) => {
-        const w = trackWRef.current;
-        if (w > 0) setDragRatio(Math.max(0, Math.min(1, e.nativeEvent.locationX / w)));
-      },
+      onPanResponderGrant: (e) => { draggingRef.current = true; applyX(e.nativeEvent.locationX); },
+      onPanResponderMove: (e) => { applyX(e.nativeEvent.locationX); },
       onPanResponderRelease: (e) => {
-        const w = trackWRef.current;
-        const r = w > 0 ? Math.max(0, Math.min(1, e.nativeEvent.locationX / w)) : 0;
-        setDragRatio(null);
+        const r = applyX(e.nativeEvent.locationX);
+        draggingRef.current = false;
         onSeek(r);
       },
-      onPanResponderTerminate: () => setDragRatio(null),
+      onPanResponderTerminate: () => { draggingRef.current = false; },
     })
   ).current;
 
-  const fill = `${Math.round(ratio * 100)}%`;
   const accentColor = accent || '#25D366';
+  const widthInterp = progress.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'], extrapolate: 'clamp' });
+  const thumbLeft = progress.interpolate({ inputRange: [0, 1], outputRange: [0, Math.max(0, trackW - 14)], extrapolate: 'clamp' });
 
   return (
     <View
@@ -267,7 +299,7 @@ const VideoViewerControls = React.memo(function VideoViewerControls({
         <Ionicons name={isPlaying ? 'pause' : 'play'} size={26} color="#fff" />
       </TouchableOpacity>
       <Text style={{ color: '#fff', fontSize: 12, width: 42, fontVariant: ['tabular-nums'] }}>
-        {fmtViewerTime(ratio * dur)}
+        {fmtViewerTime(labelMs)}
       </Text>
       <View
         style={{ flex: 1, height: 28, justifyContent: 'center', marginHorizontal: 8 }}
@@ -275,9 +307,9 @@ const VideoViewerControls = React.memo(function VideoViewerControls({
         {...pan.panHandlers}
       >
         <View style={{ height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.3)' }}>
-          <View style={{ height: 3, borderRadius: 2, width: fill, backgroundColor: accentColor }} />
+          <Animated.View style={{ height: 3, borderRadius: 2, width: widthInterp, backgroundColor: accentColor }} />
         </View>
-        <View style={{ position: 'absolute', left: Math.max(0, ratio * trackW - 7), width: 14, height: 14, borderRadius: 7, backgroundColor: accentColor }} />
+        <Animated.View style={{ position: 'absolute', left: thumbLeft, width: 14, height: 14, borderRadius: 7, backgroundColor: accentColor }} />
       </View>
       <Text style={{ color: '#fff', fontSize: 12, width: 42, textAlign: 'right', fontVariant: ['tabular-nums'] }}>
         {fmtViewerTime(dur)}

@@ -623,10 +623,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
           self._teardownMedia(true);
         }
         self._room = { roomId: p.roomId, groupId: null, callId: String(p.callId), media: self._media, joined: false };
-        self._startMedia(p.serverUrl).catch(function (e) {
-          self._log('media start failed: ' + (e && e.message));
-          self._emit('error', { message: 'Could not connect the call media' });
-        });
+        self._startMediaResilient(p.serverUrl, self._room);
       });
 
       s.on('callDeclined', function (p) {
@@ -913,10 +910,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
           // Promoted (accepted) while this join was failing — rebuild for real.
           self._teardownMedia(true);
           self._room = { roomId: room.roomId, groupId: null, callId: room.callId, media: self._media, joined: false };
-          self._startMedia(null).catch(function (e2) {
-            self._log('media start failed: ' + (e2 && e2.message));
-            self._emit('error', { message: 'Could not connect the call media' });
-          });
+          self._startMediaResilient(null, self._room);
         }
       });
     };
@@ -933,10 +927,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
         // was sent, and the server does not re-deliver it on its own.
         self._armRetry(function () { return self._reinviteGroup(gid); });
         // Host joins the room right away; media errors surface as 'error'.
-        self._startMedia(res.serverUrl).catch(function (e) {
-          self._log('group media start failed: ' + (e && e.message));
-          self._emit('error', { message: 'Could not connect the call media' });
-        });
+        self._startMediaResilient(res.serverUrl, self._room);
         return { callId: gid, offline: [] };
       });
     };
@@ -1305,6 +1296,28 @@ export const buildCallEngineHtml = () => `<!doctype html>
     };
 
     // ---- mediasoup room pipeline ----
+    // Fire-and-forget media start with self-heal. A join that dies to a socket
+    // flap (lost acks → timeout) is rebuilt on the reconnected socket instead
+    // of instantly surfacing the fatal "Could not connect the call media";
+    // superseded joins (a newer join/rebuild took over) are silent non-errors.
+    CallingSDK.prototype._startMediaResilient = function (serverUrl, room) {
+      var self = this;
+      var retry = function (n, err) {
+        var msg = String((err && err.message) || '');
+        if (self._room !== room || /superseded|torn down/i.test(msg)) return;
+        if (n >= 2) {
+          self._log('media start failed: ' + msg);
+          self._emit('error', { message: 'Could not connect the call media' });
+          return;
+        }
+        self._log('media start failed (' + msg + ') — rebuilding (attempt ' + (n + 1) + '/2)');
+        self._waitSocket(8000)
+          .then(function () { return self._room === room ? self._rebuildMedia() : null; })
+          .catch(function (e2) { retry(n + 1, e2); });
+      };
+      self._startMedia(serverUrl).catch(function (e) { retry(0, e); });
+    };
+
     CallingSDK.prototype._startMedia = function (serverUrl) {
       var self = this;
       var pre = Promise.resolve();
@@ -1323,20 +1336,31 @@ export const buildCallEngineHtml = () => `<!doctype html>
       var self = this;
       var room = self._room;
       if (!room) return Promise.reject(new Error('no room'));
+      // Join GENERATION: only the newest join may touch shared pipeline state
+      // (_device/_sendTransport/_recvTransport). A reconnect/escalation rebuild
+      // racing an accept-time join used to interleave — each loaded its own
+      // Device into self._device and neither pipeline came up. An older join
+      // aborts quietly at its next checkpoint.
+      var gen = self._joinGen = (self._joinGen || 0) + 1;
+      var superseded = function () { return self._joinGen !== gen || self._room !== room; };
       var joinRes = null;
+      var device = null;
       // Defensive: drop any stale server-side room membership (a missed cleanup
       // path would otherwise brick every future joinRoom). Idempotent no-op when
       // not in a room.
       try { self._socket && self._socket.emit('leaveRoom'); } catch (e) {}
       return self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, token: self._token || undefined }).then(function (res) {
+        if (superseded()) throw new Error('join superseded');
         joinRes = res || {};
-        self._device = new window.mediasoupClient.Device();
-        return self._device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
+        device = new window.mediasoupClient.Device();
+        return device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
       }).then(function () {
+        if (superseded()) throw new Error('join superseded');
+        self._device = device;
         // These three server round trips are independent of each other — batch
         // them instead of paying three sequential RTTs on the connect path.
         return Promise.all([
-          self._req('setRtpCapabilities', { rtpCapabilities: self._device.rtpCapabilities }),
+          self._req('setRtpCapabilities', { rtpCapabilities: device.rtpCapabilities }),
           self._req('createWebRtcTransport', { direction: 'send' }),
           self._req('createWebRtcTransport', { direction: 'recv' })
         ]);
@@ -1344,7 +1368,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
         // Torn down (hangup/remote end) while the join round trips were in
         // flight — building transports / re-capturing on the dead state would
         // leak a mic and mark a stale room joined.
-        if (self._room !== room) throw new Error('call torn down during join');
+        if (superseded()) throw new Error('call torn down during join');
         var sp = all[1];
         var rp = all[2];
         // Server-provided iceServers win; the app-supplied fallback fills in

@@ -59,7 +59,10 @@ function TileOverlay({ item, hiddenCount, available }) {
   return null;
 }
 
-function Tile({
+// Memoized: during an album upload only the PATCHED item gets a new object
+// identity (patchItem maps the array but keeps unchanged entries), so with
+// stable shared props the other tiles skip re-rendering entirely.
+const Tile = React.memo(function Tile({
   item,
   index,
   height,
@@ -153,26 +156,39 @@ function Tile({
     messageId,
     // Ring math fallback for responses without Content-Length.
     fileSize: Number(item?.mediaMeta?.fileSize || 0) || null,
+    // sha256 of the STORED bytes — authoritative post-download verify
+    // (fileSize is pre-optimization and can't be trusted for images).
+    contentHash: item?.mediaMeta?.contentHash || null,
   };
 
   // Report live state up so the album can render ONE aggregate ring.
+  // progress is ROUNDED before it crosses the boundary: the parent's
+  // setTileStates equality guard compares with ===, and raw floats arriving
+  // many times a second never bail out — with a large album that render↔effect
+  // cascade was a "Maximum update depth exceeded" crash during upload.
+  const roundedProgress = Math.round(Number(progress || 0));
   useEffect(() => {
     reportTile?.(index, {
       status,
-      progress: Number(progress || 0),
+      progress: roundedProgress,
       available,
     });
-  }, [reportTile, index, status, progress, available]);
+  }, [reportTile, index, status, roundedProgress, available]);
 
   // Hand the album-level overlay imperative control of this tile's transfer.
+  // Registered ONCE per stable identity (was dep-less = every commit); the
+  // callbacks read the LATEST descriptor through a ref, so the registration
+  // never needs to re-run just because a progress patch rebuilt the item.
+  const descriptorRef = useRef(downloadDescriptor);
+  descriptorRef.current = downloadDescriptor;
   useEffect(() => {
     registerTile?.(index, {
-      requestDownload: () => requestDownload(downloadDescriptor),
+      requestDownload: () => requestDownload(descriptorRef.current),
       pauseDownload: () => pauseDownload(),
-      resumeDownload: () => resumeDownload(downloadDescriptor),
+      resumeDownload: () => resumeDownload(descriptorRef.current),
       cancelDownload: () => cancelDownload(),
     });
-  });
+  }, [registerTile, index, requestDownload, pauseDownload, resumeDownload, cancelDownload]);
 
   const handlePress = () => {
     if (isSending || downloading || downloadPaused) return;
@@ -241,7 +257,7 @@ function Tile({
       <TileOverlay item={item} hiddenCount={hiddenCount} available={available} />
     </TouchableOpacity>
   );
-}
+});
 
 /**
  * WhatsApp-style album bubble (N attachments in ONE message).
@@ -325,29 +341,38 @@ export default function AlbumMessage({
     : 0;
   const lockedSize = lockedIdx.reduce((sum, i) => sum + Number(items[i]?.mediaMeta?.fileSize || 0), 0);
 
+  // The group-action callbacks read lockedIdx/tileStates through refs so they
+  // stay REFERENTIALLY STABLE across renders — lockedIdx is a fresh array every
+  // render, and keying useCallback on it rebuilt every callback (and therefore
+  // `shared`, and therefore every Tile) on every upload-progress patch. That
+  // churn is what let the tile→album report cascade run away on large albums.
+  const lockedIdxRef = useRef(lockedIdx);
+  lockedIdxRef.current = lockedIdx;
+  const tileStatesRef = useRef(tileStates);
+  tileStatesRef.current = tileStates;
   const downloadAll = useCallback(() => {
-    lockedIdx.forEach((i) => {
+    lockedIdxRef.current.forEach((i) => {
       const p = controlsRef.current[i]?.requestDownload?.();
       if (p?.catch) p.catch(() => {});
     });
-  }, [lockedIdx]);
+  }, []);
   const pauseAllDownloads = useCallback(() => {
-    lockedIdx.forEach((i) => controlsRef.current[i]?.pauseDownload?.());
-  }, [lockedIdx]);
+    lockedIdxRef.current.forEach((i) => controlsRef.current[i]?.pauseDownload?.());
+  }, []);
   const resumeAllDownloads = useCallback(() => {
-    lockedIdx.forEach((i) => {
-      const st = tileStates[i];
+    lockedIdxRef.current.forEach((i) => {
+      const st = tileStatesRef.current[i];
       if (st?.status === 'paused') {
         const p = controlsRef.current[i]?.resumeDownload?.();
         if (p?.catch) p.catch(() => {});
       }
     });
-  }, [lockedIdx, tileStates]);
+  }, []);
   const cancelAllDownloads = useCallback(() => {
-    lockedIdx.forEach((i) => controlsRef.current[i]?.cancelDownload?.());
-  }, [lockedIdx]);
+    lockedIdxRef.current.forEach((i) => controlsRef.current[i]?.cancelDownload?.());
+  }, []);
 
-  const shared = {
+  const shared = useMemo(() => ({
     onPressItem,
     onLongPressItem,
     isMine,
@@ -356,7 +381,7 @@ export default function AlbumMessage({
     onLockedPress: downloadAll,
     reportTile,
     registerTile,
-  };
+  }), [onPressItem, onLongPressItem, isMine, chatId, messageId, downloadAll, reportTile, registerTile]);
 
   if (!items.length) return null;
 

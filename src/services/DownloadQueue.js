@@ -46,6 +46,7 @@ class DownloadQueue {
       messageId: item.messageId || null,
       groupId: item.groupId || null,
       fileSize: Number(item.fileSize || 0) || null,
+      contentHash: item.contentHash || null,
     });
 
     this.queue.push({ ...item, mediaId });
@@ -53,7 +54,7 @@ class DownloadQueue {
     this._drain();
   }
 
-  async hydratePending() {
+  async hydratePending({ freshRetries = false } = {}) {
     const pending = await localStorageService.getPendingDownloads();
     const normalized = pending.map((item) => ({
       mediaId: String(item.mediaId),
@@ -64,7 +65,8 @@ class DownloadQueue {
       messageId: item.messageId || null,
       groupId: item.groupId || null,
       fileSize: Number(item.fileSize || 0) || null,
-      retries: Number(item.retries || 0),
+      contentHash: item.contentHash || null,
+      retries: freshRetries ? 0 : Number(item.retries || 0),
     }));
 
     for (const item of normalized) {
@@ -73,6 +75,14 @@ class DownloadQueue {
       }
     }
     this._drain();
+  }
+
+  // Reconnect hook — re-enqueue interrupted/failed rows with a FRESH retry
+  // budget (their previous attempts died with the old connection, like the
+  // upload queue's reconnect re-arm). Paused/cancelled rows stay parked —
+  // hydratePending already excludes them.
+  async resumeInterrupted() {
+    return this.hydratePending({ freshRetries: true });
   }
 
   _drain() {
@@ -99,6 +109,9 @@ class DownloadQueue {
         // Content-Length fallback — without it a chunked/gzipped response
         // reports total 0 and the tile/album ring never moves.
         expectedSize: Number(item.fileSize || 0) || null,
+        // Authoritative integrity check: sha256 of the STORED bytes (survives
+        // server-side image optimization, unlike the sender's fileSize).
+        expectedHash: item.contentHash || null,
         onProgress: async (progress) => {
           this._emit({ type: 'progress', mediaId, progress });
           await localStorageService.updateDownloadQueue(mediaId, { progress, status: 'downloading' });
@@ -128,6 +141,22 @@ class DownloadQueue {
 
       const current = await localStorageService.getDownloadQueueItem(mediaId);
       const retries = Number(current?.retries || item?.retries || 0);
+
+      // Connectivity failure: don't burn the retry budget on immediate
+      // re-attempts while the device is offline (they fail in ms). Park the
+      // row as 'pending' — the reconnect hook (resumeInterrupted) and boot
+      // hydration both pick 'pending' rows back up automatically.
+      const offlineLike = /network|internet|host|unreachable|conn(ect|ection)|timed? ?out|ENOTFOUND|ECONNREFUSED|ERR_NETWORK/i
+        .test(String(error?.message || ''));
+      if (offlineLike) {
+        await localStorageService.updateDownloadQueue(mediaId, {
+          status: 'pending',
+          retries,
+          error: error?.message || 'network interrupted',
+        });
+        this._emit({ type: 'failed', mediaId, error: error?.message || 'network interrupted' });
+        return; // finally still runs (running cleanup + drain)
+      }
 
       if (retries < MAX_RETRIES) {
         await localStorageService.updateDownloadQueue(mediaId, {

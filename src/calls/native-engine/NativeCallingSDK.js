@@ -286,8 +286,14 @@ export default class NativeCallingSDK {
         this._registered = true;
         this._log(`registered on ${url} as ${this.userId}`);
         if (done) { const d = done; done = null; d(null); }
-        // Socket came back while in a call → resume the room media.
-        if (this._room) this._resume();
+        // Socket came back while in a call → resume the room media. Only a
+        // FULLY-JOINED room resumes: a half-joined one still has its fresh
+        // joinRoom in flight, and firing _resume() beside it ran TWO joins
+        // concurrently — they clobbered each other's device/transports and the
+        // accept died with "Could not connect the call media". A join whose
+        // acks were lost to the flap times out and the resilient-start retry
+        // rebuilds it on this new socket.
+        if (this._room && this._room.joined) this._resume();
       }).catch((err) => {
         this._log(`register failed: ${err && err.message}`);
         if (done) { const d = done; done = null; d(err || new Error('register failed')); }
@@ -465,10 +471,7 @@ export default class NativeCallingSDK {
         this._teardownMedia(true);
       }
       this._room = { roomId: p.roomId, groupId: null, callId: String(p.callId), media: this._media, joined: false };
-      this._startMedia(p.serverUrl).catch((e) => {
-        this._log(`media start failed: ${e && e.message}`);
-        this._emit('error', { message: 'Could not connect the call media' });
-      });
+      this._startMediaResilient(p.serverUrl, this._room);
     });
 
     s.on('callDeclined', (p) => {
@@ -790,10 +793,7 @@ export default class NativeCallingSDK {
         // Promoted (accepted) while this join was failing — rebuild for real.
         this._teardownMedia(true);
         this._room = { roomId: room.roomId, groupId: null, callId: room.callId, media: this._media, joined: false };
-        this._startMedia(null).catch((e2) => {
-          this._log(`media start failed: ${e2 && e2.message}`);
-          this._emit('error', { message: 'Could not connect the call media' });
-        });
+        this._startMediaResilient(null, this._room);
       }
     });
   }
@@ -806,10 +806,7 @@ export default class NativeCallingSDK {
       this._groupJoined = {};
       // Re-invite members whose engine registers late (push-woken app).
       this._armRetry(() => this._reinviteGroup(gid));
-      this._startMedia(res.serverUrl).catch((e) => {
-        this._log(`group media start failed: ${e && e.message}`);
-        this._emit('error', { message: 'Could not connect the call media' });
-      });
+      this._startMediaResilient(res.serverUrl, this._room);
       return { callId: gid, offline: [] };
     });
   }
@@ -1101,6 +1098,28 @@ export default class NativeCallingSDK {
   }
 
   // ---- room media ----
+  // Fire-and-forget media start with self-heal. A join that dies to a socket
+  // flap (lost acks → timeout) gets rebuilt on the reconnected socket instead
+  // of instantly surfacing the fatal "Could not connect the call media" — that
+  // error killed just-accepted calls whose network merely blinked. Superseded
+  // joins (a newer join/rebuild took over) are silent non-errors.
+  _startMediaResilient(serverUrl, room) {
+    const fail = (msg) => {
+      this._log(`media start failed: ${msg}`);
+      this._emit('error', { message: 'Could not connect the call media' });
+    };
+    const retry = (n, err) => {
+      const msg = String((err && err.message) || '');
+      if (this._room !== room || /superseded|torn down/i.test(msg)) return; // no longer this call's join
+      if (n >= 2) { fail(msg); return; }
+      this._log(`media start failed (${msg}) — rebuilding (attempt ${n + 1}/2)`);
+      this._waitSocket(8000)
+        .then(() => (this._room === room ? this._rebuildMedia() : null))
+        .catch((e2) => retry(n + 1, e2));
+    };
+    this._startMedia(serverUrl).catch((e) => retry(0, e));
+  }
+
   _startMedia(serverUrl) {
     let pre = Promise.resolve();
     if (serverUrl && serverUrl !== this._serverUrl) pre = this._migrate(serverUrl);
@@ -1117,29 +1136,40 @@ export default class NativeCallingSDK {
   _joinRoom() {
     const room = this._room;
     if (!room) return Promise.reject(new Error('no room'));
+    // Join GENERATION: only the newest join may touch shared pipeline state
+    // (_device/_sendTransport/_recvTransport). A reconnect-triggered rebuild
+    // racing an accept-time join used to interleave — each loaded its own
+    // Device into this._device and neither pipeline came up ("double joinRoom,
+    // no ICE" on the server). An older join aborts at its next checkpoint.
+    const gen = this._joinGen = (this._joinGen || 0) + 1;
+    const superseded = () => (this._joinGen !== gen || this._room !== room);
     let joinRes = null;
+    let device = null;
     // Defensive: drop any stale server-side room membership.
     try { this._socket && this._socket.emit('leaveRoom'); } catch (_) {}
     return this._req('joinRoom', {
       roomId: room.roomId, name: this.name, sessionId: this.userId, token: this._token || undefined,
     }).then((res) => {
+      if (superseded()) throw new Error('join superseded');
       joinRes = res || {};
-      this._device = this._makeDevice();
-      return this._device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
-    }).then(() => (
+      device = this._makeDevice();
+      return device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
+    }).then(() => {
+      if (superseded()) throw new Error('join superseded');
+      this._device = device;
       // These three server round trips are independent of each other — batch
       // them instead of paying three sequential RTTs on the connect path.
-      Promise.all([
-        this._req('setRtpCapabilities', { rtpCapabilities: this._device.rtpCapabilities }),
+      return Promise.all([
+        this._req('setRtpCapabilities', { rtpCapabilities: device.rtpCapabilities }),
         this._req('createWebRtcTransport', { direction: 'send' }),
         this._req('createWebRtcTransport', { direction: 'recv' }),
-      ])
-    ))
+      ]);
+    })
       .then(([, sp, rp]) => {
         // Torn down (hangup/remote end) while the join round trips were in
         // flight — building transports / re-capturing on the dead state would
         // leak a mic and mark a stale room joined.
-        if (this._room !== room) throw new Error('call torn down during join');
+        if (superseded()) throw new Error('call torn down during join');
         const ice = (joinRes.iceServers && joinRes.iceServers.length) ? joinRes.iceServers : (this._fallbackIceServers || []);
         this._sendTransport = this._device.createSendTransport({ ...sp, iceServers: ice });
         this._wireTransport(this._sendTransport);

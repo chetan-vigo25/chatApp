@@ -52,6 +52,29 @@ export default function UploadRing({
     outputRange: [circumference, 0],
   });
 
+  // Before the FIRST progress byte lands the arc sits at 0% — a static empty
+  // ring + pause bars that reads as "stuck" during the pre-upload phase
+  // (compression, sha256, presign round-trip). Until real progress (≥1%)
+  // arrives, spin a short arc instead — an indeterminate, obviously-alive
+  // loader — then hand off to the normal determinate ring. Paused stays the
+  // dimmed static ring (pausing IS stillness).
+  const isIndeterminate = !paused && clamped < 1;
+  const spinAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (!isIndeterminate) return undefined;
+    const loop = Animated.loop(
+      Animated.timing(spinAnim, {
+        toValue: 1,
+        duration: 900,
+        easing: Easing.linear,
+        useNativeDriver: true,
+      })
+    );
+    loop.start();
+    return () => { loop.stop(); spinAnim.setValue(0); };
+  }, [isIndeterminate, spinAnim]);
+  const spinDeg = spinAnim.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
+
   const isPaused = Boolean(paused);
   const hasControls = Boolean(onPause || onResume || onCancel);
   // Glyph geometry scales with the ring so the small (36px) audio/file rings
@@ -132,22 +155,45 @@ export default function UploadRing({
           strokeWidth={strokeWidth}
           fill="none"
         />
-        {/* Progress arc — starts at 12 o'clock, dimmed while paused */}
-        <AnimatedCircle
-          cx={cx}
-          cy={cy}
-          r={radius}
-          stroke={color}
-          strokeWidth={strokeWidth}
-          fill="none"
-          strokeDasharray={`${circumference} ${circumference}`}
-          strokeDashoffset={dashOffset}
-          strokeLinecap="round"
-          opacity={isPaused ? 0.6 : 1}
-          transform={`rotate(-90 ${cx} ${cy})`}
-        />
+        {/* Progress arc — starts at 12 o'clock, dimmed while paused. Hidden
+            while indeterminate (it would draw a 0% seam under the spinner). */}
+        {!isIndeterminate && (
+          <AnimatedCircle
+            cx={cx}
+            cy={cy}
+            r={radius}
+            stroke={color}
+            strokeWidth={strokeWidth}
+            fill="none"
+            strokeDasharray={`${circumference} ${circumference}`}
+            strokeDashoffset={dashOffset}
+            strokeLinecap="round"
+            opacity={isPaused ? 0.6 : 1}
+            transform={`rotate(-90 ${cx} ${cy})`}
+          />
+        )}
         {renderCenterGlyph()}
       </Svg>
+      {isIndeterminate && (
+        <Animated.View
+          pointerEvents="none"
+          style={[StyleSheet.absoluteFill, { transform: [{ rotate: spinDeg }] }]}
+        >
+          <Svg width={size} height={size}>
+            <Circle
+              cx={cx}
+              cy={cy}
+              r={radius}
+              stroke={color}
+              strokeWidth={strokeWidth}
+              fill="none"
+              strokeDasharray={`${circumference * 0.28} ${circumference}`}
+              strokeLinecap="round"
+              transform={`rotate(-90 ${cx} ${cy})`}
+            />
+          </Svg>
+        </Animated.View>
+      )}
       {showPercent && !hasControls && (
         <Text style={[styles.percentText, { fontSize }]} allowFontScaling={false}>
           {Math.round(clamped)}%

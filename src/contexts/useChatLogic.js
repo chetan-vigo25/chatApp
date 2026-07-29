@@ -34,7 +34,7 @@ import {
   normalizeUri,
   uploadMediaFile,
 } from "../utils/mediaService";
-import { abortChunkSession } from '../utils/chunkedUpload';
+import { abortChunkSession, CHUNKED_UPLOAD_THRESHOLD } from '../utils/chunkedUpload';
 import {
   pauseUpload as registryPauseUpload,
   resumeUpload as registryResumeUpload,
@@ -115,6 +115,10 @@ const SOCKET_FETCH_LIMIT = 50;
 // paging grows the displayed window; refreshMessagesFromDB then reads at least
 // the whole loaded window so a re-read never shrinks the list back to one page.
 const INITIAL_PAGE_SIZE = 40;
+// Very first paint of a chat reads just ONE visible screenful so the open is
+// instant even on a slow/contended SQLite; the window immediately grows to
+// INITIAL_PAGE_SIZE in a background follow-up refresh (see refreshMessagesFromDB).
+const FIRST_PAINT_PAGE_SIZE = 20;
 const LOCAL_SAVE_DEBOUNCE_MS = 220;
 const MEDIA_STATUS_ACK_TIMEOUT_MS = 9000;
 const MEDIA_STATUS_MAX_RETRIES = 5;
@@ -252,7 +256,7 @@ const uploadTimeoutForSize = (sizeBytes) => Math.max(
 //   - images (except GIFs) are re-encoded via expo-image-manipulator, which both
 //     shrinks them AND strips EXIF (GPS etc.) — that re-encode is the point.
 //     Pass { hd: true } to skip compression and send the original.
-//   - the FINAL bytes are sha256-hashed (≤16MB only) so the server can dedupe
+//   - the FINAL bytes are sha256-hashed (≤64MB) so the server can dedupe
 //     via user/media/exists and receivers can verify integrity.
 // Video transcoding is intentionally NOT attempted (no ffmpeg dep — server side
 // handles it).
@@ -285,7 +289,20 @@ const prepareOutgoingMediaFile = async (file, messageType, { hd = false } = {}) 
     }
   } catch { /* keep picker-reported size */ }
 
-  // sha256 of the final bytes — computeFileSha256 self-limits to ≤16MB files.
+  // sha256 of the final bytes — computeFileSha256 self-limits to ≤64MB files.
+  //
+  // Chunked-size files (> CHUNKED_UPLOAD_THRESHOLD) do NOT wait for it: the
+  // crypto-js hash costs ~10-30s of JS-thread time for a big video, and it
+  // used to run BEFORE the upload — the receiver saw nothing while the sender
+  // was still hashing. The hash now runs CONCURRENTLY with the upload as
+  // `sourceHashPromise`; the chunked loop dedup-checks mid-flight and aborts
+  // the session on a hit. Small files keep the awaited hash (fast, and the
+  // /exists pre-check + single-POST path want it up front).
+  if (Number(prepared?.size || 0) > CHUNKED_UPLOAD_THRESHOLD) {
+    const sourceHashPromise = computeFileSha256(prepared.uri, { maxBytes: MAX_HASH_BYTES })
+      .catch(() => null);
+    return { file: prepared, sourceHash: null, sourceHashPromise };
+  }
   const sourceHash = await computeFileSha256(prepared.uri, { maxBytes: MAX_HASH_BYTES });
 
   return { file: prepared, sourceHash };
@@ -521,6 +538,11 @@ export default function useChatLogic({ navigation, route }) {
   const reconnectTimeoutRef = useRef(null);
   const searchTimeoutRef = useRef(null);
   const initialLoadDoneRef = useRef(false);
+  // True once the first (small) DB paint of the current chat has run. Separate
+  // from initialLoadDoneRef (which flips only after the WHOLE open sequence,
+  // socket join included) so the background grow-to-full-window refresh can't
+  // be mistaken for another first paint and read the small page again.
+  const firstPaintDoneRef = useRef(false);
   // Cold-start recovery: set when the on-open message fetch could not be
   // emitted (socket still connecting). The `connect` handler checks it and
   // fires the FULL fetch the open owed, instead of a seq-delta that assumes
@@ -1258,6 +1280,7 @@ export default function useChatLogic({ navigation, route }) {
     isComponentMounted.current = true;
     reconnectAttempts.current = 0;
     initialLoadDoneRef.current = false;
+    firstPaintDoneRef.current = false;
     checkAndReconnectSocket();
     return () => {
       isComponentMounted.current = false;
@@ -1284,13 +1307,21 @@ export default function useChatLogic({ navigation, route }) {
       if (queuedMediaStatusRef.current.length > 0) {
         flushQueuedMediaStatusUpdates();
       }
-      // NOTE: media uploads are intentionally NOT auto-flushed on reconnect.
-      // A NetInfo false→true flap (common while a large video saturates the
-      // radio) used to re-run the whole upload for a media whose bytes were
-      // already on the server — the "same video re-uploads by itself a few
-      // seconds later" duplicate. Media now re-sends ONLY on an explicit Retry
-      // tap (resendMessage), which re-emits already-uploaded media without
-      // re-uploading. Offline-queued media shows 'failed' → user taps Retry.
+      // Auto-resume queued/interrupted media uploads on reconnect (WhatsApp
+      // behavior — "internet wapas aate hi upload khud resume ho"). This was
+      // once disabled because a NetInfo flap re-ran an upload whose bytes were
+      // already on the server; the flush is now structurally safe against that
+      // duplicate: in-flight lock, live-queue reconcile, active-upload skip
+      // (activeMediaUploadTempIdsRef), already-sent status drop, hash-dedup
+      // fast-path, and chunked sessions resume from the server's offset — a
+      // re-run never re-sends bytes the server already has. User-paused /
+      // cancelled rows stay parked (explicit tap only). Short delay lets the
+      // socket auth + chat state settle before the re-send.
+      setTimeout(() => { flushQueuedMediaUploadsRef.current().catch(() => {}); }, 1500);
+      // Downloads get the same reconnect treatment: interrupted/parked rows
+      // re-enqueue with a fresh retry budget (their attempts died with the old
+      // connection). User-paused/cancelled rows stay parked.
+      setTimeout(() => { DownloadQueue.resumeInterrupted().catch(() => {}); }, 1500);
     } else {
       setUserStatus("offline");
       if (reconnectTimeoutRef.current) {
@@ -1505,6 +1536,7 @@ export default function useChatLogic({ navigation, route }) {
       setIsPeerTyping(false); // Reset typing state
       setIsLocalTyping(false);
       initialLoadDoneRef.current = false;
+    firstPaintDoneRef.current = false;
       
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
@@ -1599,6 +1631,7 @@ export default function useChatLogic({ navigation, route }) {
       groupScheduleTimersRef.current.clear();
 
       initialLoadDoneRef.current = false;
+    firstPaintDoneRef.current = false;
       pendingInitialFetchRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2789,11 +2822,21 @@ export default function useChatLogic({ navigation, route }) {
         // loaded window instead of snapping back to page one — which is what
         // made the screen re-trigger pagination ("load again and again") on
         // every incoming message, receipt or reaction.
-        const pageLimit = Math.max(
+        const fullLimit = Math.max(
           INITIAL_PAGE_SIZE,
           loadedLimitRef.current || 0,
           allMessagesRef.current?.length || 0,
         );
+        // Very first paint: read ONE screenful (FIRST_PAINT_PAGE_SIZE) so the
+        // chat opens with whatever exists — even a handful of rows — instantly;
+        // the full window is re-read in a background follow-up right after
+        // (scheduled at the bottom). Never smaller than what's already on
+        // screen (a warm cache may have painted a grown window).
+        const isFirstPaint = isFirstRender && !firstPaintDoneRef.current;
+        if (isFirstPaint) firstPaintDoneRef.current = true;
+        const pageLimit = isFirstPaint
+          ? Math.max(FIRST_PAINT_PAGE_SIZE, allMessagesRef.current?.length || 0)
+          : fullLimit;
         const dbMessages = await ChatDatabase.loadMessagesWithReplies(cid, {
           limit: pageLimit,
           afterTimestamp: clearedAt,
@@ -3032,6 +3075,22 @@ export default function useChatLogic({ navigation, route }) {
           const cleaned = prev.filter(m => m.status === 'scheduled' || m.status === 'processing' || m.status === 'failed');
           return cleaned.length !== prev.length ? cleaned : prev;
         });
+
+        if (isFirstPaint) {
+          // ANY rows painted → drop the loader NOW. Don't wait for the rest of
+          // the open sequence (AsyncStorage restore, message count, socket
+          // join) — those continue in the background behind visible messages.
+          if (enriched.length > 0) {
+            setIsLoadingInitial(false);
+            setIsLoadingFromLocal(false);
+          }
+          // Grow the small first page to the full window off the critical
+          // path. firstPaintDoneRef is already set, so this re-read uses
+          // fullLimit and can never recurse back into the small page.
+          if (pageLimit < fullLimit) {
+            setTimeout(() => { try { refreshMessagesFromDB(true); } catch {} }, 80);
+          }
+        }
       } catch (err) {
         console.warn('[ChatDB] refreshMessagesFromDB error:', err);
       }
@@ -6978,6 +7037,8 @@ export default function useChatLogic({ navigation, route }) {
             mediaUrl: item?.mediaUrl || null,
             messageId: parentMessageId,
             groupId: normalizeId(message?.groupId) || null,
+            fileSize: Number(item?.mediaMeta?.fileSize || 0) || null,
+            contentHash: item?.mediaMeta?.contentHash || null,
           });
         }
         return;
@@ -8144,8 +8205,18 @@ export default function useChatLogic({ navigation, route }) {
       // INSTANT UI: show message immediately with local preview
       setAllMessages((prev) => [localMsg, ...prev]);
 
-      // Write to SQLite in background (non-blocking)
-      ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
+      // Persist the optimistic row to SQLite and AWAIT it (was fire-and-forget with
+      // a swallowed error). The heavy file hashing/base64 below saturates the JS
+      // thread for hundreds of ms; if this write hadn't committed before the user
+      // navigated away + reopened the chat, the reopen's loadMessages read a
+      // snapshot WITHOUT the sending bubble ("uploading media disappears on
+      // reopen"). Committing it first — and logging any failure instead of
+      // swallowing it — guarantees the sending message survives navigation.
+      try {
+        await ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current });
+      } catch (persistErr) {
+        console.warn('[sendMedia] optimistic persist failed:', persistErr?.message || persistErr);
+      }
 
       // Back-fill intrinsic image dimensions when the picker didn't provide them,
       // so the bubble locks its final shape immediately (no resize on upload).
@@ -8278,12 +8349,14 @@ export default function useChatLogic({ navigation, route }) {
 
       const uploadTimeoutMs = uploadTimeoutForSize(uploadFile.size);
 
+      let lastSingleProgressAt = 0; // fed by onUploadProgress → stall watchdog below
       const uploadPromise = uploadMediaFile({
         file: uploadFile,
         chatId: chatIdRef.current,
         dispatch,
         mediaUploadAction: mediaUpload,
         sourceHash,
+        sourceHashPromise: prep.sourceHashPromise || null,
         timeoutMs: uploadTimeoutMs,
         // Chunked-session resume state (files > CHUNKED_UPLOAD_THRESHOLD): the
         // queue row carries {sessionId, uri, offset} so an app restart resumes
@@ -8307,19 +8380,44 @@ export default function useChatLogic({ navigation, route }) {
         // REAL byte-level progress (XHR upload / chunk offsets) — replaces the
         // old fake setInterval ticker.
         onUploadProgress: ({ loaded, total }) => {
+          lastSingleProgressAt = Date.now();
           if (!total) return;
           const fraction = Math.max(0.02, Math.min(0.98, loaded / total));
           setUploadProgress((prev) => ({ ...prev, [tempId]: fraction }));
         },
       });
 
-      // Watchdog scaled with file size — must exceed the transport timeout
-      // passed down to the XHR/chunk path above.
+      // STALL watchdog (same rationale as the album tiles): a fixed
+      // size-scaled timeout false-failed huge files on slow links even while
+      // bytes were still flowing. Fail only when NO progress event arrives for
+      // STALL_MS; the absolute cap is a runaway backstop. The initial stall
+      // window also covers the pre-upload steps (Sent/ copy + dedup RTT).
+      const SINGLE_STALL_MS = 90000;
+      const singleStartedAt = Date.now();
+      const singleCapMs = Math.max(uploadTimeoutMs * 4, 30 * 60 * 1000);
+      let watchdogTimer = null;
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error(`upload timeout after ${uploadTimeoutMs}ms`)), uploadTimeoutMs);
+        const tick = () => {
+          const idleFor = Date.now() - (lastSingleProgressAt || singleStartedAt);
+          if (Date.now() - singleStartedAt > singleCapMs) {
+            reject(new Error(`upload timeout after ${singleCapMs}ms`));
+            return;
+          }
+          if (idleFor > SINGLE_STALL_MS) {
+            reject(new Error(`upload stalled — no progress for ${Math.round(idleFor / 1000)}s`));
+            return;
+          }
+          watchdogTimer = setTimeout(tick, 5000);
+        };
+        watchdogTimer = setTimeout(tick, 5000);
       });
 
-      const action = await Promise.race([uploadPromise, timeoutPromise]);
+      let action;
+      try {
+        action = await Promise.race([uploadPromise, timeoutPromise]);
+      } finally {
+        if (watchdogTimer) clearTimeout(watchdogTimer); // the losing timer used to leak
+      }
       const uploadedLocalUri = normalizeUri(action?.localUri || uploadFile.uri || localSourceUri);
       const payloadData = action?.payload || action;
       const success = payloadData && (payloadData.status === true || payloadData.statusCode === 200 || payloadData.success === true);
@@ -8828,6 +8926,9 @@ export default function useChatLogic({ navigation, route }) {
     };
 
     const lastItemProgressAt = {};
+    // Stall detection: updated on EVERY progress event (the patch throttle map
+    // above deliberately isn't — it only tracks painted frames).
+    const lastProgressEventAt = {};
     const uploadOne = async (index) => {
       const file = normFiles[index];
       const attempt = async () => {
@@ -8852,11 +8953,13 @@ export default function useChatLogic({ navigation, route }) {
             dispatch,
             mediaUploadAction: mediaUpload,
             sourceHash: prep.sourceHash,
+            sourceHashPromise: prep.sourceHashPromise || null,
             timeoutMs: uploadTimeoutMs,
             signal: tileAbortController.signal,
             isPaused: () => isUploadPaused(tempId) || isUploadCancelled(tempId),
             // REAL byte progress per tile (throttled — patchItem re-renders the bubble).
             onUploadProgress: ({ loaded, total }) => {
+              lastProgressEventAt[index] = Date.now();
               if (!total) return;
               const now = Date.now();
               if (loaded < total && now - (lastItemProgressAt[index] || 0) < 150) return;
@@ -8865,10 +8968,37 @@ export default function useChatLogic({ navigation, route }) {
               refreshOverallProgress();
             },
           });
+          // STALL watchdog, not a total-time timeout. A fixed size-scaled
+          // timeout false-failed big files on slow links — 27/30 uploads done
+          // and the last huge videos got killed MID-TRANSFER with bytes still
+          // flowing, flipping the whole album to Retry. Now a file only fails
+          // when NO progress event arrives for STALL_MS (genuinely dead
+          // transfer); a slow-but-moving upload runs to completion. The
+          // absolute cap is a runaway backstop only.
+          const STALL_MS = 90000;
+          const startedAt = Date.now();
+          const capMs = Math.max(uploadTimeoutMs * 4, 30 * 60 * 1000);
+          let stallTimer = null;
           const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`upload timeout after ${uploadTimeoutMs}ms`)), uploadTimeoutMs);
+            const tick = () => {
+              const idleFor = Date.now() - (lastProgressEventAt[index] || startedAt);
+              if (Date.now() - startedAt > capMs) {
+                reject(new Error(`upload timeout after ${capMs}ms`));
+                return;
+              }
+              if (idleFor > STALL_MS) {
+                reject(new Error(`upload stalled — no progress for ${Math.round(idleFor / 1000)}s`));
+                return;
+              }
+              stallTimer = setTimeout(tick, 5000);
+            };
+            stallTimer = setTimeout(tick, 5000);
           });
-          action = await Promise.race([uploadPromise, timeoutPromise]);
+          try {
+            action = await Promise.race([uploadPromise, timeoutPromise]);
+          } finally {
+            if (stallTimer) clearTimeout(stallTimer);
+          }
         } finally {
           unregisterTileAbort();
         }
@@ -8897,7 +9027,10 @@ export default function useChatLogic({ navigation, route }) {
       };
 
       patchItem(index, { uploadStatus: 'uploading' });
-      for (let tries = 0; tries < 2; tries += 1) {
+      // 3 tries with growing backoff — a mid-album transient (socket blip,
+      // presign 5xx) shouldn't burn a file. Already-uploaded bytes dedupe via
+      // sourceHash, so a retried attempt is cheap for anything that got through.
+      for (let tries = 0; tries < 3; tries += 1) {
         try {
           const item = await attempt();
           patchItem(index, { ...item, uploadStatus: 'done', uploadProgress: 100 });
@@ -8910,8 +9043,8 @@ export default function useChatLogic({ navigation, route }) {
             patchItem(index, { uploadStatus: 'pending' });
             return { error: 'upload paused', paused: true };
           }
-          if (tries === 0) {
-            await new Promise((r) => setTimeout(r, 1000));
+          if (tries < 2) {
+            await new Promise((r) => setTimeout(r, 1000 * (tries + 1)));
             continue;
           }
           patchItem(index, { uploadStatus: 'failed', uploadProgress: 0 });
@@ -8993,11 +9126,25 @@ export default function useChatLogic({ navigation, route }) {
         createdAt: timestamp,
       };
 
+      // Indexes that genuinely failed (paused/cancelled returned earlier, so
+      // every error row here is a real failure). These items are SPLIT out of
+      // the sent album into their own retryable bubble below — the delivered
+      // album carries only what actually uploaded.
+      const failedIdx = results
+        .map((r, i) => (!r || r.error ? i : -1))
+        .filter((i) => i >= 0);
+      // Snapshot the failed tiles/files BEFORE liveItems is narrowed to the
+      // delivered set — the retry bubble below is built from these.
+      const failedLiveItems = failedIdx.map((i) => liveItems[i]);
+      const failedFiles = failedIdx.map((i) => normFiles[i]);
+
       // Final attachments keep the local uri so the sender renders instantly.
-      const finalItems = liveItems.map((item, i) => {
-        const server = results[i] && !results[i].error ? results[i] : null;
-        return server ? { ...item, ...server, uploadStatus: 'done' } : item;
-      });
+      const finalItems = liveItems
+        .map((item, i) => {
+          const server = results[i] && !results[i].error ? results[i] : null;
+          return server ? { ...item, ...server, uploadStatus: 'done' } : null;
+        })
+        .filter(Boolean);
       liveItems = finalItems;
 
       setAllMessages((prev) => {
@@ -9055,6 +9202,51 @@ export default function useChatLogic({ navigation, route }) {
         delete next[tempId];
         return next;
       });
+
+      // ── Partial failure: split the leftovers into their OWN retryable
+      // bubble. The delivered album (above) reached the receiver with every
+      // file that uploaded; the failed files land here as a separate 'failed'
+      // album row + persisted queue task, so tap-to-retry re-sends ONLY these
+      // files — never the whole original album (whose bytes are on the server
+      // already anyway).
+      if (failedFiles.length > 0) {
+        const retryTempId = `temp_album_${Date.now()}_${Math.random()}`;
+        const retryGroupId = `mg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        const retryItems = failedLiveItems.map((it) => ({ ...it, uploadStatus: 'failed', uploadProgress: 0 }));
+        const retryMsg = {
+          ...localMsg,
+          id: retryTempId,
+          tempId: retryTempId,
+          mediaGroupId: retryGroupId,
+          mediaItems: retryItems,
+          text: '',
+          mediaThumbnailUrl: retryItems[0]?.localUri || '',
+          previewUrl: retryItems[0]?.localUri || '',
+          localUri: retryItems[0]?.localUri || '',
+          status: 'failed',
+          payload: {
+            ...localMsg.payload,
+            albumFiles: failedFiles,
+            caption: '',
+            mediaGroupId: retryGroupId,
+            tempId: retryTempId,
+            uploadQueued: true,
+          },
+        };
+        setAllMessages((prev) => [retryMsg, ...prev]);
+        ChatDatabase.upsertMessage({ ...retryMsg, chatId: chatIdRef.current }).catch(() => {});
+        const retryQueue = [...(queuedMediaUploadsRef.current || [])];
+        retryQueue.push({
+          tempId: retryTempId,
+          chatId: chatIdRef.current,
+          albumObj: { files: failedFiles, caption: '', mediaGroupId: retryGroupId },
+          createdAt: new Date().toISOString(),
+          retries: 0,
+        });
+        queuedMediaUploadsRef.current = retryQueue;
+        await persistMediaUploadQueue(retryQueue);
+      }
+
       return { success: true, tempId, failedCount };
     } catch (err) {
       const message = String(err?.message || err || 'album send failed');

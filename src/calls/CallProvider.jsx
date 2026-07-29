@@ -1012,9 +1012,21 @@ export const CallProvider = ({ children }) => {
   }, [camPermission, requestCamPermission]);
 
   // ---- terminal handling (single source of truth) ----
+  // iOS OUTGOING caller-side audio recovery state (see
+  // scheduleOutgoingAudioRecovery): pending retry timer + bounded attempt
+  // count + "audio confirmed" latch (audioResumed). Ref-only — never renders.
+  const outgoingAudioRecoveryRef = useRef({ timer: null, attempts: 0, confirmed: false });
+
   const finalizeEnd = useCallback((reason, message) => {
     if (endedRef.current) return;
     endedRef.current = true;
+    // Kill any pending outgoing-audio recovery pass — it must never fire after
+    // the call ends (restartEngineAudio self-gates too; this is the belt).
+    {
+      const oar = outgoingAudioRecoveryRef.current;
+      if (oar.timer) { clearTimeout(oar.timer); oar.timer = null; }
+      oar.attempts = 0; oar.confirmed = false;
+    }
     // Defensive: a pending "answer on next INCOMING" must never survive a call —
     // a leaked flag would auto-accept the NEXT incoming call without a tap.
     pushAcceptPendingRef.current = false;
@@ -1645,6 +1657,14 @@ export const CallProvider = ({ children }) => {
           setTimeout(() => {
             actionsRef.current.restartEngineAudio && actionsRef.current.restartEngineAudio();
           }, 800);
+          // OUTGOING caller: the single pass above and the activation handler
+          // both race reportOutgoingConnected's LATE CallKit session activation
+          // and can miss — dead audio units until a manual Speaker toggle.
+          // Arm the bounded, self-gated recovery loop that keeps re-running the
+          // toggle's effective repair until audio is confirmed or attempts run
+          // out. No-op for incoming calls and the WebView engine.
+          actionsRef.current.scheduleOutgoingAudioRecovery
+            && actionsRef.current.scheduleOutgoingAudioRecovery();
         }
         break;
       }
@@ -1730,6 +1750,13 @@ export const CallProvider = ({ children }) => {
         // because it re-applied the same route. Do that re-apply automatically.
         // Idempotent: the button stays the single source of truth.
         actionsRef.current.reassertSpeakerRoute && actionsRef.current.reassertSpeakerRoute();
+        // Audio is confirmed flowing → latch it and cancel any pending
+        // outgoing-audio recovery pass (stop as soon as audio is confirmed).
+        {
+          const oar = outgoingAudioRecoveryRef.current;
+          oar.confirmed = true;
+          if (oar.timer) { clearTimeout(oar.timer); oar.timer = null; }
+        }
         break;
       }
       case 'presence': {
@@ -1823,6 +1850,10 @@ export const CallProvider = ({ children }) => {
           if (!snap.reconnecting) {
             dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: true });
             armReconnectWatchdog();
+            // A recovery restart mid-reconnect would fight the rejoin — drop
+            // any pending outgoing-audio pass ('stream' re-arms it on rejoin).
+            const oar = outgoingAudioRecoveryRef.current;
+            if (oar.timer) { clearTimeout(oar.timer); oar.timer = null; }
           }
           break;
         }
@@ -1843,6 +1874,10 @@ export const CallProvider = ({ children }) => {
           // Nudge the transport to renegotiate immediately (in addition to any
           // NetInfo-triggered restart) so recovery is as fast as possible.
           sendCmd({ cmd: CMD.RESTART_ICE });
+          // Drop any pending outgoing-audio recovery pass during the outage
+          // ('stream' re-arms it when the media path comes back).
+          const oar = outgoingAudioRecoveryRef.current;
+          if (oar.timer) { clearTimeout(oar.timer); oar.timer = null; }
         }
         break;
       }
@@ -2424,6 +2459,54 @@ export const CallProvider = ({ children }) => {
     if (s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
     sendCmd({ cmd: CMD.RESTART_AUDIO });
   }, [sendCmd]);
+
+  // ---- iOS OUTGOING caller-side silence recovery ----
+  // The outgoing call is registered with CallKit only at connect
+  // (reportOutgoingConnected — dial-time registration caused the ~2-ring drop,
+  // so its timing is intentional and untouched). That LATE registration makes
+  // CallKit activate the AVAudioSession AFTER the WebRTC pipeline was built:
+  // tracks read 'live' but their audio units are dead, and both existing
+  // repairs (the single 800ms restart + the didActivateAudioSession rebuild)
+  // race the activation ordering and can miss — caller silent until a manual
+  // Speaker toggle. This bounded loop re-runs EXACTLY the toggle's effective
+  // repair — hand the live session to react-native-webrtc → rebuild the audio
+  // pipeline → re-assert the button's CURRENT route — without ever flipping
+  // the user's speaker choice. Confirmation signal: the engine's 'audioResumed'
+  // event latches outgoingAudioRecoveryRef.confirmed and cancels the loop; the
+  // native engine doesn't emit it today, so the loop is hard-bounded at 3
+  // passes (~1.1s, ~1.8s, ~2.5s after 'stream'). Self-gated: iOS + native
+  // engine + direction 'outgoing' + status ACTIVE + not reconnecting; cleared
+  // on call end and on reconnect. Incoming calls, Android, mic logic and the
+  // WebView engine are never touched.
+  const runOutgoingAudioRecoveryPass = useCallback(() => {
+    const oar = outgoingAudioRecoveryRef.current;
+    oar.timer = null;
+    if (oar.confirmed) return;
+    const s = stateRef.current;
+    if (Platform.OS !== 'ios' || !isNativeCallEngine()) return;
+    if (s.direction !== 'outgoing') return;
+    if (s.status !== CALL_STATUS.ACTIVE || s.reconnecting) return;
+    oar.attempts += 1;
+    if (__DEV__) console.log('[CALL][APP][audio] outgoing audio recovery pass', oar.attempts, '/ 3');
+    try { audioSessionDidActivate(); } catch (_) { /* best-effort */ }
+    restartEngineAudio();
+    reassertSpeakerRoute();
+    if (oar.attempts < 3) {
+      oar.timer = setTimeout(runOutgoingAudioRecoveryPass, 700);
+    }
+  }, [restartEngineAudio, reassertSpeakerRoute]);
+
+  const scheduleOutgoingAudioRecovery = useCallback(() => {
+    if (Platform.OS !== 'ios' || !isNativeCallEngine()) return;
+    if (stateRef.current.direction !== 'outgoing') return;
+    const oar = outgoingAudioRecoveryRef.current;
+    if (oar.timer) clearTimeout(oar.timer);
+    oar.attempts = 0;
+    oar.confirmed = false;
+    // First pass at ~1.1s: after the existing 800ms restart, so it acts only
+    // when that single shot lost the activation race.
+    oar.timer = setTimeout(runOutgoingAudioRecoveryPass, 1100);
+  }, [runOutgoingAudioRecoveryPass]);
 
   // ---- audio-interruption recovery (WhatsApp parity) ----
   // A phone / WhatsApp / other VoIP call grabs the OS audio focus mid-call, so the
@@ -3201,7 +3284,7 @@ export const CallProvider = ({ children }) => {
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = {
     accept, reject, hangup, toggleMic, reassertCallAudio, restartEngineAudio, pullStillRingingInvites,
-    reassertSpeakerRoute,
+    reassertSpeakerRoute, scheduleOutgoingAudioRecovery,
   };
   onEngineEventRef.current = onEngineEvent;
 

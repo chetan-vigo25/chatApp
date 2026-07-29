@@ -26,7 +26,7 @@ import {
   ScrollView, TextInput, ActivityIndicator, Alert,
   Platform, FlatList, Dimensions, BackHandler, Animated, Easing, Keyboard,
 } from 'react-native';
-import { Video, ResizeMode } from 'expo-av';
+import { Video, ResizeMode } from '../../components/ExpoAvVideoCompat';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import StatusImageEditor from './StatusImageEditor';

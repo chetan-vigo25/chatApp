@@ -68,6 +68,13 @@ const ChatCard = ({
   const groupAvatarUri = isGroup || isBroadcast
     ? (item?.chatAvatar || item?.group?.avatar || item?.groupAvatar)
     : null;
+  // 1-1 avatar: peerUser.profileImage when hydrated, else the server's
+  // chatAvatar (the chat-list REST rows carry ONLY chatAvatar — without this
+  // fallback a row whose peerUser wasn't hydrated yet rendered the default
+  // person icon even though the URL was right there).
+  const peerAvatarUri = !isGroup && !isBroadcast
+    ? (item?.peerUser?.profileImage || item?.chatAvatar || null)
+    : null;
   // WhatsApp-style status ring: only for 1-1 chats whose peer has live statuses.
   const hasStatusRing = !isGroup && statusInfo && statusInfo.count > 0;
 
@@ -110,10 +117,10 @@ const ChatCard = ({
                     <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={18} color="#fff" />
                   </View>
                 )
-              ) : item?.peerUser?.profileImage ? (
+              ) : peerAvatarUri ? (
                 <Image
                   resizeMode="cover"
-                  source={{ uri: item.peerUser.profileImage }}
+                  source={{ uri: peerAvatarUri }}
                   style={[styles.avatarImage, { borderColor: theme.colors.border }]}
                 />
               ) : (

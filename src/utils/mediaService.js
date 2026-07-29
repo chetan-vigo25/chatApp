@@ -91,10 +91,14 @@ export const toSecureMediaUri = (uri) => {
     return `${BACKEND_ORIGIN}${u.startsWith('/') ? '' : '/'}${u}`;
   }
 
-  // Absolute URL pointing at OUR media (/uploads/) on a dev/LAN host that is
+  // Absolute URL pointing at OUR backend (/uploads/ static media OR /api/
+  // endpoints like media download/:token, blob) on a dev/LAN host that is
   // NOT the current backend → remap onto the current backend origin so media
   // sent against a local env still loads on the live env (and vice versa).
-  const absMatch = u.match(/^https?:\/\/([^/:]+)(?::\d+)?(\/uploads\/.*)$/i);
+  // /api/ matters for dev-over-USB: the server bakes its LAN host into
+  // downloadUrl, but the phone can only reach the backend via the adb-reverse
+  // 127.0.0.1 tunnel — without the remap every download API URL is unreachable.
+  const absMatch = u.match(/^https?:\/\/([^/:]+)(?::\d+)?(\/(?:uploads|api)\/.*)$/i);
   if (absMatch && BACKEND_ORIGIN && isDevOrLanHost(absMatch[1])) {
     const remapped = `${BACKEND_ORIGIN}${absMatch[2]}`;
     if (remapped !== u) return remapped;
@@ -467,7 +471,9 @@ export const saveFileToMediaLibrary = async (localUri, albumName = APP_FOLDER) =
 export async function mediaExistsByHash({ hash, fileName = null, chatId = null }) {
   if (!hash) return null;
   try {
-    const response = await apiCall('POST', 'user/media/exists', { hash, fileName, chatId }, { silent: true });
+    // Own short timeout: dedup is an optimization — a dead/slow link must not
+    // stall the send for the axios default 15s before the real upload starts.
+    const response = await apiCall('POST', 'user/media/exists', { hash, fileName, chatId }, { silent: true, timeout: 5000 });
     const data = response?.data || {};
     if (data?.exists) return data;
     return null;
@@ -507,19 +513,35 @@ export const uploadMediaFile = async ({
   mediaUploadAction,
   onUploadProgress = null,
   sourceHash = null,
+  // Deferred hash for chunked-size files: resolves (to hex or null) while the
+  // upload is already running; the chunk loop dedup-checks when it lands.
+  sourceHashPromise = null,
   chunkSession = null,
   onChunkSession = null,
   timeoutMs = null,
   signal = null,
   isPaused = null,
 }) => {
+  let persistentUri = null;
   try {
     if (!file || !dispatch || !mediaUploadAction) {
       throw new Error('Missing params for uploadMediaFile');
     }
 
-    // Ensure file is in app folder first
-    const persistentUri = await copyToAppFolder(file.uri, file.name, SENT_DIR);
+    const fileSize = Number(file.size || 0);
+    const goesChunked = fileSize > CHUNKED_UPLOAD_THRESHOLD;
+
+    // The Sent/ copy (local disk) and the dedup lookup (one network RTT) are
+    // independent — run them in parallel instead of back-to-back. Chunked
+    // files skip the /exists RTT entirely: session init already dedups on
+    // sourceHash and answers with the finished media.
+    const copyPromise = copyToAppFolder(file.uri, file.name, SENT_DIR);
+    const existsPromise = (sourceHash && !goesChunked)
+      ? mediaExistsByHash({ hash: sourceHash, fileName: file.name || null, chatId })
+      : Promise.resolve(null);
+    const [copiedUri, existing] = await Promise.all([copyPromise, existsPromise]);
+
+    persistentUri = copiedUri;
     if (!persistentUri || typeof persistentUri !== 'string') {
       throw new Error('Invalid local file URI for upload');
     }
@@ -529,24 +551,20 @@ export const uploadMediaFile = async ({
     }
 
     // Dedupe: skip the upload entirely when the server already has these bytes.
-    if (sourceHash) {
-      const existing = await mediaExistsByHash({ hash: sourceHash, fileName: file.name || null, chatId });
-      if (existing) {
-        if (typeof onUploadProgress === 'function' && file.size) {
-          try { onUploadProgress({ loaded: file.size, total: file.size }); } catch {}
-        }
-        return {
-          payload: { statusCode: 200, success: true, data: existing },
-          localUri: persistentUri,
-          deduplicated: true,
-        };
+    if (existing) {
+      if (typeof onUploadProgress === 'function' && file.size) {
+        try { onUploadProgress({ loaded: file.size, total: file.size }); } catch {}
       }
+      return {
+        payload: { statusCode: 200, success: true, data: existing },
+        localUri: persistentUri,
+        deduplicated: true,
+      };
     }
 
     // Large files go through the resumable chunked-session endpoints instead
     // of a single multipart POST (which can't survive a connection drop).
-    const fileSize = Number(file.size || 0);
-    if (fileSize > CHUNKED_UPLOAD_THRESHOLD) {
+    if (goesChunked) {
       const response = await uploadFileInChunks({
         uri: persistentUri,
         name: file.name || `file_${Date.now()}`,
@@ -554,6 +572,8 @@ export const uploadMediaFile = async ({
         fileSize,
         chatId,
         sourceHash,
+        sourceHashPromise,
+        dedupCheck: (hash) => mediaExistsByHash({ hash, fileName: file.name || null, chatId }),
         onProgress: onUploadProgress,
         onSession: onChunkSession,
         session: chunkSession,
@@ -631,7 +651,11 @@ export const uploadMediaFile = async ({
       const size = Number(file?.size || 0);
       if (chunkable && size > 0) {
         try {
-          const persistentUri = await copyToAppFolder(file.uri, file.name, SENT_DIR);
+          // Reuse the copy already made above — a second copyToAppFolder pays
+          // another full-file disk write and leaves a duplicate in Sent/.
+          if (!persistentUri) {
+            persistentUri = await copyToAppFolder(file.uri, file.name, SENT_DIR);
+          }
           const response = await uploadFileInChunks({
             uri: persistentUri,
             name: file.name || `file_${Date.now()}`,
