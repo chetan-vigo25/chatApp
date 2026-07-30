@@ -34,6 +34,33 @@ const CHUNK_BYTES = 999 * 1024;
 // froze scrolling/taps.
 const yieldToUiThread = () => new Promise((resolve) => setTimeout(resolve, 16));
 
+// GLOBAL HASH GATE — serialize crypto-js hashing to ONE file at a time.
+//
+// crypto-js SHA256 is CPU-bound and runs on the JS thread. An album uploads
+// ALBUM_UPLOAD_CONCURRENCY tiles at once, so N large videos would hash
+// SIMULTANEOUSLY — each ~1MB burst starves the OTHER hashers' 16ms yields, so
+// the "yield between chunks" collapses back into one multi-second freeze
+// (observed live: 33s VirtualizedList stalls → ANR → the OS kills the app
+// mid-album → the upload queue replays on relaunch → duplicate / stuck-at-0/N
+// bubbles). Gating hashing to one file at a time keeps upload NETWORK
+// concurrency intact (uploads are network-bound, not CPU-bound) while ensuring
+// only ONE hasher touches the JS thread — so the per-chunk yields actually keep
+// touches/scroll/animation alive and the app is never killed for an ANR.
+let _hashGate = Promise.resolve();
+const _runExclusiveHash = async (fn) => {
+  const prev = _hashGate;
+  let release;
+  _hashGate = new Promise((resolve) => { release = resolve; });
+  try {
+    await prev;
+  } catch { /* a prior hasher's rejection must not chain-break the gate */ }
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+};
+
 /**
  * Compute the SHA-256 (hex) of the file at `uri`.
  * Returns null when the file is missing, unreadable, or larger than maxBytes.
@@ -48,22 +75,26 @@ export const computeFileSha256 = async (uri, { maxBytes = MAX_HASH_BYTES } = {})
     const size = Number(info?.size || 0);
     if (!size || size > maxBytes) return null;
 
-    const hasher = CryptoJS.algo.SHA256.create();
+    // Serialize the CPU-bound chunk loop through the global gate so concurrent
+    // album tiles hash one-at-a-time instead of all fighting for the JS thread.
+    return await _runExclusiveHash(async () => {
+      const hasher = CryptoJS.algo.SHA256.create();
 
-    for (let position = 0; position < size; position += CHUNK_BYTES) {
-      const length = Math.min(CHUNK_BYTES, size - position);
-      const chunkB64 = await FileSystem.readAsStringAsync(uri, {
-        encoding: FileSystem.EncodingType.Base64,
-        position,
-        length,
-      });
-      if (!chunkB64) return null;
-      hasher.update(CryptoJS.enc.Base64.parse(chunkB64));
-      // Keep the JS thread responsive between chunks.
-      if (position + CHUNK_BYTES < size) await yieldToUiThread();
-    }
+      for (let position = 0; position < size; position += CHUNK_BYTES) {
+        const length = Math.min(CHUNK_BYTES, size - position);
+        const chunkB64 = await FileSystem.readAsStringAsync(uri, {
+          encoding: FileSystem.EncodingType.Base64,
+          position,
+          length,
+        });
+        if (!chunkB64) return null;
+        hasher.update(CryptoJS.enc.Base64.parse(chunkB64));
+        // Keep the JS thread responsive between chunks.
+        if (position + CHUNK_BYTES < size) await yieldToUiThread();
+      }
 
-    return hasher.finalize().toString(CryptoJS.enc.Hex);
+      return hasher.finalize().toString(CryptoJS.enc.Hex);
+    });
   } catch (error) {
     console.warn('computeFileSha256 failed:', error?.message || error);
     return null;

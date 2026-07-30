@@ -567,6 +567,11 @@ export default function useChatLogic({ navigation, route }) {
   const pendingMediaEmitRef = useRef({});
   const mediaReemitTriedRef = useRef(new Set());
   const flushQueuedMediaUploadsRef = useRef(async () => {});
+  // Rebuilds the "sending" bubble for any still-queued media/album upload on chat
+  // open — the durable AsyncStorage upload queue (NOT the lock-contended SQLite
+  // messages table) is the source of truth for in-flight uploads, so the bubble
+  // survives even when the optimistic SQLite write lost a WAL-lock race.
+  const rehydratePendingUploadBubblesRef = useRef(async () => {});
   const mediaStatusInFlightRef = useRef(false);
   const mediaStatusProcessedRef = useRef(new Set());
   const presenceUpdateVersionRef = useRef(0);
@@ -1870,6 +1875,13 @@ export default function useChatLogic({ navigation, route }) {
             loadDeletedTombstones(generatedChatId),
             loadPendingEdits(generatedChatId),
           ]);
+          // Queue is now loaded — re-show the "sending" bubble for any in-flight
+          // upload in this chat. Must run AFTER loadQueuedMediaUploads (the ref is
+          // empty before it). SQLite may have lost the optimistic write to a
+          // WAL-lock race during the heavy upload ("database is locked"), so this
+          // durable-queue rebuild is what keeps the bubble on screen across a
+          // navigate-away/reopen until the upload completes.
+          try { await rehydratePendingUploadBubblesRef.current(); } catch {}
           await checkAndReconnectSocket();
           const socket = getSocket();
           // Register listeners on the socket OBJECT even while it is still
@@ -2057,6 +2069,11 @@ export default function useChatLogic({ navigation, route }) {
       ChatDatabase.deduplicateChat(chatIdParam)
         .then(() => { refreshMessagesFromDB(true); })
         .catch(() => {});
+
+      // NOTE: the "sending"-bubble rehydration from the upload queue is NOT
+      // called here — this runs in PARALLEL with loadQueuedMediaUploads(), so the
+      // queue ref may still be empty at this point. It is invoked in initializeChat
+      // right AFTER loadQueuedMediaUploads() resolves (see rehydrate call there).
 
       return finalCount;
     } catch (err) {
@@ -2849,6 +2866,20 @@ export default function useChatLogic({ navigation, route }) {
 
         const currentUser = currentUserIdRef.current;
 
+        // DIAG: which sending/optimistic MEDIA temp rows did this SQLite read
+        // return? If a bubble "disappears" on reopen, this shows whether the
+        // temp album row is present in the DB (persist ok, render bug) or absent
+        // (something deleted it, or it never committed).
+        try {
+          const _sm = (dbMessages || []).filter((m) => {
+            const _id = String(m.id || m.tempId || '');
+            const _t = String(m.type || m.mediaType || '');
+            return _id.startsWith('temp_') && ['image', 'video', 'audio', 'file', 'album'].includes(_t);
+          });
+          console.log('[DIAG] refreshDB sending-media temp rows in SQLite read:', _sm.length,
+            _sm.map((m) => ({ id: m.id, type: m.type, status: m.status, mg: m.mediaGroupId })));
+        } catch {}
+
         // Separate still-pending scheduled messages from DB — they go to scheduledMessages state
         // Only status==='scheduled' means pending. Delivered messages (status sent/delivered) go to allMessages.
         const isPendingScheduled = (m) => m.status === 'scheduled' || m.status === 'processing';
@@ -3026,6 +3057,19 @@ export default function useChatLogic({ navigation, route }) {
             if (m.tempId) dbIdSet.add(m.tempId);
           }
 
+          // Confirmed (server) album mediaGroupIds present in this DB load. A
+          // temp album whose group already arrived as a delivered server row must
+          // NOT be preserved as optimistic — otherwise the stuck "0/N sending"
+          // temp lingers in memory right next to its sent copy (the visible
+          // duplicate) until a remount. The DB-side cleanBeforeUpsert rule #6
+          // deletes the temp row from SQLite; this mirrors it in memory.
+          const confirmedGroupIds = new Set();
+          for (const m of patchedEnriched) {
+            const gid = m.mediaGroupId;
+            const isTemp = String(m.id || m.tempId || '').startsWith('temp_');
+            if (gid && !isTemp) confirmedGroupIds.add(String(gid));
+          }
+
           // Find locally-originated messages not yet reflected in the DB load and
           // preserve them so a just-sent message never blinks out of the thread.
           const optimistic = prev.filter(m => {
@@ -3033,6 +3077,9 @@ export default function useChatLogic({ navigation, route }) {
             if (!id) return false;
             const inDB = dbIdSet.has(m.id) || dbIdSet.has(m.tempId) || dbIdSet.has(m.serverMessageId);
             if (inDB) return false;
+            // A temp album whose mediaGroupId already landed as a confirmed server
+            // row is a reconciled duplicate — drop it (see confirmedGroupIds above).
+            if (m.mediaGroupId && confirmedGroupIds.has(String(m.mediaGroupId))) return false;
             // Keep ANY message we created locally (it carries a tempId) that the DB
             // load doesn't yet contain. This covers BOTH a pre-ack temp row AND a
             // just-acked row whose `id` was already swapped to the serverMessageId
@@ -8204,6 +8251,9 @@ export default function useChatLogic({ navigation, route }) {
     if (shouldInsertLocal) {
       // INSTANT UI: show message immediately with local preview
       setAllMessages((prev) => [localMsg, ...prev]);
+      // Seed the in-memory ChatCache so a reopen's instant cache-paint already
+      // includes this sending media (prevents the one-frame flicker-out).
+      try { ChatCache.addMessage(chatIdRef.current, localMsg); } catch {}
 
       // Persist the optimistic row to SQLite and AWAIT it (was fire-and-forget with
       // a swallowed error). The heavy file hashing/base64 below saturates the JS
@@ -8868,7 +8918,30 @@ export default function useChatLogic({ navigation, route }) {
 
     if (shouldInsertLocal) {
       setAllMessages((prev) => [localMsg, ...prev]);
-      ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
+      // Seed the in-memory ChatCache too, so a reopen's INSTANT cache-paint
+      // already shows the sending album (without this the stale cache paints
+      // first WITHOUT it → the bubble flickers out for a frame until the SQLite
+      // read / queue rehydrate fills it back in).
+      try { ChatCache.addMessage(chatIdRef.current, localMsg); } catch {}
+      // Persist the optimistic album row and AWAIT it (was fire-and-forget with a
+      // swallowed error — the same bug the single-media sendMedia path already
+      // fixed). The chunked upload + per-file hashing below saturates the JS
+      // thread for a long time; if this write hadn't committed before the user
+      // navigated away + reopened the chat, the reopen's loadMessages read a
+      // snapshot WITHOUT the sending album bubble ("uploading album disappears on
+      // reopen, reappears only after upload completes"). Committing it first —
+      // and logging any failure instead of swallowing it — guarantees the sending
+      // album survives navigation.
+      try {
+        await ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current });
+        // DIAG: confirm the sending album row actually committed to SQLite.
+        try {
+          const _back = await ChatDatabase.messageExists(tempId);
+          console.log('[DIAG] album optimistic persisted?', { tempId, mediaGroupId, existsInSQLite: _back, chatId: chatIdRef.current });
+        } catch {}
+      } catch (persistErr) {
+        console.warn('[sendMediaGroup] optimistic persist failed:', persistErr?.message || persistErr);
+      }
     }
 
     const queueAlbumTask = async () => {
@@ -9383,6 +9456,151 @@ export default function useChatLogic({ navigation, route }) {
   }, [isConnected, persistMediaUploadQueue, sendMedia, sendMediaGroup]);
 
   flushQueuedMediaUploadsRef.current = flushQueuedMediaUploads;
+
+  // Re-show the "sending" bubble for every still-queued upload in THIS chat.
+  // Called on chat open. The optimistic SQLite write can silently lose a
+  // WAL-lock race during a heavy multi-video upload ("database is locked"), so
+  // the reopened chat's messages-table read comes back WITHOUT the sending
+  // album — and the bubble vanishes until the upload finishes. The durable
+  // AsyncStorage upload queue is lock-free and keeps the task until it
+  // completes, so it is the reliable source of truth for what is still sending.
+  // We rebuild a minimal 'sending' bubble (same tempId) from the queued task;
+  // the flush that continues the upload patches progress onto it by tempId, and
+  // the socket ack reconciles it exactly like the original optimistic row.
+  const rehydratePendingUploadBubbles = useCallback(async () => {
+    try {
+      const cid = chatIdRef.current;
+      if (!cid) return;
+      const tasks = (queuedMediaUploadsRef.current || []).filter(
+        (t) => t?.tempId && sameChatId(t.chatId, cid)
+      );
+      if (!tasks.length) return;
+
+      const shown = new Set(
+        (allMessagesRef.current || []).map((m) => m?.tempId).filter(Boolean)
+      );
+      const isGrp = chatData?.chatType === 'group' || chatData?.isGroup;
+      const rebuilt = [];
+
+      for (const t of tasks) {
+        if (shown.has(t.tempId)) continue;
+        // Skip a task whose bubble already exists under its server id (rare: the
+        // ack landed but the queue row hasn't been pruned yet).
+        try {
+          if (await ChatDatabase.messageExists(t.tempId)) {
+            const ex = await ChatDatabase.getMessage(t.tempId);
+            if (ex && (ex.serverMessageId || ['uploaded', 'sent', 'delivered', 'read', 'seen'].includes(String(ex.status)))) continue;
+          }
+        } catch {}
+
+        const createdAt = t.createdAt || new Date().toISOString();
+        const ts = new Date(createdAt).getTime();
+        const parked = t.paused === true || (t.tempId && isUploadPaused(t.tempId));
+        const baseStatus = parked ? 'sending' : 'sending';
+
+        if (t.albumObj) {
+          const files = (t.albumObj.files || []).filter((f) => f?.uri);
+          if (!files.length) continue;
+          const items = files.map((f) => ({
+            mediaId: null,
+            fileCategory: albumFileCategory(f.type),
+            mediaUrl: null,
+            mediaThumbnailUrl: null,
+            localUri: normalizeUri(f.uri),
+            localThumbUri: f.thumbnailUri || f.previewUri || null,
+            mediaMeta: { fileName: f.name, fileSize: f.size || null, mimeType: f.type },
+            uploadStatus: 'pending',
+            uploadProgress: 0,
+          }));
+          rebuilt.push({
+            id: t.tempId,
+            tempId: t.tempId,
+            type: 'album',
+            mediaType: 'album',
+            text: t.albumObj.caption || '',
+            mediaGroupId: t.albumObj.mediaGroupId || null,
+            mediaItems: items,
+            mediaUrl: '',
+            mediaThumbnailUrl: items[0]?.localUri || '',
+            previewUrl: items[0]?.localUri || '',
+            localUri: items[0]?.localUri || '',
+            time: moment(createdAt).format('hh:mm A'),
+            date: moment(createdAt).format('YYYY-MM-DD'),
+            senderId: currentUserIdRef.current,
+            senderName: currentUserNameRef.current || '',
+            senderType: 'self',
+            chatType: chatData?.chatType || 'private',
+            status: baseStatus,
+            createdAt,
+            timestamp: ts,
+            downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+            isMediaDownloaded: true,
+            synced: false,
+            chatId: cid,
+            ...(isGrp && { groupId: chatData?.groupId || chatData?.group?._id || cid }),
+            useLocalForSender: true,
+          });
+        } else if (t.mediaObj?.file?.uri) {
+          const f = t.mediaObj.file;
+          const nType = t.mediaObj.type === 'document' ? 'file' : t.mediaObj.type;
+          const localUri = normalizeUri(f.uri);
+          rebuilt.push({
+            id: t.tempId,
+            tempId: t.tempId,
+            type: nType,
+            mediaType: nType,
+            text: f.name || '',
+            mediaUrl: '',
+            mediaThumbnailUrl: nType === 'video' ? (f.thumbnailUri || null) : localUri,
+            previewUrl: nType === 'video' ? (f.thumbnailUri || null) : localUri,
+            localThumbUri: nType === 'video' ? (f.thumbnailUri || null) : null,
+            localUri,
+            time: moment(createdAt).format('hh:mm A'),
+            date: moment(createdAt).format('YYYY-MM-DD'),
+            senderId: currentUserIdRef.current,
+            senderName: currentUserNameRef.current || '',
+            senderType: 'self',
+            chatType: chatData?.chatType || 'private',
+            status: baseStatus,
+            createdAt,
+            timestamp: ts,
+            downloadStatus: MEDIA_DOWNLOAD_STATUS.DOWNLOADED,
+            isMediaDownloaded: true,
+            synced: false,
+            chatId: cid,
+            ...(isGrp && { groupId: chatData?.groupId || chatData?.group?._id || cid }),
+            useLocalForSender: true,
+          });
+        }
+      }
+
+      if (!rebuilt.length) return;
+      console.log('[DIAG] rehydrated sending bubbles from upload queue:', rebuilt.length,
+        rebuilt.map((m) => ({ tempId: m.tempId, type: m.type, mg: m.mediaGroupId })));
+      setAllMessages((prev) => {
+        const have = new Set(prev.map((m) => m?.tempId).filter(Boolean));
+        const add = rebuilt.filter((m) => !have.has(m.tempId));
+        if (!add.length) return prev;
+        const merged = [...add, ...prev];
+        merged.sort((a, b) => (Number(b.timestamp) || 0) - (Number(a.timestamp) || 0));
+        return merged;
+      });
+      // Best-effort re-persist so a later reopen reads it from SQLite too (if the
+      // lock has since cleared). Never awaited — the bubble is already on screen.
+      // Also seed ChatCache so the NEXT reopen's instant cache-paint has it (no flicker).
+      for (const m of rebuilt) {
+        try { ChatCache.addMessage(cid, m); } catch {}
+        ChatDatabase.upsertMessage({ ...m }).catch(() => {});
+      }
+      // Kick the flush so the upload actually continues on THIS mounted instance
+      // (the pre-remount upload's callbacks were orphaned by the unmount).
+      try { flushQueuedMediaUploadsRef.current(); } catch {}
+    } catch (e) {
+      console.warn('rehydratePendingUploadBubbles failed:', e?.message || e);
+    }
+  }, [chatData]);
+
+  rehydratePendingUploadBubblesRef.current = rehydratePendingUploadBubbles;
 
   // Manual retry for a FAILED media/album message (tap-to-retry). Re-runs the
   // persisted upload-queue row when one exists (same tempId → same

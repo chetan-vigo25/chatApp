@@ -987,6 +987,22 @@ const cleanBeforeUpsert = async (db, msg) => {
   if (serverId) {
     await db.runAsync(`DELETE FROM messages WHERE temp_id = $s AND id != $id AND id LIKE 'temp_%'`, { $s: serverId, $id: id });
   }
+  // 6. Album reconcile by mediaGroupId. The backend may NOT echo clientMessageId
+  //    on synced/list messages, so a confirmed server album can't always match
+  //    its optimistic temp row via id/temp_id/clientMessageId (#0–#5) — leaving
+  //    the temp album stuck at "0/N sending" RIGHT NEXT TO the delivered copy
+  //    (the visible duplicate). The client-generated mediaGroupId (`mg_…`) IS
+  //    echoed and is unique per album, so use it to drop the orphaned temp album.
+  //    Stored only inside the payload JSON, so match there (underscores escaped —
+  //    `mg_` ids are full of them and `_` is a LIKE wildcard). Confirmed rows only.
+  if (serverId && msg.mediaGroupId && !String(id).startsWith('temp_')) {
+    const mg = String(msg.mediaGroupId);
+    const likeEsc = mg.replace(/[\\%_]/g, (c) => `\\${c}`);
+    await db.runAsync(
+      `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND id != $id AND (media_group_id = $mg OR payload LIKE $like ESCAPE '\\')`,
+      { $cid: msg.chatId, $id: id, $mg: mg, $like: `%"mediaGroupId":"${likeEsc}"%` }
+    );
+  }
 };
 
 // Single-message upsert. Delegates to the batch path so it runs through the
@@ -1244,12 +1260,19 @@ const _runInsert = async (db, msg, _retried = false) => {
   // CRITICAL: If we're about to insert a temp row, check if a server-confirmed version
   // already exists with matching content. If so, redirect the insert to update THAT row
   // instead. This prevents duplicates when saveMessagesToLocal writes stale state back.
-  if (id.startsWith('temp_') && !msg.serverMessageId && msg.senderId && msg.timestamp) {
+  // Content-based redirect is TEXT-ONLY. A captionless media temp row has
+  // text='' — matching it against a sibling captionless media's server row
+  // (also text='') within 30s would merge the still-uploading media into the
+  // wrong row and drop its "sending" bubble. Media never redirects by content;
+  // its tempId link handles reconciliation.
+  const _insType = String(msg.type || msg.mediaType || 'text');
+  const _insIsMedia = ['image', 'video', 'audio', 'file', 'album'].includes(_insType);
+  if (id.startsWith('temp_') && !_insIsMedia && !msg.serverMessageId && msg.senderId && msg.timestamp) {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       try {
         const serverRow = await db.getFirstAsync(
-          `SELECT id FROM messages WHERE chat_id = $cid AND sender_id = $sid AND text = $text AND ABS(timestamp - $ts) < 30000 AND server_message_id IS NOT NULL AND id NOT LIKE 'temp_%' LIMIT 1`,
+          `SELECT id FROM messages WHERE chat_id = $cid AND sender_id = $sid AND text = $text AND ABS(timestamp - $ts) < 30000 AND server_message_id IS NOT NULL AND id NOT LIKE 'temp_%' AND type = 'text' LIMIT 1`,
           { $cid: msg.chatId, $sid: msg.senderId, $text: msg.text || '', $ts: ts }
         );
         if (serverRow) {
@@ -1507,12 +1530,22 @@ const _preserveLocalState = async (db, msg) => {
     existing = await db.getFirstAsync(`SELECT * FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`, { $id: id });
   } catch {}
 
-  if (!existing && msg.senderId && msg.timestamp) {
+  // Timestamp-only fallback link (no content match). MUST be restricted to TEXT
+  // temp rows: media messages reconcile through their reliable tempId /
+  // clientMessageId link (acknowledgeMessage), never by a ±5s timestamp guess.
+  // Without the `type = 'text'` guard this content-AGNOSTIC delete would grab a
+  // still-uploading media "sending" temp row when ANY nearby server message from
+  // the same sender was synced (e.g. on a chat-list refresh) and silently delete
+  // it — the "uploading media disappears on reopen" bug. Also skip entirely when
+  // the incoming message is itself media (it links by id/tempId, above).
+  const incomingType = String(msg.type || msg.mediaType || 'text');
+  const isIncomingMedia = ['image', 'video', 'audio', 'file', 'album'].includes(incomingType);
+  if (!existing && !isIncomingMedia && msg.senderId && msg.timestamp) {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       try {
         existing = await db.getFirstAsync(
-          `SELECT * FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND ABS(timestamp - $ts) < 5000 ORDER BY is_edited DESC LIMIT 1`,
+          `SELECT * FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND type = 'text' AND ABS(timestamp - $ts) < 5000 ORDER BY is_edited DESC LIMIT 1`,
           { $cid: msg.chatId, $sid: msg.senderId, $ts: ts }
         );
         if (existing?.id) await db.runAsync(`DELETE FROM messages WHERE id = $id`, { $id: existing.id });
@@ -1697,8 +1730,12 @@ const findTempRowByContent = async (chatId, senderId, text, timestamp) => {
   if (!chatId || !senderId) return null;
   const db = await getDB();
   try {
+    // TEXT-ONLY link. This resolves a self-echo that arrived WITHOUT a tempId by
+    // matching content; a captionless text/echo (text='') must never resolve to a
+    // still-uploading captionless MEDIA temp row and acknowledge it prematurely.
+    // Media self-echoes always carry their clientMessageId/tempId and link there.
     const row = await db.getFirstAsync(
-      `SELECT * FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND text = $text AND ABS(timestamp - $ts) < 10000 LIMIT 1`,
+      `SELECT * FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND type = 'text' AND text = $text AND ABS(timestamp - $ts) < 10000 LIMIT 1`,
       { $cid: chatId, $sid: senderId, $text: text || '', $ts: timestamp || 0 }
     );
     return row ? rowToMsg(row) : null;
@@ -1792,8 +1829,12 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
   try {
     const finalRow = await db.getFirstAsync(`SELECT chat_id, sender_id, text, timestamp FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`, { $s: serverMessageId });
     if (finalRow && finalRow.sender_id && finalRow.timestamp) {
+      // TEXT-ONLY: a captionless media has text='' — an unscoped delete here would
+      // wipe a sibling captionless media still uploading (same empty text, within
+      // 30s). Media temp rows are removed via their exact tempId link above, never
+      // by this content-based sweep.
       await db.runAsync(
-        `DELETE FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND text = $text AND ABS(timestamp - $ts) < 30000`,
+        `DELETE FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND type = 'text' AND text = $text AND ABS(timestamp - $ts) < 30000`,
         { $cid: finalRow.chat_id, $sid: finalRow.sender_id, $text: finalRow.text || '', $ts: finalRow.timestamp }
       );
     }
