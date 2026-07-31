@@ -3,10 +3,39 @@ import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
-import { Platform } from 'react-native';
+import { Platform, InteractionManager } from 'react-native';
 import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
 
 const ImageContext = createContext();
+
+// New-API media type selectors (the old ImagePicker.MediaTypeOptions enum is
+// deprecated in SDK 54's expo-image-picker; mediaTypes now takes an array of
+// 'images' | 'videos' | 'livePhotos' strings).
+const MEDIA_TYPES = {
+  image: ['images'],
+  video: ['videos'],
+  all: ['images', 'videos'],
+};
+
+// Android intermittently REJECTS launchImageLibraryAsync with a native
+// NullPointerException ("dispatchCancelPendingInputEvents on a null object
+// reference") when the picker activity is started in the same frame a
+// modal/attach-sheet/keyboard is still detaching — the current view is gone
+// for an instant. Let the UI settle first, and retry a couple of times when
+// exactly that transient error comes back; anything else rethrows.
+const launchImageLibrarySafe = async (options) => {
+  try { await InteractionManager.runAfterInteractions(() => {}); } catch { /* best-effort */ }
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt));
+      return await ImagePicker.launchImageLibraryAsync(options);
+    } catch (err) {
+      const msg = String(err?.message || err);
+      const transient = /dispatchCancelPendingInputEvents|NullPointerException|has been rejected/i.test(msg);
+      if (!transient || attempt >= 2) throw err;
+    }
+  }
+};
 
 // WhatsApp caps gallery multi-select at 30 per send; albums beyond this go
 // out as multiple messages.
@@ -106,12 +135,12 @@ export const ImageProvider = ({ children }) => {
       }
 
       const mediaOptions = {
-        mediaTypes: mediaType === 'video' ? ImagePicker.MediaTypeOptions.Videos : ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: mediaType === 'video' ? MEDIA_TYPES.video : MEDIA_TYPES.image,
         quality: 1,
         allowsEditing: false,
       };
 
-      const result = await ImagePicker.launchImageLibraryAsync(mediaOptions);
+      const result = await launchImageLibrarySafe(mediaOptions);
       const cancelled = result.canceled ?? result.cancelled;
       if (cancelled) return null;
       const asset = result.assets?.[0] ?? {};
@@ -203,12 +232,12 @@ export const ImageProvider = ({ children }) => {
         return null;
       }
 
-      const result = await ImagePicker.launchImageLibraryAsync({
+      const result = await launchImageLibrarySafe({
         mediaTypes: mediaType === 'video'
-          ? ImagePicker.MediaTypeOptions.Videos
+          ? MEDIA_TYPES.video
           : mediaType === 'all'
-            ? ImagePicker.MediaTypeOptions.All
-            : ImagePicker.MediaTypeOptions.Images,
+            ? MEDIA_TYPES.all
+            : MEDIA_TYPES.image,
         quality: 0.8, // light client-side compression; backend re-optimizes
         allowsEditing: false,
         allowsMultipleSelection: true,

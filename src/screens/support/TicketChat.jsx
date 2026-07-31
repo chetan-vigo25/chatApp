@@ -72,7 +72,7 @@ export default function TicketChat({ navigation, route }) {
     try {
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!perm.granted) { Alert.alert("Permission needed", "Allow photo access to attach a file."); return; }
-      const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 0.7 });
+      const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.7 });
       if (!result.canceled && result.assets?.[0]) {
         const a = result.assets[0];
         setAttachment({ uri: a.uri, name: a.fileName || `file-${Date.now()}.jpg`, type: a.mimeType || "image/jpeg" });

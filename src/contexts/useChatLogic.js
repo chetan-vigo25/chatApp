@@ -127,6 +127,18 @@ const MEDIA_UPLOAD_QUEUE_KEY = 'media_upload_queue';
 const MEDIA_UPLOAD_MAX_RETRIES = 4;
 const MEDIA_UPLOAD_TIMEOUT_MS = 30000;
 
+// APP-WIDE in-flight upload registry — MODULE level on purpose. The per-hook
+// refs below (activeMediaUploadTempIdsRef / mediaUploadQueueInFlightRef) die
+// with the hook instance, but the async send keeps running after an unmount.
+// A ChatScreen/ChatList reload therefore mounted a FRESH instance that knew
+// nothing about the still-running upload and its boot/reconnect flush re-ran
+// the same queue row concurrently — the two runs raced, and the partial-fail
+// split path minted NEW tempIds, so the receiver got DUPLICATE albums. These
+// globals make "is this tempId uploading right now" and "is a flush running"
+// true across every instance, no matter how often the UI remounts.
+const globalActiveMediaUploads = new Set();
+let globalMediaFlushInFlight = false;
+
 const normalizeId = (value) => {
   if (value == null) return null;
   if (typeof value === "string" || typeof value === "number") return String(value);
@@ -572,6 +584,7 @@ export default function useChatLogic({ navigation, route }) {
   // messages table) is the source of truth for in-flight uploads, so the bubble
   // survives even when the optimistic SQLite write lost a WAL-lock race.
   const rehydratePendingUploadBubblesRef = useRef(async () => {});
+  const reconcileStaleSendingMediaRef = useRef(async () => {});
   const mediaStatusInFlightRef = useRef(false);
   const mediaStatusProcessedRef = useRef(new Set());
   const presenceUpdateVersionRef = useRef(0);
@@ -1928,6 +1941,14 @@ export default function useChatLogic({ navigation, route }) {
           }
         })(),
       ]);
+
+      // Messages + upload queue are both loaded — heal any media bubble stuck
+      // at 'sending' whose upload actually finished (or genuinely died) before
+      // a navigate-away/reload orphaned its ack. Small delay so a live ack or
+      // the sync below gets first shot at reconciling it naturally.
+      setTimeout(() => {
+        try { reconcileStaleSendingMediaRef.current().catch(() => {}); } catch {}
+      }, 1200);
 
       // ═══════════════════════════════════════════════════════════
       // STEP 4: BACKGROUND SYNC — fetch only new messages from server
@@ -8377,7 +8398,13 @@ export default function useChatLogic({ navigation, route }) {
     // Continue the ring from the kept percent on cancel→retry / pause→resume
     // (the chunked path reports the real server offset moments later anyway).
     setUploadProgress((prev) => ({ ...prev, [tempId]: Math.max(0.02, Number(prev[tempId] || 0)) }));
+    // App-wide double-run guard (see globalActiveMediaUploads): a remounted
+    // instance's flush must never re-run a send that is still uploading.
+    if (globalActiveMediaUploads.has(tempId)) {
+      return { success: false, inFlight: true };
+    }
     activeMediaUploadTempIdsRef.current.add(tempId);
+    globalActiveMediaUploads.add(tempId);
 
     // Pause/cancel support: aborting this controller kills the direct XHR
     // upload; the chunked path polls the registry between chunks instead.
@@ -8675,6 +8702,7 @@ export default function useChatLogic({ navigation, route }) {
     } finally {
       unregisterUploadAbort();
       activeMediaUploadTempIdsRef.current.delete(tempId);
+      globalActiveMediaUploads.delete(tempId);
       if (!options?.fromQueue) {
         setPendingMedia(null);
       }
@@ -8792,6 +8820,12 @@ export default function useChatLogic({ navigation, route }) {
 
     const caption = albumObj?.caption || '';
     const tempId = options?.tempId || `temp_album_${Date.now()}_${Math.random()}`;
+    // Another instance (pre-remount) is ALREADY running this exact send —
+    // never start a second concurrent run of the same tempId (that race is
+    // what duplicated albums across chat-list reloads).
+    if (globalActiveMediaUploads.has(tempId)) {
+      return { success: false, inFlight: true };
+    }
     const timestamp = options?.createdAt || new Date().toISOString();
     const mediaGroupId = albumObj?.mediaGroupId || `mg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     const isGrpMedia = chatData?.chatType === 'group' || chatData?.isGroup;
@@ -9133,7 +9167,11 @@ export default function useChatLogic({ navigation, route }) {
       return { success: false, paused: true };
     }
 
+    if (globalActiveMediaUploads.has(tempId)) {
+      return { success: false, inFlight: true };
+    }
     activeMediaUploadTempIdsRef.current.add(tempId);
+    globalActiveMediaUploads.add(tempId);
     try {
       const results = new Array(normFiles.length);
       let cursor = 0;
@@ -9337,6 +9375,7 @@ export default function useChatLogic({ navigation, route }) {
       return { success: false, error: message };
     } finally {
       activeMediaUploadTempIdsRef.current.delete(tempId);
+      globalActiveMediaUploads.delete(tempId);
       if (!options?.fromQueue) setPendingMedia(null);
       setTimeout(() => {
         setUploadProgress((prev) => {
@@ -9361,12 +9400,17 @@ export default function useChatLogic({ navigation, route }) {
 
   const flushQueuedMediaUploads = useCallback(async () => {
     if (mediaUploadQueueInFlightRef.current) return;
+    // APP-WIDE flush lock: the per-instance ref above dies on remount while
+    // the old instance's flush keeps running — a chat-list reload then ran a
+    // SECOND flush over the same rows and duplicated the album send.
+    if (globalMediaFlushInFlight) return;
     if (!isConnected) return;
 
     const queue = [...(queuedMediaUploadsRef.current || [])];
     if (queue.length === 0) return;
 
     mediaUploadQueueInFlightRef.current = true;
+    globalMediaFlushInFlight = true;
     try {
       // Track results by tempId and reconcile against the LIVE ref at the end.
       // The old "snapshot in, snapshot out" write-back resurrected rows that
@@ -9383,7 +9427,11 @@ export default function useChatLogic({ navigation, route }) {
         }
         // Skip rows whose upload is running RIGHT NOW — rows are persisted
         // before the upload starts, so an active send would be double-run.
-        if (item?.tempId && activeMediaUploadTempIdsRef.current.has(item.tempId)) {
+        // Check the APP-WIDE set too: the ref is per-instance and blind to a
+        // send still running from a previous (remounted) instance.
+        if (item?.tempId
+          && (activeMediaUploadTempIdsRef.current.has(item.tempId)
+            || globalActiveMediaUploads.has(item.tempId))) {
           continue;
         }
         // Message already made it out (uploaded/acked) — the queue row is a
@@ -9452,6 +9500,7 @@ export default function useChatLogic({ navigation, route }) {
       console.error('flushQueuedMediaUploads error', error);
     } finally {
       mediaUploadQueueInFlightRef.current = false;
+      globalMediaFlushInFlight = false;
     }
   }, [isConnected, persistMediaUploadQueue, sendMedia, sendMediaGroup]);
 
@@ -9601,6 +9650,96 @@ export default function useChatLogic({ navigation, route }) {
   }, [chatData]);
 
   rehydratePendingUploadBubblesRef.current = rehydratePendingUploadBubbles;
+
+  // SELF-HEAL for the "uploader ring stuck after a finished send" bug. A
+  // media/album row can be left at status 'sending'/'uploading' in SQLite
+  // forever: the upload finished and the queue row was pruned, but the ack (or
+  // the debounced local save carrying 'uploaded'/'sent') died with the
+  // unmounted instance when the user backed out / reloaded the chat list at
+  // exactly that moment. Nothing ever revisits such a row — the queue-based
+  // rehydrate skips it (no queue row) — so every reopen showed a fake upload
+  // bar + ring. This pass runs on chat open and settles every stuck OWN media
+  // row that has NO queue row and NO in-flight upload (app-wide check):
+  //   - all media uploaded (real mediaIds) → re-emit the send with the same
+  //     tempId; the server dedupes on (chatId, clientMessageId) and acks the
+  //     canonical row, which reconciles the bubble to 'sent' and persists.
+  //   - media never fully uploaded → the send is genuinely dead; mark it
+  //     'failed' so the user gets a Retry instead of an eternal fake ring.
+  const reconcileStaleSendingMedia = useCallback(async () => {
+    try {
+      const cid = chatIdRef.current;
+      const isRealMediaId = (v) => v != null && String(v).length > 0 && !/^temp_/i.test(String(v));
+      const stuck = (allMessagesRef.current || []).filter((m) => (
+        m?.tempId
+        && m?.senderType === 'self'
+        && sameChatId(m?.chatId || cid, cid)
+        && ['sending', 'uploading', 'uploaded'].includes(String(m?.status))
+        && ['image', 'video', 'audio', 'file', 'album'].includes(String(m?.type || m?.mediaType))
+      ));
+      if (!stuck.length) return;
+      const queuedIds = new Set(
+        (queuedMediaUploadsRef.current || []).map((q) => q?.tempId).filter(Boolean)
+      );
+      const isGrp = chatData?.chatType === 'group' || chatData?.isGroup;
+      for (const row of stuck) {
+        const tempId = row.tempId;
+        // A live upload (this instance or a pre-remount one) or a durable queue
+        // row owns this bubble — the normal pipeline will finish it.
+        if (queuedIds.has(tempId)
+          || globalActiveMediaUploads.has(tempId)
+          || activeMediaUploadTempIdsRef.current.has(tempId)) continue;
+        const items = Array.isArray(row.mediaItems) && row.mediaItems.length ? row.mediaItems : null;
+        const allUploaded = items
+          ? items.every((it) => isRealMediaId(it?.mediaId))
+          : isRealMediaId(row.mediaId);
+        if (allUploaded) {
+          if (!isSocketConnected()) continue; // next open/reconnect heals it
+          const clean = (items || [row]).map((it) => ({
+            mediaId: String(it.mediaId),
+            fileCategory: it.fileCategory || (String(row.type) === 'file' ? 'document' : String(row.type)) || 'image',
+            mediaUrl: it.mediaUrl || '',
+            mediaThumbnailUrl: it.mediaThumbnailUrl || '',
+            mediaMeta: it.mediaMeta || row.mediaMeta || {},
+          }));
+          // eslint-disable-next-line no-await-in-loop
+          const deviceId = await getOrCreateDeviceId();
+          const first = clean[0];
+          const healPayload = {
+            chatId: cid,
+            chatType: chatData?.chatType || 'private',
+            senderId: currentUserIdRef.current,
+            senderDeviceId: deviceId,
+            receiverId: isGrp ? null : (chatData.peerUser?._id || null),
+            ...(isGrp && { groupId: chatData?.groupId || chatData?.group?._id || cid }),
+            messageType: clean.length > 1 ? 'album' : (first.fileCategory === 'document' ? 'file' : first.fileCategory),
+            text: row.text || '',
+            ...(row.mediaGroupId ? { mediaGroupId: row.mediaGroupId } : {}),
+            ...(clean.length > 1 || row.mediaGroupId ? { mediaItems: clean } : {}),
+            mediaId: first.mediaId,
+            mediaUrl: first.mediaUrl,
+            mediaThumbnailUrl: first.mediaThumbnailUrl || first.mediaUrl,
+            mediaMeta: first.mediaMeta,
+            status: 'sent',
+            createdAt: row.createdAt || new Date().toISOString(),
+          };
+          // Same tempId → same clientMessageId → server-side idempotency: an
+          // already-persisted send just acks the existing row (duplicate:true),
+          // and the ack listener reconciles this bubble to 'sent' + persists.
+          // eslint-disable-next-line no-await-in-loop
+          await sendMessageViaSocket({ ...healPayload, tempId }, tempId).catch(() => {});
+        } else {
+          setAllMessages((prev) => prev.map((m) => (
+            m.tempId === tempId ? { ...m, status: 'failed' } : m
+          )));
+          ChatDatabase.upsertMessage({ ...row, status: 'failed', chatId: cid }).catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.warn('reconcileStaleSendingMedia failed:', e?.message || e);
+    }
+  }, [chatData, getOrCreateDeviceId, sendMessageViaSocket]);
+
+  reconcileStaleSendingMediaRef.current = reconcileStaleSendingMedia;
 
   // Manual retry for a FAILED media/album message (tap-to-retry). Re-runs the
   // persisted upload-queue row when one exists (same tempId → same

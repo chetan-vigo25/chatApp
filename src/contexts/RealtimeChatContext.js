@@ -739,6 +739,32 @@ const reducer = (state, action) => {
         const isGroupChat = rawChat?.chatType === 'group' || rawChat?.isGroup;
         const chat = { ...rawChat };
 
+        // SOCKET chat:list rows (buildChatListItem) ship `lastMessage` as a
+        // plain STRING and `lastMessageAt` as epoch MS — the chat:list:update
+        // path already coerces this (see the string-coerce there), but this
+        // HYDRATE path didn't. The string slipped into chatMap, the SQLite
+        // persist read `lm.text` off a string (undefined) and wiped
+        // last_message_text to NULL — "No messages yet" + broken timestamp on
+        // EVERY app reload (the boot socket chat:list refresh runs each open).
+        if (typeof chat.lastMessage === 'string') {
+          const txt = chat.lastMessage;
+          chat.lastMessage = (txt || chat.lastMessageAt)
+            ? {
+                text: txt,
+                type: chat.lastMessageType || 'text',
+                messageType: chat.lastMessageType || 'text',
+                senderId: chat.lastMessageSender || null,
+                createdAt: chat.lastMessageAt
+                  ? new Date(Number(chat.lastMessageAt) || chat.lastMessageAt).toISOString()
+                  : null,
+              }
+            : null;
+        }
+        if (typeof chat.lastMessageAt === 'number' && Number.isFinite(chat.lastMessageAt) && chat.lastMessageAt > 0) {
+          // Keep the column/sort format consistent (ISO strings everywhere).
+          chat.lastMessageAt = new Date(chat.lastMessageAt).toISOString();
+        }
+
         // Build peerUser object from flat fields if not already present (new API format)
         if (!isGroupChat && !chat.peerUser && chat.peerUserId) {
           chat.peerUser = {
@@ -4896,7 +4922,17 @@ export function RealtimeChatProvider({ children }) {
         const apiIsEdited = Boolean(apiLastMsg?.isEdited || apiLastMsg?.editedAt);
         const apiIsDeleted = Boolean(apiLastMsg?.isDeleted);
 
+        // A hydrate row with NO meaningful lastMessage (empty server summary,
+        // wiped cache row) must BACKFILL from the local messages table — the
+        // old condition required apiLastMsg.createdAt to exist, so an empty
+        // summary never healed and the row sat on "No messages yet" (no
+        // timestamp) across app restarts even though the messages were right
+        // there in SQLite.
+        const apiHasMsg = Boolean(
+          apiLastMsg && (apiLastMsg.text || apiMsgId || apiLastMsg.createdAt)
+        ) || Boolean(tempMap[chatId]?.lastMessageAt);
         const shouldOverride =
+          !apiHasMsg ||
           (localIsEdited && !apiIsEdited) ||
           (localIsDeleted && !apiIsDeleted) ||
           // Also override if SQLite has a newer message than the API

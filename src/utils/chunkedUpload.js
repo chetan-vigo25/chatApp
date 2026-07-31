@@ -107,10 +107,14 @@ export const uploadFileInChunks = async ({
   onProgress = null,
   onSession = null,
   session = null,
-  // Pause hook — checked between chunks. Returning true stops the loop
-  // cleanly with an 'upload paused' error; the session (sessionId + server
-  // receivedBytes) stays alive so a later call resumes from the offset.
+  // Pause hook — checked between chunks AND every 250ms DURING a chunk (the
+  // in-flight PUT is cancelAsync'd, so pause is instant instead of waiting up
+  // to a whole 8MB chunk). Returning true stops the loop cleanly with an
+  // 'upload paused' error; the session (sessionId + server receivedBytes)
+  // stays alive so a later call resumes from the offset.
   isPaused = null,
+  // AbortSignal (cancel button) — cancels the in-flight chunk immediately too.
+  signal = null,
   // Internal: set on the single automatic restart after the server resets a
   // session (HTTP 410 — e.g. its assembly temp file vanished).
   _freshRetry = false,
@@ -124,7 +128,7 @@ export const uploadFileInChunks = async ({
     return uploadFileInChunks({
       uri, name, mimeType, fileSize, chatId, sourceHash,
       sourceHashPromise, dedupCheck,
-      onProgress, onSession, session: null, isPaused, _freshRetry: true,
+      onProgress, onSession, session: null, isPaused, signal, _freshRetry: true,
     });
   };
 
@@ -302,16 +306,77 @@ export const uploadFileInChunks = async ({
       let result = null;
       let failed = false;
       try {
-        result = await FileSystem.uploadAsync(chunkUrl, current.path, {
-          httpMethod: 'PUT',
-          uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
-          headers: {
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            'Content-Type': 'application/octet-stream',
-            'x-chunk-offset': String(offset),
+        // createUploadTask (NOT uploadAsync) for REAL per-byte progress: an
+        // 8MB chunk on a slow uplink is 30-60s on the wire, and uploadAsync
+        // emits nothing until the chunk lands — the bubble ring sat frozen the
+        // whole time ("progressbar not working") and the 90s stall watchdog
+        // ran blind. The native callback costs nothing (same upload primitive
+        // underneath); we throttle emits to ~150ms to keep re-renders cheap.
+        let lastByteEmit = 0;
+        const chunkBase = offset;
+        const uploadTask = FileSystem.createUploadTask(
+          chunkUrl,
+          current.path,
+          {
+            httpMethod: 'PUT',
+            uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+            headers: {
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+              'Content-Type': 'application/octet-stream',
+              'x-chunk-offset': String(offset),
+            },
           },
-        });
+          (p) => {
+            const sent = Number(p?.totalBytesSent || 0);
+            if (!(sent > 0)) return;
+            const now = Date.now();
+            if (sent < length && now - lastByteEmit < 150) return;
+            lastByteEmit = now;
+            reportProgress(Math.min(chunkBase + sent, chunkBase + length));
+          },
+        );
+        // INSTANT pause/cancel: the old flow only checked isPaused BETWEEN
+        // chunks, so tapping ⏸/✕ waited for the whole in-flight chunk (up to
+        // 8MB — 30-60s on a slow uplink) before reacting. Watch the flags
+        // every 250ms while the chunk is on the wire and cancelAsync() the
+        // task the moment they flip; the server keeps receivedBytes, so a
+        // resume re-syncs and re-sends only the interrupted chunk.
+        let interrupted = false;
+        const cancelNow = () => {
+          if (interrupted) return;
+          interrupted = true;
+          uploadTask.cancelAsync().catch(() => {});
+        };
+        const onAbort = () => cancelNow();
+        if (signal) {
+          if (signal.aborted) cancelNow();
+          else { try { signal.addEventListener('abort', onAbort); } catch { /* older polyfills */ } }
+        }
+        const pauseWatch = setInterval(() => {
+          if (pauseRequested() || dedupHit || (signal && signal.aborted)) cancelNow();
+        }, 250);
+        try {
+          result = await uploadTask.uploadAsync();
+        } catch (e) {
+          // A cancelAsync-induced rejection is our own interruption, not a
+          // network failure — fall through to the interrupted handling below.
+          if (!interrupted) throw e;
+          result = null;
+        } finally {
+          clearInterval(pauseWatch);
+          if (signal) { try { signal.removeEventListener('abort', onAbort); } catch { /* best-effort */ } }
+        }
+        if (interrupted) {
+          // Persist the resume point, then surface the intent — these messages
+          // are the pipeline's control-flow markers (treated as paused/
+          // cancelled, never as a failed upload).
+          reportSession(sessionId, offset);
+          if (pauseRequested()) throw new Error('upload paused');
+          if (signal && signal.aborted) throw new Error('upload cancelled');
+          continue; // dedupHit — the loop top returns the existing media
+        }
       } catch (err) {
+        if (/upload (paused|cancelled)/i.test(String(err?.message || ''))) throw err;
         failed = true;
       }
 

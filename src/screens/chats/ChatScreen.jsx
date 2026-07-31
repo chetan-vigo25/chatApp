@@ -842,16 +842,23 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
 
   const name = fullName || contactName || 'Contact';
   const image = profileImage || avatar || '';
-  const phone = mobileNumber || phoneNumber || '';
-  const displayPhone = countryCode ? `${countryCode} ${phone}` : phone;
-  const fullPhone = countryCode ? `${countryCode}${phone}` : phone;
+  const phone = String(mobileNumber || phoneNumber || '').trim();
+  // A shared contact sometimes carries the country code already baked into the
+  // number ("+917065…") — prepending countryCode again rendered garbage like
+  // "+917 065217946". Only prefix when the number doesn't already have one.
+  const hasBakedCode = phone.startsWith('+');
+  const displayPhone = !hasBakedCode && countryCode ? `${countryCode} ${phone}` : phone;
+  const fullPhone = !hasBakedCode && countryCode ? `${countryCode}${phone}` : phone;
 
-  const bgColor = isDarkMode ? '#000000' : '#f5f5f5';
-  const cardBg = isDarkMode ? '#1a2b3c' : '#fff';
-  const textColor = isDarkMode ? '#EDF6FC' : '#111';
-  const subColor = isDarkMode ? 'rgba(200,216,228,0.6)' : '#666';
+  // Theme tokens ONLY — the old hardcoded palette (#000 page + #1a2b3c
+  // blue-gray cards) clashed with the app's WhatsApp-dark theme and left a
+  // black void under the content.
+  const bgColor = theme.colors.surface;
+  const cardBg = theme.colors.cardBackground;
+  const textColor = theme.colors.primaryTextColor;
+  const subColor = theme.colors.secondaryTextColor;
   const accentColor = theme.colors.themeColor || '#03b0a2';
-  const borderColor = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
+  const borderColor = theme.colors.borderColor;
 
   const saveContactToDevice = () => {
     Alert.alert(
@@ -920,8 +927,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
             onPress={() => Linking.openURL(`tel:${fullPhone}`).catch(() => {})}
             style={{ alignItems: 'center' }}
           >
-            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#22C55E20', alignItems: 'center', justifyContent: 'center' }}>
-              <Ionicons name="call" size={20} color="#22C55E" />
+            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
+              <Ionicons name="call" size={20} color={accentColor} />
             </View>
             <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Roboto-Medium', marginTop: 4 }}>Call</Text>
           </Pressable>
@@ -950,8 +957,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
             onPress={saveContactToDevice}
             style={{ alignItems: 'center' }}
           >
-            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: '#8B5CF620', alignItems: 'center', justifyContent: 'center' }}>
-              <Ionicons name="person-add" size={20} color="#8B5CF6" />
+            <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
+              <Ionicons name="person-add" size={20} color={accentColor} />
             </View>
             <Text style={{ fontSize: 11, color: subColor, fontFamily: 'Roboto-Medium', marginTop: 4 }}>Save</Text>
           </Pressable>
@@ -960,10 +967,10 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
 
       {/* Phone number detail */}
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 40 }}>
-        <View style={{ backgroundColor: cardBg, marginTop: 12, borderTopWidth: 0.5, borderTopColor: borderColor }}>
+        <View style={{ backgroundColor: cardBg, marginTop: 12, marginHorizontal: 12, borderRadius: 14, borderWidth: 0.5, borderColor, overflow: 'hidden' }}>
           <Pressable
             onPress={() => Linking.openURL(`tel:${fullPhone}`).catch(() => {})}
-            style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 12, borderBottomWidth: 0.5, borderBottomColor: borderColor }}
+            style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 13, paddingHorizontal: 12 }}
           >
             <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: accentColor + '15', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
               <Ionicons name="call-outline" size={18} color={accentColor} />
@@ -3361,7 +3368,7 @@ export default function ChatScreen({ navigation, route }) {
       }
 
       const result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ['images'],
         quality: 1,
         allowsEditing: false,
       });

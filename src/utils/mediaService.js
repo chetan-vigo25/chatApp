@@ -578,6 +578,7 @@ export const uploadMediaFile = async ({
         onSession: onChunkSession,
         session: chunkSession,
         isPaused,
+        signal,
       });
       return { payload: response, localUri: persistentUri };
     }
@@ -626,6 +627,7 @@ export const uploadMediaFile = async ({
         onSession: onChunkSession,
         session: chunkSession,
         isPaused,
+        signal,
       });
       return { payload: response, localUri: persistentUri };
     }
@@ -667,6 +669,7 @@ export const uploadMediaFile = async ({
             onSession: onChunkSession,
             session: chunkSession,
             isPaused,
+            signal,
           });
           return { payload: response, localUri: persistentUri };
         } catch {

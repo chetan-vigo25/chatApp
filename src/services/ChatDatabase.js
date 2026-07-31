@@ -2342,7 +2342,19 @@ const _chatToRow = (chat) => {
   const chatId = chat.chatId || chat._id;
   if (!chatId) return null;
   const isGroup = chat.chatType === 'group' || Boolean(chat.isGroup);
-  const lm = chat.lastMessage || {};
+  // Tolerate STRING lastMessage (socket chat:list rows ship the preview text
+  // flat) — reading `.text` off a string gave undefined and nulled the stored
+  // preview. Number lastMessageAt (epoch ms) is normalized to ISO so the
+  // last_message_at column stays sortable as one format.
+  const lm = (chat.lastMessage && typeof chat.lastMessage === 'object')
+    ? chat.lastMessage
+    : (typeof chat.lastMessage === 'string' && chat.lastMessage
+      ? { text: chat.lastMessage, type: chat.lastMessageType || 'text', senderId: chat.lastMessageSender || null }
+      : {});
+  const lmAtRaw = chat.lastMessageAt || lm.createdAt || null;
+  const lmAt = (typeof lmAtRaw === 'number' && Number.isFinite(lmAtRaw) && lmAtRaw > 0)
+    ? new Date(lmAtRaw).toISOString()
+    : lmAtRaw;
   // Handle peerUser from flat API format (peerUserId + chatName + chatAvatar)
   const peerUserObj = isGroup ? null : (chat.peerUser || chat.otherUser || (chat.peerUserId ? { _id: chat.peerUserId, fullName: chat.chatName, profileImage: chat.chatAvatar } : null));
   return {
@@ -2359,10 +2371,18 @@ const _chatToRow = (chat) => {
     $lmSenderId: lm.senderId || null,
     $lmSenderName: lm.senderName || null,
     $lmStatus: lm.status || null,
-    $lmAt: chat.lastMessageAt || lm.createdAt || null,
+    $lmAt: lmAt,
     $lmId: lm.serverMessageId || lm.messageId || lm.id || null,
     $lmEdited: lm.isEdited ? 1 : 0,
     $lmDeleted: lm.isDeleted ? 1 : 0,
+    // 1 = the incoming chat object carries NO meaningful lastMessage (no
+    // text, no id, no timestamp — e.g. a name-only hydrate row or a server
+    // summary that hasn't caught up). The upsert then PRESERVES the stored
+    // last_message_* columns instead of wiping them — the wipe is why rows
+    // showed "No messages yet" with no timestamp after an app restart (and
+    // broke last_message_at sorting).
+    $lmKeep: (lm.text || lm.serverMessageId || lm.messageId || lm.id
+      || chat.lastMessageAt || lm.createdAt) ? 0 : 1,
     $unread: Number(chat.unreadCount || 0),
     $pinned: chat.isPinned ? 1 : 0,
     $pinnedAt: chat.pinnedAt || null,
@@ -2446,10 +2466,15 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
   group_id = COALESCE($groupId, group_id),
   chat_name = COALESCE($chatName, chat_name),
   chat_avatar = COALESCE($chatAvatar, chat_avatar),
-  last_message_text = $lmText, last_message_type = $lmType,
-  last_message_sender_id = $lmSenderId, last_message_sender_name = $lmSenderName,
-  last_message_status = $lmStatus, last_message_at = $lmAt, last_message_id = $lmId,
-  last_message_is_edited = $lmEdited, last_message_is_deleted = $lmDeleted,
+  last_message_text = CASE WHEN $lmKeep = 1 THEN last_message_text ELSE $lmText END,
+  last_message_type = CASE WHEN $lmKeep = 1 THEN last_message_type ELSE $lmType END,
+  last_message_sender_id = CASE WHEN $lmKeep = 1 THEN last_message_sender_id ELSE $lmSenderId END,
+  last_message_sender_name = CASE WHEN $lmKeep = 1 THEN last_message_sender_name ELSE $lmSenderName END,
+  last_message_status = CASE WHEN $lmKeep = 1 THEN last_message_status ELSE $lmStatus END,
+  last_message_at = CASE WHEN $lmKeep = 1 THEN last_message_at ELSE $lmAt END,
+  last_message_id = CASE WHEN $lmKeep = 1 THEN last_message_id ELSE $lmId END,
+  last_message_is_edited = CASE WHEN $lmKeep = 1 THEN last_message_is_edited ELSE $lmEdited END,
+  last_message_is_deleted = CASE WHEN $lmKeep = 1 THEN last_message_is_deleted ELSE $lmDeleted END,
   unread_count = $unread, is_pinned = $pinned, pinned_at = $pinnedAt,
   is_muted = $muted, mute_until = $muteUntil, is_archived = $archived,
   members = COALESCE($members, members),
