@@ -39,6 +39,21 @@ const AVATAR_SIZE   = 54;
 const RING_WIDTH    = 2.5;
 const ITEM_WIDTH    = 72;
 
+/** Ring avatar with a proper fallback — initial letter (or person glyph) on a
+ *  teal disc when there's no profile image. NEVER the app logo. */
+const RingAvatar = ({ uri, name }) => {
+  if (uri) return <Image source={{ uri }} style={styles.avatar} />;
+  const trimmed = String(name || '').trim();
+  const letter  = /^[a-z]/i.test(trimmed) ? trimmed.charAt(0).toUpperCase() : null;
+  return (
+    <View style={[styles.avatar, styles.avatarFallback]}>
+      {letter
+        ? <Text style={styles.avatarFallbackLetter}>{letter}</Text>
+        : <Ionicons name="person" size={22} color="rgba(255,255,255,0.9)" />}
+    </View>
+  );
+};
+
 /** True if every status in a contact group has been viewed */
 const isGroupFullyViewed = (group, viewedSet) => {
   const statuses = group.statuses || [];
@@ -105,10 +120,7 @@ export default function StatusFeedRow({ navigation, style }) {
       <View style={[styles.emptyRow, { backgroundColor: theme.colors.background }, style]}>
         <TouchableOpacity style={styles.emptyOwn} onPress={() => navigation.navigate('StatusCreate')}>
           <View style={[styles.ownRingEmpty, { borderColor: RING_OWN }]}>
-            <Image
-              source={user?.profileImage ? { uri: user.profileImage } : require('../../assets/icon.png')}
-              style={styles.avatar}
-            />
+            <RingAvatar uri={user?.profileImage} name={user?.fullName} />
             <View style={[styles.addBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Ionicons name="add" size={12} color="#fff" />
             </View>
@@ -136,19 +148,13 @@ export default function StatusFeedRow({ navigation, style }) {
             {hasMyStatus ? (
               <View style={[styles.gradientRing, styles.unseenRing]}>
                 <View style={styles.ringInner}>
-                  <Image
-                    source={user?.profileImage ? { uri: user.profileImage } : require('../../assets/icon.png')}
-                    style={styles.avatar}
-                  />
+                  <RingAvatar uri={user?.profileImage} name={user?.fullName} />
                 </View>
               </View>
             ) : (
               <View style={[styles.gradientRing, { borderColor: 'transparent' }]}>
                 <View style={styles.ringInner}>
-                  <Image
-                    source={user?.profileImage ? { uri: user.profileImage } : require('../../assets/icon.png')}
-                    style={styles.avatar}
-                  />
+                  <RingAvatar uri={user?.profileImage} name={user?.fullName} />
                 </View>
               </View>
             )}
@@ -205,10 +211,7 @@ export default function StatusFeedRow({ navigation, style }) {
                   ]}
                 >
                   <View style={styles.ringInner}>
-                    <Image
-                      source={avatarUri ? { uri: avatarUri } : require('../../assets/icon.png')}
-                      style={styles.avatar}
-                    />
+                    <RingAvatar uri={avatarUri} name={name} />
                   </View>
                 </View>
                 {/* Status-thumbnail badge — same corner preview as "My Status". */}
@@ -294,6 +297,17 @@ const styles = StyleSheet.create({
     width: AVATAR_SIZE,
     height: AVATAR_SIZE,
     borderRadius: AVATAR_SIZE / 2,
+  },
+  avatarFallback: {
+    backgroundColor: '#03b0a2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarFallbackLetter: {
+    color: '#fff',
+    fontSize: 20,
+    fontFamily: 'Roboto-SemiBold',
+    fontWeight: '600',
   },
   addBadge: {
     position: 'absolute',

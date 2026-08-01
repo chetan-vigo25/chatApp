@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -7,6 +7,15 @@ import {
   StyleSheet,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { toSecureMediaUri } from '../utils/mediaService';
+import { statusServices } from '../Redux/Services/Status/Status.Services';
+
+// statusId → { mediaUrl, thumbnailUrl } | null. Messages persisted before the
+// backend stored preview keys have NULL preview URLs in SQLite forever — this
+// one-shot per-status heal fetches the LIVE status and borrows its fresh
+// signed URLs so old bubbles get their thumbnail back. Module-level so a chat
+// with many replies to the same status fetches once, not per bubble.
+const healedUrlCache = new Map();
 
 /**
  * StatusReplyPreview
@@ -39,15 +48,55 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
   theme,
   onPress,
 }) {
-  if (!statusRef || !statusPreview) return null;
-
-  const mediaType = String(statusPreview.mediaType || 'text').toLowerCase();
+  // Hooks run unconditionally (before any early return) — React rule.
+  const statusId  = statusRef ? String(statusRef) : null;
+  const mediaType = String(statusPreview?.mediaType || 'text').toLowerCase();
   const isImage   = mediaType === 'image';
   const isVideo   = mediaType === 'video';
   const isLink    = mediaType === 'link';
   const isText    = !isImage && !isVideo && !isLink;
 
-  const thumb = statusPreview.thumbnailUrl || statusPreview.mediaUrl || null;
+  const storedThumb = statusPreview
+    ? (statusPreview.thumbnailUrl || statusPreview.mediaUrl || null)
+    : null;
+
+  const [healed, setHealed] = useState(
+    statusId ? (healedUrlCache.get(statusId) || null) : null
+  );
+
+  useEffect(() => {
+    // Only media previews with NO stored URL need healing.
+    if (!statusId || storedThumb || (!isImage && !isVideo)) return;
+    if (healedUrlCache.has(statusId)) {
+      setHealed(healedUrlCache.get(statusId) || null);
+      return;
+    }
+    let alive = true;
+    (async () => {
+      try {
+        const resp = await statusServices.getStatusById(statusId);
+        const live = resp?.data?.status || resp?.data;
+        const item = live?.mediaItems?.[0] || null;
+        const urls = (item && (item.thumbnailUrl || item.mediaUrl))
+          ? {
+              mediaUrl:     item.mediaUrl || null,
+              thumbnailUrl: item.thumbnailUrl || item.mediaUrl || null,
+            }
+          : null;
+        // Cache even the null result — an expired/deleted status shouldn't be
+        // re-fetched on every list render.
+        healedUrlCache.set(statusId, urls);
+        if (alive) setHealed(urls);
+      } catch {
+        healedUrlCache.set(statusId, null);
+      }
+    })();
+    return () => { alive = false; };
+  }, [statusId, storedThumb, isImage, isVideo]);
+
+  if (!statusRef || !statusPreview) return null;
+
+  const thumb = toSecureMediaUri(storedThumb || healed?.thumbnailUrl) || null;
 
   // Accent colour: green when the bubble is mine, light-teal otherwise.
   // chatColor is honoured if the user has customised the theme.
@@ -94,7 +143,18 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
 
   return (
     <TouchableOpacity
-      onPress={() => onPress?.(statusRef, statusPreview)}
+      onPress={() => onPress?.(
+        statusRef,
+        // Hand the healed URLs onward so the viewer's snapshot fallback can
+        // render media even when its own live fetch fails.
+        healed
+          ? {
+              ...statusPreview,
+              mediaUrl:     statusPreview.mediaUrl || healed.mediaUrl,
+              thumbnailUrl: storedThumb || healed.thumbnailUrl,
+            }
+          : statusPreview,
+      )}
       activeOpacity={0.72}
       style={[styles.container, { backgroundColor: cardBg }]}
     >

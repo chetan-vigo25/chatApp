@@ -83,6 +83,38 @@ function FloatingHeart({ delay, x, onDone }) {
   );
 }
 
+// ── Fallback avatar — NEVER the app logo ──────────────────────────────────────
+// No profile image → teal circle with the person's initial; if the display
+// name isn't alphabetic (phone number, empty), a neutral person glyph instead.
+
+function FallbackAvatar({ name, style }) {
+  const trimmed = String(name || '').trim();
+  const letter  = /^[a-z]/i.test(trimmed) ? trimmed.charAt(0).toUpperCase() : null;
+  return (
+    <View style={[style, fallbackAvatarStyles.circle]}>
+      {letter ? (
+        <Text style={fallbackAvatarStyles.letter}>{letter}</Text>
+      ) : (
+        <Ionicons name="person" size={16} color="rgba(255,255,255,0.9)" />
+      )}
+    </View>
+  );
+}
+
+const fallbackAvatarStyles = StyleSheet.create({
+  circle: {
+    backgroundColor: '#03b0a2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  letter: {
+    color: '#fff',
+    fontSize: 15,
+    fontFamily: 'Roboto-SemiBold',
+    fontWeight: '600',
+  },
+});
+
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export default function StatusViewer({ navigation, route }) {
@@ -97,7 +129,7 @@ export default function StatusViewer({ navigation, route }) {
   } = route.params || {};
 
   const dispatch = useDispatch();
-  const { viewers, likers, reactionCache, likeAnimationStatusId } = useSelector(s => s.status);
+  const { viewers, likers, reactionCache, likeAnimationStatusId, contactStatuses = [] } = useSelector(s => s.status);
   const { user }  = useSelector(s => s.authentication);
   const { profileData } = useSelector(s => s.profile);
   // Saved-contact resolver for the viewers/likers lists. Saved name → phone
@@ -215,6 +247,10 @@ export default function StatusViewer({ navigation, route }) {
   const currentVideoUrl =
     currentMediaItem?.mediaUrl || currentStatus?.mediaUrl || null;
   const videoUnplayable = currentMediaType === 'video' && (!currentVideoUrl || videoFailed);
+  // Image slide with NO url at all (e.g. a pre-fix statusPreview snapshot that
+  // stored null URLs) — render an "unavailable" card on a normal 5s timed
+  // slide instead of an infinite black screen with a stuck progress bar.
+  const imageUnrenderable = currentMediaType === 'image' && !currentMediaUrl && !currentThumbUrl;
 
   // ── Progress bar ─────────────────────────────────────────────────────────
   const startProgress = useCallback((duration) => {
@@ -253,7 +289,7 @@ export default function StatusViewer({ navigation, route }) {
     const needsMedia = currentMediaType === 'image' || isVideo;
     // A broken/missing video url falls back to a normal 5s timed slide (with
     // the thumbnail showing) — never an instant skip, never a forever-hang.
-    if (isVideo && videoUnplayable) {
+    if ((isVideo && videoUnplayable) || imageUnrenderable) {
       startProgress(STORY_DURATION);
       return () => animRef.current?.stop();
     }
@@ -276,7 +312,7 @@ export default function StatusViewer({ navigation, route }) {
     }
     startProgress(STORY_DURATION);
     return () => animRef.current?.stop();
-  }, [currentIndex, paused, mediaLoaded, videoUnplayable, currentMediaType]);
+  }, [currentIndex, paused, mediaLoaded, videoUnplayable, imageUnrenderable, currentMediaType]);
 
   // Safe back — always works even if StatusViewer is the root screen
   const safeGoBack = useCallback(() => {
@@ -683,7 +719,16 @@ export default function StatusViewer({ navigation, route }) {
         || user?.avatar
         || user?.image
       ) || null)
-    : toSecureMediaUri(userImage);
+    : (toSecureMediaUri(
+        userImage
+        // Route param can be empty (opened from a caller that didn't have the
+        // avatar hydrated yet) — fall back to the feed group in Redux, then to
+        // owner fields stamped on the status documents themselves.
+        || contactStatuses.find(c => String(c.userId) === String(userId))?.avatar
+        || contactStatuses.find(c => String(c.userId) === String(userId))?.profileImage
+        || currentStatus?.ownerAvatar
+        || currentStatus?.owner?.profileImage
+      ) || null);
   const likeActive = reactionData.myReaction === 'like';
 
   // Does the currently-visible slide play audio? Used to gate the mute icon.
@@ -711,6 +756,19 @@ export default function StatusViewer({ navigation, route }) {
         );
       case 'image': {
         const thumbUrl = toSecureMediaUri(currentThumbUrl);
+        if (imageUnrenderable) {
+          return (
+            <View style={styles.unavailableWrap}>
+              <Ionicons name="image-outline" size={44} color="rgba(255,255,255,0.45)" />
+              <Text style={styles.unavailableText}>This status is no longer available</Text>
+              {currentStatus.caption || currentStatus.textContent ? (
+                <Text style={styles.unavailableCaption} numberOfLines={3}>
+                  {currentStatus.caption || currentStatus.textContent}
+                </Text>
+              ) : null}
+            </View>
+          );
+        }
         return (
           <View style={styles.mediaContent}>
             {/* Blurred low-res placeholder (WhatsApp blur-up) — visible until the
@@ -955,10 +1013,11 @@ export default function StatusViewer({ navigation, route }) {
             }
           }}
         >
-          <Image
-            source={displayImage ? { uri: displayImage } : require('../../../assets/icon.png')}
-            style={styles.headerAvatar}
-          />
+          {displayImage ? (
+            <Image source={{ uri: displayImage }} style={styles.headerAvatar} />
+          ) : (
+            <FallbackAvatar name={displayName} style={styles.headerAvatar} />
+          )}
           <View style={styles.headerText}>
             <View style={styles.headerNameRow}>
               <Text style={styles.headerName}>{displayName}</Text>
@@ -1152,10 +1211,11 @@ export default function StatusViewer({ navigation, route }) {
                           onPress={openProfile}
                           accessibilityLabel={`Open ${displayName}'s profile`}
                         >
-                          <Image
-                            source={viewer?.profileImage ? { uri: viewer.profileImage } : require('../../../assets/icon.png')}
-                            style={styles.viewerAvatar}
-                          />
+                          {viewer?.profileImage ? (
+                            <Image source={{ uri: viewer.profileImage }} style={styles.viewerAvatar} />
+                          ) : (
+                            <FallbackAvatar name={displayName} style={styles.viewerAvatar} />
+                          )}
                           <View style={{ flex: 1 }}>
                             <Text style={styles.viewerName}>{displayName}</Text>
                             <Text style={styles.viewerTime}>{timeAgo(item.viewedAt)}</Text>
@@ -1199,10 +1259,11 @@ export default function StatusViewer({ navigation, route }) {
                       onPress={openProfile}
                       accessibilityLabel={`Open ${displayName}'s profile`}
                     >
-                      <Image
-                        source={item.avatar ? { uri: item.avatar } : require('../../../assets/icon.png')}
-                        style={styles.viewerAvatar}
-                      />
+                      {item.avatar ? (
+                        <Image source={{ uri: item.avatar }} style={styles.viewerAvatar} />
+                      ) : (
+                        <FallbackAvatar name={displayName} style={styles.viewerAvatar} />
+                      )}
                       <View style={{ flex: 1 }}>
                         <Text style={styles.viewerName}>{displayName}</Text>
                         <Text style={styles.viewerTime}>{timeAgo(item.likedAt)}</Text>
@@ -1482,6 +1543,27 @@ const styles = StyleSheet.create({
   // Link status
   linkContent: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e', padding: 20 },
   linkImage:   { width: SW, height: 220 },
+  unavailableWrap: {
+    flex: 1,
+    width: SW,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 40,
+  },
+  unavailableText: {
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 15,
+    fontFamily: 'Roboto-Regular',
+    marginTop: 12,
+    textAlign: 'center',
+  },
+  unavailableCaption: {
+    color: 'rgba(255,255,255,0.55)',
+    fontSize: 13,
+    fontFamily: 'Roboto-Regular',
+    marginTop: 8,
+    textAlign: 'center',
+  },
   linkBody:    { padding: 20, width: '100%' },
   linkTitle:   { color: '#fff', fontSize: 18, fontFamily: 'Roboto-Bold', marginBottom: 8 },
   linkDesc:    { color: 'rgba(255,255,255,0.7)', fontSize: 14, marginBottom: 8 },

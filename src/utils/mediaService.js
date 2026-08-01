@@ -87,7 +87,7 @@ export const toSecureMediaUri = (uri) => {
 
   // Relative server media path → current backend origin. Only server media
   // paths — anything else relative is ambiguous and left alone.
-  if (BACKEND_ORIGIN && /^\/?uploads\//i.test(u)) {
+  if (BACKEND_ORIGIN && /^\/?(uploads|media)\//i.test(u)) {
     return `${BACKEND_ORIGIN}${u.startsWith('/') ? '' : '/'}${u}`;
   }
 
@@ -98,7 +98,7 @@ export const toSecureMediaUri = (uri) => {
   // /api/ matters for dev-over-USB: the server bakes its LAN host into
   // downloadUrl, but the phone can only reach the backend via the adb-reverse
   // 127.0.0.1 tunnel — without the remap every download API URL is unreachable.
-  const absMatch = u.match(/^https?:\/\/([^/:]+)(?::\d+)?(\/(?:uploads|api)\/.*)$/i);
+  const absMatch = u.match(/^https?:\/\/([^/:]+)(?::\d+)?(\/(?:uploads|api|media)\/.*)$/i);
   if (absMatch && BACKEND_ORIGIN && isDevOrLanHost(absMatch[1])) {
     const remapped = `${BACKEND_ORIGIN}${absMatch[2]}`;
     if (remapped !== u) return remapped;

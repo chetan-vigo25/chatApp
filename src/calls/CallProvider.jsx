@@ -360,7 +360,12 @@ export const CallProvider = ({ children }) => {
       // 0 until media is CONNECTED → native shows "Calling…" with no duration
       // timer; the timer starts at connectedAt, matching the in-app UI.
       startedAt: s.connectedAt || 0,
-      state: ringing ? 'ringing' : 'ongoing',
+      // Three states, mirroring the in-app header: ringing (dialing, no answer)
+      // → connecting (answered, media not up — NO duration timer; the old
+      // two-state mapping sent 'ongoing' here and the notification counted up
+      // while the call screen still said "Connecting…") → ongoing (timer from
+      // connectedAt).
+      state: ringing ? 'ringing' : (s.connectedAt ? 'ongoing' : 'connecting'),
     };
   }, []);
 
@@ -2491,6 +2496,19 @@ export const CallProvider = ({ children }) => {
     try { audioSessionDidActivate(); } catch (_) { /* best-effort */ }
     restartEngineAudio();
     reassertSpeakerRoute();
+    // Passes 2+: the soft repairs above re-assert the SAME route, which is a
+    // session-level no-op when the audio unit started against the dead
+    // pre-CallKit session (react-native-webrtc runs without manual-audio mode,
+    // so audioSessionDidActivate alone can't restart an already-running unit).
+    // Replicate the ONE thing the manual Speaker toggle does that these don't:
+    // an actual AVAudioSession route CHANGE (opposite output → back), which
+    // forces iOS to rebuild the voice-processing unit. Route lands back on the
+    // button's current state, so the user's choice is never flipped.
+    // Bounce exactly ONCE per call (pass 2, ~1.8s in) — enough to rebuild the
+    // unit, without an audible route blip on every later pass.
+    if (oar.attempts === 2 && AudioRoute.isAvailable()) {
+      AudioRoute.bounceRoute(!!s.speakerOn);
+    }
     if (oar.attempts < 3) {
       oar.timer = setTimeout(runOutgoingAudioRecoveryPass, 700);
     }
@@ -2697,9 +2715,20 @@ export const CallProvider = ({ children }) => {
     // (no keyguard module), so this path must NEVER suppress the in-app call UI —
     // otherwise an iOS call (foreground OR tapped from the banner) shows nothing.
     const fullScreenLaunch = !!opts.fullScreen;
+    // LOCKED device ⇒ full-screen CallOverlay, decided from the LOCK signals
+    // alone (live keyguard check OR the native lock receiver). The old
+    // condition also required AppState === 'active', but on a push/socket wake
+    // the INCOMING signal is routinely processed a tick BEFORE AppState commits
+    // 'active' — the race classified a locked-device call as notification-only
+    // and the full-screen call UI never appeared ("locked device pe call ui
+    // full screen open nahi hota"). The overlay renders in the React tree
+    // regardless of foreground state, so if the app is truly backgrounded the
+    // notification's full-screen intent / body tap still brings it up with the
+    // overlay already in place.
+    const lockedAtRing = isDeviceLockedNow() || deviceLockedRef.current;
     const notificationOnly = Platform.OS === 'android'
       && !opts.fromAccept && !fullScreenLaunch
-      && !(AppState.currentState === 'active' && isDeviceLockedNow());
+      && !lockedAtRing;
     stagedIncomingRef.current = { peerId: isGroup ? null : callerId, ts: Date.now() };
     dispatch({
       type: ACT.INCOMING,
@@ -2742,7 +2771,12 @@ export const CallProvider = ({ children }) => {
     // case (Android, or an iOS build without the CallKit native module) keeps the
     // in-app ring exactly as before.
     const useCallKit = Platform.OS === 'ios' && nativeCall.isAvailable();
-    if (!useCallKit) startRinging('incoming');
+    // Android reaching here while NOT visibly foreground (locked, screen off,
+    // backgrounded) keeps the OS CallStyle notification as the ringing surface —
+    // its channel plays the ringtone and its full-screen intent brings the
+    // activity up. Playing the in-app ringtone too would double-ring.
+    const appVisible = AppState.currentState === 'active';
+    if (!useCallKit && (Platform.OS !== 'android' || appVisible)) startRinging('incoming');
     armRingTimeout();
     // Record whether the device was locked when this call arrived → back/end will
     // return to the lock screen instead of exposing the app. Use BOTH the live
@@ -2766,7 +2800,11 @@ export const CallProvider = ({ children }) => {
       ? false // CallKit is the ring UI; the overlay un-collapses on answer.
       : (Platform.OS === 'ios'
         ? true
-        : (opts.expand !== undefined ? opts.expand : AppState.currentState !== 'active'));
+        : (opts.expand !== undefined
+          ? opts.expand
+          // Locked device always takes the full-screen ring (it shows over the
+          // keyguard); otherwise expand only when the app wasn't in active use.
+          : (lockedAtRing || AppState.currentState !== 'active')));
     if (shouldExpand) {
       dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
     }
@@ -2774,8 +2812,12 @@ export const CallProvider = ({ children }) => {
     // notification so its looping ringtone doesn't double with ours and the
     // heads-up doesn't sit on top of the in-app ringing screen (one UI at a
     // time). cancel-all avoids missing it when the posted id differs from the
-    // live state id.
-    cancelAllIncomingCallNotifee();
+    // live state id. ONLY when the app is visibly foreground: on a locked /
+    // screen-off / backgrounded Android device the OS notification IS the ring
+    // (its channel ringtone + full-screen intent) — cancelling it here killed
+    // the only thing that could open the full-screen call UI. The
+    // dismiss-on-foreground effect clears it the moment the app comes up.
+    if (Platform.OS !== 'android' || appVisible) cancelAllIncomingCallNotifee();
     // CRITICAL de-dup: converge on the SAME CallKit UUID the native iOS VoIP push
     // uses. The backend mints one RFC4122 `uuid` per call; the AppDelegate reports
     // CallKit with THAT uuid, while this JS socket path would otherwise mint its
@@ -3274,12 +3316,22 @@ export const CallProvider = ({ children }) => {
     // notificationOnly (foreground call) deliberately shows ONLY the OS
     // notification, so do NOT dismiss it here — that's the whole UI for this call.
     if (state.notificationOnly) return undefined;
-    if (AppState.currentState === 'active') cancelAllIncomingCallNotifee();
+    // Ring HANDOVER, not just dismissal: on a locked/backgrounded ring the OS
+    // notification was the ringing surface (its channel ringtone; the in-app
+    // ringtone was deliberately not started). When the app comes up mid-ring
+    // (full-screen intent / body tap), cancelling the notification silences its
+    // ringtone — start the in-app one in the same beat or the ring goes MUTE
+    // while the call is still incoming. startRinging is idempotent.
+    const takeOver = () => {
+      cancelAllIncomingCallNotifee();
+      if (Platform.OS === 'android') startRinging('incoming');
+    };
+    if (AppState.currentState === 'active') takeOver();
     const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') cancelAllIncomingCallNotifee();
+      if (next === 'active') takeOver();
     });
     return () => { try { sub.remove(); } catch (_) { /* */ } };
-  }, [state.status, state.notificationOnly]);
+  }, [state.status, state.notificationOnly, startRinging]);
 
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = {

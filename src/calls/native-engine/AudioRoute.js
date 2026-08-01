@@ -65,6 +65,26 @@ export const setSpeaker = (on) => {
   } catch (_) { /* no-op */ }
 };
 
+/**
+ * iOS forced route BOUNCE — flip to the opposite output and straight back.
+ * This is the repair the manual Speaker toggle performs implicitly: the
+ * AVAudioSession route CHANGE restarts iOS's voice-processing audio unit when
+ * it was started against the pre-CallKit (dead) session. Re-asserting the
+ * SAME route (off→off) changes nothing at the session level, which is why the
+ * plain reassert passes can leave the caller silent while one Speaker tap
+ * fixes it. Final state is always `on` — the user's choice is never changed.
+ */
+export const bounceRoute = (on, delayMs = 250) => {
+  const icm = get();
+  if (!icm || Platform.OS !== 'ios') return;
+  try {
+    icm.setForceSpeakerphoneOn(!on);
+    setTimeout(() => {
+      try { icm.setForceSpeakerphoneOn(!!on); } catch (_) { /* no-op */ }
+    }, delayMs);
+  } catch (_) { /* no-op */ }
+};
+
 /** Call teardown — release routing back to the OS default. */
 export const stop = () => {
   const icm = get();

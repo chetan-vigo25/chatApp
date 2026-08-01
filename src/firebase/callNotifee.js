@@ -146,7 +146,10 @@ export const startOngoingCallNotification = (call) => {
         callerImage: call.callerImage || null,
         callType: call.callType === 'video' ? 'video' : 'audio',
         startedAt: call.startedAt || 0,
-        state: call.state === 'ringing' ? 'ringing' : 'ongoing',
+        // Pass 'connecting' through — collapsing it to 'ongoing' made the
+        // native notification start its duration chronometer while the call
+        // screen still showed "Connecting…" (timer must start at connect).
+        state: ['ringing', 'connecting'].includes(call.state) ? call.state : 'ongoing',
       });
     } catch (err) {
       console.warn('[callNotif] startOngoingCall failed:', err?.message);
@@ -180,7 +183,7 @@ export const startOngoingCallNotification = (call) => {
         title: call.callerName || 'Ongoing call',
         body: connected
           ? `Ongoing ${call.callType === 'video' ? 'video' : 'voice'} call — tap to return`
-          : 'Calling…',
+          : (call.state === 'connecting' ? 'Connecting…' : 'Calling…'),
         data: { type: 'call', kind: 'ongoing', callId: String(call.callId) },
         android: {
           channelId: ONGOING_CHANNEL_ID,

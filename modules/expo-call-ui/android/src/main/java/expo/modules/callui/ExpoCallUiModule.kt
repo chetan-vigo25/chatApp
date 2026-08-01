@@ -44,6 +44,7 @@ const val EXTRA_CALLER_ID = "callerId"
 const val EXTRA_CALLER_NAME = "callerName"
 const val EXTRA_CALLER_IMAGE = "callerImage"
 const val EXTRA_CALL_TYPE = "callType"
+const val EXTRA_CALL_LAUNCH_TS = "callLaunchTs"
 const val EXTRA_STARTED_AT = "startedAt"
 // "ringing" (outgoing call dialed, not yet answered) or "ongoing" (connected).
 const val EXTRA_STATE = "state"
@@ -269,6 +270,17 @@ class ExpoCallUiModule : Module() {
     OnActivityEntersForeground {
       if (callActive) return@OnActivityEntersForeground
       val activity = appContext.currentActivity ?: return@OnActivityEntersForeground
+      // COLD-START full-screen call launch: on a killed app + locked phone, the
+      // full-screen intent brings this activity over the keyguard BEFORE the JS
+      // runtime has booted — callActive is still false at that moment, and the
+      // unconditional bounce below shoved the very call UI we just launched
+      // back behind the lock screen. That was the "first call shows no full
+      // screen, second/third call works" bug (by the 2nd call JS was alive and
+      // had already set callActive). A FRESH call-launch intent is a legitimate
+      // over-keyguard foreground — let it through; the marker is stripped when
+      // JS consumes it (readCallIntent) and the timestamp bounds staleness, so
+      // a later recents resume with leftover extras is still bounced.
+      if (isFreshCallLaunch(activity.intent)) return@OnActivityEntersForeground
       val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
       if (km?.isKeyguardLocked == true) {
         try { activity.moveTaskToBack(true) } catch (_: Exception) {}
@@ -408,6 +420,16 @@ class ExpoCallUiModule : Module() {
       "callerImage" to intent.getStringExtra(EXTRA_CALLER_IMAGE),
       "callType" to intent.getStringExtra(EXTRA_CALL_TYPE)
     )
+  }
+
+  // True when the activity's current intent is a RECENT call launch (Answer /
+  // full-screen / body tap, ≤90s old — comfortably past the 40s ring window).
+  // Pre-timestamp launches (older builds' pending intents) count as fresh only
+  // while the un-consumed action marker is still present.
+  private fun isFreshCallLaunch(intent: Intent?): Boolean {
+    if (intent?.getStringExtra(EXTRA_CALL_ACTION) == null) return false
+    val ts = intent.getLongExtra(EXTRA_CALL_LAUNCH_TS, 0L)
+    return ts == 0L || System.currentTimeMillis() - ts < 90_000L
   }
 
   // NON-consuming read of a launch intent's call action — same fields as
@@ -603,6 +625,10 @@ class ExpoCallUiModule : Module() {
         putExtra(EXTRA_CALLER_NAME, name)
         putExtra(EXTRA_CALLER_IMAGE, image)
         putExtra(EXTRA_CALL_TYPE, type)
+        // Stamp the launch so the keyguard backstop can tell a FRESH call
+        // launch (legitimate over the lock screen) from a stale recents resume
+        // still carrying old call extras.
+        putExtra(EXTRA_CALL_LAUNCH_TS, System.currentTimeMillis())
       }
     }
   }

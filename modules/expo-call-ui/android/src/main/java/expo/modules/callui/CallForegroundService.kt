@@ -61,11 +61,13 @@ class CallForegroundService : Service() {
     val isVideo = type == "video"
     // Wall-clock ms when the call was answered; 0 → count from now.
     val startedAtMs = intent.getLongExtra(EXTRA_STARTED_AT, 0L)
-    // "ringing" = outgoing call still dialing (no answer yet) → show "Calling…"
-    // without a duration timer. "ongoing" = connected → live duration chronometer.
-    val ringing = (intent.getStringExtra(EXTRA_STATE) ?: "ongoing") == "ringing"
+    // "ringing" = outgoing call still dialing (no answer yet) → "Calling…", no
+    // timer. "connecting" = answered but media not up yet → "Connecting…", no
+    // timer (a counting-up duration here contradicted the in-app "Connecting…"
+    // screen). "ongoing" = media connected → live duration chronometer.
+    val state = intent.getStringExtra(EXTRA_STATE) ?: "ongoing"
 
-    val notification = buildNotification(callId, name, image, isVideo, startedAtMs, ringing)
+    val notification = buildNotification(callId, name, image, isVideo, startedAtMs, state)
     val promoted = startForegroundWithType(notification, isVideo)
     if (!promoted) {
       // Could not become a foreground service (e.g. a microphone-type FGS start
@@ -82,8 +84,10 @@ class CallForegroundService : Service() {
 
   private fun buildNotification(
     callId: String, name: String, image: String?, isVideo: Boolean, startedAtMs: Long,
-    ringing: Boolean = false
+    state: String = "ongoing"
   ): Notification {
+    val ringing = state == "ringing"
+    val connecting = state == "connecting"
     ensureOngoingChannel(this)
 
     val person = Person.Builder().setName(name).setImportant(true).build()
@@ -112,6 +116,7 @@ class CallForegroundService : Service() {
     val contentText = when {
       ringing && isVideo -> "Calling… (video)"
       ringing -> "Calling…"
+      connecting -> "Connecting…"
       isVideo -> "Ongoing video call"
       else -> "Ongoing voice call"
     }
@@ -130,17 +135,17 @@ class CallForegroundService : Service() {
           .setIsVideo(isVideo)
       )
 
-    if (ringing) {
-      // No duration timer while still dialing — a counting-up "0:03" during the
-      // ring reads as if the call is already connected.
+    if (ringing || connecting || startedAtMs <= 0L) {
+      // No duration timer while dialing OR while the answered call's media is
+      // still connecting — a counting-up "0:27" next to the in-app
+      // "Connecting…" screen reads as a connected call that has no audio.
+      // startedAtMs<=0 is the same signal from an older JS bundle (connectedAt
+      // not stamped yet), so it never falls back to a fake "now" timer.
       builder.setShowWhen(false).setUsesChronometer(false)
     } else {
-      // Live duration chronometer. setWhen to the answer time + usesChronometer
-      // makes the system render a counting-up timer; CallStyle surfaces it as the
-      // call duration. ALWAYS set (fall back to "now" when the answer time is
-      // unknown) so the status-bar/shade notification shows a running timer.
-      val whenBase = if (startedAtMs > 0) startedAtMs else System.currentTimeMillis()
-      builder.setWhen(whenBase).setUsesChronometer(true).setShowWhen(true)
+      // Live duration chronometer from the media-connect time (connectedAt) —
+      // matches the in-app timer exactly.
+      builder.setWhen(startedAtMs).setUsesChronometer(true).setShowWhen(true)
     }
 
     if (!image.isNullOrBlank()) {
