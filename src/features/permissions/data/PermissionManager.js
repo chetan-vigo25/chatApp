@@ -2,7 +2,7 @@ import { Platform, Linking, AppState } from 'react-native';
 
 import adapterRegistry from './adapters';
 import { PERMISSION_CATALOG } from '../domain/permissionCatalog';
-import { PermissionStatus, isSatisfied } from '../domain/permissionTypes';
+import { PermissionStatus, isSatisfied, canRequest } from '../domain/permissionTypes';
 import { loadStatusMemory, rememberStatus } from './permissionStorage';
 import { suspendAppLock, resumeAppLock } from '../../../services/appLockGuard';
 
@@ -122,6 +122,41 @@ class PermissionManager {
     } finally {
       resumeAppLock();
     }
+  }
+
+  /**
+   * Fire the NATIVE OS permission dialog for every applicable permission, one at a
+   * time, in catalog order. Used by the startup flow: right after Splash the app
+   * asks each permission via the real Android/iOS system dialog — no custom UI in
+   * between.
+   *
+   * Rules kept intact:
+   *   • already-granted permissions are skipped (never re-asked);
+   *   • permanently-denied ones are skipped (no dialog can appear — no spam);
+   *   • each dialog is awaited before the next, so they never stack;
+   *   • it NEVER fakes a grant — a skipped/denied permission stays exactly what the
+   *     OS reports.
+   *
+   * @param {(id: string, status: string) => void} [onProgress] optional per-step cb
+   * @returns {Promise<Record<string, string>>} id → resulting PermissionStatus
+   */
+  async requestAllSequentially(onProgress) {
+    const results = {};
+
+    for (const entry of this.listApplicable()) {
+      // Read the live status first — only raise a dialog when the OS will actually
+      // show one (undetermined / re-askable denied). Granted or blocked → skip.
+      let status = await this.check(entry.id);
+      if (canRequest(status)) {
+        status = await this.request(entry.id);
+      }
+      results[entry.id] = status;
+      if (typeof onProgress === 'function') {
+        try { onProgress(entry.id, status); } catch (_) {}
+      }
+    }
+
+    return results;
   }
 
   /** True when every `required: true` applicable permission is satisfied. */

@@ -6,7 +6,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { navigationRef, updateNavigationSnapshot } from "../Redux/Services/navigationService";
 
 import Splash from "../screens/Splash";
-import { PermissionsScreen } from "../features/permissions";
+import { PermissionsGate } from "../features/permissions";
 import UserAgree from "../screens/UserAgree";
 import Login from "../screens/Login";
 import LoginEmail from "../screens/LoginEmail";
@@ -106,9 +106,10 @@ export default function RootNavigator() {
           initialRouteName="Splash"
         >
           <Stack.Screen name="Splash" component={Splash} />
-          {/* One-time permission introduction, entered from Splash only. Gestures are
-              disabled: the stack is reset onto it, so there is nothing to swipe back to. */}
-          <Stack.Screen name="Permissions" component={PermissionsScreen} options={{ gestureEnabled: false }} />
+          {/* One-time startup permission step, entered from Splash only. It fires the
+              native OS permission dialogs directly (no custom UI) and then resets on
+              to the real destination. Gestures off: the stack is reset onto it. */}
+          <Stack.Screen name="Permissions" component={PermissionsGate} options={{ gestureEnabled: false }} />
           <Stack.Screen name="UserAgree" component={UserAgree} />
           <Stack.Screen name="Login" component={Login} />
           <Stack.Screen name="LoginEmail" component={LoginEmail} />

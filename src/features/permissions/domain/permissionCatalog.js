@@ -72,6 +72,15 @@ export const PERMISSION_CATALOG = Object.freeze([
     settingsHint: 'Enable Photos access to pick and save media from your library.',
   },
   {
+    id: PERMISSION_IDS.LOCATION,
+    title: 'Location',
+    description: 'Share your current location in a chat.',
+    icon: 'location',
+    accent: '#14B8A6',
+    required: true,
+    settingsHint: 'Enable Location access to share where you are from the attachment menu.',
+  },
+  {
     id: PERMISSION_IDS.MICROPHONE,
     title: 'Microphone',
     description: 'Record voice messages and make voice calls.',
@@ -88,15 +97,6 @@ export const PERMISSION_CATALOG = Object.freeze([
     accent: '#F59E0B',
     required: true,
     settingsHint: 'Enable Files access to attach and open documents.',
-  },
-  {
-    id: PERMISSION_IDS.LOCATION,
-    title: 'Location',
-    description: 'Share your current location in a chat.',
-    icon: 'location',
-    accent: '#14B8A6',
-    required: true,
-    settingsHint: 'Enable Location access to share where you are from the attachment menu.',
   },
 ]);
 
