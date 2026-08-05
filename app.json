@@ -138,7 +138,31 @@
           "cameraPermission": "TalksTry needs camera access for video calls.",
           "microphonePermission": "TalksTry needs microphone access for voice and video calls."
         }
-      ]
+      ],
+      [
+        "expo-share-intent",
+        {
+          "iosActivationRules": {
+            "NSExtensionActivationSupportsText": true,
+            "NSExtensionActivationSupportsWebURLWithMaxCount": 1,
+            "NSExtensionActivationSupportsImageWithMaxCount": 10,
+            "NSExtensionActivationSupportsMovieWithMaxCount": 5,
+            "NSExtensionActivationSupportsFileWithMaxCount": 10
+          },
+          "iosShareExtensionName": "TalksTry Share",
+          "iosAppGroupIdentifier": "group.com.chat.baatCheet.share",
+          "androidIntentFilters": [
+            "text/*",
+            "image/*",
+            "video/*",
+            "audio/*",
+            "application/pdf",
+            "*/*"
+          ],
+          "androidMultiIntentFilters": ["image/*", "video/*", "*/*"]
+        }
+      ],
+      "./plugins/withMergedAppGroups"
     ],
     "extra": {
       "eas": {

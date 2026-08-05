@@ -27,7 +27,8 @@ import CallContentInset from './src/calls/components/CallContentInset';
 import AppLockGate from './src/components/AppLockGate';
 import TrackingIndicator from './src/components/tracking/TrackingIndicator';
 import TrackingConsentSheet from './src/components/tracking/TrackingConsentSheet';
- 
+import { ShareIntentProvider } from 'expo-share-intent';
+
 import 'react-native-gesture-handler';
  
 export default function App() {
@@ -94,7 +95,8 @@ export default function App() {
     }, []);
  
   return (
-    <SafeAreaProvider>
+    <ShareIntentProvider>
+     <SafeAreaProvider>
      <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
        <ThemeProvider>
          <NetworkProvider>
@@ -129,7 +131,8 @@ export default function App() {
          </NetworkProvider>
        </ThemeProvider>
      </KeyboardProvider>
-    </SafeAreaProvider>
+     </SafeAreaProvider>
+    </ShareIntentProvider>
   );
 }
  

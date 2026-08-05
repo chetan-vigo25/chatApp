@@ -1981,6 +1981,32 @@ export default function ChatScreen({ navigation, route }) {
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
 
+  // ── Incoming OS share (share target) ──────────────────────────────────────
+  // When the user shares media into the app from the native share sheet,
+  // ShareInboxScreen opens this thread with a `pendingShare` param. Feed those
+  // files through the SAME sendMedia pipeline an in-app attachment uses (optimistic
+  // bubble → compression → chunked upload → OutboxWorker retry). Runs once, then
+  // clears the param so a re-focus can't resend.
+  const consumedShareRef = useRef(false);
+  useEffect(() => {
+    const share = route?.params?.pendingShare;
+    if (!share || consumedShareRef.current) return;
+    consumedShareRef.current = true;
+
+    (async () => {
+      try {
+        for (const item of share.files || []) {
+          if (!item?.file?.uri) continue;
+          // eslint-disable-next-line no-await-in-loop
+          await sendMedia({ file: item.file, type: item.type }).catch(() => {});
+        }
+      } finally {
+        // Drop the param so navigating back into this screen never replays it.
+        navigation.setParams({ pendingShare: undefined });
+      }
+    })();
+  }, [route?.params?.pendingShare, sendMedia, navigation]);
+
   // ── First-paint loading UX (local-first + spinner) ────────────────────────
   // Messages render from SQLite instantly. A small spinner appears ONLY if
   // that local read is slow (>200ms) and, once shown, stays ≥300ms so it never

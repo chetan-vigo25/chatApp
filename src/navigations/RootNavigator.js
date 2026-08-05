@@ -59,6 +59,8 @@ import StatusPreviewScreen from "../screens/status/StatusPreview";
 import StatusViewerScreen from "../screens/status/StatusViewer";
 import CallDetailScreen from "../screens/calls/CallDetailScreen";
 import NewCallScreen from "../screens/calls/NewCallScreen";
+import ShareInboxScreen from "../screens/chats/ShareInboxScreen";
+import ShareIntentGate from "../share/ShareIntentGate";
 
 import BottomTabNavigator from "./BottomTabNavigator";
 
@@ -183,7 +185,13 @@ export default function RootNavigator() {
           <Stack.Screen name="StatusViewer"    component={StatusViewerScreen} options={{ gestureEnabled: false }} />
           <Stack.Screen name="CallDetail"      component={CallDetailScreen} />
           <Stack.Screen name="NewCall"         component={NewCallScreen} />
+          {/* Chat picker shown when content is shared INTO the app from the OS
+              share sheet. Routed to by ShareIntentGate (mounted below). */}
+          <Stack.Screen name="ShareInbox"      component={ShareInboxScreen} options={{ gestureEnabled: false }} />
         </Stack.Navigator>
+        {/* Watches for an incoming OS share and routes it to ShareInbox. Renders
+            nothing; must live inside NavigationContainer so navigationRef is ready. */}
+        <ShareIntentGate />
       </NavigationContainer>
     </SafeAreaView>
   );
