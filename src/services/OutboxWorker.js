@@ -72,7 +72,67 @@ const sendViaSocket = (payload) => new Promise((resolve, reject) => {
   });
 });
 
+// Tracking rows (record_type='tracking') re-emit the stored `location:update`
+// payload (eventId/deviceTs/coords/telemetry) over the socket — never the chat
+// REST path. The server dedupes on eventId, so a replay can never duplicate.
+// A TRACKING_DISABLED error ack is a TERMINAL signal, not a failure: resolve
+// with a marker so the caller deletes the row and runs the stop flow.
+const sendTrackingViaSocket = (payload) => new Promise((resolve, reject) => {
+  // Lazy require — same cycle-avoidance rationale as sendViaSocket above.
+  const { getSocket, isSocketConnected } = require('../Redux/Services/Socket/socket');
+  const socket = getSocket();
+  if (!socket || !isSocketConnected()) {
+    reject(new Error('socket offline'));
+    return;
+  }
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    reject(new Error('ack timeout'));
+  }, SOCKET_ACK_TIMEOUT_MS);
+  socket.emit('location:update', payload, (response) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    if (response && response.status === false) {
+      if (response?.data?.code === 'TRACKING_DISABLED') {
+        resolve({ trackingDisabled: true });
+        return;
+      }
+      reject(new Error(response?.message || 'send failed'));
+      return;
+    }
+    resolve(response?.data || response || null);
+  });
+});
+
+// Admin disabled tracking while rows were queued: purge every queued tracking
+// row and stop the watcher/indicator via the tracking slice.
+const handleTrackingDisabled = async () => {
+  try { await ChatDatabase.purgeTrackingRows(); } catch {}
+  try {
+    const mod = require('../Redux/Store');
+    const store = mod.store || mod.default || mod;
+    const { stopped, configReceived } = require('../Redux/Reducer/Tracking/Tracking.reducer');
+    if (store?.dispatch && stopped) store.dispatch(stopped());
+    // A row drained during a brief pause can bring TRACKING_DISABLED back
+    // AFTER the admin already resumed — re-request the config so the server's
+    // current answer wins instead of the stale ack (pause→resume race).
+    const { emitSocketEvent } = require('../Redux/Services/Socket/socket');
+    if (emitSocketEvent && store?.dispatch && configReceived) {
+      emitSocketEvent('tracking:config:request', {}, (resp) => {
+        const cfg = resp?.config || resp?.data?.config || resp?.data || null;
+        if (cfg && (resp?.ok || resp?.status === true)) store.dispatch(configReceived(cfg));
+      }, { queueIfOffline: false });
+    }
+  } catch {}
+};
+
 const sendOnce = async (row) => {
+  if (row.record_type === 'tracking') {
+    return sendTrackingViaSocket(row.payload || {});
+  }
   // The payload was created by useChatLogic / send code at compose time and
   // contains everything the transport needs: receiverId / chatType /
   // messageType / text / mediaUrl / clientMessageId / ...
@@ -97,17 +157,27 @@ const tick = async () => {
   for (const row of rows || []) {
     if (!_running) break;
     const { client_message_id: cid } = row;
+    const isTracking = row.record_type === 'tracking';
     try {
       const ack = await sendOnce(row);
       // Server responded — drop from outbox. ChatDatabase.acknowledgeMessage
       // (called from the realtime ack path) will merge the optimistic SQLite
       // row with the canonical one; here we just remove our outbox entry.
       await ChatDatabase.outboxRemove(cid);
-      // Tell any listener that this client message is now settled.
-      try { _onAckListeners.forEach((cb) => cb({ clientMessageId: cid, ack })); } catch {}
+      if (isTracking) {
+        // No message row to settle. A TRACKING_DISABLED ack additionally purges
+        // the remaining queued fixes and stops the watcher/indicator.
+        if (ack?.trackingDisabled) await handleTrackingDisabled();
+      } else {
+        // Tell any listener that this client message is now settled.
+        try { _onAckListeners.forEach((cb) => cb({ clientMessageId: cid, ack })); } catch {}
+      }
     } catch (err) {
       const { exhausted } = await ChatDatabase.outboxRecordFailure(cid, err?.message);
-      if (exhausted) {
+      // Tracking rows are NEVER dropped on exhaustion — they keep retrying with
+      // the (capped) backoff and are bounded by the 500-row drop-oldest cap in
+      // enqueueTrackingEvent instead. Only chat message rows fail terminally.
+      if (exhausted && !isTracking) {
         // Final failure — drop and surface to UI via listener.
         await ChatDatabase.outboxRemove(cid);
         try { _onFailureListeners.forEach((cb) => cb({ clientMessageId: cid, error: err?.message })); } catch {}

@@ -14,6 +14,9 @@ import { claimNotification } from './notificationDedupe';
 // Without this, a build whose native auto-init didn't run throws
 // "No Firebase App '[DEFAULT]' has been created" on the first messaging() use.
 import { ensureFirebaseApp } from './config';
+// Leaf module (imports nothing) — safe to depend on from here. It tells us whether
+// the startup permission screen still owns the notification prompt.
+import { isNotificationPromptHeld } from '../features/permissions/notificationPromptGate';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -305,6 +308,14 @@ export const requestNotificationPermission = async () => {
     // app is in the foreground.
     const isForeground = AppState.currentState === 'active';
 
+    // The Permission Introduction screen (features/permissions) shows the in-app
+    // rationale BEFORE any system dialog — what Google Play and Apple both expect.
+    // While it still owns the prompt this path stays fully PASSIVE: statuses are
+    // read and the token is still fetched + registered (getToken never needed
+    // POST_NOTIFICATIONS), but no OS dialog is raised from the boot path. The gate
+    // self-releases shortly after launch, so nothing here can be suppressed forever.
+    const canPrompt = isForeground && !isNotificationPromptHeld();
+
     // ── Android 13+ POST_NOTIFICATIONS ──
     if (Platform.OS === 'android' && Platform.Version >= 33) {
       // check() is passive — safe from any context.
@@ -312,9 +323,10 @@ export const requestNotificationPermission = async () => {
         PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
       );
       if (!alreadyGranted) {
-        // Can't prompt without an Activity — defer to the next foreground boot.
-        if (!isForeground) {
-          console.warn('[FCM] POST_NOTIFICATIONS not granted; deferring prompt (no foreground Activity)');
+        // Can't prompt without an Activity (or the permission screen owns it) —
+        // defer to the permission screen / the next foreground boot.
+        if (!canPrompt) {
+          console.warn('[FCM] POST_NOTIFICATIONS not granted; deferring prompt');
           return false;
         }
         const granted = await PermissionsAndroid.request(
@@ -338,9 +350,10 @@ export const requestNotificationPermission = async () => {
 
     if (isEnabled(current)) return true;
 
-    // NOT_DETERMINED (or denied) and we can't safely prompt off-foreground.
-    if (!isForeground) {
-      console.warn('[FCM] messaging permission not yet granted; deferring prompt (no foreground Activity)');
+    // NOT_DETERMINED (or denied) and we can't safely prompt off-foreground, or the
+    // permission introduction screen is the one that should be asking.
+    if (!canPrompt) {
+      console.warn('[FCM] messaging permission not yet granted; deferring prompt');
       return false;
     }
 

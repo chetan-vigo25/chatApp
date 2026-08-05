@@ -7,6 +7,7 @@ import { initSocket, getSocket, isSocketConnected, reconnectSocket } from '../Re
 import { useDeviceInfo } from '../contexts/DeviceInfoContext';
 import { bootstrapSession, getStoredSession } from '../services/sessionManager';
 import ChatDatabase from '../services/ChatDatabase';
+import { shouldShowPermissionIntro } from '../features/permissions';
 
 const { width } = Dimensions.get('window');
  
@@ -62,6 +63,29 @@ export default function Splash({ navigation }) {
         };
     }, []);
  
+    // Single exit point from Splash.
+    //
+    // Every destination Splash can resolve (ChatList, SyncScreen, UserAgree) passes
+    // through here so the one-time permission introduction can be inserted directly
+    // after the splash, exactly once, without duplicating the reset logic. When the
+    // intro is not needed — returning user, or everything already granted — this is a
+    // straight reset to the original target and the flow is byte-for-byte what it was
+    // before. The gate itself fails safe (skips) on any error.
+    const goTo = async (target) => {
+        let showPermissions = false;
+        try {
+            showPermissions = await shouldShowPermissionIntro();
+        } catch (err) {
+            console.warn('⚠️ Permission gate check failed:', err?.message);
+        }
+
+        const route = showPermissions
+            ? { name: 'Permissions', params: { nextRoute: target } }
+            : target;
+
+        navigation.reset({ index: 0, routes: [route] });
+    };
+
     const checkAuthAndNavigate = async () => {
         try {
             console.log('🔐 Checking authentication status...');
@@ -101,25 +125,16 @@ export default function Splash({ navigation }) {
                         // single gate for BOTH the 2-step and deleted-chats
                         // passwords. It arms itself on launch when either is set,
                         // so Splash always lands straight on the chat list.
-                        navigation.reset({
-                            index: 0,
-                            routes: [{ name: 'ChatList' }],
-                        });
+                        await goTo({ name: 'ChatList' });
                     } else {
                         // First time on this device — sync chats + messages from API
-                        navigation.reset({
-                            index: 0,
-                            routes: [{ name: 'SyncScreen', params: { navigateTarget: 'ChatList' } }],
-                        });
+                        await goTo({ name: 'SyncScreen', params: { navigateTarget: 'ChatList' } });
                     }
                 } else {
                     console.log('📝 No user found - going to UserAgree');
-                   
+
                     // Navigate to UserAgree with reset
-                    navigation.reset({
-                        index: 0,
-                        routes: [{ name: 'UserAgree' }],
-                    });
+                    await goTo({ name: 'UserAgree' });
                 }
                 setIsChecking(false);
             }, 500); // Wait for animation to complete
@@ -128,11 +143,8 @@ export default function Splash({ navigation }) {
             console.error('❌ Auth check failed:', error);
            
             // On error, go to UserAgree
-            setTimeout(() => {
-                navigation.reset({
-                    index: 0,
-                    routes: [{ name: 'UserAgree' }],
-                });
+            setTimeout(async () => {
+                await goTo({ name: 'UserAgree' });
                 setIsChecking(false);
             }, 500);
         }

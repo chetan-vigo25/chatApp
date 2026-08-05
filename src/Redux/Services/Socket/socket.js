@@ -739,6 +739,26 @@ const attachCoreSocketListeners = (navigation) => {
     }
   });
 
+  // Admin-controlled tracking config, pushed to the user room on every admin
+  // change (and requested once per auth below). Lazy-require dispatch — same
+  // cycle-avoidance pattern as the block-state sync in 'authenticated'.
+  const dispatchTrackingConfig = (cfg) => {
+    if (!cfg) return;
+    try {
+      const mod = require('../../Store');
+      const store = mod.store || mod.default || mod;
+      const tr = require('../../Reducer/Tracking/Tracking.reducer');
+      if (store?.dispatch && tr?.configReceived) store.dispatch(tr.configReceived(cfg));
+      // Admin turned tracking off while fixes were queued offline — purge them
+      // so nothing collected during the disabled window ever reaches the server.
+      if (cfg.enabled === false) {
+        const ChatDatabase = require('../../../services/ChatDatabase').default;
+        ChatDatabase.purgeTrackingRows().catch(() => {});
+      }
+    } catch (e) {}
+  };
+  socket.on('tracking:config', (raw) => dispatchTrackingConfig(raw?.data || raw));
+
   // Persist presence broadcasts to SQLite for instant cold-render.
   socket.on('presence:update', persistPresenceEvent);
   socket.on('presence:subscribed:update', persistPresenceEvent);
@@ -823,6 +843,17 @@ const attachCoreSocketListeners = (navigation) => {
         socket.emit('presence:active');
         startPresenceHeartbeat();
       }
+      // Fetch the current tracking config on every auth — the config is
+      // deliberately not persisted on-device (privacy: a wiped/relaunched app
+      // is untracked until the server says otherwise), so this pull is the
+      // cold-start source of truth; live changes arrive via 'tracking:config'.
+      try {
+        socket.emit('tracking:config:request', {}, (resp) => {
+          if (resp?.ok || resp?.status === true) {
+            dispatchTrackingConfig(resp?.config || resp?.data?.config || resp?.data || null);
+          }
+        });
+      } catch (e) {}
       return;
     }
 

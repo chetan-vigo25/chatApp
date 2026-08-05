@@ -3,7 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 
 const DB_NAME = 'TalksTry.db';
-const DB_VERSION = 13;
+const DB_VERSION = 14;
 
 // Where the destructive recreate stashes pending unsent messages, and where the
 // last init outcome is recorded for telemetry. See _deleteCorruptDB / _recordOutcome.
@@ -269,8 +269,8 @@ const _restoreOutboxBackup = async (db) => {
     try {
       await db.runAsync(
         `INSERT OR REPLACE INTO outbox
-           (client_message_id, chat_id, payload, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at)
-         VALUES ($c,$cid,$p,$a,$m,0,$e,$ca,$ua)`,
+           (client_message_id, chat_id, payload, attempts, max_attempts, next_retry_at, last_error, created_at, updated_at, record_type)
+         VALUES ($c,$cid,$p,$a,$m,0,$e,$ca,$ua,$rt)`,
         {
           $c: r.client_message_id,
           $cid: r.chat_id,
@@ -280,6 +280,9 @@ const _restoreOutboxBackup = async (db) => {
           $e: r.last_error || null,
           $ca: r.created_at || Date.now(),
           $ua: Date.now(),
+          // Preserve tracking rows across a corruption-recovery wipe too — the
+          // backup is a `SELECT *`, so the discriminator is in the backed-up row.
+          $rt: r.record_type || 'message',
         },
       );
       restored++;
@@ -736,6 +739,22 @@ const runMigrations = async (db) => {
         `);
       } catch (e) {
         console.warn('[ChatDB] V13 migration warning:', e?.message);
+      }
+    }
+
+    // V14: Tracking module — the durable outbox gains a `record_type`
+    // discriminator so admin-enabled location fixes can share the outbox
+    // (durable, retried, survives app kill) without a parallel queue.
+    //   'message' (default/NULL) → legacy chat rows, behaviour unchanged.
+    //   'tracking'               → location:update payloads (chat_id '__tracking__').
+    if (currentVersion < 14) {
+      try {
+        await db.execAsync(`ALTER TABLE outbox ADD COLUMN record_type TEXT DEFAULT 'message';`);
+      } catch {}
+      try {
+        await db.execAsync(`CREATE INDEX IF NOT EXISTS idx_outbox_record_type ON outbox(record_type);`);
+      } catch (e) {
+        console.warn('[ChatDB] V14 migration warning:', e?.message);
       }
     }
 
@@ -2870,6 +2889,50 @@ const outboxDrainDue = async (limit = 20) => {
 
 const safeParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
+// ─── OUTBOX: TRACKING ROWS (record_type='tracking') ─────
+// Admin-enabled location fixes captured while the socket is down. They share
+// the durable outbox (D4) under a hard cap so an extended offline stretch is
+// bounded in storage: beyond TRACKING_ROW_CAP the OLDEST tracking rows are
+// dropped on enqueue (~8 h of fixes at 1/min). eventId is the idempotency key
+// (INSERT OR REPLACE dedupes client-side; the server dedupes on eventId too).
+const TRACKING_ROW_CAP = 500;
+const TRACKING_CHAT_ID = '__tracking__';
+
+const enqueueTrackingEvent = async (eventId, payloadObj) => {
+  if (!eventId || !payloadObj) return;
+  await runExclusive(async () => {
+    const db = await getDB();
+    const now = Date.now();
+    await db.runAsync(
+      `INSERT OR REPLACE INTO outbox
+         (client_message_id, chat_id, payload, attempts, next_retry_at, created_at, updated_at, record_type)
+       VALUES ($c, $cid, $p, 0, 0, $n, $n, 'tracking')`,
+      { $c: String(eventId), $cid: TRACKING_CHAT_ID, $p: JSON.stringify(payloadObj), $n: now }
+    );
+    // Enforce the cap: drop the oldest tracking rows beyond TRACKING_ROW_CAP.
+    await db.runAsync(
+      `DELETE FROM outbox
+        WHERE record_type = 'tracking'
+          AND client_message_id NOT IN (
+            SELECT client_message_id FROM outbox
+             WHERE record_type = 'tracking'
+             ORDER BY created_at DESC
+             LIMIT $cap
+          )`,
+      { $cap: TRACKING_ROW_CAP }
+    );
+  });
+};
+
+// Admin disabled tracking (config push or TRACKING_DISABLED ack) or logout —
+// queued fixes must never be delivered or survive.
+const purgeTrackingRows = async () => {
+  await runExclusive(async () => {
+    const db = await getDB();
+    await db.runAsync(`DELETE FROM outbox WHERE record_type = 'tracking'`);
+  });
+};
+
 const outboxCount = async () => {
   const db = await getDB();
   const r = await db.getFirstAsync(`SELECT COUNT(*) as cnt FROM outbox`);
@@ -3191,6 +3254,7 @@ export default {
   getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner,
   // Outbox + watermarks (V8)
   outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
+  enqueueTrackingEvent, purgeTrackingRows,
   setPeerReadWatermark, getPeerReadWatermark,
   // Broadcast status cache (V9)
   saveBroadcasts, loadBroadcasts, removeBroadcast,
