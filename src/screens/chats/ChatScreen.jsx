@@ -1935,6 +1935,7 @@ export default function ChatScreen({ navigation, route }) {
     handleDeleteSelected,
     promptDeleteSingleMessage,
     text,
+    setText,
     handleTextChange,
     handleSendText,
     scheduleMessage,
@@ -2000,12 +2001,22 @@ export default function ChatScreen({ navigation, route }) {
           // eslint-disable-next-line no-await-in-loop
           await sendMedia({ file: item.file, type: item.type }).catch(() => {});
         }
+
+        // A text/URL share (sharing a link from a browser) carries no files —
+        // normalizeShare only sets `text` when `files` is empty. Prefill the
+        // composer instead of auto-sending, so the user can add a note first.
+        // Without this the share was silently dropped: the loop above found
+        // nothing and the param was cleared, leaving the user in the chat with
+        // no idea the link never arrived.
+        if (share.text) {
+          setText(share.text);
+        }
       } finally {
         // Drop the param so navigating back into this screen never replays it.
         navigation.setParams({ pendingShare: undefined });
       }
     })();
-  }, [route?.params?.pendingShare, sendMedia, navigation]);
+  }, [route?.params?.pendingShare, sendMedia, setText, navigation]);
 
   // ── First-paint loading UX (local-first + spinner) ────────────────────────
   // Messages render from SQLite instantly. A small spinner appears ONLY if

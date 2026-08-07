@@ -162,6 +162,7 @@
           "androidMultiIntentFilters": ["image/*", "video/*", "*/*"]
         }
       ],
+      "./plugins/withShareIntentAndroidFix",
       "./plugins/withMergedAppGroups"
     ],
     "extra": {

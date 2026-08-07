@@ -335,8 +335,18 @@ export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = 
       return normalizeUri(destination);
     }
 
-    // Handle content URIs
+    // Handle content URIs (the shape an Android OS share hands us).
     if (/^content:\/\//i.test(normalizedUri)) {
+      // copyAsync reads content:// through the ContentResolver, so it works for
+      // ANY provider — Drive/Files documents and PDFs included. MediaLibrary is
+      // only a fallback: createAssetAsync needs media permission and refuses
+      // non-media types, which made every non-gallery share fail here.
+      try {
+        await FileSystem.copyAsync({ from: normalizedUri, to: destination });
+        return normalizeUri(destination);
+      } catch (copyErr) {
+        console.warn('Content URI copyAsync failed, trying MediaLibrary:', copyErr?.message || copyErr);
+      }
       try {
         const asset = await MediaLibrary.createAssetAsync(normalizedUri);
         if (asset && asset.uri) {

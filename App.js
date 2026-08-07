@@ -94,8 +94,13 @@ export default function App() {
       };
     }, []);
  
+  // options.debug: dev-only tracing of the library's own share pipeline
+  // (useShareIntent[refresh] / [onChange] / [parsed]). Android drops a share
+  // silently when the activity isn't task root — the native side re-launches
+  // itself and returns WITHOUT notifying JS — and these logs are the only way to
+  // see which stage swallowed it.
   return (
-    <ShareIntentProvider>
+    <ShareIntentProvider options={{ debug: __DEV__ }}>
      <SafeAreaProvider>
      <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
        <ThemeProvider>

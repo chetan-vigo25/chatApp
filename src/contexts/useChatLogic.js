@@ -667,6 +667,28 @@ export default function useChatLogic({ navigation, route }) {
   const [pendingMedia, setPendingMedia] = useState(null);
   const [downloadProgress, setDownloadProgress] = useState({});
   const [uploadProgress, setUploadProgress] = useState({});
+
+  // Mark an optimistic media row failed in ALL THREE layers.
+  //
+  // Every media failure path used to update React state ONLY, so the row stayed
+  // 'sending' in SQLite and in the in-memory ChatCache. Reopening the chat
+  // repainted a stuck "uploading" bubble for an upload that had already been
+  // permanently rejected (e.g. a 400 "file type is blocked"), and the user had no
+  // way to tell it would never finish. The failed-bubble UI only renders when the
+  // PERSISTED status says 'failed'.
+  //
+  // Declared up here (not next to sendMedia) so the reconciliation on the chat
+  // read path can call it too — that runs long before sendMedia is defined.
+  const markMediaFailed = useCallback((tempId) => {
+    if (!tempId) return;
+    setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
+    setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+    try {
+      ChatCache.updateMessage(chatIdRef.current, tempId, { status: 'failed' });
+    } catch { /* cache is best-effort */ }
+    SqliteWriter.enqueue('updateMessageStatus', { id: tempId, status: 'failed' }).catch(() => {});
+  }, []);
+
   // tempId -> true for uploads the user paused (mirrors the durable
   // `paused: true` flag on the persisted media_upload_queue rows + the
   // module-level uploadPauseRegistry, but as React state so bubbles re-render).
@@ -2899,6 +2921,33 @@ export default function useChatLogic({ navigation, route }) {
           });
           console.log('[DIAG] refreshDB sending-media temp rows in SQLite read:', _sm.length,
             _sm.map((m) => ({ id: m.id, type: m.type, status: m.status, mg: m.mediaGroupId })));
+
+          // RECONCILE ORPHANED 'sending' ROWS.
+          //
+          // A media row is only allowed to stay 'sending' while something can
+          // still finish it: an in-flight upload, a persisted retry-queue row, or
+          // a paused/cancelled upload the user can resume. Anything else is
+          // orphaned — the app was killed mid-upload, or the upload was
+          // permanently rejected (400 "file type is blocked") and its queue row
+          // was dropped. Those rows used to repaint a stuck spinner on every
+          // reopen, forever, with no way for the user to tell it was dead.
+          //
+          // Flip them to 'failed' so the existing failed-bubble UI (with retry)
+          // renders instead. Sender-only: a peer's row is never ours to judge.
+          const _queuedIds = new Set(
+            (queuedMediaUploadsRef.current || []).map((q) => String(q?.tempId || '')),
+          );
+          for (const m of _sm) {
+            const id = String(m.id || m.tempId || '');
+            if (!id || m.status !== 'sending') continue;
+            if (!sameId(m.senderId, currentUser)) continue;
+            if (activeMediaUploadTempIdsRef.current.has(id)) continue; // uploading right now
+            if (globalActiveMediaUploads.has(id)) continue;            // uploading in another mount
+            if (_queuedIds.has(id)) continue;                          // queued for retry
+            if (isUploadPaused(id) || isUploadCancelled(id)) continue;  // user parked it
+            console.warn('[DIAG] orphaned sending media row → failed', { id, type: m.type });
+            markMediaFailed(id);
+          }
         } catch {}
 
         // Separate still-pending scheduled messages from DB — they go to scheduledMessages state
@@ -8515,8 +8564,7 @@ export default function useChatLogic({ navigation, route }) {
           }
           return { success: false, paused: true };
         }
-        setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
-        setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+        markMediaFailed(tempId);
         return { success: false, error: payloadData?.message || 'upload failed' };
       }
 
@@ -8539,8 +8587,7 @@ export default function useChatLogic({ navigation, route }) {
 
       const payloadValidation = validateMediaMessagePayload(messagePayload);
       if (!payloadValidation.isValid) {
-        setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
-        setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+        markMediaFailed(tempId);
         return { success: false, error: `missing fields: ${payloadValidation.missing.join(',')}` };
       }
 
@@ -8661,6 +8708,22 @@ export default function useChatLogic({ navigation, route }) {
 
       const isNetworkFailure = /network request failed|timeout|aborted|socket not connected/i.test(message);
 
+      // A 4xx is the server saying this upload will NEVER succeed — blocked file
+      // type, too large, malformed. The kill-safe queue row was persisted BEFORE
+      // the upload started, and nothing below removes it on a non-network
+      // failure, so every flush replayed a hopeless upload (up to
+      // MEDIA_UPLOAD_MAX_RETRIES) and re-hit the server each time. Treat it as
+      // terminal: drop the row, leave the bubble 'failed' for the user to act on.
+      // 401 is excluded (the interceptor refreshes and retries), as are the
+      // genuinely transient 408/429.
+      const rejectionStatus = Number(
+        err?.statusCode || err?.status || err?.response?.status || 0,
+      );
+      const isPermanentRejection =
+        rejectionStatus >= 400 &&
+        rejectionStatus < 500 &&
+        ![401, 408, 429].includes(rejectionStatus);
+
       console.error('❌ [SEND MEDIA] Error:', {
         message,
         isConnected,
@@ -8670,8 +8733,7 @@ export default function useChatLogic({ navigation, route }) {
         fileName: file?.name,
       });
 
-      setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
-      setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+      markMediaFailed(tempId);
 
       // The queue row was persisted BEFORE the upload started (kill-safe), so
       // any failure — network or otherwise — leaves it in place for the
@@ -8696,9 +8758,22 @@ export default function useChatLogic({ navigation, route }) {
         else queue.push(task);
         queuedMediaUploadsRef.current = queue;
         await persistMediaUploadQueue(queue);
+      } else if (isPermanentRejection) {
+        console.warn('[SEND MEDIA] permanent rejection — not retrying', {
+          status: rejectionStatus,
+          message,
+          fileName: file?.name,
+          fileType: file?.type,
+        });
+        const queue = [...(queuedMediaUploadsRef.current || [])].filter(
+          (item) => item?.tempId !== tempId,
+        );
+        queuedMediaUploadsRef.current = queue;
+        await persistMediaUploadQueue(queue);
+        registryClearUploadFlags(tempId);
       }
 
-      return { success: false, error: message };
+      return { success: false, error: message, permanent: isPermanentRejection };
     } finally {
       unregisterUploadAbort();
       activeMediaUploadTempIdsRef.current.delete(tempId);
@@ -9207,8 +9282,7 @@ export default function useChatLogic({ navigation, route }) {
       const failedCount = results.length - uploaded.length;
 
       if (!uploaded.length) {
-        setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
-        setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+        markMediaFailed(tempId);
         const allNetwork = results.every((r) => /network request failed|timeout|aborted/i.test(String(r?.error || '')));
         if (allNetwork) await queueAlbumTask();
         return { success: false, error: 'all uploads failed' };
@@ -9367,8 +9441,7 @@ export default function useChatLogic({ navigation, route }) {
       if (isUploadPaused(tempId)) {
         return { success: false, paused: true };
       }
-      setAllMessages((prev) => prev.map((m) => (m.tempId === tempId ? { ...m, status: 'failed' } : m)));
-      setUploadProgress((prev) => ({ ...prev, [tempId]: 0 }));
+      markMediaFailed(tempId);
       if (/network request failed|timeout|aborted|socket not connected/i.test(message)) {
         await queueAlbumTask();
       }
