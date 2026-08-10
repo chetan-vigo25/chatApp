@@ -13,6 +13,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { generateOtpAction } from '../Redux/Reducer/Auth/Auth.reducer';
 import { getAllowedCountries } from '../Redux/Services/Auth/AppConfig.Services';
 import { getPhoneRule, isPhoneValid, phoneLengthHint } from '../utils/phoneValidation';
+import { fetchDeviceLocation } from '../contexts/DeviceLoc';
 import { detectIpCountry, getCachedIpCountry } from '../utils/ipCountry';
 import { APP_TAG_NAME } from '@env';
 
@@ -99,6 +100,10 @@ export default function Login({ navigation }) {
       console.log('[LOGIN] OTP request succeeded');
       // The OTP is delivered only via SMS — it is never returned in the response,
       // so we navigate without any code (no in-app banner).
+      // Fire-and-forget: warm up the device location (DeviceLoc context +
+      // cache) while the user types the OTP, so the verify payload carries
+      // real coordinates instead of zeros. Never blocks navigation.
+      fetchDeviceLocation();
       navigation.navigate('Otp', { selectedCountry, phoneNumber });
       setPhoneNumber('');
     } else {

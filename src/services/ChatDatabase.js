@@ -280,8 +280,6 @@ const _restoreOutboxBackup = async (db) => {
           $e: r.last_error || null,
           $ca: r.created_at || Date.now(),
           $ua: Date.now(),
-          // Preserve tracking rows across a corruption-recovery wipe too — the
-          // backup is a `SELECT *`, so the discriminator is in the backed-up row.
           $rt: r.record_type || 'message',
         },
       );
@@ -742,11 +740,8 @@ const runMigrations = async (db) => {
       }
     }
 
-    // V14: Tracking module — the durable outbox gains a `record_type`
-    // discriminator so admin-enabled location fixes can share the outbox
-    // (durable, retried, survives app kill) without a parallel queue.
-    //   'message' (default/NULL) → legacy chat rows, behaviour unchanged.
-    //   'tracking'               → location:update payloads (chat_id '__tracking__').
+    // V14: the durable outbox gained a `record_type` discriminator (kept for
+    // devices already migrated; 'message'/NULL rows behave unchanged).
     if (currentVersion < 14) {
       try {
         await db.execAsync(`ALTER TABLE outbox ADD COLUMN record_type TEXT DEFAULT 'message';`);
@@ -757,6 +752,12 @@ const runMigrations = async (db) => {
         console.warn('[ChatDB] V14 migration warning:', e?.message);
       }
     }
+
+    // The tracking module was removed — drop any leftover queued tracking rows
+    // so they are never replayed as location fixes.
+    try {
+      await db.execAsync(`DELETE FROM outbox WHERE record_type = 'tracking';`);
+    } catch {}
 
     await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
   } catch (err) {
@@ -865,6 +866,9 @@ const rowToMsg = (row) => {
     // Status reply / share — snapshot persisted in payload
     statusRef: pp?.statusRef || null,
     statusPreview: pp?.statusPreview || null,
+    // View Once — metadata only (never a local media copy)
+    isViewOnce: Boolean(pp?.isViewOnce),
+    viewOnce: pp?.viewOnce || null,
     // Reply: check column first, then payload fallback
     replyToMessageId: row.reply_to_message_id || pp?._replyToMessageId || null,
     replyPreviewText: row.reply_preview_text || pp?._replyPreviewText || null,
@@ -968,7 +972,7 @@ const cleanBeforeUpsert = async (db, msg) => {
   //    REST-created row may be keyed by the clientMessageId itself.
   if (msg.clientMessageId && msg.clientMessageId !== id) {
     await db.runAsync(
-      `DELETE FROM messages WHERE (id = $cmid OR temp_id = $cmid) AND id != $id`,
+      `DELETE FROM messages WHERE (id = $cmid OR temp_id = $cmid OR client_message_id = $cmid) AND id != $id`,
       { $cmid: String(msg.clientMessageId), $id: id }
     );
   }
@@ -1308,13 +1312,15 @@ const _runInsert = async (db, msg, _retried = false) => {
   // that omits the snapshot would strip the StatusReplyPreview card.
   let existingReplyInPayload = null;
   let existingStatusInPayload = null;
-  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview) {
+  let existingViewOnceInPayload = null;
+  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview || !msg.viewOnce) {
     try {
       const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id LIMIT 1`, { $id: id });
       if (ex?.payload) {
         const ep = JSON.parse(ex.payload);
         if (ep?._replyToMessageId) existingReplyInPayload = ep;
         if (ep?.statusRef || ep?.statusPreview) existingStatusInPayload = ep;
+        if (ep?.isViewOnce || ep?.viewOnce) existingViewOnceInPayload = ep;
       }
     } catch {}
   }
@@ -1360,6 +1366,15 @@ const _runInsert = async (db, msg, _retried = false) => {
       : (existingStatusInPayload?.statusPreview
           ? { statusPreview: existingStatusInPayload.statusPreview }
           : {})),
+    // View Once — metadata-only (mediaType/byteSize/myStatus/…); the media
+    // blob itself is NEVER persisted locally. Carried forward across partial
+    // upserts (a tick update must not strip the bubble's state).
+    ...((msg.isViewOnce || existingViewOnceInPayload?.isViewOnce) ? { isViewOnce: true } : {}),
+    ...(msg.viewOnce && typeof msg.viewOnce === 'object'
+      ? { viewOnce: msg.viewOnce }
+      : (existingViewOnceInPayload?.viewOnce
+          ? { viewOnce: existingViewOnceInPayload.viewOnce }
+          : {})),
   };
 
   const baseParams = {
@@ -1371,6 +1386,11 @@ const _runInsert = async (db, msg, _retried = false) => {
     $seq: (msg.seq != null && !Number.isNaN(Number(msg.seq))) ? Number(msg.seq) : null,
     $server_message_id: msg.serverMessageId || null,
     $temp_id: msg.tempId || null,
+    // Cross-transport idempotency key. This is the ONLY durable join between
+    // an optimistic/acked local row and the same message refetched later from
+    // the server under its canonical UUID — without it those two rows could
+    // never be bridged and survived as permanent duplicate bubbles.
+    $client_message_id: msg.clientMessageId || null,
     $chat_id: msg.chatId || null,
     $group_id: msg.groupId || null,
     $sender_id: msg.senderId || null,
@@ -1410,7 +1430,7 @@ const _runInsert = async (db, msg, _retried = false) => {
       text, type, status, timestamp, created_at, synced,
       is_deleted, deleted_for, deleted_by, placeholder_text,
       is_edited, edited_at, media_url, media_type, preview_url,
-      local_uri, media_id, reactions, delivered_to, read_by, payload, extra,
+      local_uri, media_id, reactions, delivered_to, read_by, payload, extra, client_message_id,
       reply_to_message_id, reply_preview_text, reply_preview_type, reply_sender_name, reply_sender_id
     ) VALUES (
       $id, $seq, $server_message_id, $temp_id, $chat_id, $group_id,
@@ -1418,9 +1438,10 @@ const _runInsert = async (db, msg, _retried = false) => {
       $text, $type, $status, $timestamp, $created_at, $synced,
       $is_deleted, $deleted_for, $deleted_by, $placeholder_text,
       $is_edited, $edited_at, $media_url, $media_type, $preview_url,
-      $local_uri, $media_id, $reactions, $delivered_to, $read_by, $payload, $extra,
+      $local_uri, $media_id, $reactions, $delivered_to, $read_by, $payload, $extra, $client_message_id,
       $reply_to_message_id, $reply_preview_text, $reply_preview_type, $reply_sender_name, $reply_sender_id
     ) ON CONFLICT(id) DO UPDATE SET
+      client_message_id = COALESCE($client_message_id, client_message_id),
       seq = COALESCE($seq, seq),
       server_message_id = COALESCE($server_message_id, server_message_id),
       temp_id = COALESCE($temp_id, temp_id),
@@ -1476,15 +1497,16 @@ const _runInsert = async (db, msg, _retried = false) => {
       text, type, status, timestamp, created_at, synced,
       is_deleted, deleted_for, deleted_by, placeholder_text,
       is_edited, edited_at, media_url, media_type, preview_url,
-      local_uri, media_id, reactions, delivered_to, read_by, payload, extra
+      local_uri, media_id, reactions, delivered_to, read_by, payload, extra, client_message_id
     ) VALUES (
       $id, $seq, $server_message_id, $temp_id, $chat_id, $group_id,
       $sender_id, $sender_name, $sender_type, $receiver_id,
       $text, $type, $status, $timestamp, $created_at, $synced,
       $is_deleted, $deleted_for, $deleted_by, $placeholder_text,
       $is_edited, $edited_at, $media_url, $media_type, $preview_url,
-      $local_uri, $media_id, $reactions, $delivered_to, $read_by, $payload, $extra
+      $local_uri, $media_id, $reactions, $delivered_to, $read_by, $payload, $extra, $client_message_id
     ) ON CONFLICT(id) DO UPDATE SET
+      client_message_id = COALESCE($client_message_id, client_message_id),
       seq = COALESCE($seq, seq),
       server_message_id = COALESCE($server_message_id, server_message_id),
       temp_id = COALESCE($temp_id, temp_id),
@@ -1529,8 +1551,16 @@ const _runInsert = async (db, msg, _retried = false) => {
   } catch (err) {
     // Handle unique constraint violation on server_message_id:
     // Another row with the same server_message_id but different id exists
-    if (!_retried && err?.message?.includes('UNIQUE') && msg.serverMessageId) {
-      await db.runAsync(`DELETE FROM messages WHERE server_message_id = $s AND id != $id`, { $s: msg.serverMessageId, $id: id });
+    if (!_retried && err?.message?.includes('UNIQUE') && (msg.serverMessageId || msg.clientMessageId)) {
+      if (msg.serverMessageId) {
+        await db.runAsync(`DELETE FROM messages WHERE server_message_id = $s AND id != $id`, { $s: msg.serverMessageId, $id: id });
+      }
+      // idx_messages_client_uuid: an older row already claimed this
+      // clientMessageId under a different id — it IS this same logical
+      // message, so drop it and let the canonical insert win.
+      if (msg.clientMessageId) {
+        await db.runAsync(`DELETE FROM messages WHERE client_message_id = $c AND id != $id`, { $c: String(msg.clientMessageId), $id: id });
+      }
       return _runInsert(db, msg, true);
     }
     throw err;
@@ -2155,6 +2185,32 @@ const updateMessageEdit = async (messageId, newText, editedAt) => {
   } catch (err) { console.warn('[ChatDB] updateMessageEdit error:', err); }
 };
 
+// View Once — merge a status patch into the row's payload.viewOnce (the
+// metadata lives ONLY in the payload JSON; no media is ever stored locally).
+// `patch` example: { myStatus: 'opened', openedAt, openedCount, mediaDeleted }.
+const updateMessageViewOnce = async (messageId, patch = {}) => {
+  if (!messageId || !patch || typeof patch !== 'object') return;
+  try {
+    await runExclusive(async () => {
+      const db = await getDB();
+      const row = await db.getFirstAsync(
+        `SELECT id, payload FROM messages WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+        { $id: messageId }
+      );
+      if (!row) return;
+      let pp = {};
+      try { pp = row.payload ? JSON.parse(row.payload) : {}; } catch { pp = {}; }
+      const prev = pp.viewOnce || {};
+      // A view already consumed stays "opened" — expiry never downgrades it.
+      const next = { ...prev, ...patch };
+      if (prev.myStatus === 'opened' && patch.myStatus === 'expired') next.myStatus = 'opened';
+      pp.isViewOnce = true;
+      pp.viewOnce = next;
+      await db.runAsync(`UPDATE messages SET payload = $p WHERE id = $rid`, { $p: JSON.stringify(pp), $rid: row.id });
+    });
+  } catch (err) { console.warn('[ChatDB] updateMessageViewOnce error:', err?.message); }
+};
+
 const clearChat = async (chatId, clearedAt = null) => {
   if (!chatId) return;
   await runExclusive(async () => {
@@ -2300,6 +2356,39 @@ const deduplicateChat = async (chatId) => {
           SELECT MAX(rowid) FROM messages WHERE chat_id = $c AND type = 'text'
           GROUP BY sender_id, text, CAST(timestamp / 30000 AS INTEGER)
         )
+      `, { $c: chatId });
+      // 5. clientMessageId bridge: a stale local row (optimistic/acked under an
+      //    old id) whose id/temp_id equals a CONFIRMED row's client_message_id
+      //    is the SAME logical message — the server row wins. This is the exact
+      //    pair the temp_id link in #2 can't see (both rows look "confirmed").
+      await db.runAsync(`
+        DELETE FROM messages WHERE chat_id = $c AND EXISTS (
+          SELECT 1 FROM messages s
+          WHERE s.chat_id = $c
+            AND s.id != messages.id
+            AND s.client_message_id IS NOT NULL
+            AND s.id NOT LIKE 'temp_%'
+            AND (messages.temp_id = s.client_message_id OR messages.id = s.client_message_id)
+        )
+      `, { $c: chatId });
+      // 6. View-once repair for rows written BEFORE client_message_id was
+      //    persisted (no join key survives for those): a view-once bubble is
+      //    metadata-only, so same sender + same 15s window ⇒ same send. Keep
+      //    the newest row (the refetched server copy). Scoped STRICTLY to
+      //    isViewOnce payloads — normal media is never touched.
+      // Only LEGACY rows (written before client_message_id was persisted) are
+      // eligible for the heuristic collapse — every new row carries the real
+      // idempotency key and dedupes exactly via #5, so two genuine view-once
+      // sends in the same 15s window must both survive.
+      await db.runAsync(`
+        DELETE FROM messages WHERE chat_id = $c
+          AND payload LIKE '%"isViewOnce":true%'
+          AND client_message_id IS NULL
+          AND rowid NOT IN (
+            SELECT MAX(rowid) FROM messages
+            WHERE chat_id = $c AND payload LIKE '%"isViewOnce":true%'
+            GROUP BY sender_id, CAST(timestamp / 15000 AS INTEGER)
+          )
       `, { $c: chatId });
     }),
   );
@@ -2889,50 +2978,6 @@ const outboxDrainDue = async (limit = 20) => {
 
 const safeParse = (s) => { try { return JSON.parse(s); } catch { return null; } };
 
-// ─── OUTBOX: TRACKING ROWS (record_type='tracking') ─────
-// Admin-enabled location fixes captured while the socket is down. They share
-// the durable outbox (D4) under a hard cap so an extended offline stretch is
-// bounded in storage: beyond TRACKING_ROW_CAP the OLDEST tracking rows are
-// dropped on enqueue (~8 h of fixes at 1/min). eventId is the idempotency key
-// (INSERT OR REPLACE dedupes client-side; the server dedupes on eventId too).
-const TRACKING_ROW_CAP = 500;
-const TRACKING_CHAT_ID = '__tracking__';
-
-const enqueueTrackingEvent = async (eventId, payloadObj) => {
-  if (!eventId || !payloadObj) return;
-  await runExclusive(async () => {
-    const db = await getDB();
-    const now = Date.now();
-    await db.runAsync(
-      `INSERT OR REPLACE INTO outbox
-         (client_message_id, chat_id, payload, attempts, next_retry_at, created_at, updated_at, record_type)
-       VALUES ($c, $cid, $p, 0, 0, $n, $n, 'tracking')`,
-      { $c: String(eventId), $cid: TRACKING_CHAT_ID, $p: JSON.stringify(payloadObj), $n: now }
-    );
-    // Enforce the cap: drop the oldest tracking rows beyond TRACKING_ROW_CAP.
-    await db.runAsync(
-      `DELETE FROM outbox
-        WHERE record_type = 'tracking'
-          AND client_message_id NOT IN (
-            SELECT client_message_id FROM outbox
-             WHERE record_type = 'tracking'
-             ORDER BY created_at DESC
-             LIMIT $cap
-          )`,
-      { $cap: TRACKING_ROW_CAP }
-    );
-  });
-};
-
-// Admin disabled tracking (config push or TRACKING_DISABLED ack) or logout —
-// queued fixes must never be delivered or survive.
-const purgeTrackingRows = async () => {
-  await runExclusive(async () => {
-    const db = await getDB();
-    await db.runAsync(`DELETE FROM outbox WHERE record_type = 'tracking'`);
-  });
-};
-
 const outboxCount = async () => {
   const db = await getDB();
   const r = await db.getFirstAsync(`SELECT COUNT(*) as cnt FROM outbox`);
@@ -3242,7 +3287,7 @@ export default {
   loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
-  updateReactions, updateMessageEdit, updateGroupMessageTracking, bulkUpdateStatus,
+  updateReactions, updateMessageEdit, updateMessageViewOnce, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
@@ -3254,7 +3299,6 @@ export default {
   getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner,
   // Outbox + watermarks (V8)
   outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
-  enqueueTrackingEvent, purgeTrackingRows,
   setPeerReadWatermark, getPeerReadWatermark,
   // Broadcast status cache (V9)
   saveBroadcasts, loadBroadcasts, removeBroadcast,

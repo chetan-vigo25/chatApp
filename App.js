@@ -25,8 +25,6 @@ import NoInternet from './src/screens/NoInternet';
 import { CallProvider } from './src/calls/CallProvider';
 import CallContentInset from './src/calls/components/CallContentInset';
 import AppLockGate from './src/components/AppLockGate';
-import TrackingIndicator from './src/components/tracking/TrackingIndicator';
-import TrackingConsentSheet from './src/components/tracking/TrackingConsentSheet';
 import { ShareIntentProvider } from 'expo-share-intent';
 
 import 'react-native-gesture-handler';
@@ -119,12 +117,6 @@ export default function App() {
                         <AppLockGate />
                       </CallContentInset>
                     </CallProvider>
-                    {/* Tracking UI mounts AFTER (= paints above) CallProvider,
-                        whose subtree renders the PrivacyOverlay — the
-                        tracking-active pill must stay visible even under
-                        app-lock/privacy masking (transparency requirement). */}
-                    <TrackingIndicator />
-                    <TrackingConsentSheet />
                   </RealtimeChatProvider>
                  </PresenceProvider>
                 </DeviceLocationProvider>

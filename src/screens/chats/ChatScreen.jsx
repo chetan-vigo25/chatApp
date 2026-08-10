@@ -33,6 +33,7 @@ import * as DocumentPicker from "expo-document-picker";
 import * as Location from "expo-location";
 import * as Contacts from "expo-contacts";
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
+import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import useDelayedVisible from "../../hooks/useDelayedVisible";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
@@ -71,6 +72,7 @@ import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import LocationBubble from '../../components/LocationBubble';
 import AlbumMessage from '../../components/AlbumMessage';
 import UploadRing from '../../components/UploadRing';
+import Svg, { Circle as SvgCircle, Path as SvgPath } from 'react-native-svg';
 import BlurGateImage from '../../components/BlurGateImage';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
@@ -80,6 +82,9 @@ import useSaveContact from '../../hooks/useSaveContact';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import ContactDatabase from '../../services/ContactDatabase';
 import * as ScreenCapture from 'expo-screen-capture';
+import { apiCall } from '../../Config/Https';
+import { BACKEND_URL } from '@env';
+import ChatDatabase from '../../services/ChatDatabase';
 import LinkPreviewCard from '../../components/LinkPreviewCard';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 import CallButtons from '../../calls/components/CallButtons';
@@ -318,6 +323,71 @@ const VideoViewerControls = React.memo(function VideoViewerControls({
   );
 });
 
+// View Once ring glyph (shared by all 4 bubble states). variant:
+//  'solid'  — full solid ring + "1"          (received · unopened)
+//  'half'   — top half solid, bottom dashed  (sent · unopened)
+//  'dashed' — full dashed ring + dashed dot  (opened / expired)
+const ViewOnceGlyph = React.memo(function ViewOnceGlyph({ variant, color, size = 34 }) {
+  const r = size / 2 - 2.5;
+  const c = size / 2;
+  const dash = [3.1, 3.4];
+  return (
+    <View style={{ width: size, height: size, alignItems: 'center', justifyContent: 'center' }}>
+      <Svg width={size} height={size} style={{ position: 'absolute' }}>
+        {variant === 'half' ? (
+          <>
+            <SvgPath
+              d={`M ${c - r} ${c} A ${r} ${r} 0 0 1 ${c + r} ${c}`}
+              stroke={color}
+              strokeWidth={2}
+              strokeLinecap="round"
+              fill="none"
+            />
+            <SvgPath
+              d={`M ${c + r} ${c} A ${r} ${r} 0 0 1 ${c - r} ${c}`}
+              stroke={color}
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeDasharray={dash}
+              fill="none"
+            />
+          </>
+        ) : (
+          <SvgCircle
+            cx={c}
+            cy={c}
+            r={r}
+            stroke={color}
+            strokeWidth={2}
+            strokeDasharray={variant === 'dashed' ? dash : undefined}
+            strokeLinecap="round"
+            fill="none"
+          />
+        )}
+        {variant === 'dashed' && (
+          <SvgCircle
+            cx={c}
+            cy={c}
+            r={size * 0.13}
+            stroke={color}
+            strokeWidth={1.4}
+            strokeDasharray={[2.2, 2.4]}
+            fill="none"
+          />
+        )}
+      </Svg>
+      {variant !== 'dashed' && (
+        <Text
+          allowFontScaling={false}
+          style={{ fontSize: size * 0.38, fontWeight: '700', color, lineHeight: size * 0.46 }}
+        >
+          1
+        </Text>
+      )}
+    </View>
+  );
+});
+
 const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   theme,
   isDarkMode,
@@ -334,6 +404,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   onOpenEmoji,
   onOpenAttachment,
   onRemovePendingMedia,
+  onToggleViewOnce,
   onSubmit,
   onSchedule,
   mentionSuggestionsNode,
@@ -471,6 +542,30 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                       </Text>
                     </>
                   )}
+                  {!pendingMedia.isAlbum
+                    && ['image', 'video'].includes(pendingMedia.type === 'document' ? '' : pendingMedia.type)
+                    && onToggleViewOnce ? (
+                    <TouchableOpacity
+                      onPress={onToggleViewOnce}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: Boolean(pendingMedia.viewOnce) }}
+                      accessibilityLabel={pendingMedia.viewOnce ? 'View once on' : 'View once'}
+                      style={{
+                        width: 26,
+                        height: 26,
+                        borderRadius: 13,
+                        borderWidth: 1.5,
+                        borderColor: pendingMedia.viewOnce ? chatColor : iconColor,
+                        backgroundColor: pendingMedia.viewOnce ? chatColor : 'transparent',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        marginRight: 6,
+                      }}
+                    >
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: pendingMedia.viewOnce ? '#FFFFFF' : iconColor }}>1</Text>
+                    </TouchableOpacity>
+                  ) : null}
                   <TouchableOpacity
                     onPress={onRemovePendingMedia}
                     hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -1982,7 +2077,6 @@ export default function ChatScreen({ navigation, route }) {
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
 
-  // ── Incoming OS share (share target) ──────────────────────────────────────
   // When the user shares media into the app from the native share sheet,
   // ShareInboxScreen opens this thread with a `pendingShare` param. Feed those
   // files through the SAME sendMedia pipeline an in-app attachment uses (optimistic
@@ -2108,19 +2202,13 @@ export default function ChatScreen({ navigation, route }) {
 
     (async () => {
       try {
-        if (Platform.OS === 'android') {
-          // Required for the MediaStore ContentObserver that backs the listener.
-          // Use the granular READ_MEDIA_IMAGES on Android 13+ (handled internally).
-          try {
-            const perm = await MediaLibrary.getPermissionsAsync();
-            if (!perm?.granted) {
-              await MediaLibrary.requestPermissionsAsync(false, ['photo']);
-            }
-          } catch (_e) {
-            // If permission flow fails, still try to subscribe — iOS path and
-            // newer Android (14+) ScreenCaptureCallback don't need it.
-          }
-        }
+        // The MediaStore ContentObserver behind this listener wants photo access on
+        // Android 13-, but merely OPENING a chat is not a user action that justifies
+        // a permission dialog — so nothing is requested here. Photos is asked for in
+        // context by the actions that actually need it (pick / save / capture), and
+        // once granted, screenshot detection starts working on the next chat open.
+        // Subscribing without it is harmless: iOS and Android 14+ use the
+        // ScreenCaptureCallback path, which needs no permission at all.
         if (cancelled) return;
         sub = ScreenCapture.addScreenshotListener(onScreenshot);
       } catch (_err) {
@@ -2206,6 +2294,80 @@ export default function ChatScreen({ navigation, route }) {
       || peer?.mobileNumber || peer?.mobile?.number || peer?.phone || null;
     return resolveContactName(userId, fallback, phone);
   }, [currentUserId, groupMembersMap, chatData, resolveContactName]);
+
+  // ── View Once viewer ──────────────────────────────────────────────────
+  // { streamUrl, mediaType, messageId } while open. The media streams straight
+  // from the single-use URL — never downloaded to FileSystem, never cached.
+  const [viewOnceViewer, setViewOnceViewer] = useState(null);
+  const [viewOnceOpening, setViewOnceOpening] = useState(null); // messageId in flight
+  // messageId → 'opened' | 'expired'. Instant in-memory flip the moment the
+  // open succeeds (or the server says consumed/expired) — the SQLite write +
+  // thread refresh make it durable, but the bubble must lock IMMEDIATELY so a
+  // second tap is impossible even before the refresh lands.
+  const [viewOnceLocalStatus, setViewOnceLocalStatus] = useState({});
+
+  // Hard screenshot/recording block while the view-once media is on screen
+  // (Android FLAG_SECURE via expo-screen-capture; iOS gets detection-only —
+  // the chat's existing screenshot listener still fires).
+  useEffect(() => {
+    if (!viewOnceViewer) return undefined;
+    ScreenCapture.preventScreenCaptureAsync('view-once').catch(() => {});
+    return () => { ScreenCapture.allowScreenCaptureAsync('view-once').catch(() => {}); };
+  }, [viewOnceViewer]);
+
+  const openViewOnceMessage = useCallback(async (msg) => {
+    const messageId = msg?.serverMessageId || msg?.id;
+    // Some rows (older normalizers) miss chatId — fall back to the open chat
+    // so the thread-refresh emit below always lands and the bubble flips.
+    const emitChatId = msg?.chatId || chatData?.chatId || chatData?._id || null;
+    if (!messageId || viewOnceOpening) return;
+    if (!isConnected) {
+      Alert.alert('You’re offline', 'Connect to the internet to view this media.');
+      return;
+    }
+    setViewOnceOpening(messageId);
+    try {
+      const res = await apiCall('POST', `user/chat/message/${encodeURIComponent(messageId)}/view-once/open`);
+      const path = res?.data?.streamUrl || res?.data?.data?.streamUrl;
+      if (!path) throw new Error(res?.message || 'Could not open media');
+      // streamUrl is a server-relative path (/api/v2/…) — resolve it against
+      // the backend origin (BACKEND_URL already contains the /api/v2 prefix).
+      const origin = String(BACKEND_URL || '').replace(/\/api\/.*$/, '').replace(/\/+$/, '');
+      const streamUrl = /^https?:/i.test(path) ? path : `${origin}${path}`;
+      const mediaType = msg?.viewOnce?.mediaType
+        || msg?.payload?.viewOnce?.mediaType
+        || (msg?.type === 'video' || msg?.mediaType === 'video' ? 'video' : 'image');
+      setViewOnceViewer({ streamUrl, mediaType, messageId });
+      // Consumed from this point on — lock the bubble instantly, then persist.
+      setViewOnceLocalStatus((prev) => ({ ...prev, [String(messageId)]: 'opened' }));
+      ChatDatabase.updateMessageViewOnce(messageId, {
+        myStatus: 'opened',
+        openedAt: new Date().toISOString(),
+      }).catch(() => {}).finally(() => {
+        DeviceEventEmitter.emit('chat:thread:update', { chatId: emitChatId });
+      });
+    } catch (err) {
+      const status = err?.response?.status || err?.statusCode;
+      if (status === 410) {
+        setViewOnceLocalStatus((prev) => ({ ...prev, [String(messageId)]: 'expired' }));
+        ChatDatabase.updateMessageViewOnce(messageId, { mediaDeleted: true, myStatus: 'expired' })
+          .catch(() => {})
+          .finally(() => DeviceEventEmitter.emit('chat:thread:update', { chatId: emitChatId }));
+        Alert.alert('Unavailable', 'This media is no longer available.');
+      } else if (status === 409) {
+        setViewOnceLocalStatus((prev) => ({ ...prev, [String(messageId)]: 'opened' }));
+        ChatDatabase.updateMessageViewOnce(messageId, { myStatus: 'opened' })
+          .catch(() => {})
+          .finally(() => DeviceEventEmitter.emit('chat:thread:update', { chatId: emitChatId }));
+      } else {
+        Alert.alert('Error', 'Could not open this media. Please try again.');
+      }
+    } finally {
+      setViewOnceOpening(null);
+    }
+  }, [isConnected, viewOnceOpening, chatData]);
+
+  const closeViewOnceViewer = useCallback(() => setViewOnceViewer(null), []);
 
   // Local media viewer state
   const [localMediaViewer, setLocalMediaViewer] = useState({
@@ -2693,12 +2855,12 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
 
-      // Check existing permission first — only prompt if not yet granted
-      let perm = await MediaLibrary.getPermissionsAsync();
-      if (perm.status !== 'granted') {
-        perm = await MediaLibrary.requestPermissionsAsync();
-        if (perm.status !== 'granted') return;
-      }
+      // Already granted → no dialog. Denied earlier (startup included) → asks again
+      // here; permanently denied → offers Settings.
+      const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+        purpose: 'Allow photo access to save this file to your gallery.',
+      });
+      if (!photosOk) return;
 
       await MediaLibrary.createAssetAsync(await ensureSaveableFileUri(localUri, msg));
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -3128,11 +3290,11 @@ export default function ChatScreen({ navigation, route }) {
 
   const startVoiceRecording = useCallback(async () => {
     try {
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission required', 'Microphone permission is required to record audio.');
-        return;
-      }
+      // Same gate the call flow uses — a mic denial at startup is re-asked here.
+      const micOk = await ensurePermission(PERMISSION_IDS.MICROPHONE, {
+        purpose: 'Allow microphone access to record a voice message.',
+      });
+      if (!micOk) return;
 
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
@@ -3398,11 +3560,12 @@ export default function ChatScreen({ navigation, route }) {
     // Camera backgrounds the app; suspend the app lock so returning isn't a re-lock.
     suspendAppLock();
     try {
-      const permission = await ImagePicker.requestCameraPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission required', 'Camera permission is required to capture a photo.');
-        return;
-      }
+      // Re-asks the OS even when camera was denied on the startup screen; once the
+      // OS refuses to ask again the helper offers Settings instead.
+      const cameraOk = await ensurePermission(PERMISSION_IDS.CAMERA, {
+        purpose: 'Allow camera access to capture a photo for this chat.',
+      });
+      if (!cameraOk) return;
 
       const result = await ImagePicker.launchCameraAsync({
         mediaTypes: ['images'],
@@ -3414,8 +3577,10 @@ export default function ChatScreen({ navigation, route }) {
       const asset = result.assets?.[0];
       if (!asset?.uri) return;
 
-      // No preview stage — captured photo uploads immediately (user rule).
-      sendMedia({
+      // Stage into the composer strip (thumbnail + ✕ + the View Once "1"
+      // toggle) so the capture can be sent as view-once too — send fires on
+      // the user's send tap.
+      setPendingMedia({
         file: {
           uri: asset.uri,
           name: asset.fileName || `camera_${Date.now()}.jpg`,
@@ -3425,19 +3590,26 @@ export default function ChatScreen({ navigation, route }) {
           height: Number(asset.height) || undefined,
         },
         type: 'image',
-      }).catch(() => {});
+      });
     } catch (error) {
       console.error('camera capture error', error);
       Alert.alert('Error', 'Unable to open camera right now.');
     } finally {
       resumeAppLock();
     }
-  }, [sendMedia]);
+  }, [setPendingMedia]);
 
   const handleAudioPick = useCallback(async () => {
     // Document picker backgrounds the app; suspend the app lock for the round trip.
     suspendAppLock();
     try {
+      // Files/storage only exists as a runtime permission on Android 8–12; on
+      // newer Android and iOS this resolves true without a dialog.
+      const filesOk = await ensurePermission(PERMISSION_IDS.FILES, {
+        purpose: 'Allow file access to attach an audio file.',
+      });
+      if (!filesOk) return;
+
       const result = await DocumentPicker.getDocumentAsync({
         type: ['audio/*'],
         copyToCacheDirectory: false,
@@ -3471,11 +3643,11 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
 
-      const permission = await Location.requestForegroundPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission required', 'Location permission is required to share location.');
-        return;
-      }
+      // Re-asks the OS even when location was denied on the startup screen.
+      const locationOk = await ensurePermission(PERMISSION_IDS.LOCATION, {
+        purpose: 'Allow location access to share where you are in this chat.',
+      });
+      if (!locationOk) return;
 
       const servicesEnabled = await Location.hasServicesEnabledAsync();
       if (!servicesEnabled) {
@@ -5158,6 +5330,95 @@ export default function ChatScreen({ navigation, route }) {
     );
   };
 
+  // ── View Once bubble (WhatsApp parity — 4 states, never a thumbnail) ──────
+  //  sent·unopened      filled ① + "Photo/Video"            (not tappable)
+  //  sent·opened        dashed ○ + italic "Opened"           (not tappable)
+  //  received·unopened  filled ① + label + size, OUTLINED    (tap to view)
+  //  received·opened    dashed ○ + italic "Opened", muted    (not tappable)
+  const renderViewOnceMessage = (msg, isMyMessage, progress = 0) => {
+    const vo = msg.viewOnce || msg.payload?.viewOnce || {};
+    const isVideoVO = vo.mediaType === 'video'
+      || msg.type === 'video' || msg.mediaType === 'video';
+    const label = isVideoVO ? 'Video' : 'Photo';
+    const senderOpened = (Number(vo.openedCount) || 0) > 0;
+    const localVO = viewOnceLocalStatus[String(msg.serverMessageId || msg.id || '')] || null;
+    const myConsumed = localVO === 'opened' || localVO === 'expired'
+      || vo.myStatus === 'opened' || vo.myStatus === 'expired' || vo.mediaDeleted;
+    const consumed = isMyMessage ? senderOpened : myConsumed;
+    const expiredForMe = !isMyMessage && vo.myStatus !== 'opened' && localVO !== 'opened'
+      && (vo.mediaDeleted || vo.myStatus === 'expired' || localVO === 'expired');
+    const tappable = !isMyMessage && !consumed;
+    const groupCounter = isMyMessage && (Number(vo.totalRecipients) || 0) > 1
+      ? ` ${Number(vo.openedCount) || 0}/${Number(vo.totalRecipients)}`
+      : '';
+    const baseColor = isMyMessage ? '#E9EDEF' : theme.colors.primaryTextColor;
+    const mutedColor = isMyMessage ? 'rgba(233,237,239,0.6)' : theme.colors.placeHolderTextColor;
+    const ringColor = consumed ? mutedColor : (tappable ? chatColor : baseColor);
+    const sizeLabel = !isMyMessage && !consumed && vo.byteSize ? formatBytes(Number(vo.byteSize)) : null;
+    // Sender upload state: while bytes are in flight the "1" circle BECOMES
+    // the WhatsApp-style progress ring (real chunk-by-chunk percent from the
+    // same uploadProgress feed every media bubble uses).
+    const msgStatusVO = String(msg.status || '').toLowerCase();
+    const isUploadingVO = isMyMessage
+      && ['sending', 'uploading', 'queued'].includes(msgStatusVO);
+    // IMPORTANT: read the UPLOAD feed (uploadProgress[tempId]), not the passed
+    // `progress` — that one is resolveMediaProgress (downloads) and sits at 0
+    // for the whole upload, which froze the ring.
+    const uploadFraction = resolveUploadProgress(msg) || Number(progress) || 0;
+    const uploadPct = Math.max(2, Math.round(uploadFraction * 100));
+
+    // ── Uploading (sender): the ring IS the progress indicator ────────────
+    if (isUploadingVO) {
+      return (
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 2, paddingRight: 4 }}>
+          <UploadRing percent={uploadPct} size={26} color={chatColor} />
+          <Text style={{ fontSize: 14, fontWeight: '500', color: baseColor }}>{label}</Text>
+          <Text style={{ fontSize: 12, color: mutedColor }}>{`${uploadPct}%`}</Text>
+        </View>
+      );
+    }
+
+    // ── Consumed (both sides): quiet dashed ring + italic label ───────────
+    if (consumed) {
+      return (
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 2, paddingRight: 4, opacity: 0.9 }}>
+          <ViewOnceGlyph variant="dashed" color={mutedColor} size={24} />
+          <Text style={{ fontSize: 14, fontStyle: 'italic', color: mutedColor }}>
+            {expiredForMe ? 'Expired' : `Opened${groupCounter}`}
+          </Text>
+        </View>
+      );
+    }
+
+    // ── Sent · unopened: half-solid/half-dashed ring, plain label ─────────
+    if (isMyMessage) {
+      return (
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 2, paddingRight: 4 }}>
+          <ViewOnceGlyph variant="half" color={baseColor} size={26} />
+          <Text style={{ fontSize: 14, fontWeight: '500', color: baseColor }}>{label}</Text>
+        </View>
+      );
+    }
+
+    // ── Received · unopened: teal glyph + teal label, row tappable ────────
+    return (
+      <TouchableOpacity
+        activeOpacity={0.6}
+        onPress={() => openViewOnceMessage(msg)}
+        onLongPress={() => openMessageActionsFor(msg)}
+        accessibilityRole="button"
+        accessibilityLabel={`View once ${label.toLowerCase()}, tap to view`}
+        style={{ flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 2, paddingRight: 4 }}
+      >
+        <ViewOnceGlyph variant="solid" color={chatColor} size={26} />
+        <Text style={{ fontSize: 14, fontWeight: '600', color: chatColor }}>{label}</Text>
+        {sizeLabel ? (
+          <Text style={{ fontSize: 12, color: mutedColor }}>{sizeLabel}</Text>
+        ) : null}
+      </TouchableOpacity>
+    );
+  };
+
   const renderLocationMessage = (msg, isMyMessage) => {
     // Extract location data from ALL possible sources — bulletproof chain
     const meta = msg?.mediaMeta || msg?.payload?.mediaMeta || {};
@@ -5361,8 +5622,10 @@ export default function ChatScreen({ navigation, route }) {
     // WhatsApp-style album: one message bubble carrying N attachments
     const isAlbum = (msg.type === 'album' || msg.messageType === 'album'
       || (Array.isArray(msg.mediaItems) && msg.mediaItems.length > 1)) && !isDeletedMessage;
-    const isImage = !isAlbum && (msg.type === 'image' || msg.mediaType === 'image' || msg.type === 'photo');
-    const isVideo = !isAlbum && (msg.type === 'video' || msg.mediaType === 'video');
+    // View Once — metadata-only bubble; takes over the image/video branch.
+    const isViewOnce = Boolean(msg.isViewOnce || msg.payload?.isViewOnce) && !isDeletedMessage && !isAlbum;
+    const isImage = !isAlbum && !isViewOnce && (msg.type === 'image' || msg.mediaType === 'image' || msg.type === 'photo');
+    const isVideo = !isAlbum && !isViewOnce && (msg.type === 'video' || msg.mediaType === 'video');
     const isAudio = msg.type === 'audio' || msg.mediaType === 'audio';
     const isFile = msg.type === 'file' || msg.type === 'document';
     const isLocation = msg.type === 'location' || msg.mediaType === 'location';
@@ -5911,6 +6174,7 @@ export default function ChatScreen({ navigation, route }) {
             )}
 
             {/* MEDIA MESSAGES */}
+            {isViewOnce && renderViewOnceMessage(msg, isMyMessage, progress)}
             {!isDeletedMessage && isImage && renderImageMessage(msg, isMyMessage, progress, messageKey, downloadState)}
             {!isDeletedMessage && isVideo && renderVideoMessage(msg, isMyMessage, progress, messageKey, downloadState)}
             {!isDeletedMessage && isAudio && renderAudioMessage(msg, isMyMessage, progress, downloadState)}
@@ -5968,15 +6232,15 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
   // media cell must re-render (e.g. a finished download replacing the blurred
   // placeholder with the local file:// image).
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus]
   );
 
   // Typing indicator
@@ -6223,8 +6487,10 @@ export default function ChatScreen({ navigation, route }) {
             const hasServerId = Boolean(serverActionId);
             const canEdit = selectedMessage.length === 1 && isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && hasServerId;
             const isTextMsg = selMsg?.type === 'text';
+            // View-once messages can never be forwarded or copied.
+            const isViewOnceSel = Boolean(selMsg?.isViewOnce || selMsg?.payload?.isViewOnce);
             // Copy allowed whenever the message has any text — including a media caption.
-            const hasCopyableText = Boolean(selMsg?.text && String(selMsg.text).trim().length > 0);
+            const hasCopyableText = Boolean(selMsg?.text && String(selMsg.text).trim().length > 0) && !isViewOnceSel;
             const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
             const canCancelSchedule = selectedMessage.length === 1 && (selMsg?.status === 'scheduled' || selMsg?.status === 'processing') && isOwnMsg;
             return (
@@ -6290,7 +6556,7 @@ export default function ChatScreen({ navigation, route }) {
                 {selectedMessage.length > 0 && (() => {
                   const selectedMsgs = selectedMessage
                     .map(id => messages.find(m => sameId(m.id, id) || sameId(m.serverMessageId, id) || sameId(m.tempId, id)))
-                    .filter(m => m && !m.isDeleted);
+                    .filter(m => m && !m.isDeleted && !(m.isViewOnce || m.payload?.isViewOnce));
                   // Server needs the MongoDB _id — use serverMessageId (which IS the _id)
                   // Fallback: if id is not a temp ID, it was set by acknowledgeMessage to the server _id
                   const forwardableIds = selectedMsgs.map(m => {
@@ -6906,6 +7172,7 @@ export default function ChatScreen({ navigation, route }) {
             onOpenEmoji={handleOpenEmojiPanel}
             onOpenAttachment={editingMessage ? undefined : handleToggleMediaOptions}
             onRemovePendingMedia={() => setPendingMedia(null)}
+            onToggleViewOnce={() => setPendingMedia((prev) => (prev ? { ...prev, viewOnce: !prev.viewOnce } : prev))}
             onSubmit={handleSubmitInput}
             onSchedule={scheduleMessage}
             mentionSuggestionsNode={isGroupChat ? (
@@ -7356,6 +7623,52 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
+        {/* View Once viewer — streams from the single-use URL; nothing is ever
+            written to FileSystem/cache. Closing is final (server already
+            marked the view consumed). Screen capture is blocked while open. */}
+        <Modal
+          visible={Boolean(viewOnceViewer)}
+          transparent
+          animationType="fade"
+          onRequestClose={closeViewOnceViewer}
+          statusBarTranslucent
+        >
+          <View style={{ flex: 1, backgroundColor: '#000' }}>
+            <View style={{
+              position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20,
+              flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+              paddingTop: insets.top + 8, paddingHorizontal: 14, paddingBottom: 10,
+            }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                <View style={{ width: 22, height: 22, borderRadius: 11, borderWidth: 1.5, borderColor: '#FFFFFFAA', alignItems: 'center', justifyContent: 'center' }}>
+                  <Text style={{ color: '#FFFFFFAA', fontSize: 11, fontWeight: '700' }}>1</Text>
+                </View>
+                <Text style={{ color: '#FFFFFFCC', fontSize: 14 }}>View once</Text>
+              </View>
+              <TouchableOpacity onPress={closeViewOnceViewer} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} accessibilityRole="button" accessibilityLabel="Close">
+                <Ionicons name="close" size={26} color="#FFFFFF" />
+              </TouchableOpacity>
+            </View>
+            {viewOnceViewer ? (
+              viewOnceViewer.mediaType === 'video' ? (
+                <Video
+                  source={{ uri: viewOnceViewer.streamUrl }}
+                  style={{ flex: 1 }}
+                  resizeMode={ResizeMode.CONTAIN}
+                  shouldPlay
+                  useNativeControls
+                />
+              ) : (
+                <Image
+                  source={{ uri: viewOnceViewer.streamUrl, cache: 'reload' }}
+                  style={{ flex: 1 }}
+                  resizeMode="contain"
+                />
+              )
+            ) : null}
+          </View>
+        </Modal>
+
         {/* WhatsApp-style Media viewer modal */}
         <Modal visible={localMediaViewer.visible} transparent animationType="fade" onRequestClose={closeLocalMediaViewer} statusBarTranslucent>
           <View style={{ flex: 1, backgroundColor: '#000' }}>
@@ -7431,12 +7744,11 @@ export default function ChatScreen({ navigation, route }) {
                         (cancelFn) => { viewerDownloadCancelRef.current = cancelFn; }
                       );
                       if (!localUri) return;
-                      // Check existing permission first — only prompt if undetermined
-                      let perm = await MediaLibrary.getPermissionsAsync();
-                      if (perm.status !== 'granted') {
-                        perm = await MediaLibrary.requestPermissionsAsync();
-                        if (perm.status !== 'granted') return;
-                      }
+                      // Re-asks in context when photos was denied earlier.
+                      const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+                        purpose: 'Allow photo access to save this media to your gallery.',
+                      });
+                      if (!photosOk) return;
                       await MediaLibrary.createAssetAsync(await ensureSaveableFileUri(localUri, msg));
                       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                       setViewerSavedToast(true);

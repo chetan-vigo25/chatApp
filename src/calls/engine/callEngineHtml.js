@@ -158,6 +158,30 @@ export const buildCallEngineHtml = () => `<!doctype html>
     </div>
   </div>
 
+  <script>
+  /* Track every RTCPeerConnection the vendor SDK creates so the glue script
+     can periodically getStats() for call-quality telemetry (MOS-adjacent
+     metrics for the call log). Must run BEFORE the vendor bundle. Constructor
+     wrapper only — behaviour of the returned pc is untouched. No backticks. */
+  (function () {
+    try {
+      var NativePC = window.RTCPeerConnection;
+      if (!NativePC) return;
+      window.__rtcPCs = [];
+      var WrappedPC = function (cfg, cons) {
+        var pc = cons !== undefined ? new NativePC(cfg, cons) : new NativePC(cfg);
+        try { window.__rtcPCs.push(pc); } catch (e) {}
+        return pc;
+      };
+      WrappedPC.prototype = NativePC.prototype;
+      try { Object.setPrototypeOf(WrappedPC, NativePC); } catch (e) {}
+      if (NativePC.generateCertificate) {
+        try { WrappedPC.generateCertificate = NativePC.generateCertificate.bind(NativePC); } catch (e) {}
+      }
+      window.RTCPeerConnection = WrappedPC;
+    } catch (e) {}
+  })();
+  </script>
   <script>${VENDOR_JS}</script>
   <script>
   /* CallingSDK — mediasoup adapter. Same public API as the old hosted SDK so
@@ -962,7 +986,25 @@ export const buildCallEngineHtml = () => `<!doctype html>
       var self = this;
       var list = (ids || []).map(String).filter(Boolean);
       if (!list.length) return Promise.resolve();
-      if (!self._room || !self._room.groupId) return Promise.reject(new Error('not in a group call'));
+      if (!self._room) return Promise.reject(new Error('not in a call'));
+      // Live 1:1 -> PROMOTE to a group on the media server first (same room),
+      // then the normal invite machinery takes over. No backticks here (outer
+      // template literal).
+      if (!self._room.groupId) {
+        var pcid = self._room.callId || self._acceptedId;
+        if (!pcid) return Promise.reject(new Error('no live call to promote'));
+        list.forEach(function (id) {
+          if (self._groupInvitees.indexOf(id) < 0) self._groupInvitees.push(id);
+          delete self._groupJoined[id];
+        });
+        self._log('promoting 1:1 ' + pcid + ' to group for ' + list.length + ' invitee(s)');
+        return self._req('promoteToGroup', { callId: pcid, inviteeIds: list }).then(function (res) {
+          var pgid = String((res && res.groupId) || ('group_' + pcid));
+          if (self._room) { self._room.groupId = pgid; self._room.callId = null; }
+          self._armRetry(function () { return self._reinviteGroup(pgid); });
+          return res;
+        });
+      }
       var gid = self._room.groupId;
       list.forEach(function (id) {
         if (self._groupInvitees.indexOf(id) < 0) self._groupInvitees.push(id);
@@ -2168,6 +2210,66 @@ export const buildCallEngineHtml = () => `<!doctype html>
       } catch (e) {}
     }
     function logToRN(msg) { post('log', { message: String(msg) }); }
+
+    // ── Call-quality telemetry ────────────────────────────────────────────
+    // Every 10s, aggregate getStats() across the live RTCPeerConnections the
+    // pre-vendor wrapper registered (window.__rtcPCs) and post a compact
+    // summary to RN. RN keeps the LAST snapshot and writes it into the call
+    // log at hang-up. Entirely best-effort: any failure is swallowed and can
+    // never touch call behaviour.
+    function snapshotRtcStats() {
+      var pcs;
+      try {
+        pcs = (window.__rtcPCs || []).filter(function (pc) {
+          try { return pc.connectionState !== 'closed'; } catch (e) { return false; }
+        });
+        window.__rtcPCs = pcs;
+      } catch (e) { return; }
+      if (!pcs.length) return;
+      var agg = { rtts: [], jitters: [], lost: 0, recv: 0, turnUsed: false, ice: null };
+      var done = 0;
+      var finish = function () {
+        done += 1;
+        if (done !== pcs.length) return;
+        var avg = function (a) {
+          if (!a.length) return null;
+          var s = 0; for (var i = 0; i < a.length; i++) s += a[i];
+          return s / a.length;
+        };
+        var rtt = avg(agg.rtts);
+        var jit = avg(agg.jitters);
+        var total = agg.lost + agg.recv;
+        post('rtcStats', {
+          iceConnectionState: agg.ice,
+          turnUsed: agg.turnUsed,
+          avgRttMs: rtt != null ? Math.round(rtt) : null,
+          jitterMs: jit != null ? Math.round(jit * 10) / 10 : null,
+          packetLossPct: total > 0 ? Math.round((agg.lost / total) * 1000) / 10 : null,
+        });
+      };
+      pcs.forEach(function (pc) {
+        try { agg.ice = pc.iceConnectionState || agg.ice; } catch (e) {}
+        var p;
+        try { p = pc.getStats(); } catch (e) { finish(); return; }
+        p.then(function (report) {
+          report.forEach(function (s) {
+            if (s.type === 'candidate-pair' && s.state === 'succeeded' && (s.nominated || s.selected)) {
+              if (typeof s.currentRoundTripTime === 'number') agg.rtts.push(s.currentRoundTripTime * 1000);
+              try {
+                var local = report.get && report.get(s.localCandidateId);
+                if (local && local.candidateType === 'relay') agg.turnUsed = true;
+              } catch (e) {}
+            }
+            if (s.type === 'inbound-rtp') {
+              if (typeof s.jitter === 'number') agg.jitters.push(s.jitter * 1000);
+              if (typeof s.packetsLost === 'number') agg.lost += s.packetsLost;
+              if (typeof s.packetsReceived === 'number') agg.recv += s.packetsReceived;
+            }
+          });
+        }).catch(function (e) {}).then(finish, finish);
+      });
+    }
+    setInterval(snapshotRtcStats, 10000);
 
     // Keep the grid balanced for the current tile count (1 → full, 2 → side by
     // side, 3-4 → 2 columns).

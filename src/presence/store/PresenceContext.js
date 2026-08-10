@@ -327,6 +327,18 @@ export function PresenceProvider({ children }) {
         if (!userId) return;
         dispatch({ type: 'UPSERT_CONTACT_PRESENCE', payload: { userId, presence } });
       }),
+      // Instant snapshot the server pushes on every presence:subscribe —
+      // carries status + lastSeen, so the header can show "last seen …"
+      // immediately on chat open instead of waiting for presence:get.
+      socketService.onPresenceBulk((payload) => {
+        const source = payload?.data || payload;
+        const entries = Array.isArray(source?.entries) ? source.entries : [];
+        entries.forEach((entry) => {
+          const userId = entry?.userId ? String(entry.userId) : null;
+          if (!userId) return;
+          dispatch({ type: 'UPSERT_CONTACT_PRESENCE', payload: { userId, presence: entry } });
+        });
+      }),
       socketService.onGetResponse((payload) => {
         const { userId, presence } = normalizePresencePayload(payload);
         if (!userId) return;

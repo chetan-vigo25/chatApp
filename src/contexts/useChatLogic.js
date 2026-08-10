@@ -11,6 +11,7 @@ import { useNetwork } from "../contexts/NetworkContext";
 import { useImage } from "../contexts/ImageProvider";
 import { useFocusEffect } from "@react-navigation/native";
 import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../utils/presence";
+import { formatLastSeen } from "../presence/services/lastSeenFormatter.service";
 import { useRealtimeChat } from "./RealtimeChatContext";
 import localStorageService from '../services/LocalStorageService';
 import ChatDatabase from '../services/ChatDatabase';
@@ -735,7 +736,9 @@ export default function useChatLogic({ navigation, route }) {
     const missing = [];
     if (!messagePayload?.mediaId) missing.push('mediaId');
     if (!messagePayload?.mediaUrl) missing.push('mediaUrl');
-    if (!messagePayload?.mediaThumbnailUrl) missing.push('mediaThumbnailUrl');
+    // View Once ships with NO thumbnail by design (metadata-only bubble) —
+    // requiring one here failed every view-once send with "missing fields".
+    if (!messagePayload?.mediaThumbnailUrl && !messagePayload?.viewOnce) missing.push('mediaThumbnailUrl');
     if (!messagePayload?.mediaMeta || typeof messagePayload.mediaMeta !== 'object') {
       missing.push('mediaMeta');
     }
@@ -759,13 +762,15 @@ export default function useChatLogic({ navigation, route }) {
     const normalizedMessageType = normalizeOutboundMessageType(
       uploadData?.fileCategory || messageType || file?.type || 'file'
     );
-    const generatedMessageId = String(
-      messageId ||
-      uploadData?.messageId ||
-      uploadData?._id?.$oid ||
-      uploadData?._id ||
-      generateClientMessageId()
-    );
+    // The local message id must be UNIQUE PER SEND. It must NEVER be derived
+    // from the upload response: the sha256 dedupe returns the SAME media doc
+    // (same _id / messageId) when the same file is sent twice, so deriving the
+    // message id from it gave two different messages one id — SQLite's
+    // ON CONFLICT(id) then overwrote bubble #1 with bubble #2 (the "previous
+    // view-once disappears when I send another" bug). The server allocates its
+    // own canonical UUID at persist time regardless; this id only has to be
+    // locally unique until the ack renames the row.
+    const generatedMessageId = String(messageId || generateClientMessageId());
     const resolvedFileName = file?.name || extractFileName(file?.uri || uploadData?.previewUrl || uploadData?.thumbnailUrl);
     const resolvedMimeType = file?.type || uploadData?.mimeType || `application/${normalizedMessageType}`;
     const mediaId = resolveUploadMediaId(uploadData) || generatedMessageId;
@@ -1516,7 +1521,16 @@ export default function useChatLogic({ navigation, route }) {
     const deduped = sorted.filter(msg => {
       const ids = [normalizeId(msg.serverMessageId), normalizeId(msg.id), normalizeId(msg.tempId)].filter(Boolean);
       if (ids.some(id => seenIds.has(id))) return false;
-      if (msg.senderId && msg.text != null) {
+      // Content fingerprint is TEXT-ONLY (same policy as deduplicateMessages
+      // and the SQLite dedupe rules). Media/album/view-once rows all share
+      // text '' — fingerprinting them made every in-flight upload (tempish)
+      // claim the fp first (list is newest-first) and DROP the sender's
+      // earlier media/view-once bubbles in the same ±30s bucket until the
+      // ack landed. Identity for media rows is ids only.
+      const fpMediaLike = msg.isViewOnce || msg.mediaUrl || msg.mediaItems
+        || msg.payload?.viewOnce || msg.payload?.file
+        || ['image', 'video', 'audio', 'document', 'location', 'contact'].includes(String(msg.type || msg.messageType || '').toLowerCase());
+      if (msg.senderId && msg.text != null && String(msg.text).trim() !== '' && !fpMediaLike) {
         const roundedTs = Math.round((msg.timestamp || 0) / 30000);
         const fp = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs}`;
         const fpPrev = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs - 1}`;
@@ -1536,7 +1550,14 @@ export default function useChatLogic({ navigation, route }) {
     // allMessages row, and without this the gate swallowed every patch — the
     // album's progress ring sat frozen for the whole bulk upload.
     const fingerprint = deduped.map(m => {
-      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}`;
+      // View-once flips (opened/expired) change NOTHING the base fingerprint
+      // tracks — without this the gate swallowed the patch and the sender's
+      // bubble never showed "Opened" until some unrelated change re-rendered.
+      const mvo = m.viewOnce || m.payload?.viewOnce;
+      const voFp = mvo
+        ? `:vo${Number(mvo.openedCount || 0)}.${mvo.myStatus || ''}.${mvo.mediaDeleted ? 1 : 0}`
+        : '';
+      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}${voFp}`;
       if (m.status !== 'sending' && m.status !== 'uploading') return base;
       // localThumbUri flags: locally extracted video posters land via async
       // patches on sending rows — without them in the fingerprint the gate
@@ -2387,10 +2408,20 @@ export default function useChatLogic({ navigation, route }) {
       || (normalizedPayload?.replyTo && typeof normalizedPayload.replyTo === 'object' ? normalizedPayload.replyTo : null)
       || null;
 
+    // View Once: the flag MUST survive every refetch path (REST list, sync,
+    // history, catchup). Losing it re-rendered the row as a NORMAL video/image
+    // bubble (with the sender's local uri) under the view-once bubble.
+    const resolvedIsViewOnce = Boolean(apiMsg?.isViewOnce || apiMsg?.payload?.isViewOnce);
+    const resolvedViewOnce = (apiMsg?.viewOnce && typeof apiMsg.viewOnce === 'object' ? apiMsg.viewOnce : null)
+      || (apiMsg?.payload?.viewOnce && typeof apiMsg.payload.viewOnce === 'object' ? apiMsg.payload.viewOnce : null)
+      || null;
+
     return {
       id: serverId,
       serverMessageId: serverId,
       tempId: originalTempId || serverId,
+      isViewOnce: resolvedIsViewOnce,
+      viewOnce: resolvedViewOnce,
       // Cross-transport idempotency key — lets the SQLite upsert reconcile
       // this row against one stored under a different id form (uuid vs _id)
       // or against the optimistic outbox row.
@@ -2411,9 +2442,11 @@ export default function useChatLogic({ navigation, route }) {
       status: sameId(normalizedSenderId, normalizedCurrentUser)
         ? (normalizeMessageStatus(apiMsg?.status) || "sent")
         : normalizeMessageStatus(apiMsg?.status),
-      mediaUrl: resolvedMediaUrl,
-      mediaThumbnailUrl: resolvedMediaThumbnailUrl,
-      previewUrl: incomingLocalUri || resolvedMediaThumbnailUrl || resolvedMediaUrl,
+      // View-once rows are metadata-only — never resurrect a URL/local uri for
+      // them (the sender's own payload.file.uri used to leak back in here).
+      mediaUrl: resolvedIsViewOnce ? null : resolvedMediaUrl,
+      mediaThumbnailUrl: resolvedIsViewOnce ? null : resolvedMediaThumbnailUrl,
+      previewUrl: resolvedIsViewOnce ? null : (incomingLocalUri || resolvedMediaThumbnailUrl || resolvedMediaUrl),
       // Album fields — N attachments in one bubble (WhatsApp media group)
       mediaGroupId: apiMsg?.mediaGroupId || apiMsg?.payload?.mediaGroupId || null,
       mediaItems: Array.isArray(apiMsg?.mediaItems) && apiMsg.mediaItems.length
@@ -2432,8 +2465,10 @@ export default function useChatLogic({ navigation, route }) {
       groupId: apiMsg?.groupId || null,
       // Prefer the device-contact-resolved group member name over the backend name.
       senderName: groupMembersMapRef.current?.[normalizedSenderId]?.fullName || apiMsg?.senderName || apiMsg?.sender?.fullName || apiMsg?.sender?.name || null,
-      localUri: incomingLocalUri,
-      payload: normalizedPayload,
+      localUri: resolvedIsViewOnce ? null : incomingLocalUri,
+      payload: resolvedIsViewOnce
+        ? { ...normalizedPayload, isViewOnce: true, ...(resolvedViewOnce ? { viewOnce: resolvedViewOnce } : {}) }
+        : normalizedPayload,
       mediaMeta,
       isMediaDownloaded: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri),
       downloadStatus: Boolean(normalizedPayload?.isMediaDownloaded || incomingLocalUri)
@@ -2800,22 +2835,31 @@ export default function useChatLogic({ navigation, route }) {
 
     messagesArray.forEach(msg => {
       // Primary key: prefer serverMessageId, then check if tempId maps to a known serverMessageId
+      // NOTE: mediaId is deliberately NOT an identity key — the sha256 dedupe
+      // gives two different messages the same mediaId when the same file is
+      // sent twice, and keying on it collapsed them into one bubble.
       let key =
         msg.serverMessageId ||
         (msg.tempId && tempToServerMap.get(msg.tempId)) ||
         msg.id ||
         msg.tempId ||
-        msg.mediaId ||
         null;
 
-      // Content-based fallback: match by sender + text + ~5s time window
-      // Use 5-second buckets; check both current and adjacent bucket to handle boundaries
+      // Content-based fallback: match by sender + text + ~5s time window.
+      // TEXT MESSAGES ONLY — same rule as the SQLite dedupe (#3/#4): media
+      // rows are captionless (view-once text is ALWAYS ''), so a content
+      // match collapsed two DIFFERENT media/view-once sends from the same
+      // sender into one — the "sent bubble disappears until reload" bug.
+      // Media dedupes exclusively via the id/tempId/serverMessageId keys.
       const sender = normalizeId(msg?.senderId) || 'unknown';
       const rawTs = Number(msg?.timestamp || 0);
       const textSlice = (msg?.text || '').toString().trim().slice(0, 48);
       const bucketSize = 5000;
       const bucket = rawTs > 0 ? Math.floor(rawTs / bucketSize) : 0;
-      const contentKeys = bucket > 0
+      const isMediaLike = Boolean(msg?.isViewOnce || msg?.payload?.isViewOnce)
+        || ['image', 'video', 'audio', 'file', 'document', 'album', 'location', 'contact']
+          .includes(String(msg?.type || msg?.mediaType || '').toLowerCase());
+      const contentKeys = (bucket > 0 && !isMediaLike && textSlice)
         ? [`content_${sender}_${bucket}_${textSlice}`, `content_${sender}_${bucket - 1}_${textSlice}`, `content_${sender}_${bucket + 1}_${textSlice}`]
         : [];
 
@@ -5204,6 +5248,50 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:media:downloaded:update', handleMediaDownloadedUpdate);
     registerSocketHandler('message:media:downloaded:response', handleMediaUpdateResponse);
     registerSocketHandler('message:media:downloaded', handleMediaDownloadedUpdate);
+
+    // ─── View Once realtime flips ─────────────────────────────────────────
+    // Patch the OPEN thread's in-memory state the moment the event lands so
+    // the sender's bubble shows "Opened" instantly — the RealtimeChatContext
+    // handler persists the same flip to SQLite (durable / closed-chat case).
+    const applyViewOnceRealtime = (payload, expired) => {
+      const src = payload?.data || payload || {};
+      const mid = normalizeId(src?.messageId);
+      // The event ships clientMessageId too — the sender's optimistic row may
+      // still be keyed by it (the server mints its own messageId, so before
+      // the ack lands `id` never equals the server id).
+      const cid = normalizeId(src?.clientMessageId);
+      if (!mid && !cid) return;
+      if (src?.chatId && currentChatId && !sameId(src.chatId, currentChatId)) return;
+      const selfId = normalizeId(currentUserIdRef.current);
+      setAllMessages((prev) => prev.map((m) => {
+        const isMatch = (mid && (sameId(m?.serverMessageId, mid) || sameId(m?.id, mid) || sameId(m?.tempId, mid)))
+          || (cid && (sameId(m?.clientMessageId, cid) || sameId(m?.id, cid) || sameId(m?.tempId, cid)));
+        if (!isMatch) return m;
+        const prevVO = m.viewOnce || m.payload?.viewOnce || {};
+        const nextVO = expired
+          ? {
+              ...prevVO,
+              mediaDeleted: true,
+              myStatus: prevVO.myStatus === 'opened' ? 'opened' : 'expired',
+            }
+          : {
+              ...prevVO,
+              ...(src.openedCount != null ? { openedCount: Number(src.openedCount) } : {}),
+              ...(src.totalRecipients != null ? { totalRecipients: Number(src.totalRecipients) } : {}),
+              ...(selfId && sameId(src.userId, selfId)
+                ? { myStatus: 'opened', openedAt: src.openedAt || new Date().toISOString() }
+                : {}),
+            };
+        return {
+          ...m,
+          isViewOnce: true,
+          viewOnce: nextVO,
+          payload: { ...(m.payload || {}), isViewOnce: true, viewOnce: nextVO },
+        };
+      }));
+    };
+    registerSocketHandler('viewonce:opened', (d) => applyViewOnceRealtime(d, false));
+    registerSocketHandler('viewonce:expired', (d) => applyViewOnceRealtime(d, true));
 
     const onMessageFetchResponse = (data) => {
       const source = data?.data || data;
@@ -8256,6 +8344,10 @@ export default function useChatLogic({ navigation, route }) {
 
     const { file, type } = mediaObj;
     const normalizedType = type === 'document' ? 'file' : type;
+    // WhatsApp-style View Once: single image/video only. The bubble is
+    // metadata-only — no local preview, no thumbnail, no caption.
+    const isViewOnceSend = Boolean(mediaObj.viewOnce || options?.viewOnce)
+      && ['image', 'video'].includes(normalizedType);
     const tempId = options?.tempId || `temp_media_${Date.now()}_${Math.random()}`;
     const timestamp = options?.createdAt || new Date().toISOString();
     const localSourceUri = normalizeUri(file.uri);
@@ -8281,12 +8373,27 @@ export default function useChatLogic({ navigation, route }) {
     const localMsg = {
       id: tempId,
       tempId,
+      // Durable idempotency key — joins this row to the server copy refetched
+      // later under its canonical UUID (SQLite client_message_id column).
+      clientMessageId: tempId,
       type: normalizedType,
       mediaType: normalizedType,
-      text: file.name || '',
+      text: isViewOnceSend ? '' : (file.name || ''),
       mediaUrl: '',
-      mediaThumbnailUrl: normalizedType === 'video' ? localVideoThumb : localSourceUri,
-      previewUrl: normalizedType === 'video' ? localVideoThumb : localSourceUri,
+      mediaThumbnailUrl: isViewOnceSend ? null : (normalizedType === 'video' ? localVideoThumb : localSourceUri),
+      previewUrl: isViewOnceSend ? null : (normalizedType === 'video' ? localVideoThumb : localSourceUri),
+      isViewOnce: isViewOnceSend,
+      ...(isViewOnceSend
+        ? {
+            viewOnce: {
+              mediaType: normalizedType === 'video' ? 'video' : 'image',
+              byteSize: Number(file.size) || null,
+              myStatus: 'unopened',
+              openedCount: 0,
+              totalRecipients: 0,
+            },
+          }
+        : {}),
       localThumbUri: localVideoThumb,
       localUri: localSourceUri,
       mediaMeta: localMediaMeta,
@@ -8360,7 +8467,7 @@ export default function useChatLogic({ navigation, route }) {
     // thumbnail from the first paint (not a videocam placeholder) — the server
     // poster replaces/joins it after upload. Fire-and-forget; runs even for
     // queue replays (shouldInsertLocal=false) since the bubble already exists.
-    if (normalizedType === 'video' && !localVideoThumb && localSourceUri) {
+    if (normalizedType === 'video' && !localVideoThumb && localSourceUri && !isViewOnceSend) {
       generateLocalVideoThumbnail(localSourceUri)
         .then((thumbUri) => {
           if (!thumbUri) return;
@@ -8582,8 +8689,16 @@ export default function useChatLogic({ navigation, route }) {
         senderDeviceId: deviceId,
         receiverId: chatData.peerUser?._id || null,
         chatId: chatIdRef.current,
-        messageId: responseData?.messageId,
+        // NEVER pass responseData.messageId here — for a deduped upload it is
+        // the FIRST message's id (shared media doc) and collides two sends.
       });
+      if (isViewOnceSend) {
+        // Server contract: viewOnce=true → the row persists with NO media URLs
+        // and a frozen recipients list; the wire payload mirrors that.
+        messagePayload.viewOnce = true;
+        messagePayload.text = '';
+        messagePayload.mediaThumbnailUrl = null;
+      }
 
       const payloadValidation = validateMediaMessagePayload(messagePayload);
       if (!payloadValidation.isValid) {
@@ -8608,9 +8723,11 @@ export default function useChatLogic({ navigation, route }) {
 
       // Local thumbnail cache (images only — video thumbs need
       // expo-video-thumbnails, which is not installed). Fire-and-forget.
-      generateThumbnail({ file: uploadFile, messageType: normalizedCategory })
-        .then((thumbUri) => (thumbUri ? localStorageService.saveThumbnail(mediaId, thumbUri) : null))
-        .catch(() => {});
+      if (!isViewOnceSend) {
+        generateThumbnail({ file: uploadFile, messageType: normalizedCategory })
+          .then((thumbUri) => (thumbUri ? localStorageService.saveThumbnail(mediaId, thumbUri) : null))
+          .catch(() => {});
+      }
 
       setAllMessages((prevMessages) => {
         const withoutTemp = prevMessages.filter((m) => m.tempId !== tempId && m.id !== tempId);
@@ -8618,12 +8735,25 @@ export default function useChatLogic({ navigation, route }) {
           id: serverMessageId,
           serverMessageId,
           tempId,
+          clientMessageId: tempId,
           type: normalizedCategory,
           mediaType: normalizedCategory,
-          text: uploadFile.name || file.name || '',
-          mediaUrl: resolvedMediaUrl,
-          mediaThumbnailUrl: resolvedPreviewUrl,
-          previewUrl: resolvedPreviewUrl,
+          text: isViewOnceSend ? '' : (uploadFile.name || file.name || ''),
+          mediaUrl: isViewOnceSend ? '' : resolvedMediaUrl,
+          mediaThumbnailUrl: isViewOnceSend ? null : resolvedPreviewUrl,
+          previewUrl: isViewOnceSend ? null : resolvedPreviewUrl,
+          isViewOnce: isViewOnceSend,
+          ...(isViewOnceSend
+            ? {
+                viewOnce: {
+                  mediaType: normalizedCategory === 'video' ? 'video' : 'image',
+                  byteSize: Number(mediaMeta?.fileSize || uploadFile.size) || null,
+                  myStatus: 'unopened',
+                  openedCount: 0,
+                  totalRecipients: 0,
+                },
+              }
+            : {}),
           localThumbUri: localVideoThumb || null,
           localUri: uploadedLocalUri,
           serverMediaUrl: uploadedPreviewUrl,
@@ -10063,6 +10193,11 @@ export default function useChatLogic({ navigation, route }) {
         status: 'sent',
         text: msg.text || '',
         createdAt: new Date().toISOString(),
+        // View Once must survive a retry — resending without the flag would
+        // deliver a normal (viewable-forever) media message.
+        ...((msg.isViewOnce || msg.payload?.isViewOnce)
+          ? { viewOnce: true, text: '', mediaThumbnailUrl: null }
+          : {}),
       };
 
       const payloadValidation = validateMediaMessagePayload(messagePayload);
@@ -10438,7 +10573,7 @@ export default function useChatLogic({ navigation, route }) {
       return 'busy';
     }
     if (lastSeen) {
-      return `last seen ${moment(lastSeen).fromNow()}`;
+      return formatLastSeen(lastSeen);
     }
     return 'offline';
   }, [isPeerTyping, userStatus, lastSeen, customStatus]);
@@ -10453,15 +10588,19 @@ export default function useChatLogic({ navigation, route }) {
   const handlePickMedia = useCallback(async (type) => {
     try {
       closeMediaOptions();
-      // NO staging preview (user rule): picked media uploads IMMEDIATELY.
-      // One file → single media message; several files → ONE album message
-      // (grid bubble with the center progress ring). Fire-and-forget — the
-      // optimistic bubble appears instantly and the durable queue owns retries.
+      // Albums + documents upload IMMEDIATELY (no staging). A SINGLE photo or
+      // video is STAGED into the composer's pending-media strip instead — that
+      // strip carries the WhatsApp-style View Once "1" toggle (user request,
+      // Aug-6), so the user can flip it and then hit send (one extra tap).
       if (typeof pickMediaMultiple === 'function' && (type === 'image' || type === 'video' || type === 'document')) {
         const files = await pickMediaMultiple(type);
         if (!files || !files.length) return;
         if (files.length === 1) {
-          sendMedia({ file: files[0], type }).catch((err) => console.warn('[sendMedia] pick-send error:', err?.message));
+          if (type === 'image' || type === 'video') {
+            setPendingMedia({ file: files[0], type });
+          } else {
+            sendMedia({ file: files[0], type }).catch((err) => console.warn('[sendMedia] pick-send error:', err?.message));
+          }
         } else {
           sendMediaGroup({ files, caption: '' }).catch((err) => console.warn('[sendMediaGroup] pick-send error:', err?.message));
         }
@@ -10469,11 +10608,15 @@ export default function useChatLogic({ navigation, route }) {
       }
       const file = await pickMedia(type);
       if (!file) return;
-      sendMedia({ file, type }).catch((err) => console.warn('[sendMedia] pick-send error:', err?.message));
+      if (type === 'image' || type === 'video') {
+        setPendingMedia({ file, type });
+      } else {
+        sendMedia({ file, type }).catch((err) => console.warn('[sendMedia] pick-send error:', err?.message));
+      }
     } catch (err) {
       console.error("handlePickMedia error", err);
     }
-  }, [pickMedia, pickMediaMultiple, sendMedia, sendMediaGroup]);
+  }, [pickMedia, pickMediaMultiple, sendMedia, sendMediaGroup, setPendingMedia, closeMediaOptions]);
 
   // SQLite is the single source of truth — no in-memory dedup needed.
   // The periodic dedup cleanup runs via ChatDatabase.deduplicateChat() on chat open.

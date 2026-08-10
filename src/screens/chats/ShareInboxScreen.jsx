@@ -26,7 +26,7 @@ const avatarColor = (name = '') => {
  * Route param: { share: { files: [{ file, type }], text } }  (from ShareIntentGate)
  */
 export default function ShareInboxScreen({ navigation, route }) {
-  const { theme, isDarkMode } = useTheme();
+  const { theme } = useTheme();
   const colors = theme.colors;
   const share = route?.params?.share || { files: [], text: undefined };
 
@@ -34,6 +34,9 @@ export default function ShareInboxScreen({ navigation, route }) {
   const { chatsData = [] } = useSelector((state) => state.chat || {});
   const [query, setQuery] = useState('');
 
+  // Merge both sources exactly like ForwardMessageScreen: Redux first, then the
+  // realtime list overwrites by id so the fresher copy wins. Reads only what is
+  // already in memory — a share must never wait on a network round-trip.
   const allChats = useMemo(() => {
     const map = new Map();
     for (const c of Array.isArray(chatsData) ? chatsData : []) {
@@ -55,7 +58,6 @@ export default function ShareInboxScreen({ navigation, route }) {
     (c?.chatType === 'group')
       ? (c.chatAvatar || c.group?.avatar || c.groupAvatar)
       : (c?.peerUser?.profileImage || c?.chatAvatar);
-  const getId = (c) => c?._id || c?.chatId || c?.peerUser?._id;
 
   const chats = useMemo(() => {
     return allChats
@@ -76,6 +78,8 @@ export default function ShareInboxScreen({ navigation, route }) {
   const onSelect = useCallback((chat) => {
     // Open the thread and hand it the shared payload. `item` is the canonical
     // param useChatLogic reads; `pendingShare` is consumed by ChatScreen once.
+    // replace() (not navigate) so Back from the chat doesn't land on a stale
+    // picker holding a share that was already sent.
     navigation.replace('ChatScreen', {
       item: chat,
       pendingShare: share,
@@ -119,29 +123,33 @@ export default function ShareInboxScreen({ navigation, route }) {
         </TouchableOpacity>
         <View style={styles.headerTitleWrap}>
           <Text style={[styles.headerTitle, { color: colors.primaryTextColor }]}>Share to</Text>
-          <Text style={[styles.headerSubtitle, { color: colors.secondaryTextColor }]}>{subtitle}</Text>
+          <Text style={[styles.headerSub, { color: colors.placeHolderTextColor }]}>{subtitle}</Text>
         </View>
       </View>
 
-      <View style={[styles.searchBar, { backgroundColor: colors.surface }]}>
-        <Ionicons name="search" size={18} color={colors.secondaryTextColor} />
-        <TextInput
-          value={query}
-          onChangeText={setQuery}
-          placeholder="Search chats"
-          placeholderTextColor={colors.placeHolderTextColor}
-          style={[styles.searchInput, { color: colors.primaryTextColor }]}
-        />
+      <View style={styles.searchWrap}>
+        <View style={[styles.searchBox, { backgroundColor: colors.menuBackground }]}>
+          <Ionicons name="search" size={18} color={colors.placeHolderTextColor} />
+          <TextInput
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search chats"
+            placeholderTextColor={colors.placeHolderTextColor}
+            style={[styles.searchInput, { color: colors.primaryTextColor }]}
+          />
+        </View>
       </View>
 
       <FlatList
         data={chats}
-        keyExtractor={(item) => String(getId(item))}
+        keyExtractor={(item, i) => String(item?._id || item?.chatId || i)}
         renderItem={renderItem}
         keyboardShouldPersistTaps="handled"
-        ListEmptyComponent={
-          <Text style={[styles.empty, { color: colors.secondaryTextColor }]}>No chats found</Text>
-        }
+        ListEmptyComponent={(
+          <Text style={[styles.empty, { color: colors.placeHolderTextColor }]}>
+            No chats to share with
+          </Text>
+        )}
       />
     </SafeAreaView>
   );
@@ -151,27 +159,25 @@ const styles = StyleSheet.create({
   root: { flex: 1 },
   header: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 12, paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12, paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth,
   },
   headerBtn: { padding: 4, marginRight: 8 },
   headerTitleWrap: { flex: 1 },
-  headerTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 18 },
-  headerSubtitle: { fontFamily: 'Roboto-Regular', fontSize: 12.5, marginTop: 1 },
-  searchBar: {
+  headerTitle: { fontSize: 18, fontWeight: '600' },
+  headerSub: { fontSize: 12, marginTop: 2 },
+  searchWrap: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 4 },
+  searchBox: {
     flexDirection: 'row', alignItems: 'center',
-    marginHorizontal: 14, marginTop: 12, marginBottom: 6,
-    paddingHorizontal: 12, height: 42, borderRadius: 12,
+    borderRadius: 10, paddingHorizontal: 10, height: 42,
   },
-  searchInput: { flex: 1, marginLeft: 8, fontFamily: 'Roboto-Regular', fontSize: 14 },
+  searchInput: { flex: 1, marginLeft: 8, fontSize: 15, padding: 0 },
   row: {
     flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 16, paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 14, paddingVertical: 14, borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  avatar: { width: 46, height: 46, borderRadius: 23 },
+  avatar: { width: 44, height: 44, borderRadius: 22, marginRight: 14 },
   avatarFallback: { alignItems: 'center', justifyContent: 'center' },
-  avatarLetter: { color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 18 },
-  name: { flex: 1, marginHorizontal: 14, fontFamily: 'Roboto-Medium', fontSize: 15.5 },
-  empty: { textAlign: 'center', marginTop: 40, fontFamily: 'Roboto-Regular', fontSize: 14 },
+  avatarLetter: { color: '#fff', fontSize: 18, fontWeight: '600' },
+  name: { flex: 1, fontSize: 16, fontWeight: '500' },
+  empty: { textAlign: 'center', marginTop: 40, fontSize: 14 },
 });

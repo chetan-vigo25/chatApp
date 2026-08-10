@@ -1,10 +1,26 @@
 import moment from 'moment';
 import { STATUS_COLORS, STATUS_ICONS, STATUS_TYPES } from '../constants';
 
+// Compact absolute time, never relative "a few minutes ago":
+//   today            → "last seen 4:20 PM"
+//   yesterday        → "last seen yesterday 4:20 PM"
+//   within this week → "last seen Mon 4:20 PM"
+//   older            → "last seen 18/07/26"
 export const formatLastSeen = (timestamp, privacyLevel = 'everyone') => {
   if (!timestamp) return 'offline';
   if (privacyLevel === 'nobody') return 'last seen recently';
-  return `last seen ${moment(timestamp).fromNow()}`;
+  // Limited-visibility peers get the literal string 'recently' from the
+  // backend instead of a timestamp.
+  if (timestamp === 'recently') return 'last seen recently';
+  const m = moment(Number(timestamp) || timestamp);
+  if (!m.isValid()) return 'last seen recently';
+
+  const time = m.format('h:mm A');
+  const now = moment();
+  if (m.isSame(now, 'day')) return `last seen ${time}`;
+  if (m.isSame(now.clone().subtract(1, 'day'), 'day')) return `last seen yesterday ${time}`;
+  if (m.isAfter(now.clone().subtract(7, 'day'))) return `last seen ${m.format('ddd')} ${time}`;
+  return `last seen ${m.format('DD/MM/YY')}`;
 };
 
 export const getStatusColor = (status) => {

@@ -5,6 +5,7 @@ import { Platform, Alert, Linking } from 'react-native';
 import { apiCall } from '../Config/Https';
 import { BACKEND_URL } from '@env';
 import { uploadFileInChunks, CHUNKED_UPLOAD_THRESHOLD } from './chunkedUpload';
+import { ensurePermission, PERMISSION_IDS } from '../features/permissions/ensurePermission';
 
 // Define all directories - using FileSystem.documentDirectory for compatibility
 export const APP_FOLDER = 'TalksTry';
@@ -185,34 +186,24 @@ export const initializeAppDirectories = async () => {
 // Alias for backward compatibility
 export const ensureAppFoldersExist = initializeAppDirectories;
 
-// Request permissions — checks existing permission first, only prompts if undetermined
+// Media-library gate for saving/reading gallery assets.
+//
+// Routed through the shared in-context helper so a denial (including one made on
+// the startup permission screen) is re-asked the next time a feature needs it,
+// exactly like the microphone gate in the call flow. `silent` keeps the alerts
+// out of these background save/download paths — the screens that call a save
+// action own the user-facing messaging.
 let _mediaPermissionGranted = false;
-export const requestStoragePermission = async () => {
-  // Skip system call entirely if we already know permission is granted (session cache)
+export const requestStoragePermission = async ({ silent = true } = {}) => {
+  // Skip the system call entirely if we already know it is granted (session cache).
   if (_mediaPermissionGranted) return true;
 
-  try {
-    // Check existing permission first — no dialog shown
-    const existing = await MediaLibrary.getPermissionsAsync();
-    if (existing.status === 'granted' || existing.status === 'limited') {
-      _mediaPermissionGranted = true;
-      return true;
-    }
-
-    // Only prompt if permission hasn't been decided yet (undetermined)
-    // If user previously denied, don't keep asking — return false
-    if (existing.status === 'denied' && !existing.canAskAgain) {
-      return false;
-    }
-
-    // First-time ask or user can be asked again
-    const { status } = await MediaLibrary.requestPermissionsAsync();
-    const granted = status === 'granted' || status === 'limited';
-    if (granted) _mediaPermissionGranted = true;
-    return granted;
-  } catch {
-    return false;
-  }
+  const granted = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+    silent,
+    purpose: 'Allow photo access to save media to your gallery.',
+  });
+  if (granted) _mediaPermissionGranted = true;
+  return granted;
 };
 
 // Ensure a specific directory exists

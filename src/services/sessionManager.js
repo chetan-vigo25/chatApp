@@ -263,10 +263,6 @@ export const resetRuntimeState = () => {
   const store = require('../Redux/Store').default;
   const { resetAppState } = require('../Redux/RootReducers');
   store.dispatch(resetAppState());
-  // Privacy: queued location-tracking fixes must not survive a logout/session
-  // reset (the Redux tracking slice is wiped by resetAppState above; this
-  // clears the durable SQLite side). Best-effort — DB may already be closed.
-  try { ChatDatabase.purgeTrackingRows().catch(() => {}); } catch {}
   emitSessionReset({ reason: 'runtime_reset' });
 };
 

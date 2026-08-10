@@ -7,7 +7,8 @@
  *
  * expo-share-intent `shareIntent` shape:
  *   { text, webUrl, files: [{ path, mimeType, fileName, size, width, height, duration }], meta }
- * `path` is already a `file:///…` URI RN can read.
+ * On iOS `path` is a real file:// path inside the App Group container. On Android
+ * it is often a `content://` uri — see the traps below.
  */
 
 /** Map a MIME type to the media `type` sendMedia understands. */

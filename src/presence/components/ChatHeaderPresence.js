@@ -3,6 +3,7 @@ import { Image, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
+import { formatLastSeen } from '../services/lastSeenFormatter.service';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ContactDatabase from '../../services/ContactDatabase';
 import { getSocket } from '../../Redux/Services/Socket/socket';
@@ -78,6 +79,21 @@ export default function ChatHeaderPresence({
   const effectivePresence = realtimePresence || presence || {};
   const normalizedStatus = (effectivePresence?.status || '').toLowerCase();
 
+  // Offline text: prefer whichever source actually carries a lastSeen
+  // timestamp (realtime update vs presence:get snapshot) so an offline peer
+  // shows "last seen …" instead of a bare "offline".
+  const effectiveLastSeen = effectivePresence?.lastSeen || presence?.lastSeen || null;
+  const offlineText = effectiveLastSeen
+    ? formatLastSeen(effectiveLastSeen)
+    : (lastSeenFormatted && lastSeenFormatted !== 'offline' ? lastSeenFormatted : 'offline');
+
+  // ChatScreen's legacy renderStatusText() returns the literal 'offline' when
+  // ITS presence source has no lastSeen — that must not mask our lastSeen-aware
+  // offlineText, so treat it as "no information".
+  const effectiveFallback = (fallbackStatusText && fallbackStatusText !== 'offline')
+    ? fallbackStatusText
+    : null;
+
   const peerStatusText = (isPeerTyping || isRealtimeTyping)
     ? 'typing...'
     : (
@@ -85,11 +101,8 @@ export default function ChatHeaderPresence({
       (normalizedStatus === 'online' ? 'online' : null) ||
       (normalizedStatus === 'away' ? 'away' : null) ||
       (normalizedStatus === 'busy' ? 'busy' : null) ||
-      fallbackStatusText ||
-      (effectivePresence?.lastSeen ? `last seen ${lastSeenFormatted?.replace('last seen ', '')}` : null) ||
-      lastSeenFormatted ||
-      (normalizedStatus === 'offline' ? 'offline' : null) ||
-      'offline'
+      effectiveFallback ||
+      offlineText
     );
 
   const groupStatusText = isPeerTyping

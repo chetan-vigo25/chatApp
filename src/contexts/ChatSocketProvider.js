@@ -141,8 +141,11 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
         senderId: data.senderId,
         receiverId: data.receiverId,
         status: undefined,
-        mediaUrl: data.mediaUrl || data.url || null,
-        previewUrl: data.previewUrl || data.thumbnailUrl || data.mediaUrl || data.url || null,
+        mediaUrl: data.isViewOnce ? null : (data.mediaUrl || data.url || null),
+        previewUrl: data.isViewOnce ? null : (data.previewUrl || data.thumbnailUrl || data.mediaUrl || data.url || null),
+        // View Once — metadata-only bubble; flags must survive this path too.
+        isViewOnce: Boolean(data.isViewOnce),
+        viewOnce: (data.viewOnce && typeof data.viewOnce === 'object') ? data.viewOnce : null,
         createdAt: new Date(createdAt).toISOString(),
         timestamp,
         synced: true,

@@ -39,6 +39,8 @@ const OPS = {
                            ChatDatabase.updateReactions(messageId, reactions),
   updateMessageEdit:    ({ messageId, newText, editedAt }) =>
                            ChatDatabase.updateMessageEdit(messageId, newText, editedAt),
+  updateMessageViewOnce: ({ messageId, patch }) =>
+                           ChatDatabase.updateMessageViewOnce(messageId, patch),
   markMessageDeleted:   ({ messageId, placeholderText, deletedBy }) =>
                            ChatDatabase.markMessageDeleted(messageId, placeholderText, deletedBy),
   deleteMessageForMe:   ({ messageId, userId }) =>

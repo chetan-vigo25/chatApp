@@ -11,6 +11,7 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { performSessionReset, saveAuthSession, extractLoginSession } from "../services/sessionManager";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getFCMToken } from "../firebase/fcmService";
+import { useDeviceLocation, fetchDeviceLocation } from "../contexts/DeviceLoc";
 
 function showToast(message) {
   if (Platform.OS === 'android') {
@@ -22,7 +23,20 @@ function showToast(message) {
 
 export default function Otp({ navigation, route }) {
     const deviceInfo = useDeviceInfo();
-    const { selectedCountry, phoneNumber, location, address } = route.params || {};
+    const { selectedCountry, phoneNumber, location: routeLocation, address: routeAddress } = route.params || {};
+    // Live device location from the shared DeviceLoc context — warmed up by
+    // Login.jsx's fire-and-forget fetch when the user requested the OTP.
+    // Route params remain as a fallback for older navigation paths.
+    const { location: ctxLocation, address: ctxAddress } = useDeviceLocation();
+    const location = ctxLocation || routeLocation;
+    const address = ctxAddress || routeAddress;
+    // Belt-and-braces: if the warm-up hasn't produced a fix yet (slow GPS /
+    // Login skipped), retry once on mount — the user still has to type the
+    // OTP, which gives it plenty of time. Fire-and-forget, never blocks.
+    useEffect(() => {
+      if (!ctxLocation) fetchDeviceLocation();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     const dispatch = useDispatch();
     const { isLoading, otpMessage, otpData, error } = useSelector((state) => state.authentication);
     const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -115,10 +129,15 @@ export default function Otp({ navigation, route }) {
             userName: phoneNumber,
             otp: code,
             device: {
-              deviceName: deviceInfo.brand,
+              deviceName: deviceInfo.modelName || deviceInfo.brand,
+              brand: deviceInfo.brand,
               deviceType: deviceInfo.deviceType,
               os: deviceInfo.osName,
+              osVersion: deviceInfo.version,
+              platform: Platform.OS,
               appVersion: deviceInfo.appVersion,
+              memory: deviceInfo.memory,
+              deviceYearClass: deviceInfo.deviceYearClass,
               fcmToken: deviceFcmToken || '',
               "location": {
               "lat": location?.coords?.latitude || 0,

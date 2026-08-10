@@ -836,7 +836,26 @@ export default class NativeCallingSDK {
   inviteToGroup(ids) {
     const list = (ids || []).map(String).filter(Boolean);
     if (!list.length) return Promise.resolve();
-    if (!this._room || !this._room.groupId) return Promise.reject(new Error('not in a group call'));
+    if (!this._room) return Promise.reject(new Error('not in a call'));
+    // Live 1:1 call → PROMOTE it to a group/conference on the media server
+    // first (same room, group record replaces the 1:1 record), then the normal
+    // invite/re-invite machinery takes over. callPromotedToGroup also lands on
+    // the peer so their SDK flips to group bookkeeping too.
+    if (!this._room.groupId) {
+      const callId = this._room.callId || this._acceptedId;
+      if (!callId) return Promise.reject(new Error('no live call to promote'));
+      list.forEach((id) => {
+        if (this._groupInvitees.indexOf(id) < 0) this._groupInvitees.push(id);
+        delete this._groupJoined[id];
+      });
+      this._log(`promoting 1:1 ${callId} to group for ${list.length} invitee(s)`);
+      return this._req('promoteToGroup', { callId, inviteeIds: list }).then((res) => {
+        const gid = String((res && res.groupId) || (`group_${callId}`));
+        if (this._room) { this._room.groupId = gid; this._room.callId = null; }
+        this._armRetry(() => this._reinviteGroup(gid));
+        return res;
+      });
+    }
     const gid = this._room.groupId;
     list.forEach((id) => {
       if (this._groupInvitees.indexOf(id) < 0) this._groupInvitees.push(id);

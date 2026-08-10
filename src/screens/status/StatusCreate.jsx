@@ -28,7 +28,7 @@ import {
   ScrollView, ActivityIndicator, Alert, Dimensions, Pressable,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
+import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
 import { Ionicons, MaterialCommunityIcons, FontAwesome5 } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useStatusSettings from '../../hooks/useStatusSettings';
@@ -68,10 +68,6 @@ export default function StatusCreate({ navigation, route }) {
   const [linkUrl, setLinkUrl] = useState('');
   const [fetching] = useState(false);
 
-  // Camera + mic permissions are cached by these hooks, so we only ever prompt
-  // once (instead of re-requesting on every Camera tap).
-  const [camPerm, requestCamPerm] = useCameraPermissions();
-  const [micPerm, requestMicPerm] = useMicrophonePermissions();
   const [, setLaunchingCam] = useState(false);
 
   // ── Camera ──────────────────────────────────────────────────────────────
@@ -81,15 +77,17 @@ export default function StatusCreate({ navigation, route }) {
     suspendAppLock();
     setLaunchingCam(true);
     try {
-      // Only prompt when we don't already hold the permission — the cached hook
-      // means a granted permission never re-prompts.
-      if (!camPerm?.granted) {
-        const r = await requestCamPerm();
-        if (!r?.granted) return Alert.alert('Permission needed', 'Please allow camera access');
-      }
-      // Video status needs the mic. Request it once up front (best-effort) so the
-      // camera doesn't pop a second dialog mid-capture.
-      if (!micPerm?.granted) { try { await requestMicPerm(); } catch {} }
+      // Shared in-context gate — a granted permission never re-prompts, a denial
+      // (including one made on the startup screen) is re-asked right here, and a
+      // permanent denial offers Settings.
+      const cameraOk = await ensurePermission(PERMISSION_IDS.CAMERA, {
+        purpose: 'Allow camera access to capture a status.',
+      });
+      if (!cameraOk) return;
+
+      // Video status needs the mic. Request it once up front (best-effort, no alert)
+      // so the camera doesn't pop a second dialog mid-capture.
+      await ensurePermission(PERMISSION_IDS.MICROPHONE, { silent: true });
 
       // Pre-cap video recording length to the configured limit so the OS
       // won't even capture a video that we'd have to reject afterwards.
@@ -119,7 +117,7 @@ export default function StatusCreate({ navigation, route }) {
       setLaunchingCam(false);
       resumeAppLock();
     }
-  }, [camPerm, requestCamPerm, micPerm, requestMicPerm, navigation, limits.maxVideoSecs, validateMediaList]);
+  }, [navigation, limits.maxVideoSecs, validateMediaList]);
 
   // ── Gallery multi-select (system photo picker) ────────────────────────────
   // Uses the OS picker, which on Android 13+ is the privacy-friendly Photo

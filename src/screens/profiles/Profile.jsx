@@ -14,6 +14,7 @@ import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { BACKEND_URL } from '@env';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
+import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -37,12 +38,11 @@ export default function Profile({ navigation }) {
 
   const requestPermission = async () => {
     if (Platform.OS === 'web') return true;
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Camera roll permission is required.');
-      return false;
-    }
-    return true;
+    // Shared in-context gate: re-asks the OS if photos was denied at startup, and
+    // routes to Settings once the OS will no longer show its dialog.
+    return ensurePermission(PERMISSION_IDS.PHOTOS, {
+      purpose: 'Allow access to your photos to choose a profile picture.',
+    });
   };
 
   const pickImage = async () => {

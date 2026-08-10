@@ -10,6 +10,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { updateGroup, viewGroup } from '../../Redux/Reducer/Group/Group.reducer';
 import * as ImagePicker from 'expo-image-picker';
 import { suspendAppLock, resumeAppLock } from '../../services/appLockGuard';
+import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../../Config/Https';
@@ -51,11 +52,10 @@ export default function EditGroup({ navigation, route }) {
   }, [currentGroup]);
 
   const pickAvatar = async () => {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Camera roll permission is required.');
-      return;
-    }
+    const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+      purpose: 'Allow access to your photos to choose a group picture.',
+    });
+    if (!photosOk) return;
     // The gallery picker backgrounds the app; suspend the app lock for the round trip.
     suspendAppLock();
     try {

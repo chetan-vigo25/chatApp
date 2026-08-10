@@ -46,13 +46,13 @@ export default function ShareIntentGate() {
   const unmountedRef = useRef(false);
 
   // expo-share-intent hands back a NEW `resetShareIntent` identity on every
-  // render (useShareIntent.js:24 defines it inline, with no useCallback) and the
-  // provider's value is a fresh object literal (ShareIntentProvider.js:16). Held
-  // in refs instead of listed as effect deps: as dependencies they re-ran this
-  // effect on every render, whose cleanup cancelled the in-flight handler while
-  // `handlingRef` blocked a fresh attempt — so on Android, where a cold start
-  // re-renders constantly, the share was cancelled forever and ShareInbox never
-  // appeared. iOS only survived because a warm app gave it a quiet window.
+  // render (useShareIntent.js defines it inline, with no useCallback) and the
+  // provider's value is a fresh object literal. Held in refs instead of listed as
+  // effect deps: as dependencies they re-ran this effect on every render, whose
+  // cleanup cancelled the in-flight handler while `handlingRef` blocked a fresh
+  // attempt — so on Android, where a cold start re-renders constantly, the share
+  // was cancelled forever and ShareInbox never appeared. iOS only survived
+  // because a warm app gave it a quiet window.
   const shareIntentRef = useRef(shareIntent);
   shareIntentRef.current = shareIntent;
   const resetShareIntentRef = useRef(resetShareIntent);
@@ -109,10 +109,10 @@ export default function ShareIntentGate() {
         //
         // navigationRef.isReady() alone is not enough: it flips true the moment
         // the container mounts, while Splash is still resolving auth. Every
-        // startup screen finishes with navigation.reset() — Splash.jsx:86,
-        // PermissionsGate.jsx:57, SyncScreen.jsx:303 — which REPLACES the whole
-        // stack. Pushing ShareInbox before that lands made the picker flash on
-        // screen and vanish into the chat list a moment later.
+        // startup screen finishes with navigation.reset() — Splash, PermissionsGate,
+        // SyncScreen — which REPLACES the whole stack. Pushing ShareInbox before
+        // that lands made the picker flash on screen and vanish into the chat list
+        // a moment later.
         //
         // Warm shares (app already open on a normal screen) settle on the first
         // check, so this costs nothing there.

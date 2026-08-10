@@ -46,7 +46,8 @@ import nativeCall from './services/nativeCallService';
 import { registerVoipPush } from './services/voipPushService';
 import {
   ringCall, cancelCall, acceptCallSignal, rejectCallSignal, endCallSignal,
-  registerCallSignalListeners, pullPendingCalls,
+  registerCallSignalListeners, pullPendingCalls, buildCallDeviceInfo,
+  conferenceInvite, conferenceMedia, conferenceState,
 } from './services/callSignalService';
 import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // CALL_PUSH_EVENTS lives in its own dep-free module; callNotifee resolves its
@@ -114,13 +115,15 @@ const MEDIA_WATCHDOG_MS = 20000;
 // so a genuine deliberate call-back rings — 8s ate too many real callbacks.
 const PEER_REDIAL_GUARD_MS = 4000;
 
-// After the media layer drops mid-call (network blip / ICE failed), how long to
-// wait for it to recover (auto ICE-restart + the SDK's own reconnect) before
-// giving up and ending the call as "Connection lost". 45s: strictly LONGER than
-// the media server's 40s reconnect grace (RECONNECT_GRACE_MS), so the client
-// never abandons a call the server was still holding for resume — giving up at
-// 30s wasted the last 10s of every recoverable drop.
-const RECONNECT_TIMEOUT_MS = 45000;
+// After the media layer drops mid-call (network blip / ICE failed / the peer
+// killed their app), how long to hold the "Reconnecting…" state before ending
+// the call as "Connection lost". Normally the SERVER ends it first: both the
+// media server's reconnect grace and the backend's disconnect grace are 5s,
+// so a peer who never comes back yields an authoritative call:ended/callEnded
+// at ~5s. This watchdog is the local fallback (kept strictly LONGER than the
+// servers' 5s so it never races a resume the server was still holding) — it
+// guarantees the call still ends even if no server signal arrives.
+const RECONNECT_TIMEOUT_MS = 7000;
 
 // When a call ends with a reason the user needs to READ (busy / unavailable /
 // blocked-by-admin / declined / failed), keep the end screen up at least this
@@ -202,6 +205,10 @@ export const CallProvider = ({ children }) => {
   // twice and fire two dials. This ref is set the instant startCall begins and
   // cleared when it finishes/aborts, so a second tap in that window is dropped.
   const startingRef = useRef(false);
+  // Latest WebRTC quality snapshot from the engine ('rtcStats', every 10s
+  // while media is up). Written into the durable call log at hang-up, then
+  // cleared so the next call can never inherit a stale snapshot.
+  const rtcStatsRef = useRef(null);
   const connectingRef = useRef(false);
   const htmlReadyRef = useRef(false);      // engine WebView HTML/SDK loaded
   const pendingConnectRef = useRef(null);  // { token, url } queued before HTML was ready
@@ -1188,12 +1195,27 @@ export const CallProvider = ({ children }) => {
         endedAt: new Date().toISOString(),
         durationSec,
       };
+      // Attach quality + device/network telemetry, then persist. The device
+      // info fetch is async, so the whole write runs detached (it was already
+      // fire-and-forget) — nothing here can delay the hang-up UX.
+      const qualitySnapshot = rtcStatsRef.current;
+      rtcStatsRef.current = null; // never leak into the next call
       // recordCall persists the durable CallLog AND (for a 1:1 outgoing leg)
       // drops the canonical WhatsApp-style "call" message into the chat thread
       // server-side, which messageService fans out to BOTH parties' chat screen
       // + chat-list summary in realtime. We no longer write a local-only
       // in-thread row here — that would duplicate the fanned-out message.
-      recordCall(payload);
+      (async () => {
+        try {
+          if (qualitySnapshot) payload.qualityMetrics = qualitySnapshot;
+          const di = await buildCallDeviceInfo().catch(() => null);
+          if (di) {
+            payload.deviceInfo = { platform: di.platform, appVersion: di.appVersion, model: di.model };
+            payload.networkInfo = { type: di.networkType, carrier: di.carrier };
+          }
+        } catch {}
+        recordCall(payload);
+      })();
 
       // Real-time push to the Calls log screen so the new incoming/outgoing
       // entry appears instantly, without waiting for a focus/refresh round-trip.
@@ -1497,8 +1519,10 @@ export const CallProvider = ({ children }) => {
         // after the signal's INCOMING dispatch — without this, the engine event
         // fell through to fresh staging, its dispatch was dropped by the reducer
         // busy-guard, and the callId was lost (accept stuck on pendingAccept).
-        const stagedFresh = !payload?.isGroup
-          && stagedIncomingRef.current.peerId
+        // Group/conference included — the invitee's engine incomingGroupCall
+        // races the app-socket ring the same way a 1:1's does (both `from`s
+        // are the inviter, so the peer-match holds for either shape).
+        const stagedFresh = stagedIncomingRef.current.peerId
           && payload?.from?.id != null
           && String(payload.from.id) === String(stagedIncomingRef.current.peerId)
           && (Date.now() - stagedIncomingRef.current.ts) < 45000;
@@ -1511,6 +1535,9 @@ export const CallProvider = ({ children }) => {
           if (realId && snap.pendingAccept) {
             // isGroup/peerId ride along for the native engine's direct-accept
             // path (the WebView engine ignores extra fields — wire superset).
+            // Clear the flag so the state-driven flush effect below can't
+            // double-send this ACCEPT.
+            dispatch({ type: ACT.SET_FLAG, key: 'pendingAccept', value: false });
             sendCmd({ cmd: CMD.ACCEPT, callId: realId, media: snap.media, speaker: snap.media === 'video' || snap.isGroup, isGroup: !!snap.isGroup, peerId: snap.peer?.id || null });
             armMediaWatchdog();
           }
@@ -1819,6 +1846,11 @@ export const CallProvider = ({ children }) => {
         } else if (payload?.message) {
           Alert.alert('Screen share', payload.message);
         }
+        break;
+      }
+      case 'rtcStats': {
+        // Periodic quality snapshot from the engine — keep the latest only.
+        if (payload && typeof payload === 'object') rtcStatsRef.current = payload;
         break;
       }
       case 'rejected': { finalizeEnd('rejected'); break; }
@@ -2259,6 +2291,32 @@ export const CallProvider = ({ children }) => {
     }
   }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, finalizeEnd, armMediaWatchdog, armConnectWatchdog]);
 
+  // ── pendingAccept flush (state-driven, race-proof) ─────────────────────────
+  // The engine 'incoming' handler reads stateRef, which can be one commit
+  // BEHIND: accept() dispatches pendingAccept and the engine event lands in the
+  // SAME tick, so the handler saw pendingAccept:false, never sent CMD.ACCEPT,
+  // and the callee sat on "Connecting…" until the 30s watchdog killed the call
+  // (log-proven on a conference invitee: `reconciled {pendingAccept: false}`
+  // then `watchdog {pendingAccept: true}`). This effect runs AFTER the commit,
+  // so whenever an accepted call has both the flag and the engine callId it
+  // fires the ACCEPT exactly once (the inline reconcile path clears the flag
+  // before sending, so the two can never double-send).
+  useEffect(() => {
+    if (!state.pendingAccept || !state.callId) return;
+    if (state.status !== CALL_STATUS.INCOMING || !state.accepted) return;
+    if (__DEV__) console.log('[CALL][APP][accept] pendingAccept flush (effect) → engine CMD.ACCEPT', { callId: state.callId });
+    dispatch({ type: ACT.SET_FLAG, key: 'pendingAccept', value: false });
+    sendCmd({
+      cmd: CMD.ACCEPT,
+      callId: state.callId,
+      media: state.media,
+      speaker: state.media === 'video' || state.isGroup,
+      isGroup: !!state.isGroup,
+      peerId: state.peer?.id || null,
+    });
+    armMediaWatchdog();
+  }, [state.pendingAccept, state.callId, state.status, state.accepted, state.media, state.isGroup, state.peer, sendCmd, armMediaWatchdog]);
+
   const reject = useCallback(() => {
     const snap = stateRef.current;
     if (snap.callId) sendCmd({ cmd: CMD.REJECT, callId: snap.callId });
@@ -2284,6 +2342,10 @@ export const CallProvider = ({ children }) => {
     // (the reverse direction — OS mute → app — is handled by onToggleMute).
     const ckId = snap.signalId || snap.callId;
     if (ckId) nativeCall.setMuted(ckId, !next);
+    // Conference: mirror the mute into the backend roster so every tile shows it.
+    if (snap.isConference && snap.signalId) {
+      conferenceMedia({ callId: snap.signalId, audioEnabled: next }).catch(() => {});
+    }
   }, [sendCmd]);
 
   const toggleCamera = useCallback(async () => {
@@ -2299,10 +2361,18 @@ export const CallProvider = ({ children }) => {
       const ok = await ensureMediaPermissions('video');
       if (ok !== true) return;
       sendCmd({ cmd: CMD.TOGGLE_CAMERA, on: true });
+      if (snap.isConference && snap.signalId) {
+        conferenceMedia({ callId: snap.signalId, videoEnabled: true }).catch(() => {});
+      }
       return;
     }
     dispatch({ type: ACT.SET_FLAG, key: 'cameraOn', value: next });
     sendCmd({ cmd: CMD.TOGGLE_CAMERA, on: next });
+    // Conference: publish the per-participant video state so peers' tiles flip
+    // between live video and the avatar tile.
+    if (snap.isConference && snap.signalId) {
+      conferenceMedia({ callId: snap.signalId, videoEnabled: next }).catch(() => {});
+    }
   }, [sendCmd, ensureMediaPermissions]);
 
   const switchCamera = useCallback(() => {
@@ -2327,7 +2397,11 @@ export const CallProvider = ({ children }) => {
   // once-only (idempotent), so re-ringing it would be silently dropped.
   const inviteMoreToCall = useCallback((peersToAdd) => {
     const snap = stateRef.current;
-    if (!snap.isGroup) return 0;
+    // Conference conversion: a LIVE 1:1 call may also add people — the engine
+    // promotes the SFU room to a group and the backend converts the signaling
+    // call into a conference (same callId, host = original caller).
+    const liveOneToOne = !snap.isGroup && snap.status === CALL_STATUS.ACTIVE;
+    if (!snap.isGroup && !liveOneToOne) return 0;
     if (snap.status !== CALL_STATUS.ACTIVE && !snap.accepted && snap.status !== CALL_STATUS.OUTGOING) return 0;
     // "Existing" = ONLY people currently on the live roster (joined or still
     // ringing) + self. NOT the original snap.peers invite list: someone who
@@ -2349,22 +2423,47 @@ export const CallProvider = ({ children }) => {
       if (room === 0) Alert.alert('Group call', `This call is full (up to ${MAX_PARTICIPANTS} people).`);
       return 0;
     }
-    if (__DEV__) console.log('[CALL][APP] add-participant →', invitees.map((p) => p.id));
-    // 1) media-server invite (incomingGroupCall + engine re-invite loop)
+    if (__DEV__) console.log('[CALL][APP] add-participant →', invitees.map((p) => p.id), { conference: true });
+    // 1) media-server invite (promotes a 1:1 room to group on first use, then
+    //    incomingGroupCall + the engine re-invite loop)
     sendCmd({ cmd: CMD.INVITE_TO_GROUP, ids: invitees.map((p) => p.id) });
-    // 2) reliable app-socket ring + FCM wake push, on a fresh signaling id
-    const inviteSigId = `sig_${myId || 'me'}_${Date.now()}`;
-    inviteSignalsRef.current.push({ sigId: inviteSigId, ids: invitees.map((p) => p.id) });
-    ringCall({
-      callId: inviteSigId,
-      toUserIds: invitees.map((p) => p.id),
-      media: snap.media,
-      isGroup: true,
-      groupName: snap.groupName,
-    });
-    invitees.forEach((p) => notifyIncomingCall({ peerId: p.id, media: snap.media, callId: inviteSigId }));
-    // 3) show them on the roster as ringing (joined flips on their stream), and
-    //    re-arm the ring-window sweep so a no-answer invitee is dropped again
+    // 2) backend CONFERENCE invite on the ORIGINAL signaling callId — the
+    //    server converts the call to a conference (host = original caller),
+    //    rings + pushes every invitee, arms per-invite ring timers and
+    //    broadcasts the authoritative roster. Busy invitees come back in the
+    //    ack so the UI can say "<name> is on another call".
+    const sigId = snap.signalId;
+    if (sigId) {
+      conferenceInvite({
+        callId: sigId,
+        invitedUserIds: invitees.map((p) => p.id),
+        operationId: `inv_${myId || 'me'}_${Date.now()}`,
+      }).then((ack) => {
+        if (ack && Array.isArray(ack.busyUserIds) && ack.busyUserIds.length) {
+          const names = ack.busyUserIds
+            .map((id) => (invitees.find((p) => String(p.id) === String(id))?.name) || 'Someone');
+          Alert.alert('Conference call', `${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} currently on another call.`);
+        }
+      }).catch(() => {});
+    } else {
+      // No signaling id (edge: engine-only call) — legacy fresh-sig ring.
+      const inviteSigId = `sig_${myId || 'me'}_${Date.now()}`;
+      inviteSignalsRef.current.push({ sigId: inviteSigId, ids: invitees.map((p) => p.id) });
+      ringCall({
+        callId: inviteSigId,
+        toUserIds: invitees.map((p) => p.id),
+        media: snap.media,
+        isGroup: true,
+        groupName: snap.groupName,
+      });
+      invitees.forEach((p) => notifyIncomingCall({ peerId: p.id, media: snap.media, callId: inviteSigId }));
+    }
+    // 3) optimistic roster: show invitees as ringing NOW; the backend roster
+    //    broadcast reconciles the truth moments later.
+    if (liveOneToOne) {
+      dispatch({ type: ACT.SET_FLAG, key: 'isConference', value: true });
+      dispatch({ type: ACT.SET_FLAG, key: 'isGroup', value: true });
+    }
     invitees.forEach((p) => dispatch({ type: ACT.PARTICIPANT_INVITED, peer: p }));
     armGroupRingSweep();
     return invitees.length;
@@ -2729,7 +2828,14 @@ export const CallProvider = ({ children }) => {
     const notificationOnly = Platform.OS === 'android'
       && !opts.fromAccept && !fullScreenLaunch
       && !lockedAtRing;
-    stagedIncomingRef.current = { peerId: isGroup ? null : callerId, ts: Date.now() };
+    // Staged marker for the engine-'incoming' reconcile race. GROUP/CONFERENCE
+    // included: a foreground invitee gets the app-socket ring and the media
+    // server's incomingGroupCall within the SAME tick, and without the marker
+    // the engine event fell through to fresh staging (dropped by the reducer
+    // busy-guard) — losing the engine callId and hanging accept on
+    // pendingAccept ("Connecting…" forever). Both events carry the INVITER as
+    // `from`, so the same peer-match works for group and 1:1 alike.
+    stagedIncomingRef.current = { peerId: callerId, ts: Date.now() };
     dispatch({
       type: ACT.INCOMING,
       callId: null,                       // WebRTC id arrives via the engine
@@ -2741,6 +2847,10 @@ export const CallProvider = ({ children }) => {
       groupId: payload?.groupId || null,
       groupName: payload?.groupName || null,
       media: payload?.media || 'audio',
+      // Conference invite: renders "Conference call" everywhere, camera
+      // defaults OFF, roster comes from the backend after joining.
+      isConference: !!payload?.isConference,
+      hostId: payload?.conferenceHost || null,
       chatId: isGroup ? null : deriveChatId(myId, callerId),
       nowMs: Date.now(),
       notificationOnly,
@@ -3073,11 +3183,54 @@ export const CallProvider = ({ children }) => {
         media: inv.media || inv.callType || 'audio',
         members: Array.isArray(inv.members) ? inv.members : [],
         isGroup: !!inv.isGroup,
+        isConference: !!inv.isConference,
+        conferenceHost: inv.conferenceHost || null,
         groupId: inv.groupId || null,
         groupName: inv.groupName || null,
       });
     } catch (_) { /* best-effort recovery */ }
   }, [onSignalIncoming]);
+
+  // ── Conference roster handlers (server-authoritative) ─────────────────────
+  // The backend broadcasts the full roster on every change; clients render
+  // exactly what it says. Names/avatars are resolved locally (contact
+  // directory / already-known participants) — the wire carries only ids.
+  const onConferenceRoster = useCallback((payload) => {
+    const snap = stateRef.current;
+    if (!payload?.callId || String(payload.callId) !== String(snap.signalId || '')) return;
+    if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    // Only a FULL roster payload syncs state — the granular joined/updated
+    // events (no participants array) are informational; the roster broadcast
+    // that always follows them carries the truth.
+    if (!Array.isArray(payload.participants)) return;
+    dispatch({ type: ACT.CONFERENCE_SYNC, roster: payload, selfId: myId ? String(myId) : null });
+  }, [myId]);
+
+  const onConferenceConverted = useCallback((payload) => {
+    // Our live 1:1 just became a conference (the OTHER side added someone).
+    onConferenceRoster(payload);
+  }, [onConferenceRoster]);
+
+  const onConferenceHostChanged = useCallback((payload) => {
+    const snap = stateRef.current;
+    if (!payload?.callId || String(payload.callId) !== String(snap.signalId || '')) return;
+    dispatch({ type: ACT.SET_FLAG, key: 'hostId', value: payload.hostId ? String(payload.hostId) : null });
+  }, []);
+
+  const onConferenceParticipantLeft = useCallback((payload) => {
+    const snap = stateRef.current;
+    if (!payload?.callId || String(payload.callId) !== String(snap.signalId || '')) return;
+    // Tell the engine to stop any re-invite loop for them; the roster
+    // broadcast that follows removes the tile.
+    if (payload.userId) sendCmd({ cmd: CMD.STOP_INVITE, id: String(payload.userId) });
+  }, [sendCmd]);
+
+  const onConferenceEnded = useCallback((payload) => {
+    const snap = stateRef.current;
+    if (!payload?.callId || String(payload.callId) !== String(snap.signalId || '')) return;
+    if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    finalizeEnd('completed');
+  }, [finalizeEnd]);
 
   // Attach the server→client call listeners, re-attaching whenever the socket
   // (re)connects so a fresh underlying instance keeps them.
@@ -3092,6 +3245,13 @@ export const CallProvider = ({ children }) => {
       onUnavailable: onSignalUnavailable,
       onTimeout: onSignalTimeout,
       onCancelledElsewhere: onSignalCancelledElsewhere,
+      onConferenceConverted,
+      onConferenceRoster,
+      onConferenceParticipantJoined: onConferenceRoster, // roster follows; joined event is informational
+      onConferenceParticipantLeft,
+      onConferenceParticipantUpdated: onConferenceRoster,
+      onConferenceHostChanged,
+      onConferenceEnded,
     };
     let unsub = () => {};
     let wasConnected = false;
@@ -3103,11 +3263,21 @@ export const CallProvider = ({ children }) => {
         // On every (re)connect while IDLE, recover any still-ringing invite the
         // device may have missed while offline / killed (XR-2 / APP-5).
         pullStillRingingInvites();
+        // Mid-conference reconnect: pull the authoritative roster so a socket
+        // gap can never leave the grid stale.
+        const snap = stateRef.current;
+        if (snap.isConference && snap.signalId
+            && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
+          conferenceState({ callId: snap.signalId }).then((ack) => {
+            if (ack?.active && ack.roster) onConferenceRoster(ack.roster);
+            else if (ack?.active === false) finalizeEnd('completed');
+          }).catch(() => {});
+        }
       }
       wasConnected = connected;
     });
     return () => { unsub(); unsubState(); };
-  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites]);
+  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, finalizeEnd]);
 
   // ---- incoming call from an FCM PUSH (callee offline / app backgrounded) ----
   // The push wakes the device; we reuse onSignalIncoming (which shows the ring +
@@ -3125,6 +3295,7 @@ export const CallProvider = ({ children }) => {
     isGroup: false,
     groupId: null,
     groupName: null,
+    isConference: data?.isConference === '1' || data?.isConference === true,
   }), []);
 
   const onPushIncoming = useCallback((data) => {

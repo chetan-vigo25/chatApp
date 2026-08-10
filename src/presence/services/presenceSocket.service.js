@@ -154,6 +154,7 @@ export const onPresenceConnected = (cb) => on('presence:connected', cb);
 export const onPresenceUpdateResponse = (cb) => on('presence:update:response', cb);
 export const onPresenceUpdate = (cb) => on('presence:update', cb);
 export const onPresenceSubscribedUpdate = (cb) => on('presence:subscribed:update', cb);
+export const onPresenceBulk = (cb) => on('presence:bulk', cb);
 export const onManualResponse = (cb) => on('presence:manual:response', cb);
 export const onCustomStatusUpdated = (cb) => on('presence:status:custom:updated', cb);
 export const onStatusCleared = (cb) => on('presence:status:cleared', cb);

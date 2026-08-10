@@ -6,6 +6,7 @@ import {
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
+import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import { BACKEND_URL } from "@env";
 import { viewTicket, replyTicket, SUPPORT_STATUS_META } from "../../Redux/Services/Support/Support.Services";
 import { getSocket } from "../../Redux/Services/Socket/socket";
@@ -70,8 +71,10 @@ export default function TicketChat({ navigation, route }) {
 
   const pickImage = async () => {
     try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) { Alert.alert("Permission needed", "Allow photo access to attach a file."); return; }
+      const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+        purpose: 'Allow photo access to attach a file to this ticket.',
+      });
+      if (!photosOk) return;
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.7 });
       if (!result.canceled && result.assets?.[0]) {
         const a = result.assets[0];

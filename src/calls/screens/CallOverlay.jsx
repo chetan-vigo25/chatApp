@@ -18,6 +18,7 @@ import CallParticipantsGrid from '../components/CallParticipantsGrid';
 import PulsingRing from '../components/PulsingRing';
 import CallMiniBanner from '../components/CallMiniBanner';
 import AddParticipantSheet from '../components/AddParticipantSheet';
+import ConferenceAddPeopleSheet from '../components/ConferenceAddPeopleSheet';
 
 const END_TEXT = {
   completed: 'Call ended',
@@ -128,19 +129,33 @@ export default function CallOverlay() {
   })();
 
   // "Add participant" is available on a LIVE group call (host ringing included —
-  // the host is already in the room while others ring).
-  const canAddParticipants = isGroup
-    && (status === CALL_STATUS.ACTIVE || accepted || status === CALL_STATUS.OUTGOING);
+  // the host is already in the room while others ring) — AND on a live 1:1
+  // call, where adding someone CONVERTS it into a conference (host = original
+  // caller). Group-origin calls keep the group-member picker; ad-hoc calls use
+  // the registered-contacts "Add people" sheet.
+  const canAddParticipants = (isGroup
+    && (status === CALL_STATUS.ACTIVE || accepted || status === CALL_STATUS.OUTGOING))
+    || (!isGroup && status === CALL_STATUS.ACTIVE);
   const addSheet = canAddParticipants ? (
-    <AddParticipantSheet
-      visible={showAddSheet}
-      onClose={() => setShowAddSheet(false)}
-      groupId={call?.groupId}
-      // Live roster only (joined or still ringing) — NOT the original invite
-      // list, so a member who declined/missed/dropped can be re-added.
-      existingIds={Object.keys(call?.participants || {})}
-      onInvite={(members) => inviteMoreToCall?.(members)}
-    />
+    call?.groupId ? (
+      <AddParticipantSheet
+        visible={showAddSheet}
+        onClose={() => setShowAddSheet(false)}
+        groupId={call?.groupId}
+        // Live roster only (joined or still ringing) — NOT the original invite
+        // list, so a member who declined/missed/dropped can be re-added.
+        existingIds={Object.keys(call?.participants || {})}
+        onInvite={(members) => inviteMoreToCall?.(members)}
+      />
+    ) : (
+      <ConferenceAddPeopleSheet
+        visible={showAddSheet}
+        onClose={() => setShowAddSheet(false)}
+        participants={gridParticipants}
+        existingIds={Object.keys(call?.participants || {})}
+        onInvite={(members) => inviteMoreToCall?.(members)}
+      />
+    )
   ) : null;
   // The minimize affordance shows once a call is connecting/active or dialing
   // out (same gate as the controls) — NOT on an unanswered incoming ring, which
@@ -199,8 +214,18 @@ export default function CallOverlay() {
   // Saved contact name > mobile number > backend name.
   const peerDisplayName = resolveName(peer?.id, peer?.name, peer?.mobile || peer?.phone || peer?.mobileNumber) || peer?.name || 'Unknown';
   const joined = isGroup ? joinedCount(call?.participants) : 0;
-  const groupTitle = call?.groupName
-    || (isGroup ? `Group ${isVideo ? 'video ' : ''}call` : peerDisplayName);
+  const isConference = !!call?.isConference;
+  // Conference title: "<name> & N other(s)" (host/first peer + everyone else).
+  const conferenceTitle = (() => {
+    const others = Object.values(call?.participants || {}).filter((p) => p && p.id);
+    const first = others.find((p) => call?.hostId && String(p.id) === String(call.hostId)) || others[0] || peer;
+    const firstName = resolveName(first?.id, first?.name, null) || first?.name || peerDisplayName;
+    const n = Math.max(others.length - 1, 0);
+    return n > 0 ? `${firstName} & ${n} other${n > 1 ? 's' : ''}` : firstName;
+  })();
+  const groupTitle = isConference
+    ? conferenceTitle
+    : (call?.groupName || (isGroup ? `Group ${isVideo ? 'video ' : ''}call` : peerDisplayName));
 
   const subtitle = (() => {
     // Mid-call network drop (APP-6): while the media layer is re-establishing,
@@ -217,11 +242,13 @@ export default function CallOverlay() {
       return call?.callId ? 'Ringing…' : 'Calling…';
     }
     if (status === CALL_STATUS.INCOMING) {
+      // Conference invites must NEVER read as a normal 1:1/group call.
+      if (isConference) return 'Conference call';
       if (isGroup) return `Incoming group ${isVideo ? 'video' : 'voice'} call`;
       return isVideo ? 'Incoming video call' : 'Incoming voice call';
     }
     if (status === CALL_STATUS.ACTIVE && isGroup) {
-      return `${joined + 1} in call`;
+      return isConference ? `Conference call · ${joined + 1} connected` : `${joined + 1} in call`;
     }
     // A specific server/engine message (e.g. "User is unavailable right now.")
     // wins over the generic per-reason label.

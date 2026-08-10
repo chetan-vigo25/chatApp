@@ -51,6 +51,10 @@ export const initialCallState = {
   // or null in silence. Drives the speaking highlight on a group participant tile.
   activeSpeakerId: null,
   isGroup: false,
+  // Multi-party CONFERENCE (converted from 1:1 / invited into one). Renders
+  // with "Conference call" labels everywhere; the backend roster is the truth.
+  isConference: false,
+  hostId: null,          // current conference host (migrates when host leaves)
   groupId: null,         // app-side group/thread id when the call originates from a group
   groupName: null,
   media: 'audio',        // 'audio' | 'video'
@@ -97,6 +101,9 @@ export const ACT = {
   PARTICIPANT_LEFT: 'PARTICIPANT_LEFT',
   PARTICIPANT_REMOVED: 'PARTICIPANT_REMOVED',
   ACTIVE_SPEAKER: 'ACTIVE_SPEAKER',
+  // Server-authoritative conference roster sync (call:conference:roster) —
+  // merges statuses/media flags into `participants`, sets host + flags.
+  CONFERENCE_SYNC: 'CONFERENCE_SYNC',
   SET_FLAG: 'SET_FLAG',
   CAMERA_CHANGED: 'CAMERA_CHANGED',
   NEEDS_UNMUTE: 'NEEDS_UNMUTE',
@@ -171,7 +178,7 @@ export function callReducer(state, action) {
     case ACT.INCOMING: {
       const {
         callId, signalId, awaitingEngine, peer, peers, media, chatId, isGroup, groupId, groupName, nowMs,
-        notificationOnly,
+        notificationOnly, isConference, hostId,
       } = action;
       // Same-caller duplicate while ALREADY ringing = the sibling of the ring we
       // staged (app-socket signal and engine 'incoming' land within ms of each
@@ -205,12 +212,16 @@ export function callReducer(state, action) {
         peer: peer || list[0] || null,
         peers: list,
         participants: rosterFrom(list),
-        isGroup: group,
+        isGroup: group || !!isConference,
+        isConference: !!isConference,
+        hostId: hostId ? String(hostId) : null,
         groupId: groupId || null,
         groupName: groupName || null,
         media,
         chatId: chatId || null,
-        cameraOn: media === 'video',
+        // Conference: WhatsApp-style camera default OFF on join — the user
+        // opts in with the video toggle. 1:1 video keeps the legacy default.
+        cameraOn: isConference ? false : media === 'video',
         speakerOn: media === 'video' || group,
         startedAt: nowMs || null,
         notificationOnly: !!notificationOnly,
@@ -309,6 +320,38 @@ export function callReducer(state, action) {
       const next = { ...state.participants };
       delete next[id];
       return { ...state, participants: next };
+    }
+    case ACT.CONFERENCE_SYNC: {
+      // Merge the backend roster into `participants` WITHOUT losing names/
+      // avatars we already resolved locally. Terminal members (declined/missed/
+      // left…) are dropped from the grid; RINGING/INVITED render as connecting.
+      const roster = action.roster || {};
+      const list = Array.isArray(roster.participants) ? roster.participants : [];
+      const selfId = action.selfId ? String(action.selfId) : null;
+      const next = {};
+      list.forEach((rp) => {
+        const id = String(rp.userId);
+        if (selfId && id === selfId) return; // grid shows self separately
+        const live = rp.status === 'CONNECTED' || rp.status === 'RINGING' || rp.status === 'INVITED';
+        if (!live) return;
+        const prev = state.participants[id] || {};
+        next[id] = {
+          id,
+          name: prev.name || (action.names && action.names[id]) || 'Member',
+          avatar: prev.avatar || null,
+          joined: rp.status === 'CONNECTED',
+          confStatus: rp.status,
+          audioEnabled: rp.audioEnabled !== false,
+          videoEnabled: !!rp.videoEnabled,
+        };
+      });
+      return {
+        ...state,
+        isConference: true,
+        isGroup: true, // conference reuses the multi-party grid/controls
+        hostId: roster.hostId ? String(roster.hostId) : state.hostId,
+        participants: next,
+      };
     }
     case ACT.ACTIVE_SPEAKER: {
       // Ignore once the call is over — a late relay must not resurrect a highlight.

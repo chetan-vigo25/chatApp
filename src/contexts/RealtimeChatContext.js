@@ -2079,6 +2079,10 @@ const reducer = (state, action) => {
       const { userId, presence } = action.payload || {};
       if (!userId) return state;
 
+      // A status-only update (no lastSeen in payload) must not wipe a
+      // previously known lastSeen — keep the stored one so the header can
+      // still show "last seen …" while offline.
+      const prevLastSeen = state.presenceByUser[userId]?.lastSeen || null;
       const nextPresence = {
         status: normalizeStatus(
           presence?.status ||
@@ -2086,7 +2090,7 @@ const reducer = (state, action) => {
           presence?.effectiveStatus ||
           presence?.manualStatus
         ),
-        lastSeen: presence?.lastSeen || presence?.last_seen || null,
+        lastSeen: presence?.lastSeen || presence?.last_seen || prevLastSeen,
         customStatus: presence?.customStatus || presence?.manualCustomStatus || null,
         updatedAt: presence?.updatedAt || presence?.lastUpdated || Date.now(),
       };
@@ -2576,9 +2580,11 @@ export function RealtimeChatProvider({ children }) {
     return () => { offAck(); offFailure(); };
   }, []);
 
-  // Stream realtime location + device telemetry to the backend once the user
-  // is authenticated (and the socket is up). Surfaced in the admin panel.
-  useLocationTracking(!!state.currentUserId);
+  // Continuous location streaming is intentionally DISABLED (product + store
+  // policy decision, Aug-2026): location is captured only as a one-shot at
+  // sign-in and when the user places a call (see callSignalService). Keeping
+  // the hook mounted-but-off preserves the wiring if it's ever needed again.
+  useLocationTracking(false);
 
   // Track app usage (foreground time, opens) + screen behaviour, flushed as
   // daily rollups to the backend. Surfaced in the admin panel.
@@ -2797,7 +2803,9 @@ export function RealtimeChatProvider({ children }) {
         }
 
         // Auto-download incoming group media (background chats included).
-        if (!(grpSenderId && currentUserIdRef.current && String(grpSenderId) === String(currentUserIdRef.current))) {
+        // Never for view-once — bytes only via the single-use open flow.
+        if (!source?.isViewOnce
+          && !(grpSenderId && currentUserIdRef.current && String(grpSenderId) === String(currentUserIdRef.current))) {
           maybeAutoDownloadIncomingMedia(source);
         }
 
@@ -2858,8 +2866,10 @@ export function RealtimeChatProvider({ children }) {
       }
 
       // Auto-download incoming media per the user's per-network matrix — this
-      // path also covers chats whose screen is not open.
-      if (!isSelf) {
+      // path also covers chats whose screen is not open. NEVER for view-once:
+      // the bytes may only be fetched via the single-use /view-once/open flow
+      // (auto-downloading here surfaced the full media in the thread).
+      if (!isSelf && !source?.isViewOnce) {
         maybeAutoDownloadIncomingMedia(source);
       }
 
@@ -2942,14 +2952,19 @@ export function RealtimeChatProvider({ children }) {
           timestamp: Number.isFinite(ts) ? ts : Date.now(),
           createdAt: normalized.createdAt,
           synced: 1,
-          mediaUrl: source?.mediaUrl || null,
+          // View-once rows are metadata-only: no url/preview/mediaId may ever
+          // persist for them (the bubble is the ①-metadata layout).
+          mediaUrl: source?.isViewOnce ? null : (source?.mediaUrl || null),
           // Broadcast (and some server) payloads only send messageType/type, not
           // mediaType. Derive it so media UI/branches stay consistent on reload.
           mediaType: source?.mediaType || source?.fileCategory
             || (['image', 'video', 'audio', 'file', 'album'].includes(source?.messageType || source?.type)
               ? (source?.messageType || source?.type) : null),
-          previewUrl: source?.mediaThumbnailUrl || source?.previewUrl || null,
-          mediaId: source?.mediaId || null,
+          previewUrl: source?.isViewOnce ? null : (source?.mediaThumbnailUrl || source?.previewUrl || null),
+          mediaId: source?.isViewOnce ? null : (source?.mediaId || null),
+          // View Once — persisted into the payload JSON by the upsert.
+          isViewOnce: Boolean(source?.isViewOnce),
+          viewOnce: (source?.viewOnce && typeof source.viewOnce === 'object') ? source.viewOnce : null,
           mediaMeta: source?.mediaMeta || null,
           // Album fields — survive the SQLite round-trip via payload JSON
           mediaGroupId: source?.mediaGroupId || null,
@@ -3851,6 +3866,52 @@ export function RealtimeChatProvider({ children }) {
     };
     socket.on('message:read:upto', onPeerReadWatermark);
 
+    // ─── VIEW ONCE — status flips ─────────────────────────────────────────
+    // viewonce:opened → sender bubble flips to "Opened" (and the opener's own
+    // linked devices lock their copy). viewonce:expired → media deleted /
+    // 14-day window elapsed. Both persist into the row's payload JSON via the
+    // serialized writer, then nudge any open thread to re-read SQLite.
+    const onViewOnceOpened = (payload) => {
+      const data = payload?.data || payload || {};
+      const messageId = normalizeId(data?.messageId);
+      if (!messageId) return;
+      const selfId = normalizeId(currentUserIdRef.current);
+      const patch = {
+        openedCount: data.openedCount != null ? Number(data.openedCount) : undefined,
+        totalRecipients: data.totalRecipients != null ? Number(data.totalRecipients) : undefined,
+        ...(selfId && normalizeId(data.userId) === selfId
+          ? { myStatus: 'opened', openedAt: data.openedAt || new Date().toISOString() }
+          : {}),
+      };
+      // Try the server id first; the sender's row may still be keyed only by
+      // its client id (ack race) — the second call no-ops when the first hit.
+      const clientId = normalizeId(data?.clientMessageId);
+      ChatDatabase.updateMessageViewOnce(messageId, patch)
+        .catch(() => {})
+        .then(() => (clientId && clientId !== messageId
+          ? ChatDatabase.updateMessageViewOnce(clientId, patch).catch(() => {})
+          : null))
+        .finally(() => {
+          if (data.chatId) DeviceEventEmitter.emit('chat:thread:update', { chatId: normalizeId(data.chatId) });
+        });
+    };
+    const onViewOnceExpired = (payload) => {
+      const data = payload?.data || payload || {};
+      const messageId = normalizeId(data?.messageId);
+      if (!messageId) return;
+      const clientId = normalizeId(data?.clientMessageId);
+      ChatDatabase.updateMessageViewOnce(messageId, { mediaDeleted: true, myStatus: 'expired' })
+        .catch(() => {})
+        .then(() => (clientId && clientId !== messageId
+          ? ChatDatabase.updateMessageViewOnce(clientId, { mediaDeleted: true, myStatus: 'expired' }).catch(() => {})
+          : null))
+        .finally(() => {
+          if (data.chatId) DeviceEventEmitter.emit('chat:thread:update', { chatId: normalizeId(data.chatId) });
+        });
+    };
+    socket.on('viewonce:opened', onViewOnceOpened);
+    socket.on('viewonce:expired', onViewOnceExpired);
+
     socket.on('message:edit:response', onMessageEditedForChatList);
     socket.on('message:edited', onMessageEditedForChatList);
     socket.on('chat:info:response', onChatInfoResponse);
@@ -4031,12 +4092,15 @@ export function RealtimeChatProvider({ children }) {
           timestamp: ts,
           createdAt,
           synced: 1,
-          mediaUrl: data?.mediaUrl || null,
+          // View-once rows are metadata-only — no url/preview/mediaId.
+          mediaUrl: data?.isViewOnce ? null : (data?.mediaUrl || null),
           mediaType: data?.mediaType || data?.fileCategory
             || (['image', 'video', 'audio', 'file', 'album'].includes(data?.messageType || data?.type)
               ? (data?.messageType || data?.type) : null),
-          previewUrl: data?.mediaThumbnailUrl || data?.previewUrl || null,
-          mediaId: data?.mediaId || null,
+          previewUrl: data?.isViewOnce ? null : (data?.mediaThumbnailUrl || data?.previewUrl || null),
+          mediaId: data?.isViewOnce ? null : (data?.mediaId || null),
+          isViewOnce: Boolean(data?.isViewOnce),
+          viewOnce: (data?.viewOnce && typeof data.viewOnce === 'object') ? data.viewOnce : null,
           mediaMeta: data?.mediaMeta || null,
           // Album fields — survive the SQLite round-trip via payload JSON
           mediaGroupId: data?.mediaGroupId || null,
@@ -4640,6 +4704,8 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('chat:list:update', onChatListUpdate),
       () => socket.off('broadcast:channel_updated', onBroadcastChannelUpdated),
       () => socket.off('message:read:upto', onPeerReadWatermark),
+      () => socket.off('viewonce:opened', onViewOnceOpened),
+      () => socket.off('viewonce:expired', onViewOnceExpired),
       () => socket.off('message:edit:response', onMessageEditedForChatList),
       () => socket.off('message:edited', onMessageEditedForChatList),
       () => socket.off('chat:info:response', onChatInfoResponse),

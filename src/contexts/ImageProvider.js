@@ -5,6 +5,7 @@ import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
 import { Platform, InteractionManager } from 'react-native';
 import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
+import { ensurePermission, PERMISSION_IDS } from '../features/permissions/ensurePermission';
 
 const ImageContext = createContext();
 
@@ -97,6 +98,13 @@ export const ImageProvider = ({ children }) => {
     suspendAppLock();
     try {
       if (mediaType === 'document') {
+        // Files/storage is only a real permission on Android 8–12; elsewhere the
+        // adapter reports "unavailable" and this resolves true without a dialog.
+        const filesOk = await ensurePermission(PERMISSION_IDS.FILES, {
+          purpose: 'Allow file access to attach a document.',
+        });
+        if (!filesOk) return null;
+
         // pick document
         const result = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
         if (result.canceled) return null;
@@ -127,12 +135,12 @@ export const ImageProvider = ({ children }) => {
         return file;
       }
 
-      // Request permission for media library (images/videos)
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== 'granted') {
-        alert('Permission to access gallery is required!');
-        return null;
-      }
+      // Media library (images/videos). Re-asks the OS here even if it was denied
+      // on the startup screen, and offers Settings once the OS stops asking.
+      const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+        purpose: 'Allow access to your photos and videos to share them in chats.',
+      });
+      if (!photosOk) return null;
 
       const mediaOptions = {
         mediaTypes: mediaType === 'video' ? MEDIA_TYPES.video : MEDIA_TYPES.image,
@@ -211,6 +219,11 @@ export const ImageProvider = ({ children }) => {
     suspendAppLock();
     try {
       if (mediaType === 'document') {
+        const filesOk = await ensurePermission(PERMISSION_IDS.FILES, {
+          purpose: 'Allow file access to attach documents.',
+        });
+        if (!filesOk) return null;
+
         const result = await DocumentPicker.getDocumentAsync({
           type: '*/*',
           copyToCacheDirectory: true,
@@ -226,11 +239,10 @@ export const ImageProvider = ({ children }) => {
         return files.length ? files : null;
       }
 
-      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (status !== 'granted') {
-        alert('Permission to access gallery is required!');
-        return null;
-      }
+      const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+        purpose: 'Allow access to your photos and videos to share them in chats.',
+      });
+      if (!photosOk) return null;
 
       const result = await launchImageLibrarySafe({
         mediaTypes: mediaType === 'video'

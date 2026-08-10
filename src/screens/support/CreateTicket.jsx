@@ -5,6 +5,7 @@ import {
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import * as ImagePicker from "expo-image-picker";
+import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import { SUPPORT_CATEGORIES, createTicket } from "../../Redux/Services/Support/Support.Services";
 
 export default function CreateTicket({ navigation, route }) {
@@ -27,11 +28,10 @@ export default function CreateTicket({ navigation, route }) {
 
   const pickImage = async () => {
     try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert("Permission needed", "Allow photo access to attach a screenshot.");
-        return;
-      }
+      const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
+        purpose: 'Allow photo access to attach a screenshot to this ticket.',
+      });
+      if (!photosOk) return;
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
         quality: 0.7,

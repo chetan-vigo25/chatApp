@@ -68,8 +68,23 @@ class PermissionManager {
       const status = await adapter.check();
       if (isSatisfied(status)) return status;
 
+      // A remembered "permanently denied" only applies while the OS still reports a
+      // denial. If it now reports UNDETERMINED the permission was reset (Settings →
+      // reset app preferences, revoke-on-unused, reinstall of the OS profile), so
+      // the memory is stale — drop it and let the feature raise a real dialog again.
+      // Without this, one "Don't ask again" would silently disable the in-context
+      // re-ask for the lifetime of the install.
       const remembered = await this._memoryFor(id);
-      return remembered === PermissionStatus.BLOCKED ? PermissionStatus.BLOCKED : status;
+      if (remembered !== PermissionStatus.BLOCKED) return status;
+
+      if (status === PermissionStatus.UNDETERMINED) {
+        this._memory = { ...(this._memory || {}) };
+        delete this._memory[id];
+        await rememberStatus(id, status);
+        return status;
+      }
+
+      return PermissionStatus.BLOCKED;
     } catch (error) {
       console.warn(`[permissions] check(${id}) failed:`, error?.message);
       return PermissionStatus.UNDETERMINED;

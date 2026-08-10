@@ -10,6 +10,7 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import * as ImagePicker from 'expo-image-picker';
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
+import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { BACKEND_URL } from '@env';
 import { Feather, FontAwesome5, Ionicons, FontAwesome6 } from '@expo/vector-icons';
@@ -90,12 +91,11 @@ export default function EditProfile({ navigation, route }) {
 
   const requestPermission = async () => {
     if (Platform.OS === 'web') return true;
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Camera roll permission is required.');
-      return false;
-    }
-    return true;
+    // Shared in-context gate: re-asks the OS if photos was denied at startup, and
+    // routes to Settings once the OS will no longer show its dialog.
+    return ensurePermission(PERMISSION_IDS.PHOTOS, {
+      purpose: 'Allow access to your photos to choose a profile picture.',
+    });
   };
 
   const pickImage = async () => {

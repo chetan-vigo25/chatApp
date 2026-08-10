@@ -66,17 +66,38 @@ export default function useUserPresence(userId) {
 
   useEffect(() => {
     let unsubscribePresenceConnected = () => {};
+    let retryTimer = null;
+    let cancelled = false;
+
+    // If the first fetch raced the socket connect (rejects) or came back
+    // offline without a lastSeen timestamp, retry shortly so the header
+    // upgrades from "offline" to "last seen …" within ~1s of opening the chat.
+    const refreshWithRetry = (attempt = 0) => {
+      if (cancelled) return;
+      refresh().then((response) => {
+        if (cancelled || attempt >= 3) return;
+        const source = response?.data || response;
+        const candidate = source?.presence || source;
+        const gotLastSeen = Boolean(candidate?.lastSeen);
+        const isOnline = (candidate?.status || '').toString().toLowerCase() === 'online';
+        if (!response || (!isOnline && !gotLastSeen)) {
+          retryTimer = setTimeout(() => refreshWithRetry(attempt + 1), 1000);
+        }
+      });
+    };
 
     if (userId) {
       subscribe();
-      refresh();
+      refreshWithRetry();
       unsubscribePresenceConnected = socketService.onPresenceConnected(() => {
         subscribe();
-        refresh();
+        refreshWithRetry();
       });
     }
 
     return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       unsubscribePresenceConnected();
       if (userId) {
         unsubscribe();
