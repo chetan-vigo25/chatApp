@@ -811,6 +811,25 @@ export default class NativeCallingSDK {
     });
   }
 
+  /**
+   * Forget the post-decline swallow window for a group call (all of them when
+   * `groupId` is omitted). `_declined[groupId]` exists so the HOST's re-invite
+   * loop can't ghost-re-ring a call we just declined — but a CONFERENCE keeps ONE
+   * groupId for its entire life, so that window also swallowed a GENUINE re-invite
+   * of a member who declined moments earlier: the ring was auto-declined right
+   * here (`declineGroupCall`) and the app never even saw an `incoming` event.
+   *
+   * The app calls this from the backend `call:incoming` path, which is
+   * authoritative and has already run its own just-ended guards — so anything
+   * still in `_declined` at that point is stale by definition. Group-scoped on
+   * purpose: `_declinedPeer` (the 1:1 equivalent) is NOT touched, so 1:1 decline
+   * behaviour is bit-for-bit unchanged.
+   */
+  clearGroupDecline(groupId) {
+    if (groupId == null) { this._declined = {}; return; }
+    delete this._declined[String(groupId)];
+  }
+
   _reinviteGroup(gid) {
     if (!this._room || this._room.groupId !== gid) return Promise.resolve(true);
     const missing = (this._groupInvitees || []).filter((id) => !this._groupJoined[id]);

@@ -47,7 +47,8 @@ import { registerVoipPush } from './services/voipPushService';
 import {
   ringCall, cancelCall, acceptCallSignal, rejectCallSignal, endCallSignal,
   registerCallSignalListeners, pullPendingCalls, buildCallDeviceInfo,
-  conferenceInvite, conferenceMedia, conferenceState,
+  conferenceInvite, conferenceMedia, conferenceState, conferenceEnd, conferenceRemove,
+  conferenceAccept, conferenceReject, conferenceLeave,
 } from './services/callSignalService';
 import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // CALL_PUSH_EVENTS lives in its own dep-free module; callNotifee resolves its
@@ -232,6 +233,11 @@ export const CallProvider = ({ children }) => {
   // Ids of the call that JUST ended — the engine's offline-redial/re-invite loop
   // can deliver a late 'incoming' for it; auto-decline instead of ghost-re-ringing.
   const recentEndedRef = useRef({ ids: [], ts: 0 });
+  // The `operationId` the backend stamped on the conference invite that is ringing
+  // us, echoed back on accept/reject so the server can settle THAT invite rather
+  // than guessing. Null when the ring carries none (older backend) — the accept
+  // still goes out, keyed on the conference callId alone.
+  const conferenceOpIdRef = useRef(null);
   // Synchronous record of the ring we JUST staged from the app-socket signal.
   // React state (stateRef) lags the INCOMING dispatch by a tick — the engine's
   // own 'incoming' for the same call can land inside that gap and read a stale
@@ -1152,6 +1158,25 @@ export const CallProvider = ({ children }) => {
       } else {
         endCallSignal({ callId: snap.signalId, otherUserIds: otherIds });
       }
+      // CONFERENCE: the emits above are the 1:1 vocabulary — they release the busy
+      // lock and notify the peer, but they do NOT tell the server we left the
+      // ROSTER. On a conference that distinction matters: a member who "ends" with
+      // only `call:end` can stay in the server's participant list (so the host
+      // sees a ghost tile, and a later re-invite is refused as already-a-member or
+      // still-busy), and a declined invite is never settled (the ring window runs
+      // to timeout). These are ADDITIVE — the 1:1 emits still go out exactly as
+      // before, so a backend without these handlers is unaffected (the acks just
+      // time out) and 1:1 calls never reach this branch at all.
+      if (snap.isConference) {
+        if (reason === 'rejected' && snap.direction === 'incoming') {
+          conferenceReject({ callId: snap.signalId }).catch(() => {});
+        } else if (snap.answeredAt) {
+          // We were actually IN the conference — leave the roster. (The host's
+          // "End for everyone" path already emitted call:conference:end; a leave
+          // alongside it is still true and must be handled idempotently.)
+          conferenceLeave({ callId: snap.signalId }).catch(() => {});
+        }
+      }
     }
 
     // tell engine to tear down (harmless if already ended remotely)
@@ -1484,9 +1509,19 @@ export const CallProvider = ({ children }) => {
         // never ghost-re-ring a finished call.
         {
           const re = recentEndedRef.current;
+          // Conference RE-INVITE exception: the media room keeps its ids for the
+          // whole conference, so a re-added member's engine `incoming` reuses an
+          // id this guard blacklisted at their earlier leave. If the app-socket
+          // ring already built INCOMING state (or the user already tapped
+          // Accept), this engine event is that ring's RECONCILE — declining it
+          // left the re-added member on "Connecting…" forever.
+          const expectingReinvite = snap.status === CALL_STATUS.INCOMING
+            || snap.pendingAccept
+            || (snap.isConference && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED);
           if (payload?.callId
             && re.ids.includes(String(payload.callId))
-            && Date.now() - re.ts < 60000) {
+            && Date.now() - re.ts < 60000
+            && !expectingReinvite) {
             if (__DEV__) console.log('[CALL][APP] late incoming for a finished call — auto-declining', payload.callId);
             sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
             break;
@@ -2171,16 +2206,24 @@ export const CallProvider = ({ children }) => {
     stopRinging();
     // Mic/camera must be granted before the SDK's accept runs getUserMedia, else
     // the answer hangs with no media. If denied, decline the call cleanly.
-    const permOk = await ensureMediaPermissions(snap.media);
-    if (__DEV__) console.log('[CALL][APP][accept] STEP 2 media permission', { media: snap.media, permOk });
+    // CONFERENCE joins are camera-OFF by design (WhatsApp-style opt-in), so a
+    // conference invite — even a VIDEO one — only needs the MIC here: asking
+    // for the camera blocked the accept behind an OS dialog (after CallKit had
+    // already answered) and a camera-deny could downgrade or even decline a
+    // call that wasn't going to use the camera yet. toggleCamera requests the
+    // camera permission on-demand when the user actually turns video on.
+    const permMedia = snap.isConference ? 'audio' : snap.media;
+    const permOk = await ensureMediaPermissions(permMedia);
+    if (__DEV__) console.log('[CALL][APP][accept] STEP 2 media permission', { media: permMedia, permOk });
     // ensureMediaPermissions already showed the prompt / Settings guidance; if
     // it wasn't granted, decline the incoming call cleanly.
     if (!permOk) { finalizeEnd('rejected', 'Permission denied'); return; }
     // Camera denied but mic granted on a VIDEO call → answer as a VOICE call
     // instead of declining. effMedia drives this accept synchronously; the
     // SET_FLAG keeps state.media in step for the UI and the pendingAccept
-    // reconcile path (which re-reads state later).
-    const effMedia = permOk === 'audio-fallback' ? 'audio' : snap.media;
+    // reconcile path (which re-reads state later). Never downgrade a
+    // conference — its media stays whatever the roster says.
+    const effMedia = (!snap.isConference && permOk === 'audio-fallback') ? 'audio' : snap.media;
     if (effMedia !== snap.media) dispatch({ type: ACT.SET_FLAG, key: 'media', value: effMedia });
     // iOS + CallKit: this accept may have originated OUTSIDE the CallKit screen
     // (in-app banner / notification replay / pending-accept flush). Answer the
@@ -2223,6 +2266,18 @@ export const CallProvider = ({ children }) => {
     // caller keeps hearing RINGING while the callee sits in a connected-looking
     // call. `answeredElsewhere` means another device won: stop retrying, the
     // server's `call:cancelled-elsewhere` dismisses this device.
+    // CONFERENCE accept — the roster-authoritative counterpart to `call:accept`.
+    // `call:accept` is attributed through the callee's 1:1 BUSY record, which says
+    // nothing about conference MEMBERSHIP: on a conference the server also has to
+    // settle this specific invite and put us in the roster it broadcasts. This
+    // event carries both ids explicitly, so a re-invited member is added even when
+    // no busy record exists for them. Emitted IN ADDITION to `call:accept` (never
+    // instead of it) so nothing changes for a backend that doesn't implement it —
+    // the ack simply times out and resolves optimistically. 1:1 never reaches here.
+    if (snap.isConference && snap.signalId) {
+      conferenceAccept({ callId: snap.signalId, operationId: conferenceOpIdRef.current })
+        .catch(() => {});
+    }
     (async () => {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         if (attempt) await new Promise((r) => setTimeout(r, 900 * attempt));
@@ -2328,10 +2383,41 @@ export const CallProvider = ({ children }) => {
     // Ringing incoming (not yet answered) → decline. Once answered (accepted,
     // connecting) or active → a normal hangup tear-down.
     if (snap.status === CALL_STATUS.INCOMING && !snap.accepted) { reject(); return; }
+    // Conference HOST tapping End → choose (WhatsApp-style): just leave (host
+    // migrates, call continues) or end the whole conference. Backend enforces
+    // host-only on `call:conference:end` regardless of what the client claims.
+    if (snap.isConference && snap.status === CALL_STATUS.ACTIVE && snap.signalId
+      && myId && snap.hostId && String(snap.hostId) === String(myId)) {
+      Alert.alert('You are the call host', 'Leave the call, or end it for everyone?', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Leave call', onPress: () => finalizeEnd('completed') },
+        {
+          text: 'End for everyone',
+          style: 'destructive',
+          onPress: () => {
+            conferenceEnd({ callId: snap.signalId }).catch(() => {});
+            finalizeEnd('completed');
+          },
+        },
+      ]);
+      return;
+    }
     const reason = (snap.status === CALL_STATUS.OUTGOING
       || (snap.status === CALL_STATUS.INCOMING && snap.accepted)) ? 'cancelled' : 'completed';
     finalizeEnd(reason);
-  }, [finalizeEnd, reject]);
+  }, [finalizeEnd, reject, myId]);
+
+  // HOST-ONLY kick — backend validates; a non-host gets a FORBIDDEN ack.
+  const removeFromCall = useCallback(async (targetUserId) => {
+    const snap = stateRef.current;
+    if (!snap.isConference || !snap.signalId || !targetUserId) return;
+    try {
+      const ack = await conferenceRemove({ callId: snap.signalId, targetUserId: String(targetUserId) });
+      if (ack?.error === 'FORBIDDEN') {
+        Alert.alert('Conference call', 'Only the host can remove a participant.');
+      }
+    } catch (_) { /* offline — roster broadcast reconciles on reconnect */ }
+  }, []);
 
   const toggleMic = useCallback(() => {
     const snap = stateRef.current;
@@ -2416,7 +2502,14 @@ export const CallProvider = ({ children }) => {
     ]);
     const fresh = (Array.isArray(peersToAdd) ? peersToAdd : [peersToAdd])
       .filter((p) => p && p.id && !existing.has(String(p.id)))
-      .map((p) => ({ id: String(p.id), name: p.name || 'Member', avatar: p.avatar || null }));
+      .map((p) => ({
+        id: String(p.id),
+        // Picker rows carry the contact's name/number — keep BOTH so the grid
+        // can show "saved name, else number" instead of the Member placeholder.
+        name: p.name || p.mobile || p.phone || 'Member',
+        mobile: p.mobile || p.phone || null,
+        avatar: p.avatar || null,
+      }));
     const room = Math.max(0, (MAX_PARTICIPANTS - 1) - existing.size);
     const invitees = fresh.slice(0, room);
     if (!invitees.length) {
@@ -2738,10 +2831,29 @@ export const CallProvider = ({ children }) => {
       const re = recentEndedRef.current;
       const pid = payload?.callId ? String(payload.callId) : null;
       const idHit = !!(pid && re.ids.includes(pid) && Date.now() - re.ts < 60000);
-      const peerHit = !payload?.isGroup
+      // Conference RE-INVITE exception: a conference keeps the SAME signalId for
+      // its whole life, so a member who left and is re-added by the host gets a
+      // ring whose callId this guard just blacklisted — and their phone never
+      // rang ("dubara add karo to call hi nahi jati"). The backend stamps every
+      // conference ring with `ts` at emit time: a ring MINTED AFTER our local
+      // end is a genuine re-invite → let it ring. A stale re-delivery of the
+      // OLD ring carries a ts from BEFORE the end and stays blocked.
+      // Two independent signals, ORed because they guard different clocks:
+      //  • payload.ts (SERVER clock) newer than our local end — but device
+      //    clock skew can defeat a bare comparison, so
+      //  • ≥5s of LOCAL time since the end also qualifies: the stale
+      //    re-deliveries this guard exists for land within ~1-2s of the end;
+      //    a host re-adding someone is always slower than that.
+      const conferenceReinvite = !!payload?.isConference
+        && (Number(payload?.ts || 0) > (re.ts || 0)
+          || Date.now() - (re.ts || 0) > 5000);
+      // 1:1-ONLY guard. A conference invite must never be suppressed by it: the
+      // "peer" on a conference ring is the HOST, so a 1:1 with that same host that
+      // ended seconds earlier would otherwise swallow a genuine conference invite.
+      const peerHit = !payload?.isGroup && !payload?.isConference
         && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
         && re.peerId === callerId && Date.now() - re.ts < PEER_REDIAL_GUARD_MS;
-      if (idHit || peerHit) {
+      if ((idHit && !conferenceReinvite) || peerHit) {
         if (__DEV__) console.log('[CALL][APP] incoming for a just-ended call — dismissing, not re-ringing', { callId: pid, idHit, peerHit });
         cancelAllIncomingCallNotifee();
         nativeCall.dismissIncoming(pid, payload?.uuid || null);
@@ -2785,8 +2897,23 @@ export const CallProvider = ({ children }) => {
     const others = members
       .filter((id) => id !== callerId && id !== myId)
       .map((id) => ({ id, name: 'Member', avatar: null }));
-    const isGroup = !!payload?.isGroup || others.length >= 1;
+    // A CONFERENCE IS a group call, always — even when the ring carries no member
+    // list and no explicit isGroup (the backend rings a re-invited member with just
+    // the conference callId + isConference). Without this the invite was built as a
+    // 1:1: the ring showed the HOST's name instead of the conference, accept routed
+    // audio to the EARPIECE instead of the loudspeaker, the participants grid never
+    // rendered, and — worst — the 1:1-only same-peer redial guard above became
+    // eligible to suppress the ring entirely. Push payloads get the same treatment
+    // in mapPushToIncoming; this is the app-socket / pending-pull path.
+    const isConferenceRing = !!payload?.isConference;
+    const isGroup = !!payload?.isGroup || isConferenceRing || others.length >= 1;
     const roster = isGroup ? [peer, ...others] : [peer];
+    // Remember which conference INVITE this ring belongs to, so accept/reject can
+    // settle that exact invite server-side. Cleared for a non-conference ring so a
+    // stale id can never ride along on the next call.
+    conferenceOpIdRef.current = isConferenceRing
+      ? (payload?.operationId || payload?.inviteId || null)
+      : null;
     // Foreground incoming call → present ONLY the OS push notification (CallStyle
     // with Accept/Decline), NOT the in-app banner/ring screen (product choice;
     // call case only). We STILL enter INCOMING state (flagged notificationOnly) so
@@ -2855,6 +2982,21 @@ export const CallProvider = ({ children }) => {
       nowMs: Date.now(),
       notificationOnly,
     });
+    // GROUP/CONFERENCE ONLY — drop the engine's post-decline swallow window.
+    // The SDK auto-declines a media-server group ring for 15s after we declined
+    // that group, so the host's re-invite loop can't ghost-re-ring us. But a
+    // conference keeps ONE group id for its whole life, so a member who declined
+    // and was then deliberately re-added by the host had their real invite
+    // swallowed INSIDE the engine — no `incoming` event, no ring, nothing the app
+    // could recover from. This backend ring is authoritative and has already
+    // passed the just-ended guards above, so any surviving decline memory is
+    // stale. Chained on ensureConnected (idempotent) because the SDK instance
+    // must exist for the command to land. 1:1 decline memory is NOT touched.
+    if (isGroup) {
+      Promise.resolve(ensureConnected())
+        .then(() => sendCmd({ cmd: CMD.CLEAR_GROUP_DECLINE }))
+        .catch(() => {});
+    }
     if (notificationOnly) {
       // Show / refresh the OS notification (the native FCM service usually posted
       // it already; this covers a socket-first race). Both key the notification on
@@ -2952,7 +3094,7 @@ export const CallProvider = ({ children }) => {
         (payload?.media || 'audio') === 'video',
       );
     }
-  }, [myId, startRinging, armRingTimeout, ensureConnected]);
+  }, [myId, startRinging, armRingTimeout, ensureConnected, sendCmd]);
 
   // Match an inbound lifecycle signal to the current call (by signalId if known).
   const matchesCurrent = (payload) => {
@@ -3185,8 +3327,18 @@ export const CallProvider = ({ children }) => {
         isGroup: !!inv.isGroup,
         isConference: !!inv.isConference,
         conferenceHost: inv.conferenceHost || null,
+        operationId: inv.operationId || inv.inviteId || null,
         groupId: inv.groupId || null,
         groupName: inv.groupName || null,
+        // Server-authoritative "still ringing RIGHT NOW", so stamp it as minted
+        // now. This is what lets the recent-ended guard's conference-reinvite
+        // exception fire on the RECOVERY path: a conference reuses one callId for
+        // its whole life, so a member who left and was re-added has that callId
+        // sitting in the just-ended blacklist. With no `ts` the exception's
+        // `ts > re.ts` test was `0 > re.ts` — always false — so the pull recovered
+        // the invite and the guard immediately threw it away again. The invite
+        // still had to survive the server's own liveness check to reach here.
+        ts: Date.now(),
       });
     } catch (_) { /* best-effort recovery */ }
   }, [onSignalIncoming]);
@@ -3232,6 +3384,14 @@ export const CallProvider = ({ children }) => {
     finalizeEnd('completed');
   }, [finalizeEnd]);
 
+  // This device was KICKED by the host — tear the call down with a clear label.
+  const onConferenceRemoved = useCallback((payload) => {
+    const snap = stateRef.current;
+    if (!payload?.callId || String(payload.callId) !== String(snap.signalId || '')) return;
+    if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    finalizeEnd('completed', 'You were removed from this call');
+  }, [finalizeEnd]);
+
   // Attach the server→client call listeners, re-attaching whenever the socket
   // (re)connects so a fresh underlying instance keeps them.
   useEffect(() => {
@@ -3252,6 +3412,7 @@ export const CallProvider = ({ children }) => {
       onConferenceParticipantUpdated: onConferenceRoster,
       onConferenceHostChanged,
       onConferenceEnded,
+      onConferenceRemoved,
     };
     let unsub = () => {};
     let wasConnected = false;
@@ -3277,26 +3438,51 @@ export const CallProvider = ({ children }) => {
       wasConnected = connected;
     });
     return () => { unsub(); unsubState(); };
-  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, finalizeEnd]);
+  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, onConferenceRemoved, finalizeEnd]);
 
   // ---- incoming call from an FCM PUSH (callee offline / app backgrounded) ----
   // The push wakes the device; we reuse onSignalIncoming (which shows the ring +
   // wakes the WebRTC engine so its `incoming` can reconcile the real callId). The
   // push's callId is the app-socket signaling id (set as signalId).
-  const mapPushToIncoming = useCallback((data) => ({
-    from: {
-      id: data?.callerId ? String(data.callerId) : null,
-      name: data?.callerName || 'Unknown',
-      avatar: data?.callerImage || null,
-    },
-    callId: data?.callId || null, // signaling id → onSignalIncoming stores as signalId
-    media: data?.callType || data?.media || 'audio',
-    members: [],
-    isGroup: false,
-    groupId: null,
-    groupName: null,
-    isConference: data?.isConference === '1' || data?.isConference === true,
-  }), []);
+  const mapPushToIncoming = useCallback((data) => {
+    // FCM data values are always STRINGS; a VoIP (PushKit) payload keeps real
+    // JSON types. Accept both spellings for the booleans and the member list.
+    const flag = (v) => v === true || v === 1 || v === '1' || v === 'true';
+    const memberList = (v) => {
+      if (Array.isArray(v)) return v.map(String).filter(Boolean);
+      if (typeof v === 'string' && v) {
+        try { const p = JSON.parse(v); if (Array.isArray(p)) return p.map(String).filter(Boolean); } catch (_) { /* csv below */ }
+        return v.split(',').map((s) => s.trim()).filter(Boolean);
+      }
+      return [];
+    };
+    const isConference = flag(data?.isConference);
+    return {
+      from: {
+        id: data?.callerId ? String(data.callerId) : null,
+        name: data?.callerName || 'Unknown',
+        avatar: data?.callerImage || null,
+      },
+      callId: data?.callId || null, // signaling id → onSignalIncoming stores as signalId
+      media: data?.callType || data?.media || 'audio',
+      // Group shape used to be hardcoded empty here, so a group/conference push
+      // rang as a 1:1: the wrong title, answer on the earpiece instead of the
+      // loudspeaker, and the same-peer redial guard (which only applies to 1:1)
+      // could suppress the ring. Carry whatever the push actually sent; a
+      // conference is a group by definition.
+      members: memberList(data?.members),
+      isGroup: flag(data?.isGroup) || isConference,
+      groupId: data?.groupId || null,
+      groupName: data?.groupName || null,
+      isConference,
+      conferenceHost: data?.conferenceHost || null,
+      // Which conference invite this ring settles (echoed back on accept/reject).
+      operationId: data?.operationId || data?.inviteId || null,
+      // Push mint-time — the recent-ended guard uses it to tell a genuine
+      // conference RE-INVITE (minted after our local end) from a stale re-delivery.
+      ts: data?.ts ? Number(data.ts) : Date.now(),
+    };
+  }, []);
 
   const onPushIncoming = useCallback((data) => {
     if (!data?.callerId) return;
@@ -3343,7 +3529,14 @@ export const CallProvider = ({ children }) => {
     // path, seconds old) still rings instantly.
     {
       const age = callPushAgeMs(data);
-      if (Number.isFinite(age) && age > AGED_CALL_PUSH_MS) {
+      // CONFERENCE invites get a wider direct-ring window (25s vs 12s): the
+      // backend `ts` is mint-time so it can't be a stale-flush ghost, but a
+      // cold RN boot on a slow device easily eats >12s after the VoIP push —
+      // and the pull fallback needs auth+socket the boot may not have yet.
+      // isStaleCallPush above still drops anything past the ring window.
+      const isConfPush = data?.isConference === '1' || data?.isConference === true;
+      const agedWindow = isConfPush ? 25000 : AGED_CALL_PUSH_MS;
+      if (Number.isFinite(age) && age > agedWindow) {
         if (__DEV__) console.log('[CALL][APP] aged call push — verifying with server before ringing', { callId: data?.callId, ageSec: Math.round(age / 1000) });
         cancelAllIncomingCallNotifee();
         pullStillRingingInvites();
@@ -3718,6 +3911,9 @@ export const CallProvider = ({ children }) => {
     switchCamera,
     toggleScreenShare,
     inviteMoreToCall,
+    removeFromCall,
+    // Host check for UI gating (backend re-validates every host-only action).
+    isCallHost: !!(state.isConference && state.hostId && myId && String(state.hostId) === String(myId)),
     toggleSpeaker,
     resumeAudio,
     minimize,

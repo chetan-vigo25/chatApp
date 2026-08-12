@@ -203,6 +203,14 @@ export const conferenceLeave = ({ callId }) =>
 export const conferenceMedia = ({ callId, audioEnabled, videoEnabled }) =>
   emitWithAck('call:conference:media', { callId, audioEnabled, videoEnabled });
 
+// HOST-ONLY: end the conference for everyone (backend rejects non-host).
+export const conferenceEnd = ({ callId }) =>
+  emitWithAck('call:conference:end', { callId });
+
+// HOST-ONLY: remove (kick) a participant (backend rejects non-host).
+export const conferenceRemove = ({ callId, targetUserId }) =>
+  emitWithAck('call:conference:remove', { callId, targetUserId });
+
 export const conferenceState = ({ callId }) =>
   emitWithAck('call:conference:state', { callId });
 
@@ -273,6 +281,8 @@ export const registerCallSignalListeners = (handlers = {}) => {
     'call:conference:participant:updated': wrap('call:conference:participant:updated', handlers.onConferenceParticipantUpdated),
     'call:conference:host:changed': wrap('call:conference:host:changed', handlers.onConferenceHostChanged),
     'call:conference:ended': wrap('call:conference:ended', handlers.onConferenceEnded),
+    // Sent ONLY to a kicked participant — their device tears the call down.
+    'call:conference:removed': wrap('call:conference:removed', handlers.onConferenceRemoved),
   };
   if (__DEV__) console.log('[CALL][APP][signal] registered call:* listeners on socket', socket.id || '(no id yet)');
   Object.keys(map).forEach((evt) => socket.on(evt, map[evt]));

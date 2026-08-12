@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
 import CallAvatar from './CallAvatar';
 
@@ -16,10 +16,16 @@ import CallAvatar from './CallAvatar';
 const statusLabel = (p, ringing) => {
   if (p.left) return 'Left';
   if (p.joined) return 'In call';
+  // Conference roster carries the backend's authoritative per-member status
+  // (confStatus) — a RINGING/INVITED member shows "Ringing…" even mid-call
+  // (e.g. someone re-added by the host), not a blanket "Connecting…".
+  if (p.confStatus === 'RINGING' || p.confStatus === 'INVITED') return 'Ringing…';
   return ringing ? 'Ringing…' : 'Connecting…';
 };
 
-export default function CallParticipantsGrid({ participants = {}, ringing = false, activeSpeakerId = null }) {
+// `onParticipantLongPress(p)` — optional; the conference HOST long-presses a
+// tile to get the Remove option (CallOverlay only passes it for the host).
+export default function CallParticipantsGrid({ participants = {}, ringing = false, activeSpeakerId = null, onParticipantLongPress = null }) {
   const { theme, isDarkMode } = useTheme();
   const c = theme.colors;
   const onBg = isDarkMode ? '#FFFFFF' : c.primaryTextColor;
@@ -34,7 +40,14 @@ export default function CallParticipantsGrid({ participants = {}, ringing = fals
   return (
     <View style={styles.grid}>
       {list.map((p) => (
-        <View key={p.id} style={styles.cell}>
+        <TouchableOpacity
+          key={p.id}
+          style={styles.cell}
+          activeOpacity={onParticipantLongPress ? 0.7 : 1}
+          disabled={!onParticipantLongPress}
+          onLongPress={onParticipantLongPress ? () => onParticipantLongPress(p) : undefined}
+          delayLongPress={350}
+        >
           <View style={[
             styles.avatarWrap,
             { borderColor: avatarBorder },
@@ -49,7 +62,7 @@ export default function CallParticipantsGrid({ participants = {}, ringing = fals
           <Text style={[styles.status, { color: onBgSoft }, p.joined && styles.statusActive]}>
             {statusLabel(p, ringing)}
           </Text>
-        </View>
+        </TouchableOpacity>
       ))}
     </View>
   );

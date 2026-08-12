@@ -54,9 +54,11 @@ export default function AddParticipantSheet({ visible, onClose, groupId, existin
       if (excluded.has(sid) || seen.has(sid)) return;
       seen.add(sid);
       const img = u.profileImage || m.profileImage || null;
+      const mobile = u.phoneNumber || u.mobileNumber || m.phoneNumber || m.mobileNumber || null;
       out.push({
         id: sid,
-        name: u.fullName || m.fullName || m.name || 'Member',
+        name: u.fullName || m.fullName || m.name || mobile || 'Member',
+        mobile,
         avatar: img ? toSecureMediaUri(img) : null,
       });
     });

@@ -87,16 +87,16 @@ const getMessaging = () => {
 export const isPushAvailable = () => !!getMessaging();
 
 // ─── NOTIFICATION SOUND CONFIG ───
-// Android: file must be at android/app/src/main/res/raw/notification_sound.wav
-// iOS: file must be bundled via app.json expo-notifications plugin
-const CUSTOM_SOUND_ANDROID = 'notification_sound'; // filename WITH extension for expo-notifications
-const CUSTOM_SOUND_IOS = 'notification_sound.wav';
+// Messages use the DEVICE DEFAULT notification tone (user rule Aug-11):
+// no custom sound file — 'default' resolves to the system message tune.
+const MESSAGE_SOUND_ANDROID = 'default';
+const MESSAGE_SOUND_IOS = 'default';
 
 // ─── ANDROID NOTIFICATION CHANNEL (Required for Android 8+) ───
-// IMPORTANT: When you change the sound file, bump the version number below.
+// IMPORTANT: When you change the sound, bump the version number below.
 // Android NEVER updates sound on an existing channel — only delete + recreate works.
 // Channel ID must match AndroidManifest.xml default_notification_channel_id
-const CHANNEL_VERSION = 2;
+const CHANNEL_VERSION = 3;
 const CHANNEL_ID = `chat_messages_v${CHANNEL_VERSION}`;
 
 // Incoming-call channel — kept stable ('calls') to match the backend push.
@@ -107,6 +107,7 @@ const MISSED_CALL_CHANNEL_ID = 'missed_calls';
 const OLD_CHANNEL_IDS = [
   'chat_messages',
   'chat_messages_v1',
+  'chat_messages_v2',
   'default',
   'fcm_fallback_notification_channel',
   'miscellaneous',
@@ -128,14 +129,14 @@ const setupNotificationChannel = async () => {
       description: 'Notifications for new chat messages',
       importance: Notifications.AndroidImportance.MAX,
       vibrationPattern: [0, 250, 250, 250],
-      sound: CUSTOM_SOUND_ANDROID,
+      sound: MESSAGE_SOUND_ANDROID,
       lightColor: '#34B7F1',
       enableLights: true,
       enableVibrate: true,
       showBadge: true,
     });
 
-    // console.log(`Notification channel "${CHANNEL_ID}" created with sound: ${CUSTOM_SOUND_ANDROID}`);
+    // console.log(`Notification channel "${CHANNEL_ID}" created with sound: ${MESSAGE_SOUND_ANDROID}`);
 
     // Dedicated high-importance channel for incoming calls. Must match the
     // backend call push `android.notification.channelId` ('calls'). MAX
@@ -731,7 +732,7 @@ const showLocalNotification = async (remoteMessage) => {
         title: model.title || 'New Message',
         body: model.body,
         data: data || {},
-        sound: Platform.OS === 'ios' ? CUSTOM_SOUND_IOS : true,
+        sound: Platform.OS === 'ios' ? MESSAGE_SOUND_IOS : true,
         // iOS: group this chat's notifications in the tray (WhatsApp-style). The
         // backend sets the same `thread-id` on the APNs alert for background/
         // killed pushes; this covers the foreground/expo-rendered path.

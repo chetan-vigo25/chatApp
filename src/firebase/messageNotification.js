@@ -21,7 +21,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
  */
 
 // Match the existing chat channel created in fcmService (custom sound).
-const CHANNEL_ID = 'chat_messages_v2';
+const CHANNEL_ID = 'chat_messages_v3'; // must match fcmService.js CHANNEL_VERSION
 const STORE_PREFIX = '@msgnotif/';
 const MAX_LINES = 6;            // most recent N messages kept per chat
 const STALE_MS = 6 * 60 * 60 * 1000; // drop accumulated lines older than 6h
@@ -111,7 +111,7 @@ export const displayGroupedMessage = async (data) => {
       id: CHANNEL_ID,
       name: 'Chat Messages',
       importance: AndroidImportance.HIGH,
-      sound: 'notification_sound',
+      sound: 'default',
     });
   } catch (_) { /* channel may already exist (created by expo) */ }
 

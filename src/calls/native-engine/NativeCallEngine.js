@@ -204,6 +204,15 @@ class NativeCallEngine {
           return;
         }
 
+        case CMD.CLEAR_GROUP_DECLINE: {
+          // The backend authoritatively rang us for a group/conference call — drop
+          // the SDK's post-decline swallow window so the incoming media-server ring
+          // is delivered instead of being auto-declined. Group-scoped only: the 1:1
+          // declined-peer memory is deliberately left untouched.
+          if (this._sdk) { try { this._sdk.clearGroupDecline(msg.groupId); } catch (_) {} }
+          return;
+        }
+
         case CMD.QUERY_PRESENCE: {
           if (!this._sdk) { this._post(EVT.PRESENCE_RESULT, { ref: msg.ref, map: {} }); return; }
           Promise.resolve(this._sdk.queryPresence(msg.ids || []))

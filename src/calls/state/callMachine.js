@@ -280,6 +280,7 @@ export function callReducer(state, action) {
           [id]: {
             id,
             name: existing.name || invited.name || action.name || 'Unknown',
+            mobile: existing.mobile || invited.mobile || null,
             avatar: existing.avatar || invited.avatar || action.avatar || null,
             joined: true,
           },
@@ -294,12 +295,14 @@ export function callReducer(state, action) {
       if (!p || !p.id) return state;
       const id = String(p.id);
       if (state.participants[id]) return state;
+      const invitedName = p.name || p.mobile || p.phone || 'Member';
+      const invitedMobile = p.mobile || p.phone || null;
       return {
         ...state,
-        peers: [...state.peers, { id, name: p.name || 'Member', avatar: p.avatar || null }],
+        peers: [...state.peers, { id, name: invitedName, mobile: invitedMobile, avatar: p.avatar || null }],
         participants: {
           ...state.participants,
-          [id]: { id, name: p.name || 'Member', avatar: p.avatar || null, joined: false },
+          [id]: { id, name: invitedName, mobile: invitedMobile, avatar: p.avatar || null, joined: false, confStatus: 'RINGING' },
         },
       };
     }
@@ -335,10 +338,17 @@ export function callReducer(state, action) {
         const live = rp.status === 'CONNECTED' || rp.status === 'RINGING' || rp.status === 'INVITED';
         if (!live) return;
         const prev = state.participants[id] || {};
+        // Roster now carries identity (fullName/mobileNumber/avatar). A locally
+        // resolved REAL name wins; the 'Member' placeholder never sticks when
+        // the roster can do better. `mobile` is kept so the UI can apply the
+        // "saved contact → name, unsaved → number" rule via the contact directory.
+        const prevRealName = prev.name && prev.name !== 'Member' && prev.name !== 'Unknown' ? prev.name : null;
         next[id] = {
           id,
-          name: prev.name || (action.names && action.names[id]) || 'Member',
-          avatar: prev.avatar || null,
+          name: prevRealName || rp.fullName || rp.mobileNumber
+            || (action.names && action.names[id]) || prev.name || 'Member',
+          mobile: rp.mobileNumber || prev.mobile || null,
+          avatar: prev.avatar || rp.avatar || null,
           joined: rp.status === 'CONNECTED',
           confStatus: rp.status,
           audioEnabled: rp.audioEnabled !== false,

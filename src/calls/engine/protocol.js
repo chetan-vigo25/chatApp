@@ -28,6 +28,14 @@ export const CMD = {
   // Stop re-inviting ONE member (they declined over the app socket / their ring
   // window closed) — the engine's re-invite loop must not re-ring them.
   STOP_INVITE: 'stopInvite',
+  // Forget any local "I declined this group call" memory. The engine swallows a
+  // media-server group ring for a short window after a decline, so the host's
+  // re-invite loop can't ghost-re-ring. A CONFERENCE reuses ONE group id for its
+  // whole life, so that window also swallowed a GENUINE re-invite of a member who
+  // had declined moments earlier — silently, without the app ever seeing a ring.
+  // The backend `call:incoming` is authoritative: when it rings us for a group /
+  // conference call, any stale local decline must be dropped first.
+  CLEAR_GROUP_DECLINE: 'clearGroupDecline',
   QUERY_PRESENCE: 'queryPresence',
   RESUME_AUDIO: 'resumeAudio',
   // iOS CallKit answered → the OS re-activated the process audio session UNDER

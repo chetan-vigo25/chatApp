@@ -100,6 +100,26 @@ const LARGE_DOWNLOAD_BYTES = 8 * 1024 * 1024;
 const RICH_TEXT_CHAR_LIMIT = 520;
 const RICH_TEXT_COLLAPSED_LINES = 30;
 const RICH_PARSE_CACHE_LIMIT = 500;
+
+// Auto-detect unfenced code (Teams-style): a multi-line message where most
+// lines carry code signals (keywords, tag/brace/semicolon shapes, indentation)
+// renders as a code block even without ``` fences. MUST stay in sync with
+// looksLikeCode in chat-website/src/utils/textFormatter.js so a message shows
+// the same way on both clients.
+const CODE_LINE_START_RE = /^\s*(?:import\s|export\s|function[\s(]|const\s|let\s|var\s|def\s|class\s|return[\s;]|if\s*\(|for\s*\(|while\s*\(|switch\s*\(|try\s*{|catch\s*\(|#include|#!\/|public\s|private\s|protected\s|package\s|using\s|console\.|print\s*\(|echo\s|SELECT\s|INSERT\s|UPDATE\s|<\/?[A-Za-z][\w.-]*(?:\s|\/?>)|[}\])];?,?\s*$|\/\/|\/\*|\*\/|#\s|--\s)/;
+const CODE_LINE_END_RE = /[;{}]\s*$|=>\s*{?\s*$|\)\s*{\s*$|,\s*$/;
+const looksLikeCode = (text = '') => {
+  if (!text || text.length < 24) return false;
+  const nonEmpty = String(text).split('\n').filter((l) => l.trim());
+  if (nonEmpty.length < 3) return false;
+  let signals = 0;
+  let indented = 0;
+  for (const line of nonEmpty) {
+    if (CODE_LINE_START_RE.test(line) || CODE_LINE_END_RE.test(line)) signals += 1;
+    if (/^(?: {2,}|\t)/.test(line)) indented += 1;
+  }
+  return signals >= 2 && (signals + indented * 0.5) / nonEmpty.length >= 0.5;
+};
 const MEDIA_PANEL_SHEET_HEIGHT = 360;
 const AUDIO_RECORDING_MAX_MS = 120000;
 
@@ -2008,6 +2028,9 @@ export default function ChatScreen({ navigation, route }) {
   const {
     flatListRef,
     chatData,
+    // The resolved thread id. Its arrival is the signal that initializeChat has
+    // finished — see the pendingShare effect, which must not send before that.
+    chatId: activeChatId,
     amNotGroupMember,
     liveMemberCount,
     getUserColor,
@@ -2086,6 +2109,22 @@ export default function ChatScreen({ navigation, route }) {
   useEffect(() => {
     const share = route?.params?.pendingShare;
     if (!share || consumedShareRef.current) return;
+    // WAIT for the thread to finish initializing before sending.
+    //
+    // sendMedia stamps its optimistic row with chatIdRef/currentUserIdRef, and
+    // useChatLogic's initializeChat only assigns those AFTER an await (the cached
+    // user-info read). This effect runs in the SAME effect flush, i.e. while that
+    // await is still pending — so firing immediately produced a bubble with
+    // chatId AND senderId null. Such a row fails the `messages` chat filter and is
+    // then wiped by initializeChat's cache-miss reset, so it never paints; the
+    // thread only showed the media once the SERVER copy came back. That looked
+    // "instant" for an image (sub-second upload) but left a shared video or
+    // document with no bubble at all for the whole upload.
+    //
+    // `chatId` is set inside initializeChat right before the messages load, so its
+    // arrival is the precise "safe to send" signal; currentUserId is set in the
+    // same block. The effect re-runs when they land and sends then.
+    if (!activeChatId || !currentUserId) return;
     consumedShareRef.current = true;
 
     (async () => {
@@ -2110,7 +2149,7 @@ export default function ChatScreen({ navigation, route }) {
         navigation.setParams({ pendingShare: undefined });
       }
     })();
-  }, [route?.params?.pendingShare, sendMedia, setText, navigation]);
+  }, [route?.params?.pendingShare, activeChatId, currentUserId, sendMedia, setText, navigation]);
 
   // ── First-paint loading UX (local-first + spinner) ────────────────────────
   // Messages render from SQLite instantly. A small spinner appears ONLY if
@@ -4295,6 +4334,21 @@ export default function ChatScreen({ navigation, route }) {
   const sanitizeRichMessage = useCallback((rawValue) => {
     let safe = String(rawValue ?? '');
 
+    // Only treat the text as rich HTML when it actually IS markup from the web
+    // client's editor (<p>/<br>/<strong>… structure). Shared CODE frequently
+    // contains <View>, <script>, <div> etc. — stripping those (the old
+    // unconditional behavior) deleted the whole snippet and the bubble rendered
+    // BLANK. Plain text is safe as-is: RN <Text> never executes markup, so tags
+    // in user code can render literally.
+    const looksLikeRichHtml = /<\/?(p|br|div|span|strong|b|em|i|u|s|del|strike|code|pre|blockquote|a|ul|ol|li|h[1-6])\b[^>]*>/i.test(safe);
+    if (!looksLikeRichHtml) {
+      return safe
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\n{4,}/g, '\n\n\n');
+    }
+
     // Strip high-risk tags and inline event handlers.
     safe = safe
       .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
@@ -4393,12 +4447,52 @@ export default function ChatScreen({ navigation, route }) {
       return richParseCacheRef.current.get(cacheKey);
     }
 
-    const safeText = sanitizeRichMessage(cacheKey);
+    // Fenced ```code``` blocks are split out BEFORE sanitizing so shared code /
+    // scripts keep their exact whitespace, newlines and symbols (sanitize would
+    // strip <tags> and collapse blank runs). Code segments render verbatim in a
+    // monospace block; only the surrounding text goes through the rich parser.
+    const segments = [];
+    const fencePattern = /```([\s\S]*?)```/g;
+    let fenceCursor = 0;
+    let fenceMatch;
+    while ((fenceMatch = fencePattern.exec(cacheKey)) !== null) {
+      if (fenceMatch.index > fenceCursor) {
+        segments.push({ type: 'text', value: cacheKey.slice(fenceCursor, fenceMatch.index) });
+      }
+      const code = fenceMatch[1].replace(/^\n+/, '').replace(/\s+$/, '');
+      if (code) segments.push({ type: 'code', code });
+      fenceCursor = fenceMatch.index + fenceMatch[0].length;
+    }
+    if (fenceCursor < cacheKey.length) {
+      segments.push({ type: 'text', value: cacheKey.slice(fenceCursor) });
+    }
+
+    let renderSegments = segments.map((seg) => {
+      if (seg.type === 'code') return seg;
+      const safe = sanitizeRichMessage(seg.value);
+      return { type: 'text', safe, lines: safe.split('\n').map((line) => parseInlineTokens(line)) };
+    });
+    let hasCodeBlock = renderSegments.some((seg) => seg.type === 'code');
+
+    // No fences but the whole message reads as code (Teams/Telegram-style
+    // auto-detect): render it verbatim as one code block instead of running it
+    // through the markdown parser (which would eat *, _, ` and mangle it).
+    if (!hasCodeBlock && looksLikeCode(cacheKey)) {
+      renderSegments = [{ type: 'code', code: cacheKey.replace(/^\n+/, '').replace(/\s+$/, '') }];
+      hasCodeBlock = true;
+    }
+
+    const safeText = renderSegments
+      .map((seg) => (seg.type === 'code' ? seg.code : seg.safe))
+      .join('\n');
     const normalizedLines = safeText.split('\n');
-    const lines = normalizedLines.map((line) => parseInlineTokens(line));
+    // `lines` keeps the flat text-only token view (getFirstLinkHref reads it).
+    const lines = renderSegments
+      .filter((seg) => seg.type === 'text')
+      .flatMap((seg) => seg.lines);
     const shouldCollapse = safeText.length > RICH_TEXT_CHAR_LIMIT || normalizedLines.length > RICH_TEXT_COLLAPSED_LINES;
 
-    const parsed = { safeText, lines, shouldCollapse };
+    const parsed = { safeText, lines, shouldCollapse, segments: renderSegments, hasCodeBlock };
 
     if (richParseCacheRef.current.size >= RICH_PARSE_CACHE_LIMIT) {
       const firstKey = richParseCacheRef.current.keys().next().value;
@@ -4512,11 +4606,11 @@ export default function ChatScreen({ navigation, route }) {
       });
     };
 
-    const renderInlineTokens = () => (
-      parsed.lines.map((lineTokens, lineIndex) => (
-        <Text key={`line_${messageKey}_${lineIndex}`}>
+    const renderInlineTokens = (linesOverride, keySuffix = '') => (
+      (linesOverride || parsed.lines).map((lineTokens, lineIndex) => (
+        <Text key={`line_${messageKey}${keySuffix}_${lineIndex}`}>
           {(lineTokens.length === 0 ? [{ type: 'text', text: ' ' }] : lineTokens).map((token, tokenIndex) => {
-            const key = `token_${messageKey}_${lineIndex}_${tokenIndex}`;
+            const key = `token_${messageKey}${keySuffix}_${lineIndex}_${tokenIndex}`;
             if (token.type === 'link') {
               return (
                 <Text
@@ -4577,6 +4671,62 @@ export default function ChatScreen({ navigation, route }) {
         </Text>
       ))
     );
+
+    // Message contains code (fenced ``` or auto-detected) → segment layout:
+    // text parts go through the normal rich renderer, code parts render
+    // VERBATIM (exact whitespace/newlines preserved) in a monospace card.
+    // No Read-More here — truncating shared code mid-block would corrupt it.
+    if (parsed.hasCodeBlock) {
+      return (
+        <View>
+          {parsed.segments.map((seg, segIndex) => {
+            if (seg.type === 'code') {
+              return (
+                <View
+                  key={`codeblock_${messageKey}_${segIndex}`}
+                  style={{
+                    backgroundColor: isMyMessage
+                      ? 'rgba(0,0,0,0.22)'
+                      : (isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)'),
+                    borderRadius: 8,
+                    paddingHorizontal: 10,
+                    paddingVertical: 8,
+                    marginVertical: 4,
+                    borderWidth: StyleSheet.hairlineWidth,
+                    borderColor: isMyMessage
+                      ? 'rgba(255,255,255,0.18)'
+                      : (isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.10)'),
+                  }}
+                >
+                  <Text
+                    selectable
+                    style={{
+                      fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+                      fontSize: 12.5,
+                      lineHeight: 18,
+                      color: baseColor,
+                    }}
+                  >
+                    {seg.code}
+                  </Text>
+                </View>
+              );
+            }
+            // Skip whitespace-only text segments between/around code blocks so
+            // the bubble doesn't get stray empty lines.
+            if (!seg.safe || !seg.safe.trim()) return null;
+            return (
+              <Text
+                key={`textseg_${messageKey}_${segIndex}`}
+                style={{ fontSize: 15, color: baseColor, fontFamily: 'Roboto-Regular', lineHeight: 20 }}
+              >
+                {renderInlineTokens(seg.lines, `_s${segIndex}`)}
+              </Text>
+            );
+          })}
+        </View>
+      );
+    }
 
     return (
       <View>

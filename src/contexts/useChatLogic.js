@@ -2978,6 +2978,18 @@ export default function useChatLogic({ navigation, route }) {
           //
           // Flip them to 'failed' so the existing failed-bubble UI (with retry)
           // renders instead. Sender-only: a peer's row is never ours to judge.
+          //
+          // A BRAND-NEW row is never orphaned, so it is never judged here.
+          // sendMedia commits the optimistic row to SQLite (awaited) BEFORE it
+          // claims the tempId in the retry queue and the in-flight sets — so a
+          // refresh landing inside that window read a row that legitimately had
+          // no owner yet and flipped a perfectly healthy upload to 'failed',
+          // showing the sender a Retry on media the receiver got fine. It hit the
+          // SHARE path hardest: the send starts exactly when the freshly-opened
+          // thread is running its first-paint refreshes. Every genuinely orphaned
+          // row (app killed mid-upload, permanently rejected) is far older than
+          // this grace and is still reconciled — one refresh later at worst.
+          const ORPHAN_GRACE_MS = 60 * 1000;
           const _queuedIds = new Set(
             (queuedMediaUploadsRef.current || []).map((q) => String(q?.tempId || '')),
           );
@@ -2985,6 +2997,10 @@ export default function useChatLogic({ navigation, route }) {
             const id = String(m.id || m.tempId || '');
             if (!id || m.status !== 'sending') continue;
             if (!sameId(m.senderId, currentUser)) continue;
+            // Unknown/garbled age falls through to the old behaviour (age → huge).
+            const rowAgeMs = Date.now()
+              - (Number(m.timestamp) || Date.parse(m.createdAt) || 0);
+            if (rowAgeMs < ORPHAN_GRACE_MS) continue;                  // still being sent
             if (activeMediaUploadTempIdsRef.current.has(id)) continue; // uploading right now
             if (globalActiveMediaUploads.has(id)) continue;            // uploading in another mount
             if (_queuedIds.has(id)) continue;                          // queued for retry
@@ -8529,11 +8545,22 @@ export default function useChatLogic({ navigation, route }) {
       queuedMediaUploadsRef.current = queue;
       await persistMediaUploadQueue(queue);
 
+      // QUEUED IS NOT FAILED. The row is now in the kill-safe upload queue and
+      // flushQueuedMediaUploads re-sends it automatically the moment connectivity
+      // returns — nothing here needs a user tap. Painting it 'failed' put the
+      // Retry overlay on a perfectly healthy send (the failed/cancelled branch in
+      // the media bubbles is what renders it), so keep it 'sending': the upload
+      // ring stays up until the flush completes, exactly like an in-app send.
+      //
+      // This is what the SHARE path hit every time. NetworkContext seeds
+      // isConnected = true but NetInfo's first emission on a cold start can report
+      // false for a beat, and a share send fires in precisely that window — so the
+      // bubble flashed Retry and then quietly sent itself once the flush ran.
       setAllMessages((prev) => prev.map((m) => (
         m.tempId === tempId
           ? {
               ...m,
-              status: 'failed',
+              status: 'sending',
               payload: {
                 ...(m.payload || {}),
                 uploadQueued: true,

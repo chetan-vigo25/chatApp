@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   Modal, View, Text, TouchableOpacity, FlatList, StyleSheet, TextInput, ScrollView,
-  ActivityIndicator,
+  ActivityIndicator, Animated, PanResponder, Keyboard, Dimensions,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -33,7 +34,40 @@ function ConferenceAddPeopleSheetInner({
 }) {
   const { isDarkMode } = useTheme();
   const { user } = useAuth();
+  const insets = useSafeAreaInsets();
   const myId = user?._id ? String(user._id) : null;
+
+  // ── Draggable sheet: drag the handle/header down to dismiss ───────────────
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const dragY = useRef(new Animated.Value(0)).current;
+  const panResponder = useRef(PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 4,
+    onPanResponderMove: (_e, g) => { if (g.dy > 0) dragY.setValue(g.dy); },
+    onPanResponderRelease: (_e, g) => {
+      if (g.dy > 110 || g.vy > 1.2) {
+        Animated.timing(dragY, { toValue: 600, duration: 160, useNativeDriver: true })
+          .start(() => { dragY.setValue(0); onCloseRef.current?.(); });
+      } else {
+        Animated.spring(dragY, { toValue: 0, useNativeDriver: true, bounciness: 4 }).start();
+      }
+    },
+  })).current;
+
+  // ── Keyboard lift (edge-to-edge Android: Modal lives in its own window, so
+  // KeyboardAvoidingView can't help — track kbHeight with the SCREEN height,
+  // never the window height, and pad the sheet up by it). ──
+  const [kbHeight, setKbHeight] = useState(0);
+  useEffect(() => {
+    const SCREEN_H = Dimensions.get('screen').height;
+    const show = Keyboard.addListener('keyboardDidShow', (e) => {
+      const y = e?.endCoordinates?.screenY;
+      setKbHeight(Number.isFinite(y) ? Math.max(0, SCREEN_H - y) : (e?.endCoordinates?.height || 0));
+    });
+    const hide = Keyboard.addListener('keyboardDidHide', () => setKbHeight(0));
+    return () => { show.remove(); hide.remove(); };
+  }, []);
   const [contacts, setContacts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState('');
@@ -63,20 +97,32 @@ function ConferenceAddPeopleSheetInner({
     setSelected({});
     setQuery('');
     let alive = true;
+    let poll = null;
     (async () => {
       setLoading(true);
       const mapped = await loadFromDb();
       if (!alive) return;
       // Empty local store = contacts were never fetched — trigger the full
-      // sync ONCE per open; the isSyncing effect below reloads when it lands.
+      // sync ONCE per open. The sync lands in BATCHES, so instead of blocking
+      // the picker until the whole device book is processed (slow on big
+      // contact lists), poll SQLite while it runs and surface registered
+      // matches PROGRESSIVELY — the user can pick someone as soon as their
+      // batch arrives instead of staring at the spinner till the end.
       if (!mapped.length && !syncTriggeredRef.current) {
         syncTriggeredRef.current = true;
+        poll = setInterval(() => {
+          if (alive) loadFromDb();
+        }, 1200);
         try { await syncContacts(); } catch (_) { /* permission denied / offline */ }
+        if (poll) { clearInterval(poll); poll = null; }
         if (alive) await loadFromDb();
       }
       if (alive) setLoading(false);
     })();
-    return () => { alive = false; };
+    return () => {
+      alive = false;
+      if (poll) clearInterval(poll);
+    };
   }, [visible, loadFromDb, syncContacts]);
 
   // A background sync finishing while the sheet is open refreshes the list.
@@ -146,25 +192,39 @@ function ConferenceAddPeopleSheetInner({
   return (
     <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose} statusBarTranslucent>
       <View style={styles.scrim}>
-        <TouchableOpacity style={{ flex: 1 }} activeOpacity={1} onPress={onClose} />
-        <View style={[styles.sheet, { backgroundColor: bg }]}>
-          <View style={styles.grabber} />
-          {/* Roster header — "N connected" (Image 3) */}
-          <Text style={[styles.header, { color: txt }]}>{connectedCount} connected</Text>
+        <TouchableOpacity style={styles.scrimTap} activeOpacity={1} onPress={onClose} />
+        <Animated.View
+          style={[
+            styles.sheet,
+            { backgroundColor: bg, transform: [{ translateY: dragY }] },
+            { paddingBottom: Math.max(insets.bottom, 12) + kbHeight },
+          ]}
+        >
+          {/* Drag zone: grabber + header — swipe down to dismiss */}
+          <View {...panResponder.panHandlers} style={styles.dragZone}>
+            <View style={styles.grabber} />
+            {/* Roster header — "N connected" (Image 3) */}
+            <Text style={[styles.header, { color: txt }]}>{connectedCount} connected</Text>
+          </View>
           {roster.length ? (
-            <View style={[styles.rosterWrap, { borderBottomColor: line }]}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={[styles.rosterWrap, { borderBottomColor: line }]}
+              contentContainerStyle={styles.rosterContent}
+            >
               {roster.map((p) => (
                 <View key={p.id} style={styles.rosterItem}>
-                  <CallAvatar uri={p.avatar} name={p.name} size={40} />
-                  <Text style={[styles.rosterName, { color: sub }]} numberOfLines={1}>
+                  <CallAvatar uri={p.avatar} name={p.name} id={p.id} size={46} />
+                  <Text style={[styles.rosterName, { color: txt }]} numberOfLines={1}>
                     {p.name}
                   </Text>
-                  <Text style={[styles.rosterState, { color: p.joined ? brand : sub }]}>
+                  <Text style={[styles.rosterState, { color: p.joined ? brand : sub }]} numberOfLines={1}>
                     {p.joined ? 'Connected' : 'Ringing…'}
                   </Text>
                 </View>
               ))}
-            </View>
+            </ScrollView>
           ) : null}
 
           {/* Add people — search (Image 6/8) */}
@@ -207,7 +267,9 @@ function ConferenceAddPeopleSheetInner({
             </View>
           ) : (
             <>
-              <Text style={[styles.count, { color: sub }]}>{filtered.length} contacts</Text>
+              <Text style={[styles.count, { color: sub }]}>
+                {filtered.length} contacts{(isSyncing || isProcessing) ? '  ·  syncing more…' : ''}
+              </Text>
               <FlatList
                 data={filtered}
                 keyExtractor={(item) => item.id}
@@ -223,7 +285,7 @@ function ConferenceAddPeopleSheetInner({
             style={[styles.addBtn, { backgroundColor: selectedList.length ? brand : (isDarkMode ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.08)') }]}
             disabled={!selectedList.length}
             onPress={() => {
-              const members = selectedList.map((s) => ({ id: s.id, name: s.name, avatar: s.avatar }));
+              const members = selectedList.map((s) => ({ id: s.id, name: s.name, mobile: s.phone || null, avatar: s.avatar }));
               onClose?.();
               onInvite?.(members);
             }}
@@ -233,7 +295,7 @@ function ConferenceAddPeopleSheetInner({
               Add to call{selectedList.length ? ` (${selectedList.length})` : ''}
             </Text>
           </TouchableOpacity>
-        </View>
+        </Animated.View>
       </View>
     </Modal>
   );
@@ -241,19 +303,25 @@ function ConferenceAddPeopleSheetInner({
 
 const styles = StyleSheet.create({
   scrim: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' },
+  scrimTap: { flex: 1 },
   sheet: {
-    maxHeight: '82%', borderTopLeftRadius: 18, borderTopRightRadius: 18,
-    paddingHorizontal: 16, paddingBottom: 18, paddingTop: 8,
+    maxHeight: '84%', borderTopLeftRadius: 20, borderTopRightRadius: 20,
+    paddingHorizontal: 16, paddingTop: 6,
   },
+  dragZone: { paddingBottom: 2 },
   grabber: {
-    alignSelf: 'center', width: 36, height: 4, borderRadius: 2,
-    backgroundColor: 'rgba(128,128,128,0.4)', marginBottom: 10,
+    alignSelf: 'center', width: 40, height: 4.5, borderRadius: 3,
+    backgroundColor: 'rgba(128,128,128,0.45)', marginTop: 6, marginBottom: 12,
   },
-  header: { fontSize: 17, fontWeight: '700', marginBottom: 8 },
-  rosterWrap: { borderBottomWidth: StyleSheet.hairlineWidth, paddingBottom: 10, marginBottom: 10, flexDirection: 'row', flexWrap: 'wrap' },
-  rosterItem: { alignItems: 'center', width: 76, marginRight: 4, marginBottom: 4 },
-  rosterName: { fontSize: 11, marginTop: 4, maxWidth: 72 },
-  rosterState: { fontSize: 10, marginTop: 1 },
+  header: { fontSize: 18, fontWeight: '700', marginBottom: 10 },
+  rosterWrap: {
+    flexGrow: 0, borderBottomWidth: StyleSheet.hairlineWidth,
+    marginBottom: 12,
+  },
+  rosterContent: { paddingBottom: 12 },
+  rosterItem: { alignItems: 'center', width: 84, marginRight: 6 },
+  rosterName: { fontSize: 12, marginTop: 5, maxWidth: 80, textAlign: 'center' },
+  rosterState: { fontSize: 10.5, marginTop: 1.5 },
   searchWrap: {
     flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderRadius: 10,
     paddingHorizontal: 10, height: 42, marginBottom: 8,

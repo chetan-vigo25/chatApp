@@ -20,14 +20,15 @@ import { onlyDigits } from '../utils/savedContactName';
 import { claimNotification } from '../firebase/notificationDedupe';
 
 // Preload the notification sound once at module level
-const MESSAGE_SOUND = require('../../assets/sounds/message-sound-001.mp3');
+// Fallback only — the banner plays the DEVICE DEFAULT notification tone
+// (user rule Aug-11). Android exposes it via the system content URI; if that
+// fails (or on iOS, where the system tone isn't accessible), the bundled
+// sound is used instead.
+const FALLBACK_MESSAGE_SOUND = require('../../assets/sounds/message-sound-001.mp3');
+const ANDROID_DEFAULT_NOTIFICATION_URI = 'content://settings/system/notification_sound';
 
-let OptionalBlurView = null;
-try {
-  OptionalBlurView = require('expo-blur').BlurView;
-} catch {
-  OptionalBlurView = null;
-}
+// App icon shown in the banner's header row (mirrors the OS push header).
+const APP_ICON = require('../../assets/icon.png');
 
 const AUTO_DISMISS_MS = 4000;
 // Absolute upper bound a banner may stay visible, regardless of interaction /
@@ -51,13 +52,6 @@ const isTruthyString = (value) => {
   if (typeof value === 'number') return value === 1;
   if (typeof value !== 'string') return false;
   return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
-};
-
-const formatClock = (timestamp) => {
-  if (!timestamp) return '';
-  const date = new Date(Number(timestamp));
-  if (Number.isNaN(date.getTime())) return '';
-  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
 const buildBannerModel = (payload = {}) => {
@@ -116,7 +110,7 @@ const buildBannerModel = (payload = {}) => {
 };
 
 export default function WhatsAppBannerHost() {
-  const { theme } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const { state: realtimeState } = useRealtimeChat();
   const insets = useSafeAreaInsets();
   const [banner, setBanner] = useState(null);
@@ -157,10 +151,45 @@ export default function WhatsAppBannerHost() {
         shouldDuckAndroid: true,
         staysActiveInBackground: false,
       });
-      const { sound } = await Audio.Sound.createAsync(MESSAGE_SOUND, {
-        shouldPlay: true,
-        volume: 1.0,
-      });
+      let sound = null;
+      if (Platform.OS === 'android') {
+        // Device default tone. Two constraints:
+        //  - androidImplementation 'MediaPlayer': ExoPlayer (expo-av default)
+        //    cannot open the settings content:// provider; MediaPlayer can.
+        //  - downloadFirst false: expo-av otherwise tries to cache the
+        //    content:// URI to a file first, which always fails.
+        try {
+          ({ sound } = await Audio.Sound.createAsync(
+            { uri: ANDROID_DEFAULT_NOTIFICATION_URI },
+            { shouldPlay: true, volume: 1.0, androidImplementation: 'MediaPlayer' },
+            null,
+            false
+          ));
+        } catch {
+          sound = null;
+        }
+        if (!sound) {
+          // Retry with the default player before giving up on the system tone.
+          try {
+            ({ sound } = await Audio.Sound.createAsync(
+              { uri: ANDROID_DEFAULT_NOTIFICATION_URI },
+              { shouldPlay: true, volume: 1.0 },
+              null,
+              false
+            ));
+          } catch {
+            sound = null;
+          }
+        }
+      }
+      if (!sound) {
+        // Last resort (and the iOS path — system tone isn't accessible from
+        // JS there): bundled sound, so the banner is never silent.
+        ({ sound } = await Audio.Sound.createAsync(FALLBACK_MESSAGE_SOUND, {
+          shouldPlay: true,
+          volume: 1.0,
+        }));
+      }
       soundRef.current = sound;
       // Auto-unload when playback finishes
       sound.setOnPlaybackStatusUpdate((status) => {
@@ -782,29 +811,47 @@ export default function WhatsAppBannerHost() {
   if (!banner) return null;
 
   const topOffset = Math.max(insets.top + 4, Platform.OS === 'android' ? 10 : 8);
-  const timeLabel = formatClock(banner.timestamp);
 
-  const cardStyle = {
-    minHeight: 74,
-    borderRadius: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    overflow: 'hidden',
-    justifyContent: 'center',
-    borderWidth: Platform.OS === 'ios' ? 0.5 : 0,
-    borderColor: 'rgba(255,255,255,0.28)',
-    backgroundColor: Platform.OS === 'ios' ? 'rgba(255,255,255,0.18)' : theme.colors.cardBackground,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.2,
-    shadowRadius: 18,
-    elevation: 7,
-  };
+  // System-notification palette (matches the Android push card): near-white
+  // card + dark text in light theme, dark-gray card + light text in dark theme.
+  const cardBg = isDarkMode ? '#2A2A2E' : '#FFFFFF';
+  const primaryText = isDarkMode ? '#F2F2F2' : '#1C1B1F';
+  const secondaryText = isDarkMode ? '#B8B8BD' : '#5F5B66';
 
   const BannerBody = (
-    <View style={cardStyle}>
+    <View
+      style={{
+        borderRadius: 26,
+        paddingHorizontal: 16,
+        paddingTop: 12,
+        paddingBottom: 14,
+        overflow: 'hidden',
+        backgroundColor: cardBg,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 8 },
+        shadowOpacity: 0.22,
+        shadowRadius: 18,
+        elevation: 8,
+      }}
+    >
+      {/* Header row — mirrors the OS push: app icon, "TalksTry • now", bell */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
+        <Image
+          source={APP_ICON}
+          style={{ width: 16, height: 16, borderRadius: 8, marginRight: 6 }}
+          resizeMode="cover"
+        />
+        <Text numberOfLines={1} style={{ flexShrink: 1, color: secondaryText, fontFamily: 'Roboto-Medium', fontSize: 12 }}>
+          TalksTry
+        </Text>
+        <Text style={{ color: secondaryText, fontFamily: 'Roboto-Regular', fontSize: 12 }}>
+          {'  •  now  🔔'}
+        </Text>
+      </View>
+
+      {/* Content row — avatar + title + body, like the expanded push */}
       <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-        <View style={{ width: 44, height: 44, borderRadius: 22, overflow: 'hidden', marginRight: 10, backgroundColor: theme.colors.themeColor, alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: 42, height: 42, borderRadius: 21, overflow: 'hidden', marginRight: 12, backgroundColor: theme.colors.themeColor, alignItems: 'center', justifyContent: 'center' }}>
           {banner.avatarUrl ? (
             <Image source={{ uri: banner.avatarUrl }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
           ) : (
@@ -814,25 +861,14 @@ export default function WhatsAppBannerHost() {
           )}
         </View>
 
-        <View style={{ flex: 1, paddingRight: 10 }}>
-          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Text numberOfLines={1} style={{ flexShrink: 1, color: theme.colors.primaryTextColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }}>
-              {banner.title || banner.senderName}
-            </Text>
-            {banner.isGroup ? (
-              <View style={{ marginLeft: 6, paddingHorizontal: 6, paddingVertical: 1, borderRadius: 8, backgroundColor: theme.colors.menuBackground }}>
-                <Text style={{ fontSize: 10, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>Group</Text>
-              </View>
-            ) : null}
-          </View>
-          <Text numberOfLines={1} style={{ marginTop: 2, color: theme.colors.placeHolderTextColor, fontSize: 13, fontFamily: 'Roboto-Regular' }}>
+        <View style={{ flex: 1 }}>
+          <Text numberOfLines={1} style={{ color: primaryText, fontFamily: 'Roboto-SemiBold', fontSize: 14.5 }}>
+            {banner.title || banner.senderName}
+          </Text>
+          <Text numberOfLines={2} style={{ marginTop: 1, color: primaryText, fontSize: 13.5, fontFamily: 'Roboto-Regular', opacity: 0.85 }}>
             {banner.body || 'New message'}
           </Text>
         </View>
-
-        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11, fontFamily: 'Roboto-Medium' }}>
-          {timeLabel}
-        </Text>
       </View>
     </View>
   );
@@ -857,11 +893,7 @@ export default function WhatsAppBannerHost() {
         onPressOut={startAutoDismiss}
         onPress={handleBannerPress}
       >
-        {Platform.OS === 'ios' && OptionalBlurView ? (
-          <OptionalBlurView intensity={45} tint={theme.colors.background === '#121212' ? 'dark' : 'light'} style={{ borderRadius: 14 }}>
-            {BannerBody}
-          </OptionalBlurView>
-        ) : BannerBody}
+        {BannerBody}
       </TouchableOpacity>
     </Animated.View>
   );

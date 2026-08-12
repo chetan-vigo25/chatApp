@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar,
+  View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar, Alert,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -19,6 +19,7 @@ import PulsingRing from '../components/PulsingRing';
 import CallMiniBanner from '../components/CallMiniBanner';
 import AddParticipantSheet from '../components/AddParticipantSheet';
 import ConferenceAddPeopleSheet from '../components/ConferenceAddPeopleSheet';
+import ChatDatabase from '../../services/ChatDatabase';
 
 const END_TEXT = {
   completed: 'Call ended',
@@ -35,12 +36,38 @@ export default function CallOverlay() {
     toggleMic, toggleCamera, switchCamera, toggleScreenShare, toggleSpeaker, resumeAudio,
     minimize, maximize,
     inviteMoreToCall,
+    removeFromCall,
+    isCallHost,
     audioRouteSupported,
     lockedCall, leaveToLock,
   } = useCall();
 
   // Mid-call "Add participant" member picker (group calls).
   const [showAddSheet, setShowAddSheet] = useState(false);
+
+  // Local identity fallback for roster entries that arrived as bare ids
+  // ("Member"): the 1:1 chat row for that peer already stores their name /
+  // number exactly as the chat list shows them. Looked up once per id;
+  // null-cached so a missing chat doesn't re-query every render.
+  const [peerIdentityMap, setPeerIdentityMap] = useState({});
+  const participantsForIdentity = call?.participants;
+  useEffect(() => {
+    const all = Object.values(participantsForIdentity || {});
+    const missing = all.filter((p) => p?.id
+      && (!p.name || p.name === 'Member' || p.name === 'Unknown')
+      && !p.mobile
+      && peerIdentityMap[p.id] === undefined);
+    if (!missing.length) return undefined;
+    let alive = true;
+    (async () => {
+      const updates = {};
+      for (const p of missing) {
+        updates[p.id] = await ChatDatabase.getPeerIdentity(p.id).catch(() => null);
+      }
+      if (alive) setPeerIdentityMap((prev) => ({ ...prev, ...updates }));
+    })();
+    return () => { alive = false; };
+  }, [participantsForIdentity, peerIdentityMap]);
 
   const insets = useSafeAreaInsets();
   const { theme, isDarkMode } = useTheme();
@@ -121,8 +148,18 @@ export default function CallOverlay() {
     Object.values(all).forEach((p) => {
       if (!p || !p.id) return;
       if (receiverConnectedOnly && !p.joined) return;
-      const generic = !p.name || p.name === 'Member' || p.name === 'Unknown';
-      const name = generic ? (resolveName(p.id, p.name, null) || p.name || 'Member') : p.name;
+      // Product rule: saved contact → the locally saved name; unsaved → their
+      // mobile number; NEVER the bare "Member" label when we know anything
+      // better. Number sources, in order: roster mobile (backend identity),
+      // then the local 1:1 chat row for this peer (peerIdentityMap). resolveName
+      // already prefers saved name > phone > fallback.
+      const ident = peerIdentityMap[p.id] || null;
+      const genericName = !p.name || p.name === 'Member' || p.name === 'Unknown';
+      const fallbackName = genericName
+        ? (ident?.fullName || ident?.mobileNumber || p.name)
+        : p.name;
+      const phone = p.mobile || p.phone || ident?.mobileNumber || null;
+      const name = resolveName(p.id, fallbackName, phone) || fallbackName || 'Member';
       out[p.id] = name === p.name ? p : { ...p, name };
     });
     return out;
@@ -396,6 +433,18 @@ export default function CallOverlay() {
                 participants={gridParticipants}
                 ringing={ringing}
                 activeSpeakerId={call?.activeSpeakerId || null}
+                // HOST-ONLY: long-press a tile → Remove from call (backend
+                // re-validates, so this is UI gating only).
+                onParticipantLongPress={isCallHost && call?.isConference ? (p) => {
+                  Alert.alert(
+                    'Remove from call',
+                    `Remove ${p?.name || 'this participant'} from the conference?`,
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      { text: 'Remove', style: 'destructive', onPress: () => removeFromCall?.(p.id) },
+                    ]
+                  );
+                } : null}
               />
             </View>
             {timerRunning ? (

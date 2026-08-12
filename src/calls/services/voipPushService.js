@@ -36,6 +36,21 @@ export const isVoipAvailable = () => Platform.OS === 'ios' && !!VoipPush;
 
 // Normalise a VoIP push payload → the FCM-style `data` shape CallProvider's push
 // handlers expect.
+//
+// The AppDelegate forwards the WHOLE PushKit dictionary, so everything the
+// backend sent is available here — this used to keep only the six 1:1 fields and
+// DROP the rest, which broke conference calls outright:
+//   • `ts` (backend sent-at) — without it the staleness/aged guards fall back to
+//     the epoch inside the callId, which for a conference is when the conference
+//     STARTED. A member re-invited minutes later was judged stale, JS never rang,
+//     and the CallKit screen iOS had already raised could not be answered.
+//   • `isConference` — gates BOTH the conference-reinvite exception in the
+//     recent-ended guard and the `ts` fallback above.
+//   • `isGroup` / `groupId` / `groupName` / `members` — without them a group ring
+//     is built as a 1:1 (wrong title, earpiece instead of speaker on answer, and
+//     the same-peer redial guard applies where it must not).
+// Pass them ALL through; each stays optional, so a backend that only sends the
+// original six behaves exactly as before.
 const toCallData = (payload = {}) => ({
   type: 'call',
   callId: payload.callId || null,
@@ -44,6 +59,16 @@ const toCallData = (payload = {}) => ({
   callerImage: payload.callerImage || null,
   callType: payload.callType || payload.media || 'audio',
   uuid: payload.uuid || null, // the CallKit UUID the AppDelegate reported with
+  ts: payload.ts != null ? Number(payload.ts) : undefined,
+  isConference: payload.isConference,
+  // Which conference INVITE this ring is for — echoed back on accept/reject so
+  // the server settles that exact invite instead of guessing.
+  operationId: payload.operationId || payload.inviteId || null,
+  conferenceHost: payload.conferenceHost || null,
+  isGroup: payload.isGroup,
+  groupId: payload.groupId || null,
+  groupName: payload.groupName || null,
+  members: payload.members,
   _fullScreen: true, // came in while backgrounded/killed → full-screen on accept
   // The AppDelegate PushKit handler ALREADY reported this call to CallKit. The
   // flag tells CallProvider to skip a second nativeCall.displayIncomingCall so we

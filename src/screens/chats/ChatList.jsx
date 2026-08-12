@@ -1630,7 +1630,7 @@ export default function ChatList({ navigation }) {
         activeOpacity={0.85}
         style={[styles.fab, { backgroundColor: theme.colors.themeColor }]}
       >
-        <Ionicons name="chatbubble-ellipses" size={24} color="#fff" />
+        <Ionicons name="person-add" size={24} color="#fff" />
       </TouchableOpacity>
 
       {/* ─── HEADER OVERFLOW (3-dots) DROPDOWN ─── */}
@@ -1645,7 +1645,9 @@ export default function ChatList({ navigation }) {
               {
                 top: menuPos.top,
                 right: menuPos.right,
-                backgroundColor: theme.colors.cardBackground,
+                // Elevated menu surface per theme — slightly lighter than the
+                // dark card so the dropdown reads as a layer above the list.
+                backgroundColor: isDarkMode ? '#1F2C34' : theme.colors.cardBackground,
                 borderColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
               },
             ]}
@@ -1654,6 +1656,7 @@ export default function ChatList({ navigation }) {
               { label: 'Profile', icon: 'person-outline', route: 'ProfileTab' },
               { label: 'Settings', icon: 'settings-outline', route: 'SettingsTab' },
               { label: 'Linked Devices', icon: 'qr-code-outline', route: 'LinkDevice' },
+              { label: 'Link Contacts', icon: 'people-outline', route: 'ContactsTab' },
             ].map((it, i) => (
               <TouchableOpacity
                 key={it.route}

@@ -16,6 +16,40 @@ const avatarColor = (name = '') => {
   return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
 };
 
+// An id may arrive as a raw string or as a populated object — flatten both.
+const flatId = (v) => {
+  if (v == null) return null;
+  if (typeof v === 'string' || typeof v === 'number') return String(v);
+  if (typeof v === 'object') {
+    const c = v._id?.$oid || v._id || v.id || v.userId || v.$oid;
+    return c == null ? null : String(c);
+  }
+  return null;
+};
+
+/**
+ * EVERY id that could identify this conversation, most-canonical first.
+ *
+ * The two list sources do NOT agree on which field carries the id: the Redux REST
+ * doc keeps the chat document `_id`, while the realtime store keys the same
+ * conversation on `chatId` (and rows it creates itself carry `_id === chatId`).
+ * Deduping on a single field therefore filed one chat under two keys and the
+ * picker rendered it twice. Matching on ANY shared id makes the merge immune to
+ * whichever field a given source happened to populate.
+ */
+const candidateIds = (c) => {
+  if (!c) return [];
+  const out = [];
+  const push = (v) => { const s = flatId(v); if (s && !out.includes(s)) out.push(s); };
+  if (c.chatType === 'group' || c.isGroup) {
+    push(c.groupId); push(c.group?._id); push(c.chatId); push(c._id);
+  } else {
+    push(c.peerUser?._id); push(c.peerUser?.userId); push(c.peerUser?.id);
+    push(c.peerUserId); push(c.participantId); push(c.chatId); push(c._id);
+  }
+  return out;
+};
+
 /**
  * ShareInboxScreen — the chat picker shown when content is shared INTO the app
  * from the OS share sheet. Mirrors ForwardMessageScreen's chat list, but on
@@ -34,20 +68,32 @@ export default function ShareInboxScreen({ navigation, route }) {
   const { chatsData = [] } = useSelector((state) => state.chat || {});
   const [query, setQuery] = useState('');
 
-  // Merge both sources exactly like ForwardMessageScreen: Redux first, then the
-  // realtime list overwrites by id so the fresher copy wins. Reads only what is
-  // already in memory — a share must never wait on a network round-trip.
+  // Merge both sources: Redux first, then the realtime list overwrites so the
+  // fresher copy wins. Reads only what is already in memory — a share must never
+  // wait on a network round-trip. Both are needed because a share can arrive
+  // before the realtime store has hydrated (cold start), and the Redux list can
+  // be stale/absent once it has.
+  //
+  // Dedupe by conversation IDENTITY, not by one id field: `slotOf` maps every
+  // candidate id of a chat onto a single slot, so the same conversation lands in
+  // one row no matter which id field each source filled in (that mismatch is what
+  // rendered every chat twice).
   const allChats = useMemo(() => {
-    const map = new Map();
-    for (const c of Array.isArray(chatsData) ? chatsData : []) {
-      const id = c?._id || c?.chatId || c?.peerUser?._id;
-      if (id) map.set(String(id), c);
-    }
-    for (const c of Array.isArray(realtimeChatList) ? realtimeChatList : []) {
-      const id = c?._id || c?.chatId || c?.peerUser?._id;
-      if (id) map.set(String(id), c);
-    }
-    return [...map.values()];
+    const slotOf = new Map(); // any candidate id → slot key
+    const bySlot = new Map(); // slot key → chat
+
+    const add = (c) => {
+      const ids = candidateIds(c);
+      if (!ids.length) return;
+      const known = ids.find((id) => slotOf.has(id));
+      const slot = known ? slotOf.get(known) : ids[0];
+      ids.forEach((id) => slotOf.set(id, slot));
+      bySlot.set(slot, c); // later source (realtime) wins, as before
+    };
+
+    for (const c of Array.isArray(chatsData) ? chatsData : []) add(c);
+    for (const c of Array.isArray(realtimeChatList) ? realtimeChatList : []) add(c);
+    return [...bySlot.values()];
   }, [chatsData, realtimeChatList]);
 
   const getName = (c) =>
@@ -142,7 +188,7 @@ export default function ShareInboxScreen({ navigation, route }) {
 
       <FlatList
         data={chats}
-        keyExtractor={(item, i) => String(item?._id || item?.chatId || i)}
+        keyExtractor={(item, i) => candidateIds(item)[0] || String(i)}
         renderItem={renderItem}
         keyboardShouldPersistTaps="handled"
         ListEmptyComponent={(

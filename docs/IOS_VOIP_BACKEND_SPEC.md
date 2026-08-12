@@ -77,9 +77,36 @@ data push exactly as today.)
   "callerId": "699bf91c9906da6a8930514c",
   "callerName": "User11",
   "callerImage": "https://.../avatar.webp",
-  "callType": "audio"                               // "audio" | "video"
+  "callType": "audio",                              // "audio" | "video"
+  "ts": 1783072628459,                              // REQUIRED — epoch ms, sent-at
+
+  // ---- group / conference calls only ----
+  "isGroup": true,
+  "groupId": "68f0...c31",                          // null for an ad-hoc group
+  "groupName": "Design team",
+  "members": ["68f0...a11", "68f0...b22"],          // participant user ids
+  "isConference": true                              // REQUIRED for a conference invite
 }
 ```
+
+> ⚠️ **`ts` is required** (same field the Android FCM push already sends — epoch
+> ms at send time). It is how the app tells a live ring from a push that sat
+> buffered in APNs while the device was unreachable. Without it the app falls back
+> to the epoch embedded in `callId`, **which is wrong for a conference**: a
+> conference keeps ONE `callId` for its entire life, so a re-invite sent ten
+> minutes in looks ten minutes old and gets dropped as stale — the CallKit screen
+> rings (iOS raised it from the push) but the app never joins on answer.
+
+> ⚠️ **`isConference: true` is required on every conference invite**, including a
+> RE-INVITE of a member who left and was added back. The app blacklists the
+> `callId` of a call it just ended for 60s; `isConference` + a fresh `ts` is what
+> tells it this ring is a genuine new invite rather than a stale re-delivery of
+> the ring it already dismissed. The same fields must appear on the socket
+> `call:incoming` event and in the `pullPendingCalls` response.
+
+> ℹ️ Booleans may be real JSON booleans here (a VoIP payload is not flattened, so
+> unlike the FCM data push the values need not be strings). The app accepts
+> `true`, `1`, `"1"` and `"true"`.
 
 > ⚠️ **`uuid` MUST be a valid RFC 4122 UUID.** CallKit rejects anything else and
 > the app is killed by iOS for reporting an invalid call. **Do NOT** reuse the

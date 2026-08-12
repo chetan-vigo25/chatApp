@@ -2633,6 +2633,31 @@ const getChatById = async (chatId) => {
   return _rowToChat(row);
 };
 
+// Identity of a 1:1 chat PEER by their userId, from the stored peer_user JSON.
+// Used as a local fallback where a live roster only carries ids (e.g. the
+// conference-call grid) — the chat row already knows the peer's name/number
+// exactly as the chat list shows them.
+const getPeerIdentity = async (userId) => {
+  if (!userId) return null;
+  try {
+    const db = await getDB();
+    const row = await db.getFirstAsync(
+      `SELECT peer_user, chat_name, chat_avatar FROM chats WHERE is_group = 0 AND peer_user LIKE $pat LIMIT 1`,
+      { $pat: `%${String(userId)}%` }
+    );
+    if (!row) return null;
+    const peer = parseJSON(row.peer_user) || {};
+    if (String(peer._id || peer.id || '') !== String(userId)) return null;
+    return {
+      fullName: peer.fullName || row.chat_name || null,
+      mobileNumber: peer.mobileNumber || peer.mobile || peer.phoneNumber || null,
+      profileImage: peer.profileImage || row.chat_avatar || null,
+    };
+  } catch (_) {
+    return null;
+  }
+};
+
 // Anti-downgrade map for the chat-list status column. Mirrors STATUS_PRIORITY
 // but rounded to the three states the chat list cares about.
 const CHAT_STATUS_PRIORITY = { sent: 1, delivered: 2, seen: 3, read: 3 };
@@ -3291,7 +3316,7 @@ export default {
   saveReplyData, getReplyData,
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
-  upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById,
+  upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById, getPeerIdentity,
   updateChatLastMessage, updateChatLastMessageStatusById, markChatLastMessageDeleted, updateChatUnread, incrementChatUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
   updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, updatePeerVerified, deleteChatRow, getChatCount,
