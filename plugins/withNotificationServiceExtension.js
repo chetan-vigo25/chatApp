@@ -139,7 +139,9 @@ class NotificationService: UNNotificationServiceExtension {
 }
 `;
 
-const nseInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
+// The App Store rejects/warns when an extension's version does not match the
+// containing app (ITMS-90473), so mirror the app's version + build number here.
+const nseInfoPlist = (version, buildNumber) => `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -160,9 +162,9 @@ const nseInfoPlist = `<?xml version="1.0" encoding="UTF-8"?>
   <key>CFBundlePackageType</key>
   <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0</string>
+  <string>${version}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>${buildNumber}</string>
   <key>NSExtension</key>
   <dict>
     <key>NSExtensionPointIdentifier</key>
@@ -206,7 +208,10 @@ const withNSEFiles = (config, appGroup) =>
       const nseDir = path.join(iosRoot, NSE_TARGET_NAME);
       fs.mkdirSync(nseDir, { recursive: true });
       fs.writeFileSync(path.join(nseDir, NSE_SOURCE_NAME), nseSwiftSource(appGroup));
-      fs.writeFileSync(path.join(nseDir, 'Info.plist'), nseInfoPlist);
+      fs.writeFileSync(
+        path.join(nseDir, 'Info.plist'),
+        nseInfoPlist(cfg.version || '1.0', cfg.ios?.buildNumber || '1'),
+      );
       fs.writeFileSync(
         path.join(nseDir, `${NSE_TARGET_NAME}.entitlements`),
         nseEntitlements(appGroup),
@@ -261,8 +266,8 @@ const withNSETarget = (config, appGroup) =>
       bs.SWIFT_VERSION = '5.0';
       bs.CODE_SIGN_STYLE = 'Automatic';
       bs.CLANG_ENABLE_MODULES = 'YES';
-      bs.MARKETING_VERSION = '1.0';
-      bs.CURRENT_PROJECT_VERSION = '1';
+      bs.MARKETING_VERSION = cfg.version || '1.0';
+      bs.CURRENT_PROJECT_VERSION = cfg.ios?.buildNumber || '1';
     }
 
     // Make the app DEPEND on the extension. We deliberately do NOT add an explicit

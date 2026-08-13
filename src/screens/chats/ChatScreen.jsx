@@ -5766,7 +5766,11 @@ export default function ChatScreen({ navigation, route }) {
       ? deletedFor.some((id) => sameId(id, currentUserId))
       : (typeof deletedFor === 'string' ? (deletedFor.toLowerCase() === 'everyone' || sameId(deletedFor, currentUserId)) : false);
     const isDeletedMessage = Boolean(msg?.isDeleted) || isDeletedForCurrentUser;
-    const isSystemMessage = (msg?.type === 'system' || msg?.messageType === 'system') && !isDeletedMessage;
+    // otp_2sv (org-2SV login codes in the read-only Talkstry channel) renders
+    // with the system-message pill style — distinct from a normal chat bubble;
+    // its text is server-redacted once the code is consumed/expired.
+    const isSystemMessage = (msg?.type === 'system' || msg?.messageType === 'system'
+      || msg?.type === 'otp_2sv' || msg?.messageType === 'otp_2sv') && !isDeletedMessage;
     const deletedText = msg?.placeholderText || (isMyMessage ? 'You deleted this message' : 'This message was deleted');
 
     // WhatsApp-style album: one message bubble carrying N attachments
@@ -5815,6 +5819,66 @@ export default function ChatScreen({ navigation, route }) {
     // ── System messages (group created, member joined/left/removed) ──
     if (isSystemMessage) {
       const systemText = msg?.text || msg?.content || '';
+
+      // Org-2SV login code (read-only Talkstry Authenticator channel): a
+      // RECEIVED-side (left-aligned) card — not a centered pill — with the CODE
+      // highlighted big. Once the server redacts the message (consumed/expired)
+      // there are no digits left and the same left card shows the plain text.
+      const isOtpMsg = msg?.type === 'otp_2sv' || msg?.messageType === 'otp_2sv';
+      if (isOtpMsg) {
+        const otpCodeMatch = systemText.match(/\b(\d{4,8})\b/);
+        const otpCode = otpCodeMatch ? otpCodeMatch[1] : null;
+        const otpRestText = otpCode
+          ? systemText.replace(otpCodeMatch[0], '').replace(/^\s*is\s+/, '').replace(/\s{2,}/g, ' ').trim()
+          : systemText;
+        const otpAccent = theme?.colors?.primary || '#03b0a2';
+        return (
+          <React.Fragment>
+            {dateBadgeKey && (
+              <View style={{ alignItems: 'center', paddingVertical: 8 }}>
+                <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12 }}>
+                  <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>{dateBadgeKey}</Text>
+                </View>
+              </View>
+            )}
+            {/* Same geometry/colors as a normal RECEIVED text bubble (see the
+                generic bubble below: radius 8, top-left tail 3, #202C33 dark /
+                cardBackground light, same padding + shadow) — only the code
+                line inside is highlighted. */}
+            <View style={{ alignItems: 'flex-start', paddingVertical: 2, paddingHorizontal: 12 }}>
+              <View style={{
+                maxWidth: '80%',
+                borderRadius: 8,
+                borderTopLeftRadius: 3,
+                backgroundColor: isDarkMode ? '#202C33' : theme.colors.cardBackground,
+                paddingVertical: 6,
+                paddingHorizontal: 9,
+                shadowColor: '#000',
+                shadowOffset: { width: 0, height: 1 },
+                shadowOpacity: isDarkMode ? 0.2 : 0.08,
+                shadowRadius: 1,
+                elevation: 1,
+              }}>
+                {otpCode ? (
+                  <>
+                    <Text style={{ fontSize: 15, color: isDarkMode ? '#E9EDEF' : theme.colors.textColor, fontFamily: 'Roboto-Regular', lineHeight: 21 }}>
+                      <Text selectable style={{ color: otpAccent, fontFamily: 'Roboto-Bold', fontSize: 17, letterSpacing: 2 }}>{otpCode}</Text>
+                      {otpRestText ? ` is ${otpRestText}` : ''}
+                    </Text>
+                  </>
+                ) : (
+                  <Text style={{ fontSize: 15, color: isDarkMode ? '#E9EDEF' : theme.colors.textColor, fontFamily: 'Roboto-Regular', lineHeight: 21 }}>
+                    {otpRestText}
+                  </Text>
+                )}
+                <Text style={{ fontSize: 11, color: '#8696A0', fontFamily: 'Roboto-Regular', alignSelf: 'flex-end', marginTop: 3 }}>
+                  {msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
+                </Text>
+              </View>
+            </View>
+          </React.Fragment>
+        );
+      }
 
       // Hide "created the group" system messages — the footer already shows this
       const isCreatedMsg = /created\s+(the\s+)?group/i.test(systemText);

@@ -154,11 +154,21 @@ export default function CallOverlay() {
       // then the local 1:1 chat row for this peer (peerIdentityMap). resolveName
       // already prefers saved name > phone > fallback.
       const ident = peerIdentityMap[p.id] || null;
-      const genericName = !p.name || p.name === 'Member' || p.name === 'Unknown';
+      // Identity fields can arrive as a { code, number } mobile OBJECT from
+      // older payloads/cached rows — coerce everything to a string here so the
+      // tile label can never render "[object Object]".
+      const asText = (v) => {
+        if (!v) return null;
+        if (typeof v === 'string') return v.trim() || null;
+        if (typeof v === 'object') return `${v.code || ''}${v.number || ''}`.trim() || null;
+        return String(v);
+      };
+      const pName = asText(p.name);
+      const genericName = !pName || pName === 'Member' || pName === 'Unknown';
       const fallbackName = genericName
-        ? (ident?.fullName || ident?.mobileNumber || p.name)
-        : p.name;
-      const phone = p.mobile || p.phone || ident?.mobileNumber || null;
+        ? (asText(ident?.fullName) || asText(ident?.mobileNumber) || pName)
+        : pName;
+      const phone = asText(p.mobile) || asText(p.phone) || asText(ident?.mobileNumber) || null;
       const name = resolveName(p.id, fallbackName, phone) || fallbackName || 'Member';
       out[p.id] = name === p.name ? p : { ...p, name };
     });

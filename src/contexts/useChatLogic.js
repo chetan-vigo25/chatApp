@@ -360,7 +360,11 @@ export default function useChatLogic({ navigation, route }) {
   }, []);
   const chatMessagesData = useSelector(state => state.chat?.chatMessagesData || state.chat?.data || state.chat);
   
-  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system', 'call', 'album']);
+  // otp_2sv — org-2SV login codes in the Talkstry Authenticator channel. Must
+  // survive EVERY normalizer path (REST list, sync, history, catchup): if it
+  // falls out of this set it downgrades to 'text' and renders as a plain
+  // bubble instead of the highlighted OTP bubble.
+  const ENUM_MESSAGE_TYPES = new Set(['text', 'image', 'video', 'audio', 'file', 'location', 'contact', 'system', 'call', 'album', 'otp_2sv']);
   const MEDIA_MESSAGE_TYPES = new Set(['image', 'photo', 'video', 'audio', 'file', 'document']);
 
   const normalizeOutboundMessageType = (value) => {

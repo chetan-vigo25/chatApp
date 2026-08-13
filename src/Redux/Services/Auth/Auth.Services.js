@@ -160,6 +160,31 @@ export async function emailLoginService(payload) {
     }
 }
 
+// ── Org two-step verification (in-app OTP over the Talkstry system channel) ──
+// The login call returns { data: { requiresTwoStepVerification, challengeToken } }
+// instead of tokens; these two endpoints complete / refresh that challenge.
+// Errors carry body.errorCode: OTP_INVALID | OTP_EXPIRED | OTP_ATTEMPTS_EXCEEDED |
+// CHALLENGE_EXPIRED | RESEND_COOLDOWN | RESEND_LIMIT | NO_REACHABLE_SESSION.
+export async function verify2svService(payload) {
+    try {
+        const response = await apiCall("POST", "user/auth/2sv/verify", payload);
+        if (response?.statusCode === 200) return response;
+        return Promise.reject(response || { message: "Verification failed" });
+    } catch (error) {
+        return Promise.reject(error?.response?.data || { message: error.message || "Verification failed" });
+    }
+}
+
+export async function resend2svService(payload) {
+    try {
+        const response = await apiCall("POST", "user/auth/2sv/resend", payload);
+        if (response?.statusCode === 200) return response;
+        return Promise.reject(response || { message: "Could not resend code" });
+    } catch (error) {
+        return Promise.reject(error?.response?.data || { message: error.message || "Could not resend code" });
+    }
+}
+
 export const authServices = {
     generateOtp,
     verifyOtpService,

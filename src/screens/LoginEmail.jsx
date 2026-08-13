@@ -10,6 +10,7 @@ import { useDeviceInfo } from "../contexts/DeviceInfoContext";
 import { useDeviceLocation } from "../contexts/DeviceLoc";
 import { useDispatch, useSelector } from "react-redux";
 import { emailLogin } from "../Redux/Reducer/Auth/Auth.reducer";
+import { verify2svService, resend2svService } from "../Redux/Services/Auth/Auth.Services";
 import { initSocket, emitLogoutCurrentDevice } from "../Redux/Services/Socket/socket";
 import { performSessionReset, saveAuthSession, extractLoginSession } from "../services/sessionManager";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -41,7 +42,30 @@ export default function LoginEmail({ navigation }) {
   const [passwordFocused, setPasswordFocused] = useState(false);
   const [passwordTouched, setPasswordTouched] = useState(false);
   const [fcmToken, setFcmToken] = useState(null);
+
+  // Org two-step verification step. Non-null after the backend answered the
+  // password login with { requiresTwoStepVerification, challengeToken } — the
+  // code arrives in the verified "Talkstry" channel + push on the user's
+  // already-signed-in device(s).
+  const [twoSv, setTwoSv] = useState(null); // { challengeToken, otpExpiresAt }
+  const [otpCode, setOtpCode] = useState("");
+  const [twoSvBusy, setTwoSvBusy] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [otpSecondsLeft, setOtpSecondsLeft] = useState(0);
   const isSubmitting = isLoading;
+
+  // Tick both the resend cooldown and the code-expiry countdown.
+  useEffect(() => {
+    if (!twoSv) return undefined;
+    const timer = setInterval(() => {
+      setResendCooldown((s) => (s > 0 ? s - 1 : 0));
+      if (twoSv.otpExpiresAt) {
+        const left = Math.max(0, Math.floor((new Date(twoSv.otpExpiresAt).getTime() - Date.now()) / 1000));
+        setOtpSecondsLeft(left);
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [twoSv]);
 
   useEffect(() => {
     AsyncStorage.getItem('fcmToken').then(setFcmToken).catch(() => {});
@@ -65,6 +89,96 @@ export default function LoginEmail({ navigation }) {
     ? `Password must be at most ${MAX_PASSWORD_LENGTH} characters`
     : `Password must be at least ${MIN_PASSWORD_LENGTH} characters`;
   const isFormValid = isUsernameValid && isPasswordValid;
+
+  const buildDevicePayload = () => ({
+    deviceName: deviceInfo?.brand || "Unknown",
+    deviceType: deviceInfo?.deviceType || "mobile",
+    os: deviceInfo?.osName || Platform.OS,
+    appVersion: deviceInfo?.appVersion || "1.0.0",
+    fcmToken: fcmToken || "",
+    location: location && address?.[0]
+      ? {
+          lat: location.coords.latitude,
+          lng: location.coords.longitude,
+          street: address[0].street || "",
+          city: address[0].city || "",
+          state: address[0].state || "",
+          country: address[0].country || "",
+          zipCode: address[0].postalCode || "",
+          timezone: address[0].timezone || "",
+        }
+      : {},
+  });
+
+  // Shared tail of a successful login (normal password login AND 2SV verify).
+  const completeLogin = async (loginData) => {
+    try { await emitLogoutCurrentDevice(); } catch (_) {}
+    await performSessionReset({
+      reason: "user_switch_login",
+      resetNavigation: false,
+      clearAllStorage: true,
+      nextUserId: loginData?.data?._id || loginData?.data?.id || null,
+    });
+    const session = extractLoginSession(loginData);
+    await saveAuthSession({
+      userInfo: loginData.data,
+      accessToken: session.accessToken,
+      refreshToken: session.refreshToken,
+      deviceId: session.deviceId,
+      loginMethod: 'username',
+    });
+    showToast(loginData.message);
+    if (deviceInfo) initSocket(deviceInfo, navigation);
+    if (loginData?.data?.isNewUser) {
+      navigation.reset({ index: 0, routes: [{ name: "EditProfile", params: { username: username.trim().toLowerCase() } }] });
+    } else {
+      navigation.reset({ index: 0, routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }] });
+    }
+  };
+
+  const handleVerify2sv = async () => {
+    if (twoSvBusy || otpCode.trim().length < 6) return;
+    setTwoSvBusy(true);
+    try {
+      const response = await verify2svService({
+        challengeToken: twoSv.challengeToken,
+        otp: otpCode.trim(),
+        device: buildDevicePayload(),
+      });
+      await completeLogin(response);
+    } catch (error) {
+      const code = error?.errorCode;
+      showToast(error?.message || "Verification failed. Please try again.");
+      if (code === 'CHALLENGE_EXPIRED' || code === 'RESEND_LIMIT') {
+        // Challenge unusable — back to the password step for a fresh attempt.
+        setTwoSv(null);
+        setOtpCode("");
+      }
+    } finally {
+      setTwoSvBusy(false);
+    }
+  };
+
+  const handleResend2sv = async () => {
+    if (twoSvBusy || resendCooldown > 0) return;
+    setTwoSvBusy(true);
+    try {
+      const response = await resend2svService({ challengeToken: twoSv.challengeToken });
+      setTwoSv((prev) => ({ ...prev, otpExpiresAt: response?.data?.otpExpiresAt || prev.otpExpiresAt }));
+      setOtpCode("");
+      setResendCooldown(45);
+      showToast(response?.message || "A new code was sent.");
+    } catch (error) {
+      const code = error?.errorCode;
+      showToast(error?.message || "Could not resend code.");
+      if (code === 'CHALLENGE_EXPIRED' || code === 'RESEND_LIMIT') {
+        setTwoSv(null);
+        setOtpCode("");
+      }
+    } finally {
+      setTwoSvBusy(false);
+    }
+  };
 
   const handleSubmit = async () => {
     if (!isFormValid || isLoading) return;
@@ -95,33 +209,19 @@ export default function LoginEmail({ navigation }) {
 
     try {
       const loginData = await dispatch(emailLogin(payload)).unwrap();
-      // M6 — single-account: force-logout the previous account server-side
-      // (best-effort) before wiping local state and switching.
-      try { await emitLogoutCurrentDevice(); } catch (_) {}
-      // Pass the incoming userId so the reset KEEPS the local SQLite cache on a
-      // same-account re-login (instant local-first load) and only wipes it when
-      // a different user signs in on this device.
-      await performSessionReset({
-        reason: "user_switch_login",
-        resetNavigation: false,
-        clearAllStorage: true,
-        nextUserId: loginData?.data?._id || loginData?.data?.id || null,
-      });
-      const session = extractLoginSession(loginData);
-      await saveAuthSession({
-        userInfo: loginData.data,
-        accessToken: session.accessToken,
-        refreshToken: session.refreshToken,
-        deviceId: session.deviceId,
-        loginMethod: 'username',
-      });
-      showToast(loginData.message);
-      if (deviceInfo) initSocket(deviceInfo, navigation);
-      if (loginData?.data?.isNewUser) {
-        navigation.reset({ index: 0, routes: [{ name: "EditProfile", params: { username: username.trim().toLowerCase() } }] });
-      } else {
-        navigation.reset({ index: 0, routes: [{ name: "SyncScreen", params: { navigateTarget: "ChatList" } }] });
+      // Org 2SV: password accepted but no tokens yet — the code was posted to
+      // the user's Talkstry system channel (+ push). Switch to the OTP step.
+      if (loginData?.data?.requiresTwoStepVerification) {
+        setTwoSv({
+          challengeToken: loginData.data.challengeToken,
+          otpExpiresAt: loginData.data.otpExpiresAt || null,
+        });
+        setOtpCode("");
+        setResendCooldown(45);
+        showToast(loginData.message || "Verification code sent to your Talkstry app.");
+        return;
       }
+      await completeLogin(loginData);
     } catch (error) {
       showToast(typeof error === "string" ? error : "Login failed. Please try again.");
     }
@@ -160,6 +260,40 @@ export default function LoginEmail({ navigation }) {
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <Animated.View style={[styles.content, { opacity: fadeAnim, transform: [{ translateY: slideAnim }] }]}>
+            {twoSv ? (
+              <>
+                <Text style={[styles.heading, { color: primaryText }]}>Two-step verification</Text>
+                <Text style={[styles.blurb, { color: secondaryText }]}>
+                  We sent a 6-digit code to the verified Talkstry channel in your chat list (and as a notification) on your signed-in device. Enter it below to finish signing in.
+                </Text>
+                <Text style={[styles.label, { color: secondaryText }]}>VERIFICATION CODE</Text>
+                <View style={[styles.inputRow, { borderBottomColor: accent }]}>
+                  <Ionicons name="shield-checkmark-outline" size={20} color={accent} style={styles.inputIcon} />
+                  <TextInput
+                    style={[styles.input, { color: primaryText }]}
+                    placeholder="6-digit code"
+                    placeholderTextColor={placeholderText}
+                    value={otpCode}
+                    onChangeText={(v) => setOtpCode(v.replace(/[^0-9]/g, ""))}
+                    keyboardType="number-pad"
+                    maxLength={6}
+                    returnKeyType="done"
+                    onSubmitEditing={handleVerify2sv}
+                    autoFocus
+                  />
+                </View>
+                {otpSecondsLeft > 0 ? (
+                  <Text style={[styles.countdown, { color: secondaryText }]}>
+                    Code expires in {Math.floor(otpSecondsLeft / 60)}:{String(otpSecondsLeft % 60).padStart(2, '0')}
+                  </Text>
+                ) : (
+                  <Text style={[styles.countdown, { color: errorColor }]}>
+                    Code expired — tap Resend to get a new one.
+                  </Text>
+                )}
+              </>
+            ) : (
+              <>
             <Text style={[styles.heading, { color: primaryText }]}>
               Sign in to {String(APP_TAG_NAME || 'continue')}
             </Text>
@@ -224,11 +358,50 @@ export default function LoginEmail({ navigation }) {
                 <Text style={styles.errorText}>{passwordErrorText}</Text>
               </View>
             ) : null}
+              </>
+            )}
           </Animated.View>
         </ScrollView>
 
         {/* Bottom actions */}
         <View style={styles.bottomArea}>
+          {twoSv ? (
+            <>
+              <TouchableOpacity
+                onPress={handleVerify2sv}
+                disabled={otpCode.length < 6 || twoSvBusy}
+                activeOpacity={0.85}
+                style={[styles.cta, { backgroundColor: otpCode.length === 6 && !twoSvBusy ? accent : disabledBtn }]}
+              >
+                {twoSvBusy ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={[styles.ctaText, { color: otpCode.length === 6 ? '#FFFFFF' : disabledTxt }]}>VERIFY</Text>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={handleResend2sv}
+                disabled={resendCooldown > 0 || twoSvBusy}
+                activeOpacity={0.75}
+                style={[styles.altBtn, styles.resendBtn, { borderColor: resendCooldown > 0 ? disabledBtn : accent }]}
+              >
+                <Ionicons name="refresh-outline" size={18} color={resendCooldown > 0 ? disabledTxt : accent} />
+                <Text style={[styles.altBtnText, { color: resendCooldown > 0 ? disabledTxt : accent }]}>
+                  {resendCooldown > 0 ? `Resend code in ${resendCooldown}s` : 'Resend code'}
+                </Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={() => { setTwoSv(null); setOtpCode(""); }}
+                activeOpacity={0.75}
+                style={styles.backLink}
+              >
+                <Text style={[styles.altBtnText, { color: link }]}>Back to sign in</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <>
           <TouchableOpacity
             onPress={handleSubmit}
             disabled={!isFormValid || isSubmitting}
@@ -256,6 +429,8 @@ export default function LoginEmail({ navigation }) {
             <Ionicons name="call-outline" size={18} color={accent} />
             <Text style={[styles.altBtnText, { color: accent }]}>Continue with phone</Text>
           </TouchableOpacity>
+            </>
+          )}
 
           <Text style={[styles.footer, { color: secondaryText }]}>
             Protected by end-to-end encryption
@@ -372,6 +547,13 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
   },
   altBtnText: { fontFamily: 'Roboto-Medium', fontSize: 14 },
+  resendBtn: { marginTop: 16 },
+  backLink: { alignSelf: 'center', marginTop: 18 },
+  countdown: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 13,
+    marginTop: 12,
+  },
 
   footer: {
     fontFamily: 'Roboto-Regular',

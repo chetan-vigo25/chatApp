@@ -2637,6 +2637,19 @@ const getChatById = async (chatId) => {
 // Used as a local fallback where a live roster only carries ids (e.g. the
 // conference-call grid) — the chat row already knows the peer's name/number
 // exactly as the chat list shows them.
+// Backend `mobile` can be an OBJECT ({ code, number }) — stringify it here so
+// callers can render it directly. Returning the raw object made the call UI
+// show "[object Object]" as a participant name on incoming conference rings.
+const toPhoneString = (m) => {
+  if (!m) return null;
+  if (typeof m === 'string') return m.trim() || null;
+  if (typeof m === 'object') {
+    const s = `${m.code || ''}${m.number || ''}`.trim();
+    return s || null;
+  }
+  return null;
+};
+
 const getPeerIdentity = async (userId) => {
   if (!userId) return null;
   try {
@@ -2650,7 +2663,7 @@ const getPeerIdentity = async (userId) => {
     if (String(peer._id || peer.id || '') !== String(userId)) return null;
     return {
       fullName: peer.fullName || row.chat_name || null,
-      mobileNumber: peer.mobileNumber || peer.mobile || peer.phoneNumber || null,
+      mobileNumber: toPhoneString(peer.mobileNumber) || toPhoneString(peer.mobile) || toPhoneString(peer.phoneNumber) || null,
       profileImage: peer.profileImage || row.chat_avatar || null,
     };
   } catch (_) {
