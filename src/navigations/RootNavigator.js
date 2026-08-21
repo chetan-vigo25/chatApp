@@ -26,6 +26,7 @@ import UserB from "../screens/profiles/UserB";
 import ChannelInfo from "../screens/chats/ChannelInfo";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
 import ChatPrivacy from "../screens/profiles/ChatPrivacy";
+import ChooseLanguage from "../screens/profiles/ChooseLanguage";
 import PrivacyAccount from "../screens/profiles/PrivacyAccount";
 import BlockedContacts from "../screens/profiles/BlockedContacts";
 import DeleteAccount from "../screens/profiles/DeleteAccount";
@@ -133,6 +134,7 @@ export default function RootNavigator() {
           <Stack.Screen name="ChannelInfo" component={ChannelInfo} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
           <Stack.Screen name="ChatPrivacy" component={ChatPrivacy} />
+          <Stack.Screen name="ChooseLanguage" component={ChooseLanguage} />
           <Stack.Screen name="PrivacyAccount" component={PrivacyAccount} />
           <Stack.Screen name="BlockedContacts" component={BlockedContacts} />
           <Stack.Screen name="DeleteAccount" component={DeleteAccount} />

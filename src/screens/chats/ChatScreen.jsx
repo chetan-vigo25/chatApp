@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   View,
-  Text,
+  // Text,
   FlatList,
   TouchableOpacity,
   Pressable,
@@ -27,6 +27,7 @@ import {
   DeviceEventEmitter,
   BackHandler
 } from "react-native";
+import { Text, useLanguage } from "../../components/Translate";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
@@ -100,6 +101,7 @@ const LARGE_DOWNLOAD_BYTES = 8 * 1024 * 1024;
 const RICH_TEXT_CHAR_LIMIT = 520;
 const RICH_TEXT_COLLAPSED_LINES = 30;
 const RICH_PARSE_CACHE_LIMIT = 500;
+
 
 // Auto-detect unfenced code (Teams-style): a multi-line message where most
 // lines carry code signals (keywords, tag/brace/semicolon shapes, indentation)
@@ -1275,6 +1277,7 @@ const chatMenuStyles = StyleSheet.create({
 });
 
 export default function ChatScreen({ navigation, route }) {
+  const { language } = useLanguage();
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
   const [reportPayload, setReportPayload] = useState({});

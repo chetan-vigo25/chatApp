@@ -1,8 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
-  View, Text, Image, Animated, TouchableOpacity, ScrollView,
-  Alert, StyleSheet, ActivityIndicator, Platform,
+  View, Image, Animated, TouchableOpacity, ScrollView,
+  Alert, StyleSheet, ActivityIndicator, Platform, Text
 } from "react-native";
+// Translated <Text>: static labels go through Google Translate; anything marked
+// `ignore` (the user's own name, bio, e-mail) is rendered exactly as stored.
+import { useLanguage } from "../../components/Translate";
+import { getLanguage } from "../../constant/languages";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import { useFocusEffect } from "@react-navigation/native";
@@ -19,6 +23,8 @@ const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
 export default function Setting({ navigation }) {
   const { theme, isDarkMode } = useTheme();
+  const { language } = useLanguage();
+  const currentLanguage = getLanguage(language);
   const { logout } = useAuth();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const slideAnim = useRef(new Animated.Value(14)).current;
@@ -110,6 +116,14 @@ export default function Setting({ navigation }) {
           onPress: () => navigation.navigate('ChatColorTheme'),
         },
         {
+          icon: 'language-outline',
+          label: 'App language',
+          // Already in its own script — renderMenuItem marks it `ignore`.
+          subtitle: `${currentLanguage.flag}  ${currentLanguage.label}`,
+          ignoreSubtitle: true,
+          onPress: () => navigation.navigate('ChooseLanguage'),
+        },
+        {
           icon: 'lock-closed-outline',
           label: 'Chat privacy',
           subtitle: 'Chat delete & app lock password',
@@ -185,7 +199,7 @@ export default function Setting({ navigation }) {
         },
       ],
     },
-  ]), [isDarkMode, isBackingUp, backupStatus]);
+  ]), [isDarkMode, isBackingUp, backupStatus, currentLanguage]);
 
 
   const renderProfileCard = () => (
@@ -198,18 +212,19 @@ export default function Setting({ navigation }) {
         {profileData?.profileImage ? (
           <Image resizeMode="cover" source={{ uri: profileData.profileImage }} style={styles.profileAvatarImage} />
         ) : (
-          <Text style={styles.profileAvatarText}>{getInitials(profileData?.fullName)}</Text>
+          <Text ignore style={styles.profileAvatarText}>{getInitials(profileData?.fullName)}</Text>
         )}
       </View>
 
       <View style={styles.profileInfo}>
         <View style={styles.profileNameRow}>
-          <Text style={[styles.profileName, { color: primaryText, flexShrink: 1 }]} numberOfLines={1}>
+          <Text ignore style={[styles.profileName, { color: primaryText, flexShrink: 1 }]} numberOfLines={1}>
             {profileData?.fullName || 'User'}
           </Text>
           <VerifiedBadge verified={profileData?.isVerified} size={16} />
         </View>
-        <Text style={[styles.profileSub, { color: subText }]} numberOfLines={1}>
+        {/* The user's own bio/e-mail — never sent to a translation API. */}
+        <Text ignore style={[styles.profileSub, { color: subText }]} numberOfLines={1}>
           {profileData?.about || profileData?.email || 'Tap to set up your profile'}
         </Text>
       </View>
@@ -239,6 +254,7 @@ export default function Setting({ navigation }) {
         <Text style={[styles.menuLabel, { color: primaryText }]}>{item.label}</Text>
         {item.subtitle ? (
           <Text
+            ignore={item.ignoreSubtitle}
             numberOfLines={1}
             style={[styles.menuSubtitle, { color: item.isLoading ? accent : subText }]}
           >

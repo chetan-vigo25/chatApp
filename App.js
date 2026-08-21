@@ -6,6 +6,7 @@ import { KeyboardProvider } from 'react-native-keyboard-controller';
 import RootNavigator from './src/navigations/RootNavigator';
 import { useFonts } from 'expo-font';
 import { ThemeProvider, useTheme } from './src/contexts/ThemeContext';
+import { LanguageProvider } from './src/components/Translate';
 import { ContactProvider } from './src/contexts/ContactContext';
 import { DeviceInfoProvider } from './src/contexts/DeviceInfoContext';
 import { Provider as PaperProvider } from 'react-native-paper';
@@ -102,6 +103,10 @@ export default function App() {
      <SafeAreaProvider>
      <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
        <ThemeProvider>
+        {/* Selected app language + the on-disk translation cache. Sits high so
+            every screen using the translated <Text> re-renders the moment the
+            user picks a different language — no app restart needed. */}
+        <LanguageProvider>
          <NetworkProvider>
           <PaperProvider>
            <DeviceInfoProvider>
@@ -126,6 +131,7 @@ export default function App() {
            </DeviceInfoProvider>
           </PaperProvider>
          </NetworkProvider>
+        </LanguageProvider>
        </ThemeProvider>
      </KeyboardProvider>
      </SafeAreaProvider>
