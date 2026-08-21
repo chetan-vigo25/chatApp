@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   View,
-  // Text,
+  Text,
   FlatList,
   TouchableOpacity,
   Pressable,
@@ -27,7 +27,12 @@ import {
   DeviceEventEmitter,
   BackHandler
 } from "react-native";
-import { Text, useLanguage } from "../../components/Translate";
+// Message-body text only. Everything else on this screen keeps React
+// Native's <Text>: names, timestamps, ticks, menus and system rows must
+// never be sent to a translation API.
+// NOTE: the alias MUST start with a capital letter — JSX treats a lowercase
+// element name (<myText>) as a native host component, not a React component.
+import { Text as MyText, useLanguage } from "../../components/Translate";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
@@ -4645,29 +4650,32 @@ export default function ChatScreen({ navigation, route }) {
             }
             if (token.type === 'bold') {
               return (
-                <Text key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
+                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
                   {token.text}
-                </Text>
+                </MyText>
               );
             }
             if (token.type === 'italic') {
               return (
-                <Text key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
+                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
                   {token.text}
-                </Text>
+                </MyText>
               );
             }
             if (token.type === 'underline') {
               return (
-                <Text key={key} style={{ textDecorationLine: 'underline', color: baseColor }}>
+                <MyText from="auto" key={key} style={{ textDecorationLine: 'underline', color: baseColor }}>
                   {token.text}
-                </Text>
+                </MyText>
               );
             }
+            // The message body itself. With mentions the children become an
+            // ARRAY, which MyText renders untouched — so @names are never sent
+            // anywhere; only a plain string is translated.
             return (
-              <Text key={key} style={{ color: baseColor }}>
+              <MyText from="auto" key={key} style={{ color: baseColor }}>
                 {msgMentions ? renderTextWithMentions(token.text, msgMentions, baseColor, mentionColor, key) : token.text}
-              </Text>
+              </MyText>
             );
           })}
           {lineIndex < parsed.lines.length - 1 ? '\n' : ''}
@@ -6449,7 +6457,7 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, language, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted

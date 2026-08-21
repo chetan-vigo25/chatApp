@@ -38,7 +38,7 @@ import translate from 'translate';
 import { TRANSLATE_ENGINE, TRANSLATE_KEY } from '@env';
 
 export const LANGUAGE_STORAGE_KEY = 'app.language';
-const CACHE_KEY = 'translation.cache.v1';
+const CACHE_KEY = 'translation.cache.v2';
 /** Source language of every hard-coded string in this app. */
 export const SOURCE_LANGUAGE = 'en';
 /** Disk cache ceiling — keeps AsyncStorage from growing without bound. */
@@ -115,25 +115,110 @@ function enqueue(job) {
   });
 }
 
+/* ─────────────────── auto source language (chat messages) ─────────────────── */
+
+/**
+ * The same free endpoint the package's google engine uses, called directly for
+ * ONE case the package cannot express: `sl=auto`.
+ *
+ * `translate()` validates the source against ISO 639-1 and "auto" is not a
+ * language, so it throws. Chat messages need auto-detection — the sender's
+ * language is unknown, and forcing `sl=en` means a Hindi message would never
+ * translate back to English for the other side.
+ */
+const GOOGLE_FREE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
+
+async function translateAuto(text, to, sl = 'auto') {
+  const url =
+    `${GOOGLE_FREE_ENDPOINT}?client=gtx&sl=${sl}&tl=${encodeURIComponent(to)}` +
+    `&dt=t&q=${encodeURIComponent(text)}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  const chunks = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : null;
+  if (!chunks) throw new Error('Unexpected response shape');
+  return chunks.map((chunk) => (chunk && chunk[0]) || '').join('');
+}
+
+/** Scripts, keyed by the languages this app offers. */
+const SCRIPT_OF = {
+  hi: /[\u0900-\u097F]/, mr: /[\u0900-\u097F]/,
+  bn: /[\u0980-\u09FF]/, gu: /[\u0A80-\u0AFF]/, pa: /[\u0A00-\u0A7F]/,
+  ta: /[\u0B80-\u0BFF]/, te: /[\u0C00-\u0C7F]/,
+  kn: /[\u0C80-\u0CFF]/, ml: /[\u0D00-\u0D7F]/,
+  ur: /[\u0600-\u06FF]/, ar: /[\u0600-\u06FF]/,
+  ru: /[\u0400-\u04FF]/, th: /[\u0E00-\u0E7F]/,
+  ja: /[\u3040-\u30FF\u4E00-\u9FFF]/, zh: /[\u4E00-\u9FFF]/,
+};
+const NON_LATIN_SCRIPT =
+  /[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7A3]/;
+
+/**
+ * "Is this text already readable by someone using `language`?"
+ *
+ * A cheap SCRIPT check, not language detection. Its only job is to avoid a
+ * network round-trip per chat message: an English reader looking at English
+ * messages, or a Thai reader looking at Thai messages, costs zero requests.
+ *
+ * For a Latin-script target it can only tell that the text is Latin, so a
+ * French message shown to an English reader is left untranslated — an accepted
+ * trade-off (see the guide).
+ */
+function looksAlreadyReadable(text, language) {
+  const script = SCRIPT_OF[language];
+  if (script) return script.test(text);
+  return !NON_LATIN_SCRIPT.test(text);
+}
+
+/**
+ * Which source language to ask for.
+ *
+ * `auto` is right for text written in its own script (Devanagari, Thai, Arabic…).
+ * It is WRONG for romanized text — "Kya kru", "Ab btao", "Tum kha ja rhe ho" are
+ * Hindi typed in Latin letters, and Google detects them as `hi`. With a Hindi
+ * reader that makes source == target, so the endpoint returns the message
+ * unchanged and nothing appears to translate.
+ *
+ * So: Latin-script message + non-Latin-script reader → force `sl=en`. Google
+ * then actually converts it ("Ab btao" → "अब बताओ"), and genuinely English
+ * messages are unaffected because English IS the forced source.
+ */
+function sourceFor(text, language) {
+  const readerUsesOwnScript = Boolean(SCRIPT_OF[language]);
+  const messageIsLatin = !NON_LATIN_SCRIPT.test(text);
+  return readerUsesOwnScript && messageIsLatin ? 'en' : 'auto';
+}
+
 /* ─────────────────────────── translate entry ─────────────────────────── */
 
 /**
  * Translate one string. Always resolves — on any failure it resolves with the
  * original text, so no caller ever needs a try/catch.
  */
-export async function t(text, language) {
+export async function t(text, language, from = SOURCE_LANGUAGE) {
   if (typeof text !== 'string' || !text.trim()) return text;
-  if (!language || language === SOURCE_LANGUAGE) return text;   // no call for English
+  if (!language) return text;
+
+  // 'auto' only works through the endpoint directly; any other engine falls
+  // back to treating the text as English.
+  const auto = from === 'auto' && translate.engine === 'google';
+  const source = from === 'auto' ? (auto ? 'auto' : SOURCE_LANGUAGE) : from;
+
+  if (source !== 'auto' && language === source) return text;     // en → en: nothing to do
+  if (source === 'auto' && looksAlreadyReadable(text, language)) return text;
+
+  // Romanized text needs an explicit source — see sourceFor().
+  const sl = auto ? sourceFor(text, language) : source;
 
   await loadCache();
-  const key = `${language}::${text}`;
+  const key = `${sl}::${language}::${text}`;
   if (memoryCache[key] != null) return memoryCache[key];         // cache hit — 0 requests
 
   const pending = inflight.get(key);
   if (pending) return pending;                                   // same string twice on one screen
 
   const request = enqueue(() =>
-    translate(text, language)
+    (auto ? translateAuto(text, language, sl) : translate(text, language))
       .then((result) => {
         const value = typeof result === 'string' && result.trim() ? result : text;
         memoryCache[key] = value;
@@ -222,23 +307,31 @@ export function useT(text) {
  * an ARRAY of children, and translating that would send the user's name to
  * Google — so arrays are rendered untouched. Split them instead:
  *   <Text>Hello</Text><Text ignore> {name}</Text>
+ *
+ * `from="auto"` makes the source language auto-detected instead of assumed
+ * English. That is what chat messages use — the sender's language is unknown
+ * and translation has to work in both directions.
  */
-function TText({ ignore, children, ...rest }) {
+function TText({ ignore, from, children, ...rest }) {
   const { language } = useLanguage();
   const source = typeof children === 'string' ? children : null;
   const [text, setText] = useState(children);
 
   useEffect(() => {
     let alive = true;
-    if (ignore || source === null || language === SOURCE_LANGUAGE) {
+    // `from="auto"` (chat messages) must still run when the reader's language
+    // is English — a Hindi message has to become English for them.
+    const nothingToDo =
+      ignore || source === null || (from !== 'auto' && language === SOURCE_LANGUAGE);
+    if (nothingToDo) {
       setText(children);
       return undefined;
     }
-    // Render the English immediately, swap in the translation when it lands.
+    // Render the original immediately, swap in the translation when it lands.
     setText(children);
-    t(source, language).then((result) => { if (alive) setText(result); });
+    t(source, language, from).then((result) => { if (alive) setText(result); });
     return () => { alive = false; };
-  }, [source, children, language, ignore]);
+  }, [source, children, language, ignore, from]);
 
   return <RNText {...rest}>{text}</RNText>;
 }

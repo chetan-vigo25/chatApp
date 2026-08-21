@@ -8,6 +8,7 @@
 export const LANGUAGES = [
   { code: 'en', label: 'English',    english: 'English',    flag: '🇬🇧' },
   { code: 'hi', label: 'हिन्दी',      english: 'Hindi',      flag: '🇮🇳' },
+  { code: 'th', label: 'ไทย',         english: 'Thai',       flag: '🇹🇭' },
   { code: 'bn', label: 'বাংলা',       english: 'Bengali',    flag: '🇮🇳' },
   { code: 'mr', label: 'मराठी',       english: 'Marathi',    flag: '🇮🇳' },
   { code: 'gu', label: 'ગુજરાતી',     english: 'Gujarati',   flag: '🇮🇳' },
@@ -25,7 +26,6 @@ export const LANGUAGES = [
   { code: 'ru', label: 'Русский',     english: 'Russian',    flag: '🇷🇺' },
   { code: 'zh', label: '中文',         english: 'Chinese',    flag: '🇨🇳' },
   { code: 'ja', label: '日本語',       english: 'Japanese',   flag: '🇯🇵' },
-  { code: 'th', label: 'ไทย',         english: 'Thai',       flag: '🇹🇭' },
 ];
 
 export const getLanguage = (code) =>

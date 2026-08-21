@@ -156,7 +156,7 @@ import translate from 'translate';
 import { TRANSLATE_ENGINE, TRANSLATE_KEY } from '@env';
 
 export const LANGUAGE_STORAGE_KEY = 'app.language';
-const CACHE_KEY = 'translation.cache.v1';
+const CACHE_KEY = 'translation.cache.v2';
 /** Source language of every hard-coded string in this app. */
 export const SOURCE_LANGUAGE = 'en';
 /** Disk cache ceiling — keeps AsyncStorage from growing without bound. */
@@ -233,25 +233,110 @@ function enqueue(job) {
   });
 }
 
+/* ─────────────────── auto source language (chat messages) ─────────────────── */
+
+/**
+ * The same free endpoint the package's google engine uses, called directly for
+ * ONE case the package cannot express: `sl=auto`.
+ *
+ * `translate()` validates the source against ISO 639-1 and "auto" is not a
+ * language, so it throws. Chat messages need auto-detection — the sender's
+ * language is unknown, and forcing `sl=en` means a Hindi message would never
+ * translate back to English for the other side.
+ */
+const GOOGLE_FREE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
+
+async function translateAuto(text, to, sl = 'auto') {
+  const url =
+    `${GOOGLE_FREE_ENDPOINT}?client=gtx&sl=${sl}&tl=${encodeURIComponent(to)}` +
+    `&dt=t&q=${encodeURIComponent(text)}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  const chunks = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : null;
+  if (!chunks) throw new Error('Unexpected response shape');
+  return chunks.map((chunk) => (chunk && chunk[0]) || '').join('');
+}
+
+/** Scripts, keyed by the languages this app offers. */
+const SCRIPT_OF = {
+  hi: /[\u0900-\u097F]/, mr: /[\u0900-\u097F]/,
+  bn: /[\u0980-\u09FF]/, gu: /[\u0A80-\u0AFF]/, pa: /[\u0A00-\u0A7F]/,
+  ta: /[\u0B80-\u0BFF]/, te: /[\u0C00-\u0C7F]/,
+  kn: /[\u0C80-\u0CFF]/, ml: /[\u0D00-\u0D7F]/,
+  ur: /[\u0600-\u06FF]/, ar: /[\u0600-\u06FF]/,
+  ru: /[\u0400-\u04FF]/, th: /[\u0E00-\u0E7F]/,
+  ja: /[\u3040-\u30FF\u4E00-\u9FFF]/, zh: /[\u4E00-\u9FFF]/,
+};
+const NON_LATIN_SCRIPT =
+  /[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7A3]/;
+
+/**
+ * "Is this text already readable by someone using `language`?"
+ *
+ * A cheap SCRIPT check, not language detection. Its only job is to avoid a
+ * network round-trip per chat message: an English reader looking at English
+ * messages, or a Thai reader looking at Thai messages, costs zero requests.
+ *
+ * For a Latin-script target it can only tell that the text is Latin, so a
+ * French message shown to an English reader is left untranslated — an accepted
+ * trade-off (see the guide).
+ */
+function looksAlreadyReadable(text, language) {
+  const script = SCRIPT_OF[language];
+  if (script) return script.test(text);
+  return !NON_LATIN_SCRIPT.test(text);
+}
+
+/**
+ * Which source language to ask for.
+ *
+ * `auto` is right for text written in its own script (Devanagari, Thai, Arabic…).
+ * It is WRONG for romanized text — "Kya kru", "Ab btao", "Tum kha ja rhe ho" are
+ * Hindi typed in Latin letters, and Google detects them as `hi`. With a Hindi
+ * reader that makes source == target, so the endpoint returns the message
+ * unchanged and nothing appears to translate.
+ *
+ * So: Latin-script message + non-Latin-script reader → force `sl=en`. Google
+ * then actually converts it ("Ab btao" → "अब बताओ"), and genuinely English
+ * messages are unaffected because English IS the forced source.
+ */
+function sourceFor(text, language) {
+  const readerUsesOwnScript = Boolean(SCRIPT_OF[language]);
+  const messageIsLatin = !NON_LATIN_SCRIPT.test(text);
+  return readerUsesOwnScript && messageIsLatin ? 'en' : 'auto';
+}
+
 /* ─────────────────────────── translate entry ─────────────────────────── */
 
 /**
  * Translate one string. Always resolves — on any failure it resolves with the
  * original text, so no caller ever needs a try/catch.
  */
-export async function t(text, language) {
+export async function t(text, language, from = SOURCE_LANGUAGE) {
   if (typeof text !== 'string' || !text.trim()) return text;
-  if (!language || language === SOURCE_LANGUAGE) return text;   // no call for English
+  if (!language) return text;
+
+  // 'auto' only works through the endpoint directly; any other engine falls
+  // back to treating the text as English.
+  const auto = from === 'auto' && translate.engine === 'google';
+  const source = from === 'auto' ? (auto ? 'auto' : SOURCE_LANGUAGE) : from;
+
+  if (source !== 'auto' && language === source) return text;     // en → en: nothing to do
+  if (source === 'auto' && looksAlreadyReadable(text, language)) return text;
+
+  // Romanized text needs an explicit source — see sourceFor().
+  const sl = auto ? sourceFor(text, language) : source;
 
   await loadCache();
-  const key = `${language}::${text}`;
+  const key = `${sl}::${language}::${text}`;
   if (memoryCache[key] != null) return memoryCache[key];         // cache hit — 0 requests
 
   const pending = inflight.get(key);
   if (pending) return pending;                                   // same string twice on one screen
 
   const request = enqueue(() =>
-    translate(text, language)
+    (auto ? translateAuto(text, language, sl) : translate(text, language))
       .then((result) => {
         const value = typeof result === 'string' && result.trim() ? result : text;
         memoryCache[key] = value;
@@ -340,23 +425,31 @@ export function useT(text) {
  * an ARRAY of children, and translating that would send the user's name to
  * Google — so arrays are rendered untouched. Split them instead:
  *   <Text>Hello</Text><Text ignore> {name}</Text>
+ *
+ * `from="auto"` makes the source language auto-detected instead of assumed
+ * English. That is what chat messages use — the sender's language is unknown
+ * and translation has to work in both directions.
  */
-function TText({ ignore, children, ...rest }) {
+function TText({ ignore, from, children, ...rest }) {
   const { language } = useLanguage();
   const source = typeof children === 'string' ? children : null;
   const [text, setText] = useState(children);
 
   useEffect(() => {
     let alive = true;
-    if (ignore || source === null || language === SOURCE_LANGUAGE) {
+    // `from="auto"` (chat messages) must still run when the reader's language
+    // is English — a Hindi message has to become English for them.
+    const nothingToDo =
+      ignore || source === null || (from !== 'auto' && language === SOURCE_LANGUAGE);
+    if (nothingToDo) {
       setText(children);
       return undefined;
     }
-    // Render the English immediately, swap in the translation when it lands.
+    // Render the original immediately, swap in the translation when it lands.
     setText(children);
-    t(source, language).then((result) => { if (alive) setText(result); });
+    t(source, language, from).then((result) => { if (alive) setText(result); });
     return () => { alive = false; };
-  }, [source, children, language, ignore]);
+  }, [source, children, language, ignore, from]);
 
   return <RNText {...rest}>{text}</RNText>;
 }
@@ -411,6 +504,7 @@ export { TText as Text, TTextInput as TextInput };
 export const LANGUAGES = [
   { code: 'en', label: 'English',    english: 'English',    flag: '🇬🇧' },
   { code: 'hi', label: 'हिन्दी',      english: 'Hindi',      flag: '🇮🇳' },
+  { code: 'th', label: 'ไทย',         english: 'Thai',       flag: '🇹🇭' },
   { code: 'bn', label: 'বাংলা',       english: 'Bengali',    flag: '🇮🇳' },
   { code: 'mr', label: 'मराठी',       english: 'Marathi',    flag: '🇮🇳' },
   { code: 'gu', label: 'ગુજરાતી',     english: 'Gujarati',   flag: '🇮🇳' },
@@ -428,7 +522,6 @@ export const LANGUAGES = [
   { code: 'ru', label: 'Русский',     english: 'Russian',    flag: '🇷🇺' },
   { code: 'zh', label: '中文',         english: 'Chinese',    flag: '🇨🇳' },
   { code: 'ja', label: '日本語',       english: 'Japanese',   flag: '🇯🇵' },
-  { code: 'th', label: 'ไทย',         english: 'Thai',       flag: '🇹🇭' },
 ];
 
 export const getLanguage = (code) =>
@@ -636,89 +729,110 @@ const styles = StyleSheet.create({
 
 ---
 
-## 7. WIRING — 3 jagah change
+## 7. WIRING — kahan-kahan change karna hai
+
+> Is section ka saara code **is project ki asli files se nikala gaya hai** —
+> jaisa chal raha hai, waisa hi yahan hai.
 
 ### 7.1 `App.js` — provider lagao
 
 ```jsx
 import { LanguageProvider } from './src/components/Translate';
+```
 
-export default function App() {
-  return (
-    <SafeAreaProvider>
-      <ThemeProvider>
-        {/* Language provider — navigation ke bahar aur upar */}
+Provider ko navigation ke **bahar aur upar** rakho (yahan theme ke andar hai):
+
+```jsx
+       <ThemeProvider>
+        {/* Selected app language + the on-disk translation cache. Sits high so
+            every screen using the translated <Text> re-renders the moment the
+            user picks a different language — no app restart needed. */}
         <LanguageProvider>
-          <NavigationContainer>
-            {/* ...tumhara pura navigation... */}
-          </NavigationContainer>
+         <NetworkProvider>
+          <PaperProvider>
+           <DeviceInfoProvider>
+            <AuthProvider>
+              <ContactProvider>
+               <ImageProvider>
+                <DeviceLocationProvider>
+                 <PresenceProvider>
+                  <RealtimeChatProvider>
+                    <CallProvider>
+                      <CallContentInset>
+                        <AppContent />
+                        <AppLockGate />
+                      </CallContentInset>
+                    </CallProvider>
+                  </RealtimeChatProvider>
+                 </PresenceProvider>
+                </DeviceLocationProvider>
+               </ImageProvider>
+              </ContactProvider>
+            </AuthProvider>
+           </DeviceInfoProvider>
+          </PaperProvider>
+         </NetworkProvider>
         </LanguageProvider>
-      </ThemeProvider>
-    </SafeAreaProvider>
-  );
-}
+       </ThemeProvider>
 ```
 
 ### 7.2 Navigator — route register karo
 
 ```jsx
 import ChooseLanguage from "../screens/profiles/ChooseLanguage";
+```
 
-// Stack ke andar
+```jsx
+// Stack.Navigator ke andar
 <Stack.Screen name="ChooseLanguage" component={ChooseLanguage} />
 ```
 
 ### 7.3 Settings screen — entry point
 
-Import:
+Imports:
 
 ```jsx
-// Text ko react-native se HATAO, custom wala import karo
-import { View, Image, TouchableOpacity, ScrollView } from "react-native";
-import { Text, useLanguage } from "../../components/Translate";
+import {
+  View, Image, Animated, TouchableOpacity, ScrollView,
+  Alert, StyleSheet, ActivityIndicator, Platform, Text
+} from "react-native";
+// Translated <Text>: static labels go through Google Translate; anything marked
+// `ignore` (the user's own name, bio, e-mail) is rendered exactly as stored.
+import { useLanguage } from "../../components/Translate";
 import { getLanguage } from "../../constant/languages";
+import { useTheme } from "../../contexts/ThemeContext";
 ```
+
+> Dhyaan do: yahan `Text` **react-native** se hi aa raha hai, kyunki is project
+> me sirf chat messages translate karne hain (Section 9). Agar poori Settings
+> screen translate karni ho to `Text` ko `../../components/Translate` se import
+> karo — baaki code same rahega.
 
 Component ke andar:
 
 ```jsx
-const { language } = useLanguage();
-const currentLanguage = getLanguage(language);
+  const { language } = useLanguage();
+  const currentLanguage = getLanguage(language);
 ```
 
-Menu item (jahan tumhare baaki rows hain):
+Menu item (jahan baaki rows hain):
 
 ```jsx
 {
-  icon: 'language-outline',
-  label: 'App language',
-  // Ye already apni script me hai — isliye ignore
-  subtitle: `${currentLanguage.flag}  ${currentLanguage.label}`,
-  ignoreSubtitle: true,
-  onPress: () => navigation.navigate('ChooseLanguage'),
+          icon: 'language-outline',
+          label: 'App language',
+          // Already in its own script — renderMenuItem marks it `ignore`.
+          subtitle: `${currentLanguage.flag}  ${currentLanguage.label}`,
+          ignoreSubtitle: true,
+          onPress: () => navigation.navigate('ChooseLanguage'),
 },
 ```
 
-Row render karte waqt subtitle pe `ignore` pass karo:
+`useMemo` dependency array me `currentLanguage` **zaroori** hai — warna language
+badalne pe subtitle purana dikhega:
 
 ```jsx
-<Text ignore={item.ignoreSubtitle} numberOfLines={1} style={styles.menuSubtitle}>
-  {item.subtitle}
-</Text>
-```
-
-Agar `menuSections` `useMemo` me bana hai to dependency array me `currentLanguage`
-add karna mat bhoolna — warna language badalne pe subtitle purana hi dikhega:
-
-```jsx
-]), [isDarkMode, currentLanguage]);
-```
-
-Aur profile card jaisi jagah jahan **user ka apna data** hai, wahan `ignore`:
-
-```jsx
-<Text ignore style={styles.profileName}>{profileData?.fullName || 'User'}</Text>
-<Text ignore style={styles.profileSub}>{profileData?.about || profileData?.email}</Text>
+]), [isDarkMode, isBackingUp, backupStatus, currentLanguage]);
 ```
 
 ---
@@ -782,22 +896,192 @@ Alert.alert(title, body, [ /* buttons */ ]);
 
 ---
 
-## 9. 🚨 Chat app ke liye SABSE ZAROORI warning
+## 9. Chat messages translate karna (message-only integration)
 
-**Chat screens ko kabhi opt-in mat karna** — `ChatScreen`, `ChatList`, message
-bubbles, notification text, contact names.
+Chat app me **poori screen ko opt-in karna galat hai** — sender ka naam, time,
+ticks, menu sab translate ho jayenge, aur har cheez Google ko jayegi.
 
-Wo screens users ki **private baatcheet** render karti hain. Wahan import badla to
-har message Google ke server pe chala jayega. Chat text hamesha `react-native`
-wale `Text` me hi rakho.
+Sahi tareeka: sirf **message ka text** custom component se render karo.
 
-Ye feature sirf **app ke apne static labels** ke liye hai.
+### 9.1 Import (alias CAPITAL letter se shuru hona chahiye)
+
+`ChatScreen.jsx` ke asli imports:
+
+```jsx
+// Message-body text only. Everything else on this screen keeps React
+// Native's <Text>: names, timestamps, ticks, menus and system rows must
+// never be sent to a translation API.
+// NOTE: the alias MUST start with a capital letter — JSX treats a lowercase
+// element name (<myText>) as a native host component, not a React component.
+import { Text as MyText, useLanguage } from "../../components/Translate";
+```
+
+> ⚠️ **`Text as myText` mat likhna.** JSX me chhote akshar se shuru hone wala
+> element (`<myText>`) React component nahi, **native host component** samjha
+> jata hai — app crash karegi. Alias hamesha capital: `MyText`.
+
+`react-native` wala `Text` waisa ka waisa import rehta hai — screen ke baaki
+116 `<Text>` usko hi use karte hain.
+
+Component ke andar (taaki language badalte hi bubbles re-render ho):
+
+```jsx
+const { language } = useLanguage();
+```
+
+...aur `renderChatsItem` ke `useCallback` dependency array me `language` add karo.
+
+### 9.2 Sirf message body pe `MyText` — asli code
+
+Ye poora token renderer hai. Dekho kya `MyText` hai aur kya `Text` (RN) rehta hai:
+
+```jsx
+            if (token.type === 'link') {
+              return (
+                <Text
+                  key={key}
+                  onPress={() => handleOpenLink(token.href)}
+                  style={{
+                    color: linkColor,
+                    textDecorationLine: 'underline',
+                    fontFamily: 'Roboto-Medium',
+                  }}
+                >
+                  {token.text}
+                </Text>
+              );
+            }
+            if (token.type === 'code') {
+              return (
+                <Text
+                  key={key}
+                  style={{
+                    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+                    backgroundColor: isMyMessage ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.09)',
+                    color: baseColor,
+                  }}
+                >
+                  {token.text}
+                </Text>
+              );
+            }
+            if (token.type === 'bold') {
+              return (
+                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
+                  {token.text}
+                </MyText>
+              );
+            }
+            if (token.type === 'italic') {
+              return (
+                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
+                  {token.text}
+                </MyText>
+              );
+            }
+            if (token.type === 'underline') {
+              return (
+                <MyText from="auto" key={key} style={{ textDecorationLine: 'underline', color: baseColor }}>
+                  {token.text}
+                </MyText>
+              );
+            }
+            // The message body itself. With mentions the children become an
+            // ARRAY, which MyText renders untouched — so @names are never sent
+            // anywhere; only a plain string is translated.
+            return (
+              <MyText from="auto" key={key} style={{ color: baseColor }}>
+                {msgMentions ? renderTextWithMentions(token.text, msgMentions, baseColor, mentionColor, key) : token.text}
+              </MyText>
+            );
+```
+
+### 9.3 Kya translate hota hai, kya nahi
+
+| Chat ka hissa | Component | Wajah |
+|---|---|---|
+| Message ka text (plain / bold / italic / underline) | `MyText from="auto"` | Yahi translate karna hai |
+| Inline code aur code block | `Text` (RN) | Code kabhi translate nahi hona chahiye |
+| Link / URL | `Text` (RN) | URL toot jayega |
+| @mentions | apne aap safe | Children array ban jate hain, wrapper array chhod deta hai |
+| Sender ka naam, time, ticks | `Text` (RN) | User data — bhejna hi nahi hai |
+| Menu, header, system rows | `Text` (RN) | Chhua hi nahi |
+
+### 9.4 Source language kaise choose hoti hai (Hinglish wala fix)
+
+Ye sabse important logic hai. `sourceFor()` decide karta hai ki Google ko kaunsi
+source language batani hai:
+
+| Message ka script | Reader ki language | Source bheji jati hai |
+|---|---|---|
+| Devanagari / Thai / Arabic / CJK (apni script) | koi bhi | `sl=auto` |
+| Latin letters | non-Latin reader (hi, th, ta, ar, ru, ja, zh…) | **`sl=en`** |
+
+**`sl=en` forced kyun?** Kyunki **Hinglish** (Hindi Latin letters me likhi hui)
+`auto` ke saath tootti hai:
+
+```
+"Kya kru"      + sl=auto + tl=hi   →   "Kya kru"        ← Google detect: hi
+"Ab btao"      + sl=auto + tl=hi   →   "Ab btao"        ← source == target
+```
+
+Google in messages ko **pehle hi Hindi** maan leta hai, aur reader ki language
+bhi Hindi hai — to source aur target same ho gaye, aur endpoint message **jaisa
+ka waisa** wapas kar deta hai. Isliye lagta hai ki translation kaam nahi kar raha
+(jabki koi error bhi nahi aata).
+
+`sl=en` force karte hi sahi kaam hota hai:
+
+```
+"Kya kru"                            →  क्या हुआ
+"Ab btao"                            →  अब बताओ
+"Kya kah rhe hoo"                    →  क्या कह रहे हो
+"Tum kha ja rhe ho"                  →  तुम खा जा रहे हो
+"Thoda bhot kam lunga denge aap ka"  →  थोड़ा बहुत कम लूंगा देंगे आप का
+"How are you?"                       →  आप कैसे हैं?     ← asli English bhi theek
+```
+
+### 9.5 Request kab jati hai (cost control)
+
+Ek sasta **script check** — network call tabhi jati hai jab message padhne layak
+na ho:
+
+| Message → Reader | Action |
+|---|---|
+| English msg → English reader | SKIP (0 request) |
+| Devanagari msg → Hindi reader | SKIP (0 request) |
+| Thai msg → Thai reader | SKIP (0 request) |
+| Hinglish msg → Hindi reader | TRANSLATE (`sl=en`) |
+| English msg → Hindi reader | TRANSLATE (`sl=en`) |
+| Devanagari msg → English reader | TRANSLATE (`sl=auto`) |
+| Thai msg → Hindi reader | TRANSLATE (`sl=auto`) |
+
+**Limitations:**
+* Latin script aapas me alag nahi ho sakti — French message English reader ko
+  waisa hi dikhega (skip).
+* Hinglish message **English reader** ko translate nahi hoga (dono Latin hain →
+  skip). Sirf non-Latin reader ke liye convert hota hai.
+* Hinglish message **Thai/Arabic** reader ko phonetic garbage de sakta hai
+  (`"Ab btao"` → `"แอบบีเทา"`), kyunki use English maan ke padha jata hai.
+
+### 9.6 Zaroori baatein
+
+* Har message **unique** hota hai, isliye cache kaam nahi aata — har naye message
+  pe ek request. Free endpoint rate-limited hai, to busy chat me 429 aa sakta
+  hai. Fail hone pe original message dikhta hai (kuch tootta nahi).
+* **Privacy:** message ka text Google ke server pe jata hai. Agar app privacy
+  promise karti hai to ya to users ko batao, ya on-device translation
+  (ML Kit) use karo.
+* Message **DB me original hi save rehta hai** — translation sirf display ke
+  waqt hoti hai, kuch overwrite nahi hota.
+* Apne bheje hue messages bhi translate honge (agar script alag hai). Apne
+  messages chhodne hain to `isMyMessage` check karke `from` prop mat bhejo.
 
 ---
 
 ## 10. Cache, cost aur limits
 
-* **Do layer cache**: memory + `AsyncStorage` (`translation.cache.v1`), key =
+* **Do layer cache**: memory + `AsyncStorage` (`translation.cache.v2`), key =
   `"<lang>::<English text>"`. Ek string **poore app-life me ek hi baar** fetch hoti hai.
 * **English = 0 network call** — `t()` turant return kar deta hai.
 * Ek hi screen pe same string 20 baar? → **ek hi request** (in-flight dedupe).
@@ -817,6 +1101,7 @@ Ye feature sirf **app ke apne static labels** ke liye hai.
 | RTL layout | Arabic / Urdu ka text translate hota hai par layout mirror nahi hota. Uske liye `I18nManager.forceRTL(true)` + app restart chahiye (app-wide change). |
 | Fonts | Devanagari / Bengali / Tamil / Thai glyphs tumhare custom font me hone chahiye, warna ▯▯▯ boxes dikhenge. |
 | Layout | German aur Tamil strings English se kaafi lambi hoti hain — buttons aur single-line rows check karo. |
+| Hinglish | Roman Hindi ("Kya kru") ko non-Latin reader ke liye `sl=en` force karke convert kiya jata hai (Section 9.4). English reader ke liye ye convert nahi hoti. |
 | Thai | Words ke beech space nahi hota aur tone marks upar-niche lagte hain — row ki `lineHeight` thodi badhani pad sakti hai. |
 
 ---
@@ -852,13 +1137,44 @@ chahiye — baaki sab optional hai.
 [ ] Settings me "App language" row add karo (+ useMemo deps me currentLanguage)
 [ ] Jis screen ko translate karna hai uska import badlo
 [ ] User data / numbers / messages pe `ignore` lagao
-[ ] Chat screens ko HAATH MAT LAGAO
+[ ] Chat me sirf message body pe MyText from="auto" (Section 9)
 [ ] Har language me test karo — layout, fonts, lambe strings
 ```
 
 ---
 
-## 14. Troubleshooting
+## 14. Poori change list (cross-check)
+
+Feature ke liye **exactly** ye files chhui gayi hain — isse zyada kuch nahi:
+
+### Nayi files (3)
+
+| File | Kya hai | Guide me |
+|---|---|---|
+| `src/components/Translate.js` | Core wrapper + cache + provider + auto-detect | Section 4 (poora code) |
+| `src/constant/languages.js` | 20 languages ki list | Section 5 (poora code) |
+| `src/screens/profiles/ChooseLanguage.jsx` | Search wali picker screen | Section 6 (poora code) |
+
+### Modified files (5)
+
+| File | Change | Guide me |
+|---|---|---|
+| `package.json` | `"translate": "^3.1.0"` add | Section 2 |
+| `App.js` | `LanguageProvider` import + tree me wrap | Section 7.1 |
+| `src/navigations/RootNavigator.js` | `ChooseLanguage` import + `<Stack.Screen>` | Section 7.2 |
+| `src/screens/profiles/Setting.jsx` | `useLanguage` + `getLanguage` import, `currentLanguage`, "App language" row, `useMemo` deps | Section 7.3 |
+| `src/screens/chats/ChatScreen.jsx` | `MyText` import, `useLanguage()`, 4 prose tokens → `MyText from="auto"`, deps me `language` | Section 9.1 / 9.2 |
+
+### Jo NAHI chhua gaya
+
+* Koi native code nahi (`android/`, `ios/`, koi config plugin nahi) — `translate` pure JS hai.
+* Backend / API / database me **koi change nahi** — message original hi save hota hai.
+* Baaki saari screens (ChatList, Profile, Status, Calls, group screens) **jaisi thi waisi hai**.
+* Chat ka baaki UI — sender name, time, ticks, reply preview, menu — sab RN `Text` pe hi hai.
+
+---
+
+## 15. Troubleshooting
 
 | Problem | Wajah / Fix |
 |---|---|
@@ -871,3 +1187,6 @@ chahiye — baaki sab optional hai.
 | Metro error: `Unable to resolve http` | `translate@1.4.1` install ho gaya hai. `npm install translate@^3` karo. |
 | Language ka naam khud translate ho gaya | Us `<Text>` pe `ignore` lagana bhool gaye. |
 | Language badalne pe subtitle purana dikh raha | `useMemo` deps me `currentLanguage` add karo. |
+| `<myText>` pe crash / "Unimplemented component" | Alias capital letter se shuru karo: `Text as MyText`. |
+| Message translate nahi ho raha | `from="auto"` lagana bhool gaye, ya message aur reader ki script same hai (jaan-bujh kar skip hota hai — Section 9.5). |
+| Hinglish message waisa ka waisa aa raha | Google use pehle hi Hindi detect kar leta hai; `sourceFor()` `sl=en` force karta hai. Section 9.4 dekho. |
