@@ -192,7 +192,7 @@ export default function TicketChat({ navigation, route }) {
               <TouchableOpacity onPress={pickImage} style={styles.attachBtn}>
                 <Ionicons name="attach" size={24} color={subText} />
               </TouchableOpacity>
-              <TextInput
+              <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 value={text}
                 onChangeText={setText}
                 placeholder="Type a message…"

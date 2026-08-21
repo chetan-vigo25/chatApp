@@ -118,11 +118,11 @@ export default function Login({ navigation }) {
   const dialCode = (selectedCountry?.code || '+1').replace('+', '');
 
   // WhatsApp palette
-  const accent = isDarkMode ? '#03b0a2' : '#028578';
+  const accent = isDarkMode ? theme.colors.themeColor : '#028578';
   const link = isDarkMode ? '#53BDEB' : '#027EB5';
   const bg = isDarkMode ? '#000000' : '#FFFFFF';
   const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';
-  const secondaryText = isDarkMode ? '#8696A0' : '#54656F';
+  const secondaryText = isDarkMode ? theme.colors.secondaryTextColor : '#54656F';
   const placeholderText = isDarkMode ? '#5E7280' : '#A6B0BD';
   const underlineIdle = isDarkMode ? '#2A3942' : '#D1D7DB';
   const disabledBtn = isDarkMode ? '#1F2C33' : '#D8DEE2';
@@ -174,7 +174,7 @@ export default function Login({ navigation }) {
               </View>
 
               <View style={[styles.phoneCell, { borderBottomColor: showLengthError ? '#E5484D' : (phoneFocused ? accent : underlineIdle) }]}>
-                <TextInput
+                <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                   style={[styles.phoneInput, { color: primaryText }]}
                   placeholder="phone number"
                   placeholderTextColor={placeholderText}

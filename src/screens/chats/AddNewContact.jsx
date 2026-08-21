@@ -2,7 +2,12 @@ import React, { useState, useEffect, useRef } from "react";
 import {
   View, Text, ScrollView, Animated, TouchableOpacity, Image,
   ActivityIndicator, Alert, StyleSheet, TextInput, Platform, KeyboardAvoidingView,
+  LayoutAnimation, UIManager,
 } from "react-native";
+
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
 import { useSelector } from "react-redux";
 import { useTheme } from "../../contexts/ThemeContext";
 import countryCodes from '../../jsonFile/countryCodes.json';
@@ -287,6 +292,30 @@ export default function AddNewContact({ navigation }) {
     };
 
     const handleQueryChange = (text) => {
+      // Animate the country-code chip in/out when the detected kind flips
+      // (digits-only → phone chip appears; a letter → chip slides away).
+      const prevType = detectQueryType(query);
+      const nextType = detectQueryType(text);
+      if ((prevType === 'phone') !== (nextType === 'phone')) {
+        LayoutAnimation.configureNext(LayoutAnimation.create(180, 'easeInEaseOut', 'opacity'));
+      }
+      // Phone mode: keep the field digits-clean (spaces/dashes/dots from a
+      // pasted number are stripped; the dial code lives in the chip). A pasted
+      // "+<dial><number>" auto-selects that country instead of polluting the digits.
+      if (nextType === 'phone') {
+        let raw = text.trim();
+        if (raw.startsWith('+')) {
+          const match = countryCodes
+            .filter((c) => c?.code && raw.startsWith(c.code))
+            .sort((a, b) => b.code.length - a.code.length)[0];
+          if (match) {
+            userPickedCountry.current = true;
+            setSelectedCountry(match);
+            raw = raw.slice(match.code.length);
+          }
+        }
+        text = raw.replace(/[^0-9]/g, '').slice(0, maxLen);
+      }
       setQuery(text);
 
       if (searchResult !== null) { setSearchResult(null); pendingUserDataRef.current = null; }
@@ -385,12 +414,11 @@ export default function AddNewContact({ navigation }) {
   };
 
     // WhatsApp palette
-    const accent = isDarkMode ? '#03b0a2' : '#028578';
+    const accent = isDarkMode ? theme.colors.themeColor : '#028578';
     const bg = isDarkMode ? '#000000' : '#FFFFFF';
     const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';
-    const secondaryText = isDarkMode ? '#8696A0' : '#54656F';
+    const secondaryText = isDarkMode ? theme.colors.secondaryTextColor : '#54656F';
     const placeholderText = isDarkMode ? '#5E7280' : '#A6B0BD';
-    const underlineIdle = isDarkMode ? '#2A3942' : '#D1D7DB';
     const cardBg = isDarkMode ? '#1F2C33' : '#F7F8FA';
     const errorColor = '#E5484D';
 
@@ -409,7 +437,8 @@ export default function AddNewContact({ navigation }) {
     const userDisplayName = searchResult?.user?.fullName || searchResult?.user?.name || 'User';
     const userAvatar = searchResult?.user?.profileImage || searchResult?.user?.profilePicture;
 
-    const queryUnderline = showLengthError ? errorColor : (queryFocused ? accent : underlineIdle);
+    // Phone mode drives the contextual country-code chip + numeric keyboard.
+    const isPhoneMode = queryType === 'phone';
 
     // Sub-label of the found user, shown according to what was searched.
     const resultSubLabel =
@@ -474,27 +503,45 @@ export default function AddNewContact({ navigation }) {
               </Text>
             </View>
 
-            {/* Unified search row — country code chip + smart input. The chip is
-                used only when a phone number is detected; username/email ignore it. */}
-            <View style={[styles.phoneRow, { borderBottomColor: queryUnderline }]}>
-              <View style={[styles.codeChip, { backgroundColor: cardBg }]}>
-                <CountryCodeContact
-                  selectedCountry={selectedCountry}
-                  onCountrySelect={handleCountrySelect}
-                  showFlag={true}
-                  showCode={true}
-                  showName={false}
+            {/* Unified search field — the country-code chip appears ONLY while a
+                phone number is being typed; a letter (username/email) hides it. */}
+            <View
+              style={[
+                styles.searchField,
+                {
+                  backgroundColor: cardBg,
+                  borderColor: showLengthError ? errorColor : (queryFocused ? accent : 'transparent'),
+                },
+              ]}
+            >
+              {isPhoneMode ? (
+                <View style={[styles.codeChip, { backgroundColor: isDarkMode ? '#2A3942' : '#EDF0F2' }]}>
+                  <CountryCodeContact
+                    selectedCountry={selectedCountry}
+                    onCountrySelect={handleCountrySelect}
+                    showFlag={true}
+                    showCode={true}
+                    showName={false}
+                  />
+                  <Ionicons name="chevron-down" size={14} color={secondaryText} style={styles.codeChevron} />
+                </View>
+              ) : (
+                <Ionicons
+                  name={queryType === 'email' ? 'mail-outline' : queryType === 'username' ? 'at-outline' : 'search-outline'}
+                  size={20}
+                  color={queryFocused ? accent : secondaryText}
+                  style={styles.leadIcon}
                 />
-                <Ionicons name="chevron-down" size={14} color={secondaryText} style={styles.codeChevron} />
-              </View>
+              )}
 
               <TextInput
+                keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 style={[styles.phoneInput, { color: primaryText }]}
-                placeholder="Phone, username or email"
+                placeholder={isPhoneMode ? 'Phone number' : 'Phone, username or email'}
                 placeholderTextColor={placeholderText}
                 value={query}
                 onChangeText={handleQueryChange}
-                keyboardType="default"
+                keyboardType={isPhoneMode ? 'phone-pad' : 'default'}
                 autoCapitalize="none"
                 autoCorrect={false}
                 onFocus={() => setQueryFocused(true)}
@@ -505,7 +552,7 @@ export default function AddNewContact({ navigation }) {
               {isSearching ? (
                 <ActivityIndicator size="small" color={accent} style={styles.trailIcon} />
               ) : userFound ? (
-                <Ionicons name="checkmark-circle" size={22} color="#03b0a2" style={styles.trailIcon} />
+                <Ionicons name="checkmark-circle" size={22} color={theme.colors.themeColor} style={styles.trailIcon} />
               ) : userNotFound ? (
                 <TouchableOpacity onPress={handleClearQuery} style={styles.trailIcon}>
                   <Ionicons name="close-circle" size={22} color={errorColor} />
@@ -517,10 +564,27 @@ export default function AddNewContact({ navigation }) {
               ) : null}
             </View>
 
-            {/* Validation / helper line (query-aware) */}
-            <Text style={[styles.helperText, { color: showLengthError ? errorColor : secondaryText }]}>
-              {helperLine}
-            </Text>
+            {/* Helper row: detected-kind badge + query-aware hint */}
+            <View style={styles.helperRow}>
+              {hasInput && queryType !== 'empty' && (
+                <View style={[styles.typeBadge, { backgroundColor: accent + '16' }]}>
+                  <Ionicons
+                    name={queryType === 'phone' ? 'call-outline' : queryType === 'email' ? 'mail-outline' : 'at-outline'}
+                    size={11}
+                    color={accent}
+                  />
+                  <Text style={[styles.typeBadgeText, { color: accent }]}>
+                    {queryType === 'phone' ? 'Phone' : queryType === 'email' ? 'Email' : 'Username'}
+                  </Text>
+                </View>
+              )}
+              <Text
+                style={[styles.helperText, { color: showLengthError ? errorColor : secondaryText }]}
+                numberOfLines={2}
+              >
+                {helperLine}
+              </Text>
+            </View>
 
             {/* User found card */}
             {userFound && (
@@ -642,35 +706,58 @@ const styles = StyleSheet.create({
     lineHeight: 19,
   },
 
-  // Search row
-  phoneRow: {
+  // Search field — rounded, focus-ring, contextual leading element
+  searchField: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderBottomWidth: 2,
-    paddingBottom: 4,
-    minHeight: 52,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    paddingHorizontal: 10,
+    minHeight: 54,
   },
   codeChip: {
     flexDirection: 'row',
     alignItems: 'center',
     borderRadius: 10,
     paddingRight: 8,
+    paddingVertical: 6,
     marginRight: 10,
   },
   codeChevron: { marginLeft: -4 },
+  leadIcon: { marginLeft: 4, marginRight: 10 },
   phoneInput: {
     flex: 1,
     fontFamily: 'Roboto-Regular',
-    fontSize: 18,
-    letterSpacing: 0.5,
+    fontSize: 17,
+    letterSpacing: 0.4,
     paddingVertical: 0,
   },
-  trailIcon: { marginLeft: 8 },
+  trailIcon: { marginLeft: 8, marginRight: 2 },
 
+  helperRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 10,
+    paddingHorizontal: 4,
+  },
+  typeBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    borderRadius: 8,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+  },
+  typeBadgeText: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 11,
+    letterSpacing: 0.2,
+  },
   helperText: {
+    flex: 1,
     fontFamily: 'Roboto-Regular',
     fontSize: 12,
-    marginTop: 10,
   },
 
   // Result

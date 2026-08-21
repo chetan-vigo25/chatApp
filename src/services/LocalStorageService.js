@@ -7,6 +7,10 @@ const KEY_THUMBNAILS = `${KEY_PREFIX}:thumbnails_cache`;
 const KEY_DOWNLOAD_QUEUE = `${KEY_PREFIX}:download_queue`;
 const KEY_PENDING_UPLOADS = `${KEY_PREFIX}:pending_uploads`;
 
+// Presigned S3 URLs live 1h — treat a cached http(s) thumbnail URL older than
+// this as expired (read-side miss → callers re-resolve a fresh one).
+const THUMB_URL_TTL_MS = 50 * 60 * 1000;
+
 // WhatsApp-style folder structure:
 //   WhatsApp/Media/WhatsApp Images/
 //   WhatsApp/Media/WhatsApp Video/
@@ -136,7 +140,12 @@ class LocalStorageService {
     const chatDir = `${root}${chatId || 'general'}/`;
     await ensureDir(chatDir);
 
-    const base = filename || `${mediaId || Date.now()}`;
+    // Strip only what breaks a filesystem path (separators / reserved chars) —
+    // the original filename otherwise lands on disk as-is, so shares/saves
+    // carry the real name.
+    const base = String(filename || `${mediaId || Date.now()}`)
+      .replace(/[/\\:*?"<>|]/g, '_')
+      .trim() || `${mediaId || Date.now()}`;
     return `${chatDir}${base}`;
   }
 
@@ -496,12 +505,31 @@ class LocalStorageService {
 
   async getThumbnailReference(mediaId) {
     if (!mediaId) return null;
+    const key = String(mediaId);
     const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
-    const hit = thumbnailMap[String(mediaId)] || null;
+    const hit = thumbnailMap[key] || null;
     if (!hit) return null;
+    let thumbnailUrl = hit?.url || hit?.path || null;
+    // A cached presigned http(s) URL past its TTL is almost certainly expired
+    // (S3 403) — treat it as a cache miss so callers hit the resolve path.
+    // Local file:// / non-http refs keep working regardless of age.
+    if (
+      thumbnailUrl &&
+      /^https?:\/\//i.test(thumbnailUrl) &&
+      Date.now() - Number(hit?.timestamp || 0) > THUMB_URL_TTL_MS
+    ) {
+      const localPath = hit?.path && !/^https?:\/\//i.test(hit.path) ? hit.path : null;
+      if (localPath) {
+        thumbnailUrl = localPath; // keep serving the on-device copy
+      } else {
+        delete thumbnailMap[key];
+        await this._writeObject(KEY_THUMBNAILS, thumbnailMap);
+        return null;
+      }
+    }
     return {
-      mediaId: String(mediaId),
-      thumbnailUrl: hit?.url || hit?.path || null,
+      mediaId: key,
+      thumbnailUrl,
       mediaType: hit?.mediaType || null,
       timestamp: Number(hit?.timestamp || 0),
     };

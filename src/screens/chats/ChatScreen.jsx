@@ -27,10 +27,6 @@ import {
   DeviceEventEmitter,
   BackHandler
 } from "react-native";
-// Message-body text only. Everything else on this screen keeps React
-// Native's <Text>: names, timestamps, ticks, menus and system rows must
-// never be sent to a translation API.
-import { t as translateText, useLanguage } from "../../components/Translate";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
@@ -39,7 +35,7 @@ import * as Contacts from "expo-contacts";
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import useDelayedVisible from "../../hooks/useDelayedVisible";
-import { useTheme } from "../../contexts/ThemeContext";
+import { useTheme, onColorFor, metaOnColorFor, sentBubbleBgFor } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
@@ -105,7 +101,6 @@ const RICH_TEXT_CHAR_LIMIT = 520;
 const RICH_TEXT_COLLAPSED_LINES = 30;
 const RICH_PARSE_CACHE_LIMIT = 500;
 
-
 // Auto-detect unfenced code (Teams-style): a multi-line message where most
 // lines carry code signals (keywords, tag/brace/semicolon shapes, indentation)
 // renders as a code block even without ``` fences. MUST stay in sync with
@@ -125,11 +120,11 @@ const looksLikeCode = (text = '') => {
   }
   return signals >= 2 && (signals + indented * 0.5) / nonEmpty.length >= 0.5;
 };
-const MEDIA_PANEL_SHEET_HEIGHT = 360;
+const MEDIA_PANEL_SHEET_HEIGHT = 208; // exact content height — no dead space below the tiles
 const AUDIO_RECORDING_MAX_MS = 120000;
 
-// WhatsApp-style attachment tiles: flat neutral circles with a colored glyph
-// (current WhatsApp Android attachment sheet look). `color` is the icon tint.
+// Attachment tiles: small neutral discs with a colored glyph per type —
+// current WhatsApp Android attachment-panel look (user-confirmed reference).
 // Location uses the brand teal instead of WhatsApp's green (brand rule).
 const MEDIA_PANEL_OPTIONS = [
   { key: 'gallery', label: 'Gallery', icon: 'images', iconFamily: 'Ionicons', color: '#AC44CF' },
@@ -312,7 +307,7 @@ const VideoViewerControls = React.memo(function VideoViewerControls({
     })
   ).current;
 
-  const accentColor = accent || '#25D366';
+  const accentColor = accent || '#03b0a2'; // brand teal, not WhatsApp green
   const widthInterp = progress.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'], extrapolate: 'clamp' });
   const thumbLeft = progress.interpolate({ inputRange: [0, 1], outputRange: [0, Math.max(0, trackW - 14)], extrapolate: 'clamp' });
 
@@ -506,7 +501,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           borderColor: isInputFocused ? theme.colors.themeColor : 'transparent',
           justifyContent: 'center',
           overflow: 'hidden',
-          shadowColor: '#000',
+          shadowColor: theme.colors.shadow,
           shadowOffset: { width: 0, height: 3 },
           shadowOpacity: 0.08,
           shadowRadius: 8,
@@ -602,6 +597,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                 </View>
                 {pendingMedia.isAlbum ? (
                   <TextInput
+                    keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                     placeholder="Add a caption..."
                     value={text}
                     onChangeText={onTextChange}
@@ -613,6 +609,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
               </View>
             ) : (
               <TextInput
+                keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 ref={ref}
                 placeholder="Message"
                 value={text}
@@ -1036,8 +1033,8 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
         <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Roboto-SemiBold', marginTop: 12 }}>{name}</Text>
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
-            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#03b0a2', marginRight: 6 }} />
-            <Text style={{ fontSize: 13, color: '#03b0a2', fontFamily: 'Roboto-Medium' }}>On TalksTry</Text>
+            <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: theme.colors.themeColor, marginRight: 6 }} />
+            <Text style={{ fontSize: 13, color: theme.colors.themeColor, fontFamily: 'Roboto-Medium' }}>On TalksTry</Text>
           </View>
         )}
 
@@ -1280,20 +1277,6 @@ const chatMenuStyles = StyleSheet.create({
 });
 
 export default function ChatScreen({ navigation, route }) {
-  const { language } = useLanguage();
-  /* ── Chat message translation ──────────────────────────────────────────────
-     Translations live HERE, above the bubble, on purpose.
-
-     Rendering a translated <Text> inside the bubble re-renders only that
-     descendant, so the bubble's own measured box stays stale: a wider
-     translation wrapped to a second line that the 1-line-tall bubble then
-     CLIPPED ("क्या हुआ" showing as just "क्या"). Keeping the text in list-level
-     state means renderChatsItem re-renders the whole row with the final string,
-     so width and height are measured together.
-
-     msg.text is never overwritten — this is display only. */
-  const [messageTranslations, setMessageTranslations] = useState({});
-  const translationSeenRef = useRef(new Set());
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
   const [reportPayload, setReportPayload] = useState({});
@@ -1427,6 +1410,11 @@ export default function ChatScreen({ navigation, route }) {
   }, [navigation, currentUserId, resolveContactName]);
 
   const { theme, chatColor, isDarkMode } = useTheme();
+  // Outgoing-bubble palette derived from the user's chatColor so text/meta
+  // stay readable even when a LIGHT accent is selected (was hardcoded #E9EDEF).
+  const sentBubbleBg = sentBubbleBgFor(chatColor, theme);
+  const sentBubbleText = onColorFor(sentBubbleBg);
+  const sentBubbleMeta = metaOnColorFor(sentBubbleBg);
   const { isConnected, networkType } = useNetwork();
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   // Frame-synced keyboard height from react-native-keyboard-controller. Tracks the
@@ -1509,6 +1497,9 @@ export default function ChatScreen({ navigation, route }) {
   const scrollBtnAnim = useRef(new Animated.Value(0)).current;
   const mediaBackdropAnim = useRef(new Animated.Value(0)).current;
   const mediaSheetAnim = useRef(new Animated.Value(MEDIA_PANEL_SHEET_HEIGHT)).current;
+  // Panel HEIGHT animates too (JS driver — layout prop), so the composer glides
+  // up/down with the panel like a keyboard instead of jumping.
+  const mediaPanelHeightAnim = useRef(new Animated.Value(0)).current;
   const mediaOptionEntryAnims = useRef(MEDIA_PANEL_OPTIONS.map(() => new Animated.Value(0))).current;
   const mediaOptionPressAnims = useRef(
     MEDIA_PANEL_OPTIONS.reduce((acc, item) => {
@@ -1686,7 +1677,9 @@ export default function ChatScreen({ navigation, route }) {
       // instantly (during upload too) and never expires; prefer it.
       const localThumb = msg?.localThumbUri || msg?.payload?.localThumbUri || null;
       if (localThumb) return localThumb;
-      const thumb = msg?.mediaThumbnailUrl || msg?.thumbnailUrl || null;
+      // previewUrl included: older ingest paths stored the server thumbnail
+      // only there (broadcast videos showed a blank poster without it).
+      const thumb = msg?.mediaThumbnailUrl || msg?.thumbnailUrl || msg?.previewUrl || null;
       // Videos must NOT fall back to the media file itself (black box) —
       // including legacy rows whose "thumbnail" IS the video url. Legacy
       // messages without a poster get one via the mediaResolve fallback in
@@ -1842,8 +1835,9 @@ export default function ChatScreen({ navigation, route }) {
   // An inline preview's stored signed URL failed to load (expired → S3 403).
   // The object still exists; only the URL died. Ask the server for a fresh one
   // via user/media/resolve and swap it in. One shot per media per mount so a
-  // still-failing URL can't loop requests. In-memory (refs) — SQLite stays the
-  // source of truth and is re-hydrated fresh by the backend on the next sync.
+  // still-failing URL can't loop requests. Served from refs for this mount; the
+  // healed URL is also written back to the SQLite row (best-effort, never for
+  // view-once) so the next mount doesn't repeat the 403→resolve round-trip.
   const healExpiredMediaUrl = useCallback(async (msg) => {
     const mediaId = getResolvedMediaId(msg);
     if (!mediaId) return;
@@ -1867,6 +1861,17 @@ export default function ChatScreen({ navigation, route }) {
       }
       if (freshUrl || freshThumb) {
         setThumbnailCacheVersion((v) => v + 1);
+        // Persist the healed URL so the 403→resolve round-trip doesn't repeat
+        // on the next mount. Fire-and-forget; NEVER for view-once — those rows
+        // must never re-reference media.
+        const isViewOnce = Boolean(msg?.isViewOnce || msg?.viewOnce || msg?.payload?.isViewOnce);
+        const rowId = msg?.messageId || msg?.serverMessageId || msg?.id || null;
+        if (!isViewOnce && rowId) {
+          ChatDatabase.updateMessageMediaUrl(rowId, {
+            mediaUrl: freshUrl,
+            mediaThumbnailUrl: freshThumb && !isLikelyVideoFileUrl(freshThumb) ? freshThumb : null,
+          }).catch(() => {});
+        }
       }
     } catch { /* best-effort — a broken preview simply stays broken */ }
   }, []);
@@ -2221,6 +2226,29 @@ export default function ChatScreen({ navigation, route }) {
     return () => sub.remove();
   }, [chatPeerId]);
 
+  // Live broadcast-channel branding override. Like liveVerified above, chatData
+  // is a static snapshot — when the admin renames / re-logos the channel while
+  // this thread is open, RealtimeChatContext re-emits the update here.
+  const [liveChannel, setLiveChannel] = useState(null);
+  useEffect(() => {
+    const isBroadcast = Boolean(chatData?.chatType === 'broadcast' || chatData?.isBroadcast);
+    if (!isBroadcast) return undefined;
+    const myChannelId = String(
+      chatData?.broadcastChannelId || chatData?.chatId || chatData?._id || route?.params?.chatId || '',
+    );
+    if (!myChannelId) return undefined;
+    const sub = DeviceEventEmitter.addListener('broadcast:channel:updated', (p) => {
+      if (!p || String(p.channelId) !== myChannelId) return;
+      setLiveChannel((prev) => ({
+        ...(prev || {}),
+        ...(p.chatName != null ? { chatName: p.chatName } : {}),
+        ...(p.chatAvatar !== undefined ? { chatAvatar: p.chatAvatar } : {}),
+        ...(typeof p.isVerified === 'boolean' ? { isVerified: p.isVerified } : {}),
+      }));
+    });
+    return () => sub.remove();
+  }, [chatData?.chatType, chatData?.isBroadcast, chatData?.broadcastChannelId, chatData?.chatId, chatData?._id, route?.params?.chatId]);
+
   // Sync chatData to ref for callbacks declared before destructuring (web TDZ fix)
   useEffect(() => { chatDataRef.current = chatData; }, [chatData]);
 
@@ -2497,7 +2525,10 @@ export default function ChatScreen({ navigation, route }) {
     // 2. Try signed download URL from API first (most reliable)
     const mediaId = msg?.mediaId || msg?.serverMessageId || msg?.id;
     const fileName = msg?.mediaMeta?.fileName || msg?.payload?.file?.name || msg?.text || `file_${Date.now()}`;
-    let safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    // Only strip characters that break paths/filesystems — the old
+    // allowlist turned every space/unicode char into '_', mangling the
+    // original filename on shares and saves.
+    let safeName = fileName.replace(/[/\\:*?"<>|]/g, '_').trim();
     // Gallery save (createAssetAsync) REQUIRES a file extension — caption/
     // timestamp fallback names have none. Derive one from the media URL path,
     // else from the mime type, so the cached file is always saveable.
@@ -2640,9 +2671,34 @@ export default function ChatScreen({ navigation, route }) {
       : (msg?.type === 'image' || msg?.mediaType === 'image' || msg?.mediaType === 'photo') ? 'jpg'
       : null;
     const ext = (nameExt && nameExt[1]) || extensionFromMime(getMimeType(msg)) || typeExt || 'bin';
-    const dest = `${FileSystem.cacheDirectory}save_${Date.now()}.${ext}`;
+    // Keep the ORIGINAL basename when we know it — the old `save_<epoch>` name
+    // put a synthetic name on every gallery/share copy of the file.
+    const origBase = String(msg?.mediaMeta?.fileName || '')
+      .replace(/\.[A-Za-z0-9]{2,8}$/, '')
+      .replace(/[^\w .()-]/g, '_')
+      .trim();
+    const dest = `${FileSystem.cacheDirectory}${origBase || `save_${Date.now()}`}.${ext}`;
+    await FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => {});
     await FileSystem.copyAsync({ from: uri, to: dest });
     return dest;
+  };
+
+  // Share/save must present the file under its ORIGINAL name — the download
+  // cache names files by mediaId/caption, and share sheets carry the on-disk
+  // name. Copies to a cache file named after mediaMeta.fileName when needed.
+  const withOriginalName = async (uri, msg) => {
+    try {
+      const original = String(msg?.mediaMeta?.fileName || msg?.payload?.file?.name || '').trim();
+      if (!uri || !original) return uri;
+      const safe = original.replace(/[/\\:*?"<>|]/g, '_');
+      if (String(uri).split('/').pop() === safe) return uri;
+      const dest = `${FileSystem.cacheDirectory}${safe}`;
+      await FileSystem.deleteAsync(dest, { idempotent: true }).catch(() => {});
+      await FileSystem.copyAsync({ from: uri, to: dest });
+      return dest;
+    } catch {
+      return uri;
+    }
   };
 
   const isAudioMime = (mime) => {
@@ -2886,7 +2942,7 @@ export default function ChatScreen({ navigation, route }) {
           Alert.alert('File unavailable', 'Could not load this file. Check your internet connection and try again.');
           return;
         }
-        await openDocumentWithChooser(localUri, msg);
+        await openDocumentWithChooser(await withOriginalName(localUri, msg), msg);
         return;
       }
 
@@ -2896,7 +2952,7 @@ export default function ChatScreen({ navigation, route }) {
         Alert.alert('File unavailable', 'Could not load this file. Check your internet connection and try again.');
         return;
       }
-      await openFileWithSharing(localUri, msg);
+      await openFileWithSharing(await withOriginalName(localUri, msg), msg);
     } catch (error) {
       console.error('Error sharing media:', error);
       Alert.alert('Error', 'Failed to open file.');
@@ -2925,6 +2981,51 @@ export default function ChatScreen({ navigation, route }) {
 
     } catch (error) {
       console.error('Error saving to library:', error);
+    }
+  };
+
+  // ── Save a downloaded document straight into the user's device storage ──
+  // Android: writes into a user-granted folder (Downloads picker shown ONCE,
+  // the grant is persisted and reused). iOS has no public Downloads folder —
+  // the share sheet ("Save to Files") is the platform-standard save.
+  const DOC_SAVE_DIR_KEY = 'doc-save-dir-uri';
+  const saveDocumentToDevice = async (msg, localUri) => {
+    try {
+      const fileName = msg?.mediaMeta?.fileName || msg?.payload?.file?.name || msg?.text || `file-${Date.now()}`;
+      const mime = getMimeType(msg) || 'application/octet-stream';
+      if (Platform.OS !== 'android') {
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(await withOriginalName(localUri, msg), { mimeType: mime, UTI: mime, dialogTitle: 'Save file' });
+        }
+        return true;
+      }
+      const SAF = FileSystem.StorageAccessFramework;
+      const writeInto = async (dirUri) => {
+        const base64 = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
+        const dest = await SAF.createFileAsync(dirUri, fileName, mime);
+        await FileSystem.writeAsStringAsync(dest, base64, { encoding: FileSystem.EncodingType.Base64 });
+      };
+      let dirUri = await AsyncStorage.getItem(DOC_SAVE_DIR_KEY);
+      if (dirUri) {
+        try {
+          await writeInto(dirUri);
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          return true;
+        } catch (e) {
+          // Grant revoked / folder deleted — fall through to a fresh pick.
+          await AsyncStorage.removeItem(DOC_SAVE_DIR_KEY);
+          dirUri = null;
+        }
+      }
+      const perm = await SAF.requestDirectoryPermissionsAsync();
+      if (!perm.granted) return false;
+      await AsyncStorage.setItem(DOC_SAVE_DIR_KEY, perm.directoryUri);
+      await writeInto(perm.directoryUri);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      return true;
+    } catch (error) {
+      console.error('Error saving document to device:', error);
+      return false;
     }
   };
 
@@ -2975,9 +3076,13 @@ export default function ChatScreen({ navigation, route }) {
       // First check if already downloaded
       const existingUri = resolveDownloadedUri(msg);
       if (existingUri) {
+        // Documents have no in-app viewer — hand the uri back to the caller
+        // (file tap auto-saves it to the device) instead of the image viewer.
+        const t = String(msg?.type || msg?.mediaType || '').toLowerCase();
+        if (t === 'file' || t === 'document') return existingUri;
         console.log('📁 Media already downloaded, opening viewer instead');
         openMediaViewer(msg, existingUri, msg.type === 'video' ? 'video' : 'image');
-        return;
+        return existingUri;
       }
 
       const mediaInfo = resolveMediaInfo(msg);
@@ -3010,9 +3115,11 @@ export default function ChatScreen({ navigation, route }) {
         console.log('✅ Media downloaded and persisted:', downloadedUri);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
+      return downloadedUri || null;
     } catch (error) {
       console.error('Error downloading media:', error);
       Alert.alert('Error', 'Failed to download media');
+      return null;
     }
   };
 
@@ -3234,41 +3341,6 @@ export default function ChatScreen({ navigation, route }) {
       }
     });
   }, [messages, visibleMessageKeys, primeThumbnailCacheForMessage]);
-
-  // A language switch invalidates every cached bubble translation.
-  useEffect(() => {
-    translationSeenRef.current = new Set();
-    setMessageTranslations({});
-  }, [language]);
-
-  // Translate the loaded text messages once each. The service caches by text +
-  // language and caps itself at 4 concurrent requests, so this stays cheap.
-  // Messages carrying @mentions are skipped — translating them mangles names.
-  useEffect(() => {
-    if (!Array.isArray(messages) || messages.length === 0) return undefined;
-    const pending = [];
-    messages.forEach((msg, index) => {
-      if (!msg || msg.type !== 'text' || msg.isDeleted || msg.deletedFor) return;
-      if (msg.mentions || msg.payload?.mentions) return;
-      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
-      if (!body) return;
-      const key = getMessageKey(msg, index);
-      const token = `${key}::${language}::${body}`;
-      if (translationSeenRef.current.has(token)) return;
-      translationSeenRef.current.add(token);
-      pending.push({ key, body });
-    });
-    if (pending.length === 0) return undefined;
-
-    let alive = true;
-    Promise.all(pending.map(async ({ key, body }) => {
-      const result = await translateText(body, language, 'auto');
-      if (!alive || typeof result !== 'string' || !result || result === body) return;
-      setMessageTranslations((prev) => (prev[key] === result ? prev : { ...prev, [key]: result }));
-    })).catch(() => {});
-
-    return () => { alive = false; };
-  }, [messages, language]);
 
   // Populate text input when entering edit mode
   useEffect(() => {
@@ -3599,16 +3671,22 @@ export default function ChatScreen({ navigation, route }) {
     mediaPanelClosingRef.current = true;
 
     Animated.parallel([
+      Animated.timing(mediaPanelHeightAnim, {
+        toValue: 0,
+        duration: 220,
+        easing: Easing.bezier(0.4, 0, 1, 1),
+        useNativeDriver: false,
+      }),
       Animated.timing(mediaBackdropAnim, {
         toValue: 0,
-        duration: 150,
-        easing: Easing.in(Easing.cubic),
+        duration: 180,
+        easing: Easing.bezier(0.4, 0, 1, 1),
         useNativeDriver: true,
       }),
       Animated.timing(mediaSheetAnim, {
         toValue: MEDIA_PANEL_SHEET_HEIGHT,
-        duration: 200,
-        easing: Easing.in(Easing.cubic),
+        duration: 220,
+        easing: Easing.bezier(0.4, 0, 1, 1),
         useNativeDriver: true,
       }),
     ]).start(() => {
@@ -3616,7 +3694,7 @@ export default function ChatScreen({ navigation, route }) {
       mediaPanelClosingRef.current = false;
       if (typeof afterClose === 'function') afterClose();
     });
-  }, [closeMediaOptions, mediaBackdropAnim, mediaSheetAnim]);
+  }, [closeMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaPanelHeightAnim]);
 
   const handleToggleMediaOptions = useCallback(() => {
     if (showMediaOptions) {
@@ -3955,7 +4033,7 @@ export default function ChatScreen({ navigation, route }) {
       mediaBackdropAnim.setValue(opacity);
     },
     onPanResponderRelease: (_, gestureState) => {
-      if (gestureState.dy > 110 || gestureState.vy > 1.05) {
+      if (gestureState.dy > MEDIA_PANEL_SHEET_HEIGHT * 0.35 || gestureState.vy > 0.9) {
         closeMediaPanelAnimated();
         return;
       }
@@ -3975,6 +4053,28 @@ export default function ChatScreen({ navigation, route }) {
       ]).start();
     },
   }), [closeMediaPanelAnimated, mediaBackdropAnim, mediaSheetAnim]);
+
+  // Hardware back with the media panel (or emoji panel) open closes ONLY the
+  // panel — the screen navigates back only when nothing is open (keyboard-parity:
+  // back dismisses the "keyboard replacement" first). Registered AFTER the
+  // selection-toolbar handler, so this runs FIRST (LIFO) — panels close before
+  // selection is considered.
+  useEffect(() => {
+    if (!showMediaOptions && !showEmojiPanel) return undefined;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (showMediaOptions) {
+        closeMediaPanelAnimated();
+        return true;
+      }
+      if (showEmojiPanel) {
+        setShowEmojiPanel(false);
+        return true;
+      }
+      return false;
+    });
+    return () => sub.remove();
+  }, [showMediaOptions, showEmojiPanel, closeMediaPanelAnimated]);
+
 
   // The live keyboard movement is driven by react-native-keyboard-controller via
   // `rootKeyboardStyle`. These listeners only (a) capture the resting keyboard
@@ -4016,28 +4116,36 @@ export default function ChatScreen({ navigation, route }) {
     if (!showMediaOptions) {
       mediaBackdropAnim.setValue(0);
       mediaSheetAnim.setValue(MEDIA_PANEL_SHEET_HEIGHT);
+      mediaPanelHeightAnim.setValue(0);
       mediaOptionEntryAnims.forEach((anim) => anim.setValue(0));
       return;
     }
 
     mediaBackdropAnim.setValue(0);
     mediaSheetAnim.setValue(MEDIA_PANEL_SHEET_HEIGHT);
+    mediaPanelHeightAnim.setValue(0);
     mediaOptionEntryAnims.forEach((anim) => anim.setValue(0));
 
     // ONE smooth ease-out slide (WhatsApp feel) — no springs anywhere in the
     // open sequence: overshoot/bounce on the sheet or the tiles read as the
     // screen "fluctuating".
     Animated.parallel([
+      Animated.timing(mediaPanelHeightAnim, {
+        toValue: MEDIA_PANEL_SHEET_HEIGHT,
+        duration: 260,
+        easing: Easing.bezier(0.2, 0, 0, 1),
+        useNativeDriver: false, // height is a layout prop
+      }),
       Animated.timing(mediaBackdropAnim, {
         toValue: 1,
-        duration: 180,
-        easing: Easing.out(Easing.cubic),
+        duration: 220,
+        easing: Easing.bezier(0.2, 0, 0, 1),
         useNativeDriver: true,
       }),
       Animated.timing(mediaSheetAnim, {
         toValue: 0,
-        duration: 240,
-        easing: Easing.out(Easing.cubic),
+        duration: 260,
+        easing: Easing.bezier(0.2, 0, 0, 1),
         useNativeDriver: true,
       }),
     ]).start();
@@ -4053,7 +4161,7 @@ export default function ChatScreen({ navigation, route }) {
         }),
       ),
     ).start();
-  }, [showMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaOptionEntryAnims]);
+  }, [showMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaPanelHeightAnim, mediaOptionEntryAnims]);
 
   useEffect(() => () => {
     clearStickyDateHideTimer();
@@ -4331,7 +4439,7 @@ export default function ChatScreen({ navigation, route }) {
           paddingHorizontal: 12,
           paddingVertical: 5,
           borderRadius: 8,
-          shadowColor: '#000',
+          shadowColor: theme.colors.shadow,
           shadowOffset: { width: 0, height: 0.5 },
           shadowOpacity: 0.08,
           shadowRadius: 2,
@@ -4641,19 +4749,15 @@ export default function ChatScreen({ navigation, route }) {
     });
   };
 
-  const renderRichMessageText = (msg, isMyMessage, messageKey, displayText) => {
-    // `displayText` is the translated body, supplied by the list-level
-    // messageTranslations map. The ORIGINAL is never overwritten — msg.text
-    // still holds it, and falling back to it is always safe.
-    const bodyText = typeof displayText === 'string' ? displayText : (msg?.text || '');
-    const parsed = getParsedRichMessage(bodyText);
+  const renderRichMessageText = (msg, isMyMessage, messageKey) => {
+    const parsed = getParsedRichMessage(msg?.text || '');
     const isExpanded = Boolean(expandedRichMessages[messageKey]);
     const measuredLineCount = Number(richMessageLineCounts[messageKey] || 0);
     const showReadMore = measuredLineCount > RICH_TEXT_COLLAPSED_LINES;
 
     const baseColor = isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.primaryTextColor);
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
-    const mentionColor = isMyMessage ? '#D8ECFF' : '#03b0a2';
+    const mentionColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
     const msgMentions = msg?.mentions || msg?.payload?.mentions;
 
     const handleMeasureLayout = (event) => {
@@ -4981,7 +5085,7 @@ export default function ChatScreen({ navigation, route }) {
             <Ionicons
               name="refresh-circle"
               size={13}
-              color={msg?.status === 'cancelled' ? '#03b0a2' : '#FF8A80'}
+              color={msg?.status === 'cancelled' ? theme.colors.themeColor : '#FF8A80'}
               style={{ marginLeft: 3 }}
             />
           </TouchableOpacity>
@@ -5341,7 +5445,7 @@ export default function ChatScreen({ navigation, route }) {
             <View style={{
               position: 'absolute', right: -2, bottom: -2,
               width: 18, height: 18, borderRadius: 9,
-              backgroundColor: '#03b0a2',
+              backgroundColor: theme.colors.themeColor,
               alignItems: 'center', justifyContent: 'center',
               borderWidth: 1.5, borderColor: bubbleColor,
             }}>
@@ -5421,15 +5525,27 @@ export default function ChatScreen({ navigation, route }) {
     const isDownloading = dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADING;
     const isDownloadPausedState = dlStatus === MEDIA_DOWNLOAD_STATUS.PAUSED;
 
-    // File icon based on extension
+    // File-type tile: solid tinted rounded-square with a white glyph
+    // (WhatsApp-style), colored per extension.
     const ext = getExtFromName(fileName);
     let fileIcon = 'document-text';
     let fileIconColor = theme.colors.themeColor;
     if (ext === 'pdf') { fileIcon = 'document-text'; fileIconColor = '#E53935'; }
     else if (['doc', 'docx'].includes(ext)) { fileIcon = 'document-text'; fileIconColor = '#1565C0'; }
-    else if (['xls', 'xlsx'].includes(ext)) { fileIcon = 'document-text'; fileIconColor = '#2E7D32'; }
-    else if (['ppt', 'pptx'].includes(ext)) { fileIcon = 'document-text'; fileIconColor = '#E65100'; }
-    else if (['zip', 'rar', '7z'].includes(ext)) { fileIcon = 'file-tray-stacked'; fileIconColor = '#6D4C41'; }
+    else if (['xls', 'xlsx', 'csv'].includes(ext)) { fileIcon = 'grid'; fileIconColor = '#2E7D32'; }
+    else if (['ppt', 'pptx'].includes(ext)) { fileIcon = 'easel'; fileIconColor = '#E65100'; }
+    else if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) { fileIcon = 'file-tray-full'; fileIconColor = '#8D6E63'; }
+    else if (['txt', 'md', 'rtf'].includes(ext)) { fileIcon = 'reader'; fileIconColor = '#607D8B'; }
+    else if (['apk'].includes(ext)) { fileIcon = 'logo-android'; fileIconColor = '#43A047'; }
+
+    // Inset panel tinted relative to the parent bubble (darker teal on sent,
+    // subtle neutral on received) — WhatsApp parity instead of a flat menu card.
+    const panelBg = isMyMessage
+      ? 'rgba(0,0,0,0.16)'
+      : (isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.045)');
+    const nameColor = isMyMessage ? '#E9EDEF' : theme.colors.primaryTextColor;
+    const metaColor = isMyMessage ? 'rgba(233,237,239,0.65)' : theme.colors.placeHolderTextColor;
+    const extLabel = ext ? ext.toUpperCase() : '';
 
     const handleFileTap = async () => {
       if (msg.status === 'sending') return;
@@ -5449,7 +5565,10 @@ export default function ChatScreen({ navigation, route }) {
         Alert.alert('Offline', 'Connect to internet to download this file.');
         return;
       }
-      handleDownloadWithPersistence(msg);
+      // Single tap for documents (web parity): download AND save straight to
+      // the device — no second "downloaded → tap again to save" step.
+      const uri = await handleDownloadWithPersistence(msg);
+      if (uri) await saveDocumentToDevice(msg, uri);
     };
 
     return (
@@ -5459,21 +5578,20 @@ export default function ChatScreen({ navigation, route }) {
         delayLongPress={300}
         style={{
           width: Math.min(320, MAX_MEDIA_BUBBLE_WIDTH),
-          borderRadius: 12,
+          borderRadius: 14,
           marginBottom: 4,
-          padding: 12,
-          backgroundColor: theme.colors.menuBackground,
+          paddingVertical: 10,
+          paddingHorizontal: 10,
+          backgroundColor: panelBg,
           flexDirection: 'row',
           alignItems: 'center',
-          gap: 10,
-          borderWidth: 0.5,
-          borderColor: theme.colors.borderColor,
+          gap: 12,
         }}
         activeOpacity={0.85}
       >
-        <View style={{ width: 42, height: 42, borderRadius: 10, backgroundColor: fileIconColor + '20', alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: 44, height: 44, borderRadius: 12, backgroundColor: fileIconColor, alignItems: 'center', justifyContent: 'center' }}>
           {isMyMessage && (msg.status === 'failed' || msg.status === 'cancelled')
-            ? <Ionicons name="refresh" size={24} color={fileIconColor} />
+            ? <Ionicons name="refresh" size={24} color="#FFFFFF" />
             : isMyMessage && isMediaStillUploading(msg)
             ? <UploadRing
                 percent={(sendingProgress || 0.02) * 100}
@@ -5492,22 +5610,22 @@ export default function ChatScreen({ navigation, route }) {
                   onResume={() => handleResumeDownload(msg)}
                   onCancel={() => handleCancelDownload(msg)}
                 />
-              : <Ionicons name={fileIcon} size={24} color={fileIconColor} />}
+              : <Ionicons name={fileIcon} size={22} color="#FFFFFF" />}
         </View>
 
         <View style={{ flex: 1 }}>
-          <Text style={{ color: theme.colors.primaryTextColor, fontSize: 13, fontFamily: 'Roboto-Medium' }} numberOfLines={1}>
+          <Text style={{ color: nameColor, fontSize: 14, lineHeight: 18, fontFamily: 'Roboto-Medium' }} numberOfLines={2}>
             {fileName}
           </Text>
 
           {/* Download progress bar (kept visible, frozen, while paused) */}
           {(isDownloading || isDownloadPausedState) && (
-            <View style={{ height: 3, borderRadius: 3, backgroundColor: 'rgba(0,0,0,0.08)', marginTop: 4, marginBottom: 2, overflow: 'hidden' }}>
-              <View style={{ width: `${Math.round(Math.max(5, progress * 100))}%`, height: 3, borderRadius: 3, backgroundColor: fileIconColor }} />
+            <View style={{ height: 3, borderRadius: 3, backgroundColor: isMyMessage ? 'rgba(255,255,255,0.25)' : 'rgba(127,127,127,0.25)', marginTop: 5, marginBottom: 1, overflow: 'hidden' }}>
+              <View style={{ width: `${Math.round(Math.max(5, progress * 100))}%`, height: 3, borderRadius: 3, backgroundColor: isMyMessage ? '#E9EDEF' : fileIconColor }} />
             </View>
           )}
 
-          <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 10, marginTop: 2 }}>
+          <Text style={{ color: metaColor, fontSize: 11, marginTop: 3 }} numberOfLines={1}>
             {msg.status === 'sending'
               ? (isUploadPausedFor(msg) ? 'Upload paused' : 'Uploading…')
               : msg.status === 'failed'
@@ -5515,7 +5633,7 @@ export default function ChatScreen({ navigation, route }) {
                 : msg.status === 'cancelled'
                 ? 'Cancelled • Tap to retry'
                 : isMyMessage
-                  ? `${mediaInfo.sizeLabel} • Tap to open`
+                  ? `${mediaInfo.sizeLabel}${extLabel ? ` • ${extLabel}` : ''} • Tap to open`
                   : dlStatus === MEDIA_DOWNLOAD_STATUS.FAILED
                     ? 'Download failed • Tap to retry'
                     : isDownloadPausedState
@@ -5523,16 +5641,27 @@ export default function ChatScreen({ navigation, route }) {
                       : isDownloading
                         ? 'Downloading…'
                         : dlStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED
-                          ? `${mediaInfo.sizeLabel} • Tap to open`
-                          : `${mediaInfo.sizeLabel} • Tap to download`}
+                          ? `${mediaInfo.sizeLabel}${extLabel ? ` • ${extLabel}` : ''} • Tap to open`
+                          : `${mediaInfo.sizeLabel}${extLabel ? ` • ${extLabel}` : ''} • Tap to download`}
           </Text>
           {!isConnected && !downloaded && !isMyMessage && (
             <Text style={{ color: '#D97706', fontSize: 10, marginTop: 2 }}>Offline</Text>
           )}
         </View>
 
+        {/* Received & not yet downloaded → circular download affordance */}
         {!isMyMessage && !downloaded && dlStatus === MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED && (
-          <Ionicons name="cloud-download" size={22} color={fileIconColor} />
+          <View style={{
+            width: 34, height: 34, borderRadius: 17,
+            borderWidth: 1.5, borderColor: metaColor,
+            alignItems: 'center', justifyContent: 'center',
+          }}>
+            <Ionicons name="arrow-down" size={18} color={metaColor} />
+          </View>
+        )}
+        {/* Downloaded / own file → subtle open chevron */}
+        {(isMyMessage || downloaded) && !isMediaStillUploading(msg) && msg.status !== 'failed' && msg.status !== 'cancelled' && (
+          <Ionicons name="open-outline" size={18} color={metaColor} style={{ marginRight: 2 }} />
         )}
       </TouchableOpacity>
     );
@@ -5759,8 +5888,8 @@ export default function ChatScreen({ navigation, route }) {
             </Text>
             {isRegistered && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
-                <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: '#03b0a2', marginRight: 4 }} />
-                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : '#03b0a2', fontSize: 10, fontFamily: 'Roboto-Medium' }}>
+                <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: theme.colors.themeColor, marginRight: 4 }} />
+                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : theme.colors.themeColor, fontSize: 10, fontFamily: 'Roboto-Medium' }}>
                   On TalksTry
                 </Text>
               </View>
@@ -5911,7 +6040,7 @@ export default function ChatScreen({ navigation, route }) {
                 backgroundColor: isDarkMode ? '#202C33' : theme.colors.cardBackground,
                 paddingVertical: 6,
                 paddingHorizontal: 9,
-                shadowColor: '#000',
+                shadowColor: theme.colors.shadow,
                 shadowOffset: { width: 0, height: 1 },
                 shadowOpacity: isDarkMode ? 0.2 : 0.08,
                 shadowRadius: 1,
@@ -5929,7 +6058,7 @@ export default function ChatScreen({ navigation, route }) {
                     {otpRestText}
                   </Text>
                 )}
-                <Text style={{ fontSize: 11, color: '#8696A0', fontFamily: 'Roboto-Regular', alignSelf: 'flex-end', marginTop: 3 }}>
+                <Text style={{ fontSize: 11, color: theme.colors.secondaryTextColor, fontFamily: 'Roboto-Regular', alignSelf: 'flex-end', marginTop: 3 }}>
                   {msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
                 </Text>
               </View>
@@ -6135,17 +6264,13 @@ export default function ChatScreen({ navigation, route }) {
             borderTopRightRadius: isMyMessage ? 3 : 8,
             borderTopLeftRadius: isMyMessage ? 8 : 3,
             backgroundColor: isDeletedMessage
-              ? (isDarkMode ? '#182229' : theme.colors.menuBackground)
-              : (isMyMessage
-                  // Keep a user-customised bubble colour; otherwise WhatsApp's
-                  // dark-mode outgoing green (#03574f), not the bright accent.
-                  ? ((chatColor && chatColor !== '#03b0a2') ? chatColor : '#03574f')
-                  : (isDarkMode ? '#202C33' : theme.colors.cardBackground)),
+              ? theme.colors.bubbleDeleted
+              : (isMyMessage ? sentBubbleBg : theme.colors.bubbleReceived),
             paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 3 : 6,
             paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 9,
             borderWidth: isHighlighted ? 2 : 0,
-            borderColor: '#FFC107',
-            shadowColor: '#000',
+            borderColor: theme.colors.replyHighlight,
+            shadowColor: theme.colors.shadow,
             shadowOffset: { width: 0, height: 1 },
             shadowOpacity: isDarkMode ? 0.2 : 0.08,
             shadowRadius: 1,
@@ -6179,10 +6304,10 @@ export default function ChatScreen({ navigation, route }) {
             {/* Scheduled message label — same UI before and after delivery, both sender and receiver */}
             {!isDeletedMessage && msg.status !== 'cancelled' && (msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel || msg.wasScheduled || msg.payload?.wasScheduled || ((msg.status === 'scheduled' || msg.status === 'processing') && msg.isScheduled)) && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
-                <Ionicons name="time-outline" size={13} color={isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0'} style={{ marginRight: 4 }} />
+                <Ionicons name="time-outline" size={13} color={isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta} style={{ marginRight: 4 }} />
                 <Text style={{
                   fontFamily: 'Roboto-Regular', fontSize: 11, fontStyle: 'italic',
-                  color: isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0',
+                  color: isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta,
                 }}>
                   {msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel
                     ? `Scheduled ${msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel}`
@@ -6207,14 +6332,14 @@ export default function ChatScreen({ navigation, route }) {
                 <Ionicons
                   name="arrow-redo"
                   size={14}
-                  color={isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0'}
+                  color={isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta}
                   style={{ marginRight: 4 }}
                 />
                 <Text style={{
                   fontFamily: 'Roboto-Regular',
                   fontSize: 12,
                   fontStyle: 'italic',
-                  color: isMyMessage ? 'rgba(255,255,255,0.65)' : '#8696A0',
+                  color: isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta,
                 }}>Forwarded</Text>
               </View>
             )}
@@ -6369,7 +6494,7 @@ export default function ChatScreen({ navigation, route }) {
                       (time+ticks is wide), overlapping the text. */}
                   <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
                     <View style={{ flexShrink: 1 }}>
-                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[messageKey])}
+                      {renderRichMessageText(msg, isMyMessage, messageKey)}
                     </View>
                     {renderMessageMeta(msg, isMyMessage, { inline: true })}
                   </View>
@@ -6433,7 +6558,7 @@ export default function ChatScreen({ navigation, route }) {
                   <Text style={{
                     fontSize: 15,
                     lineHeight: 20,
-                    color: isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.textColor),
+                    color: isMyMessage ? sentBubbleText : (isDarkMode ? '#E9EDEF' : theme.colors.textColor),
                     fontFamily: 'Roboto-Regular',
                     marginTop: 5,
                     paddingHorizontal: 4,
@@ -6449,6 +6574,22 @@ export default function ChatScreen({ navigation, route }) {
             {isViewOnce && renderViewOnceMessage(msg, isMyMessage, progress)}
             {!isDeletedMessage && isImage && renderImageMessage(msg, isMyMessage, progress, messageKey, downloadState)}
             {!isDeletedMessage && isVideo && renderVideoMessage(msg, isMyMessage, progress, messageKey, downloadState)}
+            {/* Caption under a single image/video (album captions render in the
+                album branch) — e.g. broadcast-channel media with text. Skip when
+                the "caption" is just the upload's file name. */}
+            {!isDeletedMessage && (isImage || isVideo) && Boolean(msg.text) && msg.text !== msg?.mediaMeta?.fileName && (
+              <Text style={{
+                fontSize: 15,
+                lineHeight: 20,
+                color: isMyMessage ? sentBubbleText : (isDarkMode ? '#E9EDEF' : theme.colors.textColor),
+                fontFamily: 'Roboto-Regular',
+                marginTop: 5,
+                paddingHorizontal: 4,
+                maxWidth: 220,
+              }}>
+                {msg.text}
+              </Text>
+            )}
             {!isDeletedMessage && isAudio && renderAudioMessage(msg, isMyMessage, progress, downloadState)}
             {!isDeletedMessage && isFile && renderFileMessage(msg, isMyMessage, progress, downloadState)}
             {!isDeletedMessage && isLocation && renderLocationMessage(msg, isMyMessage)}
@@ -6504,15 +6645,15 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, language, messageTranslations, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
   // media cell must re-render (e.g. a finished download replacing the blurred
   // placeholder with the local file:// image).
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus]
   );
 
   // Typing indicator
@@ -6529,7 +6670,7 @@ export default function ChatScreen({ navigation, route }) {
           borderBottomLeftRadius: 4, 
           paddingVertical: 8, 
           paddingHorizontal: 12,
-          shadowColor: "#000",
+          shadowColor: theme.colors.shadow,
           shadowOffset: { width: 0, height: 1 },
           shadowOpacity: 0.05,
           shadowRadius: 1,
@@ -6737,9 +6878,9 @@ export default function ChatScreen({ navigation, route }) {
           // peer presence). isBroadcast lets the header suppress "last seen".
           isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup || isBroadcastChat)}
           isBroadcast={isBroadcastChat}
-          isVerified={liveVerified ?? Boolean(chatData?.isVerified || chatData?.peerUser?.isVerified)}
-          groupName={chatData?.chatName || chatData?.group?.name || chatData?.groupName}
-          groupAvatar={chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar}
+          isVerified={liveChannel?.isVerified ?? liveVerified ?? Boolean(chatData?.isVerified || chatData?.peerUser?.isVerified)}
+          groupName={liveChannel?.chatName ?? (chatData?.chatName || chatData?.group?.name || chatData?.groupName)}
+          groupAvatar={liveChannel?.chatAvatar !== undefined ? liveChannel.chatAvatar : (chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar)}
           memberCount={isBroadcastChat ? undefined : (liveMemberCount ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount))}
           rightActions={selectedMessage.length > 0 ? (() => {
             const selMsg = selectedMessage.length === 1
@@ -6898,7 +7039,7 @@ export default function ChatScreen({ navigation, route }) {
                       handleReportMessage(selMsg);
                     }}
                     style={{ padding: 10 }}>
-                    <Ionicons name="flag-outline" size={22} color="#E53935" />
+                    <Ionicons name="flag-outline" size={22} color={theme.colors.danger} />
                   </TouchableOpacity>
                 )}
               </View>
@@ -6949,6 +7090,7 @@ export default function ChatScreen({ navigation, route }) {
             }}>
               <Ionicons name="search" size={18} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
               <TextInput 
+                keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 placeholder="Search messages..." 
                 value={search} 
                 onChangeText={handleSearch} 
@@ -7172,7 +7314,7 @@ export default function ChatScreen({ navigation, route }) {
               borderWidth: 1,
               borderColor: isDarkMode ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.08)',
               backgroundColor: isDarkMode ? 'rgba(25,40,55,0.92)' : 'rgba(225,230,236,0.96)',
-              shadowColor: '#000',
+              shadowColor: theme.colors.shadow,
               shadowOffset: { width: 0, height: 2 },
               shadowOpacity: 0.16,
               shadowRadius: 4,
@@ -7216,7 +7358,7 @@ export default function ChatScreen({ navigation, route }) {
               paddingVertical: 8, 
               borderWidth: 1, 
               borderColor: theme.colors.borderColor,
-              shadowColor: "#000",
+              shadowColor: theme.colors.shadow,
               shadowOffset: { width: 0, height: 2 },
               shadowOpacity: 0.1,
               shadowRadius: 3,
@@ -7779,51 +7921,25 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {/* Media options overlay — no Modal, no BlurView, lightweight */}
+        {/* Media panel — INLINE below the input bar (keyboard-replacement,
+            WhatsApp style): the composer stays visible above the panel. */}
         {showMediaOptions && (
-          <View style={{ position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, zIndex: 50 }} pointerEvents="box-none">
-            <Animated.View
-              style={{
-                position: 'absolute',
-                left: 0,
-                right: 0,
-                top: 0,
-                bottom: 0,
-                // Theme-aware scrim — light mode gets a gentler dim so the
-                // chat doesn't flash dark behind the sheet.
-                backgroundColor: isDarkMode ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0.28)',
-                opacity: mediaBackdropAnim,
-              }}
-            >
-              <Pressable
-                onPress={closeMediaPanelAnimated}
-                style={{ flex: 1 }}
-              />
-            </Animated.View>
-
-            {/* WhatsApp-style FLOATING card: rounded on all corners with a
-                margin off the screen edges, sliding up as one solid piece. */}
+          <Animated.View
+            style={{
+              height: mediaPanelHeightAnim,
+              backgroundColor: isDarkMode ? theme.colors.cardBackground : '#F0F2F5',
+              overflow: 'hidden',
+            }}
+          >
             <Animated.View
               {...mediaPanelPanResponder.panHandlers}
               style={{
-                position: 'absolute',
-                bottom: Platform.OS === 'ios' ? 24 : 10,
-                left: 8,
-                right: 8,
-                alignSelf: 'center',
-                maxWidth: 640,
-                borderRadius: 24,
-                overflow: 'hidden',
-                backgroundColor: isDarkMode ? theme.colors.surface : theme.colors.cardBackground,
+                flex: 1,
+                opacity: mediaBackdropAnim,
                 transform: [{ translateY: mediaSheetAnim }],
-                shadowColor: '#000',
-                shadowOpacity: isDarkMode ? 0.45 : 0.18,
-                shadowRadius: 18,
-                shadowOffset: { width: 0, height: -6 },
-                elevation: 14,
               }}
             >
-              {/* Grip handle — tap-outside, swipe-down, or grip all dismiss. */}
+              {/* Grip handle — swipe-down or grip drag dismisses. */}
               <View style={{ alignItems: 'center', paddingTop: 10, paddingBottom: 4 }}>
                 <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? 'rgba(233,237,239,0.28)' : 'rgba(0,0,0,0.16)' }} />
               </View>
@@ -7833,11 +7949,9 @@ export default function ChatScreen({ navigation, route }) {
                   flexDirection: 'row',
                   flexWrap: 'wrap',
                   paddingHorizontal: 8,
-                  paddingTop: 14,
-                  // Floating card clears the home bar via its own bottom
-                  // margin — no oversized inner padding needed.
-                  paddingBottom: 20,
-                  rowGap: 22,
+                  paddingTop: 12,
+                  paddingBottom: 12,
+                  rowGap: 18,
                 }}
               >
                 {MEDIA_PANEL_OPTIONS.map((item, idx) => {
@@ -7850,8 +7964,6 @@ export default function ChatScreen({ navigation, route }) {
                         width: '25%',
                         alignItems: 'center',
                         opacity: entry,
-                        // Gentle fade + rise only — the old 0.45→1 scale pop
-                        // made the grid look like it was fluctuating on open.
                         transform: [
                           { scale: press },
                           { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) },
@@ -7869,16 +7981,13 @@ export default function ChatScreen({ navigation, route }) {
                         <AttachOptionDisc
                           color={item.color}
                           icon={item.icon}
-                          size={56}
-                          // Disc contrasts with the sheet in BOTH modes: dark
-                          // sheet (surface) gets darker discs (card), light
-                          // sheet (card/white) gets soft gray discs (surface).
-                          bg={isDarkMode ? theme.colors.cardBackground : theme.colors.surface}
+                          size={48}
+                          bg={isDarkMode ? 'rgba(255,255,255,0.06)' : '#ffffff'}
                         />
                         <Text
                           style={{
-                            marginTop: 8,
-                            fontSize: 12.5,
+                            marginTop: 7,
+                            fontSize: 12,
                             color: theme.colors.secondaryTextColor,
                             fontFamily: 'Roboto-Regular',
                             textAlign: 'center',
@@ -7892,7 +8001,7 @@ export default function ChatScreen({ navigation, route }) {
                 })}
               </View>
             </Animated.View>
-          </View>
+          </Animated.View>
         )}
 
         {/* View Once viewer — streams from the single-use URL; nothing is ever
@@ -7988,7 +8097,7 @@ export default function ChatScreen({ navigation, route }) {
                         (cancelFn) => { viewerDownloadCancelRef.current = cancelFn; }
                       );
                       if (localUri && await Sharing.isAvailableAsync()) {
-                        await Sharing.shareAsync(localUri);
+                        await Sharing.shareAsync(await withOriginalName(localUri, msg));
                       }
                     } catch (e) {
                       console.error('Share error:', e);
@@ -8142,6 +8251,22 @@ export default function ChatScreen({ navigation, route }) {
                       isDoubleTapEnabled
                       style={{ flex: 1 }}
                       resizeMode="contain"
+                      // Stored signed URL expired (S3 403) — one-shot heal via
+                      // resolve, then swap the fresh URL into the open viewer.
+                      // Local files don't expire; leave those errors alone.
+                      onError={() => {
+                        if (!/^https?:\/\//i.test(String(localMediaViewer.uri || ''))) return;
+                        const msg = viewerActiveMessage();
+                        const mediaId = getResolvedMediaId(msg);
+                        if (!mediaId) return;
+                        healExpiredMediaUrl(msg)
+                          .then(() => {
+                            const fresh = resolvedFullUrlRef.current[mediaId];
+                            if (!fresh || fresh === localMediaViewer.uri) return;
+                            setLocalMediaViewer((prev) => (prev.visible ? { ...prev, uri: fresh } : prev));
+                          })
+                          .catch(() => {});
+                      }}
                     />
                   </GestureHandlerRootView>
                 )}
@@ -8217,7 +8342,7 @@ export default function ChatScreen({ navigation, route }) {
                 paddingHorizontal: 18, paddingVertical: 10,
                 flexDirection: 'row', alignItems: 'center', gap: 8,
               }}>
-                <Ionicons name="checkmark-circle" size={18} color="#03b0a2" />
+                <Ionicons name="checkmark-circle" size={18} color={theme.colors.themeColor} />
                 <Text style={{ color: '#fff', fontSize: 13, fontFamily: 'Roboto-Medium' }}>Saved</Text>
               </View>
             )}

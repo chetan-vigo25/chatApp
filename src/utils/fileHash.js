@@ -8,7 +8,11 @@
 //
 // Files are read in chunks (base64 slices via FileSystem.readAsStringAsync
 // position/length) and the JS thread is yielded between chunks so a large hash
-// never freezes the UI. Files above MAX_HASH_BYTES are skipped (returns null).
+// never freezes the UI. Files above maxBytes (default MAX_HASH_BYTES) are
+// skipped (returns null). DEFERRED call sites — where the hash promise is NOT
+// awaited and the upload runs concurrently (chunked uploads' sourceHashPromise)
+// — may pass { maxBytes: Infinity } to hash files of any size; AWAITED call
+// sites must keep a cap so a send/verify never stalls on a multi-minute hash.
 import * as FileSystem from 'expo-file-system/legacy';
 import CryptoJS from 'crypto-js';
 

@@ -154,7 +154,7 @@ export default function BlockedContacts({ navigation }) {
 
       <View style={[styles.searchWrap, { backgroundColor: cardBg }]}>
         <Ionicons name="search" size={18} color={subText} />
-        <TextInput
+        <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
           value={search}
           onChangeText={setSearch}
           placeholder="Search blocked contacts"

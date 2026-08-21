@@ -130,7 +130,7 @@ const setupNotificationChannel = async () => {
       importance: Notifications.AndroidImportance.MAX,
       vibrationPattern: [0, 250, 250, 250],
       sound: MESSAGE_SOUND_ANDROID,
-      lightColor: '#34B7F1',
+      lightColor: '#03b0a2', // brand teal — was stale WhatsApp blue
       enableLights: true,
       enableVibrate: true,
       showBadge: true,

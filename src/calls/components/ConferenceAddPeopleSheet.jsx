@@ -32,7 +32,7 @@ export default function ConferenceAddPeopleSheet(props) {
 function ConferenceAddPeopleSheetInner({
   visible, onClose, participants = {}, existingIds = [], onInvite, maxSelectable = 30,
 }) {
-  const { isDarkMode } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const { user } = useAuth();
   const insets = useSafeAreaInsets();
   const myId = user?._id ? String(user._id) : null;
@@ -163,14 +163,14 @@ function ConferenceAddPeopleSheetInner({
   const txt = isDarkMode ? '#E9EDEF' : '#111B21';
   const sub = isDarkMode ? '#8696A0' : '#667781';
   const line = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
-  const brand = '#03b0a2';
+  const brand = theme.colors.themeColor;
 
   const renderContact = ({ item }) => {
     const disabled = onCallIds.has(item.id);
     const isSel = !!selected[item.id];
     return (
       <TouchableOpacity
-        style={[styles.row, disabled && { opacity: 0.45 }]}
+        style={[styles.row, disabled && { opacity: theme.colors.disabledOpacity }]}
         onPress={() => toggle(item)}
         disabled={disabled}
         activeOpacity={0.7}

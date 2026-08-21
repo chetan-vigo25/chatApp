@@ -14,6 +14,11 @@ import BlurGateImage from './BlurGateImage';
 // thumbnail server-side).
 const videoThumbCache = new Map();
 
+// mediaId → { mediaUrl, thumbnailUrl } (or null = in-flight/failed). A tile's
+// stored presigned URL expired (S3 403) — resolve a fresh one ONCE per mediaId
+// per session, same guard pattern as videoThumbCache above.
+const tileUrlHealCache = new Map();
+
 const GRID_WIDTH = 220;
 const GAP = 3;
 const MAX_VISIBLE = 4;
@@ -140,12 +145,36 @@ const Tile = React.memo(function Tile({
     return () => { alive = false; };
   }, [isVideo, mediaId, item?.mediaThumbnailUrl]);
 
+  // Stored presigned URL failed to load (expired → S3 403): ask the server for
+  // a fresh one and swap it in. One resolve per mediaId per session via the
+  // module-level tileUrlHealCache (same pattern as the poster resolve above).
+  const [healedUrls, setHealedUrls] = useState(
+    () => (mediaId && tileUrlHealCache.get(mediaId)) || null,
+  );
+  const handleTileImageError = useCallback(() => {
+    if (!mediaId || tileUrlHealCache.has(mediaId)) return;
+    tileUrlHealCache.set(mediaId, null); // in-flight marker — one request per id
+    mediaResolve([mediaId])
+      .then((map) => {
+        const entry = map?.[mediaId];
+        const it = Array.isArray(entry?.items) ? entry.items[0] : entry;
+        const healed = {
+          mediaUrl: it?.mediaUrl || it?.previewUrl || null,
+          thumbnailUrl: it?.thumbnailUrl || null,
+        };
+        tileUrlHealCache.set(mediaId, healed);
+        if (healed.mediaUrl || healed.thumbnailUrl) setHealedUrls(healed);
+      })
+      .catch(() => { tileUrlHealCache.delete(mediaId); });
+  }, [mediaId]);
+
   // Video tiles ALWAYS render a poster image (never the video file — an .mp4
   // in <Image> paints black, downloaded or not); images use the local file
-  // once present.
+  // once present. Healed URLs outrank the (expired) item URLs; local files
+  // always win.
   const posterUri = isVideo
-    ? (item?.localThumbUri || localGenThumb || item?.mediaThumbnailUrl || resolvedThumb || null)
-    : (localUri || item?.mediaThumbnailUrl || item?.mediaUrl || null);
+    ? (item?.localThumbUri || localGenThumb || healedUrls?.thumbnailUrl || item?.mediaThumbnailUrl || resolvedThumb || null)
+    : (localUri || healedUrls?.thumbnailUrl || healedUrls?.mediaUrl || item?.mediaThumbnailUrl || item?.mediaUrl || null);
   const source = posterUri ? toSecureMediaUri(posterUri) : null;
 
   const downloadDescriptor = {
@@ -217,6 +246,8 @@ const Tile = React.memo(function Tile({
           active={downloading}
           paused={downloadPaused}
           progress={Math.min(100, Number(progress || 0)) / 100}
+          // Heal only remote URLs — a broken local file can't be re-signed.
+          onError={/^https?:\/\//i.test(String(posterUri || '')) ? handleTileImageError : undefined}
         />
       ) : isVisual(item) ? (
         // Image/video with NO poster yet (local frame still extracting, or a

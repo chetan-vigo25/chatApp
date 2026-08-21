@@ -115,7 +115,7 @@ export default function IncomingCallBanner() {
           <TouchableOpacity
             activeOpacity={0.85}
             onPress={() => accept && accept()}
-            style={[styles.btn, styles.accept]}
+            style={[styles.btn, styles.accept, { backgroundColor: c.themeColor }]}
           >
             <Ionicons name={isVideo ? 'videocam' : 'call'} size={19} color="#fff" />
             <Text style={styles.btnText}>Answer</Text>

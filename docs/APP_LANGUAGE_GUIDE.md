@@ -335,27 +335,41 @@ function sourceFor(text, language) {
 /* ─────────────────────────── translate entry ─────────────────────────── */
 
 /**
- * Translate one string. Always resolves — on any failure it resolves with the
- * original text, so no caller ever needs a try/catch.
+ * Translate one string and report WHAT happened.
+ *
+ *   { text, status }
+ *     'skipped'    — nothing to do (empty, same language, already readable).
+ *                    The caller can stop asking about this string.
+ *     'translated' — real translation (fresh or from cache).
+ *     'unchanged'  — the engine answered, but with the same string back.
+ *     'failed'     — the request errored. `text` is the original, and the
+ *                    caller MAY retry later; nothing was cached.
+ *
+ * Callers that only want the string use `t()` below. Callers that must retry
+ * transient failures (chat bubbles) need this distinction — without it a failed
+ * request looks exactly like "no translation needed" and is never retried.
  */
-export async function t(text, language, from = SOURCE_LANGUAGE) {
-  if (typeof text !== 'string' || !text.trim()) return text;
-  if (!language) return text;
+export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) {
+  if (typeof text !== 'string' || !text.trim()) return { text, status: 'skipped' };
+  if (!language) return { text, status: 'skipped' };
 
   // 'auto' only works through the endpoint directly; any other engine falls
   // back to treating the text as English.
   const auto = from === 'auto' && translate.engine === 'google';
   const source = from === 'auto' ? (auto ? 'auto' : SOURCE_LANGUAGE) : from;
 
-  if (source !== 'auto' && language === source) return text;     // en → en: nothing to do
-  if (source === 'auto' && looksAlreadyReadable(text, language)) return text;
+  if (source !== 'auto' && language === source) return { text, status: 'skipped' };
+  if (source === 'auto' && looksAlreadyReadable(text, language)) return { text, status: 'skipped' };
 
   // Romanized text needs an explicit source — see sourceFor().
   const sl = auto ? sourceFor(text, language) : source;
 
   await loadCache();
   const key = `${sl}::${language}::${text}`;
-  if (memoryCache[key] != null) return memoryCache[key];         // cache hit — 0 requests
+  if (memoryCache[key] != null) {                                // cache hit — 0 requests
+    const hit = memoryCache[key];
+    return { text: hit, status: hit === text ? 'unchanged' : 'translated' };
+  }
 
   const pending = inflight.get(key);
   if (pending) return pending;                                   // same string twice on one screen
@@ -366,16 +380,23 @@ export async function t(text, language, from = SOURCE_LANGUAGE) {
         const value = typeof result === 'string' && result.trim() ? result : text;
         memoryCache[key] = value;
         persistCache();
-        return value;
+        return { text: value, status: value === text ? 'unchanged' : 'translated' };
       })
       .catch((error) => {
         if (__DEV__) console.warn('[translate] failed:', error?.message || error);
-        return text;                                             // English fallback
+        // NOT cached: a transient failure must stay retryable.
+        return { text, status: 'failed' };
       }),
   ).finally(() => inflight.delete(key));
 
   inflight.set(key, request);
   return request;
+}
+
+/** String-only wrapper: always resolves with something renderable. */
+export async function t(text, language, from = SOURCE_LANGUAGE) {
+  const { text: value } = await translateDetailed(text, language, from);
+  return value;
 }
 
 /* ───────────────────────── language context ───────────────────────── */
@@ -784,7 +805,7 @@ Provider ko navigation ke **bahar aur upar** rakho (yahan theme ke andar hai):
             user picks a different language — no app restart needed. */}
         <LanguageProvider>
          <NetworkProvider>
-          <PaperProvider>
+          <ThemedPaperProvider>
            <DeviceInfoProvider>
             <AuthProvider>
               <ContactProvider>
@@ -805,7 +826,7 @@ Provider ko navigation ke **bahar aur upar** rakho (yahan theme ke andar hai):
               </ContactProvider>
             </AuthProvider>
            </DeviceInfoProvider>
-          </PaperProvider>
+          </ThemedPaperProvider>
          </NetworkProvider>
         </LanguageProvider>
        </ThemeProvider>
@@ -831,8 +852,8 @@ import {
   View, Image, Animated, TouchableOpacity, ScrollView,
   Alert, StyleSheet, ActivityIndicator, Platform, Text
 } from "react-native";
-// Translated <Text>: static labels go through Google Translate; anything marked
-// `ignore` (the user's own name, bio, e-mail) is rendered exactly as stored.
+// `useLanguage` powers the "App language" row; `getLanguage` turns the saved
+// code ("hi") into its flag + native name for the subtitle.
 import { useLanguage } from "../../components/Translate";
 import { getLanguage } from "../../constant/languages";
 import { useTheme } from "../../contexts/ThemeContext";
@@ -946,7 +967,7 @@ Sahi tareeka: sirf **message ka text** custom component se render karo.
 // Message-body text only. Everything else on this screen keeps React
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
-import { t as translateText, useLanguage } from "../../components/Translate";
+import { translateDetailed, useLanguage } from "../../components/Translate";
 ```
 
 `react-native` wala `Text` waisa ka waisa rehta hai — screen ke baaki 116
@@ -1004,18 +1025,42 @@ State:
      state means renderChatsItem re-renders the whole row with the final string,
      so width and height are measured together.
 
+     Keyed by `${messageKey}::${language}`, NOT by messageKey alone, and never
+     cleared on a language switch. Switching hi → en → hi therefore restores the
+     Hindi text instantly from state — no refetch, no flicker, and no dependence
+     on the network still being reachable. Wiping the map on every switch is
+     what made the second switch back come up empty.
+
      msg.text is never overwritten — this is display only. */
   const [messageTranslations, setMessageTranslations] = useState({});
-  const translationSeenRef = useRef(new Set());
+  // Slots (`${messageKey}::${language}`) the engine said need no translation —
+  // empty text, same language, or already in the reader's script. Recorded only
+  // AFTER a definitive answer, so a failed request is never mistaken for one.
+  const translationSkipRef = useRef(new Set());
+  // Slots with a request in flight right now (prevents duplicate calls).
+  const translationInflightRef = useRef(new Set());
+  // Slot → failed attempts. Failures stay retryable, but not forever.
+  const translationFailRef = useRef(new Map());
+  // A translation result may only be dropped when the SCREEN is gone or the
+  // reader switched language — never because `messages` changed. See the
+  // translate effect below for why that distinction matters.
+  const translationMountedRef = useRef(true);
+  const translationLanguageRef = useRef(language);
 ```
 
 Effects — language change pe clear, aur har message ek baar translate:
 
 ```jsx
-  // A language switch invalidates every cached bubble translation.
   useEffect(() => {
-    translationSeenRef.current = new Set();
-    setMessageTranslations({});
+    translationMountedRef.current = true;
+    return () => { translationMountedRef.current = false; };
+  }, []);
+
+  // Track the reader's language for the async guard below. Nothing is cleared:
+  // both the seen-set tokens and the translation map are already scoped by
+  // language, so previous languages stay valid and switching back is instant.
+  useEffect(() => {
+    translationLanguageRef.current = language;
   }, [language]);
 
   // Translate the loaded text messages once each. The service caches by text +
@@ -1030,29 +1075,93 @@ Effects — language change pe clear, aur har message ek baar translate:
       const body = typeof msg.text === 'string' ? msg.text.trim() : '';
       if (!body) return;
       const key = getMessageKey(msg, index);
-      const token = `${key}::${language}::${body}`;
-      if (translationSeenRef.current.has(token)) return;
-      translationSeenRef.current.add(token);
-      pending.push({ key, body });
+      const slot = `${key}::${language}`;
+      // Work is derived from STATE, not from a fire-and-forget token set: a
+      // slot is pending unless it already has a translation, was answered as
+      // "nothing to do", is being fetched right now, or has failed too often.
+      if (messageTranslations[slot] != null) return;
+      if (translationSkipRef.current.has(slot)) return;
+      if (translationInflightRef.current.has(slot)) return;
+      if ((translationFailRef.current.get(slot) || 0) >= TRANSLATION_MAX_ATTEMPTS) return;
+      translationInflightRef.current.add(slot);
+      pending.push({ key, slot, body });
     });
     if (pending.length === 0) return undefined;
 
-    let alive = true;
-    Promise.all(pending.map(async ({ key, body }) => {
-      const result = await translateText(body, language, 'auto');
-      if (!alive || typeof result !== 'string' || !result || result === body) return;
-      setMessageTranslations((prev) => (prev[key] === result ? prev : { ...prev, [key]: result }));
+    if (__DEV__) {
+      console.log(`[chat-translate] language=${language} pending=${pending.length}`);
+    }
+
+    // NOTE: no per-run cancellation flag here, deliberately.
+    //
+    // This effect depends on `messages`, and an INCOMING message triggers a
+    // burst of further `messages` updates (delivery receipt → read receipt →
+    // status sent/delivered/seen → SQLite refresh). A cleanup that flipped an
+    // `alive` flag would abort the translation that was still in flight for the
+    // message that had just arrived — and because its token is already in
+    // translationSeenRef it would never be retried, so the bubble stayed
+    // untranslated until the screen was reopened with a fresh Set.
+    //
+    // A result is therefore only discarded when the screen unmounted or the
+    // reader changed language, both of which outlive a single effect run.
+    Promise.all(pending.map(async ({ slot, body }) => {
+      let outcome = { text: body, status: 'failed' };
+      try {
+        outcome = await translateDetailed(body, language, 'auto');
+      } catch (error) {
+        if (__DEV__) console.warn('[chat-translate] unexpected error', error?.message || error);
+      }
+      translationInflightRef.current.delete(slot);
+      if (!translationMountedRef.current) return;
+      if (translationLanguageRef.current !== language) return;
+
+      if (outcome.status === 'failed') {
+        // Keep it retryable — the next messages/language update tries again,
+        // up to TRANSLATION_MAX_ATTEMPTS so a dead network can't spin forever.
+        const attempts = (translationFailRef.current.get(slot) || 0) + 1;
+        translationFailRef.current.set(slot, attempts);
+        if (__DEV__) console.warn(`[chat-translate] failed (${attempts}) "${body.slice(0, 30)}"`);
+        return;
+      }
+      translationFailRef.current.delete(slot);
+
+      if (outcome.status === 'translated' && outcome.text && outcome.text !== body) {
+        setMessageTranslations((prev) => (
+          prev[slot] === outcome.text ? prev : { ...prev, [slot]: outcome.text }
+        ));
+        return;
+      }
+      // 'skipped' / 'unchanged' — a definitive "nothing to show", so stop asking.
+      translationSkipRef.current.add(slot);
     })).catch(() => {});
 
-    return () => { alive = false; };
-  }, [messages, language]);
+    return undefined;
+  }, [messages, language, messageTranslations]);
 ```
+
+> ⚠️ **Translation map ko language ke saath key karo, aur language switch pe
+> wipe mat karo.** `messageTranslations[messageKey]` (sirf key) + har switch pe
+> `setMessageTranslations({})` ka matlab hai: har baar sab kuch dobara fetch
+> karna. hi → en → hi karne pe wo dobara-fetch fail/skip ho jaye to messages
+> English me hi atke rehte hain. `${messageKey}::${language}` se key karne pe
+> purani language ki translation state me bachi rehti hai — wapas switch karte
+> hi turant dikhti hai, **zero request**, aur network band ho tab bhi.
+
+> ⚠️ **Is effect me per-run `alive` flag / cleanup mat lagana.** Effect
+> `messages` pe depend karta hai, aur ek INCOMING message ke baad `messages` kai
+> baar update hota hai (delivery receipt → read receipt → status → SQLite
+> refresh). Cleanup `alive = false` kar dega to jo translation abhi in-flight
+> thi wo **discard** ho jayegi — aur uska token `translationSeenRef` me pehle se
+> hone ki wajah se **dobara kabhi try nahi hogi**. Symptom: incoming message
+> chat screen pe translate nahi hota, sirf screen dobara kholne pe hota hai
+> (fresh Set). Isliye result sirf tab discard hota hai jab **screen unmount** ho
+> ya **reader ne language badli** ho.
 
 Render — bubble ko bas ready text milta hai (original fallback hamesha safe):
 
 ```jsx
                     <View style={{ flexShrink: 1 }}>
-                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[messageKey])}
+                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[`${messageKey}::${language}`])}
                     </View>
 ```
 
@@ -1267,4 +1376,6 @@ Feature ke liye **exactly** ye files chhui gayi hain — isse zyada kuch nahi:
 | `<myText>` pe crash / "Unimplemented component" | JSX me chhote akshar wala element host component samjha jata hai — alias capital rakho (`MyText`), ya component ke bajaye `useT` hook use karo. |
 | Message beech me toot raha, ya doosra word gayab | Translation bubble ke andar ho rahi hai → ancestors ka layout stale. Section 9.2: list-level state use karo + deps/extraData wire karo. |
 | Message translate nahi ho raha | `from="auto"` lagana bhool gaye, ya message aur reader ki script same hai (jaan-bujh kar skip hota hai — Section 9.5). |
+| Incoming message chat screen pe translate nahi hota, wapas aane pe hota hai | Effect me per-run `alive` cleanup laga hai → receipts/status updates in-flight translation cancel kar dete hain, aur token seen-set me hone se retry nahi hota. Section 9.2 ka mount-guard use karo. |
+| Language wapas badalne pe (hi → en → hi) messages English me hi rehte hain | Translation map sirf `messageKey` se keyed tha aur har switch pe wipe ho raha tha. `${messageKey}::${language}` se key karo aur wipe hatao — Section 9.2. |
 | Hinglish message waisa ka waisa aa raha | Google use pehle hi Hindi detect kar leta hai; `sourceFor()` `sl=en` force karta hai. Section 9.4 dekho. |

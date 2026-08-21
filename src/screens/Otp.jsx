@@ -41,7 +41,7 @@ export default function Otp({ navigation, route }) {
     const { isLoading, otpMessage, otpData, error } = useSelector((state) => state.authentication);
     const fadeAnim = useRef(new Animated.Value(0)).current;
     const otpInputRef = useRef(null);
-    const { theme } = useTheme();
+    const { theme, isDarkMode } = useTheme();
     const [otp, setOtp] = useState("");
     const [otpError, setOtpError] = useState("");
     const [seconds, setSeconds] = useState(60);
@@ -276,6 +276,7 @@ export default function Otp({ navigation, route }) {
             textInputProps={{
               accessibilityLabel: "One-Time Password",
               keyboardType: 'number-pad',
+              keyboardAppearance: isDarkMode ? 'dark' : 'light',
             }}
             textProps={{
               accessibilityRole: "text",
@@ -283,6 +284,9 @@ export default function Otp({ navigation, route }) {
               allowFontScaling: false,
             }}
             theme={{
+              // Placeholder dashes were OS-default grey — near-invisible on the
+              // dark background without this.
+              placeholderTextStyle: { color: theme.colors.placeHolderTextColor },
               containerStyle: {
                 width: '100%',        
                 flexDirection: 'row',

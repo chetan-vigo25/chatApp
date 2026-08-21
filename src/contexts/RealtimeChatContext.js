@@ -1,7 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
 import { AppState, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getSocket, isSocketConnected, subscribeSocketState } from '../Redux/Services/Socket/socket';
+import NetInfo from '@react-native-community/netinfo';
+import { getSocket, isSocketConnected, isSocketAuthed, subscribeSocketState } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
@@ -2961,6 +2962,10 @@ export function RealtimeChatProvider({ children }) {
             || (['image', 'video', 'audio', 'file', 'album'].includes(source?.messageType || source?.type)
               ? (source?.messageType || source?.type) : null),
           previewUrl: source?.isViewOnce ? null : (source?.mediaThumbnailUrl || source?.previewUrl || null),
+          // Keep the thumbnail under its own key too — the video bubble reads
+          // mediaThumbnailUrl (it must NOT fall back to the media file itself),
+          // so folding it into previewUrl alone left videos posterless.
+          mediaThumbnailUrl: source?.isViewOnce ? null : (source?.mediaThumbnailUrl || source?.thumbnailUrl || null),
           mediaId: source?.isViewOnce ? null : (source?.mediaId || null),
           // View Once — persisted into the payload JSON by the upsert.
           isViewOnce: Boolean(source?.isViewOnce),
@@ -3013,11 +3018,20 @@ export function RealtimeChatProvider({ children }) {
         // the peer, so persist their identity with the same write: without it a
         // brand-new chat row sits nameless in SQLite until the debounced
         // chat-list flush runs, and shows "Unknown" after an early kill/reload.
+        // Broadcast channel: identity is the CHANNEL branding, never the admin
+        // sender — seeding sender identity here is how a channel row ended up
+        // named after the admin user.
+        const isBroadcastMsg = source?.chatType === 'broadcast' || Boolean(source?.isBroadcast)
+          || normalized?.chatType === 'broadcast';
         const peerName = !isSelf
-          ? (source?.senderName || normalized?.senderName || '')
+          ? (isBroadcastMsg
+            ? (source?.chatName || source?.senderName || '')
+            : (source?.senderName || normalized?.senderName || ''))
           : '';
         const peerAvatar = !isSelf
-          ? (source?.senderProfileImage || source?.senderAvatar || null)
+          ? (isBroadcastMsg
+            ? (source?.chatAvatar || null)
+            : (source?.senderProfileImage || source?.senderAvatar || null))
           : null;
         ChatDatabase.updateChatLastMessage(normalized.chatId, {
           text: normalized.text || '',
@@ -3027,12 +3041,13 @@ export function RealtimeChatProvider({ children }) {
           createdAt: normalized.createdAt,
           serverMessageId: msgId,
         }, {
+          chatType: isBroadcastMsg ? 'broadcast' : undefined,
           chatName: peerName || null,
           chatAvatar: peerAvatar,
           // Only ship a peerUser when it carries a real name/number — writing a
           // nameless JSON would occupy the fill-if-missing slot and block a
           // later, better identity from landing.
-          peerUser: (!isSelf && normalized.senderId && (peerName || source?.senderMobile))
+          peerUser: (!isSelf && !isBroadcastMsg && normalized.senderId && (peerName || source?.senderMobile))
             ? {
                 _id: String(normalized.senderId),
                 fullName: peerName,
@@ -3610,9 +3625,12 @@ export function RealtimeChatProvider({ children }) {
     // message the moment it's opened. Throttled — this walks summaries
     // server-side, so once per 30s is plenty.
     let lastListReconcileAt = 0;
-    const reconcileChatList = () => {
+    // Resolves once the list response is hydrated (or on timeout/throttle) so
+    // the reconnect catch-up can await it — a chat created while offline must
+    // be known before the per-chat sync derives its chat list.
+    const reconcileChatList = () => new Promise((resolveDone) => {
       const now = Date.now();
-      if (now - lastListReconcileAt < 30000) return;
+      if (now - lastListReconcileAt < 30000) { resolveDone(false); return; }
       lastListReconcileAt = now;
       try {
         let settled = false;
@@ -3626,15 +3644,45 @@ export function RealtimeChatProvider({ children }) {
           if (chats && chats.length > 0) {
             try { hydrateChatsRef.current?.(chats); } catch {}
           }
+          resolveDone(true);
         };
         const timer = setTimeout(() => finish(null), 20000);
         socket.on('chat:list:response', finish);
         socket.emit('chat:list', {}, finish);
-      } catch { /* best-effort */ }
+      } catch { resolveDone(false); }
+    });
+
+    // The server binds socket.userId ASYNCHRONOUSLY after 'connect' — every
+    // raw emit below (chat:list, message:sync:catchup, mute:sync) fired in
+    // that window was rejected NOT_AUTHENTICATED server-side and NEVER
+    // retried: the whole offline-window catch-up silently did nothing (the
+    // "internet wapas aane par messages sync nahi hote" bug). Wait for the
+    // auth bind (the 'authenticated' event flips the flag; the client's
+    // AUTH_FLUSH fallback covers servers that never send it) before any round.
+    const waitForSocketAuth = async (timeoutMs = 15000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (!socket.connected) return false;
+        if (isSocketAuthed()) return true;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      return isSocketAuthed();
     };
 
     const onConnectCatchup = async () => {
-      reconcileChatList();
+      if (!(await waitForSocketAuth())) return;
+      // Await the list reconcile so a chat CREATED while offline is known
+      // (DB/memory) before the per-chat catch-up derives its chat list —
+      // otherwise the new chat's messages were skipped this pass.
+      try { await reconcileChatList(); } catch (_) { /* best-effort */ }
+      // Missed CALLS while offline: the server re-rings any still-pending
+      // invite to this socket (call:incoming) — pullPendingCalls previously
+      // had no caller at all, so a ring that landed while offline was lost.
+      // Lazy require: a top-level import would create a require cycle.
+      try {
+        const callSignals = require('../calls/services/callSignalService');
+        callSignals.pullPendingCalls?.().catch?.(() => {});
+      } catch (_) { /* calls module absent — non-fatal */ }
       try {
         // Source the chat list from BOTH the persistent DB and the live in-memory
         // map (via stateRef — NOT the stale `state` captured when this effect was
@@ -3788,9 +3836,30 @@ export function RealtimeChatProvider({ children }) {
       lastFgCatchupAt = now;
       onConnectCatchup();
     });
+    // Network-regain catchup: if internet drops and returns while the app
+    // stays FOREGROUNDED, socket.io usually reconnects (→ 'connect' fires),
+    // but a short blip can leave the socket "connected" with events lost in
+    // between — and the AppState fg-catchup never fires because the app never
+    // backgrounded. Run the same delta catchup on every offline→online
+    // transition (small delay lets the socket/auth settle; the catchup itself
+    // waits for auth and is a cheap no-op when nothing was missed).
+    let prevNetOnline = null;
+    const netCatchupSub = NetInfo.addEventListener((s) => {
+      const online = !!(s?.isConnected && s?.isInternetReachable !== false);
+      const cameOnline = prevNetOnline === false && online;
+      prevNetOnline = online;
+      if (!cameOnline) return;
+      setTimeout(() => { if (socket.connected) onConnectCatchup(); }, 1500);
+    });
     // Hydrate mutes from the server on (re)connect — mute is a server-owned
     // per-user setting; mute:sync:response reconciles the local chat rows.
-    const onConnectMuteSync = () => { try { socket.emit('mute:sync'); } catch { /* non-fatal */ } };
+    // Waits for auth: a pre-auth mute:sync was silently dropped server-side.
+    const onConnectMuteSync = () => {
+      waitForSocketAuth().then((ok) => {
+        if (!ok) return;
+        try { socket.emit('mute:sync'); } catch { /* non-fatal */ }
+      }).catch(() => {});
+    };
     socket.on('connect', onConnectMuteSync);
     if (socket.connected) onConnectMuteSync();
     socket.on('message:delivered', onMessageDelivered);
@@ -3836,8 +3905,23 @@ export function RealtimeChatProvider({ children }) {
         type: 'UPDATE_BROADCAST_CHANNEL',
         payload: { channelId, isActive, chatName: ch.name, chatAvatar: ch.avatarUrl, isVerified: ch.isVerified },
       });
+      // An open ChatScreen renders from a static chatData snapshot — re-emit
+      // locally so its header rebrands live too.
+      DeviceEventEmitter.emit('broadcast:channel:updated', {
+        channelId,
+        chatName: ch.name,
+        chatAvatar: ch.avatarUrl ?? null,
+        isVerified: ch.isVerified,
+        isActive,
+      });
       if (isActive === false) {
         try { ChatDatabase.deleteChatRow(channelId); } catch (e) { /* best-effort */ }
+      } else {
+        // Persist the rebrand — the chat list boots from SQLite, so without
+        // this a cold start shows the old name/logo until the next API sync.
+        try {
+          ChatDatabase.updateChatGroupMeta(channelId, { name: ch.name, avatar: ch.avatarUrl });
+        } catch (e) { /* best-effort */ }
       }
     };
     socket.on('broadcast:channel_updated', onBroadcastChannelUpdated);
@@ -4677,6 +4761,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('message:received', onMessage),
       () => socket.off('connect', onConnectCatchup),
       () => { try { fgCatchupSub.remove(); } catch (_) { /* */ } },
+      () => { try { netCatchupSub(); } catch (_) { /* */ } },
       () => socket.off('connect', onConnectMuteSync),
       () => socket.off('message:delivered', onMessageDelivered),
       () => socket.off('message:seen', onMessageSeen),

@@ -186,7 +186,7 @@ export default function QRScannerScreen({ navigation }) {
             {/* Loading overlay */}
             {isLinking && (
               <View style={styles.scanOverlay}>
-                <ActivityIndicator size="large" color="#03b0a2" />
+                <ActivityIndicator size="large" color={theme.colors.themeColor} />
                 <Text style={styles.linkingText}>Linking device...</Text>
               </View>
             )}

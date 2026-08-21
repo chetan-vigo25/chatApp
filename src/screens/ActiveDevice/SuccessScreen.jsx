@@ -41,7 +41,7 @@ export default function SuccessScreen({ navigation, route }) {
       >
         {/* Success animation */}
         <View style={styles.animationContainer}>
-          <View style={[styles.checkCircle, { backgroundColor: '#03b0a2' }]}>
+          <View style={[styles.checkCircle, { backgroundColor: theme.colors.themeColor }]}>
             <FontAwesome6 name="check" size={48} color="#fff" />
           </View>
         </View>

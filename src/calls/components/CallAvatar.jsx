@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, Image, StyleSheet } from 'react-native';
+import { alwaysDark } from '../../contexts/ThemeContext';
 
 // Stable color from an id/name (mirrors the app's avatar fallback style).
 const COLORS = ['#6C5CE7', '#0984E3', '#00B894', '#E17055', '#E84393', '#0EA5A4', '#F39C12'];
@@ -30,5 +31,5 @@ export default function CallAvatar({ uri, name = '', id = '', size = 132 }) {
 const styles = StyleSheet.create({
   img: { backgroundColor: '#222' },
   fallback: { alignItems: 'center', justifyContent: 'center' },
-  letter: { color: '#fff', fontFamily: 'Roboto-Bold' },
+  letter: { color: alwaysDark.text, fontFamily: 'Roboto-Bold' },
 });

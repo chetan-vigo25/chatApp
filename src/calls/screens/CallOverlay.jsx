@@ -331,6 +331,7 @@ export default function CallOverlay() {
   if (isVideoActive) {
     return (
       <View style={styles.videoRoot} pointerEvents="box-none">
+        {/* video call surface is always dark by design */}
         <StatusBar barStyle="light-content" />
         <View style={[styles.videoTopBar, { paddingTop: insets.top + 8 }]} pointerEvents="box-none">
           {canMinimize ? (

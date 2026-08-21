@@ -9,7 +9,7 @@ import AppBannerHost from '../../src/components/AppBannerHost';
 import OfflineBanner from '../components/OfflineBanner';
 
 export default function AppContent() {
-  const { theme, isDarkMode } = useTheme();
+  const { theme, isDarkMode, isLoading: themeLoading } = useTheme();
 
   const [fontsLoaded] = useFonts({
     'Roboto-Black': require('../../assets/fonts/Roboto-Black.ttf'),
@@ -20,7 +20,9 @@ export default function AppContent() {
     'Roboto-SemiBold': require('../../assets/fonts/Roboto-SemiBold.ttf'),
   });
 
-  if (!fontsLoaded) return null;
+  // Hold the first frame until the persisted theme is read — otherwise dark
+  // users get a flash of light UI on every cold start (isDarkMode boots false).
+  if (!fontsLoaded || themeLoading) return null;
 
   // Offline is handled by a thin, NON-BLOCKING banner (OfflineBanner) — never a
   // full-screen overlay. RootNavigator stays mounted across network drops so the

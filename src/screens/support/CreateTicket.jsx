@@ -76,7 +76,7 @@ export default function CreateTicket({ navigation, route }) {
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
           {/* Subject */}
           <Text style={[styles.label, { color: subText }]}>Subject</Text>
-          <TextInput
+          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
             value={subject}
             onChangeText={setSubject}
             placeholder="Briefly, what's the issue?"
@@ -105,7 +105,7 @@ export default function CreateTicket({ navigation, route }) {
 
           {/* Description */}
           <Text style={[styles.label, { color: subText }]}>Description</Text>
-          <TextInput
+          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
             value={description}
             onChangeText={setDescription}
             placeholder="Tell us what happened, and any steps to reproduce…"

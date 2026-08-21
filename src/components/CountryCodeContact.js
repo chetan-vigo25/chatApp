@@ -194,6 +194,7 @@ const CountryCodeContact = ({
             <View style={[styles.searchContainer, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.04)' }]}>
               <Ionicons name="search" size={18} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
               <TextInput
+                keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
                 placeholder="Search country or code..."
                 placeholderTextColor={theme.colors.placeHolderTextColor}

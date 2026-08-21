@@ -98,7 +98,7 @@ export default function ProfilePreviewModal({
   if (!mounted) return null;
 
   // WhatsApp's popup action icons are bright green (dark) / teal-green (light).
-  const actionGreen = isDarkMode ? '#03b0a2' : '#028578';
+  const actionGreen = isDarkMode ? theme.colors.themeColor : '#028578';
   const initial = (name || '?').charAt(0).toUpperCase();
 
   const showMessage = typeof onMessage === 'function';

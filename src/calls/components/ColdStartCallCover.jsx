@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { View, Text, Image, StyleSheet, Animated, Easing } from 'react-native';
+import { alwaysDark } from '../../contexts/ThemeContext';
 
 // Instant full-screen "Incoming call" cover painted from the FIRST frame on a
 // killed/locked cold start, BEFORE the Splash/ChatList boot flow can show. It is a
@@ -61,9 +62,9 @@ const styles = StyleSheet.create({
     elevation: 99998,
   },
   avatarWrap: { marginBottom: 28 },
-  avatar: { width: 132, height: 132, borderRadius: 66, backgroundColor: '#1f2c34' },
+  avatar: { width: 132, height: 132, borderRadius: 66, backgroundColor: alwaysDark.surface },
   avatarFallback: { alignItems: 'center', justifyContent: 'center' },
-  avatarLetter: { color: '#fff', fontSize: 52, fontWeight: '600' },
-  name: { color: '#fff', fontSize: 26, fontWeight: '600', maxWidth: '80%', textAlign: 'center' },
+  avatarLetter: { color: alwaysDark.text, fontSize: 52, fontWeight: '600' },
+  name: { color: alwaysDark.text, fontSize: 26, fontWeight: '600', maxWidth: '80%', textAlign: 'center' },
   sub: { color: '#8aa0ab', fontSize: 15, marginTop: 8 },
 });

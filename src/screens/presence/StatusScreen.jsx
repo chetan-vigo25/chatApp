@@ -67,7 +67,7 @@ export default function StatusScreen() {
 
       <View style={{ marginTop: 24, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
         <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Medium' }}>Invisible mode</Text>
-        <Switch value={presence.isInvisible} onValueChange={(value) => setInvisible(value)} />
+        <Switch value={presence.isInvisible} onValueChange={(value) => setInvisible(value)} trackColor={{ false: theme.colors.border, true: theme.colors.themeColor }} thumbColor={'#ffffff'} ios_backgroundColor={theme.colors.border} />
       </View>
 
       {isLoading && <Text style={{ color: theme.colors.placeHolderTextColor, marginTop: 12 }}>Updating status...</Text>}

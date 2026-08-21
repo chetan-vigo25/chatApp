@@ -227,7 +227,7 @@ export default function CreateGroup({ navigation }) {
       <View style={styles.searchWrap}>
         <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
           <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
-          <TextInput
+          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
             placeholder="Search contacts..."
             placeholderTextColor={theme.colors.placeHolderTextColor}
             value={searchQuery}
@@ -299,7 +299,7 @@ export default function CreateGroup({ navigation }) {
         <View style={styles.inputSection}>
           <View style={[styles.inputRow, { borderBottomColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)' }]}>
             <Ionicons name="people" size={20} color={theme.colors.themeColor} style={{ marginRight: 12 }} />
-            <TextInput
+            <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               placeholder="Group name (required)"
               placeholderTextColor={theme.colors.placeHolderTextColor}
               value={groupName}
@@ -312,7 +312,7 @@ export default function CreateGroup({ navigation }) {
 
           <View style={[styles.inputRow, { borderBottomColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)' }]}>
             <Ionicons name="document-text-outline" size={20} color={theme.colors.themeColor} style={{ marginRight: 12 }} />
-            <TextInput
+            <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               placeholder="Group description (optional)"
               placeholderTextColor={theme.colors.placeHolderTextColor}
               value={groupDescription}

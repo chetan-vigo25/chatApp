@@ -10,15 +10,15 @@ export default function NoInternetScreen({ onRetry, isRetrying }) {
     const { theme } = useTheme();
   return (
     <View style={{ flex:1, justifyContent: 'center', alignItems: 'center', backgroundColor: theme.colors.background }}>
-      <Text style={styles.title}>Ooops!</Text>
+      <Text style={[styles.title, { color: theme.colors.primaryTextColor }]}>Ooops!</Text>
       {LottieView ? (
         <LottieView source={require('../../assets/lottie/NoInternet.json')} autoPlay loop style={{ width: 200, height: 200 }} />
       ) : (
-        <MaterialIcons name="wifi-off" size={80} color="gray" style={{ marginVertical: 20 }} />
+        <MaterialIcons name="wifi-off" size={80} color={theme.colors.secondaryTextColor} style={{ marginVertical: 20 }} />
       )}
-      <Text style={{ fontSize: 18, color: 'gray', fontFamily:'Roboto-Medium' }}>You are currently offline.</Text>
-      <Text style={{ fontSize: 14, color: 'gray', fontFamily:'Roboto-Medium' }}>No Internet connection found.</Text>
-      <Text style={styles.subtitle}>Please check your Internet connection.</Text>
+      <Text style={{ fontSize: 18, color: theme.colors.secondaryTextColor, fontFamily:'Roboto-Medium' }}>You are currently offline.</Text>
+      <Text style={{ fontSize: 14, color: theme.colors.secondaryTextColor, fontFamily:'Roboto-Medium' }}>No Internet connection found.</Text>
+      <Text style={[styles.subtitle, { color: theme.colors.secondaryTextColor }]}>Please check your Internet connection.</Text>
       {/* <Button title={isRetrying ? "Checking..." : "Try Again"} onPress={onRetry} disabled={isRetrying} /> */}
     </View>
   );
@@ -26,9 +26,9 @@ export default function NoInternetScreen({ onRetry, isRetrying }) {
 
 const styles = StyleSheet.create({
   title: {
-    fontSize: 24, marginBottom: 10, fontFamily:'Roboto-Bold', color: 'gray'
+    fontSize: 24, marginBottom: 10, fontFamily:'Roboto-Bold'
   },
   subtitle: {
-    fontSize: 14, color: 'gray', marginBottom: 20, fontFamily:'Roboto-Medium'
+    fontSize: 14, marginBottom: 20, fontFamily:'Roboto-Medium'
   }
 });

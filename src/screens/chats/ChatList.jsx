@@ -1349,7 +1349,7 @@ export default function ChatList({ navigation }) {
   const previewAvatarColor = getAvatarColor(previewName);
   // WhatsApp's profile-popup action icons are a bright green (dark mode) /
   // teal-green (light mode) — distinct from the app's own brand teal.
-  const previewActionGreen = isDarkMode ? '#03b0a2' : '#028578';
+  const previewActionGreen = isDarkMode ? theme.colors.themeColor : '#028578';
 
   // ─── RENDER ───
 
@@ -1414,6 +1414,7 @@ export default function ChatList({ navigation }) {
       <View style={[styles.searchBar, { backgroundColor: isDarkMode ? '#1F2C3380' : '#f0f2f5' }]}>
         <Ionicons name="search" size={17} color={theme.colors.iconColor} />
         <TextInput
+          keyboardAppearance={isDarkMode ? 'dark' : 'light'}
           placeholder="Search"
           // Darker/higher-contrast placeholder than the default muted grey.
           placeholderTextColor={isDarkMode ? '#9AA9B2' : '#54656F'}
@@ -1645,9 +1646,9 @@ export default function ChatList({ navigation }) {
               {
                 top: menuPos.top,
                 right: menuPos.right,
-                // Elevated menu surface per theme — slightly lighter than the
-                // dark card so the dropdown reads as a layer above the list.
-                backgroundColor: isDarkMode ? '#1F2C34' : theme.colors.cardBackground,
+                // Same card surface as the app's other sheets/dialogs; the
+                // hairline border below provides the layer separation.
+                backgroundColor: theme.colors.cardBackground,
                 borderColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
               },
             ]}

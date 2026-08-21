@@ -297,7 +297,7 @@ export default function DeletedChatsPassword({ navigation }) {
         )}
         <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
           <Ionicons name="key-outline" size={18} color={subText} />
-          <TextInput
+          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
             value={pwd}
             onChangeText={(t) => { setPwd(t); clearMessages(); }}
             placeholder={hasPassword ? 'New password' : 'Password'}
@@ -322,7 +322,7 @@ export default function DeletedChatsPassword({ navigation }) {
 
         <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
           <Ionicons name="checkmark-circle-outline" size={18} color={subText} />
-          <TextInput
+          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
             value={confirmPwd}
             onChangeText={(t) => { setConfirmPwd(t); clearMessages(); }}
             placeholder="Confirm password"
@@ -337,7 +337,7 @@ export default function DeletedChatsPassword({ navigation }) {
 
         {!!error && (
           <View style={styles.msgRow}>
-            <Ionicons name="alert-circle" size={14} color="#E53935" />
+            <Ionicons name="alert-circle" size={14} color={theme.colors.danger} />
             <Text style={styles.errorText}>{error}</Text>
           </View>
         )}
@@ -424,19 +424,19 @@ export default function DeletedChatsPassword({ navigation }) {
             backgroundColor: hasPassword ? '#E5393520' : (isDarkMode ? '#243340' : '#F2F4F8'),
           }]}>
             {resetting ? (
-              <ActivityIndicator size="small" color="#E53935" />
+              <ActivityIndicator size="small" color={theme.colors.danger} />
             ) : (
               <MaterialCommunityIcons
                 name="lock-reset"
                 size={22}
-                color={hasPassword ? '#E53935' : subText}
+                color={hasPassword ? theme.colors.danger : subText}
               />
             )}
           </View>
           <View style={styles.rowTextWrap}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, {
-                color: hasPassword ? '#E53935' : subText,
+                color: hasPassword ? theme.colors.danger : subText,
               }]}>
                 Reset password
               </Text>

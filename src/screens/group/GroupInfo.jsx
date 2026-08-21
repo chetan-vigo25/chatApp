@@ -457,7 +457,7 @@ export default function GroupInfo({ navigation, route }) {
               borderBottomWidth: StyleSheet.hairlineWidth,
               borderBottomColor: theme.colors.borderColor || 'rgba(0,0,0,0.08)',
               elevation: 4,
-              shadowColor: '#000',
+              shadowColor: theme.colors.shadow,
               shadowOffset: { width: 0, height: 2 },
               shadowOpacity: 0.08,
               shadowRadius: 4,
@@ -617,24 +617,24 @@ export default function GroupInfo({ navigation, route }) {
 
           <TouchableOpacity onPress={() => setReportVisible(true)} activeOpacity={0.6} style={styles.actionRow}>
             <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
-              <Ionicons name="flag-outline" size={20} color="#E53935" />
+              <Ionicons name="flag-outline" size={20} color={theme.colors.danger} />
             </View>
-            <Text style={[styles.actionLabel, { color: '#E53935' }]}>Report group</Text>
+            <Text style={[styles.actionLabel, { color: theme.colors.danger }]}>Report group</Text>
           </TouchableOpacity>
 
           <TouchableOpacity onPress={handleExitGroup} activeOpacity={0.6} style={styles.actionRow}>
             <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
-              <Ionicons name="exit-outline" size={20} color="#E53935" />
+              <Ionicons name="exit-outline" size={20} color={theme.colors.danger} />
             </View>
-            <Text style={[styles.actionLabel, { color: '#E53935' }]}>Exit group</Text>
+            <Text style={[styles.actionLabel, { color: theme.colors.danger }]}>Exit group</Text>
           </TouchableOpacity>
 
           {canDeleteGroup && (
             <TouchableOpacity onPress={handleDeleteGroup} activeOpacity={0.6} style={styles.actionRow}>
               <View style={[styles.actionIcon, { backgroundColor: '#E5393514' }]}>
-                <Ionicons name="trash-outline" size={20} color="#E53935" />
+                <Ionicons name="trash-outline" size={20} color={theme.colors.danger} />
               </View>
-              <Text style={[styles.actionLabel, { color: '#E53935' }]}>Delete group</Text>
+              <Text style={[styles.actionLabel, { color: theme.colors.danger }]}>Delete group</Text>
             </TouchableOpacity>
           )}
         </View>
@@ -685,8 +685,8 @@ export default function GroupInfo({ navigation, route }) {
 
             {canRemoveMembers && selectedMember?.role !== 'owner' && String(getMemberUser(selectedMember).id) !== String(ownerId) && (
               <TouchableOpacity onPress={() => handleRemoveMember(selectedMember)} style={styles.modalOption}>
-                <Ionicons name="person-remove-outline" size={20} color="#E53935" />
-                <Text style={[styles.modalOptionText, { color: '#E53935' }]}>Remove from Group</Text>
+                <Ionicons name="person-remove-outline" size={20} color={theme.colors.danger} />
+                <Text style={[styles.modalOptionText, { color: theme.colors.danger }]}>Remove from Group</Text>
               </TouchableOpacity>
             )}
 

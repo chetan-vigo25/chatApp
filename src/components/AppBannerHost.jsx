@@ -827,7 +827,7 @@ export default function WhatsAppBannerHost() {
         paddingBottom: 14,
         overflow: 'hidden',
         backgroundColor: cardBg,
-        shadowColor: '#000',
+        shadowColor: theme.colors.shadow,
         shadowOffset: { width: 0, height: 8 },
         shadowOpacity: 0.22,
         shadowRadius: 18,

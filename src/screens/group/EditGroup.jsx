@@ -221,7 +221,7 @@ export default function EditGroup({ navigation, route }) {
             </Text>
             {groupAvatar && !newAvatarUri && (
               <TouchableOpacity onPress={removeAvatar} disabled={isSaving} activeOpacity={0.6} style={{ marginTop: 10 }}>
-                <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 13, color: '#E53935' }}>Remove Photo</Text>
+                <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 13, color: theme.colors.danger }}>Remove Photo</Text>
               </TouchableOpacity>
             )}
           </View>
@@ -230,7 +230,7 @@ export default function EditGroup({ navigation, route }) {
           <View style={styles.fieldSection}>
             <View style={[styles.fieldRow, { borderBottomColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)' }]}>
               <Text style={[styles.fieldLabel, { color: theme.colors.placeHolderTextColor }]}>Group Name</Text>
-              <TextInput
+              <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 value={groupName}
                 onChangeText={setGroupName}
                 maxLength={50}
@@ -243,7 +243,7 @@ export default function EditGroup({ navigation, route }) {
 
             <View style={[styles.fieldRow, { borderBottomColor: isDarkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)' }]}>
               <Text style={[styles.fieldLabel, { color: theme.colors.placeHolderTextColor }]}>Description</Text>
-              <TextInput
+              <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 value={groupDescription}
                 onChangeText={setGroupDescription}
                 maxLength={100}

@@ -22,17 +22,69 @@ const fonts = {
   bold: 'Roboto-Bold',
 };
 
+// Type scale — the app previously used 14+ ad-hoc sizes; new code must pick
+// from this scale (closest step) instead of a raw number.
+const fontSizes = {
+  caption: 11,
+  small: 12,
+  body: 14,
+  subtitle: 15,
+  title: 16,
+  heading: 18,
+  large: 22,
+};
+
+const spacing = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24 };
+const radii = { sm: 6, md: 10, lg: 16, pill: 999 };
+
+// Surfaces that are dark in BOTH themes by design (media viewers, status
+// viewer/editor, in-call video). Named so the decision is visible (never
+// flatten these into the mode-dependent tokens).
+export const alwaysDark = {
+  background: '#000000',
+  surface: '#1F2C34',
+  text: '#ffffff',
+  textMuted: 'rgba(255,255,255,0.7)',
+  scrim: 'rgba(0,0,0,0.5)',
+};
+
+// Perceived-luminance check so text painted ON a user-chosen accent
+// (chatColor) stays readable — light accents get dark ink, dark accents white.
+export const isLightColor = (hex) => {
+  if (typeof hex !== 'string') return false;
+  const h = hex.replace('#', '');
+  const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
+  if (full.length < 6) return false;
+  const r = parseInt(full.slice(0, 2), 16);
+  const g = parseInt(full.slice(2, 4), 16);
+  const b = parseInt(full.slice(4, 6), 16);
+  return 0.299 * r + 0.587 * g + 0.114 * b > 160;
+};
+export const onColorFor = (hex) => (isLightColor(hex) ? '#0B141A' : '#E9EDEF');
+// Secondary/meta ink (timestamps, ticks, labels) on an accent-colored bubble.
+export const metaOnColorFor = (hex) =>
+  isLightColor(hex) ? 'rgba(11,20,26,0.62)' : 'rgba(255,255,255,0.65)';
+// Outgoing bubble background: user-customised chatColor wins; the default
+// accent maps to WhatsApp's dark outgoing green, not the bright brand teal.
+export const sentBubbleBgFor = (chatColor, theme) =>
+  chatColor && chatColor !== BRAND ? chatColor : theme.colors.bubbleSent;
+
 // Light theme
 const lightTheme = {
   colors: {
     background: '#ffffff',
     primaryTextColor: '#0B141A',
+    textColor: '#0B141A', // alias — several call sites read this name
     secondaryTextColor: '#667781',
+    muted: '#667781',
     textWhite: '#ffffff',
     themeColor: BRAND,
+    primary: BRAND, // alias — several call sites read this name
+    onAccent: '#ffffff',
     placeHolderTextColor: '#a9a9a9',
     borderColor: '#e6e6e6',
     border: '#e6e6e6',
+    divider: 'rgba(0,0,0,0.06)',
     menuBackground: '#f5f5f5',
     cardBackground: '#ffffff',
     surface: '#f5f6f6',
@@ -40,8 +92,24 @@ const lightTheme = {
     iconColor: '#54656f',
     danger: '#e53935',
     success: BRAND,
+    warning: '#B26A00',
+    info: '#0277BD',
+    scrim: 'rgba(0,0,0,0.5)',
+    shadow: '#000000',
+    readReceipt: '#53BDEB',
+    // Message bubbles (WhatsApp-parity; sent bg is overridden by chatColor)
+    bubbleSent: '#03574f',
+    bubbleSentText: '#E9EDEF',
+    bubbleReceived: '#ffffff',
+    bubbleDeleted: '#f5f5f5',
+    bubbleMeta: '#5B6B75',
+    replyHighlight: '#D19D00',
+    disabledOpacity: 0.4,
   },
   fonts,
+  fontSizes,
+  spacing,
+  radii,
 };
 
 // Dark theme — same design as light, with dark-appropriate values per token
@@ -50,12 +118,17 @@ const darkTheme = {
   colors: {
     background: '#000000',
     primaryTextColor: '#ffffff',
+    textColor: '#ffffff',
     secondaryTextColor: '#8696a0',
+    muted: '#8696a0',
     textWhite: '#ffffff',
     themeColor: BRAND,
+    primary: BRAND,
+    onAccent: '#ffffff',
     placeHolderTextColor: '#8696a0',
     borderColor: '#2A3942',
     border: '#2A3942',
+    divider: 'rgba(255,255,255,0.08)',
     menuBackground: '#16222C',
     cardBackground: '#16222C',
     surface: '#1F2C33',
@@ -63,8 +136,26 @@ const darkTheme = {
     iconColor: '#aebac1',
     danger: '#ff6b6b',
     success: BRAND,
+    warning: '#FFC107',
+    info: '#53BDEB',
+    scrim: 'rgba(0,0,0,0.5)',
+    // Shadows are invisible on #000 — dark mode separates elevated surfaces
+    // with `divider` borders instead; keep shadow transparent so light-mode
+    // shadow styles don't paint mud.
+    shadow: 'transparent',
+    readReceipt: '#53BDEB',
+    bubbleSent: '#03574f',
+    bubbleSentText: '#E9EDEF',
+    bubbleReceived: '#202C33',
+    bubbleDeleted: '#182229',
+    bubbleMeta: '#8696a0',
+    replyHighlight: '#FFC107',
+    disabledOpacity: 0.55,
   },
   fonts,
+  fontSizes,
+  spacing,
+  radii,
 };
 
 // Default fallback
@@ -114,7 +205,6 @@ export const ThemeProvider = ({ children }) => {
   useEffect(() => {
     const subscription = Appearance.addChangeListener(({ colorScheme }) => {
       if (!hasManualTheme) {
-        console.log('System theme changed to:', colorScheme);
         setIsDarkMode(colorScheme === 'dark');
       }
     });
@@ -129,7 +219,6 @@ export const ThemeProvider = ({ children }) => {
       setIsDarkMode(newTheme);
       setHasManualTheme(true);
       await AsyncStorage.setItem('theme', newTheme ? 'dark' : 'light');
-      console.log('Theme toggled to:', newTheme ? 'dark' : 'light');
     } catch (error) {
       console.error('Error saving theme:', error);
     }
@@ -141,7 +230,6 @@ export const ThemeProvider = ({ children }) => {
       setIsDarkMode(isDark);
       setHasManualTheme(true);
       await AsyncStorage.setItem('theme', isDark ? 'dark' : 'light');
-      console.log('Theme set to:', isDark ? 'dark' : 'light');
     } catch (error) {
       console.error('Error saving theme:', error);
     }
@@ -154,7 +242,6 @@ export const ThemeProvider = ({ children }) => {
       const systemScheme = Appearance.getColorScheme();
       setIsDarkMode(systemScheme === 'dark');
       await AsyncStorage.removeItem('theme');
-      console.log('Theme reset to system:', systemScheme);
     } catch (error) {
       console.error('Error resetting theme:', error);
     }

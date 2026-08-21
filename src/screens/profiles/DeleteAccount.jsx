@@ -42,7 +42,7 @@ export default function DeleteAccount({ navigation }) {
   const pageBg = theme.colors.background;
   const cardBg = theme.colors.background;
   const sepClr = isDarkMode ? "rgba(255,255,255,0.07)" : "rgba(15,30,50,0.07)";
-  const DANGER = "#E53935";
+  const DANGER = theme.colors.danger;
 
   const isOther = reason === "Other";
   const canContinue = !!reason && (!isOther || customReason.trim().length >= 2);
@@ -138,7 +138,7 @@ export default function DeleteAccount({ navigation }) {
           </View>
 
           {isOther && (
-            <TextInput
+            <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               value={customReason}
               onChangeText={setCustomReason}
               placeholder="Tell us more…"

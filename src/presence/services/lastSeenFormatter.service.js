@@ -17,9 +17,9 @@ export const formatLastSeen = (timestamp, privacyLevel = 'everyone') => {
 
   const time = m.format('h:mm A');
   const now = moment();
-  if (m.isSame(now, 'day')) return `last seen ${time}`;
-  if (m.isSame(now.clone().subtract(1, 'day'), 'day')) return `last seen yesterday ${time}`;
-  if (m.isAfter(now.clone().subtract(7, 'day'))) return `last seen ${m.format('ddd')} ${time}`;
+  if (m.isSame(now, 'day')) return `last seen today at ${time}`;
+  if (m.isSame(now.clone().subtract(1, 'day'), 'day')) return `last seen yesterday at ${time}`;
+  if (m.isAfter(now.clone().subtract(7, 'day'))) return `last seen ${m.format('ddd')} at ${time}`;
   return `last seen ${m.format('DD/MM/YY')}`;
 };
 

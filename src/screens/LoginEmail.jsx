@@ -228,12 +228,12 @@ export default function LoginEmail({ navigation }) {
   };
 
   // WhatsApp palette
-  const accent = isDarkMode ? '#03b0a2' : '#028578';
+  const accent = isDarkMode ? theme.colors.themeColor : '#028578';
   const link = isDarkMode ? '#53BDEB' : '#027EB5';
   const errorColor = '#E5484D';
   const bg = isDarkMode ? '#000000' : '#FFFFFF';
   const primaryText = isDarkMode ? '#E9EDEF' : '#111B21';
-  const secondaryText = isDarkMode ? '#8696A0' : '#54656F';
+  const secondaryText = isDarkMode ? theme.colors.secondaryTextColor : '#54656F';
   const placeholderText = isDarkMode ? '#5E7280' : '#A6B0BD';
   const underlineIdle = isDarkMode ? '#2A3942' : '#D1D7DB';
   const disabledBtn = isDarkMode ? '#1F2C33' : '#D8DEE2';
@@ -269,7 +269,7 @@ export default function LoginEmail({ navigation }) {
                 <Text style={[styles.label, { color: secondaryText }]}>VERIFICATION CODE</Text>
                 <View style={[styles.inputRow, { borderBottomColor: accent }]}>
                   <Ionicons name="shield-checkmark-outline" size={20} color={accent} style={styles.inputIcon} />
-                  <TextInput
+                  <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                     style={[styles.input, { color: primaryText }]}
                     placeholder="6-digit code"
                     placeholderTextColor={placeholderText}
@@ -305,7 +305,7 @@ export default function LoginEmail({ navigation }) {
             <Text style={[styles.label, { color: secondaryText }]}>USERNAME</Text>
             <View style={[styles.inputRow, { borderBottomColor: usernameUnderline }]}>
               <Ionicons name="person-outline" size={20} color={usernameFocused ? accent : placeholderText} style={styles.inputIcon} />
-              <TextInput
+              <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 style={[styles.input, { color: primaryText }]}
                 placeholder="Username"
                 placeholderTextColor={placeholderText}
@@ -325,7 +325,7 @@ export default function LoginEmail({ navigation }) {
             <Text style={[styles.label, { color: secondaryText, marginTop: 26 }]}>PASSWORD</Text>
             <View style={[styles.inputRow, { borderBottomColor: passwordUnderline }]}>
               <Ionicons name="lock-closed-outline" size={20} color={showPasswordError ? errorColor : (passwordFocused ? accent : placeholderText)} style={styles.inputIcon} />
-              <TextInput
+              <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 style={[styles.input, { color: primaryText }]}
                 placeholder="Enter your password"
                 placeholderTextColor={placeholderText}

@@ -1648,15 +1648,19 @@ const loadMessages = async (chatId, opts = {}) => {
   // This is a WRITE on the read path; route it through the write mutex so it can't
   // race the exclusive-transaction batch writers (was a silent SQLITE_BUSY source).
   if (!skipCleanup) {
-    try {
-      await runExclusive(async () => {
-        const wdb = await getDB();
-        await wdb.runAsync(
-          `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND server_message_id IS NOT NULL`,
-          { $cid: chatId }
-        );
-      });
-    } catch {}
+    // FIRE-AND-FORGET: this write used to be AWAITED, which parked the
+    // first-paint read behind the write mutex — right after a chat-list
+    // refresh (upsertChats) or the first-sync warm holds it, opening a chat
+    // sat on the loader until the whole write drained. Display correctness
+    // doesn't need it synchronously: the in-memory dedup already suppresses
+    // temp/server twins; this just tidies the stored rows for later reads.
+    runExclusive(async () => {
+      const wdb = await getDB();
+      await wdb.runAsync(
+        `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND server_message_id IS NOT NULL`,
+        { $cid: chatId }
+      );
+    }).catch(() => {});
   }
 
   // ── STEP 2: Load raw rows using indexed query ──
@@ -2211,6 +2215,22 @@ const updateMessageViewOnce = async (messageId, patch = {}) => {
   } catch (err) { console.warn('[ChatDB] updateMessageViewOnce error:', err?.message); }
 };
 
+// Persist a healed (re-signed) media URL so the 403→resolve round-trip does
+// not repeat on every mount. URL columns only — never touches payload, and
+// callers must NEVER invoke this for view-once rows (no media re-reference).
+const updateMessageMediaUrl = async (messageId, { mediaUrl = null, mediaThumbnailUrl = null } = {}) => {
+  if (!messageId || (!mediaUrl && !mediaThumbnailUrl)) return;
+  const u = []; const p = { $id: messageId };
+  if (mediaUrl) { u.push('media_url = $mu'); p.$mu = String(mediaUrl); }
+  if (mediaThumbnailUrl) { u.push('preview_url = $pu'); p.$pu = String(mediaThumbnailUrl); }
+  try {
+    await runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync(`UPDATE messages SET ${u.join(', ')} WHERE id = $id OR server_message_id = $id OR temp_id = $id`, p);
+    });
+  } catch (err) { console.warn('[ChatDB] updateMessageMediaUrl error:', err?.message); }
+};
+
 const clearChat = async (chatId, clearedAt = null) => {
   if (!chatId) return;
   await runExclusive(async () => {
@@ -2474,6 +2494,12 @@ const _chatToRow = (chat) => {
     $groupId: chat.groupId || chat.group?._id || (isGroup ? chatId : null),
     $chatName: chat.chatName || chat.groupName || chat.group?.name || peerUserObj?.fullName || null,
     $chatAvatar: chat.chatAvatar || chat.groupAvatar || chat.group?.avatar || peerUserObj?.profileImage || null,
+    // 1 = server branding is authoritative (broadcast channels): the fresh
+    // name/avatar OVERWRITES what's stored instead of fill-if-missing. Without
+    // this a row mis-seeded with a sender name (e.g. "admin") could never be
+    // repaired by the branded API/socket rows, and an admin logo removal
+    // (avatar → null) never cleared.
+    $nameAuth: (chat.chatType === 'broadcast' || chat.isBroadcast) ? 1 : 0,
     $lmText: lm.text || null,
     $lmType: lm.type || lm.messageType || 'text',
     $lmSenderId: lm.senderId || null,
@@ -2572,8 +2598,8 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
   peer_user = COALESCE($peerUser, peer_user),
   group_data = COALESCE($groupData, group_data),
   group_id = COALESCE($groupId, group_id),
-  chat_name = COALESCE($chatName, chat_name),
-  chat_avatar = COALESCE($chatAvatar, chat_avatar),
+  chat_name = CASE WHEN $nameAuth = 1 AND $chatName IS NOT NULL THEN $chatName ELSE COALESCE($chatName, chat_name) END,
+  chat_avatar = CASE WHEN $nameAuth = 1 THEN $chatAvatar ELSE COALESCE($chatAvatar, chat_avatar) END,
   last_message_text = CASE WHEN $lmKeep = 1 THEN last_message_text ELSE $lmText END,
   last_message_type = CASE WHEN $lmKeep = 1 THEN last_message_type ELSE $lmType END,
   last_message_sender_id = CASE WHEN $lmKeep = 1 THEN last_message_sender_id ELSE $lmSenderId END,
@@ -2600,14 +2626,26 @@ const upsertChat = async (chat) => {
 
 const upsertChats = async (chats) => {
   if (!Array.isArray(chats) || chats.length === 0) return;
-  await runExclusive(async () => {
-    const db = await getDB();
-    for (const chat of chats) {
-      const params = _chatToRow(chat);
-      if (!params) continue;
-      try { await db.runAsync(UPSERT_CHAT_SQL, params); } catch {}
-    }
-  });
+  // Write in SMALL batches, releasing the write mutex between them. One
+  // exclusive block over the whole list made a chat-list refresh hold the
+  // writer for its full duration — a chat opened right then queued its
+  // first-paint read behind it and showed the loader until the refresh drained.
+  const BATCH = 10;
+  for (let i = 0; i < chats.length; i += BATCH) {
+    const slice = chats.slice(i, i + BATCH);
+    // eslint-disable-next-line no-await-in-loop
+    await runExclusive(async () => {
+      const db = await getDB();
+      for (const chat of slice) {
+        const params = _chatToRow(chat);
+        if (!params) continue;
+        try { await db.runAsync(UPSERT_CHAT_SQL, params); } catch {}
+      }
+    });
+    // Yield the JS tick too, so queued readers actually get to run.
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 0));
+  }
 };
 
 const loadChatList = async (opts = {}) => {
@@ -2688,7 +2726,9 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
   // never a blank "private" placeholder. INSERT OR IGNORE only seeds when the
   // row is genuinely missing; existing rows are left untouched.
   const isGroup = Boolean(opts.isGroup);
-  const peerUserJson = !isGroup && opts.peerUser && opts.peerUser._id
+  const isBroadcast = opts.chatType === 'broadcast' || Boolean(opts.isBroadcast);
+  // Broadcast channels have no peer — never seed the admin sender as peer_user.
+  const peerUserJson = !isGroup && !isBroadcast && opts.peerUser && opts.peerUser._id
     ? JSON.stringify(opts.peerUser)
     : null;
   await db.runAsync(
@@ -2696,7 +2736,7 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
      VALUES ($chatId, $chatType, $isGroup, $groupId, $chatName, $chatAvatar, $peerUser, $groupData, 0, $now, $now)`,
     {
       $chatId: chatId,
-      $chatType: isGroup ? 'group' : 'private',
+      $chatType: isBroadcast ? 'broadcast' : (isGroup ? 'group' : 'private'),
       $isGroup: isGroup ? 1 : 0,
       $groupId: isGroup ? (opts.groupId || chatId) : null,
       $chatName: opts.chatName || null,
@@ -3325,7 +3365,7 @@ export default {
   loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
-  updateReactions, updateMessageEdit, updateMessageViewOnce, updateGroupMessageTracking, bulkUpdateStatus,
+  updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist

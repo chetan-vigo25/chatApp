@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Image, StyleSheet } from 'react-native';
+import { useTheme } from '../contexts/ThemeContext';
 
 // Full-screen opaque, branded overlay shown the instant the app leaves the
 // foreground (AppState `inactive` or `background`) for ANY reason — a manual
@@ -16,15 +17,16 @@ import { View, Image, StyleSheet } from 'react-native';
 // Solid brand background + logo only — it must NEVER render readable chat text.
 // Mounted high in the tree (CallProvider) so it sits above the whole app, and
 // removed only when AppState returns to `active` (LK4).
-const BRAND_BG = '#0B141A';
-
 export default function PrivacyOverlay() {
+  // Follow the active theme so the cover doesn't flash a dark plate over a
+  // light app (or vice versa) in the app switcher.
+  const { theme } = useTheme();
   return (
     <View
       pointerEvents="auto"
       accessibilityElementsHidden
       importantForAccessibility="no-hide-descendants"
-      style={styles.root}
+      style={[styles.root, { backgroundColor: theme.colors.background }]}
     >
       <Image
         source={require('../../assets/icon0.png')}
@@ -42,7 +44,6 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
-    backgroundColor: BRAND_BG,
     alignItems: 'center',
     justifyContent: 'center',
     // Above every screen, banner and call surface.

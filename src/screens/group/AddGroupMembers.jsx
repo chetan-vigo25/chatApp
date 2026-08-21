@@ -199,7 +199,7 @@ export default function AddGroupMembers({ navigation, route }) {
       <View style={styles.searchWrap}>
         <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
           <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
-          <TextInput
+          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
             placeholder="Search contacts..."
             placeholderTextColor={theme.colors.placeHolderTextColor}
             value={searchQuery}

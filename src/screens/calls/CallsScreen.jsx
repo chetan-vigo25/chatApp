@@ -126,8 +126,9 @@ function PressScale({ children, onPress, onLongPress, style }) {
   );
 }
 
-// Collapse consecutive log rows for the same peer into one entry (count badge),
-// keeping the most-recent row's direction/outcome/media — exactly like WhatsApp.
+// One row per call — consecutive calls with the same peer are NOT collapsed
+// (product decision: show every log entry individually, no "(n)" count badge).
+// The de-dup below still guards against realtime/pagination double-inserts.
 const groupCalls = (items) => {
   // Defensive de-dup: realtime prepends + paginated appends can land the same
   // call in `items` twice (by callId, or by _id). Drop repeats before grouping
@@ -144,12 +145,6 @@ const groupCalls = (items) => {
   const groups = [];
   for (const it of deduped) {
     const peerId = String(it.peerId?._id || it.peerId || '');
-    const prev = groups[groups.length - 1];
-    if (prev && prev.peerKey === peerId && peerId) {
-      prev.count += 1;
-      appendCallId(prev, it);
-      continue;
-    }
     groups.push({
       peerKey: peerId,
       // Stable + unique: after the de-dup above, each group's first row has a
@@ -175,11 +170,6 @@ const groupCalls = (items) => {
     });
   }
   return groups;
-};
-
-// Collect the callId of a collapsed row (and its merged siblings).
-const appendCallId = (group, it) => {
-  if (it.callId) group.callIds.push(String(it.callId));
 };
 
 export default function CallsScreen({ navigation }) {

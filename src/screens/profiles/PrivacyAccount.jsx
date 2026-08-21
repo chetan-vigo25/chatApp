@@ -38,8 +38,8 @@ export default function PrivacyAccount({ navigation }) {
   ];
 
   const renderItem = (item, isLast) => {
-    const color = item.destructive ? "#E53935" : primaryText;
-    const icon = item.destructive ? "#E53935" : iconColor;
+    const color = item.destructive ? theme.colors.danger : primaryText;
+    const icon = item.destructive ? theme.colors.danger : iconColor;
     return (
       <View key={item.label}>
         <TouchableOpacity onPress={item.onPress} activeOpacity={0.6} style={styles.menuItem}>

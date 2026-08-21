@@ -377,6 +377,17 @@ export default class NativeCallingSDK {
           return q && !q.group && q.from && String(q.from.id) === fromId;
         });
         const dupActive = this._acceptedFrom === fromId && (this._acceptedId || this._room);
+        // We already ANSWERED this peer but with an id the lobby may not know
+        // (banner/CallKit accept used the app-signaling `sig_…` id before this
+        // engine ring delivered the real one). This ring IS that call — re-issue
+        // the accept with the real id instead of swallowing, or the alias
+        // retries die NOT FOUND when the record was re-minted server-side.
+        if (dupActive && this._acceptedId && !this._room && String(this._acceptedId) !== key) {
+          this._log(`ring ${key} from accepted peer ${fromId} — re-accepting with real id`);
+          this._acceptedId = key;
+          this._acceptWithRetry(key).catch(() => {});
+          return;
+        }
         if (dupRinging || dupActive) { this._log(`duplicate 1:1 ring from ${fromId} (${key}) — swallowed`); return; }
         // Just declined this peer → quietly decline their reasserts too instead
         // of ghost-re-ringing (parity with the group _declined window).
@@ -912,6 +923,21 @@ export default class NativeCallingSDK {
   accept(callId, media, opts = {}) {
     const key = String(callId);
     const p = this._pendingIn[key];
+    if (!p && opts.isGroup !== true) {
+      // The app can answer with the app-socket signaling id (`sig_…`) when the
+      // engine ring hasn't reconciled yet. If a live pending 1:1 ring from the
+      // same peer exists, THAT lobby id is the real call — accept with it so
+      // the server finds the record first try (no alias-reconciliation needed).
+      const peerId = opts.peerId != null ? String(opts.peerId) : null;
+      const altKey = Object.keys(this._pendingIn).find((k) => {
+        const q = this._pendingIn[k];
+        return q && !q.group && (!peerId || (q.from && String(q.from.id) === peerId));
+      });
+      if (altKey) {
+        this._log(`accept: mapped unknown id ${key} → pending ring ${altKey}`);
+        return this.accept(altKey, media, opts);
+      }
+    }
     if (!p) {
       // No pending entry. A KNOWN 1:1 (the app layer reconciled the real SFU
       // callId but this SDK instance lost/never had the ring — engine reconnect

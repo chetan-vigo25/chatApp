@@ -403,7 +403,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 12,
     paddingVertical: 8,
-    backgroundColor: '#FFFFFF',
+    // bg comes from the themed inline override — a static color here paints
+    // a white band inside the dark sheet.
   },
   sectionIcon: {
     marginRight: 8,

@@ -135,7 +135,7 @@ export default function DeletedPasswordGate({ navigation }) {
               borderColor: error ? '#E5393580' : 'transparent',
             }]}>
               <Ionicons name="key-outline" size={18} color={subText} />
-              <TextInput
+              <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                 value={pwd}
                 onChangeText={(t) => { setPwd(t); if (error) setError(''); }}
                 placeholder="Password"

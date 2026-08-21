@@ -305,7 +305,15 @@ class MediaDownloadManager {
             mediaId: key,
             chatId: options?.chatId || identity.chatId || message?.chatId,
             messageType: identity.messageType,
-            filename: options?.filename || message?.text || message?.fileName || key,
+            // ORIGINAL upload name first (mediaMeta.fileName is where it lives);
+            // the caption-text fallback named cache files after the caption and
+            // every share/save then carried that wrong name.
+            filename: options?.filename
+              || identity.mediaMeta?.fileName
+              || message?.mediaMeta?.fileName
+              || message?.fileName
+              || message?.text
+              || key,
             force,
             messageId: identity.messageId || message?.messageId || message?.serverMessageId || message?.id || null,
             groupId: identity.groupId || message?.groupId || null,

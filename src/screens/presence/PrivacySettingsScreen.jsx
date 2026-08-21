@@ -16,17 +16,17 @@ export default function PrivacySettingsScreen() {
       <View style={{ marginTop: 16, gap: 12 }}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text style={{ color: theme.colors.primaryTextColor }}>Show Last Seen</Text>
-          <Switch value={settings.showLastSeen} onValueChange={(value) => updateSettings({ showLastSeen: value })} />
+          <Switch value={settings.showLastSeen} onValueChange={(value) => updateSettings({ showLastSeen: value })} trackColor={{ false: theme.colors.border, true: theme.colors.themeColor }} thumbColor={'#ffffff'} ios_backgroundColor={theme.colors.border} />
         </View>
 
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text style={{ color: theme.colors.primaryTextColor }}>Show Online Status</Text>
-          <Switch value={settings.showOnlineStatus} onValueChange={(value) => updateSettings({ showOnlineStatus: value })} />
+          <Switch value={settings.showOnlineStatus} onValueChange={(value) => updateSettings({ showOnlineStatus: value })} trackColor={{ false: theme.colors.border, true: theme.colors.themeColor }} thumbColor={'#ffffff'} ios_backgroundColor={theme.colors.border} />
         </View>
 
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text style={{ color: theme.colors.primaryTextColor }}>Typing Indicators</Text>
-          <Switch value={settings.typingIndicators} onValueChange={(value) => updateSettings({ typingIndicators: value })} />
+          <Switch value={settings.typingIndicators} onValueChange={(value) => updateSettings({ typingIndicators: value })} trackColor={{ false: theme.colors.border, true: theme.colors.themeColor }} thumbColor={'#ffffff'} ios_backgroundColor={theme.colors.border} />
         </View>
       </View>
 

@@ -347,7 +347,7 @@ export default function TwoStepPassword({ navigation }) {
         <View style={[styles.formCard, { backgroundColor: cardBg, shadowColor: isDarkMode ? 'transparent' : '#0B141A' }]}>
           <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
             <Ionicons name="key-outline" size={18} color={subText} />
-            <TextInput
+            <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               value={pwd}
               onChangeText={(t) => { setPwd(t); clearMessages(); }}
               placeholder={hasPassword ? 'New password' : 'Password'}
@@ -372,7 +372,7 @@ export default function TwoStepPassword({ navigation }) {
 
           <View style={[styles.inputWrap, { backgroundColor: inputBg }]}>
             <Ionicons name="checkmark-circle-outline" size={18} color={subText} />
-            <TextInput
+            <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               value={confirmPwd}
               onChangeText={(t) => { setConfirmPwd(t); clearMessages(); }}
               placeholder="Confirm password"
@@ -387,7 +387,7 @@ export default function TwoStepPassword({ navigation }) {
 
           {!!error && (
             <View style={styles.msgRow}>
-              <Ionicons name="alert-circle" size={14} color="#E53935" />
+              <Ionicons name="alert-circle" size={14} color={theme.colors.danger} />
               <Text style={styles.errorText}>{error}</Text>
             </View>
           )}
@@ -442,12 +442,12 @@ export default function TwoStepPassword({ navigation }) {
               <MaterialCommunityIcons
                 name="lock-reset"
                 size={22}
-                color={hasPassword ? '#E53935' : subText}
+                color={hasPassword ? theme.colors.danger : subText}
               />
             </View>
             <View style={styles.rowTextWrap}>
               <View style={styles.flex}>
-                <Text style={[styles.rowLabel, { color: hasPassword ? '#E53935' : subText }]}>
+                <Text style={[styles.rowLabel, { color: hasPassword ? theme.colors.danger : subText }]}>
                   Reset password
                 </Text>
                 <Text style={[styles.rowSub, { color: subText }]}>

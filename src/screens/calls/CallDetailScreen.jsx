@@ -117,7 +117,7 @@ const deriveStats = (calls = []) => {
 };
 
 export default function CallDetailScreen() {
-  const { theme } = useTheme();
+  const { theme, isDarkMode } = useTheme();
   const navigation = useNavigation();
   const route = useRoute();
   const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
@@ -264,7 +264,7 @@ export default function CallDetailScreen() {
   return (
     <View style={[styles.screen, { backgroundColor: c.background }]}>
       <StatusBar
-        barStyle={c.background === '#ffffff' ? 'dark-content' : 'light-content'}
+        barStyle={isDarkMode ? 'light-content' : 'dark-content'}
         backgroundColor={c.background}
       />
 

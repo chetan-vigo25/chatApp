@@ -559,12 +559,12 @@ export default function AppLockGate() {
                 ]}
               >
                 <View style={[styles.lockBadge, {
-                  backgroundColor: inCooldown ? '#E5393514' : themeColor + '14',
+                  backgroundColor: inCooldown ? theme.colors.danger + '14' : themeColor + '14',
                 }]}>
                   <Ionicons
                     name={inCooldown ? 'time-outline' : 'lock-closed'}
                     size={38}
-                    color={inCooldown ? '#E53935' : themeColor}
+                    color={inCooldown ? theme.colors.danger : themeColor}
                   />
                 </View>
 
@@ -579,7 +579,7 @@ export default function AppLockGate() {
 
                 {inCooldown && (
                   <View style={styles.countdownWrap}>
-                    <MaterialCommunityIcons name="clock-outline" size={16} color="#E53935" />
+                    <MaterialCommunityIcons name="clock-outline" size={16} color={theme.colors.danger} />
                     <Text style={styles.countdownText}>
                       {formatCooldown(cooldownSeconds)}
                     </Text>
@@ -589,7 +589,7 @@ export default function AppLockGate() {
                 <View style={[styles.inputWrap, {
                   backgroundColor: inputBg,
                   borderBottomColor: error
-                    ? '#E53935'
+                    ? theme.colors.danger
                     : (focused ? themeColor : 'transparent'),
                   opacity: inCooldown ? 0.5 : 1,
                 }]}>
@@ -599,6 +599,7 @@ export default function AppLockGate() {
                     color={focused && !error ? themeColor : subText}
                   />
                   <TextInput
+                    keyboardAppearance={isDarkMode ? 'dark' : 'light'}
                     value={pwd}
                     onChangeText={(t) => { setPwd(t); if (error && !inCooldown) setError(''); }}
                     onFocus={() => setFocused(true)}

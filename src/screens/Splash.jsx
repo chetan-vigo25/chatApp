@@ -151,7 +151,7 @@ export default function Splash({ navigation }) {
     };
  
     return (
-        <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#ffffff'}}>
+        <SafeAreaView style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: theme.colors.background}}>
             <Animated.View style={{ opacity: fadeAnim, alignItems: 'center' }}>
                 {/* <LottieView
                     style={{ width: 220, height: 220 }}

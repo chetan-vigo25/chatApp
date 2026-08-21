@@ -678,7 +678,7 @@ const attachCoreSocketListeners = (navigation) => {
   if (!socket || socketListenersBound) return;
   socketListenersBound = true;
 
-  socket.on('connect', () => {
+  socket.on('connect', async () => {
     console.log('✅ socket connected', { socketId: socket?.id });
     isSocketAuthenticated = false;
     updateSocketState({
@@ -689,7 +689,17 @@ const attachCoreSocketListeners = (navigation) => {
       lastError: null,
     });
 
-    const authToken = accessTokenCache;
+    // Read the token fresh from storage: the HTTP layer's silent refresh writes
+    // AsyncStorage only, so the module-level accessTokenCache can be stale here
+    // — handshaking with it costs a guaranteed failed auth + reauth round-trip.
+    let authToken = accessTokenCache;
+    try {
+      const stored = await getAuthStorage();
+      if (stored?.accessToken) {
+        authToken = stored.accessToken;
+        accessTokenCache = stored.accessToken;
+      }
+    } catch { /* fall back to cache */ }
     socket.emit('authenticate', {
       token: authToken,
       deviceId,
@@ -773,6 +783,14 @@ const attachCoreSocketListeners = (navigation) => {
     if (socket && accessTokenCache) {
       socket.auth = { ...(socket.auth || {}), token: accessTokenCache };
     }
+    // Also refresh the cache from storage (fire-and-forget) so a token the HTTP
+    // layer rotated out-of-band reaches the next handshake attempt.
+    getAuthStorage().then((stored) => {
+      if (stored?.accessToken && socket) {
+        accessTokenCache = stored.accessToken;
+        socket.auth = { ...(socket.auth || {}), token: stored.accessToken };
+      }
+    }).catch(() => {});
     updateSocketState({ status: 'reconnecting', connected: false, reconnectAttempts: attemptNumber || 0 });
   });
 
@@ -1315,6 +1333,10 @@ export const getSocket = () => socket;
 export const getSessionId = () => sessionId;
 
 export const isSocketConnected = () => !!(socket && socket.connected);
+// Auth-aware check: the server binds socket.userId asynchronously after
+// 'connect' — emits sent before this is true are rejected NOT_AUTHENTICATED
+// and silently lost. Catch-up/sync paths must wait on this, not on connect.
+export const isSocketAuthed = () => !!(socket && socket.connected && isSocketAuthenticated);
 
 export const disconnectSocket = () => {
   safeDisconnectSocket();

@@ -49,7 +49,10 @@ const normalizePickedAsset = async (asset, mediaType) => {
   if (!uri) return null;
 
   const segments = uri.split('/');
-  const name = asset.fileName || segments[segments.length - 1] || `media_${Date.now()}`;
+  // `fileName` is ImagePicker's field; expo-document-picker exposes `name` —
+  // reading only fileName made MULTI-picked documents fall back to the picker
+  // cache uuid, losing the original filename.
+  const name = asset.fileName || asset.name || segments[segments.length - 1] || `media_${Date.now()}`;
   const type = asset.mimeType
     || (asset.type ? `${asset.type}/${(name.split('.').pop() || 'jpg')}` : (mediaType === 'video' ? 'video/mp4' : 'image/jpeg'));
 

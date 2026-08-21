@@ -243,7 +243,7 @@ export default function DeletedChatsSelector({ navigation, route }) {
     if (chats.length === 0) return null;
     const ScopeOption = ({ value, icon, label, danger }) => {
       const active = scope === value;
-      const tint = danger ? '#E53935' : themeColor;
+      const tint = danger ? theme.colors.danger : themeColor;
       return (
         <TouchableOpacity
           activeOpacity={0.8}

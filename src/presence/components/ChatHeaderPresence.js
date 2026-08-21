@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from 'react';
-import { Image, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react-native';
+import React, { useEffect, useState, useRef } from 'react';
+import { Animated, Easing, Image, ScrollView, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react-native';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
@@ -7,6 +7,73 @@ import { formatLastSeen } from '../services/lastSeenFormatter.service';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ContactDatabase from '../../services/ContactDatabase';
 import { getSocket } from '../../Redux/Services/Socket/socket';
+
+// Marquee for one-line header text: static while it fits; when it overflows
+// the available width it auto-scrolls right→left in a seamless loop (second
+// copy trails GAP px behind), pausing briefly at the start of each pass.
+const MARQUEE_GAP = 48;
+const MARQUEE_SPEED = 40; // px per second
+
+function MarqueeText({ text, style }) {
+  const [containerW, setContainerW] = useState(0);
+  const [textW, setTextW] = useState(0);
+  const scrollX = useRef(new Animated.Value(0)).current;
+  const overflow = containerW > 0 && textW > containerW + 2;
+
+  useEffect(() => {
+    scrollX.setValue(0);
+    if (!overflow) return undefined;
+    const distance = textW + MARQUEE_GAP;
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.delay(1500),
+        Animated.timing(scrollX, {
+          toValue: -distance,
+          duration: (distance / MARQUEE_SPEED) * 1000,
+          easing: Easing.linear,
+          useNativeDriver: true,
+        }),
+        // Snap back instantly — the trailing copy is already in place, so the
+        // jump is invisible and the loop restarts from the pause.
+        Animated.timing(scrollX, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ]),
+    );
+    anim.start();
+    return () => anim.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overflow, textW, containerW, text]);
+
+  return (
+    // Horizontal ScrollView (scrolling disabled) = an UNBOUNDED-width content
+    // box, so the text lays out at its natural width and onLayout reports the
+    // TRUE width. Measuring a numberOfLines-clipped Text inside a plain View
+    // always reported textW <= containerW, so overflow never triggered — that
+    // is why the marquee "didn't run".
+    <ScrollView
+      horizontal
+      scrollEnabled={false}
+      showsHorizontalScrollIndicator={false}
+      style={styles.marqueeClip}
+      onLayout={(e) => setContainerW(Math.floor(e.nativeEvent.layout.width))}
+      pointerEvents="none"
+    >
+      <Animated.View style={[styles.marqueeRow, { transform: [{ translateX: scrollX }] }]}>
+        <Text
+          numberOfLines={1}
+          style={style}
+          onLayout={(e) => setTextW(Math.ceil(e.nativeEvent.layout.width))}
+        >
+          {text}
+        </Text>
+        {overflow && (
+          <Text numberOfLines={1} style={[style, { marginLeft: MARQUEE_GAP }]}>
+            {text}
+          </Text>
+        )}
+      </Animated.View>
+    </ScrollView>
+  );
+}
 
 export default function ChatHeaderPresence({
   user,
@@ -135,11 +202,11 @@ export default function ChatHeaderPresence({
   const subText = theme.colors.placeHolderTextColor;
   const bg = theme.colors.background;
   const borderColor = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.08)';
-  const ringColor = isPeerOnline ? '#03b0a2' : (themeColor + '30');
+  const ringColor = isPeerOnline ? theme.colors.themeColor :(themeColor + '30');
 
   const statusColor = isTyping
     ? themeColor
-    : isPeerOnline ? '#03b0a2' : subText;
+    : isPeerOnline ? theme.colors.themeColor :subText;
 
   return (
     <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
@@ -188,8 +255,8 @@ export default function ChatHeaderPresence({
         </View>
         <View style={styles.statusRow}>
           {isTyping && <View style={[styles.typingDot, { backgroundColor: themeColor }]} />}
-          <Text
-            numberOfLines={1}
+          <MarqueeText
+            text={statusText}
             style={[
               styles.statusText,
               {
@@ -197,9 +264,7 @@ export default function ChatHeaderPresence({
                 fontStyle: isTyping ? 'italic' : 'normal',
               },
             ]}
-          >
-            {statusText}
-          </Text>
+          />
         </View>
       </TouchableOpacity>
 
@@ -268,5 +333,14 @@ const styles = StyleSheet.create({
   statusText: {
     fontFamily: 'Roboto-Medium',
     fontSize: 12,
+  },
+  marqueeClip: {
+    flex: 1,
+    overflow: 'hidden',
+  },
+  marqueeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
   },
 });

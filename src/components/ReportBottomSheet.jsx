@@ -252,6 +252,7 @@ export const ReportBottomSheet = ({
 
             <Text style={[styles.sectionLabel, dynamicStyles.sectionLabel]}>Additional details (optional)</Text>
             <TextInput
+              keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               style={[styles.input, dynamicStyles.input]}
               value={description}
               onChangeText={setDescription}

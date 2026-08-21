@@ -26,7 +26,6 @@ import UserB from "../screens/profiles/UserB";
 import ChannelInfo from "../screens/chats/ChannelInfo";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
 import ChatPrivacy from "../screens/profiles/ChatPrivacy";
-import ChooseLanguage from "../screens/profiles/ChooseLanguage";
 import PrivacyAccount from "../screens/profiles/PrivacyAccount";
 import BlockedContacts from "../screens/profiles/BlockedContacts";
 import DeleteAccount from "../screens/profiles/DeleteAccount";
@@ -88,6 +87,14 @@ export default function RootNavigator() {
             border: theme.colors.border,
             notification: theme.colors.themeColor,
           },
+          // React Navigation 7 requires `fonts` on custom themes — header/label
+          // components read theme.fonts.* and crash/fall back without it.
+          fonts: {
+            regular: { fontFamily: theme.fonts.regular, fontWeight: '400' },
+            medium: { fontFamily: theme.fonts.medium, fontWeight: '500' },
+            bold: { fontFamily: theme.fonts.bold, fontWeight: '700' },
+            heavy: { fontFamily: theme.fonts.bold, fontWeight: '800' },
+          },
         }}
       >
         <Stack.Navigator
@@ -134,7 +141,6 @@ export default function RootNavigator() {
           <Stack.Screen name="ChannelInfo" component={ChannelInfo} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
           <Stack.Screen name="ChatPrivacy" component={ChatPrivacy} />
-          <Stack.Screen name="ChooseLanguage" component={ChooseLanguage} />
           <Stack.Screen name="PrivacyAccount" component={PrivacyAccount} />
           <Stack.Screen name="BlockedContacts" component={BlockedContacts} />
           <Stack.Screen name="DeleteAccount" component={DeleteAccount} />

@@ -3,6 +3,7 @@ import {
   View, Text, Pressable, StyleSheet, Animated,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { alwaysDark } from '../../contexts/ThemeContext';
 import { getWebrtc } from './webrtcGlobals';
 import * as registry from './streamRegistry';
 import CallAvatar from '../components/CallAvatar';
@@ -236,7 +237,7 @@ export default function NativeVideoStage({ peer = null, cameraOn = true, remoteC
 const styles = StyleSheet.create({
   stage: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: '#000',
+    backgroundColor: alwaysDark.background,
   },
   single: { flex: 1 },
   fill: { flex: 1 },

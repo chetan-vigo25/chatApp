@@ -156,7 +156,7 @@ export default function PersonalInfoEdit({ navigation, route }) {
             {field === 'mobile' && extra?.code ? (
               <Text style={[styles.codePrefix, { color: primaryText }]}>{extra.code}</Text>
             ) : null}
-            <TextInput
+            <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
               ref={inputRef}
               value={inputValue}
               onChangeText={handleChange}

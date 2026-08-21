@@ -6,10 +6,9 @@ import { KeyboardProvider } from 'react-native-keyboard-controller';
 import RootNavigator from './src/navigations/RootNavigator';
 import { useFonts } from 'expo-font';
 import { ThemeProvider, useTheme } from './src/contexts/ThemeContext';
-import { LanguageProvider } from './src/components/Translate';
 import { ContactProvider } from './src/contexts/ContactContext';
 import { DeviceInfoProvider } from './src/contexts/DeviceInfoContext';
-import { Provider as PaperProvider } from 'react-native-paper';
+import { Provider as PaperProvider, MD3DarkTheme, MD3LightTheme } from 'react-native-paper';
 import { NetworkProvider, useNetwork } from './src/contexts/NetworkContext';
 import { DeviceLocationProvider } from './src/contexts/DeviceLoc';
 import { ImageProvider } from './src/contexts/ImageProvider';
@@ -27,9 +26,30 @@ import { CallProvider } from './src/calls/CallProvider';
 import CallContentInset from './src/calls/components/CallContentInset';
 import AppLockGate from './src/components/AppLockGate';
 import { ShareIntentProvider } from 'expo-share-intent';
-
-import 'react-native-gesture-handler';
  
+import 'react-native-gesture-handler';
+
+// Paper components (Portal/Dialog/Menu/Snackbar) render from Paper's own theme,
+// not ThemeContext — without this bridge they'd stay MD3-light in dark mode.
+// Must sit INSIDE ThemeProvider so it re-renders on theme switch.
+const ThemedPaperProvider = ({ children }) => {
+  const { theme, isDarkMode } = useTheme();
+  const base = isDarkMode ? MD3DarkTheme : MD3LightTheme;
+  const paperTheme = {
+    ...base,
+    colors: {
+      ...base.colors,
+      primary: theme.colors.themeColor,
+      background: theme.colors.background,
+      surface: theme.colors.surface,
+      onSurface: theme.colors.primaryTextColor,
+      outline: theme.colors.border,
+      error: theme.colors.danger,
+    },
+  };
+  return <PaperProvider theme={paperTheme}>{children}</PaperProvider>;
+};
+
 export default function App() {
  
     useEffect(() => {
@@ -103,12 +123,8 @@ export default function App() {
      <SafeAreaProvider>
      <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
        <ThemeProvider>
-        {/* Selected app language + the on-disk translation cache. Sits high so
-            every screen using the translated <Text> re-renders the moment the
-            user picks a different language — no app restart needed. */}
-        <LanguageProvider>
          <NetworkProvider>
-          <PaperProvider>
+          <ThemedPaperProvider>
            <DeviceInfoProvider>
             <AuthProvider>
               <ContactProvider>
@@ -129,13 +145,11 @@ export default function App() {
               </ContactProvider>
             </AuthProvider>
            </DeviceInfoProvider>
-          </PaperProvider>
+          </ThemedPaperProvider>
          </NetworkProvider>
-        </LanguageProvider>
        </ThemeProvider>
      </KeyboardProvider>
      </SafeAreaProvider>
     </ShareIntentProvider>
   );
 }
- 

@@ -1,6 +1,7 @@
 // utils/mediaService.js
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform, Alert, Linking } from 'react-native';
 import { apiCall } from '../Config/Https';
 import { BACKEND_URL } from '@env';
@@ -22,6 +23,17 @@ export const DOCUMENT_SENT_DIR = `${SENT_DIR}Documents/`;
 export const IMAGE_RECEIVED_DIR = `${RECEIVED_DIR}Images/`;
 export const VIDEO_RECEIVED_DIR = `${RECEIVED_DIR}Videos/`;
 export const DOCUMENT_RECEIVED_DIR = `${RECEIVED_DIR}Documents/`;
+
+// Backend-tokenized download URLs (/api/v2/user/media/download/:token) now
+// REQUIRE the requester's Bearer — an unauthenticated GET is refused. Presigned
+// S3 URLs must NOT carry it (S3 rejects requests with two auth mechanisms).
+const authHeadersForUrl = async (url) => {
+  const isPresigned = /[?&](X-Amz-Signature|X-Amz-Credential)=/i.test(String(url || ''));
+  if (isPresigned) return {};
+  let token = null;
+  try { token = await AsyncStorage.getItem('accessToken'); } catch { /* best-effort */ }
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
 
 // Track initialization status
 let directoriesInitialized = false;
@@ -305,10 +317,11 @@ export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = 
 
     // Handle remote URLs
     if (/^https?:\/\//i.test(normalizedUri)) {
+      const remoteUri = toSecureMediaUri(normalizedUri);
       const downloadResumable = FileSystem.createDownloadResumable(
-        toSecureMediaUri(normalizedUri),
+        remoteUri,
         destination,
-        {},
+        { headers: await authHeadersForUrl(remoteUri) },
         (downloadProgress) => {
           if (onProgress && downloadProgress.totalBytesExpectedToWrite > 0) {
             onProgress(downloadProgress.totalBytesWritten / downloadProgress.totalBytesExpectedToWrite);
@@ -397,10 +410,11 @@ export const downloadRemoteToReceived = async (remoteUrl, filename, onProgress =
       return normalizeUri(destination);
     }
 
+    const resolvedRemoteUrl = toSecureMediaUri(remoteUrl);
     const downloadResumable = FileSystem.createDownloadResumable(
-      toSecureMediaUri(remoteUrl),
+      resolvedRemoteUrl,
       destination,
-      {},
+      { headers: await authHeadersForUrl(resolvedRemoteUrl) },
       (downloadProgress) => {
         if (onProgress && downloadProgress.totalBytesExpectedToWrite > 0) {
           onProgress(downloadProgress.totalBytesWritten / downloadProgress.totalBytesExpectedToWrite);
@@ -802,10 +816,11 @@ export async function persistDownloadedMedia({ mediaId, chatId, sourceUrl, fileN
 
   console.log('[MEDIA:DOWNLOAD:START]', mediaId);
   
+  const resolvedSourceUrl = toSecureMediaUri(sourceUrl);
   const resumable = FileSystem.createDownloadResumable(
-    toSecureMediaUri(sourceUrl),
+    resolvedSourceUrl,
     destination,
-    {},
+    { headers: await authHeadersForUrl(resolvedSourceUrl) },
     (event) => {
       const progress = event?.totalBytesExpectedToWrite
         ? event.totalBytesWritten / event.totalBytesExpectedToWrite

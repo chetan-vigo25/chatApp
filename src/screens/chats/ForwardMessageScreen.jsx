@@ -366,6 +366,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
       <View style={[styles.searchWrap, { backgroundColor: theme.colors.menuBackground }]}>
         <Ionicons name="search-outline" size={18} color={theme.colors.placeHolderTextColor} />
         <TextInput
+          keyboardAppearance={isDarkMode ? 'dark' : 'light'}
           placeholder="Search chats..."
           placeholderTextColor={theme.colors.placeHolderTextColor}
           value={searchQuery}

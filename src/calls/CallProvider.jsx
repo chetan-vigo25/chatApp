@@ -11,6 +11,7 @@ import { useCameraPermissions } from 'expo-camera';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import * as ScreenCapture from 'expo-screen-capture';
 import { MaterialIcons } from '@expo/vector-icons';
+import { alwaysDark } from '../contexts/ThemeContext';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { useAuth } from '../contexts/AuthContext';
@@ -1576,6 +1577,22 @@ export const CallProvider = ({ children }) => {
             sendCmd({ cmd: CMD.ACCEPT, callId: realId, media: snap.media, speaker: snap.media === 'video' || snap.isGroup, isGroup: !!snap.isGroup, peerId: snap.peer?.id || null });
             armMediaWatchdog();
           }
+          break;
+        }
+        // Same-peer ring arriving AFTER we already answered this peer (banner/
+        // CallKit accept raced the engine ring): this IS the live call under a
+        // fresh lobby id. Busy-rejecting it sent declineCall on the REAL id,
+        // the lobby deleted the record, and our alias-id accept retries died
+        // NOT FOUND forever (prod log: decline → acceptCall NOT FOUND ×4).
+        // Reconcile to the real id and answer with it instead.
+        if (!payload?.isGroup && !snap.isGroup && snap.accepted
+          && snap.peer?.id && payload?.from?.id != null
+          && String(payload.from.id) === String(snap.peer.id)
+          && payload?.callId && String(payload.callId) !== String(snap.callId || '')) {
+          if (__DEV__) console.log('[CALL] post-accept same-peer ring — re-reconciling', payload.callId);
+          dispatch({ type: ACT.RECONCILE_CALLID, callId: payload.callId, peer: null });
+          sendCmd({ cmd: CMD.ACCEPT, callId: payload.callId, media: snap.media, speaker: snap.media === 'video', isGroup: false, peerId: snap.peer?.id || null });
+          armMediaWatchdog();
           break;
         }
         if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
@@ -3978,7 +3995,7 @@ export const CallProvider = ({ children }) => {
               </View>
               <View style={styles.pipBottomRow} pointerEvents="box-none">
                 <TouchableOpacity onPress={hangup} activeOpacity={0.85} style={styles.pipEnd}>
-                  <MaterialIcons name="call-end" size={16} color="#fff" />
+                  <MaterialIcons name="call-end" size={16} color={alwaysDark.text} />
                 </TouchableOpacity>
               </View>
             </>
@@ -4020,7 +4037,7 @@ const styles = StyleSheet.create({
   engineHostVisible: {
     position: 'absolute',
     top: 0, left: 0, right: 0, bottom: 0,
-    backgroundColor: '#000',
+    backgroundColor: alwaysDark.background,
     zIndex: 998,
   },
   // Parked: pushed OFF-SCREEN with a real (tiny) size — NOT zero-size. A 0x0
@@ -4045,7 +4062,7 @@ const styles = StyleSheet.create({
     height: PIP_H,
     borderRadius: 16,
     overflow: 'hidden',
-    backgroundColor: '#000',
+    backgroundColor: alwaysDark.background,
     zIndex: 1000,
     elevation: 1000,
     shadowColor: '#000',
@@ -4064,7 +4081,7 @@ const styles = StyleSheet.create({
   pipTimer: {
     fontSize: 11,
     fontFamily: 'Roboto-Medium',
-    color: '#fff',
+    color: alwaysDark.text,
     backgroundColor: 'rgba(0,0,0,0.45)',
     paddingHorizontal: 6,
     paddingVertical: 2,

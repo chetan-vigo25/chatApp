@@ -6,7 +6,7 @@ import moment from "moment";
 import { useDispatch, useSelector } from "react-redux";
 import { chatMessage, chatListData, mediaUpload } from "../Redux/Reducer/Chat/Chat.reducer";
 import { viewGroup } from "../Redux/Reducer/Group/Group.reducer";
-import { getSocket, isSocketConnected, reconnectSocket, emitSocketEvent } from "../Redux/Services/Socket/socket";
+import { getSocket, isSocketConnected, isSocketAuthed, reconnectSocket, emitSocketEvent } from "../Redux/Services/Socket/socket";
 import { useNetwork } from "../contexts/NetworkContext";
 import { useImage } from "../contexts/ImageProvider";
 import { useFocusEffect } from "@react-navigation/native";
@@ -302,7 +302,7 @@ const prepareOutgoingMediaFile = async (file, messageType, { hd = false } = {}) 
     }
   } catch { /* keep picker-reported size */ }
 
-  // sha256 of the final bytes — computeFileSha256 self-limits to ≤64MB files.
+  // sha256 of the final bytes.
   //
   // Chunked-size files (> CHUNKED_UPLOAD_THRESHOLD) do NOT wait for it: the
   // crypto-js hash costs ~10-30s of JS-thread time for a big video, and it
@@ -311,8 +311,14 @@ const prepareOutgoingMediaFile = async (file, messageType, { hd = false } = {}) 
   // `sourceHashPromise`; the chunked loop dedup-checks mid-flight and aborts
   // the session on a hit. Small files keep the awaited hash (fast, and the
   // /exists pre-check + single-POST path want it up front).
+  //
+  // The deferred path passes maxBytes: Infinity — the 64MB MAX_HASH_BYTES cap
+  // only protects AWAITED hashes from stalling a send; here the hash runs
+  // concurrently with the upload (1MB chunks + 16ms yields keep the JS thread
+  // alive), so >64MB files hash too and retries of big files dedup instead of
+  // creating duplicate S3 objects.
   if (Number(prepared?.size || 0) > CHUNKED_UPLOAD_THRESHOLD) {
-    const sourceHashPromise = computeFileSha256(prepared.uri, { maxBytes: MAX_HASH_BYTES })
+    const sourceHashPromise = computeFileSha256(prepared.uri, { maxBytes: Infinity })
       .catch(() => null);
     return { file: prepared, sourceHash: null, sourceHashPromise };
   }
@@ -1096,7 +1102,8 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     // Storage hygiene — once per app session, fire-and-forget, never blocks
-    // startup: usage snapshot, LRU quota eviction, orphaned-record cleanup.
+    // startup: usage snapshot, LRU quota eviction, orphaned-record cleanup,
+    // aged thumbnail-cache sweep.
     if (!_storageHygieneRan) {
       _storageHygieneRan = true;
       (async () => {
@@ -1104,6 +1111,7 @@ export default function useChatLogic({ navigation, route }) {
         console.log('[MEDIA:STORAGE:USAGE]', usage);
         await localStorageService.enforceStorageQuota();
         await localStorageService.cleanupOrphanedMedia();
+        await localStorageService.cleanupCache();
       })().catch(() => {});
     }
 
@@ -1480,8 +1488,20 @@ export default function useChatLogic({ navigation, route }) {
   // Merges scheduledMessages (sender-only) with chatMessages for display
   // Uses shallow comparison to skip setMessages when nothing actually changed
   const lastMessagesFingerprintRef = useRef('');
+  // Live length of the PAINTED list. The fingerprint gate may only skip a
+  // repaint when what's on screen already matches — comparing against this ref
+  // (not the possibly-stale closure) makes a "gate holds an empty screen while
+  // rows exist" state impossible no matter which reset/race preceded it.
+  const paintedMessagesLenRef = useRef(0);
+  useEffect(() => { paintedMessagesLenRef.current = messages.length; }, [messages]);
   useEffect(() => {
     if (!chatId || (allMessages.length === 0 && scheduledMessages.length === 0)) {
+      // Reset the change-gate with the list. Keeping the old fingerprint here
+      // was the "loader forever until back-and-reopen" bug: after a same-mount
+      // chat re-init the freshly loaded rows can hash to the SAME fingerprint
+      // as before the reset, the gate swallowed the setMessages, and the
+      // screen sat on the loader/empty state even though SQLite had the rows.
+      lastMessagesFingerprintRef.current = '';
       if (messages.length > 0) setMessages([]);
       return;
     }
@@ -1571,7 +1591,12 @@ export default function useChatLogic({ navigation, route }) {
         : '';
       return `${base}:${Math.round(Number(m.uploadProgress || 0))}:${m.localThumbUri ? 't' : ''}:${itemsFp}`;
     }).join('|');
-    if (fingerprint === lastMessagesFingerprintRef.current) return;
+    // Skip ONLY when the screen already shows this exact list. The second
+    // check is the hard invariant: even if the fingerprint matches (stale ref
+    // after a reset the ref-clearing paths missed), a painted-length mismatch
+    // forces the repaint — the gate can never again pin an empty screen.
+    if (fingerprint === lastMessagesFingerprintRef.current
+      && paintedMessagesLenRef.current === deduped.length) return;
     lastMessagesFingerprintRef.current = fingerprint;
 
     setMessages(deduped);
@@ -1592,6 +1617,9 @@ export default function useChatLogic({ navigation, route }) {
       
       setMessages([]);
       setAllMessages([]);
+      // New chat lifecycle → the change-gate must start clean, or the first
+      // rows loaded for this chat can be swallowed as a "no change" no-op.
+      lastMessagesFingerprintRef.current = '';
       setCurrentPage(1);
       setHasMoreMessages(true);
       setHasLoadedFromAPI(false);
@@ -1798,6 +1826,21 @@ export default function useChatLogic({ navigation, route }) {
         ? (chatData.groupId || chatData.group?._id || `grp_${Date.now()}`)
         : buildPrivateChatId(userId, chatData.peerUser?._id || 'unknown'));
       if (lastInitializedChatRef.current && lastInitializedChatRef.current === generatedChatId) {
+        // Same chat re-initialized on the SAME mount: the init effect that led
+        // here just CLEARED allMessages, so early-returning left a blank screen
+        // ("loader/empty until back-and-reopen"). Repaint from cache/SQLite
+        // before returning.
+        if ((allMessagesRef.current?.length || 0) === 0) {
+          const cachedSame = ChatCache.hasMessages(generatedChatId)
+            ? ChatCache.getMessages(generatedChatId)
+            : [];
+          if (cachedSame.length > 0) {
+            setAllMessages(cachedSame);
+            allMessagesRef.current = cachedSame;
+          } else {
+            loadMessagesFromLocal(generatedChatId).catch(() => {});
+          }
+        }
         setIsLoadingInitial(false);
         setIsLoadingFromLocal(false);
         initialLoadDoneRef.current = true;
@@ -1892,6 +1935,18 @@ export default function useChatLogic({ navigation, route }) {
           if (Number(count) > 0 || ChatCache.hasMessages(generatedChatId)) {
             setIsLoadingInitial(false);
             setIsLoadingFromLocal(false);
+          } else {
+            // Local is EMPTY. The old contract armed the loader until the
+            // socket fetch/sync response cleared it — a slow or reconnecting
+            // socket (dev IP change, backend restart) meant a spinner pinned
+            // for 10-12s on EVERY open. HARD CAP instead: give the network a
+            // short grace, then show the screen regardless. The chat is fully
+            // usable (composer works) and history paints the moment the fetch
+            // response / recovery poll lands it.
+            setTimeout(() => {
+              setIsLoadingInitial(false);
+              setIsLoadingFromLocal(false);
+            }, 2500);
           }
         })
         .catch(() => {
@@ -3310,7 +3365,10 @@ export default function useChatLogic({ navigation, route }) {
     //     refresh instead of pinning a spinner. The old version capped the
     //     POLLING at 15 tries and then gave up with the loader still up —
     //     exactly the "loader never goes away" report.
-    const DEADLINE_MS = 10000;
+    // Short, hard ceiling — the screen must become usable fast even when the
+    // DB/socket are wedged; the empty-screen recovery poll below keeps looking
+    // for late-landing rows after the loader is gone.
+    const DEADLINE_MS = 4000;
 
     const tick = async () => {
       if (!alive) return;
@@ -3344,6 +3402,51 @@ export default function useChatLogic({ navigation, route }) {
     tick();
     return () => { alive = false; if (timer) clearTimeout(timer); };
   }, [isLoadingInitial, refreshMessagesFromDB]);
+
+  // ── LOADER INVARIANT ──────────────────────────────────────────────────────
+  // The initial loader may exist only while there is truly nothing loaded.
+  // Any path that lands rows in allMessages ends it — unconditionally. This is
+  // the last line of defense against every "loader stays up though the data
+  // arrived" race, past and future.
+  useEffect(() => {
+    if (allMessages.length > 0 && (isLoadingInitial || isLoadingFromLocal)) {
+      setIsLoadingInitial(false);
+      setIsLoadingFromLocal(false);
+    }
+  }, [allMessages.length, isLoadingInitial, isLoadingFromLocal]);
+
+  // ── EMPTY-SCREEN RECOVERY ─────────────────────────────────────────────────
+  // The deadline above can drop the loader while the screen still has ZERO
+  // rows (first-sync write lock outliving the deadline, or history landing in
+  // SQLite moments later with no repaint event). Without this, the user sat on
+  // "No messages yet" and had to back-and-reopen — the exact reported bug.
+  // While the list is empty (loader already down), keep a slow poll going for
+  // up to a minute; the moment rows exist in SQLite, paint them.
+  const hasNoMessages = allMessages.length === 0;
+  useEffect(() => {
+    if (isLoadingInitial || !hasNoMessages) return undefined;
+    let alive = true;
+    let timer = null;
+    let tries = 0;
+    const MAX_TRIES = 30; // 30 × 2s = 60s of quiet recovery
+    const tick = async () => {
+      if (!alive || tries++ >= MAX_TRIES) return;
+      const cid = chatIdRef.current;
+      if (cid) {
+        try {
+          const count = await ChatDatabase.getMessageCount(cid);
+          if (!alive) return;
+          if (Number(count) > 0) {
+            try { await refreshMessagesFromDB(true); } catch { /* next tick retries */ }
+            return; // refresh fills allMessages → this effect re-arms only if still empty
+          }
+        } catch { /* DB busy — try again */ }
+      }
+      timer = setTimeout(tick, 2000);
+    };
+    timer = setTimeout(tick, 2000);
+    return () => { alive = false; if (timer) clearTimeout(timer); };
+  }, [isLoadingInitial, hasNoMessages, refreshMessagesFromDB]);
 
   // A call ended → the calling layer wrote an in-thread "call" entry to SQLite.
   // Refresh if it belongs to the chat currently open.
@@ -3674,6 +3777,7 @@ export default function useChatLogic({ navigation, route }) {
       }
       setMessages([]);
       setAllMessages([]);
+      lastMessagesFingerprintRef.current = '';
       setHasMoreMessages(false);
       setCurrentPage(1);
     }
@@ -3899,6 +4003,16 @@ export default function useChatLogic({ navigation, route }) {
           }
           const liveSocket = socketRef.current || getSocket();
           if (!liveSocket || !isSocketConnected()) return;
+          // Pre-auth window: an emit before the server binds socket.userId is
+          // rejected NOT_AUTHENTICATED and silently lost — wait briefly for
+          // the auth bind so an on-open sync right after reconnect isn't eaten.
+          if (!isSocketAuthed()) {
+            const start = Date.now();
+            while (Date.now() - start < 8000 && isSocketConnected() && !isSocketAuthed()) {
+              await new Promise((r) => setTimeout(r, 250));
+            }
+            if (!isSocketAuthed()) return;
+          }
           liveSocket.emit('message:sync', {
             chatId: chatIdParam,
             sinceSeq,
@@ -6227,9 +6341,12 @@ export default function useChatLogic({ navigation, route }) {
 
     const onUserOffline = (data) => {
       console.log("user:offline", data);
-      if (data.userId === chatData.peerUser._id) { 
+      if (data.userId === chatData.peerUser._id) {
         setUserStatus(PRESENCE_STATUS.OFFLINE);
-        setLastSeen(data.lastSeen || new Date().toISOString()); 
+        // No fabricated "now": without a real timestamp keep the previous
+        // lastSeen (the presence:get/mirror path supplies the true one).
+        const ls = data.lastSeen || data?.data?.lastSeen || null;
+        if (ls) setLastSeen(ls);
       }
     };
     registerSocketHandler('user:offline', onUserOffline);
@@ -8230,7 +8347,9 @@ export default function useChatLogic({ navigation, route }) {
         },
         {
           chatId: effectiveChatId || chatIdRef.current,
-          filename: msg.text || msg.fileName || `${mediaId}`,
+          // Original upload name first — caption text as the cache filename
+          // leaked into every later share/save of the file.
+          filename: msg?.mediaMeta?.fileName || msg?.payload?.mediaMeta?.fileName || msg.fileName || msg.text || `${mediaId}`,
           onProgress: (progressPct) => {
             const normalized = Math.max(0, Math.min(100, Number(progressPct || 0)));
             setDownloadProgress(prev => ({
