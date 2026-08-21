@@ -280,19 +280,22 @@ export function LanguageProvider({ children }) {
 export const useLanguage = () => useContext(LanguageContext);
 
 /** Translate a string inside any component: `const label = useT('Submit');` */
-export function useT(text) {
+export function useT(text, from = SOURCE_LANGUAGE) {
   const { language } = useLanguage();
   const [value, setValue] = useState(text);
 
   useEffect(() => {
     let alive = true;
-    if (typeof text !== 'string' || language === SOURCE_LANGUAGE) {
+    // `from="auto"` must still run when the reader's language is English —
+    // a Hindi message has to become English for them.
+    if (typeof text !== 'string' || (from !== 'auto' && language === SOURCE_LANGUAGE)) {
       setValue(text);
       return undefined;
     }
-    t(text, language).then((result) => { if (alive) setValue(result); });
+    setValue(text);                                   // show the original first
+    t(text, language, from).then((result) => { if (alive) setValue(result); });
     return () => { alive = false; };
-  }, [text, language]);
+  }, [text, language, from]);
 
   return value;
 }
@@ -309,8 +312,15 @@ export function useT(text) {
  *   <Text>Hello</Text><Text ignore> {name}</Text>
  *
  * `from="auto"` makes the source language auto-detected instead of assumed
- * English. That is what chat messages use — the sender's language is unknown
- * and translation has to work in both directions.
+ * English.
+ *
+ * NOTE for long-form text (chat messages): prefer the `useT(text, 'auto')` hook
+ * over this component. A nested <Text> that swaps its string asynchronously
+ * does NOT re-measure its parent on Android — the bubble keeps the width it
+ * measured from the ORIGINAL string, so a slightly wider translation wraps
+ * mid-sentence ("क्या हुआ" breaking into "क्या" / "हुआ"). The hook translates
+ * BEFORE the text is rendered, so the whole subtree lays out with the final
+ * string. See docs/APP_LANGUAGE_GUIDE.md Section 9.2.
  */
 function TText({ ignore, from, children, ...rest }) {
   const { language } = useLanguage();

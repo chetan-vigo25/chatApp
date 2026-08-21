@@ -30,9 +30,7 @@ import {
 // Message-body text only. Everything else on this screen keeps React
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
-// NOTE: the alias MUST start with a capital letter — JSX treats a lowercase
-// element name (<myText>) as a native host component, not a React component.
-import { Text as MyText, useLanguage } from "../../components/Translate";
+import { t as translateText, useLanguage } from "../../components/Translate";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
@@ -1283,6 +1281,19 @@ const chatMenuStyles = StyleSheet.create({
 
 export default function ChatScreen({ navigation, route }) {
   const { language } = useLanguage();
+  /* ── Chat message translation ──────────────────────────────────────────────
+     Translations live HERE, above the bubble, on purpose.
+
+     Rendering a translated <Text> inside the bubble re-renders only that
+     descendant, so the bubble's own measured box stays stale: a wider
+     translation wrapped to a second line that the 1-line-tall bubble then
+     CLIPPED ("क्या हुआ" showing as just "क्या"). Keeping the text in list-level
+     state means renderChatsItem re-renders the whole row with the final string,
+     so width and height are measured together.
+
+     msg.text is never overwritten — this is display only. */
+  const [messageTranslations, setMessageTranslations] = useState({});
+  const translationSeenRef = useRef(new Set());
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
   const [reportPayload, setReportPayload] = useState({});
@@ -3224,6 +3235,41 @@ export default function ChatScreen({ navigation, route }) {
     });
   }, [messages, visibleMessageKeys, primeThumbnailCacheForMessage]);
 
+  // A language switch invalidates every cached bubble translation.
+  useEffect(() => {
+    translationSeenRef.current = new Set();
+    setMessageTranslations({});
+  }, [language]);
+
+  // Translate the loaded text messages once each. The service caches by text +
+  // language and caps itself at 4 concurrent requests, so this stays cheap.
+  // Messages carrying @mentions are skipped — translating them mangles names.
+  useEffect(() => {
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const pending = [];
+    messages.forEach((msg, index) => {
+      if (!msg || msg.type !== 'text' || msg.isDeleted || msg.deletedFor) return;
+      if (msg.mentions || msg.payload?.mentions) return;
+      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+      if (!body) return;
+      const key = getMessageKey(msg, index);
+      const token = `${key}::${language}::${body}`;
+      if (translationSeenRef.current.has(token)) return;
+      translationSeenRef.current.add(token);
+      pending.push({ key, body });
+    });
+    if (pending.length === 0) return undefined;
+
+    let alive = true;
+    Promise.all(pending.map(async ({ key, body }) => {
+      const result = await translateText(body, language, 'auto');
+      if (!alive || typeof result !== 'string' || !result || result === body) return;
+      setMessageTranslations((prev) => (prev[key] === result ? prev : { ...prev, [key]: result }));
+    })).catch(() => {});
+
+    return () => { alive = false; };
+  }, [messages, language]);
+
   // Populate text input when entering edit mode
   useEffect(() => {
     if (editingMessage) {
@@ -4595,8 +4641,12 @@ export default function ChatScreen({ navigation, route }) {
     });
   };
 
-  const renderRichMessageText = (msg, isMyMessage, messageKey) => {
-    const parsed = getParsedRichMessage(msg?.text || '');
+  const renderRichMessageText = (msg, isMyMessage, messageKey, displayText) => {
+    // `displayText` is the translated body, supplied by the list-level
+    // messageTranslations map. The ORIGINAL is never overwritten — msg.text
+    // still holds it, and falling back to it is always safe.
+    const bodyText = typeof displayText === 'string' ? displayText : (msg?.text || '');
+    const parsed = getParsedRichMessage(bodyText);
     const isExpanded = Boolean(expandedRichMessages[messageKey]);
     const measuredLineCount = Number(richMessageLineCounts[messageKey] || 0);
     const showReadMore = measuredLineCount > RICH_TEXT_COLLAPSED_LINES;
@@ -4650,32 +4700,29 @@ export default function ChatScreen({ navigation, route }) {
             }
             if (token.type === 'bold') {
               return (
-                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
+                <Text key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
                   {token.text}
-                </MyText>
+                </Text>
               );
             }
             if (token.type === 'italic') {
               return (
-                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
+                <Text key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
                   {token.text}
-                </MyText>
+                </Text>
               );
             }
             if (token.type === 'underline') {
               return (
-                <MyText from="auto" key={key} style={{ textDecorationLine: 'underline', color: baseColor }}>
+                <Text key={key} style={{ textDecorationLine: 'underline', color: baseColor }}>
                   {token.text}
-                </MyText>
+                </Text>
               );
             }
-            // The message body itself. With mentions the children become an
-            // ARRAY, which MyText renders untouched — so @names are never sent
-            // anywhere; only a plain string is translated.
             return (
-              <MyText from="auto" key={key} style={{ color: baseColor }}>
+              <Text key={key} style={{ color: baseColor }}>
                 {msgMentions ? renderTextWithMentions(token.text, msgMentions, baseColor, mentionColor, key) : token.text}
-              </MyText>
+              </Text>
             );
           })}
           {lineIndex < parsed.lines.length - 1 ? '\n' : ''}
@@ -6322,7 +6369,7 @@ export default function ChatScreen({ navigation, route }) {
                       (time+ticks is wide), overlapping the text. */}
                   <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
                     <View style={{ flexShrink: 1 }}>
-                      {renderRichMessageText(msg, isMyMessage, messageKey)}
+                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[messageKey])}
                     </View>
                     {renderMessageMeta(msg, isMyMessage, { inline: true })}
                   </View>
@@ -6457,15 +6504,15 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, language, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, language, messageTranslations, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
   // media cell must re-render (e.g. a finished download replacing the blurred
   // placeholder with the local file:// image).
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations]
   );
 
   // Typing indicator

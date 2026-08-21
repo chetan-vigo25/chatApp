@@ -12,6 +12,31 @@ Entry point (is project me): **Settings → App language**.
 
 ---
 
+## 0. Quick start (5 minute)
+
+Poori file padhne ki zaroorat nahi — naye project me bas itna karo:
+
+```bash
+npm install translate
+npx expo install @react-native-async-storage/async-storage
+```
+
+1. **3 files copy karo** (poora code Section 4, 5, 6 me hai):
+   * `src/components/Translate.js`
+   * `src/constant/languages.js`
+   * `src/screens/.../ChooseLanguage.jsx`
+2. Agar project me `react-native-dotenv` nahi hai → `Translate.js` se `@env`
+   wali import line hata do (Section 12).
+3. `App.js` ko `<LanguageProvider>` se wrap karo (Section 7.1).
+4. Navigator me `ChooseLanguage` route add karo (Section 7.2).
+5. Settings me "App language" row add karo (Section 7.3).
+6. **Chat messages** ke liye message body pe `<MyText from="auto">` lagao
+   (Section 9) — chat screen ka baaki UI mat chhuo.
+
+Bas. Native code, prebuild, API key — kuch nahi chahiye.
+
+---
+
 ## 1. Kaise kaam karta hai
 
 ```
@@ -398,19 +423,22 @@ export function LanguageProvider({ children }) {
 export const useLanguage = () => useContext(LanguageContext);
 
 /** Translate a string inside any component: `const label = useT('Submit');` */
-export function useT(text) {
+export function useT(text, from = SOURCE_LANGUAGE) {
   const { language } = useLanguage();
   const [value, setValue] = useState(text);
 
   useEffect(() => {
     let alive = true;
-    if (typeof text !== 'string' || language === SOURCE_LANGUAGE) {
+    // `from="auto"` must still run when the reader's language is English —
+    // a Hindi message has to become English for them.
+    if (typeof text !== 'string' || (from !== 'auto' && language === SOURCE_LANGUAGE)) {
       setValue(text);
       return undefined;
     }
-    t(text, language).then((result) => { if (alive) setValue(result); });
+    setValue(text);                                   // show the original first
+    t(text, language, from).then((result) => { if (alive) setValue(result); });
     return () => { alive = false; };
-  }, [text, language]);
+  }, [text, language, from]);
 
   return value;
 }
@@ -427,8 +455,15 @@ export function useT(text) {
  *   <Text>Hello</Text><Text ignore> {name}</Text>
  *
  * `from="auto"` makes the source language auto-detected instead of assumed
- * English. That is what chat messages use — the sender's language is unknown
- * and translation has to work in both directions.
+ * English.
+ *
+ * NOTE for long-form text (chat messages): prefer the `useT(text, 'auto')` hook
+ * over this component. A nested <Text> that swaps its string asynchronously
+ * does NOT re-measure its parent on Android — the bubble keeps the width it
+ * measured from the ORIGINAL string, so a slightly wider translation wraps
+ * mid-sentence ("क्या हुआ" breaking into "क्या" / "हुआ"). The hook translates
+ * BEFORE the text is rendered, so the whole subtree lays out with the final
+ * string. See docs/APP_LANGUAGE_GUIDE.md Section 9.2.
  */
 function TText({ ignore, from, children, ...rest }) {
   const { language } = useLanguage();
@@ -903,7 +938,7 @@ ticks, menu sab translate ho jayenge, aur har cheez Google ko jayegi.
 
 Sahi tareeka: sirf **message ka text** custom component se render karo.
 
-### 9.1 Import (alias CAPITAL letter se shuru hona chahiye)
+### 9.1 Import
 
 `ChatScreen.jsx` ke asli imports:
 
@@ -911,17 +946,11 @@ Sahi tareeka: sirf **message ka text** custom component se render karo.
 // Message-body text only. Everything else on this screen keeps React
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
-// NOTE: the alias MUST start with a capital letter — JSX treats a lowercase
-// element name (<myText>) as a native host component, not a React component.
-import { Text as MyText, useLanguage } from "../../components/Translate";
+import { t as translateText, useLanguage } from "../../components/Translate";
 ```
 
-> ⚠️ **`Text as myText` mat likhna.** JSX me chhote akshar se shuru hone wala
-> element (`<myText>`) React component nahi, **native host component** samjha
-> jata hai — app crash karegi. Alias hamesha capital: `MyText`.
-
-`react-native` wala `Text` waisa ka waisa import rehta hai — screen ke baaki
-116 `<Text>` usko hi use karte hain.
+`react-native` wala `Text` waisa ka waisa rehta hai — screen ke baaki 116
+`<Text>` usko hi use karte hain. Sirf message body alag handle hoti hai.
 
 Component ke andar (taaki language badalte hi bubbles re-render ho):
 
@@ -931,79 +960,127 @@ const { language } = useLanguage();
 
 ...aur `renderChatsItem` ke `useCallback` dependency array me `language` add karo.
 
-### 9.2 Sirf message body pe `MyText` — asli code
+### 9.2 Translation LIST level pe rakho (⚠️ text-break / word-hide wala fix)
 
-Ye poora token renderer hai. Dekho kya `MyText` hai aur kya `Text` (RN) rehta hai:
+**Ye sabse important cheez hai.** Message bubble ke *andar* translated `<Text>`
+lagana kaam karta hua dikhta hai, par layout tod deta hai. Do symptom aate hain:
+
+```
+Symptom 1 (wrap):   "क्या हुआ"  →   क्या
+                                     हुआ      ← beech me toot gaya
+
+Symptom 2 (clip):   "क्या हुआ"  →   क्या       ← "हुआ" gayab hi ho gaya
+```
+
+**Wajah:** bubble ki chaudai aur unchai **original text** se measure hoti hai:
+
+```
+"Kya hua"   (~50px, 1 line)   →  bubble 50px × 1 line
+"क्या हुआ"    (~62px)           →  62px 50px me nahi samati → doosri line
+                                  par bubble ki height abhi bhi 1 line ki hai
+                                  → doosri line CLIP ho gayi → word gayab
+```
+
+Agar translation bubble ke **andar** ho rahi hai, to state change sirf us
+**descendant** ko re-render karta hai — bubble, row aur uske ancestors ka
+measured box purana hi rehta hai. Isliye kabhi wrap dikhta hai, kabhi word
+gayab. Chhote single-word messages ("हाँ") theek lagte hain kyunki wo original
+se **chhote** hote hain.
+
+**Fix:** translation ko **list level state** me rakho (`ChatScreen` me), bubble
+ke andar nahi. Phir `renderChatsItem` poori row ko final text ke saath re-render
+karta hai — width aur height dono saath me measure hote hain.
+
+State:
 
 ```jsx
-            if (token.type === 'link') {
-              return (
-                <Text
-                  key={key}
-                  onPress={() => handleOpenLink(token.href)}
-                  style={{
-                    color: linkColor,
-                    textDecorationLine: 'underline',
-                    fontFamily: 'Roboto-Medium',
-                  }}
-                >
-                  {token.text}
-                </Text>
-              );
-            }
-            if (token.type === 'code') {
-              return (
-                <Text
-                  key={key}
-                  style={{
-                    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-                    backgroundColor: isMyMessage ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.09)',
-                    color: baseColor,
-                  }}
-                >
-                  {token.text}
-                </Text>
-              );
-            }
-            if (token.type === 'bold') {
-              return (
-                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-SemiBold', color: baseColor }}>
-                  {token.text}
-                </MyText>
-              );
-            }
-            if (token.type === 'italic') {
-              return (
-                <MyText from="auto" key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
-                  {token.text}
-                </MyText>
-              );
-            }
-            if (token.type === 'underline') {
-              return (
-                <MyText from="auto" key={key} style={{ textDecorationLine: 'underline', color: baseColor }}>
-                  {token.text}
-                </MyText>
-              );
-            }
-            // The message body itself. With mentions the children become an
-            // ARRAY, which MyText renders untouched — so @names are never sent
-            // anywhere; only a plain string is translated.
-            return (
-              <MyText from="auto" key={key} style={{ color: baseColor }}>
-                {msgMentions ? renderTextWithMentions(token.text, msgMentions, baseColor, mentionColor, key) : token.text}
-              </MyText>
-            );
+  /* ── Chat message translation ──────────────────────────────────────────────
+     Translations live HERE, above the bubble, on purpose.
+
+     Rendering a translated <Text> inside the bubble re-renders only that
+     descendant, so the bubble's own measured box stays stale: a wider
+     translation wrapped to a second line that the 1-line-tall bubble then
+     CLIPPED ("क्या हुआ" showing as just "क्या"). Keeping the text in list-level
+     state means renderChatsItem re-renders the whole row with the final string,
+     so width and height are measured together.
+
+     msg.text is never overwritten — this is display only. */
+  const [messageTranslations, setMessageTranslations] = useState({});
+  const translationSeenRef = useRef(new Set());
 ```
+
+Effects — language change pe clear, aur har message ek baar translate:
+
+```jsx
+  // A language switch invalidates every cached bubble translation.
+  useEffect(() => {
+    translationSeenRef.current = new Set();
+    setMessageTranslations({});
+  }, [language]);
+
+  // Translate the loaded text messages once each. The service caches by text +
+  // language and caps itself at 4 concurrent requests, so this stays cheap.
+  // Messages carrying @mentions are skipped — translating them mangles names.
+  useEffect(() => {
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const pending = [];
+    messages.forEach((msg, index) => {
+      if (!msg || msg.type !== 'text' || msg.isDeleted || msg.deletedFor) return;
+      if (msg.mentions || msg.payload?.mentions) return;
+      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+      if (!body) return;
+      const key = getMessageKey(msg, index);
+      const token = `${key}::${language}::${body}`;
+      if (translationSeenRef.current.has(token)) return;
+      translationSeenRef.current.add(token);
+      pending.push({ key, body });
+    });
+    if (pending.length === 0) return undefined;
+
+    let alive = true;
+    Promise.all(pending.map(async ({ key, body }) => {
+      const result = await translateText(body, language, 'auto');
+      if (!alive || typeof result !== 'string' || !result || result === body) return;
+      setMessageTranslations((prev) => (prev[key] === result ? prev : { ...prev, [key]: result }));
+    })).catch(() => {});
+
+    return () => { alive = false; };
+  }, [messages, language]);
+```
+
+Render — bubble ko bas ready text milta hai (original fallback hamesha safe):
+
+```jsx
+                    <View style={{ flexShrink: 1 }}>
+                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[messageKey])}
+                    </View>
+```
+
+Aur do jagah wire karna **zaroori** hai, warna translation aane par row
+re-render hi nahi hoga:
+
+```jsx
+// renderChatsItem ke useCallback deps me
+}, [selectedMessage, ..., language, messageTranslations, ...]);
+
+// FlatList ke extraData me
+extraData={mediaRenderExtra}   // is object me messageTranslations bhi ho
+```
+
+**Iske 4 fayde:**
+1. Layout theek — na text tootta hai, na koi word chhupta hai.
+2. Quality behtar — Google ko poora sentence milta hai, tukde nahi.
+3. Cost kam — ek message = ek request.
+4. `msg.text` kabhi overwrite nahi hota — display-only translation.
 
 ### 9.3 Kya translate hota hai, kya nahi
 
 | Chat ka hissa | Component | Wajah |
 |---|---|---|
-| Message ka text (plain / bold / italic / underline) | `MyText from="auto"` | Yahi translate karna hai |
+| Message ka text (poora message) | list-level `messageTranslations` map | Yahi translate karna hai |
 | Inline code aur code block | `Text` (RN) | Code kabhi translate nahi hona chahiye |
 | Link / URL | `Text` (RN) | URL toot jayega |
-| @mentions | apne aap safe | Children array ban jate hain, wrapper array chhod deta hai |
+| @mentions wale messages | translate hi nahi hote | Naam mangle ho jate aur mention offsets bigad jate |
 | Sender ka naam, time, ticks | `Text` (RN) | User data — bhejna hi nahi hai |
 | Menu, header, system rows | `Text` (RN) | Chhua hi nahi |
 
@@ -1187,6 +1264,7 @@ Feature ke liye **exactly** ye files chhui gayi hain — isse zyada kuch nahi:
 | Metro error: `Unable to resolve http` | `translate@1.4.1` install ho gaya hai. `npm install translate@^3` karo. |
 | Language ka naam khud translate ho gaya | Us `<Text>` pe `ignore` lagana bhool gaye. |
 | Language badalne pe subtitle purana dikh raha | `useMemo` deps me `currentLanguage` add karo. |
-| `<myText>` pe crash / "Unimplemented component" | Alias capital letter se shuru karo: `Text as MyText`. |
+| `<myText>` pe crash / "Unimplemented component" | JSX me chhote akshar wala element host component samjha jata hai — alias capital rakho (`MyText`), ya component ke bajaye `useT` hook use karo. |
+| Message beech me toot raha, ya doosra word gayab | Translation bubble ke andar ho rahi hai → ancestors ka layout stale. Section 9.2: list-level state use karo + deps/extraData wire karo. |
 | Message translate nahi ho raha | `from="auto"` lagana bhool gaye, ya message aur reader ki script same hai (jaan-bujh kar skip hota hai — Section 9.5). |
 | Hinglish message waisa ka waisa aa raha | Google use pehle hi Hindi detect kar leta hai; `sourceFor()` `sl=en` force karta hai. Section 9.4 dekho. |
