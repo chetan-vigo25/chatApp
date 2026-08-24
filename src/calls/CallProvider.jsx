@@ -1601,6 +1601,12 @@ export const CallProvider = ({ children }) => {
           break;
         }
         endedRef.current = false;
+        // A NEW call must always be free to apply its own initial route. The
+        // one-shot latch is normally cleared by resetAudioRoute() on end, so a
+        // call that ended without reaching finalizeEnd used to leave it ARMED —
+        // and the next call's applyInitialCallRoute() was a silent no-op, i.e.
+        // it kept whatever route the ringtone left behind (the loudspeaker).
+        initialRouteAppliedRef.current = false;
         const peer = { id: payload?.from?.id ? String(payload.from.id) : null, name: payload?.from?.name || 'Unknown', avatar: null };
         // Group calls may arrive with a member roster; otherwise it's a 1:1.
         const members = Array.isArray(payload?.members) ? payload.members
@@ -1609,8 +1615,12 @@ export const CallProvider = ({ children }) => {
         // "Others" = everyone on the roster except the caller and me. A call is
         // only a GROUP if there's at least one third party. Counting the raw
         // roster length would misread a 1:1 whose roster lists [caller, me].
+        // Without a hydrated myId we can't subtract OURSELVES from the roster, so a
+        // 1:1 [caller, me] would count as a third party and answer on the
+        // loudspeaker — require two others in that case (same guard as the
+        // app-socket path).
         const others = members.filter((m) => m.id !== peer.id && m.id !== myId);
-        const isGroup = !!payload?.isGroup || others.length >= 1;
+        const isGroup = !!payload?.isGroup || others.length >= (myId ? 1 : 2);
         // Roster the callee sees = the caller + any other invited members (minus self).
         const roster = isGroup ? [peer, ...others] : [peer];
         dispatch({
@@ -2077,6 +2087,7 @@ export const CallProvider = ({ children }) => {
       return;
     }
     endedRef.current = false;
+    initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
     const chatId = isGroup ? null : (opts.chatId || deriveChatId(myId, peers[0].id));
     const wantSpeaker = media === 'video' || isGroup;
     // App-socket signaling id (busy lock + call:* events). Distinct from the
@@ -2321,6 +2332,28 @@ export const CallProvider = ({ children }) => {
     // Video / group calls answer on the loudspeaker; a 1:1 voice call on the earpiece.
     const wantSpeaker = effMedia === 'video' || snap.isGroup;
 
+    // ── ANDROID: claim the call audio route AT ANSWER TIME ────────────────────
+    // The incoming RING leaves the device on the LOUDSPEAKER: the ringtone goes
+    // through expo-av, and expo-av always sends `playThroughEarpieceAndroid`
+    // (false unless we say otherwise) — which natively runs
+    // `setMode(MODE_NORMAL); setSpeakerphoneOn(true)`. Until now the earpiece was
+    // only re-applied by applyInitialCallRoute() on the engine 'stream' event, so
+    // EVERY answered 1:1 voice call ran loud from the tap until the first remote
+    // stream landed — and stayed loud whenever that one-shot was skipped (a call
+    // whose predecessor never ran finalizeEnd, a late/missing 'stream').
+    // Re-asserting the route here also puts the device into MODE_IN_COMMUNICATION
+    // BEFORE the SDK's getUserMedia, which is where it belongs anyway.
+    // NOT gated by initialRouteAppliedRef on purpose: the 'stream' pass must still
+    // run (an early route can land before the audio element exists). AudioRoute
+    // .start() is self-guarded, so this is a no-op re-entry there.
+    // iOS is deliberately untouched — CallKit owns that session and it works.
+    if (Platform.OS === 'android') {
+      if (__DEV__) console.log('[CALL][APP][audio] answer-time route (android) →', wantSpeaker ? 'LOUDSPEAKER' : 'earpiece');
+      AudioRoute.start({ video: effMedia === 'video' });
+      if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(wantSpeaker);
+      else applyAudioRoute(wantSpeaker);
+    }
+
     // The callee only wakes the engine on the ring — that connect can still be
     // in flight (or have failed) when the user taps Accept. So on accept we
     // re-fetch a fresh calling-service token (GET /call/token) and CONNECT if the
@@ -2361,7 +2394,7 @@ export const CallProvider = ({ children }) => {
       if (__DEV__) console.log('[CALL][APP][accept] STEP 5b callId NOT yet known → set pendingAccept, waiting for WebRTC incoming to reconcile (connect watchdog armed)');
       dispatch({ type: ACT.SET_FLAG, key: 'pendingAccept', value: true });
     }
-  }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, finalizeEnd, armMediaWatchdog, armConnectWatchdog]);
+  }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, applyAudioRoute, finalizeEnd, armMediaWatchdog, armConnectWatchdog]);
 
   // ── pendingAccept flush (state-driven, race-proof) ─────────────────────────
   // The engine 'incoming' handler reads stateRef, which can be one commit
@@ -2909,6 +2942,7 @@ export const CallProvider = ({ children }) => {
     }
     if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) return; // busy
     endedRef.current = false;
+    initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
     const peer = { id: callerId, name: payload?.from?.name || 'Unknown', avatar: payload?.from?.avatar || null };
     const members = Array.isArray(payload?.members) ? payload.members.map(String).filter(Boolean) : [];
     const others = members
@@ -2923,7 +2957,13 @@ export const CallProvider = ({ children }) => {
     // eligible to suppress the ring entirely. Push payloads get the same treatment
     // in mapPushToIncoming; this is the app-socket / pending-pull path.
     const isConferenceRing = !!payload?.isConference;
-    const isGroup = !!payload?.isGroup || isConferenceRing || others.length >= 1;
+    // Roster-based inference needs `myId` to subtract US from the member list. On a
+    // COLD push-wake the auth user isn't hydrated yet (myId === null), so a 1:1 ring
+    // whose roster is [caller, me] left one "other" — us — and the call was built as
+    // a GROUP: it then answered on the LOUDSPEAKER by design (speakerOn = video ||
+    // group). Without myId, require TWO others (a real 3-party call still qualifies).
+    const othersThreshold = myId ? 1 : 2;
+    const isGroup = !!payload?.isGroup || isConferenceRing || others.length >= othersThreshold;
     const roster = isGroup ? [peer, ...others] : [peer];
     // Remember which conference INVITE this ring belongs to, so accept/reject can
     // settle that exact invite server-side. Cleared for a non-conference ring so a
