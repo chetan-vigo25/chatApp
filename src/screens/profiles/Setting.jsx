@@ -5,7 +5,7 @@ import {
 } from "react-native";
 // `useLanguage` powers the "App language" row; `getLanguage` turns the saved
 // code ("hi") into its flag + native name for the subtitle.
-import { useLanguage } from "../../components/Translate";
+import { useLanguage, needsSystemFont } from "../../components/Translate";
 import { getLanguage } from "../../constant/languages";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
@@ -256,7 +256,13 @@ export default function Setting({ navigation }) {
         {item.subtitle ? (
           <Text
             numberOfLines={1}
-            style={[styles.menuSubtitle, { color: item.isLoading ? accent : subText }]}
+            style={[
+              styles.menuSubtitle,
+              { color: item.isLoading ? accent : subText },
+              // "हिन्दी", "ไทย", "中文" have no glyphs in Roboto — the language
+              // subtitle is the one row here that can carry a foreign script.
+              needsSystemFont(item.subtitle) && { fontFamily: undefined },
+            ]}
           >
             {item.subtitle}
           </Text>

@@ -1,9 +1,12 @@
 /**
  * Languages offered by the "Choose language" screen.
  *
- * `code` must be a valid ISO 639-1 tag — the `translate` package validates it
- * and throws for anything else. Adding a language is a one-line change here;
- * nothing else in the app needs to know about it.
+ * `code` must be a tag ML Kit's on-device translator knows. Adding a language
+ * is a one-line change here — but check it against
+ * MlkitTranslate.getSupportedLanguages() first: ML Kit covers fewer languages
+ * than the cloud API did. Malayalam and Punjabi were dropped for exactly that
+ * reason, and the picker filters this list against the native list anyway so an
+ * unsupported entry is hidden rather than offered and then silently broken.
  */
 export const LANGUAGES = [
   { code: 'en', label: 'English',    english: 'English',    flag: '🇬🇧' },
@@ -12,11 +15,9 @@ export const LANGUAGES = [
   { code: 'bn', label: 'বাংলা',       english: 'Bengali',    flag: '🇮🇳' },
   { code: 'mr', label: 'मराठी',       english: 'Marathi',    flag: '🇮🇳' },
   { code: 'gu', label: 'ગુજરાતી',     english: 'Gujarati',   flag: '🇮🇳' },
-  { code: 'pa', label: 'ਪੰਜਾਬੀ',      english: 'Punjabi',    flag: '🇮🇳' },
   { code: 'ta', label: 'தமிழ்',       english: 'Tamil',      flag: '🇮🇳' },
   { code: 'te', label: 'తెలుగు',      english: 'Telugu',     flag: '🇮🇳' },
   { code: 'kn', label: 'ಕನ್ನಡ',       english: 'Kannada',    flag: '🇮🇳' },
-  { code: 'ml', label: 'മലയാളം',     english: 'Malayalam',  flag: '🇮🇳' },
   { code: 'ur', label: 'اردو',        english: 'Urdu',       flag: '🇵🇰' },
   { code: 'ar', label: 'العربية',      english: 'Arabic',     flag: '🇸🇦' },
   { code: 'fr', label: 'Français',    english: 'French',     flag: '🇫🇷' },

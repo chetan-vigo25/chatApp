@@ -93,7 +93,7 @@ import CallMessageBubble from '../../calls/components/CallMessageBubble';
 // Message-body text only. Everything else on this screen keeps React
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
-import { translateDetailed, ensureTranslationCacheReady, peekTranslation, getRetryDelay, useLanguage } from "../../components/Translate";
+import { translateDetailed, ensureTranslationCacheReady, peekTranslation, getRetryDelay, needsSystemFont, useLanguage } from "../../components/Translate";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -121,13 +121,25 @@ const TRANSLATION_RETRY_MIN_MS = 6000;
  *
  * @mentions are skipped outright — translating them mangles the names and
  * invalidates the mention offsets.
+ *
+ * So is CODE. The translator replaces the whole message body, and the bubble
+ * re-parses that result — so a shared snippet came back with its keywords and
+ * identifiers translated, i.e. corrupted. Both fenced (```) and auto-detected
+ * code are left exactly as the sender typed them.
+ *
+ * `looksLikeCode` is declared below this function; that is fine, because this
+ * only ever runs from an effect, long after the module has evaluated.
  */
+const containsCode = (text) => text.includes('```') || looksLikeCode(text);
+
 const isTranslatableMessage = (msg) => (
   Boolean(msg)
   && msg.type === 'text'
   && !msg.isDeleted
   && !msg.mentions
   && !msg.payload?.mentions
+  && typeof msg.text === 'string'
+  && !containsCode(msg.text)
 );
 
 // Auto-detect unfenced code (Teams-style): a multi-line message where most
@@ -2285,6 +2297,35 @@ export default function ChatScreen({ navigation, route }) {
     // A result is therefore only discarded when the screen unmounted or the
     // reader changed language, both of which outlive a single effect run.
     let deferred = false;
+    // Results are collected and committed in ONE setState per flush rather than
+    // one per message. Committing individually re-rendered the whole FlatList
+    // once per translated bubble — opening a chat with 50 of them meant 50 full
+    // list passes and visible jank.
+    let batch = null;
+    let flushTimer = null;
+    const commit = () => {
+      flushTimer = null;
+      const ready = batch;
+      batch = null;
+      if (!ready || !translationMountedRef.current) return;
+      if (translationLanguageRef.current !== language) return;
+      setMessageTranslations((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        Object.entries(ready).forEach(([slot, value]) => {
+          if (next[slot] !== value) { next[slot] = value; changed = true; }
+        });
+        return changed ? next : prev;
+      });
+    };
+    const queueTranslation = (slot, value) => {
+      if (!batch) batch = {};
+      batch[slot] = value;
+      // A microtask-ish window: everything that resolves in the same tick — the
+      // common case, since cache hits settle together — lands in one render.
+      if (flushTimer == null) flushTimer = setTimeout(commit, 0);
+    };
+
     Promise.all(pending.map(async ({ slot, body }) => {
       let outcome = { text: body, status: 'failed' };
       try {
@@ -2296,8 +2337,9 @@ export default function ChatScreen({ navigation, route }) {
       if (!translationMountedRef.current) return;
       if (translationLanguageRef.current !== language) return;
 
-      // Rate-limit cooldown: nothing was even attempted, so this must NOT eat a
-      // retry. The timer at the end of this effect brings it back.
+      // The on-device model is still downloading, so nothing was attempted —
+      // this must NOT eat a retry. The timer at the end of this effect brings
+      // it back once the model is in place.
       if (outcome.status === 'deferred') { deferred = true; return; }
 
       if (outcome.status === 'failed') {
@@ -2312,17 +2354,19 @@ export default function ChatScreen({ navigation, route }) {
       translationFailRef.current.delete(slot);
 
       if (outcome.status === 'translated' && outcome.text && outcome.text !== body) {
-        setMessageTranslations((prev) => (
-          prev[slot] === outcome.text ? prev : { ...prev, [slot]: outcome.text }
-        ));
+        queueTranslation(slot, outcome.text);
         return;
       }
       // 'skipped' / 'unchanged' — a definitive "nothing to show", so stop asking.
       translationSkipRef.current.add(slot);
     })).then(() => {
-      // Self-heal. Anything still owed a translation — deferred by the cooldown,
-      // or failed with retries left — gets one scheduled wake-up. Without this a
-      // single 429 left the chat in English until the user reopened it.
+      // Land whatever is still batched, even if the flush timer has not run.
+      if (flushTimer != null) { clearTimeout(flushTimer); commit(); }
+
+      // Self-heal. Anything still owed a translation — deferred because its
+      // on-device model is still downloading, or failed with retries left — gets
+      // one scheduled wake-up. Without this the chat sat in English until the
+      // user reopened it, even once the model had landed.
       if (!translationMountedRef.current) return;
       if (translationLanguageRef.current !== language) return;
       const suffix = `::${language}`;
@@ -4974,6 +5018,10 @@ export default function ChatScreen({ navigation, route }) {
     const isExpanded = Boolean(expandedRichMessages[messageKey]);
     const measuredLineCount = Number(richMessageLineCounts[messageKey] || 0);
     const showReadMore = measuredLineCount > RICH_TEXT_COLLAPSED_LINES;
+    // Roboto has no Devanagari/Bengali/Tamil/Arabic/Thai/CJK glyphs, so a
+    // translated bubble must hand those scripts to the platform font instead of
+    // forcing a family that cannot draw them.
+    const bodyFont = needsSystemFont(displayText) ? undefined : 'Roboto-Regular';
 
     const baseColor = isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.primaryTextColor);
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
@@ -5031,7 +5079,7 @@ export default function ChatScreen({ navigation, route }) {
             }
             if (token.type === 'italic') {
               return (
-                <Text key={key} style={{ fontFamily: 'Roboto-Regular', fontStyle: 'italic', color: baseColor }}>
+                <Text key={key} style={{ fontFamily: bodyFont, fontStyle: 'italic', color: baseColor }}>
                   {token.text}
                 </Text>
               );
@@ -5100,7 +5148,7 @@ export default function ChatScreen({ navigation, route }) {
             return (
               <Text
                 key={`textseg_${messageKey}_${segIndex}`}
-                style={{ fontSize: 15, color: baseColor, fontFamily: 'Roboto-Regular', lineHeight: 20 }}
+                style={{ fontSize: 15, color: baseColor, fontFamily: bodyFont, lineHeight: 20 }}
               >
                 {renderInlineTokens(seg.lines, `_s${segIndex}`)}
               </Text>
@@ -5120,7 +5168,7 @@ export default function ChatScreen({ navigation, route }) {
             zIndex: -1,
             fontSize: 15,
             color: baseColor,
-            fontFamily: 'Roboto-Regular',
+            fontFamily: bodyFont,
             lineHeight: 20,
           }}
         >
@@ -5133,7 +5181,7 @@ export default function ChatScreen({ navigation, route }) {
           style={{
             fontSize: 15,
             color: baseColor,
-            fontFamily: 'Roboto-Regular',
+            fontFamily: bodyFont,
             lineHeight: 20,
           }}
         >

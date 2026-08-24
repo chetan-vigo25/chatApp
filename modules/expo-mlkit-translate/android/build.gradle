@@ -1,0 +1,39 @@
+apply plugin: 'com.android.library'
+
+group = 'expo.modules.mlkittranslate'
+version = '1.0.0'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useExpoPublishing()
+
+// Inherit the app's SDK versions so this library always matches the host app
+// (avoids manifest-merge minSdk conflicts).
+buildscript {
+  ext.safeExtGet = { prop, fallback ->
+    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+  }
+}
+
+android {
+  namespace "expo.modules.mlkittranslate"
+  compileSdkVersion safeExtGet("compileSdkVersion", 35)
+  defaultConfig {
+    minSdkVersion safeExtGet("minSdkVersion", 24)
+    targetSdkVersion safeExtGet("targetSdkVersion", 35)
+    versionCode 1
+    versionName "1.0.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+dependencies {
+  // On-device translation + the language detector the `auto` source needs.
+  // Both ship their models on demand, so the APK does not carry them.
+  implementation "com.google.mlkit:translate:17.0.3"
+  implementation "com.google.mlkit:language-id:17.0.6"
+}

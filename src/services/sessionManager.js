@@ -236,7 +236,7 @@ const stampCacheOwnerForBootstrap = (userId) => {
 // app language to English and threw away every cached translation — the user
 // picked Hindi once and found the app back in English after a reload. These
 // keys are read before the wipe and written back after it.
-const DEVICE_PREFERENCE_KEYS = ['app.language', 'translation.cache.v2'];
+const DEVICE_PREFERENCE_KEYS = ['app.language', 'translation.cache.v3'];
 
 const preserveDevicePreferences = async (wipe) => {
   let saved = [];

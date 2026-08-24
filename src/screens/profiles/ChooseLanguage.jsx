@@ -1,11 +1,15 @@
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   View, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator, Keyboard,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import { useTheme } from '../../contexts/ThemeContext';
-import { Text, TextInput, useLanguage } from '../../components/Translate';
+import {
+  Text, TextInput, useLanguage,
+  SOURCE_LANGUAGE, getDownloadedLanguages, getSupportedLanguages,
+  isTranslationAvailable, needsSystemFont,
+} from '../../components/Translate';
 import { LANGUAGES } from '../../constant/languages';
 
 /**
@@ -25,6 +29,51 @@ export default function ChooseLanguage({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const { language, setLanguage, ready } = useLanguage();
   const [query, setQuery] = useState('');
+  // Which languages already have their ~30MB on-device model.
+  const [downloaded, setDownloaded] = useState([]);
+  // The row currently fetching a model, so only it shows a spinner.
+  const [busyCode, setBusyCode] = useState(null);
+  const [failedCode, setFailedCode] = useState(null);
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => { aliveRef.current = false; };
+  }, []);
+
+  const refreshDownloaded = useCallback(async () => {
+    try {
+      const models = await getDownloadedLanguages();
+      if (aliveRef.current) setDownloaded(models || []);
+    } catch {
+      /* listing is a nicety; the picker still works without it */
+    }
+  }, []);
+
+  useEffect(() => { refreshDownloaded(); }, [refreshDownloaded]);
+
+  const nativeReady = isTranslationAvailable();
+
+  // Which pick is the current one. Rows stay tappable during a download, so a
+  // slow first download must not clear the spinner (or post a failure) for a
+  // language the user picked afterwards.
+  const pickSeqRef = useRef(0);
+
+  const onPick = useCallback(async (code) => {
+    setFailedCode(null);
+    // English is the source language — it never needs a model or a download.
+    if (code === SOURCE_LANGUAGE) { setLanguage(code); return; }
+
+    pickSeqRef.current += 1;
+    const seq = pickSeqRef.current;
+    setBusyCode(code);
+    // requireWifi false: the user tapped this row and the size is on screen.
+    const ok = await setLanguage(code, { requireWifi: false });
+    if (!aliveRef.current || pickSeqRef.current !== seq) return;
+    setBusyCode(null);
+    if (!ok) setFailedCode(code);
+    refreshDownloaded();
+  }, [setLanguage, refreshDownloaded]);
 
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
@@ -34,15 +83,26 @@ export default function ChooseLanguage({ navigation }) {
 
   // Matches the English name ("Thai"), the endonym ("ไทย") and the code ("th"),
   // so the list is reachable whichever script the user is thinking in.
+  // Only offer what the installed ML Kit build can actually translate — an
+  // entry it does not know would be selectable and then silently do nothing.
+  // When the native module is missing (Expo Go) the list is left intact so the
+  // screen still renders rather than coming up empty.
+  const offered = useMemo(() => {
+    const supported = getSupportedLanguages();
+    if (!supported || supported.length === 0) return LANGUAGES;
+    const allowed = new Set(supported);
+    return LANGUAGES.filter(({ code }) => code === SOURCE_LANGUAGE || allowed.has(code));
+  }, []);
+
   const results = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return LANGUAGES;
-    return LANGUAGES.filter(({ english, label, code }) =>
+    if (!needle) return offered;
+    return offered.filter(({ english, label, code }) =>
       english.toLowerCase().includes(needle)
       || label.toLowerCase().includes(needle)
       || code.toLowerCase() === needle,
     );
-  }, [query]);
+  }, [query, offered]);
 
   return (
     <View style={[styles.container, { backgroundColor: theme.colors.background }]}>
@@ -100,23 +160,62 @@ export default function ChooseLanguage({ navigation }) {
           ) : (
             results.map((item) => {
               const selected = item.code === language;
+              const isBusy = busyCode === item.code;
+              // English is the app's own language — nothing to download.
+              const needsModel =
+                item.code !== SOURCE_LANGUAGE && !downloaded.includes(item.code);
+
               return (
                 <TouchableOpacity
                   key={item.code}
                   activeOpacity={0.6}
-                  onPress={() => setLanguage(item.code)}
+                  onPress={() => onPick(item.code)}
+                  // Only the row that is downloading is locked. Disabling the
+                  // WHOLE list meant one stuck download made the screen dead —
+                  // the user could not even pick a different language.
+                  disabled={isBusy}
                   style={[styles.row, { borderBottomColor: divider }]}
                   accessibilityRole="radio"
-                  accessibilityState={{ selected }}
+                  accessibilityState={{ selected, busy: isBusy }}
                 >
                   <Text ignore style={styles.flag}>{item.flag}</Text>
                   <View style={styles.flex}>
                     {/* `ignore`: these are already in their own language. */}
-                    <Text ignore style={[styles.rowLabel, { color: primaryText }]}>{item.label}</Text>
-                    <Text style={[styles.rowSub, { color: subText }]}>{item.english}</Text>
+                    <Text
+                      ignore
+                      style={[
+                        styles.rowLabel,
+                        { color: primaryText },
+                        // The endonym is written in its own script — the very
+                        // thing the bundled font lacks. Hand those to the OS.
+                        needsSystemFont(item.label) && { fontFamily: undefined },
+                      ]}
+                    >
+                      {item.label}
+                    </Text>
+                    {/* The English name and the model's state share this line —
+                        a 30MB download should be visible BEFORE the tap. */}
+                    {isBusy ? (
+                      <Text style={[styles.rowSub, { color: themeColor }]}>Downloading language…</Text>
+                    ) : failedCode === item.code ? (
+                      <Text style={[styles.rowSub, { color: theme.colors.danger || '#E5484D' }]}>
+                        Download failed — tap to retry
+                      </Text>
+                    ) : needsModel ? (
+                      <View style={styles.rowSubLine}>
+                        <Text ignore style={[styles.rowSub, { color: subText }]}>{item.english}</Text>
+                        <Text style={[styles.rowSub, { color: subText }]}> · 30 MB download</Text>
+                      </View>
+                    ) : (
+                      <Text ignore style={[styles.rowSub, { color: subText }]}>{item.english}</Text>
+                    )}
                   </View>
-                  {selected ? (
+                  {isBusy ? (
+                    <ActivityIndicator size="small" color={themeColor} />
+                  ) : selected ? (
                     <Ionicons name="checkmark-circle" size={22} color={themeColor} />
+                  ) : needsModel ? (
+                    <Ionicons name="cloud-download-outline" size={21} color={divider} />
                   ) : (
                     <Ionicons name="ellipse-outline" size={22} color={divider} />
                   )}
@@ -127,7 +226,16 @@ export default function ChooseLanguage({ navigation }) {
 
           {results.length > 0 && (
             <Text style={[styles.footnote, { color: subText }]}>
-              Your chats and contact names are never translated.
+              Translation happens on your device — your messages are never sent to a
+              server. Each language downloads once, then works offline. Contact names
+              are never translated.
+            </Text>
+          )}
+
+          {!nativeReady && (
+            <Text style={[styles.footnote, { color: theme.colors.danger || '#E5484D' }]}>
+              On-device translation is unavailable in this build. Rebuild the app
+              (npx expo prebuild, then run:android / run:ios) to enable it.
             </Text>
           )}
         </ScrollView>
@@ -167,6 +275,7 @@ const styles = StyleSheet.create({
   flag: { fontSize: 26 },
   rowLabel: { fontFamily: 'Roboto-Medium', fontSize: 16 },
   rowSub: { fontFamily: 'Roboto-Regular', fontSize: 12.5, marginTop: 2 },
+  rowSubLine: { flexDirection: 'row', alignItems: 'center' },
 
   empty: { alignItems: 'center', paddingTop: 60, gap: 10 },
   emptyText: { fontFamily: 'Roboto-Regular', fontSize: 14 },

@@ -94,7 +94,8 @@
         {
           "ios": {
             "useFrameworks": "static",
-            "buildReactNativeFromSource": true
+            "buildReactNativeFromSource": true,
+            "deploymentTarget": "15.5"
           }
         }
       ],

@@ -1,5 +1,5 @@
 /**
- * Google-Translate powered <Text> / <TextInput>.
+ * ML Kit powered <Text> / <TextInput>.
  *
  * A screen opts in by changing ONE import line:
  *
@@ -10,19 +10,20 @@
  * The JSX stays exactly the same. Every string child is translated into the
  * language saved in AsyncStorage, cached on disk, and re-rendered in place.
  *
- * ── What actually talks to Google ────────────────────────────────────────────
- * The `translate` package's "google" engine calls
- * https://translate.googleapis.com/translate_a/single?client=gtx — the FREE,
- * undocumented endpoint. It needs no API key and no billing (setting
- * `translate.key` is a no-op for this engine; only yandex/deepl/libre use it).
- * The trade-off is that it is rate-limited per IP and unofficial, so it can
- * start returning errors at any time. Every failure falls back to the original
- * English text, so the UI never breaks — but see the notes in
- * docs/APP_LANGUAGE_GUIDE.md before shipping this to production.
+ * ── What actually does the translating ───────────────────────────────────────
+ * Google ML Kit's ON-DEVICE translation, through the local `expo-mlkit-translate`
+ * native module. Nothing leaves the phone: no API key, no billing, no rate
+ * limit, and it works with the network off.
  *
- * Switch engine without touching code by adding to .env:
- *   TRANSLATE_ENGINE=libre        (or deepl / yandex)
- *   TRANSLATE_KEY=xxxxxxxx        (required by deepl / yandex)
+ * This replaced translate.googleapis.com/translate_a/single — Google's
+ * undocumented free endpoint — which rate-limited a single IP after a handful
+ * of requests and left every message untranslated.
+ *
+ * The trade-offs that come with on-device:
+ *   • each language needs a ~30MB model, downloaded when the user picks it;
+ *   • ML Kit covers fewer languages than the cloud API (no Malayalam/Punjabi);
+ *   • quality is below the cloud model, especially for romanized text.
+ * See docs/APP_LANGUAGE_GUIDE.md before changing any of this.
  */
 import React, {
   createContext,
@@ -34,36 +35,41 @@ import React, {
 } from 'react';
 import { AppState, Text as RNText, TextInput as RNTextInput } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import translate from 'translate';
-import { TRANSLATE_ENGINE, TRANSLATE_KEY } from '@env';
+import MlkitTranslate from 'expo-mlkit-translate';
 
 export const LANGUAGE_STORAGE_KEY = 'app.language';
-const CACHE_KEY = 'translation.cache.v2';
+/**
+ * v3: the key scheme changed with the ML Kit switch (the source language is no
+ * longer baked into the key), so v2's cloud-era entries would never be hit.
+ */
+const CACHE_KEY = 'translation.cache.v3';
 /** Source language of every hard-coded string in this app. */
 export const SOURCE_LANGUAGE = 'en';
 /** Disk cache ceiling — keeps AsyncStorage from growing without bound. */
 const MAX_CACHE_ENTRIES = 3000;
-/** The free endpoint 429s if hammered; keep a few requests in flight, not 50. */
-const MAX_CONCURRENT = 4;
 /**
- * Hard ceiling on a single request.
- *
- * React Native's fetch has NO default timeout on Android, and the queue above
- * only frees a slot in `.finally`. Four sockets left hanging on a flaky mobile
- * network would therefore wedge the queue for the rest of the app's life and
- * every later translation would silently never run.
+ * On-device work is CPU- and RAM-bound rather than network-bound, and a live
+ * ML Kit translator holds 30–150MB. Two at a time keeps the JS thread and the
+ * heap calm while still overlapping work.
  */
-const REQUEST_TIMEOUT_MS = 12000;
-/** 429 backoff schedule. Escalates while it keeps refusing, resets on success. */
-const COOLDOWN_STEPS_MS = [30000, 60000, 120000, 300000];
-
-translate.engine = TRANSLATE_ENGINE || 'google';
-translate.from = SOURCE_LANGUAGE;
-if (TRANSLATE_KEY) translate.key = TRANSLATE_KEY;
+const MAX_CONCURRENT = 2;
+/** A local call should never take this long; guards against a wedged model. */
+const REQUEST_TIMEOUT_MS = 15000;
+/** How long to wait before re-asking once a model turned out to be missing. */
+const MODEL_RETRY_MS = 4000;
+/**
+ * Ceiling on a model download, enforced here so BOTH platforms are covered by
+ * one rule.
+ *
+ * A download that never settles would leave the language picker's spinner up
+ * for good. The native side has its own guard too — this one also catches a
+ * bridge that simply never answers.
+ */
+const MODEL_DOWNLOAD_TIMEOUT_MS = 200000;
 
 /* ────────────────────────────── cache ────────────────────────────── */
 
-let memoryCache = {};           // { "hi::Submit": "जमा करें" }
+let memoryCache = {};           // { "auto::hi::Good Morning": "सुप्रभात" }
 let cacheLoaded = false;
 let loadPromise = null;
 let saveTimer = null;
@@ -94,8 +100,8 @@ function writeCacheNow() {
 function persistCache() {
   // Debounced: a screen mounting 30 labels writes to disk once, not 30 times.
   // Kept SHORT — this cache is what makes a reopened chat paint its previous
-  // translation instantly and offline. A long window meant a reload right after
-  // translating lost the write, and the messages came back in English.
+  // translation instantly. A long window meant a reload right after translating
+  // lost the write, and the messages came back in English.
   clearTimeout(saveTimer);
   saveTimer = setTimeout(writeCacheNow, 250);
 }
@@ -121,7 +127,7 @@ export async function clearTranslationCache() {
 
 /* ─────────────────────── request queue + dedupe ─────────────────────── */
 
-const inflight = new Map();     // cacheKey → Promise<string>
+const inflight = new Map();     // cacheKey → Promise<{text, status}>
 let active = 0;
 const waiting = [];
 
@@ -143,83 +149,96 @@ function enqueue(job) {
   });
 }
 
-/* ─────────────────── auto source language (chat messages) ─────────────────── */
-
-/**
- * The same free endpoint the package's google engine uses, called directly for
- * ONE case the package cannot express: `sl=auto`.
- *
- * `translate()` validates the source against ISO 639-1 and "auto" is not a
- * language, so it throws. Chat messages need auto-detection — the sender's
- * language is unknown, and forcing `sl=en` means a Hindi message would never
- * translate back to English for the other side.
- */
-const GOOGLE_FREE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
-
-/**
- * Rate-limit cooldown.
- *
- * The free endpoint does not throttle politely — once it starts answering 429
- * it keeps doing so for a while, and hammering it extends the block. So the
- * FIRST 429 parks every caller for a growing window instead of letting each
- * message burn another rejected request.
- */
-let rateLimitedUntil = 0;
-let cooldownStep = 0;
-
-function enterCooldown() {
-  const wait = COOLDOWN_STEPS_MS[Math.min(cooldownStep, COOLDOWN_STEPS_MS.length - 1)];
-  cooldownStep += 1;
-  rateLimitedUntil = Date.now() + wait;
-  if (__DEV__) console.warn(`[translate] rate limited — pausing ${wait / 1000}s`);
-}
-
-function leaveCooldown() {
-  cooldownStep = 0;
-  rateLimitedUntil = 0;
-}
-
-/**
- * How long until it is worth asking again, in ms (0 = right now).
- *
- * Callers that hold retryable work poll this to schedule themselves, which is
- * what makes a chat heal on its own once the block expires.
- */
-export function getRetryDelay() {
-  return Math.max(0, rateLimitedUntil - Date.now());
-}
-
-/** Rejects if the underlying request outlives REQUEST_TIMEOUT_MS. */
-function withTimeout(promise, controller) {
+/** Rejects if the underlying call outlives REQUEST_TIMEOUT_MS. */
+function withTimeout(promise) {
   let timer;
   const guard = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      if (controller) { try { controller.abort(); } catch {} }
-      reject(new Error('timeout'));
-    }, REQUEST_TIMEOUT_MS);
+    timer = setTimeout(() => reject(new Error('timeout')), REQUEST_TIMEOUT_MS);
   });
   return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
-async function translateAuto(text, to, sl = 'auto') {
-  const url =
-    `${GOOGLE_FREE_ENDPOINT}?client=gtx&sl=${sl}&tl=${encodeURIComponent(to)}` +
-    `&dt=t&q=${encodeURIComponent(text)}`;
-  const controller = typeof AbortController === 'function' ? new AbortController() : null;
-  const response = await withTimeout(
-    fetch(url, controller ? { signal: controller.signal } : undefined),
-    controller,
-  );
-  if (response.status === 429) {
-    enterCooldown();
-    throw new Error('HTTP 429');
-  }
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const data = await response.json();
-  const chunks = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : null;
-  if (!chunks) throw new Error('Unexpected response shape');
-  return chunks.map((chunk) => (chunk && chunk[0]) || '').join('');
+/* ───────────────────────── on-device models ───────────────────────── */
+
+/** True when the native module is in this build (false in Expo Go). */
+export const isTranslationAvailable = () => MlkitTranslate.isAvailable();
+
+/** ML Kit's own list — the picker filters against this. */
+export const getSupportedLanguages = () => MlkitTranslate.getSupportedLanguages();
+
+/**
+ * When a model turned out to be absent, hold off briefly instead of asking on
+ * every render. ChatScreen reads this to schedule its own retry, so a chat
+ * translates itself the moment the download finishes.
+ */
+let modelRetryUntil = 0;
+export function getRetryDelay() {
+  return Math.max(0, modelRetryUntil - Date.now());
 }
+
+const downloading = new Map();  // language → Promise<boolean>
+
+/**
+ * Make a language usable, downloading its ~30MB model if needed.
+ *
+ * ML Kit pivots every pair through English, so the English model is fetched
+ * alongside the requested one — without it a hi→th translation cannot run.
+ *
+ * Resolves true when the language is ready. Never throws: a failed download
+ * just means translations stay in the original text.
+ */
+export function ensureLanguageReady(language, { requireWifi = true } = {}) {
+  if (!language || language === SOURCE_LANGUAGE) return prepare(SOURCE_LANGUAGE, requireWifi);
+  return Promise.all([
+    prepare(SOURCE_LANGUAGE, requireWifi),
+    prepare(language, requireWifi),
+  ]).then(([en, target]) => en && target);
+}
+
+/**
+ * Resolve to `fallback` if `promise` has not settled in time.
+ *
+ * Deliberately resolves rather than rejects: a download that stalls is a "not
+ * ready", not an error the caller has to handle. What matters is that whoever
+ * is waiting — the picker, with its spinner up — is always released.
+ */
+function settleWithin(promise, ms, fallback) {
+  let timer;
+  const guard = new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+function prepare(language, requireWifi) {
+  if (!MlkitTranslate.isAvailable()) return Promise.resolve(false);
+  const existing = downloading.get(language);
+  if (existing) return existing;
+
+  const download = MlkitTranslate.isModelDownloaded(language)
+    .then((ready) => {
+      if (ready) return true;
+      return MlkitTranslate.downloadModel({ language, requireWifi })
+        .then(() => { modelRetryUntil = 0; return true; })
+        .catch((error) => {
+          if (__DEV__) console.warn(`[translate] model download failed (${language})`, error?.message || error);
+          return false;
+        });
+    })
+    .catch(() => false);
+
+  const job = settleWithin(download, MODEL_DOWNLOAD_TIMEOUT_MS, false)
+    .finally(() => { downloading.delete(language); });
+
+  downloading.set(language, job);
+  return job;
+}
+
+/** Which languages already have their model on disk. */
+export const getDownloadedLanguages = () => MlkitTranslate.getDownloadedModels();
+
+/** Free the disk a language's model occupies. */
+export const removeLanguageModel = (language) => MlkitTranslate.deleteModel(language);
+
+/* ─────────────────── source language (chat messages) ─────────────────── */
 
 /** Scripts, keyed by the languages this app offers. */
 const SCRIPT_OF = {
@@ -235,11 +254,37 @@ const NON_LATIN_SCRIPT =
   /[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7A3]/;
 
 /**
+ * Scripts this app's bundled font cannot draw.
+ *
+ * Roboto-Regular.ttf carries 922 codepoints \u2014 Latin, Greek and Cyrillic. Twelve
+ * of the languages the picker offers (Devanagari, Bengali, Gujarati, Tamil,
+ * Telugu, Kannada, Arabic, Thai, CJK, \u2026) have NO glyphs in it. Both platforms
+ * normally cascade to a system font, but that fallback is not guaranteed and
+ * mixes metrics; forcing `fontFamily` on text the family cannot render is how
+ * you end up looking at \u25AF\u25AF\u25AF.
+ *
+ * Cyrillic is deliberately excluded here \u2014 Roboto covers it, so Russian keeps
+ * the app's own typeface.
+ */
+const UNSUPPORTED_BY_APP_FONT =
+  /[\u0590-\u05FF\u0600-\u08FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7A3]/;
+
+/**
+ * True when `text` must be drawn with the platform font instead of the app's.
+ *
+ * Callers pass `fontFamily: needsSystemFont(t) ? undefined : 'Roboto-Regular'`
+ * so the OS picks a face that actually has the glyphs.
+ */
+export function needsSystemFont(text) {
+  return typeof text === 'string' && UNSUPPORTED_BY_APP_FONT.test(text);
+}
+
+/**
  * "Is this text already readable by someone using `language`?"
  *
- * A cheap SCRIPT check, not language detection. Its only job is to avoid a
- * network round-trip per chat message: an English reader looking at English
- * messages, or a Thai reader looking at Thai messages, costs zero requests.
+ * A cheap SCRIPT check, not language detection. Its only job is to skip work:
+ * an English reader looking at English messages, or a Thai reader looking at
+ * Thai messages, costs nothing.
  *
  * For a Latin-script target it can only tell that the text is Latin, so a
  * French message shown to an English reader is left untranslated — an accepted
@@ -252,59 +297,62 @@ function looksAlreadyReadable(text, language) {
 }
 
 /**
- * Which source language to ask for.
+ * Latin text + a reader whose language uses its own script → treat it as
+ * English rather than asking the detector.
  *
- * `auto` is right for text written in its own script (Devanagari, Thai, Arabic…).
- * It is WRONG for romanized text — "Kya kru", "Ab btao", "Tum kha ja rhe ho" are
- * Hindi typed in Latin letters, and Google detects them as `hi`. With a Hindi
- * reader that makes source == target, so the endpoint returns the message
- * unchanged and nothing appears to translate.
+ * Romanized Hindi ("Kya kru", "Ab btao") is detected as `hi`, which would make
+ * source == target and return the message unchanged. Forcing English at least
+ * produces Devanagari, and genuinely English messages are unaffected.
  *
- * So: Latin-script message + non-Latin-script reader → force `sl=en`. Google
- * then actually converts it ("Ab btao" → "अब बताओ"), and genuinely English
- * messages are unaffected because English IS the forced source.
+ * Returns null when the detector should decide.
  */
-function sourceFor(text, language) {
+function presumedSource(text, language) {
   const readerUsesOwnScript = Boolean(SCRIPT_OF[language]);
   const messageIsLatin = !NON_LATIN_SCRIPT.test(text);
-  return readerUsesOwnScript && messageIsLatin ? 'en' : 'auto';
+  return readerUsesOwnScript && messageIsLatin ? SOURCE_LANGUAGE : null;
+}
+
+/**
+ * Ask ML Kit what language a message is in.
+ *
+ * Falls back to English on 'und' (short or mixed strings often land there) —
+ * guessing English is what the app assumed before detection existed, so it is
+ * the safe default rather than a new failure mode.
+ */
+async function detectSource(text, language) {
+  const presumed = presumedSource(text, language);
+  if (presumed) return presumed;
+  try {
+    const detected = await MlkitTranslate.identifyLanguage(text);
+    if (!detected || detected === 'und') return SOURCE_LANGUAGE;
+    // ML Kit returns BCP-47 with regions ("zh-Hant"); the models are keyed on
+    // the base tag.
+    return String(detected).split('-')[0];
+  } catch {
+    return SOURCE_LANGUAGE;
+  }
 }
 
 /* ─────────────────────────── translate entry ─────────────────────────── */
 
 /**
- * Translate one string and report WHAT happened.
+ * Plan a translation without doing it.
  *
- *   { text, status }
- *     'skipped'    — nothing to do (empty, same language, already readable).
- *                    The caller can stop asking about this string.
- *     'translated' — real translation (fresh or from cache).
- *     'unchanged'  — the engine answered, but with the same string back.
- *     'failed'     — the request errored. `text` is the original, and the
- *                    caller MAY retry later; nothing was cached.
- *     'deferred'   — the engine is in its rate-limit cooldown, so NOTHING was
- *                    tried. Callers must retry after `getRetryDelay()` and must
- *                    NOT count this against a retry budget: no attempt was made.
- *
- * Callers that only want the string use `t()` below. Callers that must retry
- * transient failures (chat bubbles) need this distinction — without it a failed
- * request looks exactly like "no translation needed" and is never retried.
+ * The cache key intentionally stores 'auto' rather than the resolved source:
+ * resolving needs the detector, which is async, and `peekTranslation` has to
+ * stay synchronous so a reopened chat can repaint in its first frame.
  */
 function resolveRequest(text, language, from) {
   if (typeof text !== 'string' || !text.trim()) return { skip: true };
   if (!language) return { skip: true };
 
-  // 'auto' only works through the endpoint directly; any other engine falls
-  // back to treating the text as English.
-  const auto = from === 'auto' && translate.engine === 'google';
-  const source = from === 'auto' ? (auto ? 'auto' : SOURCE_LANGUAGE) : from;
+  const auto = from === 'auto';
+  const source = auto ? 'auto' : from;
 
-  if (source !== 'auto' && language === source) return { skip: true };
-  if (source === 'auto' && looksAlreadyReadable(text, language)) return { skip: true };
+  if (!auto && language === source) return { skip: true };
+  if (auto && looksAlreadyReadable(text, language)) return { skip: true };
 
-  // Romanized text needs an explicit source — see sourceFor().
-  const sl = auto ? sourceFor(text, language) : source;
-  return { skip: false, auto, sl, key: `${sl}::${language}::${text}` };
+  return { skip: false, auto, source, key: `${source}::${language}::${text}` };
 }
 
 /** Resolves once the on-disk cache has been read into memory. */
@@ -313,13 +361,12 @@ export function ensureTranslationCacheReady() {
 }
 
 /**
- * SYNCHRONOUS cache lookup — no request, ever. Returns the stored translation
- * or null.
+ * SYNCHRONOUS cache lookup — no work, ever. Returns the stored translation or
+ * null.
  *
  * This is what lets a reopened chat paint its previous translation in the FIRST
- * frame, with no network and no per-message promise. Call
- * `ensureTranslationCacheReady()` once before relying on it, otherwise the disk
- * cache may not be in memory yet and every lookup misses.
+ * frame. Call `ensureTranslationCacheReady()` once before relying on it,
+ * otherwise the disk cache may not be in memory yet and every lookup misses.
  */
 export function peekTranslation(text, language, from = SOURCE_LANGUAGE) {
   const plan = resolveRequest(text, language, from);
@@ -328,41 +375,69 @@ export function peekTranslation(text, language, from = SOURCE_LANGUAGE) {
   return typeof hit === 'string' && hit !== text ? hit : null;
 }
 
+/**
+ * Translate one string and report WHAT happened.
+ *
+ *   { text, status }
+ *     'skipped'    — nothing to do (empty, same language, already readable).
+ *                    The caller can stop asking about this string.
+ *     'translated' — real translation (fresh or from cache).
+ *     'unchanged'  — the engine answered with the same string back.
+ *     'deferred'   — the on-device model is not downloaded yet, so NOTHING was
+ *                    attempted. Retry after `getRetryDelay()`; do NOT count it
+ *                    against a retry budget.
+ *     'failed'     — the call errored. `text` is the original, the caller MAY
+ *                    retry, and nothing was cached.
+ *
+ * Callers that only want the string use `t()`. Callers that must retry
+ * transient failures (chat bubbles) need this distinction — without it a failed
+ * call looks exactly like "no translation needed" and is never retried.
+ */
 export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) {
   const plan = resolveRequest(text, language, from);
   if (plan.skip) return { text, status: 'skipped' };
-  const { auto, sl, key } = plan;
+  const { auto, key } = plan;
 
   await loadCache();
-  if (memoryCache[key] != null) {                                // cache hit — 0 requests
+  if (memoryCache[key] != null) {                          // cache hit — no work
     const hit = memoryCache[key];
     return { text: hit, status: hit === text ? 'unchanged' : 'translated' };
   }
 
   const pending = inflight.get(key);
-  if (pending) return pending;                                   // same string twice on one screen
+  if (pending) return pending;                             // same string twice on one screen
 
-  // Cooling down after a 429: answer without touching the network. Spending the
-  // request would only prolong the block, and the caller reschedules itself.
-  if (getRetryDelay() > 0) return { text, status: 'deferred' };
+  if (!MlkitTranslate.isAvailable()) return { text, status: 'failed' };
 
-  const request = enqueue(() =>
-    (auto
-      ? translateAuto(text, language, sl)
-      : withTimeout(Promise.resolve(translate(text, language))))
-      .then((result) => {
-        const value = typeof result === 'string' && result.trim() ? result : text;
-        leaveCooldown();                        // the endpoint is answering again
-        memoryCache[key] = value;
-        persistCache();
-        return { text: value, status: value === text ? 'unchanged' : 'translated' };
-      })
-      .catch((error) => {
-        if (__DEV__) console.warn('[translate] failed:', error?.message || error);
-        // NOT cached: a transient failure must stay retryable.
-        return { text, status: 'failed' };
-      }),
-  ).finally(() => inflight.delete(key));
+  const request = enqueue(async () => {
+    try {
+      const source = auto ? await detectSource(text, language) : plan.source;
+      if (source === language) return { text, status: 'skipped' };
+
+      const result = await withTimeout(
+        MlkitTranslate.translate({ text, source, target: language }),
+      );
+      const value = typeof result === 'string' && result.trim() ? result : text;
+      memoryCache[key] = value;
+      persistCache();
+      return { text: value, status: value === text ? 'unchanged' : 'translated' };
+    } catch (error) {
+      if (error?.code === 'ERR_MLKIT_MODEL_MISSING') {
+        // Not a failure — the model just is not here yet. Nudge the download and
+        // tell the caller to come back, without burning its retry budget.
+        modelRetryUntil = Date.now() + MODEL_RETRY_MS;
+        ensureLanguageReady(language);
+        return { text, status: 'deferred' };
+      }
+      if (error?.code === 'ERR_MLKIT_UNSUPPORTED_LANGUAGE') {
+        // Permanent for this pair — stop asking.
+        return { text, status: 'skipped' };
+      }
+      if (__DEV__) console.warn('[translate] failed:', error?.message || error);
+      // NOT cached: a transient failure must stay retryable.
+      return { text, status: 'failed' };
+    }
+  }).finally(() => inflight.delete(key));
 
   inflight.set(key, request);
   return request;
@@ -387,8 +462,8 @@ export async function t(text, language, from = SOURCE_LANGUAGE) {
  *
  * Reading starts at import time and the result is remembered here, so the very
  * first render after hydration already has the saved language and any later
- * remount is synchronous. English is now used ONLY when storage genuinely holds
- * no preference.
+ * remount is synchronous. English is used ONLY when storage genuinely holds no
+ * preference.
  */
 let cachedLanguage = null;
 let languageLoadPromise = null;
@@ -442,7 +517,21 @@ export function LanguageProvider({ children }) {
     return () => { alive = false; };
   }, [ready]);
 
-  const setLanguage = useCallback(async (code) => {
+  // Make sure the restored language can actually be translated into. A model
+  // deleted by the OS to reclaim space would otherwise leave the app silently
+  // untranslated until the user re-picked the language.
+  useEffect(() => {
+    if (!ready || language === SOURCE_LANGUAGE) return;
+    ensureLanguageReady(language);
+  }, [ready, language]);
+
+  /**
+   * `requireWifi` defaults to true for background callers. The picker passes
+   * false: the user tapped the language themselves and the screen shows the
+   * download size, so it is an informed choice rather than a surprise 30MB on
+   * someone's data plan.
+   */
+  const setLanguage = useCallback(async (code, { requireWifi = true } = {}) => {
     if (!code) return;
     cachedLanguage = code;               // remounts read this, not AsyncStorage
     setLang(code);                       // every <Text> re-renders — no app restart
@@ -451,6 +540,8 @@ export function LanguageProvider({ children }) {
     } catch (error) {
       if (__DEV__) console.warn('[translate] could not save language', error);
     }
+    // Picking a language IS the user asking for its model; start the download.
+    return ensureLanguageReady(code, { requireWifi });
   }, []);
 
   const value = useMemo(() => ({ language, setLanguage, ready }), [language, setLanguage, ready]);
@@ -487,12 +578,11 @@ export function useT(text, from = SOURCE_LANGUAGE) {
  * user names, messages, phone numbers, amounts, IDs, brand names.
  *
  * Only a plain string child is translated. `<Text>Hi {name}</Text>` compiles to
- * an ARRAY of children, and translating that would send the user's name to
- * Google — so arrays are rendered untouched. Split them instead:
+ * an ARRAY of children, and translating that would mangle the interpolated
+ * value — so arrays are rendered untouched. Split them instead:
  *   <Text>Hello</Text><Text ignore> {name}</Text>
  *
- * `from="auto"` makes the source language auto-detected instead of assumed
- * English.
+ * `from="auto"` makes the source language detected instead of assumed English.
  *
  * NOTE for long-form text (chat messages): prefer the `useT(text, 'auto')` hook
  * over this component. A nested <Text> that swaps its string asynchronously

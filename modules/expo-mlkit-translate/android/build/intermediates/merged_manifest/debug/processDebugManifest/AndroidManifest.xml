@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="expo.modules.mlkittranslate" >
+
+    <uses-sdk android:minSdkVersion="24" />
+    <!-- Models are fetched on demand from Google's servers. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+</manifest>

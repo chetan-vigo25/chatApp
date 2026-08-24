@@ -1,0 +1,7 @@
+{
+  "name": "expo-mlkit-translate",
+  "version": "1.0.0",
+  "description": "Expo native module wrapping Google ML Kit on-device Translation + Language Identification (Android & iOS).",
+  "main": "index.ts",
+  "private": true
+}
