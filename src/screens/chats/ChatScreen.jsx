@@ -109,6 +109,13 @@ const RICH_PARSE_CACHE_LIMIT = 500;
 const TRANSLATION_MAX_ATTEMPTS = 3;
 /** Floor for the self-heal timer, so a flapping network can't busy-loop it. */
 const TRANSLATION_RETRY_MIN_MS = 6000;
+/**
+ * How long a message may be withheld from its first paint while its translation
+ * resolves. On-device translation is milliseconds, so this is a safety net, not
+ * a wait — past it the row renders in the original language rather than staying
+ * invisible.
+ */
+const TRANSLATION_FIRST_PAINT_HOLD_MS = 700;
 
 /**
  * Which rows the message translator is allowed to touch.
@@ -2222,6 +2229,28 @@ export default function ChatScreen({ navigation, route }) {
   useEffect(() => {
     translationLanguageRef.current = language;
   }, [language]);
+
+  /**
+   * Translation for one message, resolved DURING RENDER.
+   *
+   * State is checked first, then the on-disk cache synchronously. That second
+   * step is what removes the flicker: a message whose translation is already
+   * cached is painted translated in its FIRST frame, instead of showing the
+   * original and being swapped a tick later by the effect below.
+   *
+   * Returns undefined when there is nothing cached — the caller then decides
+   * whether to hold the row back (see renderableMessages) or show the original.
+   */
+  const translationFor = useCallback((msg, messageKey) => {
+    if (!languageReady) return undefined;
+    const slot = `${messageKey}::${language}`;
+    const known = messageTranslations[slot];
+    if (known != null) return known;
+    if (!isTranslatableMessage(msg)) return undefined;
+    const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+    if (!body) return undefined;
+    return peekTranslation(body, language, 'auto') ?? undefined;
+  }, [languageReady, language, messageTranslations]);
 
   // Repaint from the PERSISTED cache before asking the network anything.
   //
@@ -6762,7 +6791,7 @@ export default function ChatScreen({ navigation, route }) {
                       (time+ticks is wide), overlapping the text. */}
                   <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
                     <View style={{ flexShrink: 1 }}>
-                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[`${messageKey}::${language}`])}
+                      {renderRichMessageText(msg, isMyMessage, messageKey, translationFor(msg, messageKey))}
                     </View>
                     {renderMessageMeta(msg, isMyMessage, { inline: true })}
                   </View>
@@ -6913,7 +6942,65 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor]);
+
+  /**
+   * Rows held back from their FIRST paint while their translation resolves.
+   *
+   * The requirement is "no intermediate original-language render": a message
+   * must appear already in the reader's language, not appear in the sender's
+   * and change a tick later. Since ML Kit runs on-device, that resolution is
+   * milliseconds — short enough to simply not draw the row yet.
+   *
+   * Every hold carries a deadline. If translation is slow, fails, or the model
+   * is still downloading, the row appears anyway with its original text: a
+   * message must NEVER be permanently invisible because of translation.
+   */
+  const translationHoldRef = useRef(new Map());   // messageKey::lang → deadline ms
+  const [, setHoldTick] = useState(0);
+  const holdTimerRef = useRef(null);
+
+  useEffect(() => () => clearTimeout(holdTimerRef.current), []);
+
+  const renderableMessages = useMemo(() => {
+    if (!Array.isArray(messages) || messages.length === 0) return messages;
+    // English reader + nothing to translate is the common case; skip all of it.
+    if (!languageReady) return messages;
+
+    const now = Date.now();
+    let earliestDeadline = Infinity;
+    const holds = translationHoldRef.current;
+
+    const visible = messages.filter((msg, index) => {
+      const key = getMessageKey(msg, index);
+      const slot = `${key}::${language}`;
+      // Resolved one way or the other — drop any hold so the map stays small.
+      if (messageTranslations[slot] != null) { holds.delete(slot); return true; }
+      if (translationSkipRef.current.has(slot)) { holds.delete(slot); return true; }
+      if (!isTranslatableMessage(msg)) return true;
+      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+      if (!body) return true;
+      // resolveRequest says "skipped" for same-script pairs; peek returning null
+      // is ambiguous, so lean on the effect's skip set plus the deadline below.
+      if (peekTranslation(body, language, 'auto')) return true; // cache hit, paints translated
+
+      const deadline = holds.get(slot) ?? (now + TRANSLATION_FIRST_PAINT_HOLD_MS);
+      if (!holds.has(slot)) holds.set(slot, deadline);
+      if (now >= deadline) return true;                         // waited long enough
+      earliestDeadline = Math.min(earliestDeadline, deadline);
+      return false;
+    });
+
+    // Wake up exactly when the soonest hold expires so those rows appear.
+    if (earliestDeadline !== Infinity) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = setTimeout(
+        () => setHoldTick((n) => n + 1),
+        Math.max(earliestDeadline - now, 16),
+      );
+    }
+    return visible.length === messages.length ? messages : visible;
+  }, [messages, language, languageReady, messageTranslations]);
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
@@ -7492,7 +7579,9 @@ export default function ChatScreen({ navigation, route }) {
           <View style={{ flex: 1 }}>
           <FlatList
             ref={flatListRef}
-            data={messages}
+            // Held-back rows are excluded here, so a message never paints in
+            // the sender's language and then switches. See renderableMessages.
+            data={renderableMessages}
             keyExtractor={getMessageKey}
             renderItem={renderChatsItem}
             // Download/upload state lives OUTSIDE the `messages` array (in

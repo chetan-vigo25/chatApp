@@ -167,21 +167,58 @@ ek timer lagta hai jo model aane par apne aap dobara try karta hai.
 Har message pe alag `setState` matlab poori FlatList ka ek re-render. Results
 batch hokar ek commit me jate hain.
 
+### Flicker — original pehle mat dikhao
+
+Message pehle sender ki language me paint hota tha, phir translation aane pe
+badal jata tha. Do cheezein isse rokti hain:
+
+1. **`translationFor()` render ke DAURAN resolve karta hai** — state, phir
+   `peekTranslation()` (synchronous disk cache). Jo message pehle translate ho
+   chuka hai wo **pehle hi frame me** translated paint hota hai.
+
+2. **`renderableMessages`** — jis message ka translation abhi nahi hai, uski row
+   FlatList ko di hi nahi jati. On-device translation milliseconds ki hai, to
+   row bas thodi der baad aati hai — original kabhi flash nahi hota.
+
+`TRANSLATION_FIRST_PAINT_HOLD_MS` (700ms) safety net hai: iske baad row original
+text ke saath dikh jati hai. **Message kabhi permanently invisible nahi hona
+chahiye** — translation fail ho, model download ho raha ho, kuch bhi ho.
+
+Pehli translation model ko RAM me load karti hai, isliye wo slow ho sakti hai.
+Device pe hold time tune karna pad sakta hai.
+
 ---
 
-## 6. Source language kaise chunti hai
+## 6. Source language kaise chunti hai (aur Hinglish ki sachai)
 
-| Message ka script | Reader | Source |
+| Message | Reader | Source |
 |---|---|---|
 | Apni script (Devanagari/Thai/Arabic/CJK) | koi bhi | `identifyLanguage()` |
-| Latin | non-Latin reader (hi, th, ta, ar, ja, zh…) | **forced `en`** |
+| Latin, detector kehta hai `en` (ya `und`) | non-Latin reader | `en` → translate |
+| Latin, detector kehta hai kuch aur (Hinglish) | non-Latin reader | **refuse — original hi rehta hai** |
 
-**Latin pe `en` force kyun?** Hinglish. `"Ab btao"` ko detector `hi` batata hai;
-reader bhi `hi` hai → source == target → message jaisa ka waisa wapas. `en`
-force karne se `"अब बताओ"` milta hai, aur asli English messages pe koi farak
-nahi padta (English hi source hai).
+### Hinglish on-device translate NAHI hoti — ye limitation hai, bug nahi
 
-`identifyLanguage` `'und'` de to English maan lete hain.
+`"Ab btao"`, `"kya kr rha h"` — Hindi, Latin letters me. ML Kit ke models
+**scripts ke beech** translate karte hain: `hi→x` model Devanagari maangta hai,
+`en→x` model asli English maangta hai. Romanized Hindi ko `en→hi` me daalne se
+model unknown tokens copy kar deta hai — output kabhi input jaisa hi, kabhi
+aadha-mangled. Yahi "kabhi kabhi kaam karta hai" wali shikayat thi.
+
+Isliye ab **detector se poocha jata hai**. Latin text tabhi English mana jata hai
+jab detector bhi English kahe; warna message **jaisa ka waisa** chhod diya jata
+hai. Ye "kabhi-kabhi mangled" ko "hamesha predictable" se badalta hai — par
+Hinglish translate phir bhi nahi hoti.
+
+**Hinglish sach me chahiye to** romanized input pe trained model chahiye, yani
+cloud API (Google Cloud Translation apne backend proxy ke through). On-device
+ML Kit se ye possible nahi hai. Agar aapke users mostly Hinglish likhte hain, to
+ye product-level decision hai, code ka issue nahi.
+
+### Request kab jati hai
+
+Sasta **script check** pehle — same script = 0 kaam. Latin aapas me alag nahi ho
+sakti, isliye French message English reader ko waisa hi dikhega.
 
 ### Request kab jati hai
 

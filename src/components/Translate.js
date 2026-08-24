@@ -297,40 +297,50 @@ function looksAlreadyReadable(text, language) {
 }
 
 /**
- * Latin text + a reader whose language uses its own script → treat it as
- * English rather than asking the detector.
+ * Decide the source language, or refuse.
  *
- * Romanized Hindi ("Kya kru", "Ab btao") is detected as `hi`, which would make
- * source == target and return the message unchanged. Forcing English at least
- * produces Devanagari, and genuinely English messages are unaffected.
+ * Returns a language tag, or `null` meaning "leave this message alone".
  *
- * Returns null when the detector should decide.
- */
-function presumedSource(text, language) {
-  const readerUsesOwnScript = Boolean(SCRIPT_OF[language]);
-  const messageIsLatin = !NON_LATIN_SCRIPT.test(text);
-  return readerUsesOwnScript && messageIsLatin ? SOURCE_LANGUAGE : null;
-}
-
-/**
- * Ask ML Kit what language a message is in.
+ * ── The Hinglish problem, and why this refuses ───────────────────────────────
+ * "Ab btao", "kya kr rha h" is Hindi typed in Latin letters. ML Kit's detector
+ * correctly calls it `hi`, but its models translate BETWEEN SCRIPTS: the hi→x
+ * model expects Devanagari, and the en→x model expects real English. Feeding
+ * romanized Hindi to en→hi makes the model copy the tokens it does not know, so
+ * the output is sometimes the input verbatim and sometimes half-mangled — the
+ * "kabhi kabhi" behaviour users reported.
  *
- * Falls back to English on 'und' (short or mixed strings often land there) —
- * guessing English is what the app assumed before detection existed, so it is
- * the safe default rather than a new failure mode.
+ * Guessing English (what this used to do unconditionally) is therefore wrong.
+ * Latin text is only treated as English when the DETECTOR agrees it is English;
+ * otherwise the message is left exactly as the sender typed it. That trades
+ * "occasionally mangled" for "always predictable".
+ *
+ * Making Hinglish actually translate needs a model trained on romanized input —
+ * i.e. the cloud API. See docs/APP_LANGUAGE_GUIDE.md.
  */
 async function detectSource(text, language) {
-  const presumed = presumedSource(text, language);
-  if (presumed) return presumed;
+  const readerUsesOwnScript = Boolean(SCRIPT_OF[language]);
+  const messageIsLatin = !NON_LATIN_SCRIPT.test(text);
+
+  let detected = null;
   try {
-    const detected = await MlkitTranslate.identifyLanguage(text);
-    if (!detected || detected === 'und') return SOURCE_LANGUAGE;
-    // ML Kit returns BCP-47 with regions ("zh-Hant"); the models are keyed on
-    // the base tag.
-    return String(detected).split('-')[0];
+    const raw = await MlkitTranslate.identifyLanguage(text);
+    // ML Kit returns BCP-47 with regions ("zh-Hant"); models are keyed on the
+    // base tag.
+    if (raw && raw !== 'und') detected = String(raw).split('-')[0];
   } catch {
-    return SOURCE_LANGUAGE;
+    detected = null;
   }
+
+  if (messageIsLatin && readerUsesOwnScript) {
+    // Undetermined is usually a very short string ("ok", "yes"); English is the
+    // safe read there. Anything the detector names as non-English in Latin
+    // letters is romanized text ML Kit cannot handle — refuse rather than mangle.
+    if (detected == null || detected === SOURCE_LANGUAGE) return SOURCE_LANGUAGE;
+    return null;
+  }
+
+  // Text in its own script: trust the detector, fall back to English.
+  return detected ?? SOURCE_LANGUAGE;
 }
 
 /* ─────────────────────────── translate entry ─────────────────────────── */
@@ -412,6 +422,9 @@ export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) 
   const request = enqueue(async () => {
     try {
       const source = auto ? await detectSource(text, language) : plan.source;
+      // null = romanized text no on-device model can handle. Definitive, so the
+      // caller stops asking instead of retrying something that cannot work.
+      if (source == null) return { text, status: 'skipped' };
       if (source === language) return { text, status: 'skipped' };
 
       const result = await withTimeout(
