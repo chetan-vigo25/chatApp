@@ -231,9 +231,33 @@ const stampCacheOwnerForBootstrap = (userId) => {
   } catch {}
 };
 
+// DEVICE preferences, not account data. AsyncStorage.clear() below is
+// indiscriminate, so a token-refresh failure or a re-login silently reset the
+// app language to English and threw away every cached translation — the user
+// picked Hindi once and found the app back in English after a reload. These
+// keys are read before the wipe and written back after it.
+const DEVICE_PREFERENCE_KEYS = ['app.language', 'translation.cache.v2'];
+
+const preserveDevicePreferences = async (wipe) => {
+  let saved = [];
+  try {
+    saved = (await AsyncStorage.multiGet(DEVICE_PREFERENCE_KEYS))
+      .filter(([, value]) => value != null);
+  } catch {}
+
+  await wipe();
+
+  if (saved.length === 0) return;
+  try {
+    await AsyncStorage.multiSet(saved);
+  } catch (error) {
+    console.warn('Unable to restore device preferences after wipe', error);
+  }
+};
+
 export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
   if (clearAllStorage) {
-    await AsyncStorage.clear();
+    await preserveDevicePreferences(() => AsyncStorage.clear());
   } else {
     await AsyncStorage.multiRemove(Object.values(AUTH_KEYS));
 

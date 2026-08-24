@@ -60,6 +60,7 @@ import StatusViewerScreen from "../screens/status/StatusViewer";
 import CallDetailScreen from "../screens/calls/CallDetailScreen";
 import NewCallScreen from "../screens/calls/NewCallScreen";
 import ShareInboxScreen from "../screens/chats/ShareInboxScreen";
+import ChooseLanguage from "../screens/profiles/ChooseLanguage";
 import ShareIntentGate from "../share/ShareIntentGate";
 
 import BottomTabNavigator from "./BottomTabNavigator";
@@ -141,6 +142,7 @@ export default function RootNavigator() {
           <Stack.Screen name="ChannelInfo" component={ChannelInfo} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />
           <Stack.Screen name="ChatPrivacy" component={ChatPrivacy} />
+          <Stack.Screen name="ChooseLanguage" component={ChooseLanguage} />
           <Stack.Screen name="PrivacyAccount" component={PrivacyAccount} />
           <Stack.Screen name="BlockedContacts" component={BlockedContacts} />
           <Stack.Screen name="DeleteAccount" component={DeleteAccount} />

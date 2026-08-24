@@ -26,6 +26,7 @@ import { CallProvider } from './src/calls/CallProvider';
 import CallContentInset from './src/calls/components/CallContentInset';
 import AppLockGate from './src/components/AppLockGate';
 import { ShareIntentProvider } from 'expo-share-intent';
+import { LanguageProvider } from './src/components/Translate';
  
 import 'react-native-gesture-handler';
 
@@ -123,6 +124,10 @@ export default function App() {
      <SafeAreaProvider>
      <KeyboardProvider statusBarTranslucent navigationBarTranslucent>
        <ThemeProvider>
+        {/* Selected app language + the on-disk translation cache. Sits high so
+            every screen using the translated <Text> re-renders the moment the
+            user picks a different language — no app restart needed. */}
+        <LanguageProvider>
          <NetworkProvider>
           <ThemedPaperProvider>
            <DeviceInfoProvider>
@@ -147,6 +152,7 @@ export default function App() {
            </DeviceInfoProvider>
           </ThemedPaperProvider>
          </NetworkProvider>
+        </LanguageProvider>
        </ThemeProvider>
      </KeyboardProvider>
      </SafeAreaProvider>

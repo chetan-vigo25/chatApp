@@ -3,6 +3,10 @@ import {
   View, Text, Image, Animated, TouchableOpacity, ScrollView,
   Alert, StyleSheet, ActivityIndicator, Platform,
 } from "react-native";
+// `useLanguage` powers the "App language" row; `getLanguage` turns the saved
+// code ("hi") into its flag + native name for the subtitle.
+import { useLanguage } from "../../components/Translate";
+import { getLanguage } from "../../constant/languages";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import { useFocusEffect } from "@react-navigation/native";
@@ -24,6 +28,8 @@ export default function Setting({ navigation }) {
   const slideAnim = useRef(new Animated.Value(14)).current;
   const dispatch = useDispatch();
   const { profileData } = useSelector(state => state.profile);
+  const { language } = useLanguage();
+  const currentLanguage = getLanguage(language);
 
   const [isBackingUp, setIsBackingUp] = useState(false);
   const [backupStatus, setBackupStatus] = useState('');
@@ -115,6 +121,16 @@ export default function Setting({ navigation }) {
           subtitle: 'Chat delete & app lock password',
           onPress: () => navigation.navigate('ChatPrivacy'),
         },
+        {
+          icon: 'language-outline',
+          label: 'App language',
+          // Already in its own script — must never be re-translated. This screen
+          // renders with react-native's <Text>, so nothing translates it; the flag
+          // keeps that explicit if the screen is ever opted in.
+          subtitle: `${currentLanguage.flag}  ${currentLanguage.label}`,
+          ignoreSubtitle: true,
+          onPress: () => navigation.navigate('ChooseLanguage'),
+        },
       ],
     },
     // OEM skins (MIUI, FuntouchOS, …) block a killed/rebooted app from waking on
@@ -185,7 +201,7 @@ export default function Setting({ navigation }) {
         },
       ],
     },
-  ]), [isDarkMode, isBackingUp, backupStatus]);
+  ]), [isDarkMode, isBackingUp, backupStatus, currentLanguage]);
 
 
   const renderProfileCard = () => (

@@ -90,6 +90,10 @@ import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket
 import CallButtons from '../../calls/components/CallButtons';
 import GroupCallButtons from '../../calls/components/GroupCallButtons';
 import CallMessageBubble from '../../calls/components/CallMessageBubble';
+// Message-body text only. Everything else on this screen keeps React
+// Native's <Text>: names, timestamps, ticks, menus and system rows must
+// never be sent to a translation API.
+import { translateDetailed, ensureTranslationCacheReady, peekTranslation, getRetryDelay, useLanguage } from "../../components/Translate";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -100,6 +104,31 @@ const LARGE_DOWNLOAD_BYTES = 8 * 1024 * 1024;
 const RICH_TEXT_CHAR_LIMIT = 520;
 const RICH_TEXT_COLLAPSED_LINES = 30;
 const RICH_PARSE_CACHE_LIMIT = 500;
+// A chat-message translation may fail transiently (rate limit, offline). It stays
+// retryable, but not forever — a dead network must not spin requests per render.
+const TRANSLATION_MAX_ATTEMPTS = 3;
+/** Floor for the self-heal timer, so a flapping network can't busy-loop it. */
+const TRANSLATION_RETRY_MIN_MS = 6000;
+
+/**
+ * Which rows the message translator is allowed to touch.
+ *
+ * `deletedFor` is deliberately NOT tested for truthiness: it is an array of the
+ * users who deleted the message for themselves, so a message another
+ * participant removed from their own view is a normal, visible message here —
+ * a bare `|| msg.deletedFor` skipped it forever. Delete-for-everyone is already
+ * covered: it sets `isDeleted` and rewrites the row to type 'system'.
+ *
+ * @mentions are skipped outright — translating them mangles the names and
+ * invalidates the mention offsets.
+ */
+const isTranslatableMessage = (msg) => (
+  Boolean(msg)
+  && msg.type === 'text'
+  && !msg.isDeleted
+  && !msg.mentions
+  && !msg.payload?.mentions
+);
 
 // Auto-detect unfenced code (Teams-style): a multi-line message where most
 // lines carry code signals (keywords, tag/brace/semicolon shapes, indentation)
@@ -1416,6 +1445,11 @@ export default function ChatScreen({ navigation, route }) {
   const sentBubbleText = onColorFor(sentBubbleBg);
   const sentBubbleMeta = metaOnColorFor(sentBubbleBg);
   const { isConnected, networkType } = useNetwork();
+  // Reader's app language. Only the message BODY is translated (see the
+  // translation state + effect below); the rest of this screen stays untouched.
+  // `languageReady` is false until the saved preference has been read back —
+  // translating before that runs the whole pass as English.
+  const { language, ready: languageReady } = useLanguage();
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   // Frame-synced keyboard height from react-native-keyboard-controller. Tracks the
   // native keyboard 1:1 on iOS + Android (60fps, no jump). `height` is negative
@@ -1451,6 +1485,44 @@ export default function ChatScreen({ navigation, route }) {
   const [recentEmojis, setRecentEmojis] = useState(['😀', '😂', '❤️', '👍', '🔥', '🙏']);
   const [expandedRichMessages, setExpandedRichMessages] = useState({});
   const [richMessageLineCounts, setRichMessageLineCounts] = useState({});
+
+  /* ── Chat message translation ──────────────────────────────────────────────
+     Translations live HERE, above the bubble, on purpose.
+
+     Rendering a translated <Text> inside the bubble re-renders only that
+     descendant, so the bubble's own measured box stays stale: a wider
+     translation wrapped to a second line that the 1-line-tall bubble then
+     CLIPPED ("क्या हुआ" showing as just "क्या"). Keeping the text in list-level
+     state means renderChatsItem re-renders the whole row with the final string,
+     so width and height are measured together.
+
+     Keyed by `${messageKey}::${language}`, NOT by messageKey alone, and never
+     cleared on a language switch. Switching hi → en → hi therefore restores the
+     Hindi text instantly from state — no refetch, no flicker, and no dependence
+     on the network still being reachable. Wiping the map on every switch is
+     what made the second switch back come up empty.
+
+     msg.text is never overwritten — this is display only. */
+  const [messageTranslations, setMessageTranslations] = useState({});
+  // Slots (`${messageKey}::${language}`) the engine said need no translation —
+  // empty text, same language, or already in the reader's script. Recorded only
+  // AFTER a definitive answer, so a failed request is never mistaken for one.
+  const translationSkipRef = useRef(new Set());
+  // Slots with a request in flight right now (prevents duplicate calls).
+  const translationInflightRef = useRef(new Set());
+  // Slot → failed attempts. Failures stay retryable, but not forever.
+  const translationFailRef = useRef(new Map());
+  // A translation result may only be dropped when the SCREEN is gone or the
+  // reader switched language — never because `messages` changed. See the
+  // translate effect below for why that distinction matters.
+  const translationMountedRef = useRef(true);
+  const translationLanguageRef = useRef(language);
+  // Bumped by the retry timer below. A translation that failed (offline, or the
+  // free endpoint rate-limiting us) used to stay English forever: nothing
+  // re-ran the effect once the network recovered, because `messages` and
+  // `language` had not changed. This tick is that missing trigger.
+  const [translationRetryTick, setTranslationRetryTick] = useState(0);
+  const translationRetryTimerRef = useRef(null);
   const [isRecordingAudio, setIsRecordingAudio] = useState(false);
   const [recordingDurationMs, setRecordingDurationMs] = useState(0);
   const audioRecordingRef = useRef(null);
@@ -2123,6 +2195,148 @@ export default function ChatScreen({ navigation, route }) {
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
+
+  useEffect(() => {
+    translationMountedRef.current = true;
+    return () => {
+      translationMountedRef.current = false;
+      clearTimeout(translationRetryTimerRef.current);
+    };
+  }, []);
+
+  // Track the reader's language for the async guard below. Nothing is cleared:
+  // both the seen-set tokens and the translation map are already scoped by
+  // language, so previous languages stay valid and switching back is instant.
+  useEffect(() => {
+    translationLanguageRef.current = language;
+  }, [language]);
+
+  // Repaint from the PERSISTED cache before asking the network anything.
+  //
+  // messageTranslations is component state, so reopening a chat starts empty —
+  // which is why a message translated in the previous session came back in
+  // English. The on-disk translation cache already holds the string, so one
+  // synchronous sweep restores every previously translated bubble in the first
+  // frame: no requests, and it works with no connectivity at all.
+  useEffect(() => {
+    if (!languageReady) return undefined;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    let alive = true;
+    ensureTranslationCacheReady().then(() => {
+      if (!alive) return;
+      const seeded = {};
+      messages.forEach((msg, index) => {
+        if (!isTranslatableMessage(msg)) return;
+        const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+        if (!body) return;
+        const slot = `${getMessageKey(msg, index)}::${language}`;
+        if (messageTranslations[slot] != null) return;
+        const hit = peekTranslation(body, language, 'auto');
+        if (hit) seeded[slot] = hit;
+      });
+      if (Object.keys(seeded).length === 0) return;
+      setMessageTranslations((prev) => ({ ...seeded, ...prev }));
+    });
+    return () => { alive = false; };
+  }, [messages, language, languageReady, messageTranslations]);
+
+  // Translate the loaded text messages once each. The service caches by text +
+  // language and caps itself at 4 concurrent requests, so this stays cheap.
+  // Messages carrying @mentions are skipped — translating them mangles names.
+  useEffect(() => {
+    // Never run under a provisional language: before the saved preference is
+    // read back `language` is still 'en', and a pass at that point answers
+    // "nothing to do" for every English message and caches that verdict.
+    if (!languageReady) return undefined;
+    if (!Array.isArray(messages) || messages.length === 0) return undefined;
+    const pending = [];
+    messages.forEach((msg, index) => {
+      if (!isTranslatableMessage(msg)) return;
+      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+      if (!body) return;
+      const key = getMessageKey(msg, index);
+      const slot = `${key}::${language}`;
+      // Work is derived from STATE, not from a fire-and-forget token set: a
+      // slot is pending unless it already has a translation, was answered as
+      // "nothing to do", is being fetched right now, or has failed too often.
+      if (messageTranslations[slot] != null) return;
+      if (translationSkipRef.current.has(slot)) return;
+      if (translationInflightRef.current.has(slot)) return;
+      if ((translationFailRef.current.get(slot) || 0) >= TRANSLATION_MAX_ATTEMPTS) return;
+      translationInflightRef.current.add(slot);
+      pending.push({ key, slot, body });
+    });
+    if (pending.length === 0) return undefined;
+
+    if (__DEV__) {
+      console.log(`[chat-translate] language=${language} pending=${pending.length}`);
+    }
+
+    // NOTE: no per-run cancellation flag here, deliberately.
+    //
+    // This effect depends on `messages`, and an INCOMING message triggers a
+    // burst of further `messages` updates (delivery receipt → read receipt →
+    // status sent/delivered/seen → SQLite refresh). A cleanup that flipped an
+    // `alive` flag would abort the translation that was still in flight for the
+    // message that had just arrived — and because its slot is already marked
+    // in-flight/seen it would never be retried, so the bubble stayed
+    // untranslated until the screen was reopened with a fresh Set.
+    //
+    // A result is therefore only discarded when the screen unmounted or the
+    // reader changed language, both of which outlive a single effect run.
+    let deferred = false;
+    Promise.all(pending.map(async ({ slot, body }) => {
+      let outcome = { text: body, status: 'failed' };
+      try {
+        outcome = await translateDetailed(body, language, 'auto');
+      } catch (error) {
+        if (__DEV__) console.warn('[chat-translate] unexpected error', error?.message || error);
+      }
+      translationInflightRef.current.delete(slot);
+      if (!translationMountedRef.current) return;
+      if (translationLanguageRef.current !== language) return;
+
+      // Rate-limit cooldown: nothing was even attempted, so this must NOT eat a
+      // retry. The timer at the end of this effect brings it back.
+      if (outcome.status === 'deferred') { deferred = true; return; }
+
+      if (outcome.status === 'failed') {
+        // Keep it retryable — the retry timer below (and any messages/language
+        // update) tries again, up to TRANSLATION_MAX_ATTEMPTS so a dead network
+        // can't spin forever.
+        const attempts = (translationFailRef.current.get(slot) || 0) + 1;
+        translationFailRef.current.set(slot, attempts);
+        if (__DEV__) console.warn(`[chat-translate] failed (${attempts}) "${body.slice(0, 30)}"`);
+        return;
+      }
+      translationFailRef.current.delete(slot);
+
+      if (outcome.status === 'translated' && outcome.text && outcome.text !== body) {
+        setMessageTranslations((prev) => (
+          prev[slot] === outcome.text ? prev : { ...prev, [slot]: outcome.text }
+        ));
+        return;
+      }
+      // 'skipped' / 'unchanged' — a definitive "nothing to show", so stop asking.
+      translationSkipRef.current.add(slot);
+    })).then(() => {
+      // Self-heal. Anything still owed a translation — deferred by the cooldown,
+      // or failed with retries left — gets one scheduled wake-up. Without this a
+      // single 429 left the chat in English until the user reopened it.
+      if (!translationMountedRef.current) return;
+      if (translationLanguageRef.current !== language) return;
+      const suffix = `::${language}`;
+      const retryable = deferred || Array.from(translationFailRef.current.entries())
+        .some(([key, n]) => n < TRANSLATION_MAX_ATTEMPTS && key.endsWith(suffix));
+      if (!retryable) return;
+      clearTimeout(translationRetryTimerRef.current);
+      translationRetryTimerRef.current = setTimeout(() => {
+        if (translationMountedRef.current) setTranslationRetryTick((n) => n + 1);
+      }, Math.max(getRetryDelay(), TRANSLATION_RETRY_MIN_MS));
+    }).catch(() => {});
+
+    return undefined;
+  }, [messages, language, languageReady, messageTranslations, translationRetryTick]);
 
   // When the user shares media into the app from the native share sheet,
   // ShareInboxScreen opens this thread with a `pendingShare` param. Feed those
@@ -4749,8 +4963,14 @@ export default function ChatScreen({ navigation, route }) {
     });
   };
 
-  const renderRichMessageText = (msg, isMyMessage, messageKey) => {
-    const parsed = getParsedRichMessage(msg?.text || '');
+  const renderRichMessageText = (msg, isMyMessage, messageKey, translatedText) => {
+    // `translatedText` arrives already resolved from list-level state, so the
+    // whole row lays out with the final string (see the translation state
+    // above). msg.text itself is never overwritten — this is display only.
+    const displayText = (typeof translatedText === 'string' && translatedText.trim())
+      ? translatedText
+      : (msg?.text || '');
+    const parsed = getParsedRichMessage(displayText);
     const isExpanded = Boolean(expandedRichMessages[messageKey]);
     const measuredLineCount = Number(richMessageLineCounts[messageKey] || 0);
     const showReadMore = measuredLineCount > RICH_TEXT_COLLAPSED_LINES;
@@ -6494,7 +6714,7 @@ export default function ChatScreen({ navigation, route }) {
                       (time+ticks is wide), overlapping the text. */}
                   <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
                     <View style={{ flexShrink: 1 }}>
-                      {renderRichMessageText(msg, isMyMessage, messageKey)}
+                      {renderRichMessageText(msg, isMyMessage, messageKey, messageTranslations[`${messageKey}::${language}`])}
                     </View>
                     {renderMessageMeta(msg, isMyMessage, { inline: true })}
                   </View>
@@ -6645,15 +6865,17 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations]);
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
   // media cell must re-render (e.g. a finished download replacing the blurred
-  // placeholder with the local file:// image).
+  // placeholder with the local file:// image). It also carries
+  // messageTranslations + language: a translation landing must re-render the
+  // whole row, otherwise the bubble keeps painting the original text.
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language]
   );
 
   // Typing indicator
