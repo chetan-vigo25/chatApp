@@ -103,6 +103,18 @@ const getRingTimeoutMs = () => clampRingSec(getServerRingDurationSec() || ENV_RI
 // on "Connecting…" forever. 30s ≈ WhatsApp's "couldn't connect" window.
 const CONNECT_TIMEOUT_MS = 30000;
 
+// A CONFERENCE/GROUP invite arrives on TWO planes: the backend `call:incoming`
+// signal and the media server's own ring (SDK `incomingGroupCall` → engine
+// `incoming`), which is what carries the WebRTC callId we need to actually JOIN
+// the room. Both are emitted from the same invite and normally land in the same
+// tick. When only the signal arrives, accept() parks on `pendingAccept` with no
+// callId — nothing is in flight and waiting cannot help, yet the user stared at
+// "Connecting…" for the full CONNECT_TIMEOUT_MS before the call died (log-proven
+// on a conference re-invite: roster said CONNECTED while the engine never rang).
+// Fail fast instead, with a message that says what actually happened. Generous
+// vs the normal same-tick arrival, so a slow media socket is never false-killed.
+const MEDIA_RING_TIMEOUT_MS = 12000;
+
 // How long to wait for the engine's `localstream` (getUserMedia succeeded)
 // before declaring the mic/camera unreachable. Was 10s — too tight: a cold
 // mic, a deferred video-camera capture (background/CallKit answer), a loaded
@@ -218,12 +230,17 @@ export const CallProvider = ({ children }) => {
   const ringTimeoutRef = useRef(null); // auto-end an unanswered ringing call
   const mediaWatchdogRef = useRef(null); // detect a hung getUserMedia (no localstream)
   const connectWatchdogRef = useRef(null); // detect an answered call that never reaches ACTIVE (no remote media)
+  const mediaRingWatchdogRef = useRef(null); // answered, but the media server's ring (WebRTC callId) never arrived
+  const acceptingRef = useRef(false);      // synchronous accept lock (double-tap / re-render re-entry)
   const reconnectWatchdogRef = useRef(null); // mid-call media-drop recovery watchdog (APP-6)
   const audioRouteAppliedRef = useRef(false); // did the user toggle Speaker this call? (so we reset routing on end)
   const initialRouteAppliedRef = useRef(false); // initial earpiece/speaker route applied for THIS call (once, at connect)
   const presenceWaiters = useRef({}); // ref -> resolve
   const pingWaiters = useRef({});     // ref -> resolve (engine liveness probe)
   const readyWaiters = useRef([]);    // [resolve]
+  // Last mid-call "Add participant" attempt — { id: name } — so a failed
+  // media-server invite (EVT.GROUP_INVITE_RESULT) can name who didn't get added.
+  const lastInviteNamesRef = useRef({});
   // Mid-call "Add participant" rings, keyed on their own fresh signaling ids —
   // [{ sigId, ids }] — so call-end can cancel any invite still ringing.
   const inviteSignalsRef = useRef([]);
@@ -774,6 +791,16 @@ export const CallProvider = ({ children }) => {
     }
   }, []);
 
+  // ---- media-ring watchdog: we ANSWERED but the media server never rang this
+  // device, so no WebRTC callId ever landed and CMD.ACCEPT could not be sent.
+  // Shorter than the connect watchdog on purpose (see MEDIA_RING_TIMEOUT_MS). ----
+  const clearMediaRingWatchdog = useCallback(() => {
+    if (mediaRingWatchdogRef.current) {
+      clearTimeout(mediaRingWatchdogRef.current);
+      mediaRingWatchdogRef.current = null;
+    }
+  }, []);
+
   // ---- mid-call reconnect watchdog (APP-6) ----
   // A live call whose media layer dropped (network blip / ICE failed) is given a
   // window to recover (auto ICE restart + the engine's own reconnect). If it
@@ -1052,9 +1079,11 @@ export const CallProvider = ({ children }) => {
     nativeEndPendingRef.current = 0;
     myAcceptedCallRef.current = { id: null, ts: 0 };
     stagedIncomingRef.current = { peerId: null, ts: 0 };
+    acceptingRef.current = false;
     clearRingTimeout();
     clearMediaWatchdog();
     clearConnectWatchdog();
+    clearMediaRingWatchdog();
     clearReconnectWatchdog();
     clearGroupRingSweep();
     // Remember this call's ids briefly: the peer engine's offline-redial /
@@ -1296,7 +1325,7 @@ export const CallProvider = ({ children }) => {
       }
       dispatch({ type: ACT.RESET });
     }, resetDelay);
-  }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, clearGroupRingSweep, resetAudioRoute]);
+  }, [myId, sendCmd, stopRinging, clearRingTimeout, clearMediaWatchdog, clearConnectWatchdog, clearMediaRingWatchdog, clearReconnectWatchdog, clearGroupRingSweep, resetAudioRoute]);
 
   // ---- group roster lifecycle (per-participant, never the whole call) ----
   // Drop ONE member from the live group roster (declined / left / never
@@ -1388,6 +1417,29 @@ export const CallProvider = ({ children }) => {
       finalizeEnd('failed', 'Could not connect the call');
     }, CONNECT_TIMEOUT_MS);
   }, [clearConnectWatchdog, finalizeEnd]);
+
+  // Arm the media-ring watchdog. Only meaningful while the accept is parked on
+  // `pendingAccept` with no callId; it self-checks at fire time, so the callId
+  // landing late needs no explicit clear — the connect watchdog owns the call
+  // from that point on.
+  const armMediaRingWatchdog = useCallback(() => {
+    clearMediaRingWatchdog();
+    mediaRingWatchdogRef.current = setTimeout(() => {
+      mediaRingWatchdogRef.current = null;
+      const snap = stateRef.current;
+      if (snap.status === CALL_STATUS.ACTIVE
+        || snap.status === CALL_STATUS.IDLE
+        || snap.status === CALL_STATUS.ENDED) return;
+      if (snap.callId) return;        // the media ring landed — connect watchdog takes over
+      if (!snap.pendingAccept) return; // not waiting on the engine any more
+      if (__DEV__) {
+        console.log('[CALL] media-ring watchdog — answered but the media server never rang this device', {
+          signalId: snap.signalId, isConference: snap.isConference, isGroup: snap.isGroup,
+        });
+      }
+      finalizeEnd('failed', 'Could not join the call');
+    }, MEDIA_RING_TIMEOUT_MS);
+  }, [clearMediaRingWatchdog, finalizeEnd]);
 
   // Arm the mid-call reconnect watchdog (APP-6). Fires once if the dropped media
   // layer hasn't recovered within RECONNECT_TIMEOUT_MS — ending the call as
@@ -1883,6 +1935,24 @@ export const CallProvider = ({ children }) => {
         Alert.alert('Camera', payload?.message || 'Could not start the camera.');
         break;
       }
+      case 'groupInviteResult': {
+        if (payload?.ok) {
+          if (__DEV__) console.log('[CALL][APP] group invite → media server OK', payload?.ids || []);
+          break;
+        }
+        // The media-server half of the invite failed. The backend conference
+        // invite still went out, so the invitee WILL ring and WILL appear in the
+        // roster — but no media ring reaches them and they die on "Connecting…".
+        // Tell the inviter instead of leaving them to guess.
+        if (__DEV__) console.log('[CALL][APP] group invite → media server FAILED', { ids: payload?.ids || [], message: payload?.message || '' });
+        {
+          const names = (payload?.ids || [])
+            .map((id) => lastInviteNamesRef.current[String(id)] || 'Member');
+          const who = names.length ? names.join(', ') : 'The member';
+          Alert.alert('Group call', `Couldn't add ${who} to the call. Please try again.`);
+        }
+        break;
+      }
       // The engine's accept failed (the retrying accept exhausted its tries).
       // Do NOT end the call instantly: on a reconnecting / half-open media
       // socket the engine can throw `not connected` 3× within ~4.5s on an
@@ -2223,6 +2293,15 @@ export const CallProvider = ({ children }) => {
     const snap = stateRef.current;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 1 accept tapped ═════', { status: snap.status, callId: snap.callId, signalId: snap.signalId, media: snap.media, isGroup: snap.isGroup, peer: snap.peer, awaitingEngine: snap.awaitingEngine });
     if (snap.status !== CALL_STATUS.INCOMING) return;
+    // SYNCHRONOUS re-entry lock. `status` stays INCOMING after ACT.ACCEPT (only
+    // `accepted` flips), and stateRef trails the commit by a tick — so the guard
+    // above let a double-tap (or a re-render firing onPress twice) run accept()
+    // TWICE: two ACT.ACCEPT dispatches, two call:accept + call:conference:accept
+    // emits (server replied `duplicate: true`), two connect watchdogs and two
+    // CMD.ACCEPTs into the engine. Mirrors startingRef on the outgoing path.
+    // Released by finalizeEnd and by the next incoming ring.
+    if (acceptingRef.current || snap.accepted) return;
+    acceptingRef.current = true;
     // The user TAPPED accept — the ring is over. Stop the no-answer timer and
     // the ringtone RIGHT NOW, before the (awaited) permission prompt and iOS
     // audio-session setup. Otherwise, on a first-ever call the OS mic/camera
@@ -2391,10 +2470,14 @@ export const CallProvider = ({ children }) => {
       // Engine is up but the WebRTC `incoming` (with the real callId) hasn't
       // arrived yet. Mark pending; the reconcile step fires CMD.ACCEPT — with
       // this same media/speaker — the moment the id lands.
-      if (__DEV__) console.log('[CALL][APP][accept] STEP 5b callId NOT yet known → set pendingAccept, waiting for WebRTC incoming to reconcile (connect watchdog armed)');
+      if (__DEV__) console.log('[CALL][APP][accept] STEP 5b callId NOT yet known → set pendingAccept, waiting for WebRTC incoming to reconcile (media-ring + connect watchdogs armed)');
       dispatch({ type: ACT.SET_FLAG, key: 'pendingAccept', value: true });
+      // Nothing is in flight on the media plane: if the media server's ring
+      // never arrives there is no callId to accept with, so don't make the user
+      // wait out the full connect watchdog on a call that cannot connect.
+      armMediaRingWatchdog();
     }
-  }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, applyAudioRoute, finalizeEnd, armMediaWatchdog, armConnectWatchdog]);
+  }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, applyAudioRoute, finalizeEnd, armMediaWatchdog, armConnectWatchdog, armMediaRingWatchdog]);
 
   // ── pendingAccept flush (state-driven, race-proof) ─────────────────────────
   // The engine 'incoming' handler reads stateRef, which can be one commit
@@ -2567,6 +2650,9 @@ export const CallProvider = ({ children }) => {
       return 0;
     }
     if (__DEV__) console.log('[CALL][APP] add-participant →', invitees.map((p) => p.id), { conference: true });
+    // Remember the display names for this attempt — a failed media-server invite
+    // comes back with ids only (see EVT.GROUP_INVITE_RESULT).
+    lastInviteNamesRef.current = invitees.reduce((acc, p) => { acc[String(p.id)] = p.name; return acc; }, {});
     // 1) media-server invite (promotes a 1:1 room to group on first use, then
     //    incomingGroupCall + the engine re-invite loop)
     sendCmd({ cmd: CMD.INVITE_TO_GROUP, ids: invitees.map((p) => p.id) });
@@ -2942,6 +3028,7 @@ export const CallProvider = ({ children }) => {
     }
     if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) return; // busy
     endedRef.current = false;
+    acceptingRef.current = false; // new ring → a previous call's accept lock must never block this one
     initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
     const peer = { id: callerId, name: payload?.from?.name || 'Unknown', avatar: payload?.from?.avatar || null };
     const members = Array.isArray(payload?.members) ? payload.members.map(String).filter(Boolean) : [];

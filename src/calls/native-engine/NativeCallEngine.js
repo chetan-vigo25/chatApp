@@ -192,10 +192,25 @@ class NativeCallEngine {
         }
 
         case CMD.INVITE_TO_GROUP: {
-          if (!this._sdk) return;
-          Promise.resolve(this._sdk.inviteToGroup(msg.ids || []))
-            .then(() => this._log('group invite sent'))
-            .catch((e) => this._log(`group invite failed: ${e && e.message}`));
+          const ids = (msg.ids || []).map(String);
+          if (!this._sdk) {
+            this._log('group invite DROPPED — no SDK instance');
+            this._post(EVT.GROUP_INVITE_RESULT, { ok: false, ids, message: 'not connected' });
+            return;
+          }
+          Promise.resolve(this._sdk.inviteToGroup(ids))
+            .then(() => {
+              this._log(`group invite sent (${ids.length})`);
+              this._post(EVT.GROUP_INVITE_RESULT, { ok: true, ids, message: null });
+            })
+            .catch((e) => {
+              const message = (e && e.message) || 'invite failed';
+              // NOT just an engine-local log: the backend conference invite runs
+              // in parallel and DOES succeed, so a silent failure here left the
+              // invitee ringing, joining the roster, and never getting media.
+              this._log(`group invite FAILED (${ids.length}): ${message}`);
+              this._post(EVT.GROUP_INVITE_RESULT, { ok: false, ids, message });
+            });
           return;
         }
 

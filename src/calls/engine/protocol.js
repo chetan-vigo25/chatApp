@@ -92,6 +92,13 @@ export const EVT = {
   START_CALL_RESULT: 'startCallResult',
   START_CALL_ERROR: 'startCallError',
   PRESENCE_RESULT: 'presenceResult',
+  // Result of CMD.INVITE_TO_GROUP — { ok, ids, message }. A mid-call invite goes
+  // out on TWO planes (media server + backend conference API) and only the
+  // backend one has an ack path. When the media-server half failed it did so
+  // SILENTLY (engine-local log): the invitee still got the backend ring, joined
+  // the roster, and then sat on "Connecting…" because no media ring ever reached
+  // them. Surface it so the inviter is told the add didn't take.
+  GROUP_INVITE_RESULT: 'groupInviteResult',
   PONG: 'pong',
   SCREEN_SHARE_STARTED: 'screenShareStarted',
   SCREEN_SHARE_STOPPED: 'screenShareStopped',
