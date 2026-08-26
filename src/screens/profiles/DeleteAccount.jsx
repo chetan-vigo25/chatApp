@@ -1,14 +1,15 @@
 import React, { useState } from "react";
 import {
   View,
-  Text,
   TouchableOpacity,
   ScrollView,
   StyleSheet,
-  TextInput,
   Alert,
   ActivityIndicator,
-} from "react-native";
+  Text,
+  TextInput,
+} from 'react-native';
+
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import { DELETE_REASONS, deleteAccount } from "../../Redux/Services/Account/Account.Services";
@@ -96,6 +97,7 @@ export default function DeleteAccount({ navigation }) {
       >
         <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
       </TouchableOpacity>
+      {/* i18n-ok: `title` is always a literal ("Delete Account") from the caller. */}
       <Text style={[styles.headerTitle, { color: primaryText }]}>{title}</Text>
       <View style={styles.headerSpacer} />
     </View>

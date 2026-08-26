@@ -1391,9 +1391,20 @@ export const buildCallEngineHtml = () => `<!doctype html>
       // path would otherwise brick every future joinRoom). Idempotent no-op when
       // not in a room.
       try { self._socket && self._socket.emit('leaveRoom'); } catch (e) {}
-      return self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, token: self._token || undefined }).then(function (res) {
+      return self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, token: self._token || undefined, appCallId: self._appCallId || undefined }).then(function (res) {
         if (superseded()) throw new Error('join superseded');
         joinRes = res || {};
+        // Tell RN which SFU room actually carried this call. It goes onto the
+        // CallLog row — the only exact link between our signaling callId and
+        // anything the media server knows (admin drill-down, recording lookup).
+        try {
+          post('mediaRoom', {
+            roomId: room.roomId || null,
+            mediaCallId: room.callId || null,
+            peerId: joinRes.peerId || null,
+            joinedAt: new Date().toISOString(),
+          });
+        } catch (e) {}
         device = new window.mediasoupClient.Device();
         return device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
       }).then(function () {
@@ -1657,7 +1668,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
       var self = this;
       var room = self._room;
       if (!room) return;
-      self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, resume: true, token: self._token || undefined }).then(function (res) {
+      self._req('joinRoom', { roomId: room.roomId, name: self.name, sessionId: self.userId, resume: true, token: self._token || undefined, appCallId: self._appCallId || undefined }).then(function (res) {
         if (res && res.resumed) {
           self.restartIce();
           // Heal any pause/resume command the dying socket ate mid-flap.
@@ -2903,6 +2914,11 @@ export const buildCallEngineHtml = () => `<!doctype html>
             break;
           }
           case 'reject': { if (call) call.reject(msg.callId); break; }
+          // Correlation key only: the backend's signaling callId, handed to the
+          // media server on joinRoom so a server-side recording can be filed
+          // against the right call row. Carries no capability and shows nothing
+          // to the user.
+          case 'appCallId': { if (call) call._appCallId = msg.callId ? String(msg.callId) : null; break; }
           case 'startRecording': { startRecording(msg.media, msg.chunkMs); break; }
           case 'stopRecording': { stopRecording(); break; }
           case 'hangup': { stopRecording(); if (call) call.hangup(); resetTiles(); break; }

@@ -1,7 +1,11 @@
 # App Language / Translation — Implementation Guide
 
-Feature: app ka static UI text aur chat message bodies **on-device** translate
-hote hain. Entry point: **Settings → App language**.
+Feature: **receive kiye gaye chat messages** on-device translate hote hain.
+Entry point: **Settings → App language**.
+
+> **Scope jaan-bujh kar chhota hai.** App ka UI text translate NAHI hota — sirf
+> `ChooseLanguage` screen apne aap ko translate karti hai. Language badalne pe
+> baaki koi screen nahi badalti. Ye product decision hai, bug nahi.
 
 > **Ye file 2026-08-24 ko rewrite hui.** Pehle ye Google ke free
 > `translate_a/single` endpoint wala implementation document karti thi. Wo
@@ -88,10 +92,16 @@ jaan-bujh kar chhod deta hai. Todo: `<Text>Hello</Text><Text ignore> {name}</Tex
 
 `Alert.alert()` ke liye `t(text, language)` use karo.
 
-> **Abhi sirf `ChooseLanguage` screen opted-in hai.** Settings/ChatList/Profile/
-> Calls sab English hain. Picker ka subtitle "The app translates itself into the
-> language you pick" isliye poori tarah sach nahi — ya aur screens opt-in karo,
-> ya wo line badlo.
+> **Jaan-bujh kar sirf `ChooseLanguage` opted-in hai.** Baaki har screen English
+> rehti hai — ye maanga gaya behaviour hai. Picker ka subtitle isliye
+> "Messages you receive are translated into the language you pick" kehta hai,
+> jo sach hai.
+>
+> Aage kabhi koi screen opt-in karni ho:
+> `node scripts/optin-translate.js <file>` chalao, phir
+> `node scripts/check-translate-optin.js` — wo batayega kahan `ignore` chahiye
+> taaki kisi user ka naam/phone translator me na chala jaye. Wapas hatana ho to
+> `node scripts/optout-translate.js <file>`.
 
 ---
 
@@ -135,6 +145,41 @@ Wire karna zaroori hai warna row re-render hi nahi hoga:
 }, [..., language, messageTranslations, translationRetryTick]);  // renderChatsItem deps
 extraData={mediaRenderExtra}                                     // isme dono hain
 ```
+
+### Kaun sa message translate hota hai — recipient-side, opt-in
+
+Translation **poori tarah client-side** hai aur sirf **receive kiye gaye**
+messages pe lagti hai. Server pe hamesha original hi store hota hai, isliye ek
+hi message har recipient ke device pe alag dikh sakta hai.
+
+Sab kuch ek gate se hokar guzarta hai — `shouldTranslateMessage()`:
+
+| Condition | Kyun |
+|---|---|
+| `hasLanguagePreference` | Jisne kabhi language chuni hi nahi, usko har message **jaisa bheja gaya waisa** dikhega |
+| `!isOwnMessage(msg)` | Aapne likha hai, aapne padha hai. Apna hi message translate karna matlab aapke shabd aapko badal ke dikhana |
+| `isTranslatableMessage(msg)` | Text ho, code na ho, mention na ho, deleted na ho |
+
+**`hasPreference` aur `language === 'en'` alag cheezein hain.** Jisne picker
+kabhi khola hi nahi uski koi preference nahi — Hindi message Hindi hi rahega.
+Jisne jaan-bujh kar English chuna, uski preference hai — wahi Hindi message
+uske liye English me translate hoga. Dono ko ek maan lena matlab un logon ke
+chats bhi auto-translate karna jinhone kabhi maanga hi nahi.
+
+Example flow:
+
+```
+User A (Hindi chuni)  → "कैसे हो?"     → server original store karta hai
+                                        → B (koi preference nahi) ko "कैसे हो?"
+                                        → A ko bhi "कैसे हो?" (apna message)
+
+User B (kuch nahi chuna) → "How are you?" → server original store karta hai
+                                        → B ko "How are you?" (apna message)
+                                        → A ka client translate karta hai → "आप कैसे हैं?"
+```
+
+`msg.text` kabhi overwrite nahi hota, aur koi translation kisi send path me
+nahi jati — display-only hai.
 
 ### Kya translate NAHI hota
 
@@ -197,23 +242,91 @@ Device pe hold time tune karna pad sakta hai.
 | Latin, detector kehta hai `en` (ya `und`) | non-Latin reader | `en` → translate |
 | Latin, detector kehta hai kuch aur (Hinglish) | non-Latin reader | **refuse — original hi rehta hai** |
 
-### Hinglish on-device translate NAHI hoti — ye limitation hai, bug nahi
+### Hinglish — free, on-device, phrase pack se
 
-`"Ab btao"`, `"kya kr rha h"` — Hindi, Latin letters me. ML Kit ke models
-**scripts ke beech** translate karte hain: `hi→x` model Devanagari maangta hai,
-`en→x` model asli English maangta hai. Romanized Hindi ko `en→hi` me daalne se
-model unknown tokens copy kar deta hai — output kabhi input jaisa hi, kabhi
-aadha-mangled. Yahi "kabhi kabhi kaam karta hai" wali shikayat thi.
+`"chale chalo"`, `"Abhi nahi"` — Hindi, Latin letters me. ML Kit ke models
+**scripts ke beech** translate karte hain: `hi→x` Devanagari maangta hai, `en→x`
+asli English. Romanized Hindi koi bhi on-device model nahi padh sakta.
 
-Isliye ab **detector se poocha jata hai**. Latin text tabhi English mana jata hai
-jab detector bhi English kahe; warna message **jaisa ka waisa** chhod diya jata
-hai. Ye "kabhi-kabhi mangled" ko "hamesha predictable" se badalta hai — par
-Hinglish translate phir bhi nahi hoti.
+Flow:
 
-**Hinglish sach me chahiye to** romanized input pe trained model chahiye, yani
-cloud API (Google Cloud Translation apne backend proxy ke through). On-device
-ML Kit se ye possible nahi hai. Agar aapke users mostly Hinglish likhte hain, to
-ye product-level decision hai, code ka issue nahi.
+1. **Detector se poocho.** Latin text tabhi English mana jata hai jab detector
+   bhi English kahe. Warna `detectSource` `null` deta hai.
+2. **Phrase pack** (`src/constant/hinglish.js`, **191 phrases**) usse English me
+   badalta hai, aur ML Kit us English ko target language me le jata hai —
+   **poori tarah device pe, zero cost**.
+
+```
+"chale chalo" → (pack) → "let's go" → (ML Kit en→th) → "ไปกันเถอะ"
+```
+
+Spelling variants pehle fold hote hain, kyunki Hinglish ka standard spelling
+nahi hota: `"nhi yrrr"` → `nahi yaar`, `"kya kr rhe ho"` → `kya kar rahe ho`.
+
+### Coverage kaise badhaye — guess mat karo, MAAPO
+
+Pack me jo nahi hai wo translate nahi hoga. Ise theek karne ka ek hi tareeka
+hai: **pack badhao, data ke hisaab se.**
+
+```bash
+node scripts/check-hinglish.js                      # sirf integrity
+node scripts/check-hinglish.js messages.txt         # + hit rate
+node scripts/check-hinglish.js messages.txt -v      # + misses ki list
+```
+
+`messages.txt` = aapke asli chat messages, ek per line.
+
+Ye script do aisi galtiyan pakadti hai jo file padh kar **kabhi nahi dikhtin**:
+
+1. **Dead keys.** Lookup pehle message normalize karta hai (`kr`→`kar`,
+   `thik`→`theek`). Agar key non-canonical spelling me likhi ho to wo **kabhi
+   match nahi karegi**. `'thik hai bye'` chup-chaap bekaar padi thi jab tak ye
+   check nahi bana.
+2. **Duplicate keys.** Baad wali chup-chaap pehli ko overwrite kar deti hai.
+
+Miss list me har entry ready-to-paste key deti hai:
+
+```
+"khana kha liya"   → key to add: "khana kha liya"
+```
+
+### Ye approach kitna kaam karta hai — asli numbers
+
+62 realistic Hinglish messages ke corpus pe maapa gaya:
+
+| Step | Hit rate |
+|---|---|
+| Shuruat (191 phrases) | 48% |
+| `kha → kahan` bug fix + filler stripping | **71%** — ek bhi naya phrase nahi |
+| Naapi hui misses add ki (216 phrases) | **100%** |
+
+Sabse bada fayda phrases add karne se nahi, **normalization se** aaya. Naya
+phrase add karne se pehle dekho ki koi variant ya filler ka issue to nahi.
+
+### Do cheezein jo har entry ki value badha deti hain
+
+**Filler stripping** — `bhai`, `yaar`, `na`, `bro`, `ji`, `toh` shuru/aakhir se
+hat jate hain. Isliye `"kaise ho"` ki ek entry `"kaise ho bhai"`,
+`"kaise ho yaar"`, `"kaise ho na"` sab cover karti hai. Exact match pehle try
+hota hai, to `"haan bhai"` → "yes brother" ab bhi jeetta hai.
+
+**Spelling variants** (`SPELLING_VARIANTS`) — `nhi/nahin/nahee` → `nahi`. Ek
+naya variant add karna aksar ek naya phrase add karne se zyada faydemand hai,
+kyunki wo **poore pack** pe lagta hai.
+
+> ⚠️ `SPELLING_VARIANTS` me chhote ambiguous shabd mat daalna. `kha → kahan`
+> tha, aur usne `"khana kha liya"` (khaya kya) ko `"khana kahan liya"` (kahan
+> se liya) bana diya — matlab hi ulta ho gaya. Ambiguous cheezein `PHRASES` me
+> daalo jahan poora context hota hai.
+
+### Koi cloud fallback nahi — jaan-bujh kar
+
+Ye app free translate karti hai ya bilkul nahi. Koi paid API nahi, koi backend
+route nahi, koi per-character bill nahi.
+
+Iska matlab: **jo phrase pack me nahi hai wo translate nahi hoga.** Coverage
+badhane ka ek hi tareeka hai — `PHRASES` me entries add karo. Kisi cloud
+provider ko wapas mat laao; wo jaan-bujh kar hataya gaya tha.
 
 ### Request kab jati hai
 

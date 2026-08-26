@@ -45,6 +45,10 @@ export const CMD = {
   // stream so playback restarts under the new session.
   RESTART_AUDIO: 'restartAudio',
   SET_SPEAKER: 'setSpeaker',
+  // Hand the engine the backend signaling callId. It rides along on joinRoom
+  // so the media server can file its server-side recording against the right
+  // call. Purely a correlation key — no UI, no user-visible effect.
+  APP_CALL_ID: 'appCallId',
   START_RECORDING: 'startRecording',
   STOP_RECORDING: 'stopRecording',
   // 1:1 peer identity for in-stage placeholders ({ peerId, name, avatar }) —

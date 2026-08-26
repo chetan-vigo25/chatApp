@@ -117,7 +117,7 @@ export default function ChooseLanguage({ navigation }) {
         <View style={styles.flex}>
           <Text style={[styles.appBarTitle, { color: primaryText }]}>Choose your language</Text>
           <Text style={[styles.appBarSub, { color: subText }]}>
-            The app translates itself into the language you pick
+            Messages you receive are translated into the language you pick
           </Text>
         </View>
       </View>

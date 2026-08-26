@@ -35,7 +35,9 @@ import React, {
 } from 'react';
 import { AppState, Text as RNText, TextInput as RNTextInput } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import MlkitTranslate from 'expo-mlkit-translate';
+import MlkitTranslate from '../../modules/expo-mlkit-translate';
+import { lookupUiString } from '../constant/uiStrings';
+import { hinglishToEnglish } from '../constant/hinglish';
 
 export const LANGUAGE_STORAGE_KEY = 'app.language';
 /**
@@ -335,8 +337,18 @@ async function detectSource(text, language) {
     // Undetermined is usually a very short string ("ok", "yes"); English is the
     // safe read there. Anything the detector names as non-English in Latin
     // letters is romanized text ML Kit cannot handle — refuse rather than mangle.
-    if (detected == null || detected === SOURCE_LANGUAGE) return SOURCE_LANGUAGE;
-    return null;
+    const source = (detected == null || detected === SOURCE_LANGUAGE) ? SOURCE_LANGUAGE : null;
+    // Romanized input is the one case where the outcome surprises people
+    // ("why is my Hinglish not translating?"), so say exactly what was decided.
+    if (__DEV__) {
+      console.log(
+        `[translate] latin "${text.slice(0, 40)}" → detector:${detected ?? 'und'} `
+        + `→ ${source
+          ? `translate ${source}→${language}`
+          : 'romanized → phrase pack, else shown as-is'}`,
+      );
+    }
+    return source;
   }
 
   // Text in its own script: trust the detector, fall back to English.
@@ -408,6 +420,15 @@ export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) 
   if (plan.skip) return { text, status: 'skipped' };
   const { auto, key } = plan;
 
+  // Curated UI labels win over the model. "Save", "Call", "View once" and the
+  // brand name are precisely what machine translation gets wrong, and they are
+  // a fixed list that can just be translated properly once. A miss falls
+  // through and ML Kit handles it as before.
+  const curated = lookupUiString(text, language);
+  if (curated != null) {
+    return { text: curated, status: curated === text ? 'unchanged' : 'translated' };
+  }
+
   await loadCache();
   if (memoryCache[key] != null) {                          // cache hit — no work
     const hit = memoryCache[key];
@@ -422,9 +443,43 @@ export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) 
   const request = enqueue(async () => {
     try {
       const source = auto ? await detectSource(text, language) : plan.source;
-      // null = romanized text no on-device model can handle. Definitive, so the
-      // caller stops asking instead of retrying something that cannot work.
-      if (source == null) return { text, status: 'skipped' };
+      // null = romanized text ("chale chalo") that no on-device model can read.
+      // This is the ONLY path that leaves the device: the cloud model handles
+      // romanized input, ML Kit cannot. A null answer — route not deployed,
+      // offline, backed off — means the message stays as the sender typed it,
+      // which is the behaviour from before the fallback existed.
+      if (source == null) {
+        // Romanized Hindi ("chale chalo"): no on-device model can read it, so
+        // the bundled phrase pack turns the common ones into English and ML Kit
+        // carries that English to ANY target language — all on the device.
+        //
+        // There is deliberately NO cloud fallback here. This app translates
+        // for free or not at all; a phrase the pack does not know is shown
+        // exactly as the sender typed it. The way to cover more is to add
+        // entries to src/constant/hinglish.js, not to call a paid API.
+        const asEnglish = hinglishToEnglish(text);
+        if (asEnglish) {
+          if (language === SOURCE_LANGUAGE) {
+            memoryCache[key] = asEnglish;
+            persistCache();
+            return { text: asEnglish, status: 'translated' };
+          }
+          try {
+            const out = await withTimeout(MlkitTranslate.translate({
+              text: asEnglish, source: SOURCE_LANGUAGE, target: language,
+            }));
+            if (typeof out === 'string' && out.trim()) {
+              memoryCache[key] = out;
+              persistCache();
+              return { text: out, status: 'translated' };
+            }
+          } catch {
+            // Model missing or wedged — show the original rather than a
+            // half-translated string. NOT cached, so it retries later.
+          }
+        }
+        return { text, status: 'skipped' };
+      }
       if (source === language) return { text, status: 'skipped' };
 
       const result = await withTimeout(
@@ -479,6 +534,17 @@ export async function t(text, language, from = SOURCE_LANGUAGE) {
  * preference.
  */
 let cachedLanguage = null;
+/**
+ * Has the user ever CHOSEN a language?
+ *
+ * Distinct from `cachedLanguage === 'en'` on purpose. A user who never opened
+ * the picker has no preference, and their messages must be shown exactly as
+ * sent — a Hindi message stays Hindi. A user who deliberately picked English
+ * DOES have a preference, so that same message is translated for them.
+ * Collapsing the two would auto-translate every chat for people who never
+ * asked for translation at all.
+ */
+let cachedHasPreference = null;
 let languageLoadPromise = null;
 
 function loadLanguage() {
@@ -486,10 +552,12 @@ function loadLanguage() {
   if (!languageLoadPromise) {
     languageLoadPromise = AsyncStorage.getItem(LANGUAGE_STORAGE_KEY)
       .then((saved) => {
+        cachedHasPreference = Boolean(saved);
         cachedLanguage = saved || SOURCE_LANGUAGE;
         return cachedLanguage;
       })
       .catch(() => {
+        cachedHasPreference = false;
         cachedLanguage = SOURCE_LANGUAGE;   // unreadable storage → documented fallback
         return cachedLanguage;
       });
@@ -512,6 +580,7 @@ export function LanguageProvider({ children }) {
   // and is `ready` in its first render — no English frame, no re-fetch.
   const [language, setLang] = useState(() => cachedLanguage || SOURCE_LANGUAGE);
   const [ready, setReady] = useState(() => cachedLanguage != null);
+  const [hasPreference, setHasPreference] = useState(() => cachedHasPreference === true);
 
   useEffect(() => {
     if (ready) return undefined;
@@ -519,7 +588,10 @@ export function LanguageProvider({ children }) {
     (async () => {
       try {
         const saved = await loadLanguage();
-        if (alive) setLang(saved);
+        if (alive) {
+          setLang(saved);
+          setHasPreference(cachedHasPreference === true);
+        }
         await loadCache();
       } catch {
         /* keep English */
@@ -547,6 +619,8 @@ export function LanguageProvider({ children }) {
   const setLanguage = useCallback(async (code, { requireWifi = true } = {}) => {
     if (!code) return;
     cachedLanguage = code;               // remounts read this, not AsyncStorage
+    cachedHasPreference = true;          // an explicit pick, even if it is English
+    setHasPreference(true);
     setLang(code);                       // every <Text> re-renders — no app restart
     try {
       await AsyncStorage.setItem(LANGUAGE_STORAGE_KEY, code);
@@ -557,7 +631,10 @@ export function LanguageProvider({ children }) {
     return ensureLanguageReady(code, { requireWifi });
   }, []);
 
-  const value = useMemo(() => ({ language, setLanguage, ready }), [language, setLanguage, ready]);
+  const value = useMemo(
+    () => ({ language, setLanguage, ready, hasPreference }),
+    [language, setLanguage, ready, hasPreference],
+  );
   return <LanguageContext.Provider value={value}>{children}</LanguageContext.Provider>;
 }
 

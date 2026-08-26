@@ -1,8 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from "react";
 import {
   View,
-  Text,
-  TextInput,
   TouchableOpacity,
   FlatList,
   Image,
@@ -10,7 +8,10 @@ import {
   ActivityIndicator,
   Alert,
   RefreshControl,
-} from "react-native";
+  Text,
+  TextInput,
+} from 'react-native';
+
 import { useDispatch, useSelector } from "react-redux";
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";

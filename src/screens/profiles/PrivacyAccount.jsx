@@ -1,5 +1,12 @@
 import React from "react";
-import { View, Text, TouchableOpacity, ScrollView, StyleSheet } from "react-native";
+import {
+  View,
+  TouchableOpacity,
+  ScrollView,
+  StyleSheet,
+  Text,
+} from 'react-native';
+
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 

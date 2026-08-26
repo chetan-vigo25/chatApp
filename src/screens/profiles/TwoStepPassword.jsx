@@ -1,9 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  View, Text, ScrollView, TouchableOpacity, Animated, StyleSheet,
-  TextInput, ActivityIndicator, Alert, Switch,
-  KeyboardAvoidingView, Platform,
+  View,
+  ScrollView,
+  TouchableOpacity,
+  Animated,
+  StyleSheet,
+  ActivityIndicator,
+  Alert,
+  Switch,
+  KeyboardAvoidingView,
+  Platform,
+  Text,
+  TextInput,
 } from 'react-native';
+
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { FontAwesome6, Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';

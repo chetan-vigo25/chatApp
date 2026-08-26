@@ -1,8 +1,14 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  View, Text, ScrollView, TouchableOpacity, Animated,
-  StyleSheet, ActivityIndicator,
+  View,
+  ScrollView,
+  TouchableOpacity,
+  Animated,
+  StyleSheet,
+  ActivityIndicator,
+  Text,
 } from 'react-native';
+
 import { FontAwesome6, Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { useTheme } from '../../contexts/ThemeContext';

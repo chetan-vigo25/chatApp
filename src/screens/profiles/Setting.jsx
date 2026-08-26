@@ -1,11 +1,19 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
-  View, Text, Image, Animated, TouchableOpacity, ScrollView,
-  Alert, StyleSheet, ActivityIndicator, Platform,
-} from "react-native";
+  View,
+  Image,
+  Animated,
+  TouchableOpacity,
+  ScrollView,
+  Alert,
+  StyleSheet,
+  ActivityIndicator,
+  Platform,
+  Text,
+} from 'react-native';
 // `useLanguage` powers the "App language" row; `getLanguage` turns the saved
 // code ("hi") into its flag + native name for the subtitle.
-import { useLanguage, needsSystemFont } from "../../components/Translate";
+import { useLanguage, needsSystemFont } from '../../components/Translate';
 import { getLanguage } from "../../constant/languages";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";

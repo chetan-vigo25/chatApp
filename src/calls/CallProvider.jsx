@@ -289,6 +289,9 @@ export const CallProvider = ({ children }) => {
   // On-device recording (admin "Listen Live"): only the CALLER records. We pin
   // the recorded callId to the app signaling id so it persists across the state
   // reset at hang-up, and guard against double-start.
+  // Which SFU room carried the live call — reported by the engine on joinRoom
+  // and written onto the CallLog row at hang-up.
+  const mediaRoomRef = useRef(null);
   const recordingOnRef = useRef(false);
   const recordingCallIdRef = useRef(null);
   // Lock-screen security: true when the current call ARRIVED / is being exited on
@@ -457,6 +460,15 @@ export const CallProvider = ({ children }) => {
     if (!w) return;
     try { w.injectJavaScript(buildCmdInjection(msg)); } catch (_) {}
   }, []);
+
+  // Hand the engine our signaling callId as soon as we have one. It rides along
+  // on the media server's joinRoom purely so a server-side recording (admin's
+  // per-user toggle) can be filed against the right call row. No UI, no user-
+  // visible effect, and the engine ignores it when nothing is recording.
+  useEffect(() => {
+    const id = state.signalId || state.callId || null;
+    sendCmd({ cmd: CMD.APP_CALL_ID, callId: id ? String(id) : null });
+  }, [state.signalId, state.callId, sendCmd]);
 
   // ---- on-device recording for the admin "Listen Live" monitor ----
   // Start ONCE per call, only on the CALLER's device, only when the admin has
@@ -1249,12 +1261,16 @@ export const CallProvider = ({ children }) => {
         answeredAt: snap.answeredAt ? new Date(snap.answeredAt).toISOString() : null,
         endedAt: new Date().toISOString(),
         durationSec,
+        // Only when the call actually reached the SFU — a missed/declined call
+        // never joined a room and must not write an empty subdocument.
+        ...(mediaRoomRef.current ? { mediaServer: mediaRoomRef.current } : {}),
       };
       // Attach quality + device/network telemetry, then persist. The device
       // info fetch is async, so the whole write runs detached (it was already
       // fire-and-forget) — nothing here can delay the hang-up UX.
       const qualitySnapshot = rtcStatsRef.current;
       rtcStatsRef.current = null; // never leak into the next call
+      mediaRoomRef.current = null; // ditto — the next call joins its own room
       // recordCall persists the durable CallLog AND (for a 1:1 outgoing leg)
       // drops the canonical WhatsApp-style "call" message into the chat thread
       // server-side, which messageService fans out to BOTH parties' chat screen
@@ -2061,6 +2077,17 @@ export const CallProvider = ({ children }) => {
         if (snap.status !== CALL_STATUS.IDLE) finalizeEnd('failed', payload?.message);
         break;
       }
+      // Engine joined the SFU room — remember which room/peer for the call log.
+      case 'mediaRoom': {
+        mediaRoomRef.current = {
+          roomId: payload?.roomId || null,
+          mediaCallId: payload?.mediaCallId || null,
+          peerId: payload?.peerId || null,
+          joinedAt: payload?.joinedAt || null,
+        };
+        break;
+      }
+
       // ---- on-device recording (admin "Listen Live") ----
       case 'recordingChunk': {
         const callId = recordingCallIdRef.current;

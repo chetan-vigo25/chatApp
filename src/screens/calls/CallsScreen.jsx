@@ -1,8 +1,19 @@
 import React, { useCallback, useState, useRef, useEffect } from 'react';
 import {
-  View, Text, SectionList, TouchableOpacity, StyleSheet, RefreshControl,
-  ActivityIndicator, Animated, Platform, DeviceEventEmitter, Modal, BackHandler,
+  View,
+  SectionList,
+  TouchableOpacity,
+  StyleSheet,
+  RefreshControl,
+  ActivityIndicator,
+  Animated,
+  Platform,
+  DeviceEventEmitter,
+  Modal,
+  BackHandler,
+  Text,
 } from 'react-native';
+
 import { useFocusEffect } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import { Ionicons, MaterialIcons, MaterialCommunityIcons } from '@expo/vector-icons';
@@ -619,6 +630,7 @@ export default function CallsScreen({ navigation }) {
         sections={sections}
         keyExtractor={(g) => g.key}
         renderItem={renderItem}
+        // i18n-ok: "Today" / "Yesterday" / "Earlier" / a date — a real label.
         renderSectionHeader={({ section }) => (
           <Text style={[styles.sectionLabel, { color: theme.colors.placeHolderTextColor, backgroundColor: theme.colors.background }]}>
             {section.title}

@@ -111,11 +111,19 @@ const TRANSLATION_MAX_ATTEMPTS = 3;
 const TRANSLATION_RETRY_MIN_MS = 6000;
 /**
  * How long a message may be withheld from its first paint while its translation
- * resolves. On-device translation is milliseconds, so this is a safety net, not
- * a wait — past it the row renders in the original language rather than staying
- * invisible.
+ * resolves. Past it the row renders in the ORIGINAL language rather than
+ * staying invisible — a message is never lost to a slow translation.
+ *
+ * On-device translation is milliseconds, so for most messages this never
+ * matters. It is sized for the other path: romanized text goes to the cloud
+ * fallback, and a network round trip is what actually risks the "original
+ * first, translation second" flicker this hold exists to prevent.
+ *
+ * A slow tail beyond this still flickers — covering the fallback's full 8s
+ * timeout would mean staring at a gap that long, which is worse. Lower it if
+ * you would rather see messages sooner and accept the swap.
  */
-const TRANSLATION_FIRST_PAINT_HOLD_MS = 700;
+const TRANSLATION_FIRST_PAINT_HOLD_MS = 2500;
 
 /**
  * Which rows the message translator is allowed to touch.
@@ -1468,7 +1476,7 @@ export default function ChatScreen({ navigation, route }) {
   // translation state + effect below); the rest of this screen stays untouched.
   // `languageReady` is false until the saved preference has been read back —
   // translating before that runs the whole pass as English.
-  const { language, ready: languageReady } = useLanguage();
+  const { language, ready: languageReady, hasPreference: hasLanguagePreference } = useLanguage();
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   // Frame-synced keyboard height from react-native-keyboard-controller. Tracks the
   // native keyboard 1:1 on iOS + Android (60fps, no jump). `height` is negative
@@ -2231,6 +2239,31 @@ export default function ChatScreen({ navigation, route }) {
   }, [language]);
 
   /**
+   * The single gate every translation path goes through.
+   *
+   * Translation is RECIPIENT-SIDE and OPT-IN:
+   *
+   *  • `hasLanguagePreference` — a user who never picked a language sees every
+   *    message exactly as it was sent. Note this is not the same as picking
+   *    English: an explicit English pick does translate incoming Hindi.
+   *
+   *  • `!isOwnMessage` — you wrote it, so you already read it. Translating your
+   *    own outgoing text would rewrite your words back at you in a language you
+   *    did not type them in.
+   *
+   * Neither of these touches what is stored or sent. `msg.text` is never
+   * overwritten and no translation reaches the server, so the same message can
+   * be rendered differently on every recipient's device.
+   */
+  const isOwnMessage = useCallback((msg) => (
+    msg?.senderType ? msg.senderType === 'self' : sameId(msg?.senderId, currentUserId)
+  ), [currentUserId]);
+
+  const shouldTranslateMessage = useCallback((msg) => (
+    hasLanguagePreference && !isOwnMessage(msg) && isTranslatableMessage(msg)
+  ), [hasLanguagePreference, isOwnMessage]);
+
+  /**
    * Translation for one message, resolved DURING RENDER.
    *
    * State is checked first, then the on-disk cache synchronously. That second
@@ -2246,11 +2279,11 @@ export default function ChatScreen({ navigation, route }) {
     const slot = `${messageKey}::${language}`;
     const known = messageTranslations[slot];
     if (known != null) return known;
-    if (!isTranslatableMessage(msg)) return undefined;
+    if (!shouldTranslateMessage(msg)) return undefined;
     const body = typeof msg.text === 'string' ? msg.text.trim() : '';
     if (!body) return undefined;
     return peekTranslation(body, language, 'auto') ?? undefined;
-  }, [languageReady, language, messageTranslations]);
+  }, [languageReady, language, messageTranslations, shouldTranslateMessage]);
 
   // Repaint from the PERSISTED cache before asking the network anything.
   //
@@ -2267,7 +2300,7 @@ export default function ChatScreen({ navigation, route }) {
       if (!alive) return;
       const seeded = {};
       messages.forEach((msg, index) => {
-        if (!isTranslatableMessage(msg)) return;
+        if (!shouldTranslateMessage(msg)) return;
         const body = typeof msg.text === 'string' ? msg.text.trim() : '';
         if (!body) return;
         const slot = `${getMessageKey(msg, index)}::${language}`;
@@ -2279,7 +2312,7 @@ export default function ChatScreen({ navigation, route }) {
       setMessageTranslations((prev) => ({ ...seeded, ...prev }));
     });
     return () => { alive = false; };
-  }, [messages, language, languageReady, messageTranslations]);
+  }, [messages, language, languageReady, messageTranslations, shouldTranslateMessage]);
 
   // Translate the loaded text messages once each. The service caches by text +
   // language and caps itself at 4 concurrent requests, so this stays cheap.
@@ -2292,7 +2325,7 @@ export default function ChatScreen({ navigation, route }) {
     if (!Array.isArray(messages) || messages.length === 0) return undefined;
     const pending = [];
     messages.forEach((msg, index) => {
-      if (!isTranslatableMessage(msg)) return;
+      if (!shouldTranslateMessage(msg)) return;
       const body = typeof msg.text === 'string' ? msg.text.trim() : '';
       if (!body) return;
       const key = getMessageKey(msg, index);
@@ -2409,7 +2442,7 @@ export default function ChatScreen({ navigation, route }) {
     }).catch(() => {});
 
     return undefined;
-  }, [messages, language, languageReady, messageTranslations, translationRetryTick]);
+  }, [messages, language, languageReady, messageTranslations, translationRetryTick, shouldTranslateMessage]);
 
   // When the user shares media into the app from the native share sheet,
   // ShareInboxScreen opens this thread with a `pendingShare` param. Feed those
@@ -6977,7 +7010,7 @@ export default function ChatScreen({ navigation, route }) {
       // Resolved one way or the other — drop any hold so the map stays small.
       if (messageTranslations[slot] != null) { holds.delete(slot); return true; }
       if (translationSkipRef.current.has(slot)) { holds.delete(slot); return true; }
-      if (!isTranslatableMessage(msg)) return true;
+      if (!shouldTranslateMessage(msg)) return true;
       const body = typeof msg.text === 'string' ? msg.text.trim() : '';
       if (!body) return true;
       // resolveRequest says "skipped" for same-script pairs; peek returning null
