@@ -1,5 +1,6 @@
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { loadContactNames, resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
 
 /**
  * WhatsApp-style message notifications (Android) via notifee's MessagingStyle.
@@ -91,7 +92,17 @@ export const displayGroupedMessage = async (data) => {
   const isGroup = typeof data?.isGroup === 'boolean'
     ? data.isGroup
     : (data?.chatType === 'group' || !!data?.groupId);
-  const senderName = data?.senderName || data?.senderFullName || data?.name || data?.title || 'New message';
+  // The push carries the sender's SELF-SET account name as a fallback; the name
+  // actually shown must follow the device's address book: saved name → number →
+  // push name. Runs headless on a killed app, so load the index explicitly.
+  await loadContactNames().catch(() => {});
+  const serverSenderName = data?.senderName || data?.senderFullName || data?.name || data?.title || '';
+  const senderName = resolveCanonicalName({
+    userId: data?.senderId,
+    phone: data?.senderMobile || data?.mobileNumber || null,
+    pushName: serverSenderName,
+    fallback: 'New message',
+  });
   // Prefer the un-prefixed per-line preview (`lineBody`); MessagingStyle attaches
   // the sender to each line itself, so the "Sender: " prefix must not be doubled.
   const text = data?.lineBody || data?.body || data?.message || data?.text || data?.content || '';

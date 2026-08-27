@@ -4,6 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../useCall';
+import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 
 /**
  * Audio + video call buttons for the 1:1 chat header. Wire into
@@ -14,9 +15,22 @@ export default function CallButtons({ peer, chatId }) {
   const { theme } = useTheme();
   const { startAudioCall, startVideoCall, callBusy } = useCall();
 
+  const peerMobile = peer?.mobileNumber
+    || (peer?.mobile?.number ? `${peer.mobile.code || ''}${peer.mobile.number}` : null)
+    || peer?.phone
+    || null;
   const peerObj = peer ? {
     id: String(peer._id || peer.userId || peer.id || ''),
-    name: peer.fullName || peer.name || 'Unknown',
+    // Outgoing-call label follows the same rule as everywhere else: saved
+    // contact name → number → the callee's own account name.
+    name: resolveCanonicalName({
+      userId: peer._id || peer.userId || peer.id,
+      phone: peerMobile,
+      pushName: peer.fullName || peer.name,
+      fallback: 'Unknown',
+    }),
+    pushName: peer.fullName || peer.name || null,
+    mobile: peerMobile,
     avatar: peer.profileImage || peer.profilePicture || null,
   } : null;
   const peerId = peerObj?.id || '';

@@ -222,10 +222,15 @@ export const useContactSync = () => {
     return incoming.filter(Boolean).map((contact) => {
       const phoneNumber = contact?.phoneNumber || contact?.normalizedPhone || null;
       const localMapEntry = phoneNumber ? numberMap[phoneNumber] : null;
-      // Device contact name takes priority over the backend-stored name, per
-      // product spec (show the name as saved on THIS device). Fall back to the
-      // backend name only when the number isn't in the device's contacts.
-      const fullName = localMapEntry?.localName || contact?.fullName || contact?.name || contact?.displayName || '';
+      // `fullName` on a stored contact row means ONE thing: the name as saved in
+      // THIS device's address book. The backend's name is the peer's own account
+      // name — a push name — and must NEVER be written into that column: once
+      // stored it is indistinguishable from a real saved contact, and every
+      // resolver downstream would then show it as if the user had saved them
+      // (the "why does an unsaved number show a name?" bug). It is kept
+      // separately as `pushName` for group "~name" rendering.
+      const serverPushName = contact?.fullName || contact?.name || contact?.displayName || '';
+      const fullName = localMapEntry?.localName || '';
       return {
         originalId: contact?.originalId || localMapEntry?.originalId || contact?.id || null,
         phoneNumber,
@@ -233,6 +238,7 @@ export const useContactSync = () => {
         userId: contact?.userId || null,
         fullName,
         name: fullName,
+        pushName: serverPushName,
         email: contact?.email || null,
         mobile: contact?.mobile || {
           code: null,

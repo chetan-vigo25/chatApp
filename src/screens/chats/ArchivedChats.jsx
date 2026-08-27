@@ -8,6 +8,7 @@ import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
+import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 
 const MUTE_OPTIONS = [
   { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
@@ -410,7 +411,13 @@ export default function ArchivedChats({ navigation }) {
   const isGroupItem = selectedChatItem?.chatType === 'group' || selectedChatItem?.isGroup;
   const previewName = isGroupItem
     ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
-    : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
+    // Matches the row itself (ChatCard): saved name → number → account name.
+    : resolveCanonicalName({
+        userId: selectedChatItem?.peerUser?._id || selectedChatItem?.peerUserId,
+        phone: selectedChatItem?.mobileNumber || selectedChatItem?.peerUser?.mobileNumber,
+        pushName: selectedChatItem?.peerUser?.fullName,
+        fallback: 'Unknown User',
+      });
   const previewImage = isGroupItem
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : (selectedChatItem?.peerUser?.profileImage || selectedChatItem?.chatAvatar);

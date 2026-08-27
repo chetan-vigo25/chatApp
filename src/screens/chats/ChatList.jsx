@@ -25,6 +25,8 @@ import ChatCard from '../../components/ChatCard';
 import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import useStatusIndicators from '../../hooks/useStatusIndicators';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import useDisplayName from '../../hooks/useDisplayName';
+import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 import { useCall } from '../../calls/useCall';
 import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Services';
 import ChatCache from '../../services/ChatCache';
@@ -100,6 +102,39 @@ const peerIdOf = (chat, currentUserId) => {
   }
   return '';
 };
+
+// One place that turns a chat row into the string the UI shows. Private rows go
+// through the canonical rule (saved name → number → server push name); groups
+// and channels keep their server-side name. Used by search + the action-sheet
+// title so they can never disagree with the row itself (ChatCard).
+const chatRowLabel = (item) => {
+  if (!item) return '';
+  const isGroupItem = item?.chatType === 'group' || item?.isGroup;
+  const isBroadcastItem = item?.chatType === 'broadcast' || item?.isBroadcast;
+  if (isBroadcastItem) return item?.chatName || item?.broadcastChannel?.name || 'Channel';
+  if (isGroupItem) return item?.chatName || item?.group?.name || item?.groupName || 'Group';
+  const peerMobile =
+    item?.mobileNumber
+    || item?.peerUser?.mobileNumber
+    || (item?.peerUser?.mobile?.number
+      ? `${item.peerUser.mobile.code || ''}${item.peerUser.mobile.number}`
+      : (typeof item?.peerUser?.mobile === 'string' ? item.peerUser.mobile : ''));
+  return resolveCanonicalName({
+    userId: item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId,
+    phone: peerMobile,
+    pushName: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
+    fallback: 'Unknown',
+  });
+};
+
+// Every number we know for a chat row — so search matches a number the user
+// types even when the row currently displays a saved name.
+const chatRowNumbers = (item) => [
+  item?.mobileNumber,
+  item?.peerUser?.mobileNumber,
+  item?.peerUser?.mobile?.number,
+  item?.peerUser?.phone,
+].filter(Boolean).map(String);
 
 // Force the chat row's displayed name to match the user's saved contact name.
 // `contactMap` is userId -> { fullName, profileImage } built from the locally
@@ -283,6 +318,9 @@ export default function ChatList({ navigation }) {
   // via the status feed + realtime sockets (see the hook for data-source order).
   const statusByUserId = useStatusIndicators();
   const { resolveName } = useContactDirectory();
+  // Canonical resolver + a version counter that changes whenever the address
+  // book changes, so search/derived memos re-run with the new names.
+  const { namesVersion } = useDisplayName();
   const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall } = useCall();
 
   const [visible, setVisible] = useState(false);
@@ -460,11 +498,19 @@ export default function ChatList({ navigation }) {
       const isBroadcastItem = item?.chatType === 'broadcast' || item?.isBroadcast;
       const chatDisplayName = (isGroupItem || isBroadcastItem)
         ? (item?.chatName || item?.group?.name || '').toLowerCase()
-        : (item?.peerUser?.fullName || '').toLowerCase();
+        // Search the RESOLVED name (what the row actually shows), not the
+        // server's profile name — otherwise a saved contact renamed on this
+        // device is unfindable.
+        : chatRowLabel(item).toLowerCase();
       const lastMessage = getLastMessageText(item).toLowerCase();
-      return chatDisplayName.includes(query) || lastMessage.includes(query);
+      // Also match on the peer's number, digits-only, so "7742" finds them.
+      const queryDigits = query.replace(/\D/g, '');
+      const numberHit = queryDigits.length >= 3
+        && chatRowNumbers(item).some((n) => n.replace(/\D/g, '').includes(queryDigits));
+      return chatDisplayName.includes(query) || lastMessage.includes(query) || numberHit;
     });
-  }, [searchQuery, dedupedChatList, activeFilter]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, dedupedChatList, activeFilter, namesVersion]);
 
   const isSearching = searchQuery.trim() !== '';
 
@@ -932,9 +978,20 @@ export default function ChatList({ navigation }) {
             const sid = String(id);
             if (sid === String(currentUserId) || seen.has(sid)) return;
             seen.add(sid);
+            const memberMobile = u?.mobileNumber
+              || (u?.mobile?.number ? `${u.mobile.code || ''}${u.mobile.number}` : null);
             peers.push({
               id: sid,
-              name: u.fullName || m.fullName || m.name || 'Member',
+              name: resolveCanonicalName({
+                userId: sid,
+                phone: memberMobile,
+                pushName: u.fullName || m.fullName || m.name,
+                fallback: 'Member',
+              }),
+              // Server profile name rides along as the push name so call UI can
+              // show "~name" for unsaved participants without ever promoting it.
+              pushName: u.fullName || m.fullName || m.name || null,
+              mobile: memberMobile,
               avatar: u.profileImage || m.profileImage || null,
             });
           });
@@ -950,9 +1007,14 @@ export default function ChatList({ navigation }) {
     const peer = item?.peerUser;
     const peerId = peer?._id || item?.peerUserId;
     if (!peerId) return;
+    const peerMobile = item?.mobileNumber
+      || peer?.mobileNumber
+      || (peer?.mobile?.number ? `${peer.mobile.code || ''}${peer.mobile.number}` : null);
     const peerObj = {
       id: String(peerId),
-      name: peer?.fullName || 'Unknown User',
+      name: chatRowLabel(item),
+      pushName: peer?.fullName || null,
+      mobile: peerMobile,
       avatar: peer?.profileImage || null,
     };
     closeProfilePreview();
@@ -1342,7 +1404,7 @@ export default function ChatList({ navigation }) {
     ? (selectedChatItem?.chatName || 'Channel')
     : isPreviewGroup
       ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
-      : (selectedChatItem?.peerUser?.fullName || 'Unknown User');
+      : chatRowLabel(selectedChatItem);
   const previewImage = (isPreviewGroup || isPreviewBroadcast)
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;

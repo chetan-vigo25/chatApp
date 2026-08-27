@@ -1,6 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import ContactDatabase from '../services/ContactDatabase';
-import { hashPhoneForMatch, onlyDigits } from '../utils/savedContactName';
+import { onlyDigits } from '../utils/savedContactName';
+import {
+  resolveDisplayName as resolveCanonicalName,
+  subscribeContactNames,
+  loadContactNames,
+  invalidateContactNames,
+  getContactNamesVersion,
+} from '../services/contactNameStore';
 
 /**
  * useContactDirectory
@@ -56,58 +63,26 @@ const loadDirectory = async (force = false) => {
   return _cachedDirectory;
 };
 
-/** Format a raw phone string for display ("+91 98765 43210"). */
-const formatPhone = (raw) => {
-  if (!raw) return '';
-  const s = String(raw).trim();
-  if (!s) return '';
-  // Already formatted (contains spaces or starts with +) → use as-is
-  if (/[\s()-]/.test(s)) return s;
-  if (s.startsWith('+')) {
-    // Try to split country code (1-3 digits after +) and rest
-    const m = s.match(/^(\+\d{1,3})(\d+)$/);
-    if (m) {
-      const rest = m[2].replace(/(\d{5})(\d+)/, '$1 $2'); // crude split
-      return `${m[1]} ${rest}`;
-    }
-  }
-  return s;
-};
-
 /**
  * Resolve a display label for a user.
- *  • Saved contact   → fullName
- *  • Unsaved + phone → formatted phone number
- *  • Otherwise       → fallbackName (server-provided name, profile name, etc.)
+ *
+ * Thin adapter over the canonical resolver in services/contactNameStore.js so
+ * every existing call site (status, calls, group sender lines) obeys the ONE
+ * rule: saved contact name → phone number → (only if no number exists) the
+ * server profile name. `fallbackName` is a server-provided name, i.e. a PUSH
+ * name — it must never outrank the number.
+ *
+ * `directory` is accepted for signature compatibility; the canonical store owns
+ * the lookup index now.
  */
-export const resolveDisplayName = (directory, userId, fallbackName, phone) => {
-  // 1) Saved contact matched by the registered user's id.
-  if (directory && userId) {
-    const c = directory[String(userId)];
-    if (c?.fullName && c.fullName.trim()) return c.fullName.trim();
-  }
-  if (directory && phone) {
-    // 2) Saved contact matched by phone HASH (same salt/normalization as the
-    //    contact-sync pipeline — survives country-code / formatting diffs).
-    const h = hashPhoneForMatch(phone);
-    if (h) {
-      const c = directory[`h:${h}`];
-      if (c?.fullName && c.fullName.trim()) return c.fullName.trim();
-    }
-    // 3) Fallback: match by normalized phone digits.
-    const c = directory[`p:${onlyDigits(phone)}`];
-    if (c?.fullName && c.fullName.trim()) return c.fullName.trim();
-  }
-  // No saved name — prefer the phone number over any server-side display name
-  // because the user asked for "number shown if not saved".
-  const formatted = formatPhone(phone);
-  if (formatted) return formatted;
-  if (fallbackName && String(fallbackName).trim()) return String(fallbackName).trim();
-  return 'Unknown';
-};
+export const resolveDisplayName = (directory, userId, fallbackName, phone) =>
+  resolveCanonicalName({ userId, phone, pushName: fallbackName });
 
 export default function useContactDirectory() {
   const [directory, setDirectory] = useState(_cachedDirectory || {});
+  // Bumped by the canonical store whenever the address book changes, so screens
+  // holding `resolveName` re-render with the new names (no restart / re-open).
+  const [namesVersion, setNamesVersion] = useState(getContactNamesVersion());
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -115,11 +90,19 @@ export default function useContactDirectory() {
     loadDirectory().then((d) => {
       if (mountedRef.current) setDirectory(d);
     });
-    return () => { mountedRef.current = false; };
+    loadContactNames();
+    const unsubscribe = subscribeContactNames((v) => {
+      if (!mountedRef.current) return;
+      setNamesVersion(v);
+      // Keep the legacy `directory` map (still read by GroupInfo) in step.
+      loadDirectory(true).then((d) => { if (mountedRef.current) setDirectory(d); });
+    });
+    return () => { mountedRef.current = false; unsubscribe(); };
   }, []);
 
   const refresh = useCallback(async () => {
     const d = await loadDirectory(true);
+    await invalidateContactNames();
     if (mountedRef.current) setDirectory(d);
     return d;
   }, []);
@@ -127,8 +110,9 @@ export default function useContactDirectory() {
   const resolveName = useCallback(
     (userId, fallbackName, phone) =>
       resolveDisplayName(directory, userId, fallbackName, phone),
-    [directory]
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [namesVersion]
   );
 
-  return { directory, resolveName, refresh };
+  return { directory, resolveName, refresh, namesVersion };
 }

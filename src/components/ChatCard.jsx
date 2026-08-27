@@ -3,6 +3,7 @@ import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import SegmentedRing from './SegmentedRing';
 import { useTranslatedText, needsSystemFont } from './Translate';
+import useDisplayName from '../hooks/useDisplayName';
 
 const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
 const RING_SIZE   = 53; // outer ring diameter — leaves a small gap around the avatar
@@ -30,6 +31,9 @@ const ChatCard = ({
   statusInfo = null,
 }) => {
   const scale = useRef(new Animated.Value(1)).current;
+  // Canonical name resolution — the row re-renders by itself when the address
+  // book changes (contact synced / saved / deleted).
+  const { resolveName } = useDisplayName();
 
   const animateTo = (value) => {
     Animated.spring(scale, {
@@ -82,11 +86,20 @@ const ChatCard = ({
     || (item?.peerUser?.mobile?.number
       ? `${item.peerUser.mobile.code || ''}${item.peerUser.mobile.number}`
       : (typeof item?.peerUser?.mobile === 'string' ? item.peerUser.mobile : ''));
+  // 1-1 rows follow the ONE display rule: my saved contact name → the peer's
+  // phone number → (only when no number exists at all) whatever name the server
+  // shipped. `peerUser.fullName` is the peer's SELF-SET profile name — a push
+  // name — so it must never win over the number for someone I never saved.
   const peerName = isBroadcast
     ? (item?.chatName || item?.broadcastChannel?.name || 'Channel')
     : isGroup
       ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
-      : (item?.peerUser?.fullName || item?.chatName || peerMobile || item?.peerUser?.userName || 'Unknown');
+      : resolveName({
+          userId: item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId,
+          phone: peerMobile,
+          pushName: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
+          fallback: 'Unknown',
+        });
   // Broadcast channels render their logo just like a group avatar.
   const groupAvatarUri = isGroup || isBroadcast
     ? (item?.chatAvatar || item?.group?.avatar || item?.groupAvatar)

@@ -1,4 +1,5 @@
 import * as SQLite from 'expo-sqlite';
+import { emitContactsChanged } from './contactEvents';
 
 const DB_NAME = 'TalksTry_contacts.db';
 // v2: contact matching switched from hashed → PLAINTEXT E.164. The primary key is
@@ -396,6 +397,9 @@ const UPSERT_SQL = `INSERT INTO contacts (
 
 const upsertContacts = async (contacts) => {
   if (!Array.isArray(contacts) || contacts.length === 0) return;
+  // Every write announces itself so the display-name store re-reads and all
+  // mounted screens re-render with the new saved names (see contactEvents.js).
+  const announce = () => emitContactsChanged('upsert');
 
   // Serialized so no two upserts (or another write) open a transaction at once.
   return runExclusive(() => withDB(async (db) => {
@@ -426,6 +430,7 @@ const upsertContacts = async (contacts) => {
         }
       }
     }
+    announce();
   }));
 };
 
@@ -540,6 +545,7 @@ const removeContacts = async (numbers) => {
   return runExclusive(() => withDB(async (db) => {
     const ph = numbers.map(() => '?').join(',');
     await db.runAsync(`DELETE FROM contacts WHERE phone_number IN (${ph})`, numbers);
+    emitContactsChanged('remove');
   }));
 };
 
@@ -553,6 +559,7 @@ const getExistingNumbers = async () => {
 const clearAllContacts = async () => {
   return runExclusive(() => withDB(async (db) => {
     await db.execAsync('DELETE FROM contacts; DELETE FROM contact_sync_meta;');
+    emitContactsChanged('clear');
   }));
 };
 
@@ -579,6 +586,7 @@ const removeStaleContacts = async (currentNumbers) => {
       removed += result?.changes || chunk.length;
     }
     console.log(`[ContactDB] removeStaleContacts: removed ${removed} stale records`);
+    if (removed > 0) emitContactsChanged('stale-sweep');
     return removed;
   }));
 };

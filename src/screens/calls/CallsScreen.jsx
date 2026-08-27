@@ -140,6 +140,17 @@ function PressScale({ children, onPress, onLongPress, style }) {
 // One row per call — consecutive calls with the same peer are NOT collapsed
 // (product decision: show every log entry individually, no "(n)" count badge).
 // The de-dup below still guards against realtime/pagination double-inserts.
+
+// Every number a call-log peer record might carry. Passing this to the resolver
+// is what lets an UNSAVED caller render as their number instead of the account
+// name they set for themselves (the resolver was previously called with
+// `phone = null`, which disabled the number branch entirely).
+const peerPhoneOf = (u = {}) => u?.mobileNumber
+  || (u?.mobile?.number ? `${u.mobile.code || ''}${u.mobile.number}` : null)
+  || u?.phoneNumber
+  || u?.phone
+  || null;
+
 const groupCalls = (items) => {
   // Defensive de-dup: realtime prepends + paginated appends can land the same
   // call in `items` twice (by callId, or by _id). Drop repeats before grouping
@@ -333,7 +344,9 @@ export default function CallsScreen({ navigation }) {
       const peers = (group.participants || [])
         .map((u) => (u && u._id ? {
           id: String(u._id),
-          name: u.fullName || u.userName || 'Member',
+          name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u)),
+          pushName: u.fullName || u.userName || null,
+          mobile: peerPhoneOf(u),
           avatar: toSecureMediaUri(u.profileImageUrl || u.profileImage) || null,
         } : null))
         .filter(Boolean);
@@ -347,12 +360,14 @@ export default function CallsScreen({ navigation }) {
     if (!p?._id) return;
     const peerObj = {
       id: String(p._id),
-      name: p.fullName || p.userName || 'Unknown',
+      name: resolveName(String(p._id), p.fullName || p.userName || 'Unknown', peerPhoneOf(p)),
+      pushName: p.fullName || p.userName || null,
+      mobile: peerPhoneOf(p),
       avatar: toSecureMediaUri(p.profileImageUrl || p.profileImage) || null,
     };
     if (media === 'video') startVideoCall?.(peerObj);
     else startAudioCall?.(peerObj);
-  }, [startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall]);
+  }, [startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall, resolveName]);
 
   // Open the WhatsApp-style call-info page for a collapsed row: pass the peer/
   // group identity plus every underlying log entry this row stands for, so the
@@ -433,11 +448,18 @@ export default function CallsScreen({ navigation }) {
     let name;
     let avatarUri = null;
     if (g.isGroup) {
-      const names = g.participantNames
-        || (g.participants || []).map((u) => u?.fullName || u?.userName).filter(Boolean);
+      // Resolve each participant through the display rule rather than showing
+      // the account names the server populated. `participantNames` (realtime
+      // rows) is a frozen string list — only used when no user objects exist.
+      const resolvedNames = (g.participants || [])
+        .map((u) => (u && (u._id || u.userId)
+          ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u))
+          : null))
+        .filter(Boolean);
+      const names = resolvedNames.length ? resolvedNames : g.participantNames;
       name = g.groupName || (names && names.length ? names.join(', ') : 'Group call');
     } else {
-      name = resolveName(peerId, p.fullName || p.userName || 'Unknown', null);
+      name = resolveName(peerId, p.fullName || p.userName || 'Unknown', peerPhoneOf(p));
       avatarUri = toSecureMediaUri(p.profileImageUrl || p.profileImage) || null;
     }
 

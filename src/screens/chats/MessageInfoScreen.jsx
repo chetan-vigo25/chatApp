@@ -17,6 +17,7 @@ import moment from 'moment';
 import { useTheme } from '../../contexts/ThemeContext';
 import { getMessageInfo } from '../../Redux/Services/Chat/Chat.Services';
 import { getSocket } from '../../Redux/Services/Socket/socket';
+import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 
 const READ_BLUE = '#53BDEB';
 const GRAY_LIGHT = '#8696A0';
@@ -61,7 +62,15 @@ const Tick = ({ status, size = 16, isDarkMode }) => {
 };
 
 const ReceiptRow = ({ user, timestamp, palette }) => {
-  const fullName = (user?.fullName || 'Unknown').trim();
+  // Read/delivered lists show the same identity as the rest of the app:
+  // saved contact name → number → the recipient's own account name.
+  const fullName = resolveCanonicalName({
+    userId: user?._id || user?.userId,
+    phone: user?.mobileNumber
+      || (user?.mobile?.number ? `${user.mobile.code || ''}${user.mobile.number}` : null),
+    pushName: user?.fullName,
+    fallback: 'Unknown',
+  }).trim();
   const initial = (fullName.charAt(0) || '?').toUpperCase();
   return (
     <View style={[styles.row, { borderBottomColor: palette.divider, backgroundColor: palette.surface }]}>

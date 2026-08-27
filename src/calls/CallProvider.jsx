@@ -32,6 +32,7 @@ import CallOverlay from './screens/CallOverlay';
 // incoming calls). Re-enable this import + the <IncomingCallBanner /> render below.
 // import IncomingCallBanner from './components/IncomingCallBanner';
 import PrivacyOverlay from '../components/PrivacyOverlay';
+import { resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
 import CallTimer from './components/CallTimer';
 import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
@@ -77,6 +78,28 @@ export { CallContext };
 export const useCall = () => useContext(CallContext) || {};
 
 // Expo Go cannot do getUserMedia inside a WebView — needs a dev/EAS build.
+
+// Caller identity for an inbound ring. The backend can only tell us the
+// caller's OWN account name (a push name) — it does not know this device's
+// address book — so the name shown on the ring screen, the native CallKeep /
+// CallStyle UI and the call log is resolved HERE: my saved contact name → the
+// caller's number → only then whatever name the server sent.
+const buildIncomingPeer = (from = {}) => {
+  const id = from?.id ? String(from.id) : null;
+  const mobile = from?.mobile
+    || from?.mobileNumber
+    || (from?.mobileObj?.number ? `${from.mobileObj.code || ''}${from.mobileObj.number}` : null)
+    || null;
+  const pushName = from?.pushName || from?.name || null;
+  return {
+    id,
+    name: resolveCanonicalName({ userId: id, phone: mobile, pushName, fallback: 'Unknown' }),
+    pushName,
+    mobile,
+    avatar: from?.avatar || null,
+  };
+};
+
 const IS_EXPO_GO = false
 //  Constants.appOwnership === 'expo'
 //   || Constants.executionEnvironment === 'storeClient';
@@ -1710,7 +1733,7 @@ export const CallProvider = ({ children }) => {
         // and the next call's applyInitialCallRoute() was a silent no-op, i.e.
         // it kept whatever route the ringtone left behind (the loudspeaker).
         initialRouteAppliedRef.current = false;
-        const peer = { id: payload?.from?.id ? String(payload.from.id) : null, name: payload?.from?.name || 'Unknown', avatar: null };
+        const peer = buildIncomingPeer(payload?.from);
         // Group calls may arrive with a member roster; otherwise it's a 1:1.
         const members = Array.isArray(payload?.members) ? payload.members
           .map((m) => ({ id: m?.id ? String(m.id) : null, name: m?.name || 'Unknown', avatar: null }))
@@ -3167,7 +3190,7 @@ export const CallProvider = ({ children }) => {
     endedRef.current = false;
     acceptingRef.current = false; // new ring → a previous call's accept lock must never block this one
     initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
-    const peer = { id: callerId, name: payload?.from?.name || 'Unknown', avatar: payload?.from?.avatar || null };
+    const peer = buildIncomingPeer({ ...(payload?.from || {}), id: callerId });
     const members = Array.isArray(payload?.members) ? payload.members.map(String).filter(Boolean) : [];
     const others = members
       .filter((id) => id !== callerId && id !== myId)
@@ -3637,7 +3660,11 @@ export const CallProvider = ({ children }) => {
       onSignalIncoming({
         from: {
           id: (from.id != null ? String(from.id) : (inv.callerId != null ? String(inv.callerId) : null)),
+          // Server names are PUSH names — buildIncomingPeer decides what is
+          // actually shown (saved name → number → push name).
           name: from.name || inv.callerName || 'Unknown',
+          pushName: from.pushName || inv.callerPushName || from.name || inv.callerName || null,
+          mobile: from.mobile || from.mobileNumber || inv.callerMobile || null,
           avatar: from.avatar || inv.callerImage || null,
         },
         callId: inv.callId || null,
@@ -3789,6 +3816,8 @@ export const CallProvider = ({ children }) => {
       from: {
         id: data?.callerId ? String(data.callerId) : null,
         name: data?.callerName || 'Unknown',
+        pushName: data?.callerPushName || data?.callerName || null,
+        mobile: data?.callerMobile || null,
         avatar: data?.callerImage || null,
       },
       callId: data?.callId || null, // signaling id → onSignalIncoming stores as signalId

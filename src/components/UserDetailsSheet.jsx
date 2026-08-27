@@ -34,6 +34,7 @@ import { useTheme } from '../contexts/ThemeContext';
 import { useCall } from '../calls/useCall';
 import { profileServices } from '../Redux/Services/Profile/Profile.Services';
 import ContactDatabase from '../services/ContactDatabase';
+import { resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
 
 const { height: SCREEN_H } = Dimensions.get('window');
 
@@ -107,12 +108,21 @@ export default function UserDetailsSheet({
   if (!mounted) return null;
 
   // ── Display rules (mirror UserB / the chat header) ──
+  // ONE rule: saved contact name → number → the user's own account name.
+  // `fallbackName` arrives from the caller (often a server-provided name), so it
+  // is treated as a push name, never as something that outranks the number.
   const name =
     localContact?.fullName ||
     (profile?.isSavedContact ? profile?.displayName : null) ||
-    fallbackName ||
-    profile?.fullName ||
-    'User';
+    resolveCanonicalName({
+      userId: peerId,
+      phone: localContact?.normalizedPhone
+        || (profile?.mobile?.number
+          ? `${profile.mobile.code || profile.mobile.countryCode || ''}${profile.mobile.number}`
+          : null),
+      pushName: fallbackName || profile?.fullName,
+      fallback: 'User',
+    });
   const initial = (name || '?').charAt(0).toUpperCase();
   const image =
     profile?.profileImage ||

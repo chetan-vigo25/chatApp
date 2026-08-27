@@ -18,9 +18,9 @@ import { getSocket } from '../../Redux/Services/Socket/socket';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
-import { hashPhoneForMatch, onlyDigits } from '../../utils/savedContactName';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import VerifiedBadge from '../../components/VerifiedBadge';
+import useDisplayName from '../../hooks/useDisplayName';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
@@ -70,27 +70,26 @@ export default function GroupInfo({ navigation, route }) {
   const { startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
   const { currentGroup, isLoading } = useSelector((s) => s.group);
   const { leaveGroup, removeChat, removeGroupMember: socketRemoveMember, promoteGroupMember, demoteGroupMember } = useRealtimeChat();
-  // Device contact directory (local SQLite only) for device-name-first display.
+  // Device contact directory (local SQLite only) — still read by other parts of
+  // this screen; names themselves go through the canonical resolver.
   const { directory } = useContactDirectory();
-  // Priority: device/saved contact name > backend name. The saved contact is
-  // matched by user id first, then by the phone-number HASH (canonical join,
-  // works when the saved row has no user_id), then by normalized phone digits.
+  const { resolveName, pushNameOf } = useDisplayName();
+  // ONE rule (saved name → number → account name), shared with every other
+  // screen. Re-renders automatically when the address book changes.
   const resolveMemberName = (m) => {
     const u = getMemberUser(m);
-    let saved = u.id && directory?.[String(u.id)]?.fullName?.trim();
-    if (!saved && u.mobile) {
-      const h = hashPhoneForMatch(u.mobile);
-      saved = (h && directory?.[`h:${h}`]?.fullName?.trim())
-        || directory?.[`p:${onlyDigits(u.mobile)}`]?.fullName?.trim();
-    }
-    if (saved) return saved;
-    // Not saved on this device → show the phone number (WhatsApp behaviour);
-    // the server profile name is only the last resort when no number is known.
-    if (u.mobile) {
-      const num = String(u.mobile).replace(/[^\d+]/g, '');
-      if (num) return num.startsWith('+') ? num : `+${num}`;
-    }
-    return u.fullName;
+    return resolveName({
+      userId: u.id,
+      phone: u.mobile,
+      pushName: u.fullName,
+      fallback: 'Member',
+    });
+  };
+  // WhatsApp's secondary "~name" line: an UNSAVED member is identified by their
+  // number, with the name they set on their own account shown beneath it.
+  const resolveMemberPushName = (m) => {
+    const u = getMemberUser(m);
+    return pushNameOf({ userId: u.id, phone: u.mobile, pushName: u.fullName });
   };
   const fadeAnim = useRef(new Animated.Value(0)).current;
   // Scroll position drives the collapsing header: the solid header bar + title
@@ -359,6 +358,7 @@ export default function GroupInfo({ navigation, route }) {
     const displayName = resolveMemberName(member);
     const color = getAvatarColor(displayName);
     const isSelf = String(user.id) === String(currentUserId);
+    const memberPushName = isSelf ? null : resolveMemberPushName(member);
     const memberIsOwner = member.role === 'owner' || String(user.id) === String(ownerId);
     const memberIsAdmin = member.role === 'admin';
     const isMuted = Boolean(member.isMuted);
@@ -399,7 +399,12 @@ export default function GroupInfo({ navigation, route }) {
             {isMuted && <Ionicons name="volume-mute" size={12} color={theme.colors.placeHolderTextColor} />}
           </View>
           <Text style={[styles.memberSub, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
-            {user.email || formatJoinDate(member.joinedAt) || (member.canSendMessage === false ? 'Restricted' : '')}
+            {/* Unsaved member → "~their account name" (WhatsApp parity); saved
+                members keep the existing email/joined-date subtitle. */}
+            {memberPushName
+              || user.email
+              || formatJoinDate(member.joinedAt)
+              || (member.canSendMessage === false ? 'Restricted' : '')}
           </Text>
         </View>
 

@@ -17,6 +17,7 @@ import {
 import { subscribeSessionReset } from '../services/sessionEvents';
 import { previewFor, buildNotificationModel } from '../firebase/notificationModel';
 import { onlyDigits } from '../utils/savedContactName';
+import { formatPhoneNumber } from '../services/contactNameStore';
 import { claimNotification } from '../firebase/notificationDedupe';
 import { translateNotificationBody } from './Translate';
 
@@ -470,7 +471,15 @@ export default function WhatsAppBannerHost() {
       const serverRealName = rawName && (!mobile || onlyDigits(rawName) !== onlyDigits(mobile))
         ? rawName : null;
 
-      const resolvedName = localName || serverRealName || mobile || item.senderName || 'New Message';
+      // ONE rule: my saved name → the sender's NUMBER → only then any server
+      // name. The server name is the sender's own account name (a push name);
+      // promoting it above the number is what made banners show a name for
+      // people the user never saved.
+      const resolvedName = localName
+        || formatPhoneNumber(mobile)
+        || serverRealName
+        || item.senderName
+        || 'New Message';
       groupSenderName = resolvedName;
 
       if (item.isGroup) {

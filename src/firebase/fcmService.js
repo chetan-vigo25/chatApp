@@ -18,6 +18,7 @@ import { ensureFirebaseApp } from './config';
 // the startup permission screen still owns the notification prompt.
 import { isNotificationPromptHeld } from '../features/permissions/notificationPromptGate';
 import { translateNotificationBody } from '../components/Translate';
+import { loadContactNames, resolveDisplayName as resolveCallerName } from '../services/contactNameStore';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -240,7 +241,14 @@ const presentIncomingCallNotification = async (data) => {
   try {
     await setupCallNotificationCategory();
     const isVideo = (data?.callType || data?.media) === 'video';
-    const name = data?.callerName || data?.title || 'Incoming call';
+    // Saved contact name → caller's number → the caller's own account name.
+    await loadContactNames().catch(() => {});
+    const name = resolveCallerName({
+      userId: data?.callerId,
+      phone: data?.callerMobile || null,
+      pushName: data?.callerPushName || data?.callerName || data?.title,
+      fallback: 'Incoming call',
+    });
     await Notifications.scheduleNotificationAsync({
       content: {
         title: name,

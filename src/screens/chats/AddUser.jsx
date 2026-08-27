@@ -62,7 +62,15 @@ const ContactRow = memo(function ContactRow({
   bgColor, textColor, subTextColor, themeColor, inviteBgColor,
   onPressContact, onPressAvatar, onPressInfo, onPressInvite, displayPhone,
 }) {
-  const displayName = contact?.name || contact?.fullName || '?';
+  // A contacts-screen row is by definition a DEVICE contact, so its saved name
+  // is the label. When a row somehow has no device name (matched by number
+  // only), fall back to the NUMBER — never to the peer's own account name.
+  const displayName = contact?.name
+    || contact?.fullName
+    || displayPhone
+    || contact?.mobileFormatted
+    || contact?.phoneNumber
+    || '?';
   const initials = displayName.charAt(0).toUpperCase();
   const avatarBg = getAvatarColor(displayName);
 

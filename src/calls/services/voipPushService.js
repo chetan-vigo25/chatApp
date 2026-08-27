@@ -56,6 +56,11 @@ const toCallData = (payload = {}) => ({
   callId: payload.callId || null,
   callerId: payload.callerId || null,
   callerName: payload.callerName || null,
+  // The caller's OWN account name + number. Optional and additive: they let the
+  // client resolve the ring label against this device's address book (saved
+  // name → number → account name) instead of trusting a server-composed name.
+  callerPushName: payload.callerPushName || null,
+  callerMobile: payload.callerMobile || null,
   callerImage: payload.callerImage || null,
   callType: payload.callType || payload.media || 'audio',
   uuid: payload.uuid || null, // the CallKit UUID the AppDelegate reported with

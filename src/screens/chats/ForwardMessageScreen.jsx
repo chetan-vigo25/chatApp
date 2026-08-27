@@ -14,6 +14,21 @@ import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import OutboxWorker from '../../services/OutboxWorker';
+import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
+
+// Same display rule as every other surface: my saved name → the peer's number
+// → their own account name only when no number is known.
+const privateChatLabel = (chat) => resolveCanonicalName({
+  userId: chat?.peerUser?._id || chat?.peerUser?.userId || chat?.peerUserId,
+  phone: chat?.mobileNumber
+    || chat?.peerUser?.mobileNumber
+    || (chat?.peerUser?.mobile?.number
+      ? `${chat.peerUser.mobile.code || ''}${chat.peerUser.mobile.number}`
+      : null),
+  pushName: chat?.peerUser?.fullName || chat?.chatName,
+  fallback: 'Unknown',
+});
+
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
   '#E84393', '#00CEC9', '#FDCB6E', '#D63031',
@@ -73,7 +88,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const isGroup = chat.chatType === 'group' || chat.isGroup;
         const name = isGroup
           ? (chat.chatName || chat.group?.name || chat.groupName || '')
-          : (chat.peerUser?.fullName || chat.chatName || '');
+          : privateChatLabel(chat);
         if (!name) return false;
         if (searchQuery) return name.toLowerCase().includes(searchQuery.toLowerCase());
         return true;
@@ -94,7 +109,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
   const getChatId = (chat) => chat?._id || chat?.chatId || chat?.peerUser?._id;
   const getChatName = (chat) => {
     if (chat?.chatType === 'group' || chat?.isGroup) return chat.chatName || chat.group?.name || chat.groupName || 'Group';
-    return chat?.peerUser?.fullName || chat?.chatName || 'Unknown';
+    return privateChatLabel(chat);
   };
   const getChatAvatar = (chat) => {
     if (chat?.chatType === 'group') return chat.chatAvatar || chat.group?.avatar || chat.groupAvatar;

@@ -116,6 +116,16 @@ const deriveStats = (calls = []) => {
   return s;
 };
 
+
+// Every number a call-log peer/participant record might carry — the resolver
+// needs one to label an unsaved caller by number instead of by the name they
+// set on their own account.
+const peerPhoneOf = (u = {}) => u?.mobileNumber
+  || (u?.mobile?.number ? `${u.mobile.code || ''}${u.mobile.number}` : null)
+  || u?.phoneNumber
+  || u?.phone
+  || null;
+
 export default function CallDetailScreen() {
   const { theme, isDarkMode } = useTheme();
   const navigation = useNavigation();
@@ -167,11 +177,19 @@ export default function CallDetailScreen() {
 
   const name = useMemo(() => {
     if (isGroup) {
-      const names = participantNames
-        || (participants || []).map((u) => u?.fullName || u?.userName).filter(Boolean);
+      // Resolve each participant now; `participantNames` is a frozen list from
+      // realtime rows and is only used when no user objects are available.
+      const resolved = (participants || [])
+        .map((u) => (u && (u._id || u.userId)
+          ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u))
+          : null))
+        .filter(Boolean);
+      const names = resolved.length ? resolved : participantNames;
       return groupName || (names && names.length ? names.join(', ') : 'Group call');
     }
-    return resolveName(peerId, peer?.fullName || peer?.userName || 'Unknown', null);
+    // Pass the peer's number so an unsaved caller shows as a number, not as the
+    // account name they chose for themselves.
+    return resolveName(peerId, peer?.fullName || peer?.userName || 'Unknown', peerPhoneOf(peer));
   }, [isGroup, groupName, participants, participantNames, peer, peerId, resolveName]);
 
   // Newest-first, then bucket into day sections (Today / Yesterday / dated).
@@ -204,7 +222,9 @@ export default function CallDetailScreen() {
       const peers = (participants || [])
         .map((u) => (u && u._id ? {
           id: String(u._id),
-          name: u.fullName || u.userName || 'Member',
+          name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u)),
+          pushName: u.fullName || u.userName || null,
+          mobile: peerPhoneOf(u),
           avatar: toSecureMediaUri(u.profileImageUrl || u.profileImage) || null,
         } : null))
         .filter(Boolean);
@@ -218,11 +238,13 @@ export default function CallDetailScreen() {
     const peerObj = {
       id: peerId,
       name,
+      pushName: peer?.fullName || peer?.userName || null,
+      mobile: peerPhoneOf(peer),
       avatar: avatarUri,
     };
     if (media === 'video') startVideoCall?.(peerObj);
     else startAudioCall?.(peerObj);
-  }, [isGroup, participants, groupName, peerId, name, avatarUri,
+  }, [isGroup, participants, groupName, peerId, peer, name, avatarUri, resolveName,
     startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall]);
 
   const peerObjForNav = useMemo(() => ({

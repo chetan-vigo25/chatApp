@@ -1,6 +1,7 @@
 import { Platform, DeviceEventEmitter } from 'react-native';
 import { requireOptionalNativeModule } from 'expo-modules-core';
 import { CALL_PUSH_EVENTS } from './callEvents';
+import { loadContactNames, resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
 
 /**
  * WhatsApp-style incoming-call notification for Android (background / killed /
@@ -297,10 +298,22 @@ export const ensureCallChannel = async () => {
 
 // ===== display =====
 export const displayIncomingCallNotifee = async (data) => {
+  // The OS-level call UI must obey the same rule as every in-app surface:
+  // my saved contact name → the caller's number → only then the name the
+  // caller set on their own account. The backend cannot know this device's
+  // address book, so resolve against the local contacts DB here — this path
+  // runs headless (killed app), hence the explicit load.
+  await loadContactNames().catch(() => {});
+  const resolvedCallerName = resolveCanonicalName({
+    userId: data?.callerId,
+    phone: data?.callerMobile || data?.senderMobile || null,
+    pushName: data?.callerPushName || data?.callerName || data?.title,
+    fallback: 'Incoming call',
+  });
   const call = {
     callId: data?.callId,
     callerId: data?.callerId,
-    callerName: data?.callerName || data?.title,
+    callerName: resolvedCallerName,
     callerImage: data?.callerImage || null,
     callType: (data?.callType || data?.media) === 'video' ? 'video' : 'audio',
   };
@@ -435,9 +448,16 @@ export const displayMissedCallNotification = async (data = {}) => {
     missedShownIds.add(key);
   }
   const isGroup = !!(data.isGroup || data.groupId);
+  // Same rule as the ringing notification: saved name → number → push name.
+  await loadContactNames().catch(() => {});
   const name = isGroup
     ? (data.groupName || data.callerName || 'Group call')
-    : (data.callerName || data.senderName || data.title || 'Someone');
+    : resolveCanonicalName({
+        userId: data.callerId || data.senderId,
+        phone: data.callerMobile || data.senderMobile || null,
+        pushName: data.callerPushName || data.callerName || data.senderName || data.title,
+        fallback: 'Someone',
+      });
   const isVideo = (data.callType || data.media) === 'video';
   const title = name;
   const body = isVideo ? 'Missed video call' : 'Missed voice call';

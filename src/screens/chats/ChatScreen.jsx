@@ -80,6 +80,7 @@ import ReactionDetailSheet from '../../components/ReactionDetailSheet';
 import SaveContactBanner from '../../components/SaveContactBanner';
 import useSaveContact from '../../hooks/useSaveContact';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import useDisplayName from '../../hooks/useDisplayName';
 import ContactDatabase from '../../services/ContactDatabase';
 import * as ScreenCapture from 'expo-screen-capture';
 import { apiCall } from '../../Config/Https';
@@ -2657,6 +2658,8 @@ export default function ChatScreen({ navigation, route }) {
   // Used to resolve status-reply preview owner names against the local
   // saved-contacts directory (saved name → phone number → server name).
   const { resolveName: resolveContactName } = useContactDirectory();
+  // Companion resolver for the group "~push name" secondary line.
+  const { pushNameOf: resolveContactPushName } = useDisplayName();
   const {
     showSuggestions: showMentionSuggestions,
     suggestions: mentionSuggestions,
@@ -6513,6 +6516,15 @@ export default function ChatScreen({ navigation, route }) {
       senderMeta.fullName || msg.senderName || 'Member',
       senderMeta.mobileNumber
     );
+    // "~account name" for unsaved senders (null when the sender IS saved, or
+    // when the server name is just the number again).
+    const senderPushName = showSenderName
+      ? resolveContactPushName({
+          userId: msg.senderId,
+          phone: senderMeta.mobileNumber,
+          pushName: senderMeta.fullName || msg.senderName,
+        })
+      : null;
     const openSenderProfile = () => {
       if (!msg.senderId) return;
       navigation.navigate('UserB', {
@@ -6634,13 +6646,24 @@ export default function ChatScreen({ navigation, route }) {
                 {/* Saved contact → device contact name. Not saved → phone
                     number (3rd arg). Backend/profile name is only the final
                     fallback when no number is known. */}
-                {resolveContactName(
-                  msg.senderId,
-                  groupMembersMap?.[msg.senderId]?.fullName
-                    || msg.senderName
-                    || 'Member',
-                  groupMembersMap?.[msg.senderId]?.mobileNumber
-                )}
+                {senderLabel}
+              </Text>
+            )}
+
+            {/* WhatsApp "~push name": an unsaved group member is identified by
+                their NUMBER above, with the name they set on their own account
+                shown here as a secondary line. Saved members show nothing. */}
+            {showSenderName && senderPushName && (
+              <Text
+                numberOfLines={1}
+                style={{
+                  fontSize: 11,
+                  color: theme.colors.bubbleMeta,
+                  fontFamily: 'Roboto-Regular',
+                  marginBottom: 3,
+                  paddingRight: 8,
+                }}>
+                {senderPushName}
               </Text>
             )}
 
@@ -7228,9 +7251,13 @@ export default function ChatScreen({ navigation, route }) {
       seen.add(sid);
       const info = groupMembersMap?.[sid] || {};
       const img = u.profileImage || info.profileImage || null;
+      const memberMobile = u.mobileNumber || info.mobileNumber
+        || (u.mobile?.number ? `${u.mobile.code || ''}${u.mobile.number}` : null);
       out.push({
         id: sid,
-        name: u.fullName || info.fullName || m?.name || 'Member',
+        name: resolveContactName(sid, u.fullName || info.fullName || m?.name || 'Member', memberMobile),
+        pushName: u.fullName || info.fullName || m?.name || null,
+        mobile: memberMobile,
         avatar: img ? toSecureMediaUri(img) : null,
       });
     });
@@ -7244,7 +7271,9 @@ export default function ChatScreen({ navigation, route }) {
         const info = groupMembersMap[sid] || {};
         out.push({
           id: sid,
-          name: info.fullName || 'Member',
+          name: resolveContactName(sid, info.fullName || 'Member', info.mobileNumber),
+          pushName: info.fullName || null,
+          mobile: info.mobileNumber || null,
           avatar: info.profileImage ? toSecureMediaUri(info.profileImage) : null,
         });
       });
@@ -7583,7 +7612,14 @@ export default function ChatScreen({ navigation, route }) {
         {/* Save Contact Banner — shown for unknown TalksTry users in 1:1 chats */}
         {/* {!isGroupChat && (isPeerUnknownContact || contactSavedSuccessfully) && (
           <SaveContactBanner
-            peerName={chatData?.peerUser?.fullName || chatData?.peerUser?.name || ''}
+            peerName={resolveContactName(
+              chatData?.peerUser?._id,
+              chatData?.peerUser?.fullName || chatData?.peerUser?.name || '',
+              chatData?.peerUser?.mobileNumber
+                || (chatData?.peerUser?.mobile?.number
+                  ? `${chatData.peerUser.mobile.code || ''}${chatData.peerUser.mobile.number}`
+                  : null),
+            )}
             isSaving={isContactSaving}
             isSyncing={isContactSyncing}
             savedSuccessfully={contactSavedSuccessfully}

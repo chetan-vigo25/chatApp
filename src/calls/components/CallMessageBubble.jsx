@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../useCall';
+import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 
 /**
  * In-thread "call" entry, WhatsApp style. Rendered by ChatScreen for messages of
@@ -40,9 +41,22 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
   // callee. The caller's own unanswered/cancelled leg reads neutrally.
   const isMissed = (outcome === 'missed' || outcome === 'cancelled') && !isOutgoing;
 
+  const peerMobile = peer?.mobileNumber
+    || (peer?.mobile?.number ? `${peer.mobile.code || ''}${peer.mobile.number}` : null)
+    || peer?.phone
+    || null;
   const peerObj = peer ? {
     id: String(peer._id || peer.userId || peer.id || ''),
-    name: peer.fullName || peer.name || 'Unknown',
+    // Call-back label follows the display rule, so an unsaved peer rings out as
+    // a number rather than as the name they set on their own account.
+    name: resolveCanonicalName({
+      userId: peer._id || peer.userId || peer.id,
+      phone: peerMobile,
+      pushName: peer.fullName || peer.name,
+      fallback: 'Unknown',
+    }),
+    pushName: peer.fullName || peer.name || null,
+    mobile: peerMobile,
     avatar: peer.profileImage || peer.profilePicture || null,
   } : null;
 

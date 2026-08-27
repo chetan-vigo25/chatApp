@@ -7,6 +7,7 @@ import { formatLastSeen } from '../services/lastSeenFormatter.service';
 import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
 import ContactDatabase from '../../services/ContactDatabase';
 import { getSocket } from '../../Redux/Services/Socket/socket';
+import useDisplayName from '../../hooks/useDisplayName';
 
 // Marquee for one-line header text: static while it fits; when it overflows
 // the available width it auto-scrolls right→left in a seamless loop (second
@@ -96,6 +97,12 @@ export default function ChatHeaderPresence({
   const { presence, lastSeenFormatted } = useUserPresence(isGroup ? null : user?._id);
   const { state } = useRealtimeChat();
 
+  // `namesVersion` changes whenever the address book changes, so saving the
+  // contact while this chat is OPEN flips the header name immediately — no
+  // re-navigation, no restart (the old effect keyed on user._id alone never
+  // re-ran and left a stale number/name on screen).
+  const { resolveName, namesVersion } = useDisplayName();
+
   const [localContact, setLocalContact] = useState(null);
   useEffect(() => {
     if (isGroup || !user?._id) { setLocalContact(null); return; }
@@ -104,7 +111,7 @@ export default function ChatHeaderPresence({
       .then((row) => { if (!cancelled) setLocalContact(row); })
       .catch(() => { if (!cancelled) setLocalContact(null); });
     return () => { cancelled = true; };
-  }, [isGroup, user?._id]);
+  }, [isGroup, user?._id, namesVersion]);
 
   // Live profile-photo override: reflect the peer's photo change in realtime
   // without leaving the chat. Resets when the peer changes.
@@ -179,11 +186,23 @@ export default function ChatHeaderPresence({
   const statusText = isBroadcast
     ? 'tap here for channel info'
     : isGroup ? groupStatusText : peerStatusText;
-  const peerDisplayName =
-    localContact?.fullName ||
-    user?.fullName ||
-    user?.name ||
-    'Unknown User';
+  // ONE rule: my saved contact name → the peer's number → (only when no number
+  // is known) the server profile name. `user.fullName` is the peer's OWN
+  // account name — a push name — and must never outrank the number here.
+  const peerPhone =
+    localContact?.normalizedPhone
+    || user?.mobileNumber
+    || (user?.mobile?.number ? `${user.mobile.code || ''}${user.mobile.number}` : null)
+    || user?.phone
+    || null;
+  const peerDisplayName = isGroup
+    ? null
+    : resolveName({
+        userId: user?._id,
+        phone: peerPhone,
+        pushName: user?.fullName || user?.name,
+        fallback: 'Unknown User',
+      });
   // Prefer the live server photo (realtime override → chat's peerUser) so a
   // profile-picture change shows immediately; the locally-saved contact image
   // is only a stale snapshot, used last. Saved-contact NAME still wins above.
@@ -232,7 +251,7 @@ export default function ChatHeaderPresence({
         ) : (
           <View style={[styles.avatarFallback, { backgroundColor: getUserColor?.(user?._id || '') || '#888' }]}>
             <Text style={styles.avatarLetter}>
-              {peerDisplayName?.charAt(0).toUpperCase() || '?'}
+              {displayName?.charAt(0)?.toUpperCase() || '?'}
             </Text>
           </View>
         )}
