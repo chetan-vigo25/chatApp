@@ -4093,8 +4093,12 @@ export const CallProvider = ({ children }) => {
     // in-app ringtone so the notification channel is the only thing ringing.
     const handBack = () => {
       if (Platform.OS !== 'android') return;
+      // Same accept-in-flight guard as the pop-up effect: backgrounding the app
+      // in the instant between `accept()` and the `accepted` commit must not
+      // re-post a ring notification for a call that is already being answered.
+      if (acceptingRef.current || endedRef.current) return;
       const snap = stateRef.current;
-      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted) return;
+      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted || snap.answeredAt) return;
       const id = snap.signalId || snap.callId;
       if (!id) return;
       stopRinging();
@@ -4142,8 +4146,16 @@ export const CallProvider = ({ children }) => {
     if (Platform.OS !== 'android') return undefined;
     if (state.status !== CALL_STATUS.INCOMING || state.accepted) return undefined;
     const popUp = (why) => {
+      // ACCEPT IN FLIGHT — the one case this must never fire on. `accept()` sets
+      // `acceptingRef` synchronously and cancels the notification, but the
+      // `accepted: true` commit lands a beat later and `stateRef` trails it by a
+      // render. Answering from the notification also foregrounds the app, so an
+      // AppState 'active' arrives inside exactly that window: without this guard
+      // the ring notification was re-posted on top of a call that was already
+      // connected — the pop-up sitting over a running 0:07 timer.
+      if (acceptingRef.current || endedRef.current) return;
       const snap = stateRef.current;
-      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted) return;
+      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted || snap.answeredAt) return;
       const id = snap.signalId || snap.callId;
       if (!id) return;
       // The notification channel carries the ringtone; silence the in-app one
@@ -4165,8 +4177,20 @@ export const CallProvider = ({ children }) => {
     };
     if (AppState.currentState === 'active') popUp('ring-while-open');
     const sub = AppState.addEventListener('change', (next) => { if (next === 'active') popUp('app-opened'); });
-    return () => { try { sub.remove(); } catch (_) { /* */ } };
-  }, [state.status, state.accepted, stopRinging]);
+    return () => {
+      try { sub.remove(); } catch (_) { /* */ }
+      // Belt for the same failure: if this effect is tearing down because the
+      // ring is OVER (answered, ending, or gone), make sure nothing it posted
+      // outlives it. Deliberately NOT unconditional — a teardown caused by a
+      // dependency identity change while the call is still ringing must leave
+      // the notification alone, or it would kill the only ring surface a
+      // backgrounded device has.
+      const snap = stateRef.current;
+      if (acceptingRef.current || snap.status !== CALL_STATUS.INCOMING || snap.accepted || snap.answeredAt) {
+        cancelAllIncomingCallNotifee();
+      }
+    };
+  }, [state.status, state.accepted, state.answeredAt, stopRinging]);
 
   // ── onAppForeground() → getActiveCall() → show the in-app call banner ──────
   // The architecture rule this implements: BANNER VISIBILITY IS NEVER THE
