@@ -10,7 +10,7 @@ import {
   SOURCE_LANGUAGE, getDownloadedLanguages, getSupportedLanguages,
   isTranslationAvailable, needsSystemFont,
 } from '../../components/Translate';
-import { LANGUAGES } from '../../constant/languages';
+import { LANGUAGES, NO_TRANSLATION, NO_TRANSLATION_OPTION } from '../../constant/languages';
 
 /**
  * Choose language.
@@ -61,8 +61,10 @@ export default function ChooseLanguage({ navigation }) {
 
   const onPick = useCallback(async (code) => {
     setFailedCode(null);
-    // English is the source language — it never needs a model or a download.
-    if (code === SOURCE_LANGUAGE) { setLanguage(code); return; }
+    // Neither English (the app's own language) nor "Don't translate" needs a
+    // model — both apply the instant they are tapped, with nothing to download
+    // and nothing that can fail.
+    if (code === SOURCE_LANGUAGE || code === NO_TRANSLATION) { setLanguage(code); return; }
 
     pickSeqRef.current += 1;
     const seq = pickSeqRef.current;
@@ -89,9 +91,16 @@ export default function ChooseLanguage({ navigation }) {
   // screen still renders rather than coming up empty.
   const offered = useMemo(() => {
     const supported = getSupportedLanguages();
-    if (!supported || supported.length === 0) return LANGUAGES;
-    const allowed = new Set(supported);
-    return LANGUAGES.filter(({ code }) => code === SOURCE_LANGUAGE || allowed.has(code));
+    const base = (!supported || supported.length === 0)
+      ? LANGUAGES
+      : LANGUAGES.filter(({ code }) => {
+        const allowed = new Set(supported);
+        return code === SOURCE_LANGUAGE || allowed.has(code);
+      });
+    // "Don't translate" is always first and always present: it needs no model,
+    // so the ML Kit support filter must never be able to hide it. It is the
+    // only row that still works in Expo Go.
+    return [NO_TRANSLATION_OPTION, ...base];
   }, []);
 
   const results = useMemo(() => {
@@ -161,9 +170,13 @@ export default function ChooseLanguage({ navigation }) {
             results.map((item) => {
               const selected = item.code === language;
               const isBusy = busyCode === item.code;
-              // English is the app's own language — nothing to download.
+              const isOffRow = item.code === NO_TRANSLATION;
+              // English is the app's own language — nothing to download. Nor is
+              // there anything to download for "Don't translate".
               const needsModel =
-                item.code !== SOURCE_LANGUAGE && !downloaded.includes(item.code);
+                !isOffRow
+                && item.code !== SOURCE_LANGUAGE
+                && !downloaded.includes(item.code);
 
               return (
                 <TouchableOpacity
@@ -174,7 +187,14 @@ export default function ChooseLanguage({ navigation }) {
                   // WHOLE list meant one stuck download made the screen dead —
                   // the user could not even pick a different language.
                   disabled={isBusy}
-                  style={[styles.row, { borderBottomColor: divider }]}
+                  style={[
+                    styles.row,
+                    { borderBottomColor: divider },
+                    // A different KIND of choice, not one more language — the
+                    // heavier rule stops the list reading as if "Don't
+                    // translate" were another language.
+                    isOffRow && { borderBottomWidth: 8, borderBottomColor: divider },
+                  ]}
                   accessibilityRole="radio"
                   accessibilityState={{ selected, busy: isBusy }}
                 >

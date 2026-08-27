@@ -38,6 +38,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import MlkitTranslate from '../../modules/expo-mlkit-translate';
 import { lookupUiString } from '../constant/uiStrings';
 import { hinglishToEnglish } from '../constant/hinglish';
+import { isTranslationOff } from '../constant/languages';
 
 export const LANGUAGE_STORAGE_KEY = 'app.language';
 /**
@@ -190,11 +191,64 @@ const downloading = new Map();  // language → Promise<boolean>
  * just means translations stay in the original text.
  */
 export function ensureLanguageReady(language, { requireWifi = true } = {}) {
+  // Nothing to download when the reader asked for no translation at all.
+  if (isTranslationOff(language)) return Promise.resolve(true);
   if (!language || language === SOURCE_LANGUAGE) return prepare(SOURCE_LANGUAGE, requireWifi);
   return Promise.all([
     prepare(SOURCE_LANGUAGE, requireWifi),
     prepare(language, requireWifi),
   ]).then(([en, target]) => en && target);
+}
+
+/**
+ * Did the user accept a metered model download?
+ *
+ * Yes exactly when they picked a language: the picker shows the download size
+ * next to the row and passes requireWifi:false, so the tap IS the consent. A
+ * model needed later — for a language someone ELSE writes in — is the same
+ * deal, and follows the same answer.
+ *
+ * Deliberately derived from `cachedHasPreference` rather than stored in its own
+ * flag: that one is already rebuilt from the saved language on every launch, so
+ * the consent survives a restart for free. A separate key would also have to be
+ * added to sessionManager.DEVICE_PREFERENCE_KEYS or the next logout would wipe
+ * it — see docs/APP_LANGUAGE_GUIDE.md Section 4.
+ */
+const allowCellularModelDownloads = () => cachedHasPreference === true;
+
+/**
+ * Make ONE pair usable — the pair a message actually needs.
+ *
+ * `ensureLanguageReady` only fetches English and the READER's language. A chat
+ * translates `whatever the sender wrote → the reader's language`, and the
+ * sender's language is not knowable until a message arrives, so its model was
+ * never downloaded by anyone:
+ *
+ *   • reader picked English → only `en` was fetched, and an incoming Hindi
+ *     message needs `hi`. Missing → 'deferred' → retry → still missing, for
+ *     ever, because the retry asked for `en` again.
+ *   • reader picked Thai → `en` + `th` were fetched; that same Hindi message
+ *     still needs `hi`.
+ *
+ * Translation therefore only ever worked when the sender happened to write in
+ * English. This is the on-demand counterpart that fixes it.
+ *
+ * All three models are requested because ML Kit pivots every pair through
+ * English: hi→th runs as hi→en→th internally and fails without `en`.
+ *
+ * `requireWifi` INHERITS the choice the user already made in the picker rather
+ * than being hard-coded. This runs off an INCOMING MESSAGE, never a tap, so it
+ * must not pull ~30MB over mobile data on its own — but a user who tapped a
+ * language, with the download size on screen, has accepted exactly that cost,
+ * and a sender's model is the same deal. Hard-coding Wi-Fi-only meant a reader
+ * on mobile data was simply never translated.
+ */
+export function ensurePairReady(source, target, { requireWifi = !allowCellularModelDownloads() } = {}) {
+  if (isTranslationOff(target)) return Promise.resolve(true);
+  if (!source || !target || source === target) return Promise.resolve(true);
+  const needed = Array.from(new Set([SOURCE_LANGUAGE, source, target]));
+  return Promise.all(needed.map((code) => prepare(code, requireWifi)))
+    .then((results) => results.every(Boolean));
 }
 
 /**
@@ -254,6 +308,43 @@ const SCRIPT_OF = {
 };
 const NON_LATIN_SCRIPT =
   /[\u0400-\u04FF\u0590-\u06FF\u0900-\u0DFF\u0E00-\u0E7F\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7A3]/;
+
+/**
+ * Most likely language for non-Latin text, from its SCRIPT alone.
+ *
+ * ML Kit's identifier needs a reasonable amount of text and answers 'und' for
+ * short strings — "कैसे हो", "नमस्ते", "สวัสดี" — which is most of what a chat
+ * contains. Falling back to English there is worse than useless: the source
+ * then equals an English reader's target and the message is skipped as
+ * "nothing to do", so SHORT foreign messages were exactly the ones that never
+ * translated.
+ *
+ * Script is a weaker signal than a detector, but for these ranges it is almost
+ * always right, and it is only consulted after the detector has given up.
+ * Where a script serves several languages the most widely used one wins
+ * (Devanagari → Hindi, not Marathi). A wrong guess inside one script still
+ * translates far better than not translating at all.
+ */
+const SCRIPT_LANGUAGE = [
+  [/[\u0900-\u097F]/, 'hi'],
+  [/[\u0980-\u09FF]/, 'bn'],
+  [/[\u0A00-\u0A7F]/, 'pa'],
+  [/[\u0A80-\u0AFF]/, 'gu'],
+  [/[\u0B80-\u0BFF]/, 'ta'],
+  [/[\u0C00-\u0C7F]/, 'te'],
+  [/[\u0C80-\u0CFF]/, 'kn'],
+  [/[\u0D00-\u0D7F]/, 'ml'],
+  [/[\u0600-\u06FF]/, 'ar'],
+  [/[\u0E00-\u0E7F]/, 'th'],
+  [/[\u0400-\u04FF]/, 'ru'],
+  [/[\u3040-\u30FF]/, 'ja'],
+  [/[\u4E00-\u9FFF]/, 'zh'],
+];
+
+function languageFromScript(text) {
+  const hit = SCRIPT_LANGUAGE.find(([re]) => re.test(text));
+  return hit ? hit[1] : null;
+}
 
 /**
  * Scripts this app's bundled font cannot draw.
@@ -319,6 +410,33 @@ function looksAlreadyReadable(text, language) {
  * Making Hinglish actually translate needs a model trained on romanized input —
  * i.e. the cloud API. See docs/APP_LANGUAGE_GUIDE.md.
  */
+/**
+ * Is this romanized text with a few native-script words mixed in?
+ *
+ * "Aur meri jaan kya हाल-चाल isko Hindi mein likho" is Hinglish carrying one
+ * Devanagari fragment. That one word is enough to make the detector answer
+ * Hindi, and the hi→x model then meets mostly Latin tokens it cannot read, so
+ * it drops or invents them: ML Kit returned "And I am sorry" and Chrome's
+ * translator (on the web client) truncated it to "Aur meri jaan kya". In both
+ * cases most of the sentence silently disappeared from the bubble while the
+ * chat list, showing the original, still had it in full.
+ *
+ * It is the same problem the pure-romanized refusal below already covers; the
+ * mixed case simply slipped past it.
+ *
+ * "Mixed" means Latin is the DOMINANT script. A mostly-Hindi sentence with one
+ * English word ("मैं office जा रहा हूँ") is normal and translates fine, so it
+ * deliberately does not match.
+ */
+function isLatinDominantMixed(text) {
+  const latin = (text.match(/[A-Za-z]/g) || []).length;
+  if (latin === 0) return false;
+  let nonLatin = 0;
+  for (const ch of text) if (NON_LATIN_SCRIPT.test(ch)) nonLatin += 1;
+  if (nonLatin === 0) return false;
+  return latin > nonLatin;
+}
+
 async function detectSource(text, language) {
   const readerUsesOwnScript = Boolean(SCRIPT_OF[language]);
   const messageIsLatin = !NON_LATIN_SCRIPT.test(text);
@@ -351,8 +469,22 @@ async function detectSource(text, language) {
     return source;
   }
 
-  // Text in its own script: trust the detector, fall back to English.
-  return detected ?? SOURCE_LANGUAGE;
+  // Text in its own script. Trust the detector when it committed to an answer.
+  if (detected) return detected;
+
+  // Detector said 'und' — almost always because the message is SHORT
+  // ("कैसे हो", "नमस्ते"). Assuming English here was a real bug: the source then
+  // matched an English reader's target and the message was dropped as "nothing
+  // to do". The script itself is a good enough answer.
+  const byScript = languageFromScript(text);
+  if (byScript) {
+    if (__DEV__) {
+      console.log(`[translate] detector:und "${text.slice(0, 30)}" → script says ${byScript}`);
+    }
+    return byScript;
+  }
+
+  return SOURCE_LANGUAGE;
 }
 
 /* ─────────────────────────── translate entry ─────────────────────────── */
@@ -367,12 +499,36 @@ async function detectSource(text, language) {
 function resolveRequest(text, language, from) {
   if (typeof text !== 'string' || !text.trim()) return { skip: true };
   if (!language) return { skip: true };
+  // "Don't translate": every caller funnels through here — translateDetailed,
+  // t() and the synchronous peek alike — so one check disables the whole
+  // feature, and no stale cache entry can leak a translation back onto screen.
+  if (isTranslationOff(language)) return { skip: true };
 
   const auto = from === 'auto';
   const source = auto ? 'auto' : from;
 
   if (!auto && language === source) return { skip: true };
   if (auto && looksAlreadyReadable(text, language)) return { skip: true };
+
+  // Romanized text carrying a few native-script words — see isLatinDominantMixed.
+  //
+  // Refused HERE rather than in detectSource, because detectSource only runs on
+  // a cache MISS: a mangled translation produced before this guard existed is
+  // still in the cache, and `peekTranslation` would keep painting it. Checking
+  // at the plan stage makes those entries unreachable from every path at once,
+  // without having to migrate or version the cache.
+  //
+  // This does NOT touch the Hinglish phrase pack. PURE romanized text has no
+  // native-script characters, so it never matches here and still reaches the
+  // pack through detectSource → null. Only MIXED text stops early — and the
+  // pack cannot help there anyway, since its lookups are whole phrases and a
+  // Devanagari fragment in the middle matches nothing.
+  if (auto && isLatinDominantMixed(text)) {
+    if (__DEV__) {
+      console.log(`[translate] mixed script "${text.slice(0, 40)}" → shown as sent`);
+    }
+    return { skip: true };
+  }
 
   return { skip: false, auto, source, key: `${source}::${language}::${text}` };
 }
@@ -441,8 +597,11 @@ export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) 
   if (!MlkitTranslate.isAvailable()) return { text, status: 'failed' };
 
   const request = enqueue(async () => {
+    // Hoisted out of the try: the catch below needs the pair that failed, so it
+    // can fetch THAT model instead of the reader's language.
+    let source = plan.source;
     try {
-      const source = auto ? await detectSource(text, language) : plan.source;
+      source = auto ? await detectSource(text, language) : plan.source;
       // null = romanized text ("chale chalo") that no on-device model can read.
       // This is the ONLY path that leaves the device: the cloud model handles
       // romanized input, ML Kit cannot. A null answer — route not deployed,
@@ -494,7 +653,11 @@ export async function translateDetailed(text, language, from = SOURCE_LANGUAGE) 
         // Not a failure — the model just is not here yet. Nudge the download and
         // tell the caller to come back, without burning its retry budget.
         modelRetryUntil = Date.now() + MODEL_RETRY_MS;
-        ensureLanguageReady(language);
+        // Ask for the PAIR that failed. This used to call
+        // ensureLanguageReady(language), which never fetches the SENDER's
+        // model — see ensurePairReady for why that left messages permanently
+        // untranslated.
+        try { ensurePairReady(source, language); } catch { /* best-effort */ }
         return { text, status: 'deferred' };
       }
       if (error?.code === 'ERR_MLKIT_UNSUPPORTED_LANGUAGE') {
@@ -573,6 +736,10 @@ const LanguageContext = createContext({
   language: SOURCE_LANGUAGE,
   setLanguage: async () => {},
   ready: false,
+  // Explicit: a consumer rendered outside the provider must read "no
+  // preference" and translate nothing, rather than `undefined` happening to be
+  // falsy today.
+  hasPreference: false,
 });
 
 export function LanguageProvider({ children }) {
@@ -606,7 +773,7 @@ export function LanguageProvider({ children }) {
   // deleted by the OS to reclaim space would otherwise leave the app silently
   // untranslated until the user re-picked the language.
   useEffect(() => {
-    if (!ready || language === SOURCE_LANGUAGE) return;
+    if (!ready || language === SOURCE_LANGUAGE || isTranslationOff(language)) return;
     ensureLanguageReady(language);
   }, [ready, language]);
 
@@ -649,7 +816,12 @@ export function useT(text, from = SOURCE_LANGUAGE) {
     let alive = true;
     // `from="auto"` must still run when the reader's language is English —
     // a Hindi message has to become English for them.
-    if (typeof text !== 'string' || (from !== 'auto' && language === SOURCE_LANGUAGE)) {
+    // `isTranslationOff` short-circuits here as well as in resolveRequest: the
+    // core would answer 'skipped' anyway, but there is no reason to schedule
+    // async work for a reader who asked for none.
+    if (typeof text !== 'string'
+        || isTranslationOff(language)
+        || (from !== 'auto' && language === SOURCE_LANGUAGE)) {
       setValue(text);
       return undefined;
     }
@@ -660,6 +832,123 @@ export function useT(text, from = SOURCE_LANGUAGE) {
 
   return value;
 }
+
+/**
+ * Translate ONE message body for display — the chat-list preview.
+ *
+ * ChatScreen has its own per-thread machinery (a keyed map, retry budgets, a
+ * self-heal timer) because it juggles a whole list. A chat-list row has exactly
+ * one string, so it gets this instead — but it goes through the SAME core, so a
+ * chat's row and its open thread can never show two different sentences for one
+ * message. They share the cache too: whichever renders first pays, the other is
+ * free.
+ *
+ * Returns null when nothing should change, so the caller keeps its original.
+ *
+ * `enabled` is how the caller says "this is real text" — media labels, call
+ * summaries and system notices are OUR words, not the sender's, and are not
+ * translated. `isOwn` keeps translation recipient-side, exactly as in the
+ * thread: your own preview reads as you typed it.
+ */
+export function useTranslatedText(text, { isOwn = false, enabled = true } = {}) {
+  const { language, ready, hasPreference } = useLanguage();
+
+  const body = typeof text === 'string' ? text.trim() : '';
+  const eligible = Boolean(
+    ready && hasPreference && enabled && !isOwn && body && !isTranslationOff(language),
+  );
+
+  // Resolved DURING RENDER from the synchronous cache, so a row whose message
+  // the thread already translated paints translated in its FIRST frame.
+  const cached = eligible ? peekTranslation(body, language, 'auto') : null;
+
+  // Only the ASYNC result needs state, and it carries the input it belongs to —
+  // without that key a recycled row would show the previous chat's translation
+  // for a frame.
+  const [fetched, setFetched] = useState(null);
+  const key = `${language}::${body}`;
+
+  useEffect(() => {
+    if (!eligible || cached) return undefined;
+    let alive = true;
+    ensureTranslationCacheReady()
+      .then(() => translateDetailed(body, language, 'auto'))
+      .then((outcome) => {
+        if (!alive) return;
+        // Only a real translation replaces the text. 'skipped', 'unchanged',
+        // 'deferred' and 'failed' all mean "keep what the sender wrote" — and a
+        // deferred one appears on its own once the model lands, because the
+        // thread and this row read the same cache.
+        if (outcome?.status === 'translated' && outcome.text && outcome.text !== body) {
+          setFetched({ key: `${language}::${body}`, value: outcome.text });
+        }
+      })
+      .catch(() => { /* the preview keeps the original */ });
+    return () => { alive = false; };
+  }, [eligible, cached, body, language]);
+
+  if (!eligible) return null;
+  return cached ?? (fetched?.key === key ? fetched.value : null);
+}
+
+/* ────────────────────── notifications / banners ────────────────────── */
+
+/**
+ * How long a banner may wait for a translation.
+ *
+ * A banner is not a surface the user is waiting on — it either arrives promptly
+ * or it is noise. On-device translation is well under this once the model is
+ * warm, and the common case is a straight cache hit, because the same message
+ * is being translated for the chat list and the thread at that very moment.
+ */
+const NOTIFICATION_DEADLINE_MS = 600;
+
+/**
+ * Translate a notification body, with a deadline.
+ *
+ * Returns null for "leave the original alone" — no preference, translation off,
+ * not plain text, or simply not ready in time. A banner showing the original is
+ * far better than a banner that arrives late.
+ *
+ * Callers pass the BARE body. A group banner's "Sender: " prefix must stay
+ * OUTSIDE this: a name through a translator comes back as a person who does not
+ * exist. Media labels ("Photo", "Voice call") are OUR words, not the sender's,
+ * and are excluded by the messageType check.
+ *
+ * Not a hook — banners are built from event handlers, outside React — so it
+ * reads the module-level language cache directly.
+ */
+export async function translateNotificationBody(text, { messageType = 'text' } = {}) {
+  const body = typeof text === 'string' ? text.trim() : '';
+  if (!body) return null;
+  if (messageType && messageType !== 'text') return null;
+  if (cachedHasPreference !== true) return null;
+
+  const language = cachedLanguage || SOURCE_LANGUAGE;
+  if (isTranslationOff(language)) return null;
+
+  // Free path: the chat list or the open thread already translated this string.
+  const cached = peekTranslation(body, language, 'auto');
+  if (cached) return cached;
+
+  let timer;
+  try {
+    const work = translateDetailed(body, language, 'auto');
+    const deadline = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), NOTIFICATION_DEADLINE_MS);
+    });
+    const outcome = await Promise.race([work, deadline]);
+    if (outcome?.status === 'translated' && outcome.text && outcome.text !== body) {
+      return outcome.text;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 /* ─────────────────────── translated components ─────────────────────── */
 
@@ -692,7 +981,10 @@ function TText({ ignore, from, children, ...rest }) {
     // `from="auto"` (chat messages) must still run when the reader's language
     // is English — a Hindi message has to become English for them.
     const nothingToDo =
-      ignore || source === null || (from !== 'auto' && language === SOURCE_LANGUAGE);
+      ignore
+      || source === null
+      || isTranslationOff(language)
+      || (from !== 'auto' && language === SOURCE_LANGUAGE);
     if (nothingToDo) {
       setText(children);
       return undefined;
@@ -713,7 +1005,9 @@ function TTextInput({ placeholder, ...rest }) {
 
   useEffect(() => {
     let alive = true;
-    if (typeof placeholder !== 'string' || language === SOURCE_LANGUAGE) {
+    if (typeof placeholder !== 'string'
+        || isTranslationOff(language)
+        || language === SOURCE_LANGUAGE) {
       setHint(placeholder);
       return undefined;
     }

@@ -138,10 +138,12 @@ export const registerCallUuid = (callId, uuid) => {
   const old = idToUuid[key];
   if (old && old !== u) {
     try { if (isAvailable()) RNCallKeep.endCall(old); } catch (_) { /* no-op */ }
+    markSelfEnded(old);
     delete uuidToId[old];
   }
   idToUuid[key] = u;
   uuidToId[u] = key;
+  clearSelfEnded(u);
 };
 
 const callIdForUuid = (uuid) => uuidToId[String(uuid || '')] || null;
@@ -152,6 +154,38 @@ const forget = (callId) => {
   if (u) { delete uuidToId[u]; }
   delete idToUuid[key];
   outgoingReported.delete(key);
+};
+
+// ── uuids WE ended, and when ───────────────────────────────────────────────
+// Every endCall / endAllCalls / dismissIncoming we file comes back as an
+// `endCall` EVENT from CallKit — asynchronously, typically 1-2s later, and by
+// then the mapping it referred to is already forgotten. The provider then reads
+// that echo as "the user ended a call": with a fresh ring up (call-backs and
+// conference re-invites arrive within seconds, and a conference reuses ONE id
+// forever) it rejected the call the user was in the middle of answering.
+// Remember what we ended ourselves so the echo can be dropped at the source —
+// the only place that can tell "I filed this" from "the user pressed End".
+const selfEnded = new Map(); // uuid → ts
+const SELF_ENDED_TTL_MS = 15000;
+const markSelfEnded = (uuid) => {
+  const u = String(uuid || '');
+  if (!u) return;
+  const now = Date.now();
+  selfEnded.set(u, now);
+  // Opportunistic prune — this map only ever holds a handful of entries.
+  for (const [k, ts] of selfEnded) { if (now - ts > SELF_ENDED_TTL_MS) selfEnded.delete(k); }
+};
+// A uuid that is RINGING again is, by definition, not one we already ended.
+// Backend-supplied uuids can repeat (a conference reuses one id for its whole
+// life), so without this a leave followed by a re-invite within the TTL would
+// have us swallow the user's own genuine Decline on the new ring.
+const clearSelfEnded = (uuid) => { selfEnded.delete(String(uuid || '')); };
+const wasSelfEnded = (uuid) => {
+  const u = String(uuid || '');
+  const ts = selfEnded.get(u);
+  if (!ts) return false;
+  if (Date.now() - ts > SELF_ENDED_TTL_MS) { selfEnded.delete(u); return false; }
+  return true;
 };
 
 export const setup = async () => {
@@ -193,7 +227,9 @@ export const setup = async () => {
 export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
   if (!isAvailable()) return;
   try {
-    RNCallKeep.displayIncomingCall(uuidForCall(callId), String(handle || name || 'call'), name || 'Incoming call', 'generic', !!hasVideo);
+    const u = uuidForCall(callId);
+    clearSelfEnded(u);
+    RNCallKeep.displayIncomingCall(u, String(handle || name || 'call'), name || 'Incoming call', 'generic', !!hasVideo);
   } catch (_) { /* no-op */ }
 };
 
@@ -281,6 +317,7 @@ export const endCall = (callId, endedReason = 0) => {
     } else {
       RNCallKeep.endCall(u);
     }
+    markSelfEnded(u);
   } catch (_) { /* no-op */ }
   forget(callId);
 };
@@ -296,6 +333,7 @@ export const endCall = (callId, endedReason = 0) => {
 export const endAllCalls = () => {
   if (!isAvailable()) return;
   try { RNCallKeep.endAllCalls(); } catch (_) { /* no-op */ }
+  for (const key of Object.keys(idToUuid)) markSelfEnded(idToUuid[key]);
   for (const key of Object.keys(idToUuid)) forget(key);
 };
 
@@ -318,6 +356,7 @@ export const dismissIncoming = (callId, uuid, reason = 2) => {
         RNCallKeep.endCall(u);
       }
     } catch (_) { /* no-op */ }
+    markSelfEnded(u);
     delete uuidToId[u];
   }
   if (callId) forget(callId);
@@ -351,6 +390,11 @@ export const registerEvents = (handlers = {}) => {
   // down the current call.
   const end = ({ callUUID }) => {
     const u = String(callUUID || '');
+    // The echo of an end WE filed (finalizeEnd's endCall/endAllCalls, a stale-push
+    // dismissIncoming, a uuid re-bind). It arrives 1-2s late, after the mapping is
+    // gone, and a fresh ring can already be up by then — forwarding it declined the
+    // call the user was answering. Ours to swallow: nobody pressed anything.
+    if (wasSelfEnded(u)) return;
     const cid = callIdForUuid(u);
     if (!cid) {
       // Unknown uuid. With live mappings this is a ghost from an earlier call

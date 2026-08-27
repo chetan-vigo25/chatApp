@@ -29,5 +29,39 @@ export const LANGUAGES = [
   { code: 'ja', label: '日本語',       english: 'Japanese',   flag: '🇯🇵' },
 ];
 
-export const getLanguage = (code) =>
-  LANGUAGES.find((language) => language.code === code) || LANGUAGES[0];
+/**
+ * "Don't translate anything" — a real, explicit choice, not the absence of one.
+ *
+ * Deliberately NOT a language tag: it is a sentinel that every translation
+ * choke point checks first, so picking it turns the feature off rather than
+ * translating into some default. Every message then renders exactly as its
+ * sender typed it, whatever language that is.
+ *
+ * Distinct from picking English: an English reader still has Hindi messages
+ * translated FOR them. This option translates nothing, in any direction.
+ *
+ * The value is persisted under 'app.language', so it must never collide with a
+ * BCP-47 tag — 'off' is not one. It must also match the web client's sentinel
+ * (chat-website src/features/translation/languages.js), because the two share
+ * this storage key's meaning.
+ */
+export const NO_TRANSLATION = 'off';
+
+export const isTranslationOff = (language) => language === NO_TRANSLATION;
+
+/**
+ * Picker row for the sentinel. Kept OUT of LANGUAGES so the ML Kit support
+ * filter can never hide it — "no translation" works even in Expo Go, where
+ * there is no native module at all.
+ */
+export const NO_TRANSLATION_OPTION = {
+  code: NO_TRANSLATION,
+  label: "Don't translate",
+  english: 'Show every message exactly as it was sent',
+  flag: '\u{1F6AB}',
+};
+
+export const getLanguage = (code) => {
+  if (isTranslationOff(code)) return NO_TRANSLATION_OPTION;
+  return LANGUAGES.find((language) => language.code === code) || LANGUAGES[0];
+};

@@ -94,6 +94,7 @@ import CallMessageBubble from '../../calls/components/CallMessageBubble';
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
 import { translateDetailed, ensureTranslationCacheReady, peekTranslation, getRetryDelay, needsSystemFont, useLanguage } from "../../components/Translate";
+import { isTranslationOff } from "../../constant/languages";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -115,15 +116,20 @@ const TRANSLATION_RETRY_MIN_MS = 6000;
  * staying invisible — a message is never lost to a slow translation.
  *
  * On-device translation is milliseconds, so for most messages this never
- * matters. It is sized for the other path: romanized text goes to the cloud
- * fallback, and a network round trip is what actually risks the "original
- * first, translation second" flicker this hold exists to prevent.
+ * matters at all.
  *
- * A slow tail beyond this still flickers — covering the fallback's full 8s
- * timeout would mean staring at a gap that long, which is worse. Lower it if
- * you would rather see messages sooner and accept the swap.
+ * It was 2500ms, sized for a CLOUD fallback and its network round trip. That
+ * fallback no longer exists — everything is on-device now — so the only thing
+ * the extra seconds bought was a message that took two and a half seconds to
+ * appear.
+ *
+ * Applies to the FIRST PAINT of already-loaded history only. A message that
+ * ARRIVES while the screen is open is never held: see `arrivedLive` in
+ * renderableMessages. Waiting on a translation before showing a message that
+ * just came in is the opposite of realtime, and the original-then-swap it
+ * avoids is by far the smaller problem.
  */
-const TRANSLATION_FIRST_PAINT_HOLD_MS = 2500;
+const TRANSLATION_FIRST_PAINT_HOLD_MS = 800;
 
 /**
  * Which rows the message translator is allowed to touch.
@@ -2251,6 +2257,10 @@ export default function ChatScreen({ navigation, route }) {
    *    own outgoing text would rewrite your words back at you in a language you
    *    did not type them in.
    *
+   *  • `!isTranslationOff` — the picker's "Don't translate" row. A reader can
+   *    have an explicit preference and still want every message exactly as it
+   *    was sent, in whatever language it arrived.
+   *
    * Neither of these touches what is stored or sent. `msg.text` is never
    * overwritten and no translation reaches the server, so the same message can
    * be rendered differently on every recipient's device.
@@ -2260,8 +2270,11 @@ export default function ChatScreen({ navigation, route }) {
   ), [currentUserId]);
 
   const shouldTranslateMessage = useCallback((msg) => (
-    hasLanguagePreference && !isOwnMessage(msg) && isTranslatableMessage(msg)
-  ), [hasLanguagePreference, isOwnMessage]);
+    hasLanguagePreference
+    && !isTranslationOff(language)
+    && !isOwnMessage(msg)
+    && isTranslatableMessage(msg)
+  ), [hasLanguagePreference, language, isOwnMessage]);
 
   /**
    * Translation for one message, resolved DURING RENDER.
@@ -6992,6 +7005,13 @@ export default function ChatScreen({ navigation, route }) {
   const translationHoldRef = useRef(new Map());   // messageKey::lang → deadline ms
   const [, setHoldTick] = useState(0);
   const holdTimerRef = useRef(null);
+  /**
+   * When this screen opened. Anything stamped at or after it arrived LIVE and
+   * is never withheld — a message that just came in has to appear now, not
+   * after a translation resolves. The hold only ever applied to history that
+   * was already on screen.
+   */
+  const screenOpenedAtRef = useRef(Date.now());
 
   useEffect(() => () => clearTimeout(holdTimerRef.current), []);
 
@@ -7013,6 +7033,11 @@ export default function ChatScreen({ navigation, route }) {
       if (!shouldTranslateMessage(msg)) return true;
       const body = typeof msg.text === 'string' ? msg.text.trim() : '';
       if (!body) return true;
+      // Arrived while the user was looking at this chat → show it immediately
+      // and let the translation swap in. Realtime beats flicker.
+      const stamp = new Date(msg.timestamp || msg.createdAt || 0).getTime();
+      const arrivedLive = stamp >= screenOpenedAtRef.current;
+      if (arrivedLive) return true;
       // resolveRequest says "skipped" for same-script pairs; peek returning null
       // is ambiguous, so lean on the effect's skip set plus the deadline below.
       if (peekTranslation(body, language, 'auto')) return true; // cache hit, paints translated

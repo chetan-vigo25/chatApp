@@ -18,6 +18,7 @@ import { subscribeSessionReset } from '../services/sessionEvents';
 import { previewFor, buildNotificationModel } from '../firebase/notificationModel';
 import { onlyDigits } from '../utils/savedContactName';
 import { claimNotification } from '../firebase/notificationDedupe';
+import { translateNotificationBody } from './Translate';
 
 // Preload the notification sound once at module level
 // Fallback only — the banner plays the DEVICE DEFAULT notification tone
@@ -452,6 +453,10 @@ export default function WhatsAppBannerHost() {
     // The device-saved contact name is authoritative (the chat list reads the
     // same contacts table) so the banner stays correct even when the server's
     // contact sync is stale. Best-effort: any failure keeps the canonical name.
+    // Resolved inside the try below, needed after it to rebuild a group body
+    // around the translated text.
+    let groupSenderName = null;
+
     try {
       const local = (item.senderId || item.senderMobile)
         ? await ContactDatabase.getContactDisplay({ userId: item.senderId, phone: item.senderMobile })
@@ -466,6 +471,7 @@ export default function WhatsAppBannerHost() {
         ? rawName : null;
 
       const resolvedName = localName || serverRealName || mobile || item.senderName || 'New Message';
+      groupSenderName = resolvedName;
 
       if (item.isGroup) {
         // Group: the title stays the group name — only the "Sender: " body
@@ -480,6 +486,33 @@ export default function WhatsAppBannerHost() {
       if (!item.avatarUrl && local?.profileImage) item.avatarUrl = local.profileImage;
     } catch {
       // keep whatever buildNotificationModel resolved
+    }
+
+    // ── Translated body ───────────────────────────────────────────────────
+    //
+    // The banner shows the sender's words in the language the reader picked —
+    // the same translation the chat itself shows, out of the same cache, so the
+    // banner and the chat can never disagree.
+    //
+    // Only `lineBody` (the bare message) goes through the translator. The
+    // sender's NAME is re-attached afterwards: a name through a translator comes
+    // back as a person who does not exist. Media previews are excluded inside
+    // translateNotificationBody — those are our words, not the sender's.
+    //
+    // Bounded by a deadline, so a slow translation can never delay the banner;
+    // it just shows the original instead.
+    try {
+      const translated = await translateNotificationBody(item.lineBody, {
+        messageType: item.messageType,
+      });
+      if (translated) {
+        item.lineBody = translated;
+        item.body = (item.isGroup && groupSenderName && groupSenderName !== 'New Message')
+          ? `${groupSenderName}: ${translated}`.trim()
+          : translated;
+      }
+    } catch {
+      // keep the original text
     }
 
     // Play notification sound for every new banner

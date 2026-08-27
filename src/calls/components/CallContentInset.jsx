@@ -2,8 +2,8 @@ import React from 'react';
 import { View, StyleSheet } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCall } from '../useCall';
-import { isMiniBannerActive } from '../state/callMachine';
-import { MINI_BAR_HEIGHT } from './CallMiniBanner';
+import { isMiniBannerActive, CALL_STATUS } from '../state/callMachine';
+import { MINI_BAR_HEIGHT, RING_BAR_HEIGHT } from './CallMiniBanner';
 
 /**
  * Pushes the whole app (the navigator) down by the FULL height of the minimized
@@ -27,8 +27,12 @@ export default function CallContentInset({ children }) {
   const { call } = useCall();
   const insets = useSafeAreaInsets();
   const active = isMiniBannerActive(call);
+  // The ringing variant is taller (avatar + Answer/Decline), so reserve its
+  // height or the app's header lands underneath it.
+  const ringing = active && call?.status === CALL_STATUS.INCOMING && !call?.accepted;
+  const barHeight = ringing ? RING_BAR_HEIGHT : MINI_BAR_HEIGHT;
   return (
-    <View style={[styles.fill, active ? { paddingTop: insets.top + MINI_BAR_HEIGHT } : null]}>
+    <View style={[styles.fill, active ? { paddingTop: insets.top + barHeight } : null]}>
       {children}
     </View>
   );

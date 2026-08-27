@@ -232,6 +232,13 @@ export const CallProvider = ({ children }) => {
   const connectWatchdogRef = useRef(null); // detect an answered call that never reaches ACTIVE (no remote media)
   const mediaRingWatchdogRef = useRef(null); // answered, but the media server's ring (WebRTC callId) never arrived
   const acceptingRef = useRef(false);      // synchronous accept lock (double-tap / re-render re-entry)
+  // Was the full-screen ring opened AUTOMATICALLY (the app happened to be
+  // backgrounded when the call arrived), or did the USER ask for it (banner tap /
+  // notification tap / full-screen intent)? Only the automatic one may be
+  // collapsed back to the banner when the app is opened — an explicit request
+  // must survive, including when the notification tap's expand lands a beat
+  // AFTER the foreground event it caused.
+  const autoExpandedRef = useRef(false);
   const reconnectWatchdogRef = useRef(null); // mid-call media-drop recovery watchdog (APP-6)
   const audioRouteAppliedRef = useRef(false); // did the user toggle Speaker this call? (so we reset routing on end)
   const initialRouteAppliedRef = useRef(false); // initial earpiece/speaker route applied for THIS call (once, at connect)
@@ -1664,11 +1671,39 @@ export const CallProvider = ({ children }) => {
           break;
         }
         if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
-          // already busy → auto-reject the new one
+          // OUR OWN group/conference call re-ringing. The host's re-invite loop
+          // keeps re-emitting the media-server ring until it sees us joined, and a
+          // conference reuses ONE groupId for its whole life — so this event is
+          // routinely a duplicate of the call we are ALREADY on. Rejecting it sent
+          // `declineGroupCall` for that group: we declined our own seat and the SDK
+          // blacklisted the group for 15s, so the accept could never join and the
+          // media-ring watchdog cut the call ("banner se pick kiya, call uthi hi
+          // nahi"). The SDK swallows these once `_room` exists; this covers the
+          // pre-join window, where it can't. Ignore — never decline.
+          const pGid = payload?.groupId ? String(payload.groupId) : null;
+          const sGid = snap.groupId ? String(snap.groupId) : null;
+          // Both sides name a group and they DISAGREE → genuinely someone else's
+          // call, keep busy-rejecting it.
+          const differentGroup = !!pGid && !!sGid && pGid !== sGid;
+          const ownGroupRing = !!payload?.isGroup && !differentGroup && (
+            (pGid && sGid && pGid === sGid)
+            || (payload?.callId && snap.callId && String(payload.callId) === String(snap.callId))
+            || !!snap.isConference
+          );
+          if (ownGroupRing) {
+            if (__DEV__) console.log('[CALL][APP] group re-ring for the call we are already on — ignored (NOT declined)', { callId: payload?.callId, groupId: payload?.groupId });
+            break;
+          }
+          // A genuinely different call while busy → auto-reject it.
           if (payload?.callId) sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
           break;
         }
         endedRef.current = false;
+        // A previous call's accept lock must never block this ring. The app-socket
+        // path clears this; the engine path (a call that only ever arrives over the
+        // media server — e.g. a mid-call add-participant) did not, so a leaked lock
+        // made Accept a silent no-op.
+        acceptingRef.current = false;
         // A NEW call must always be free to apply its own initial route. The
         // one-shot latch is normally cleared by resetAudioRoute() on end, so a
         // call that ended without reaching finalizeEnd used to leave it ARMED —
@@ -2189,6 +2224,14 @@ export const CallProvider = ({ children }) => {
     const wantSpeaker = media === 'video' || isGroup;
     // App-socket signaling id (busy lock + call:* events). Distinct from the
     // calling-service callId that the engine returns for WebRTC.
+    // OBSERVED IN A PROD LOG: an iOS device dialled with `sig_me_1787806956757` —
+    // i.e. `myId` was null, so the placeholder shipped into the id BOTH sides key
+    // the whole call on. The backend's conference guards parse `sig_<hostId>_<ms>`,
+    // the call-log rows key on it, and the roster inference below can't subtract
+    // "us" from the member list without an id. Never silent again: this is an
+    // auth/user-shape problem (the persisted user had no _id/id/userId), and it
+    // has to be visible to be fixed.
+    if (!myId) console.warn('[CALL][APP] dialling WITHOUT a local user id — signalId falls back to "me"; check what login persisted (userInfo/userData)', { userKeys: user ? Object.keys(user) : null });
     const signalId = `sig_${myId || 'me'}_${Date.now()}`;
     const peerIds = peers.map((p) => p.id);
 
@@ -2320,6 +2363,19 @@ export const CallProvider = ({ children }) => {
     const snap = stateRef.current;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 1 accept tapped ═════', { status: snap.status, callId: snap.callId, signalId: snap.signalId, media: snap.media, isGroup: snap.isGroup, peer: snap.peer, awaitingEngine: snap.awaitingEngine });
     if (snap.status !== CALL_STATUS.INCOMING) return;
+    // SYNCHRONOUS staleness check. `stateRef` is committed by an EFFECT, so it
+    // trails the ENDED dispatch by a full render — and under load (SQLite writes,
+    // message sync, a chatty dev bundle) that lag runs into SECONDS. A call that
+    // was already torn down therefore still reads `status: 'incoming'` here, the
+    // ringing UI is still painted, and a tap ran half of accept() against a dead
+    // call: ACT.ACCEPT (dropped by the reducer), a connect watchdog, a
+    // myAcceptedCallRef marker, then a silent bail at the post-await ENDED check
+    // (log signature: STEP 3 + STEP 4 with no STEP 5 and no `emit call:accept`).
+    // `endedRef` flips SYNCHRONOUSLY inside finalizeEnd, so it can't lag.
+    if (endedRef.current) {
+      if (__DEV__) console.log('[CALL][APP][accept] IGNORED — this call already ended (stale ring UI; stateRef had not caught up)');
+      return;
+    }
     // SYNCHRONOUS re-entry lock. `status` stays INCOMING after ACT.ACCEPT (only
     // `accepted` flips), and stateRef trails the commit by a tick — so the guard
     // above let a double-tap (or a re-render firing onPress twice) run accept()
@@ -2483,7 +2539,10 @@ export const CallProvider = ({ children }) => {
     // Re-read state: the WebRTC `incoming` (carrying the real callId) may have
     // landed while we were connecting, and the call may have ended meanwhile.
     const cur = stateRef.current;
-    if (cur.status === CALL_STATUS.ENDED || cur.status === CALL_STATUS.IDLE) return;
+    if (cur.status === CALL_STATUS.ENDED || cur.status === CALL_STATUS.IDLE || endedRef.current) {
+      if (__DEV__) console.log('[CALL][APP][accept] ABORTED after connect — the call ended while we were answering', { status: cur.status, endedRef: endedRef.current, signalId: cur.signalId });
+      return;
+    }
 
     if (cur.callId) {
       // Real id known → answer now. The SDK answers with the call's own media
@@ -2954,7 +3013,39 @@ export const CallProvider = ({ children }) => {
   // screen (tap the banner). Until this fires, an unanswered incoming call rings
   // only as the top banner so the user can keep using the app (WhatsApp-style).
   const expandIncoming = useCallback(() => {
+    autoExpandedRef.current = false;
     dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
+  }, []);
+
+  // The inverse: drop the full-screen ring screen back to the persistent top
+  // strip, so an un-answered incoming call behaves like a minimized one — the
+  // user can keep using the app and the call stays visible and reachable. Back
+  // used to be swallowed here, which left the user stuck on the ring screen with
+  // no way out but answering or declining.
+  // Swipe the ringing banner away. UI-ONLY: the call is untouched (still
+  // ringing, still answerable from the OS notification / CallKit), and the flag
+  // is cleared on the next foreground so the banner comes back — the whole point
+  // being that dismissing it is temporary, not a way to lose a live call.
+  // CallManager.getActiveCall() — the single source of truth any surface can
+  // ask, instead of inferring "is there a call?" from whether some banner
+  // happens to be mounted. Returns the live call, or null when genuinely idle.
+  // Reads the ref (not `state`) so a caller inside an event handler / timer
+  // always sees the current call rather than the one captured at render time.
+  const getActiveCall = useCallback(() => {
+    const active = stateRef.current;
+    if (!active || active.status === CALL_STATUS.IDLE) return null;
+    return active;
+  }, []);
+
+  const dismissIncomingBanner = useCallback(() => {
+    if (__DEV__) console.log('[CALL][APP] call banner swiped away — call stays live, banner returns on next foreground');
+    dispatch({ type: ACT.SET_FLAG, key: 'bannerDismissed', value: true });
+  }, []);
+
+  const collapseIncoming = useCallback(() => {
+    // A call that arrived on a LOCKED device must never reveal the app behind it.
+    if (isDeviceLockedNow() || lockedCallRef.current) { returnToLockScreen(); return; }
+    dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: false });
   }, []);
 
   const queryPresence = useCallback((ids = []) => {
@@ -3038,12 +3129,31 @@ export const CallProvider = ({ children }) => {
       // Already ringing (e.g. WebRTC arrived first, or it rang notification-only in
       // the background) → record the signal id.
       if (!snap.signalId && payload?.callId) dispatch({ type: ACT.SET_SIGNAL, signalId: payload.callId });
+      // The ring is being ASSERTED again (backend re-ring, push replay, recovery
+      // pull). That is by definition a "present this call" event, so a banner the
+      // user swiped away earlier must come back with it.
+      if (snap.bannerDismissed) dispatch({ type: ACT.SET_FLAG, key: 'bannerDismissed', value: false });
+      // CallKit UUID CONVERGENCE for the engine-rang-first case. When the media
+      // server's ring stages the call, it reports CallKit under the ENGINE callId
+      // and mints its own uuid; if a VoIP push then reports the SAME logical call
+      // natively under the backend uuid (keyed on the signaling id), CallKit holds
+      // TWO calls for one call. Answering one makes iOS end the other, and that
+      // endCall event is indistinguishable from a decline — the call died the
+      // instant it was answered. Binding both ids to the backend uuid collapses
+      // them into one (registerCallUuid ends the superseded uuid, and our own
+      // end-echo is swallowed in nativeCallService). No-op without a uuid.
+      const uuidNow = payload?.uuid || payload?.callUuid || payload?.callKitUuid || null;
+      if (uuidNow && Platform.OS === 'ios' && nativeCall.isAvailable()) {
+        if (payload?.callId) nativeCall.registerCallUuid(payload.callId, uuidNow);
+        if (snap.callId) nativeCall.registerCallUuid(snap.callId, uuidNow);
+      }
       // A full-screen RE-ENTRY (the user tapped the notification / a full-screen
       // intent launched us / fromAccept) must PROMOTE a notification-only ring to the
       // full-screen CallOverlay — otherwise the call UI never replaces the launch
       // cover and the user is stuck on a caller-name screen. Also mark it locked if
       // the device is locked so back/end returns to the lock screen.
       if (opts.fromAccept || opts.fullScreen) {
+        autoExpandedRef.current = false; // the user asked for the full screen
         if (snap.notificationOnly) dispatch({ type: ACT.SET_FLAG, key: 'notificationOnly', value: false });
         dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
         if (isDeviceLockedNow() || deviceLockedRef.current) {
@@ -3228,6 +3338,22 @@ export const CallProvider = ({ children }) => {
           // Locked device always takes the full-screen ring (it shows over the
           // keyguard); otherwise expand only when the app wasn't in active use.
           : (lockedAtRing || AppState.currentState !== 'active')));
+    // The ring's PRESENTATION decision — the single thing that determines whether
+    // the user gets the top banner or the full-screen call screen, and until now
+    // the only step of the incoming path that logged nothing at all.
+    if (__DEV__) {
+      console.log('[CALL][APP][ring] presentation decided', {
+        shouldExpand,
+        willShow: shouldExpand ? 'FULL-SCREEN ring' : 'top BANNER',
+        notificationOnly,
+        useCallKit,
+        lockedAtRing,
+        appState: AppState.currentState,
+        optsExpand: opts.expand,
+        optsFullScreen: !!opts.fullScreen,
+      });
+    }
+    autoExpandedRef.current = !!shouldExpand;
     if (shouldExpand) {
       dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: true });
     }
@@ -3311,8 +3437,21 @@ export const CallProvider = ({ children }) => {
   }, []);
   const onSignalCancelled = useCallback((payload) => {
     if (!matchesCurrent(payload)) { dismissGhostRing(payload); return; }
-    finalizeEnd(stateRef.current.direction === 'incoming' ? 'missed' : 'cancelled');
-  }, [finalizeEnd, dismissGhostRing]);
+    const snap = stateRef.current;
+    // GROUP/CONFERENCE we are already IN: a cancel withdraws ONE member's invite,
+    // it can never mean "end the call for someone who has already answered". This
+    // was the only terminal handler without the carve-out its siblings
+    // (onSignalRejected / onSignalEnded) have — and because a conference reuses one
+    // callId forever, matchesCurrent() happily matched a cancel aimed at a
+    // completely different member and tore our live call down.
+    if (snap.isGroup && snap.answeredAt) {
+      const by = payload?.by != null ? String(payload.by) : null;
+      if (__DEV__) console.log('[CALL][APP] cancel on a group call we already answered — dropping only that member', { by });
+      if (by) removeGroupParticipant(by, 'cancelled');
+      return;
+    }
+    finalizeEnd(snap.direction === 'incoming' ? 'missed' : 'cancelled');
+  }, [finalizeEnd, dismissGhostRing, removeGroupParticipant]);
   const onSignalRejected = useCallback((payload) => {
     if (!matchesCurrent(payload)) return;
     const snap = stateRef.current;
@@ -3400,6 +3539,15 @@ export const CallProvider = ({ children }) => {
     if (!matchesCurrent(payload)) return;
     const snap = stateRef.current;
     const reason = String(payload?.reason || '');
+    // A multi-device dismissal is about THE RING. Once we have answered on THIS
+    // device we are a participant, not a ringing invite — and on a conference
+    // (one immortal callId) a dismissal minted for another member, or for our own
+    // earlier invite to the same call, matches this one exactly. Never let it end
+    // a call we are already in.
+    if (snap.isGroup && snap.answeredAt) {
+      if (__DEV__) console.log('[CALL][APP] cancelled-elsewhere on a group call we already answered — ignored', { reason });
+      return;
+    }
     if (reason === 'answered_elsewhere' || reason === 'accepted_elsewhere') {
       // WE are the winning device → this is a stray sibling-dismiss that leaked
       // to a duplicate socket of our own device (the server carries the winner's
@@ -3601,8 +3749,17 @@ export const CallProvider = ({ children }) => {
         if (snap.isConference && snap.signalId
             && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
           conferenceState({ callId: snap.signalId }).then((ack) => {
-            if (ack?.active && ack.roster) onConferenceRoster(ack.roster);
-            else if (ack?.active === false) finalizeEnd('completed');
+            if (ack?.active && ack.roster) { onConferenceRoster(ack.roster); return; }
+            // `active:false` ends the call — so only trust it once we are actually
+            // IN the conference. While merely RINGING (invited, not yet answered)
+            // this races: the reconnect fires the moment a push-woken device comes
+            // back, which is exactly when the server may not have settled our
+            // invite yet, and a false negative silently killed a live ring. An
+            // un-answered invite that really is dead still ends on its own — the
+            // ring timeout and the server's cancel/timeout events both cover it.
+            const live = stateRef.current;
+            if (ack?.active === false && live.answeredAt) finalizeEnd('completed');
+            else if (ack?.active === false && __DEV__) console.log('[CALL][APP] conference reports inactive but we are still RINGING — letting the ring stand');
           }).catch(() => {});
         }
       }
@@ -3729,10 +3886,42 @@ export const CallProvider = ({ children }) => {
     });
   }, [onSignalIncoming, mapPushToIncoming]);
 
+  // Is this OS action (notification button / CallKit / notifee) about a call OTHER
+  // than the one we're currently on?
+  //
+  // The Accept/Decline/End actions used to be applied to whatever call happened to
+  // be live, with NO id check — so an action belonging to a FINISHED call could
+  // land on the NEXT one. That is not hypothetical: a lingering heads-up from the
+  // previous call, a queued notifee response, or a CallKit action replayed after
+  // the app foregrounds all arrive seconds late, and the previous call's Decline
+  // then silently rejected the call that was ringing at that moment (log signature:
+  // `[CALL] end … outcome:"rejected"` with no preceding `[CALL][APP][accept]` and
+  // no Decline from the user, followed by an Accept tap that no-ops on the dead
+  // state). Only ignore when we can PROVE the mismatch: the action carries an id
+  // and the live call has ids that don't include it. An id-less action (older
+  // payload / cold start with no state yet) keeps the previous behaviour.
+  const isForeignCallAction = useCallback((data) => {
+    const pid = data?.callId ? String(data.callId) : null;
+    if (!pid) return false;
+    const snap = stateRef.current;
+    // A push/notification action always carries the SIGNALING id, so we can only
+    // judge once this call HAS one. Before that (engine ring reconciled first,
+    // `call:incoming` not landed yet) the state may hold only the WebRTC callId —
+    // comparing against that would reject a perfectly good Accept. Unknown ⇒ act.
+    if (!snap.signalId) return false;
+    const ids = [snap.signalId, snap.callId].filter(Boolean).map(String);
+    if (ids.includes(pid)) return false;
+    if (__DEV__) console.log('[CALL][APP][push] action for a DIFFERENT call — ignored', { actionCallId: pid, liveIds: ids });
+    return true;
+  }, []);
+
   // Accept tapped on the notification (or a plain tap): make sure the ringing
   // state exists (cold start from a killed app), then answer once it commits.
   const onPushAccept = useCallback((data) => {
     if (!data?.callerId) return;
+    // An Accept belonging to an already-finished call must never answer (or worse,
+    // re-ring) the call that is live now — see isForeignCallAction.
+    if (isForeignCallAction(data)) return;
     // Accept tapped on a call notification that lingered after the call already
     // ended → don't build a ghost ringing state that hangs 30s on the connect
     // watchdog. Same staleness test as onPushIncoming (dial time embedded in the
@@ -3761,22 +3950,29 @@ export const CallProvider = ({ children }) => {
     // the full in-app connect path (not the notification-only path).
     onSignalIncoming(mapPushToIncoming(data), { expand: true, fromAccept: true });
     pushAcceptPendingRef.current = true;
-  }, [accept, onSignalIncoming, mapPushToIncoming]);
+  }, [accept, onSignalIncoming, mapPushToIncoming, isForeignCallAction]);
 
   // Decline from the notification: reject if we're ringing, else tell the caller
   // over the app socket directly (best-effort — needs the socket connected).
   const onPushReject = useCallback((data) => {
     const snap = stateRef.current;
-    if (snap.status === CALL_STATUS.INCOMING) { reject(); return; }
+    if (isForeignCallAction(data)) return;
+    if (snap.status === CALL_STATUS.INCOMING) {
+      if (__DEV__) console.log('[CALL][APP][push] DECLINE action → rejecting the ringing call', { callId: data?.callId || null });
+      reject();
+      return;
+    }
     rejectCallSignal({ callId: data?.callId || null, callerId: data?.callerId || null });
-  }, [reject]);
+  }, [reject, isForeignCallAction]);
 
   // End tapped on the active-call ongoing notification → hang up the live call.
-  const onPushHangup = useCallback(() => {
+  const onPushHangup = useCallback((data) => {
     const snap = stateRef.current;
     if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    if (isForeignCallAction(data)) return;
+    if (__DEV__) console.log('[CALL][APP][push] END action → tearing the call down', { callId: data?.callId || null, status: snap.status });
     if (snap.status === CALL_STATUS.INCOMING) reject(); else hangup();
-  }, [reject, hangup]);
+  }, [reject, hangup, isForeignCallAction]);
 
   // Body tap on the active-call ongoing notification → bring the call forward
   // (un-minimize so CallOverlay shows full-screen once the app is foregrounded).
@@ -3848,8 +4044,13 @@ export const CallProvider = ({ children }) => {
   // the app is active).
   useEffect(() => {
     if (state.status !== CALL_STATUS.INCOMING) return undefined;
-    // notificationOnly (foreground call) deliberately shows ONLY the OS
-    // notification, so do NOT dismiss it here — that's the whole UI for this call.
+    // notificationOnly (the call arrived while the app was already foreground)
+    // deliberately shows ONLY the OS notification — that's the whole ring UI for
+    // this call, and it is the one that carries Answer/Decline. Cancelling it
+    // here would leave the user with a silent banner and no way to answer
+    // without opening the call screen first. The banner shows alongside it
+    // (CallOverlay renders it from state), which is the point: two surfaces, one
+    // ring — only the notification makes sound.
     if (state.notificationOnly) return undefined;
     // Ring HANDOVER, not just dismissal: on a locked/backgrounded ring the OS
     // notification was the ringing surface (its channel ringtone; the in-app
@@ -3857,16 +4058,282 @@ export const CallProvider = ({ children }) => {
     // (full-screen intent / body tap), cancelling the notification silences its
     // ringtone — start the in-app one in the same beat or the ring goes MUTE
     // while the call is still incoming. startRinging is idempotent.
+    //
+    // Opening the app mid-ring must NOT force the full-screen call screen: the
+    // call comes back as the top BANNER (CallMiniBanner, rendered by CallOverlay
+    // whenever the ring is collapsed) over whatever screen the user landed on —
+    // that is the WhatsApp behaviour and what the banner is for. Tapping it
+    // opens the full-screen UI. The full screen is still used where it belongs:
+    // a ring that arrives on a locked device, and a notification/full-screen
+    // intent the user actually tapped (both set `incomingExpanded` at ring time).
     const takeOver = () => {
+      const snap = stateRef.current;
+      if (snap.status !== CALL_STATUS.INCOMING) return;
+      // ANSWERED already (status stays INCOMING through the whole connecting
+      // gap): the ring is over. Re-starting the ringtone here played it OVER a
+      // call that was connecting, every time the user switched back to the app.
+      if (snap.accepted) return;
+      // ANDROID: the CallStyle pop-up (avatar + Decline/Answer) is now the ring
+      // surface for the WHOLE ring, app open or closed — see the re-post effect
+      // below. Cancelling it here is what made opening the app swap the pop-up
+      // for a bare in-app bar, which is the "app kholne par call banner nahi
+      // aata" report. Leave it up; it also keeps ringing, so no in-app ringtone
+      // is started either (two would ring over each other).
+      if (Platform.OS === 'android') return;
+      // iOS: CallKit is the system ring surface, so the local notification (if
+      // any) must go and the in-app ringtone stays off.
       cancelAllIncomingCallNotifee();
-      if (Platform.OS === 'android') startRinging('incoming');
+    };
+    // The other half of the handover. Taking the ring in-app CANCELS the OS
+    // notification — so if the user then switches away WITHOUT answering, the
+    // call has no surface outside the app at all: no heads-up, no shade entry,
+    // no Answer button, only an in-app ringtone nobody can act on. Put the
+    // notification back as the app leaves the foreground (Android; iOS rings via
+    // CallKit, which we neither cancelled nor need to restore) and stop the
+    // in-app ringtone so the notification channel is the only thing ringing.
+    const handBack = () => {
+      if (Platform.OS !== 'android') return;
+      const snap = stateRef.current;
+      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted) return;
+      const id = snap.signalId || snap.callId;
+      if (!id) return;
+      stopRinging();
+      if (__DEV__) console.log('[CALL][APP] app backgrounded mid-ring → handing the ring back to the OS notification', { callId: id });
+      displayIncomingCallNotifee({
+        callId: id,
+        callerId: snap.peer?.id,
+        callerName: snap.isGroup ? (snap.groupName || 'Group call') : (snap.peer?.name || 'Unknown'),
+        callerImage: snap.peer?.avatar || null,
+        callType: snap.media === 'video' ? 'video' : 'audio',
+        media: snap.media,
+        isGroup: !!snap.isGroup,
+        isConference: !!snap.isConference,
+        groupId: snap.groupId || null,
+        groupName: snap.groupName || null,
+      });
     };
     if (AppState.currentState === 'active') takeOver();
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') takeOver();
+      else handBack();
     });
     return () => { try { sub.remove(); } catch (_) { /* */ } };
-  }, [state.status, state.notificationOnly, startRinging]);
+  }, [state.status, state.notificationOnly, startRinging, stopRinging]);
+
+  // ── Keep the OS call POP-UP coming back, app open or closed (Android) ──────
+  // The pop-up is the CallStyle notification: caller avatar, "Incoming voice
+  // call", and the wide Decline / Answer buttons. It is the surface the user
+  // actually recognises as "the call banner".
+  //
+  // A heads-up notification pops up ONCE, when it is posted. After it slides
+  // away it lives on in the shade, and simply reopening the app does not make
+  // it pop again — so a call that rang while the app was closed showed the
+  // pop-up perfectly, and then showed nothing at all on the way back in.
+  // Re-posting it on every foreground is what makes it pop again.
+  //
+  // Re-posting is not stacking: the notification is keyed by the call id, so a
+  // second post REPLACES the first. And it is `setOngoing(true)`, so it can
+  // never be swiped away in between — the only thing that removes it is the
+  // call ending.
+  //
+  // The in-app banner is untouched and shows alongside it: two surfaces, one
+  // ring, and only the notification makes sound.
+  useEffect(() => {
+    if (Platform.OS !== 'android') return undefined;
+    if (state.status !== CALL_STATUS.INCOMING || state.accepted) return undefined;
+    const popUp = (why) => {
+      const snap = stateRef.current;
+      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted) return;
+      const id = snap.signalId || snap.callId;
+      if (!id) return;
+      // The notification channel carries the ringtone; silence the in-app one
+      // so a foreground ring does not play two at once.
+      stopRinging();
+      if (__DEV__) console.log(`[CALL][APP] re-posting the OS call pop-up (${why})`, { callId: id });
+      displayIncomingCallNotifee({
+        callId: id,
+        callerId: snap.peer?.id,
+        callerName: snap.isGroup ? (snap.groupName || 'Group call') : (snap.peer?.name || 'Unknown'),
+        callerImage: snap.peer?.avatar || null,
+        callType: snap.media === 'video' ? 'video' : 'audio',
+        media: snap.media,
+        isGroup: !!snap.isGroup,
+        isConference: !!snap.isConference,
+        groupId: snap.groupId || null,
+        groupName: snap.groupName || null,
+      });
+    };
+    if (AppState.currentState === 'active') popUp('ring-while-open');
+    const sub = AppState.addEventListener('change', (next) => { if (next === 'active') popUp('app-opened'); });
+    return () => { try { sub.remove(); } catch (_) { /* */ } };
+  }, [state.status, state.accepted, stopRinging]);
+
+  // ── onAppForeground() → getActiveCall() → show the in-app call banner ──────
+  // The architecture rule this implements: BANNER VISIBILITY IS NEVER THE
+  // SOURCE OF TRUTH FOR THE CALL. `bannerDismissed` is a presentation flag and
+  // nothing else — dismissing it leaves status/callId/peer untouched, and every
+  // time the app comes to the foreground we re-derive the banner from the call
+  // state instead of remembering what the user did to it earlier.
+  //
+  //     onAppForeground()
+  //           ↓
+  //     getActiveCall()            ← stateRef.current, the one source of truth
+  //           ↓
+  //     status === INCOMING && !accepted ?  → show the banner
+  //
+  // Two deliberate implementation choices:
+  //
+  //  • The effect stays mounted for the WHOLE life of a non-idle call, not just
+  //    while the banner happens to be dismissed. A listener that is attached
+  //    only in the dismissed state has to be re-attached by a re-render at
+  //    exactly the wrong moment; one that is always up cannot miss a resume.
+  //
+  //  • It does not trust the 'change' event to arrive. That event is dropped,
+  //    coalesced, or delivered without a clean background→active pair on plenty
+  //    of OEM builds, and when it went missing the flag stayed true and the
+  //    banner was gone for the rest of the ring. The event is now only the fast
+  //    path; the guarantee is a poll of `AppState.currentState`, which RN keeps
+  //    up to date natively whether or not any JS callback fires.
+  useEffect(() => {
+    if (state.status === CALL_STATUS.IDLE) return undefined;
+    // getActiveCall() → if a ring is still live, the banner belongs on screen.
+    const restoreBannerForActiveCall = (why) => {
+      const active = stateRef.current;
+      if (active.status !== CALL_STATUS.INCOMING || active.accepted) return;
+      if (!active.bannerDismissed) return; // already showing — nothing to do
+      if (__DEV__) console.log(`[CALL][APP] app resumed with a live ring → restoring the in-app call banner (${why})`, {
+        callId: active.signalId || active.callId,
+        media: active.media,
+        isConference: !!active.isConference,
+      });
+      dispatch({ type: ACT.SET_FLAG, key: 'bannerDismissed', value: false });
+    };
+    // Already foregrounded when the ring landed / this effect mounted.
+    if (AppState.currentState === 'active') restoreBannerForActiveCall('mount');
+    const sub = AppState.addEventListener('change', (next) => restoreBannerForActiveCall(`appstate:${next}`));
+    let seen = AppState.currentState;
+    const poll = setInterval(() => {
+      const now = AppState.currentState;
+      if (now === seen) return;
+      seen = now;
+      restoreBannerForActiveCall(`poll:${now}`);
+    }, 500);
+    return () => {
+      try { sub.remove(); } catch (_) { /* */ }
+      clearInterval(poll);
+    };
+  }, [state.status]);
+
+  // ── Opening the app during a ring must land on the BANNER ──────────────────
+  // A ring that arrives while the app is BACKGROUNDED is expanded at ring time
+  // (`shouldExpand`), because back then the full screen was the only way to
+  // present it. So when the user later opens the app they were dropped straight
+  // into the full-screen call screen — no banner anywhere, which is exactly the
+  // "app kholne par banner nahi aaya" report: nothing was broken, the app was
+  // showing the other surface.
+  //
+  // Now that the banner exists, opening the app should land on it: the call is
+  // visible on whatever screen the user is on, and one tap opens the full screen
+  // if they want it. Two deliberate exceptions:
+  //   • a ring on a LOCKED device keeps the full screen (it shows over the
+  //     keyguard; collapsing it would expose the app behind);
+  //   • tapping the notification / full-screen intent re-expands immediately
+  //     after this (its `fullScreen` opt lands once the tap is routed), so an
+  //     explicit "open the call" gesture still gets the full screen.
+  useEffect(() => {
+    if (state.status !== CALL_STATUS.INCOMING || state.accepted) return undefined;
+    const collapseToBanner = () => {
+      const snap = stateRef.current;
+      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted) return;
+      if (!snap.incomingExpanded) return;
+      if (!autoExpandedRef.current) return; // the user opened it on purpose — leave it
+      if (lockedCallRef.current || isDeviceLockedNow()) return;
+      autoExpandedRef.current = false;
+      if (__DEV__) console.log('[CALL][APP] app opened mid-ring → collapsing the full-screen ring to the banner');
+      dispatch({ type: ACT.SET_FLAG, key: 'incomingExpanded', value: false });
+    };
+    const sub = AppState.addEventListener('change', (next) => { if (next === 'active') collapseToBanner(); });
+    return () => { try { sub.remove(); } catch (_) { /* */ } };
+  }, [state.status, state.accepted]);
+
+  // ── Verify a ring that is STILL up when the app is reopened ────────────────
+  // A ring can outlive the call it belongs to. The server's `call:timeout` /
+  // `call:cancelled` is the thing that ends it, and that event is exactly what a
+  // backgrounded / socket-blipped device misses — so the banner sits there
+  // saying "Incoming call" for a call the server has already logged as MISSED
+  // (seen live: a missed-call row in the chat list under a banner still ringing).
+  //
+  // Worse than the stale banner: a stuck ring makes the app BUSY. The reducer
+  // ignores a second incoming while a call is up, so every LATER call is
+  // silently dropped — "call aa rahi hai lekin banner hi nahi aata". One dead
+  // ring poisons every call after it.
+  //
+  // The recovery pull can't help: it refuses to run unless we are IDLE, which is
+  // precisely the state we are not in. So verify explicitly, with the same
+  // safety rule the pull's own sweep uses — act ONLY on an authoritative answer
+  // (a session-bind failure or a no-ack timeout is a guess, never truth).
+  useEffect(() => {
+    if (state.status !== CALL_STATUS.INCOMING || state.accepted) return undefined;
+    const verify = async () => {
+      const snap = stateRef.current;
+      if (snap.status !== CALL_STATUS.INCOMING || snap.accepted) return;
+      const ids = [snap.signalId, snap.callId].filter(Boolean).map(String);
+      if (!ids.length) return;                                   // nothing to match on
+      // Only ever touch a ring that is ALREADY IMPOSSIBLE — one that has outlived
+      // the whole ring window plus a grace margin. Such a ring cannot be live by
+      // definition, so cleaning it up is safe no matter what the server replies.
+      //
+      // The earlier version acted on any ring older than 5s that the pull did not
+      // list, which made a LIVE call's survival depend on `call:pending:pull`
+      // returning exactly the set we assume it returns — semantics this backend
+      // has not confirmed (it's an open item in the backend audit). If that
+      // endpoint scopes its list even slightly differently, every ring died five
+      // seconds after the app was opened: the banner appeared once and never
+      // again. A backstop must never be able to kill the thing it protects.
+      //
+      // The local ring timeout normally ends these rings first; this exists for
+      // when that timer never fired — Android throttles JS timers in the
+      // background, which is exactly how a ring gets stuck in the first place.
+      const ringWindowMs = getRingTimeoutMs() + 10000;
+      if (Date.now() - (snap.startedAt || 0) < ringWindowMs) return;
+      let ack = null;
+      try { ack = await pullPendingCalls(); } catch (_) { return; }
+      if (!ack || ack.ok === false || ack.timedOut) return;      // not server truth
+      const live = stateRef.current;
+      if (live.status !== CALL_STATUS.INCOMING || live.accepted) return; // moved on meanwhile
+      const calls = Array.isArray(ack.calls) ? ack.calls : [];
+      if (calls.some((c) => c?.callId && ids.includes(String(c.callId)))) return; // still ringing
+      if (__DEV__) console.log('[CALL][APP] ring outlived its window AND the server does not have it — clearing the stale banner', { ids, ageMs: Date.now() - (snap.startedAt || 0) });
+      finalizeEnd('missed');
+    };
+    if (AppState.currentState === 'active') verify();
+    const sub = AppState.addEventListener('change', (next) => { if (next === 'active') verify(); });
+    return () => { try { sub.remove(); } catch (_) { /* */ } };
+  }, [state.status, state.accepted, finalizeEnd]);
+
+  // ── Recover a ring the app never knew about, on foreground ─────────────────
+  // The ring state lives in memory, so an app that was KILLED while a call was
+  // ringing comes back with nothing — and if the notification was dismissed too,
+  // the call is invisible even though the server still has it ringing. The
+  // recovery pull already covers this on socket (re)connect, but only then: an
+  // app that is merely resumed, or whose socket was already up when it came
+  // back, never re-asks. Ask on every foreground while IDLE so opening the app
+  // always restores a still-ringing call. The server is authoritative (every
+  // terminal path removes the record) and the just-ended guard in
+  // onSignalIncoming blocks anything we ourselves just finished, so this can
+  // never resurrect a dead call. Throttled so app-switching doesn't spam it.
+  const lastRingPullRef = useRef(0);
+  useEffect(() => {
+    if (!isAuthenticated) return undefined;
+    const pullIfIdle = () => {
+      if (stateRef.current.status !== CALL_STATUS.IDLE) return;
+      if (Date.now() - lastRingPullRef.current < 3000) return;
+      lastRingPullRef.current = Date.now();
+      pullStillRingingInvites();
+    };
+    const sub = AppState.addEventListener('change', (next) => { if (next === 'active') pullIfIdle(); });
+    return () => { try { sub.remove(); } catch (_) { /* */ } };
+  }, [isAuthenticated, pullStillRingingInvites]);
 
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = {
@@ -3982,7 +4449,23 @@ export const CallProvider = ({ children }) => {
             return;
           }
         }
-        if (snap.status === CALL_STATUS.INCOMING) { actionsRef.current.reject && actionsRef.current.reject(); return; }
+        if (snap.status === CALL_STATUS.INCOMING) {
+          // ANSWERED ALREADY (accepted, still connecting — ACCEPT keeps the status
+          // INCOMING until remote media arrives, so this window is the whole
+          // "Connecting…" gap). A CallKit end landing here is a stale echo of an
+          // EARLIER call's teardown, not a decline: rejecting would kill the call
+          // the user just answered, which is exactly the "pick karte hi cut"
+          // report. A genuine End on an answered call is a hangup, never a
+          // reject — fall through to the hangup path below.
+          if (snap.accepted) {
+            if (__DEV__) console.log('[CALL][APP] native end on an ALREADY-ACCEPTED call → hangup, not reject', { endedCallId, signalId: snap.signalId });
+            actionsRef.current.hangup && actionsRef.current.hangup();
+            return;
+          }
+          if (__DEV__) console.log('[CALL][APP] native end while ringing → rejecting', { endedCallId, signalId: snap.signalId });
+          actionsRef.current.reject && actionsRef.current.reject();
+          return;
+        }
         // ENDED = the echo of OUR OWN teardown: finalizeEnd's endCall/endAllCalls
         // file CXEndCallActions whose 'endCall' events bounce back here after the
         // mappings are already forgotten. Ignore — arming the decline flag here
@@ -4089,7 +4572,14 @@ export const CallProvider = ({ children }) => {
     resumeAudio,
     minimize,
     maximize,
+    // Who this app instance is logged in as. Purely so a log line can be
+    // attributed to a device: two handsets on one Metro session interleave their
+    // output, and without this every '[CALL][UI]' line is unattributable.
+    selfId: myId,
+    getActiveCall,
     expandIncoming,
+    collapseIncoming,
+    dismissIncomingBanner,
     queryPresence,
     lockedCall,
     leaveToLock,
@@ -4099,8 +4589,20 @@ export const CallProvider = ({ children }) => {
   // draggable PiP): the WebView engine renders the WebView (it IS the video
   // surface), the native engine renders RTCView tiles via NativeVideoStage.
   const showEngine = isAuthenticated && !IS_EXPO_GO;
+  // When the engine host is VISIBLE it is a full-screen OPAQUE dark surface
+  // (engineHostVisible) that also takes touches. An incoming VIDEO call used to
+  // qualify the moment it started ringing — before the user answered — so a
+  // video ring that is presented by the OS (and therefore has no full-screen
+  // call UI in-app) blacked out the whole app and swallowed its touches, with
+  // nothing drawn on top. Nobody's camera is running before the answer anyway,
+  // so there is nothing to show: require `accepted` for an incoming call, which
+  // is exactly the condition CallOverlay's own isVideoActive already uses. The
+  // WebView/stage stays MOUNTED either way (parked off-screen) — only its
+  // visibility changes, so the live call is never disturbed.
   const videoActive = state.media === 'video'
-    && (state.status === CALL_STATUS.ACTIVE || state.status === CALL_STATUS.OUTGOING || state.status === CALL_STATUS.INCOMING);
+    && (state.status === CALL_STATUS.ACTIVE
+      || state.status === CALL_STATUS.OUTGOING
+      || (state.status === CALL_STATUS.INCOMING && state.accepted));
   // Video call minimized → the engine WebView itself becomes the draggable PiP
   // (it IS the video surface), like WhatsApp's floating video window. A voice
   // call minimizes to the CallMiniBanner top bar in CallOverlay instead.

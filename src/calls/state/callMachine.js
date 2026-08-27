@@ -44,6 +44,12 @@ export const initialCallState = {
   // INCOMING state so the lifecycle works (notification Accept/Decline answer or
   // reject; cancel/timeout dismiss it) — this flag just hides the in-app ring UI.
   notificationOnly: false,
+  // The user swiped the in-app call banner away. UI-ONLY and deliberately
+  // short-lived: the call stays exactly as it was (still ringing, still
+  // answerable) and the flag is cleared the next time the app comes to the
+  // foreground, so the banner comes back — WhatsApp-style. Part of
+  // initialCallState, so a new call always starts with a visible banner.
+  bannerDismissed: false,
   peer: null,            // { id, name, avatar } — 1:1 other party / group fallback
   peers: [],             // [{ id, name, avatar }] — full invited list
   participants: {},      // { [id]: { id, name, avatar, joined } }
@@ -130,18 +136,26 @@ const rosterFrom = (peers = []) => {
 export const joinedCount = (participants = {}) =>
   Object.values(participants).filter((p) => p && p.joined).length;
 
-// True when the minimized call should show the WhatsApp-style top BANNER (and
-// the app content below it should be pushed down). That's a minimized AUDIO call
-// (a minimized video call uses the floating draggable PiP instead, which floats
-// over the app and needs no content push), plus the brief "Call ended" flash of
-// a minimized video call once its video stage is gone. Kept here so the overlay
-// and the content-inset wrapper stay in exact agreement.
-export const isMiniBannerActive = (s) => (
-  !!s
-  && s.minimized
-  && s.status !== CALL_STATUS.IDLE
-  && (s.media !== 'video' || s.status === CALL_STATUS.ENDED)
-);
+// True when the WhatsApp-style top call BAR should be up (and the app content
+// below it pushed down). Two cases: a MINIMIZED live call, and a RINGING call
+// that has no full-screen UI of its own. Kept here so the overlay and the
+// content-inset wrapper stay in exact agreement — they must never disagree, or
+// the bar covers a screen header (or reserves space with nothing in it).
+export const isMiniBannerActive = (s) => {
+  if (!s || s.status === CALL_STATUS.IDLE) return false;
+  // A MINIMIZED live call → the top bar. (A minimized video call uses the
+  // floating draggable PiP instead, except for its brief "Call ended" flash.)
+  if (s.minimized) return s.media !== 'video' || s.status === CALL_STATUS.ENDED;
+  // A RINGING incoming call with no full-screen UI up. Such a call is presented
+  // ONLY by the OS — the Android CallStyle notification or the iOS CallKit
+  // banner — and the user can swipe that away (or it can time out on its own)
+  // while the call is still ringing. Without an in-app fallback the call then
+  // becomes completely invisible inside the app: it is still live, still
+  // ringing the caller, and there is no way to reach it. This strip is that
+  // fallback, and it is what makes an active call always discoverable in-app.
+  if (s.status === CALL_STATUS.INCOMING && !s.accepted && !s.incomingExpanded) return !s.bannerDismissed;
+  return false;
+};
 
 export function callReducer(state, action) {
   switch (action.type) {
@@ -197,6 +211,36 @@ export function callReducer(state, action) {
           signalId: state.signalId || action.signalId || null,
           awaitingEngine: mergedCallId ? false : state.awaitingEngine,
         };
+      }
+      // Same for a GROUP / CONFERENCE ring. The merge above is 1:1-only because it
+      // matches on the peer, and on a conference the two planes disagree about who
+      // "from" is: the app socket names whoever INVITED us, the media server names
+      // the host. So the sibling ring fell through to the busy-guard below and was
+      // dropped WHOLESALE — taking the engine callId with it, which is the one
+      // thing accept() needs. The result was an invitee parked on pendingAccept
+      // until the media-ring watchdog killed the call. Match on the ids that a
+      // conference actually keeps stable (groupId / signalId / callId) instead.
+      if (state.status === CALL_STATUS.INCOMING && (isGroup || state.isGroup)) {
+        const same = (a, b) => !!a && !!b && String(a) === String(b);
+        // The peer fallback is gated on `!state.callId`: it exists purely to
+        // recover the engine id we don't have yet, so it can never hijack a ring
+        // that is already fully identified.
+        if (same(groupId, state.groupId) || same(signalId, state.signalId)
+          || same(callId, state.callId)
+          || (!state.callId && action.peer && state.peer && same(action.peer.id, state.peer.id))) {
+          const mergedCallId = state.callId || callId || null;
+          return {
+            ...state,
+            callId: mergedCallId,
+            signalId: state.signalId || signalId || null,
+            groupId: state.groupId || groupId || null,
+            groupName: state.groupName || groupName || null,
+            isGroup: true,
+            isConference: state.isConference || !!isConference,
+            hostId: state.hostId || (hostId ? String(hostId) : null),
+            awaitingEngine: mergedCallId ? false : state.awaitingEngine,
+          };
+        }
       }
       // Ignore a second incoming while busy.
       if (state.status !== CALL_STATUS.IDLE && state.status !== CALL_STATUS.ENDED) return state;

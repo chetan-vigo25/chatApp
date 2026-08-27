@@ -359,7 +359,21 @@ class NativeCallEngine {
     // the fresh instance is ever wired — a stale one could post ghost events
     // for a dead call (WebView glue APP-7 rule).
     if (this._sdk) {
-      try { this._sdk.hangup(); } catch (_) {}
+      // hangup() is the "the user ended this" verb: it DECLINES every pending
+      // incoming ring (declineGroupCall / declineCall) and blacklists a group for
+      // 15s. A rebuild is not a decline — and this path runs at the worst possible
+      // moment, because foregrounding the app to ANSWER fires doConnect(), whose
+      // liveness probe routinely fails on a socket that idled in the background.
+      // That silently declined the very call the user was answering, with nothing
+      // posted back to the app layer: the banner slid away, the ring never came
+      // back, and the accept sat on pendingAccept until the media-ring watchdog
+      // cut it ("banner se pick kiya, call uthi hi nahi"). Only tear down a call
+      // that is actually ESTABLISHED; a ringing one is left alone so the fresh
+      // SDK can reconcile it.
+      if (this._sdk._room) { try { this._sdk.hangup(); } catch (_) {} }
+      else if (Object.keys(this._sdk._pendingIn || {}).length) {
+        this._log('connect: rebuilding with a ring in flight — NOT declining it');
+      }
       try { this._sdk.disconnect(); } catch (_) {}
       this._sdk = null;
     }

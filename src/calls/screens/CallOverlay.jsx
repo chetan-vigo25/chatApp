@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar, Alert,
+  View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar, Alert, Platform,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -35,6 +35,7 @@ export default function CallOverlay() {
     call, accept, reject, hangup,
     toggleMic, toggleCamera, switchCamera, toggleScreenShare, toggleSpeaker, resumeAudio,
     minimize, maximize,
+    expandIncoming, collapseIncoming, dismissIncomingBanner, selfId,
     inviteMoreToCall,
     removeFromCall,
     isCallHost,
@@ -240,12 +241,15 @@ export default function CallOverlay() {
       // Call arrived on a locked device → back returns to the system lock screen,
       // never the app (the call keeps running; the ongoing notification brings it back).
       if (lockedCall) { leaveToLock(); return true; }
-      if (canMinimize) minimize();
-      // else: unanswered incoming ring (expanded) — consume back, keep ringing.
+      if (canMinimize) { minimize(); return true; }
+      // Unanswered incoming ring, expanded to full screen → collapse it back to
+      // the persistent top strip (the call keeps ringing and stays reachable),
+      // instead of swallowing back and trapping the user on the ring screen.
+      if (status === CALL_STATUS.INCOMING && !accepted) collapseIncoming();
       return true;
     });
     return () => sub.remove();
-  }, [visible, minimized, incomingCollapsed, canMinimize, minimize, lockedCall, leaveToLock]);
+  }, [visible, minimized, incomingCollapsed, canMinimize, minimize, lockedCall, leaveToLock, status, accepted, collapseIncoming]);
 
   // A short haptic when an incoming call appears (in addition to the ringtone +
   // vibration loop) so the device "kicks" the moment the screen comes up.
@@ -255,7 +259,26 @@ export default function CallOverlay() {
     }
   }, [status]);
 
-  if (!visible || incomingCollapsed) return null;
+  // Why the banner is (or is not) on screen. One line, only while a call is
+  // ringing — this is the exact set of flags the render below branches on, so a
+  // "banner nahi aaya" report can be answered from the log instead of guessed at.
+  if (__DEV__ && status === CALL_STATUS.INCOMING) {
+    console.log('[CALL][UI] incoming render', {
+      self: selfId || 'unknown',
+      platform: Platform.OS,
+      willRender: !visible ? 'NOTHING (idle)'
+        : (incomingCollapsed
+          ? (call?.bannerDismissed ? 'NOTHING (banner swiped away)' : 'BANNER')
+          : 'FULL-SCREEN'),
+      accepted: accepted0,
+      incomingExpanded: !!call?.incomingExpanded,
+      bannerDismissed: !!call?.bannerDismissed,
+      notificationOnly: !!call?.notificationOnly,
+      minimized,
+    });
+  }
+
+  if (!visible) return null;
 
   const peer = call?.peer || {};
   // Saved contact name > mobile number > backend name.
@@ -302,6 +325,39 @@ export default function CallOverlay() {
     if (status === CALL_STATUS.ENDED) return call?.errorMessage || END_TEXT[call?.endReason] || 'Call ended';
     return null;
   })();
+
+  // ---- Collapsed incoming ring: the persistent in-app call strip ----
+  // The ring itself is presented by the OS (Android CallStyle notification /
+  // iOS CallKit). That surface can be swiped away or time out while the call is
+  // still ringing, and this screen used to render NOTHING in that state — the
+  // live call simply vanished from the app with no way to get back to it. The
+  // strip is the in-app fallback: it sits above every screen (CallContentInset
+  // pushes the navigator down for it), shows who is calling and the call state,
+  // and opens the full-screen ring screen on tap.
+  //
+  // A call that lived its whole life as the strip and then ENDED still dismisses
+  // silently — no terminal "Missed"/"Declined" flash over the app, as before.
+  if (incomingCollapsed) {
+    if (status !== CALL_STATUS.INCOMING) return null;
+    // Swiped away by the user — stay out of the way until the app is reopened.
+    if (call?.bannerDismissed) return null;
+    return (
+      <CallMiniBanner
+        ringing
+        onDismiss={dismissIncomingBanner}
+        onAnswer={accept}
+        onDecline={reject}
+        peer={peer}
+        displayName={peerDisplayName}
+        isGroup={isGroup}
+        groupName={groupTitle}
+        media={call?.media}
+        statusText={subtitle || 'Incoming call'}
+        showTimer={false}
+        onExpand={expandIncoming}
+      />
+    );
+  }
 
   // ---- Minimized: WhatsApp-style floating call window ----
   // A still-live minimized VIDEO call shows its video feed in the draggable

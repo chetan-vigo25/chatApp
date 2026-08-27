@@ -2,6 +2,7 @@ import React, { memo, useRef } from 'react';
 import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react-native';
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import SegmentedRing from './SegmentedRing';
+import { useTranslatedText, needsSystemFont } from './Translate';
 
 const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
 const RING_SIZE   = 53; // outer ring diameter — leaves a small gap around the avatar
@@ -42,6 +43,28 @@ const ChatCard = ({
   const hasUnread = Number(item?.unreadCount || 0) > 0;
   const isTyping = item?.realtime?.typing?.isTyping;
   const isLastMsgDeleted = item?.lastMessageDisplay?.isDeleted || item?.lastMessage?.isDeleted;
+
+  // ── Translated summary ────────────────────────────────────────────────────
+  //
+  // The row shows the same sentence the chat itself will show. buildLastMessageDisplay
+  // already split the parts, so only the sender's own words are translated: the
+  // "You: " marker, the media icon and a group member's NAME are all in
+  // prefixText and never reach the translator.
+  //
+  // The FULL body is translated and getPreviewText truncates afterwards.
+  // Truncating first would hand the translator half a sentence plus a trailing
+  // "...", which reads worse and — being a different string — would also miss
+  // the cache entry the open chat already created for the whole message.
+  const display = item?.lastMessageDisplay;
+  const translatedBody = useTranslatedText(display?.body, {
+    isOwn: display?.isOwn,
+    // Media labels, call summaries and system notices are OUR words, not the
+    // sender's. Typing and deleted rows are placeholders. None get translated.
+    enabled: Boolean(display?.translatable) && !isTyping && !isLastMsgDeleted,
+  });
+  const summaryText = translatedBody
+    ? `${display?.prefixText || ''}${translatedBody}${display?.suffixText || ''}`.trim()
+    : getLastMessageText(item);
   const isBroadcast = Boolean(item?.chatType === 'broadcast' || item?.isBroadcast);
   const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
   // Verified badge: broadcast channels + admin-verified peer users. `isVerified`
@@ -186,11 +209,18 @@ const ChatCard = ({
                       fontStyle: (isTyping || isLastMsgDeleted) ? 'italic' : 'normal',
                       fontFamily: hasUnread ? 'Roboto-Medium' : 'Roboto-Regular',
                     },
+                    // Roboto-Regular carries 922 codepoints — Latin, Greek and
+                    // Cyrillic. A preview translated into Hindi, Thai, Tamil,
+                    // Arabic or CJK has NO glyphs in it and renders as boxes.
+                    // Hand those to the OS font. See docs/APP_LANGUAGE_GUIDE.md
+                    // Section 7 — every new place foreign script can appear
+                    // needs this, and the chat list is now one of them.
+                    needsSystemFont(summaryText) && { fontFamily: undefined },
                   ]}
                 >
                   {isTyping
                     ? (item?.lastMessageDisplay?.text || 'Typing...')
-                    : getPreviewText(getLastMessageText(item), 38)}
+                    : getPreviewText(summaryText, 38)}
                 </Text>
               </View>
 

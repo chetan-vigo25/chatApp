@@ -17,6 +17,7 @@ import { ensureFirebaseApp } from './config';
 // Leaf module (imports nothing) — safe to depend on from here. It tells us whether
 // the startup permission screen still owns the notification prompt.
 import { isNotificationPromptHeld } from '../features/permissions/notificationPromptGate';
+import { translateNotificationBody } from '../components/Translate';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -681,6 +682,35 @@ const showLocalNotification = async (remoteMessage) => {
   // duplicate. The real message is shown either by the OS (notification payload)
   // or by a content-bearing one.
   if (!model || (!model.title && !model.body)) return;
+
+  // ── Translated body ────────────────────────────────────────────────────────
+  //
+  // Same translation the chat itself will show, out of the same cache, so the
+  // notification and the chat never disagree. Only the BARE message goes
+  // through the translator — `senderName` is re-attached afterwards, because a
+  // name through a translator comes back as a person who does not exist. Media
+  // previews are excluded inside translateNotificationBody.
+  //
+  // Reliable in the FOREGROUND, where the app (and its language preference and
+  // models) are already loaded. From the background/killed handler this is
+  // opportunistic: the preference is read asynchronously at import time and the
+  // model may not be resident, in which case the helper returns null within its
+  // deadline and the notification shows the original — never a delay, never a
+  // failure. Making push translation reliable needs more than this; see
+  // docs/APP_LANGUAGE_GUIDE.md.
+  try {
+    const translated = await translateNotificationBody(model.lineBody, {
+      messageType: model.messageType,
+    });
+    if (translated) {
+      model.lineBody = translated;
+      model.body = (model.isGroup && model.senderName && model.senderName !== 'New message')
+        ? `${model.senderName}: ${translated}`.trim()
+        : translated;
+    }
+  } catch {
+    // keep the original text
+  }
 
   // Never raise an OS notification for the chat the user is actively viewing.
   // The in-app banner has this guard (AppBannerHost.shouldSuppressForActiveRoute);

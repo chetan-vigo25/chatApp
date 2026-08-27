@@ -21,8 +21,10 @@ import {
 import { navigationRef } from '../Redux/Services/navigationService';
 import { TWO_STEP_ENABLED_KEY } from '../screens/profiles/TwoStepPassword';
 import { isAppLockSuspended } from '../services/appLockGuard';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useCall } from '../calls/useCall';
 import { CALL_STATUS } from '../calls/state/callMachine';
+import CallMiniBanner, { RING_BAR_HEIGHT } from '../calls/components/CallMiniBanner';
 import { getDeletedChatConfig, clearDeletedChatConfig, DELETED_PWD_SET_KEY } from '../utils/deletedChatConfig';
 import { executeDeletedChatPurge } from '../utils/deletedChatExecutor';
 
@@ -43,7 +45,8 @@ export default function AppLockGate() {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
   const { removeChat } = useRealtimeChat();
-  const { call } = useCall();
+  const { call, expandIncoming, accept: acceptCall, reject: rejectCall } = useCall();
+  const insets = useSafeAreaInsets();
   const [enabled, setEnabled] = useState(false);
   const [locked, setLocked] = useState(false);
   const [pwd, setPwd] = useState('');
@@ -97,6 +100,44 @@ export default function AppLockGate() {
     && (call.status === CALL_STATUS.OUTGOING
       || call.status === CALL_STATUS.ACTIVE
       || (call.status === CALL_STATUS.INCOMING && (call.accepted || call.incomingExpanded)));
+
+  // ---- a ring must never hide UNDER the lock ----
+  // The bypass above deliberately does NOT fire for an unanswered ring that is
+  // showing only as the top banner: the banner covers 54px, so suppressing the
+  // lock for it would leave the whole app exposed. But a Modal always paints
+  // above the in-hierarchy CallOverlay, so the consequence was that reopening
+  // the app mid-ring showed the password screen and NOTHING else — the app kept
+  // reporting it was rendering the banner (it was; the modal was simply on top
+  // of it) and the user had no way to see or reach the live call.
+  //
+  // So the lock keeps the app hidden AND carries the banner itself. Tapping it
+  // expands the ring to full screen, which flips `incomingExpanded` → the
+  // bypass above fires → the modal steps aside for the real call UI. Nothing is
+  // leaked that the OS call notification does not already show, and no swipe
+  // handler is passed: under the lock the ring is not dismissable.
+  const ringingUnderLock = !!call
+    && call.status === CALL_STATUS.INCOMING
+    && !call.accepted
+    && !call.incomingExpanded;
+  const ringBanner = ringingUnderLock ? (
+    <CallMiniBanner
+      ringing
+      peer={call.peer}
+      displayName={call.peer?.name}
+      isGroup={!!call.isGroup}
+      groupName={call.groupName || call.peer?.name}
+      media={call.media}
+      showTimer={false}
+      statusText={call.isConference
+        ? 'Conference call'
+        : (call.isGroup
+          ? `Incoming group ${call.media === 'video' ? 'video' : 'voice'} call`
+          : (call.media === 'video' ? 'Incoming video call' : 'Incoming voice call'))}
+      onExpand={expandIncoming}
+      onAnswer={acceptCall}
+      onDecline={rejectCall}
+    />
+  ) : null;
 
   // Tick once a second while the cooldown is active so the countdown updates.
   useEffect(() => {
@@ -436,6 +477,13 @@ export default function AppLockGate() {
   // Never suppress the purge loader: it only runs post-unlock and must hold.
   if (callCoversScreen && !purging) return null;
 
+  // Past both early returns, so the lock modal IS about to cover the screen.
+  // If a call is ringing right now, this is the line that explains a "banner
+  // nahi aaya" report: the banner was rendering, a Modal was over it.
+  if (__DEV__ && ringingUnderLock) {
+    console.log('[CALL][UI] app-lock modal is covering the screen during a ring — banner moved INSIDE the lock');
+  }
+
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
@@ -539,7 +587,12 @@ export default function AppLockGate() {
       statusBarTranslucent
       onRequestClose={() => {}}
     >
-      <View style={[styles.root, { backgroundColor: pageBg }]}>
+      <View style={[
+        styles.root,
+        { backgroundColor: pageBg },
+        ringBanner ? { paddingTop: insets.top + RING_BAR_HEIGHT } : null,
+      ]}>
+        {ringBanner}
         <KeyboardAvoidingView
           behavior={Platform.OS === 'ios' ? 'padding' : undefined}
           style={styles.flex}

@@ -127,6 +127,16 @@ export default class NativeCallingSDK {
     this._acceptedFrom = null;  // 1:1 peerId whose call we accepted (dedupe post-accept reasserts)
     this._acceptedId = null;    // 1:1 callId accepted; waiting for callAccepted
     this._room = null;          // { roomId, groupId, callId, media, joined }
+    // Bumped by hangup()/disconnect(). A GROUP/conference accept signals first
+    // (joinGroupCall) and only assigns _room when that round trip resolves — up to
+    // ~12s later behind _waitSocket. A teardown inside that window finds _room
+    // still null, so it emits no leaveGroupCall and _teardownMedia has nothing to
+    // clean; then the join resolves, assigns a FRESH _room and starts media —
+    // rejoining the SFU and reopening the mic AFTER the app's UI has already ended
+    // the call ("call cut ho gayi par background me chalti rehti hai"). _joinRoom's
+    // own `superseded` check can't see it: that room was created after the
+    // teardown, so it looks current. This counter is the missing epoch.
+    this._callGen = 0;
     this._pendingProducers = [];
     this._pendingStreamEmits = []; // 'stream' payloads held until recv ICE/DTLS is up
     this._media = 'audio';
@@ -923,6 +933,17 @@ export default class NativeCallingSDK {
   accept(callId, media, opts = {}) {
     const key = String(callId);
     const p = this._pendingIn[key];
+    // Epoch for THIS answer. A hangup/disconnect while the joinGroupCall round
+    // trip is in flight bumps _callGen — see the field's note: without this the
+    // late resolve rebuilt the room and reopened the mic on a call the app had
+    // already ended. Also releases the server-side seat we may have taken.
+    const gen = this._callGen;
+    const joinAborted = (groupId) => {
+      if (this._callGen === gen) return false;
+      this._log(`join for group ${groupId} ABANDONED — the call was torn down while joining`);
+      try { this._socket && this._socket.emit('leaveGroupCall', { groupId }); } catch (_) {}
+      return true;
+    };
     if (!p && opts.isGroup !== true) {
       // The app can answer with the app-socket signaling id (`sig_…`) when the
       // engine ring hasn't reconciled yet. If a live pending 1:1 ring from the
@@ -964,6 +985,7 @@ export default class NativeCallingSDK {
       this._media = media === 'video' ? 'video' : this._media;
       this._capture().catch(() => {}); // kick off; _startMedia awaits the memoized attempt
       return this._reqDial('joinGroupCall', { groupId: key }).then((res) => {
+        if (joinAborted(key)) return null;
         this._media = res.callType === 'video' ? 'video' : this._media;
         this._room = { roomId: res.roomId, groupId: key, callId: null, media: this._media, joined: false };
         this._groupInvitees = [];
@@ -976,6 +998,7 @@ export default class NativeCallingSDK {
     if (p.group) {
       this._capture().catch(() => {}); // concurrent with the join round trip
       return this._reqDial('joinGroupCall', { groupId: p.groupId }).then((res) => {
+        if (joinAborted(p.groupId)) return null;
         this._media = res.callType === 'video' ? 'video' : this._media;
         this._room = { roomId: res.roomId, groupId: String(p.groupId), callId: null, media: this._media, joined: false };
         this._groupInvitees = [];
@@ -1018,6 +1041,7 @@ export default class NativeCallingSDK {
 
   // ---- teardown ----
   hangup() {
+    this._callGen += 1;
     this._clearRetry();
     Object.keys(this._pendingIn).forEach((key) => {
       const p = this._pendingIn[key];
@@ -1054,6 +1078,7 @@ export default class NativeCallingSDK {
   }
 
   disconnect() {
+    this._callGen += 1;
     this._clearRetry();
     this._acceptedId = null;
     this._acceptedFrom = null;

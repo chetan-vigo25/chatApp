@@ -396,8 +396,34 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
   const baseText = isGroupChat
     ? (messageText || getMessageTypeDisplayText(messageType, '', rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {}))
     : getMessageTypeDisplayText(messageType, messageText, rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {});
-  const prefix = (!isGroupChat && currentUserId && messageSender && String(currentUserId) === String(messageSender)) ? 'You: ' : '';
+  const isOwn = Boolean(currentUserId && messageSender && String(currentUserId) === String(messageSender));
+  const prefix = (!isGroupChat && isOwn) ? 'You: ' : '';
   const editedSuffix = isEdited ? ' (edited)' : '';
+  const iconPart = icon && !isGroupChat ? `${icon} ` : '';
+
+  // ── Split the sender's NAME off the body ──────────────────────────────────
+  //
+  // A group's lastMessage.text is stored as "John: Hello" (see the group
+  // incoming-message reducer). The chat list translates this preview, and a
+  // name must never go through a translator — it gets mangled, and the row
+  // then shows a person who does not exist. So the name is separated here,
+  // once, instead of every consumer re-deriving it.
+  //
+  // Split on the FIRST ": " only, and only for groups: a message that itself
+  // contains a colon ("John: Note: buy milk") keeps everything after the name
+  // intact. A group message with no prefix (a system notice) simply has no
+  // match and is left whole.
+  let namePrefix = '';
+  let body = baseText;
+  if (isGroupChat) {
+    const match = /^([^:]{1,60}): ([\s\S]+)$/.exec(baseText);
+    if (match) {
+      namePrefix = `${match[1]}: `;
+      body = match[2];
+    }
+  }
+
+  const prefixText = `${prefix}${iconPart}${namePrefix}`;
 
   return {
     text: baseText,
@@ -405,7 +431,17 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
     prefix,
     isEdited,
     isDeleted: false,
-    fullText: `${prefix}${icon && !isGroupChat ? `${icon} ` : ''}${baseText}${editedSuffix}`.trim(),
+    isOwn,
+    // Everything the chat list needs to swap a TRANSLATED body back in without
+    // re-deriving any of this. `prefixText + body + suffixText` reproduces
+    // fullText exactly.
+    prefixText,
+    body,
+    suffixText: editedSuffix,
+    // Only real text carries meaning worth translating. "Photo", "Voice call"
+    // and friends are OUR labels, not the sender's words.
+    translatable: messageType === 'text' && Boolean(body),
+    fullText: `${prefixText}${body}${editedSuffix}`.trim(),
   };
 };
 
