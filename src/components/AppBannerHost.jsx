@@ -4,7 +4,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio } from 'expo-av';
 import { useTheme } from '../contexts/ThemeContext';
-import { useRealtimeChat } from '../contexts/RealtimeChatContext';
+import { useRealtimeChatStateRef } from '../contexts/RealtimeChatContext';
 import ChatDatabase from '../services/ChatDatabase';
 import ContactDatabase from '../services/ContactDatabase';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
@@ -113,7 +113,10 @@ const buildBannerModel = (payload = {}) => {
 
 export default function WhatsAppBannerHost() {
   const { theme, isDarkMode } = useTheme();
-  const { state: realtimeState } = useRealtimeChat();
+  // Realtime state is read ONLY inside callbacks below, never during render,
+  // so take the ref: this always-mounted host now re-renders zero times for
+  // typing ticks, presence heartbeats and unread bumps.
+  const realtimeStateRef = useRealtimeChatStateRef();
   const insets = useSafeAreaInsets();
   const [banner, setBanner] = useState(null);
   const [screenWidth, setScreenWidth] = useState(Dimensions.get('window').width);
@@ -135,8 +138,6 @@ export default function WhatsAppBannerHost() {
   const appStateRef = useRef(AppState.currentState);
 
   // Keep a ref to realtime state so socket handlers can read latest chatMap/currentUserId
-  const realtimeStateRef = useRef(realtimeState);
-  realtimeStateRef.current = realtimeState;
 
   // Notification sound — preload once, reuse on every banner
   const soundRef = useRef(null);
@@ -707,8 +708,13 @@ export default function WhatsAppBannerHost() {
       const currentUserId = realtimeStateRef.current?.currentUserId;
       if (currentUserId && senderId && String(senderId) === String(currentUserId)) return;
 
+      // `senderName` is already receiver-resolved by the backend (saved name →
+      // "@handle" when they hide their number → number). The rest are fallbacks
+      // for older payloads; a bare handle gets its "@" so it never reads as a name.
+      const senderHandle = data?.sender?.userName || data?.sender?.username || null;
       const senderName = data?.senderName || data?.sender?.fullName || data?.sender?.name
-        || data?.sender?.username || source?.senderName || 'New Message';
+        || (senderHandle ? `@${senderHandle}` : null)
+        || source?.senderName || 'New Message';
       // Backend attaches the receiver-resolved number on the receiver-bound emit
       // as `senderMobile` so this device can show it for an unsaved sender.
       const senderMobile = data?.senderMobile || source?.senderMobile || null;

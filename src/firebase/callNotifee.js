@@ -304,10 +304,18 @@ export const displayIncomingCallNotifee = async (data) => {
   // address book, so resolve against the local contacts DB here — this path
   // runs headless (killed app), hence the explicit load.
   await loadContactNames().catch(() => {});
+  // FCM/VoIP data values are STRINGS, so the flag arrives as 'true' — compare as
+  // text (`Boolean('false')` is true and would hide the number for everyone).
+  const callerHidesContact = String(data?.callerHideContact ?? '') === 'true';
   const resolvedCallerName = resolveCanonicalName({
     userId: data?.callerId,
     phone: data?.callerMobile || data?.senderMobile || null,
     pushName: data?.callerPushName || data?.callerName || data?.title,
+    // Without this the chain falls from a withheld number to `callerPushName`,
+    // the caller's own account name — which is what the handle replaces. This is
+    // the full-screen lock-screen ring, so it is the surface that matters most.
+    username: data?.callerUserName || null,
+    hideContact: callerHidesContact,
     fallback: 'Incoming call',
   });
   const call = {
@@ -456,6 +464,8 @@ export const displayMissedCallNotification = async (data = {}) => {
         userId: data.callerId || data.senderId,
         phone: data.callerMobile || data.senderMobile || null,
         pushName: data.callerPushName || data.callerName || data.senderName || data.title,
+        username: data.callerUserName || data.senderUserName || null,
+        hideContact: String(data.callerHideContact ?? data.senderHideContact ?? '') === 'true',
         fallback: 'Someone',
       });
   const isVideo = (data.callType || data.media) === 'video';

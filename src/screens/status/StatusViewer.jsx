@@ -134,7 +134,7 @@ export default function StatusViewer({ navigation, route }) {
   const { profileData } = useSelector(s => s.profile);
   // Saved-contact resolver for the viewers/likers lists. Saved name → phone
   // number → server-provided name. Same rule used across the status list.
-  const { resolveName: resolveContactName } = useContactDirectory();
+  const { resolveName: resolveContactName, peerPrivacyOf } = useContactDirectory();
 
   const [statuses, setStatuses]           = useState(initialStatuses);
   const [currentIndex, setCurrentIndex]   = useState(Math.min(startIndex, Math.max(0, initialStatuses.length - 1)));
@@ -1192,7 +1192,11 @@ export default function StatusViewer({ navigation, route }) {
                         || (viewer?.mobile?.code && viewer?.mobile?.number
                               ? `${viewer.mobile.code} ${viewer.mobile.number}`
                               : viewer?.mobile?.number);
-                      const displayName = resolveContactName(viewerIdStr, serverName, phone);
+                      // Contact privacy: the server already withholds the number
+                      // for a viewer who hides it, and sends the handle instead.
+                      const displayName = resolveContactName(
+                        viewerIdStr, serverName, phone, peerPrivacyOf(viewer || item),
+                      );
                       const openProfile = () => {
                         if (!viewerIdStr) return;
                         closePanel();
@@ -1240,7 +1244,9 @@ export default function StatusViewer({ navigation, route }) {
                     || (item.mobile?.code && item.mobile?.number
                           ? `${item.mobile.code} ${item.mobile.number}`
                           : item.mobile?.number);
-                  const displayName = resolveContactName(likerIdStr, item.name, phone);
+                  const displayName = resolveContactName(
+                    likerIdStr, item.name, phone, peerPrivacyOf(item),
+                  );
                   const openProfile = () => {
                     if (!likerIdStr) return;
                     closePanel();

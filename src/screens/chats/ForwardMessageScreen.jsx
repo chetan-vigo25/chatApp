@@ -10,7 +10,7 @@ import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setForwardTimestamp } from '../../utils/forwardState';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import OutboxWorker from '../../services/OutboxWorker';
@@ -26,6 +26,10 @@ const privateChatLabel = (chat) => resolveCanonicalName({
       ? `${chat.peerUser.mobile.code || ''}${chat.peerUser.mobile.number}`
       : null),
   pushName: chat?.peerUser?.fullName || chat?.chatName,
+  // Contact privacy — the forward picker is a full list of peers, so a hidden
+  // number showing here would defeat the toggle everywhere else.
+  username: chat?.peerUser?.userName || null,
+  hideContact: Boolean(chat?.peerUser?.hideContact ?? chat?.hideContact),
   fallback: 'Unknown',
 });
 
@@ -50,7 +54,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
   const { messageIds = [], messages = [] } = route.params || {};
   const { theme, isDarkMode } = useTheme();
   const { chatsData = [] } = useSelector(state => state.chat || {});
-  const { chatList: realtimeChatList } = useRealtimeChat();
+  const { chatList: realtimeChatList } = useRealtimeChatLists();
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedReceivers, setSelectedReceivers] = useState([]);
   const [isSending, setIsSending] = useState(false);

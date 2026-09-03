@@ -27,6 +27,10 @@ export default function CallButtons({ peer, chatId }) {
       userId: peer._id || peer.userId || peer.id,
       phone: peerMobile,
       pushName: peer.fullName || peer.name,
+      // Contact privacy — an outgoing call to a peer who hides their number
+      // rings out under their handle.
+      username: peer.userName || peer.publicUsername || null,
+      hideContact: Boolean(peer.hideContact ?? peer.privacySettings?.hideContact),
       fallback: 'Unknown',
     }),
     pushName: peer.fullName || peer.name || null,

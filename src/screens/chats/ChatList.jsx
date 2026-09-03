@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from '
 import {
   View,
   Text,
+  StatusBar,
   FlatList,
   TouchableOpacity,
   ActivityIndicator,
@@ -20,11 +21,12 @@ import { useDispatch, useSelector } from 'react-redux';
 import { chatListData } from '../../Redux/Reducer/Chat/Chat.reducer';
 import { useFocusEffect } from '@react-navigation/native';
 import { FontAwesome6, AntDesign, MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatActions, useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
+import { isSelfChat, selfChatLabel, selfIdentityOf } from '../../utils/selfChat';
 import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import useStatusIndicators from '../../hooks/useStatusIndicators';
-import useContactDirectory from '../../hooks/useContactDirectory';
+import useContactDirectory, { peerPrivacyOf } from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 import { useCall } from '../../calls/useCall';
@@ -32,9 +34,11 @@ import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Serv
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import ContactDatabase from '../../services/ContactDatabase';
+import { primeDeviceContactsIndex } from '../../services/SaveContactService';
 import { subscribeSessionReset } from '../../services/sessionEvents';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
+import { orderChatsForDisplay } from '../../utils/chatOrder';
 import { getUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 import {
   DELETED_PWD_SET_KEY,
@@ -96,6 +100,10 @@ const peerIdOf = (chat, currentUserId) => {
   if (currentUserId && cid.startsWith('u_')) {
     const parts = cid.slice(2).split('_');
     if (parts.length === 2) {
+      // Self chat (`u_<id>_<id>`): both halves are me, so there is no "other" —
+      // the peer IS me. Without this the row resolved to no peer at all and fell
+      // out of dedupe/name resolution entirely.
+      if (parts[0] === parts[1]) return String(currentUserId);
       const other = parts.find((p) => p && p !== String(currentUserId));
       if (other) return other;
     }
@@ -107,12 +115,27 @@ const peerIdOf = (chat, currentUserId) => {
 // through the canonical rule (saved name → number → server push name); groups
 // and channels keep their server-side name. Used by search + the action-sheet
 // title so they can never disagree with the row itself (ChatCard).
-const chatRowLabel = (item) => {
+// `me` is the owner's profile slice — only the self-chat branch needs it, to
+// apply the owner's own contact-privacy toggle (see selfChatLabel).
+const chatRowLabel = (item, me = null) => {
   if (!item) return '';
   const isGroupItem = item?.chatType === 'group' || item?.isGroup;
   const isBroadcastItem = item?.chatType === 'broadcast' || item?.isBroadcast;
   if (isBroadcastItem) return item?.chatName || item?.broadcastChannel?.name || 'Channel';
   if (isGroupItem) return item?.chatName || item?.group?.name || item?.groupName || 'Group';
+  const selfMobile =
+    item?.mobileNumber
+    || item?.peerUser?.mobileNumber
+    || (item?.peerUser?.mobile?.number
+      ? `${item.peerUser.mobile.code || ''}${item.peerUser.mobile.number}`
+      : '');
+  if (isSelfChat(item)) {
+    return selfChatLabel({
+      mobileNumber: selfMobile,
+      name: item?.peerUser?.fullName || item?.chatName,
+      ...selfIdentityOf(me),
+    });
+  }
   const peerMobile =
     item?.mobileNumber
     || item?.peerUser?.mobileNumber
@@ -123,6 +146,12 @@ const chatRowLabel = (item) => {
     userId: item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId,
     phone: peerMobile,
     pushName: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
+    // Contact privacy. This label feeds the row title, the profile-preview
+    // popup, the image viewer caption and the action sheet header — so without
+    // these the popup kept showing the number even after the row itself had
+    // switched to the "@handle".
+    username: item?.peerUser?.userName || item?.peerUser?.publicUsername || null,
+    hideContact: Boolean(item?.peerUser?.hideContact ?? item?.hideContact),
     fallback: 'Unknown',
   });
 };
@@ -313,6 +342,8 @@ export default function ChatList({ navigation }) {
   const openSwipeableRef = useRef(null);
   const dispatch = useDispatch();
   const { chatsData, isLoading } = useSelector((state) => state.chat);
+  // My own handle + privacy toggle — the self-chat row is labelled from it.
+  const myProfile = useSelector((state) => state.profile?.profileData);
 
   // WhatsApp-style status rings on chat rows: a userId → indicator map kept live
   // via the status feed + realtime sockets (see the hook for data-source order).
@@ -333,7 +364,17 @@ export default function ChatList({ navigation }) {
     const node = menuBtnRef.current;
     if (node && node.measureInWindow) {
       node.measureInWindow((x, y, w, h) => {
-        setMenuPos({ top: y + h + 6, right: Math.max(8, SCREEN_WIDTH - (x + w)) });
+        // The dropdown is inside a statusBarTranslucent Modal, whose coordinate
+        // space starts at the very top of the screen — but measureInWindow
+        // reports the button BELOW the status bar. Without adding that height
+        // back, the card is drawn a status bar too high and crowds the header.
+        const statusBarOffset = Platform.OS === 'android' ? (StatusBar.currentHeight || 0) : 0;
+        setMenuPos({
+          // 12dp of air under the button, not 6 — the card reads as its own
+          // layer instead of hanging off the header.
+          top: y + h + 2 + statusBarOffset,
+          right: Math.max(8, SCREEN_WIDTH - (x + w)),
+        });
         setVisible(true);
       });
     } else {
@@ -446,10 +487,7 @@ export default function ChatList({ navigation }) {
   const sheetBgAnim = useRef(new Animated.Value(0)).current;
 
   const {
-    chatList: realtimeChatList,
-    archivedChatList: realtimeArchivedChatList,
     hydrateChats,
-    state: realtimeState,
     requestChatInfo,
     pinChat,
     unpinChat,
@@ -459,7 +497,11 @@ export default function ChatList({ navigation }) {
     unarchiveChat,
     applyChatClearedPreview,
     removeChat,
-  } = useRealtimeChat();
+  } = useRealtimeChatActions();
+  const {
+    chatList: realtimeChatList,
+    archivedChatList: realtimeArchivedChatList,
+  } = useRealtimeChatLists();
 
   const effectiveChatList = Array.isArray(realtimeChatList)
     ? realtimeChatList
@@ -491,9 +533,9 @@ export default function ChatList({ navigation }) {
     } else if (activeFilter === 'unread') {
       chats = chats.filter((item) => Number(item?.unreadCount || 0) > 0);
     }
-    if (searchQuery.trim() === '') return chats;
+    if (searchQuery.trim() === '') return orderChatsForDisplay(chats);
     const query = searchQuery.toLowerCase().trim();
-    return chats.filter((item) => {
+    chats = chats.filter((item) => {
       const isGroupItem = item?.chatType === 'group' || item?.isGroup;
       const isBroadcastItem = item?.chatType === 'broadcast' || item?.isBroadcast;
       const chatDisplayName = (isGroupItem || isBroadcastItem)
@@ -501,7 +543,7 @@ export default function ChatList({ navigation }) {
         // Search the RESOLVED name (what the row actually shows), not the
         // server's profile name — otherwise a saved contact renamed on this
         // device is unfindable.
-        : chatRowLabel(item).toLowerCase();
+        : chatRowLabel(item, myProfile).toLowerCase();
       const lastMessage = getLastMessageText(item).toLowerCase();
       // Also match on the peer's number, digits-only, so "7742" finds them.
       const queryDigits = query.replace(/\D/g, '');
@@ -509,8 +551,15 @@ export default function ChatList({ navigation }) {
         && chatRowNumbers(item).some((n) => n.replace(/\D/g, '').includes(queryDigits));
       return chatDisplayName.includes(query) || lastMessage.includes(query) || numberHit;
     });
+    // Ordered LAST, after every filter, so the visible list is always
+    // pinned-first / newest-first regardless of where the rows came from. The
+    // realtime context already sorts, but the `chatsData` fallback (the raw
+    // REST payload rendered while SQLite hydration is still in flight) does
+    // not — that is the path that showed freshly-auto-loaded chats in server
+    // order right after a login.
+    return orderChatsForDisplay(chats);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, dedupedChatList, activeFilter, namesVersion]);
+  }, [searchQuery, dedupedChatList, activeFilter, namesVersion, myProfile]);
 
   const isSearching = searchQuery.trim() !== '';
 
@@ -520,6 +569,12 @@ export default function ChatList({ navigation }) {
     const id = setInterval(() => setTimeTick((prev) => prev + 1), 30000);
     return () => clearInterval(id);
   }, []);
+
+  // Warm the device phone-book index in the background. Reading the address
+  // book takes seconds on a large device; doing it here means the profile
+  // screen's "Save to contacts" button can render instantly instead of after a
+  // multi-second lookup. Best effort — no permission, no work.
+  useEffect(() => { primeDeviceContactsIndex(); }, []);
 
   useEffect(() => {
     if (effectiveChatList.length > 0) {
@@ -671,24 +726,90 @@ export default function ChatList({ navigation }) {
     }
   }, [isArming, selectedChatIds, armedChatIds, armedScope, exitSelectionMode]);
 
-  // Initial sync: only call API if SQLite has no chatlist data (first login)
-  // After first sync, chatlist is driven entirely by SQLite + socket updates
-  const initialSyncDone = useRef(false);
-  useFocusEffect(
-    useCallback(() => {
-      if (initialSyncDone.current) return;
-      initialSyncDone.current = true;
-      // Only fetch from API if realtime chatlist is empty (no SQLite data loaded yet)
-      if (!realtimeChatList || realtimeChatList.length === 0) {
-        cllog('🌐 CHAT LIST: SQLite empty → fetching from REST API (chatListData)');
-        dispatch(chatListData(''));
-      } else {
+  // ── First load after login: fetch until the list is actually there ────────
+  //
+  // This used to be a ONE-SHOT guard: the first focus decided "list is empty →
+  // fetch once" and then latched itself off forever. Right after a login that
+  // single attempt is exactly the one most likely to fail — the socket and the
+  // network stack are still coming up, the token was written moments ago — and
+  // when it did, the user sat on an empty list until they pulled to refresh.
+  //
+  // Now it RETRIES with backoff until one of two things is true:
+  //   • rows arrived (from this fetch, from SQLite hydration, or over the
+  //     socket) — whichever wins, we stop; or
+  //   • the server answered successfully with an empty list, which means the
+  //     account genuinely has no chats and there is nothing to wait for.
+  // A rejected fetch settles nothing, so it is tried again.
+  const FIRST_LOAD_MAX_ATTEMPTS = 6;
+  const firstLoadAttemptsRef = useRef(0);
+  const firstLoadSettledRef = useRef(false);
+  const firstLoadTimerRef = useRef(null);
+  const [firstLoadTick, setFirstLoadTick] = useState(0);
+
+  useEffect(() => {
+    if (firstLoadSettledRef.current) return undefined;
+
+    // Rows are on screen — nothing to chase.
+    if (Array.isArray(realtimeChatList) && realtimeChatList.length > 0) {
+      firstLoadSettledRef.current = true;
+      if (firstLoadAttemptsRef.current === 0) {
         cllog('📂 CHAT LIST rendered from SQLite cache (no API call)', {
           rows: realtimeChatList.length,
           source: 'SQLite via RealtimeChatContext — NOT a REST API call',
         });
       }
-    }, [dispatch, realtimeChatList])
+      return undefined;
+    }
+
+    const attempt = firstLoadAttemptsRef.current;
+    if (attempt >= FIRST_LOAD_MAX_ATTEMPTS) return undefined;
+
+    // First try immediately; then 600ms, 1.2s, 2.4s, 4.8s, capped at 8s — long
+    // enough to outlive a slow post-login network, short enough that the user
+    // never sits looking at an empty screen wondering what to do.
+    const delay = attempt === 0 ? 0 : Math.min(8000, 600 * Math.pow(2, attempt - 1));
+    firstLoadTimerRef.current = setTimeout(async () => {
+      firstLoadTimerRef.current = null;
+      firstLoadAttemptsRef.current += 1;
+      cllog('🌐 CHAT LIST: empty → auto-fetching from REST API (chatListData)', {
+        attempt: firstLoadAttemptsRef.current,
+      });
+      try {
+        const result = await dispatch(chatListData('')).unwrap();
+        if (Array.isArray(result?.docs) && result.docs.length === 0) {
+          // A successful, genuinely empty account — stop here instead of
+          // hammering the endpoint for chats that do not exist.
+          firstLoadSettledRef.current = true;
+          cllog('📭 CHAT LIST: server returned no chats — nothing to sync');
+          return;
+        }
+      } catch (err) {
+        cllog('⚠️ CHAT LIST: auto-fetch failed, will retry', { message: err?.message || String(err) });
+      }
+      // Re-run the effect even when the list reference did not change (a failed
+      // fetch changes nothing — without this the retry chain would stall).
+      setFirstLoadTick((t) => t + 1);
+    }, delay);
+
+    return () => {
+      if (firstLoadTimerRef.current) {
+        clearTimeout(firstLoadTimerRef.current);
+        firstLoadTimerRef.current = null;
+      }
+    };
+  }, [realtimeChatList, firstLoadTick, dispatch]);
+
+  // If the retry chain ran itself out (device was offline the whole time),
+  // coming back to this screen starts it again — the user's "reload" gesture is
+  // just walking back into the list, not a deliberate pull-to-refresh.
+  useFocusEffect(
+    useCallback(() => {
+      if (firstLoadSettledRef.current) return;
+      if (Array.isArray(realtimeChatList) && realtimeChatList.length > 0) return;
+      if (firstLoadAttemptsRef.current < FIRST_LOAD_MAX_ATTEMPTS) return;
+      firstLoadAttemptsRef.current = 0;
+      setFirstLoadTick((t) => t + 1);
+    }, [realtimeChatList])
   );
 
   // When a chat appears without a resolved peer (e.g. a brand-new chat created
@@ -898,7 +1019,11 @@ export default function ChatList({ navigation }) {
     if (!group) return;
     const serverName = group.name || group.fullName || group.userName;
     const phone = group.phone || group.number || group.mobile?.number || group.mobileNumber;
-    const label = resolveName(group.userId, serverName, phone);
+    // The feed group carries the owner's privacy bits (`userName` /
+    // `hideContact`) — they MUST be passed. Without them the resolver treats
+    // the peer as public, discards the server's "@handle" as a stale redaction,
+    // finds no number (the server withholds it) and lands on "Unknown".
+    const label = resolveName(group.userId, serverName, phone, peerPrivacyOf(group));
     navigation.navigate('StatusViewer', {
       statuses: group.statuses || [],
       startIndex: 0,
@@ -1012,7 +1137,7 @@ export default function ChatList({ navigation }) {
       || (peer?.mobile?.number ? `${peer.mobile.code || ''}${peer.mobile.number}` : null);
     const peerObj = {
       id: String(peerId),
-      name: chatRowLabel(item),
+      name: chatRowLabel(item, myProfile),
       pushName: peer?.fullName || null,
       mobile: peerMobile,
       avatar: peer?.profileImage || null,
@@ -1404,7 +1529,7 @@ export default function ChatList({ navigation }) {
     ? (selectedChatItem?.chatName || 'Channel')
     : isPreviewGroup
       ? (selectedChatItem?.chatName || selectedChatItem?.group?.name || selectedChatItem?.groupName || 'Group')
-      : chatRowLabel(selectedChatItem);
+      : chatRowLabel(selectedChatItem, myProfile);
   const previewImage = (isPreviewGroup || isPreviewBroadcast)
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;
@@ -1700,18 +1825,31 @@ export default function ChatList({ navigation }) {
       {/* Modal-based so it NEVER gets stuck the way react-native-paper's Menu
           did on rapid taps. Backdrop closes it; each item closes + navigates.
           Background follows the theme (cardBackground). */}
-      <Modal animationType="fade" transparent visible={visible} onRequestClose={() => setVisible(false)}>
-        <TouchableOpacity activeOpacity={1} onPress={() => setVisible(false)} style={StyleSheet.absoluteFill}>
+      {/* Header overflow menu — same card as the chat screen's 3-dot menu.
+          It used to differ in every way that matters: no scrim (so it floated
+          over a fully lit list with nothing to sit against), the pale
+          cardBackground surface (a light slab now that the app's dark ground is
+          true black), and hairline separators between every row, which made
+          four navigation shortcuts read like a settings table. Both menus now
+          share one look: dimmed backdrop, deep surface, icon disc + label rows,
+          no dividers. */}
+      <Modal animationType="fade" transparent visible={visible} onRequestClose={() => setVisible(false)} statusBarTranslucent>
+        <TouchableOpacity
+          activeOpacity={1}
+          onPress={() => setVisible(false)}
+          style={[
+            StyleSheet.absoluteFill,
+            { backgroundColor: isDarkMode ? 'rgba(0,0,0,0.42)' : 'rgba(0,0,0,0.18)' },
+          ]}
+        >
           <View
             style={[
               styles.headerMenuCard,
               {
                 top: menuPos.top,
                 right: menuPos.right,
-                // Same card surface as the app's other sheets/dialogs; the
-                // hairline border below provides the layer separation.
-                backgroundColor: theme.colors.cardBackground,
-                borderColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+                backgroundColor: isDarkMode ? '#0F1A21' : '#FFFFFF',
+                borderColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)',
               },
             ]}
           >
@@ -1720,18 +1858,20 @@ export default function ChatList({ navigation }) {
               { label: 'Settings', icon: 'settings-outline', route: 'SettingsTab' },
               { label: 'Linked Devices', icon: 'qr-code-outline', route: 'LinkDevice' },
               { label: 'Link Contacts', icon: 'people-outline', route: 'ContactsTab' },
-            ].map((it, i) => (
+            ].map((it) => (
               <TouchableOpacity
                 key={it.route}
-                activeOpacity={0.6}
+                activeOpacity={0.65}
                 onPress={() => { setVisible(false); navigation.navigate(it.route); }}
-                style={[
-                  styles.headerMenuItem,
-                  i > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)' },
-                ]}
+                style={styles.headerMenuItem}
               >
-                <Ionicons name={it.icon} size={18} color={theme.colors.placeHolderTextColor} style={styles.headerMenuIcon} />
-                <Text style={[styles.menuItemText, { color: theme.colors.primaryTextColor }]}>{it.label}</Text>
+                <View style={[
+                  styles.headerMenuIconDisc,
+                  { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.06)' },
+                ]}>
+                  <Ionicons name={it.icon} size={17} color={isDarkMode ? '#FFFFFF' : '#0B141A'} />
+                </View>
+                <Text style={[styles.headerMenuLabel, { color: theme.colors.primaryTextColor }]}>{it.label}</Text>
               </TouchableOpacity>
             ))}
           </View>
@@ -2099,26 +2239,38 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   // Custom header overflow dropdown (Modal-anchored under the 3-dots button).
+  // Geometry mirrors chatMenuStyles.popoverCard on the chat screen.
   headerMenuCard: {
     position: 'absolute',
     minWidth: 196,
-    borderRadius: 16,
-    paddingVertical: 4,
+    maxWidth: 280,
+    borderRadius: 18,
+    paddingVertical: 6,
     borderWidth: StyleSheet.hairlineWidth,
-    elevation: 10,
+    elevation: 18,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.18,
-    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.22,
+    shadowRadius: 22,
   },
   headerMenuItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 13,
+    gap: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    marginHorizontal: 6,
   },
-  headerMenuIcon: {
-    marginRight: 14,
+  headerMenuIconDisc: {
+    width: 32, height: 32, borderRadius: 11,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  headerMenuLabel: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 15,
+    letterSpacing: 0.1,
+    flexShrink: 1,
   },
 
   // ─── DELETE PROGRESS OVERLAY ───

@@ -25,7 +25,10 @@ import StatusList from '../screens/status/StatusList';
 import CallsScreen from '../screens/calls/CallsScreen';
 import BottomTabBar from '../components/BottomTabBar';
 import { useTheme } from '../contexts/ThemeContext';
-import { useRealtimeChat } from '../contexts/RealtimeChatContext';
+import { useRealtimeChatSlice } from '../contexts/RealtimeChatContext';
+
+// Module scope keeps the selector identity stable across renders.
+const selectTotalUnread = (s) => Number(s?.totalUnread || 0);
 import { useMissedCallBadge, startMissedCallTracking } from '../calls/services/missedCallBadge';
 
 const SCREEN_W = Dimensions.get('window').width;
@@ -42,7 +45,10 @@ const COMMIT_VELOCITY = 520;
 // ---------------------------------------------------------------------------
 function CustomTabBar({ state, navigation }) {
   const { theme, isDarkMode } = useTheme();
-  const { state: realtimeState } = useRealtimeChat();
+  // Only the unread badge count is read here, so subscribe to just that: the
+  // always-mounted tab bar re-renders when the number changes, not on every
+  // realtime event.
+  const totalUnread = useRealtimeChatSlice(selectTotalUnread);
   const missedCallCount = useMissedCallBadge();
 
   // Track unseen missed calls for the Calls-tab badge for as long as the tab bar
@@ -84,7 +90,7 @@ function CustomTabBar({ state, navigation }) {
       onTabPress={handleTabPress}
       theme={theme}
       isDarkMode={isDarkMode}
-      unreadCount={Number(realtimeState?.totalUnread || 0)}
+      unreadCount={totalUnread}
       missedCallCount={Number(missedCallCount || 0)}
     />
   );

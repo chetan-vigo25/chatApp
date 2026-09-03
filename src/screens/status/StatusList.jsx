@@ -116,7 +116,7 @@ export default function StatusList({ navigation }) {
   const { myStatuses, contactStatuses, viewedStatusIds, broadcasts, isLoading } = useSelector(state => state.status);
   const { user } = useSelector(state => state.authentication);
   const [refreshing, setRefreshing] = useState(false);
-  const { resolveName, refresh: refreshContacts } = useContactDirectory();
+  const { resolveName, refresh: refreshContacts, peerPrivacyOf } = useContactDirectory();
 
   const loadData = useCallback(() => {
     dispatch(fetchMyStatuses());
@@ -242,7 +242,9 @@ export default function StatusList({ navigation }) {
     // the contact is not saved on this device, then to the server-side name.
     const serverName   = item.name || item.fullName;
     const phone        = item.phone || item.number || item.mobile?.number || item.mobileNumber;
-    const displayName  = isOfficial ? item.name : resolveName(item.userId, serverName, phone);
+    const displayName  = isOfficial
+      ? item.name
+      : resolveName(item.userId, serverName, phone, peerPrivacyOf(item));
     const viewedCount  = (item.statuses || []).filter(
       s => (isOfficial && s.isViewed) || viewedStatusIds.includes(String(s._id))
     ).length;

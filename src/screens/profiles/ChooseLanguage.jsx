@@ -16,10 +16,12 @@ import { LANGUAGES, NO_TRANSLATION, NO_TRANSLATION_OPTION } from '../../constant
  * Choose language.
  *
  * Tapping a language saves it to AsyncStorage and updates the LanguageProvider,
- * so every screen using the translated <Text> re-renders immediately — no app
- * restart, no navigation reset. The screen stays open on purpose: its own
- * labels translate in front of you, which is the quickest way to confirm the
- * feature is live.
+ * so incoming messages switch language immediately — no app restart, no
+ * navigation reset.
+ *
+ * The picker's OWN labels (and the rest of the app's chrome) stay English: the
+ * setting translates the messages you RECEIVE, not the interface. See
+ * TRANSLATE_APP_UI in components/Translate.
  *
  * The language NAMES carry `ignore` — "हिन्दी" must never be fed back through
  * the translator. The search box uses the translated TextInput, which localises

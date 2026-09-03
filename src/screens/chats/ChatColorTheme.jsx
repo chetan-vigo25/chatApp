@@ -117,8 +117,12 @@ export default function ChatColorTheme({ navigation }) {
   const iconColor = theme.colors.iconColor;
   const pageBg = theme.colors.background;
   const cardBg = theme.colors.background;
-  const bubbleRecvBg = isDarkMode ? '#202C33' : '#FFFFFF';
-  const previewBg = isDarkMode ? '#0B141A' : '#ECE5DD';
+  // Read from the theme instead of repeating literals: this preview exists to
+  // show what the real chat looks like, and the hardcoded #202C33 / #0B141A
+  // stopped matching it once the received bubble was darkened and the chat
+  // wallpaper went transparent (the chat ground is theme.colors.background now).
+  const bubbleRecvBg = theme.colors.bubbleReceived;
+  const previewBg = theme.colors.chatBackground;
   const sepClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)';
 
   // ─── Chat preview (WhatsApp wallpaper-style) ───

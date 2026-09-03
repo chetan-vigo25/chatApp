@@ -208,10 +208,15 @@ export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, ref
   // same-account re-login (keep cache) from a different user (wipe). Fire-and-
   // forget + best-effort: a DB hiccup must never break login. Runs AFTER any
   // performSessionReset (login does reset→save), so it stamps the NEW owner.
+  // AWAITED, and it is `ensureDBOwnedBy` rather than a bare stamp: if the cache
+  // still belongs to somebody else (a login path that forgot `nextUserId`, a
+  // crash mid-switch, an install predating the tag) it is wiped here, BEFORE
+  // emitUserChanged wakes the readers — otherwise the new user's first render
+  // comes from the previous account's rows. Stamping also lifts the write seal.
   if (resolvedUserId) {
     try {
       const { Platform } = require('react-native');
-      if (Platform.OS !== 'web') { ChatDatabase.setDBOwner(resolvedUserId); }
+      if (Platform.OS !== 'web') { await ChatDatabase.ensureDBOwnedBy(resolvedUserId); }
     } catch {}
   }
 
@@ -223,11 +228,13 @@ export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, ref
 // Stamp the local-cache owner on an authenticated app relaunch. Backfills the
 // tag for installs that logged in before it existed, so the FIRST different
 // user to take over the device afterwards is correctly wiped.
-const stampCacheOwnerForBootstrap = (userId) => {
+const stampCacheOwnerForBootstrap = async (userId) => {
   if (!userId) return;
   try {
     const { Platform } = require('react-native');
-    if (Platform.OS !== 'web') { ChatDatabase.setDBOwner(String(userId)); }
+    // Same gate as login: a relaunch must never render a cache that belongs to
+    // a different account, whatever left it there.
+    if (Platform.OS !== 'web') { await ChatDatabase.ensureDBOwnedBy(String(userId)); }
   } catch {}
 };
 
@@ -329,6 +336,20 @@ export const performSessionReset = async ({
       shouldWipeLocalDB = Boolean(known) && String(known) !== String(nextUserId);
     } catch {}
   }
+
+  // ── Freeze the cache BEFORE touching it ───────────────────────────────────
+  // The old session does not stop the instant logout is tapped: SqliteWriter
+  // still holds queued jobs, ChatCache still holds the previous user's chats,
+  // and socket handlers may still be draining. Wiping first and freezing later
+  // is exactly the race that let user A's chat list reappear under user B —
+  // the DELETE ran, then those stragglers wrote the rows back. Sealing stops
+  // every write at the door; the seal lifts only when the next login stamps
+  // the new owner (ChatDatabase.setDBOwner).
+  if (!isWeb) {
+    try { ChatDatabase.sealWrites(); } catch {}
+    try { require('./SqliteWriter').default.dropPending(); } catch {}
+  }
+  try { require('./ChatCache').default.clearAll(); } catch {}
 
   await clearAllSessionData({ clearAllStorage });
 
@@ -450,7 +471,7 @@ export const bootstrapSession = async () => {
   }
 
   if (session.accessToken && !isTokenExpired(session.accessToken)) {
-    stampCacheOwnerForBootstrap(session.userId);
+    await stampCacheOwnerForBootstrap(session.userId);
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap' });
     return { authenticated: true, refreshed: false, session };
   }
@@ -461,7 +482,7 @@ export const bootstrapSession = async () => {
 
   try {
     const refreshed = await refreshAccessToken({ force: true });
-    stampCacheOwnerForBootstrap(session.userId);
+    await stampCacheOwnerForBootstrap(session.userId);
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap_refresh' });
     return {
       authenticated: true,
@@ -482,7 +503,7 @@ export const bootstrapSession = async () => {
     if (error?.isAuthRejection) {
       return { authenticated: false, refreshed: false, session, error };
     }
-    stampCacheOwnerForBootstrap(session.userId);
+    await stampCacheOwnerForBootstrap(session.userId);
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap_offline' });
     return { authenticated: true, refreshed: false, offline: true, session, error };
   }

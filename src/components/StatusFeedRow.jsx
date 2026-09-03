@@ -68,7 +68,7 @@ export default function StatusFeedRow({ navigation, style }) {
 
   const { myStatuses, contactStatuses, viewedStatusIds } = useSelector(s => s.status);
   const { user } = useSelector(s => s.authentication);
-  const { resolveName } = useContactDirectory();
+  const { resolveName, peerPrivacyOf } = useContactDirectory();
 
   const viewedSet = new Set(viewedStatusIds.map(String));
   const hasMyStatus = myStatuses && myStatuses.length > 0;
@@ -101,9 +101,11 @@ export default function StatusFeedRow({ navigation, style }) {
   }, [hasMyStatus, myStatuses, navigation]);
 
   const openContactStatus = useCallback((group) => {
-    const serverName = group.name || group.fullName || group.userName;
+    // `group.name` is already server-resolved (saved name → @handle → number),
+    // so it rides as the push-name fallback; the local address book still wins.
+    const serverName = group.name || group.fullName;
     const phone      = group.phone || group.number || group.mobile?.number || group.mobileNumber;
-    const label      = resolveName(group.userId, serverName, phone);
+    const label      = resolveName(group.userId, serverName, phone, peerPrivacyOf(group));
     navigation.navigate('StatusViewer', {
       statuses:  group.statuses || [],
       startIndex: 0,

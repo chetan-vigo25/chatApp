@@ -128,7 +128,14 @@ const LocationBubble = memo(function LocationBubble({
       activeOpacity={0.85}
       style={[
         styles.container,
-        { backgroundColor: isMyMessage ? (themeColors?.chatBubbleRight || '#03574f') : (themeColors?.menuBackground || '#202C33') },
+        {
+          // Received side uses the shared incoming-bubble token, not
+          // menuBackground — that was a different (lighter) surface, so a
+          // shared location stood out against the messages around it.
+          backgroundColor: isMyMessage
+            ? (themeColors?.chatBubbleRight || '#03574f')
+            : (themeColors?.bubbleReceived || '#151E23'),
+        },
       ]}
     >
       {/* Map Preview — 3x3 OSM tile grid */}

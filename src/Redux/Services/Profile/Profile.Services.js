@@ -95,3 +95,78 @@ export const profileServices = {
     updateImage,
     removeDp,
 };
+// ── Public username + contact privacy ───────────────────────────────────────
+// These have their own endpoints rather than riding `updateProfile` above: the
+// generic profile update writes whatever body it is given, so a username claim
+// sent that way would bypass the reserved-word list, the change rate limit and
+// the atomic uniqueness claim. The backend strips both fields from that route.
+//
+// All three are ONLINE-ONLY. They are deliberately never queued through the
+// outbox: uniqueness cannot be honoured from a replay queue, and a replayed
+// claim could resurrect a handle someone else has since legitimately taken.
+
+/**
+ * Live availability check for the username field. ADVISORY — a "free" answer is
+ * not a reservation, so `setUsername` below can still come back USERNAME_TAKEN
+ * and the caller must handle that.
+ *
+ * Silent: this fires on every debounced keystroke, so a transient failure must
+ * not raise a toast. Resolves to null when the check could not be made.
+ */
+export async function checkUsernameAvailability(username) {
+  try {
+    const response = await apiCall(
+      'GET',
+      `user/profile/username/availability?u=${encodeURIComponent(username)}`,
+      {},
+      { silent: true }
+    );
+    return response?.statusCode === 200 ? (response?.data || null) : null;
+  } catch (error) {
+    return null; // network blip → the UI just shows no hint yet
+  }
+}
+
+/**
+ * Claim or change the public username.
+ * Rejects with { code, message } so the caller can branch on the code
+ * (USERNAME_TAKEN, USERNAME_RATE_LIMITED, …) rather than parsing prose.
+ */
+export async function setUsername(username) {
+  try {
+    const response = await apiCall('POST', 'user/profile/username', { username }, { silent: true });
+    if (response?.statusCode === 200) return response;
+    return Promise.reject({
+      code: response?.data?.code || 'UNKNOWN',
+      message: response?.message || 'Something went wrong',
+      retryAfterMs: response?.data?.retryAfterMs || 0,
+    });
+  } catch (error) {
+    return Promise.reject({
+      code: error?.data?.code || 'NETWORK',
+      message: error?.message || 'Could not reach the server. Please try again.',
+    });
+  }
+}
+
+/** Turn the "hide my phone number and email" toggle on or off. */
+export async function setHideContact(enabled) {
+  try {
+    const response = await apiCall(
+      'POST',
+      'user/profile/privacy/hide-contact',
+      { enabled: Boolean(enabled) },
+      { silent: true }
+    );
+    if (response?.statusCode === 200) return response;
+    return Promise.reject({
+      code: response?.data?.code || 'UNKNOWN',
+      message: response?.message || 'Something went wrong',
+    });
+  } catch (error) {
+    return Promise.reject({
+      code: error?.data?.code || 'NETWORK',
+      message: error?.message || 'Could not reach the server. Please try again.',
+    });
+  }
+}

@@ -7,7 +7,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSelector } from 'react-redux';
 
 import { useTheme } from '../../contexts/ThemeContext';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const avatarColor = (name = '') => {
@@ -64,7 +64,7 @@ export default function ShareInboxScreen({ navigation, route }) {
   const colors = theme.colors;
   const share = route?.params?.share || { files: [], text: undefined };
 
-  const { chatList: realtimeChatList } = useRealtimeChat();
+  const { chatList: realtimeChatList } = useRealtimeChatLists();
   const { chatsData = [] } = useSelector((state) => state.chat || {});
   const [query, setQuery] = useState('');
 

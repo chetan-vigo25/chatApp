@@ -59,7 +59,7 @@ import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
-import { mediaDownloadSigned, toSecureMediaUri, mediaResolve } from '../../utils/mediaService';
+import { mediaDownloadSigned, toSecureMediaUri, mediaResolve, saveAssetToAlbum } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
@@ -77,8 +77,6 @@ import BlurGateImage from '../../components/BlurGateImage';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
-import SaveContactBanner from '../../components/SaveContactBanner';
-import useSaveContact from '../../hooks/useSaveContact';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
 import ContactDatabase from '../../services/ContactDatabase';
@@ -89,6 +87,7 @@ import ChatDatabase from '../../services/ChatDatabase';
 import LinkPreviewCard from '../../components/LinkPreviewCard';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 import CallButtons from '../../calls/components/CallButtons';
+import { isSelfChatId } from '../../utils/selfChat';
 import GroupCallButtons from '../../calls/components/GroupCallButtons';
 import CallMessageBubble from '../../calls/components/CallMessageBubble';
 // Message-body text only. Everything else on this screen keeps React
@@ -96,6 +95,7 @@ import CallMessageBubble from '../../calls/components/CallMessageBubble';
 // never be sent to a translation API.
 import { translateDetailed, ensureTranslationCacheReady, peekTranslation, getRetryDelay, needsSystemFont, useLanguage } from "../../components/Translate";
 import { isTranslationOff } from "../../constant/languages";
+import { renderSystemMessage } from '../../utils/systemMessage';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -183,39 +183,112 @@ const looksLikeCode = (text = '') => {
   }
   return signals >= 2 && (signals + indented * 0.5) / nonEmpty.length >= 0.5;
 };
-const MEDIA_PANEL_SHEET_HEIGHT = 208; // exact content height — no dead space below the tiles
+const MEDIA_PANEL_SHEET_HEIGHT = 218; // exact content height — no dead space below the tiles
 const AUDIO_RECORDING_MAX_MS = 120000;
 
-// Attachment tiles: small neutral discs with a colored glyph per type —
-// current WhatsApp Android attachment-panel look (user-confirmed reference).
-// Location uses the brand teal instead of WhatsApp's green (brand rule).
+// Attachment tiles — WhatsApp Android attachment panel (user-supplied
+// reference screenshot): a tinted rounded-square DISC holding the glyph alone,
+// with the label sitting plainly on the sheet below it.
+//
+// The previous version wrapped glyph AND label inside one tinted surface, so
+// each option read as a coloured card rather than an icon. WhatsApp keeps the
+// colour on the disc only — the label is ordinary sheet text — which is what
+// makes the row scan as icons-with-captions instead of a sticker sheet.
+//
+// Colours are vivid (the disc is a low-alpha wash of the same hue), one per
+// type so hue alone identifies the action without reading. Location keeps the
+// brand teal — WhatsApp's green is never used here (brand rule).
+//
+// `glyphDark` / `glyphLight` exist because one hue cannot hold contrast on both
+// a near-black and a white sheet: dark gets the lighter step of the hue, light
+// the deeper one.
 const MEDIA_PANEL_OPTIONS = [
-  { key: 'gallery', label: 'Gallery', icon: 'images', iconFamily: 'Ionicons', color: '#AC44CF' },
-  { key: 'camera', label: 'Camera', icon: 'camera', iconFamily: 'Ionicons', color: '#E4487D' },
-  { key: 'video', label: 'Video', icon: 'videocam', iconFamily: 'Ionicons', color: '#F0644C' },
-  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', color: '#7C63F4' },
-  { key: 'audio', label: 'Audio', icon: 'headset', iconFamily: 'Ionicons', color: '#F2913D' },
-  { key: 'contact', label: 'Contact', icon: 'person', iconFamily: 'Ionicons', color: '#0795DC' },
-  { key: 'location', label: 'Location', icon: 'location', iconFamily: 'Ionicons', color: '#03b0a2' },
+  { key: 'gallery',  label: 'Gallery',  icon: 'images',        iconFamily: 'Ionicons', tint: '99,102,241',  glyphDark: '#8E90F8', glyphLight: '#4F46E5' },
+  { key: 'camera',   label: 'Camera',   icon: 'camera',        iconFamily: 'Ionicons', tint: '236,72,153',  glyphDark: '#F472B6', glyphLight: '#DB2777' },
+  { key: 'video',    label: 'Video',    icon: 'videocam',      iconFamily: 'Ionicons', tint: '239,68,68',   glyphDark: '#F87171', glyphLight: '#DC2626' },
+  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', tint: '139,92,246',  glyphDark: '#A78BFA', glyphLight: '#7C3AED' },
+  { key: 'audio',    label: 'Audio',    icon: 'headset',       iconFamily: 'Ionicons', tint: '245,158,11',  glyphDark: '#FBBF24', glyphLight: '#B45309' },
+  { key: 'contact',  label: 'Contact',  icon: 'person',        iconFamily: 'Ionicons', tint: '59,130,246',  glyphDark: '#60A5FA', glyphLight: '#2563EB' },
+  { key: 'location', label: 'Location', icon: 'location',      iconFamily: 'Ionicons', tint: '3,176,162',   glyphDark: '#5FD8CA', glyphLight: '#0E9A8D' },
 ];
 
-// WhatsApp-style attachment tile — a flat circle on a slightly elevated neutral
-// surface with the colored glyph centred on top (no gradients, no tinted
-// shadows — matches WhatsApp's current attachment sheet).
-function AttachOptionDisc({ color = '#777', icon, size = 56, bg }) {
+// Shared recipe for every disc, so the hues above are the ONLY thing that
+// varies. The disc is the tile's own hue at low alpha — a soft well the glyph
+// sits in, not a grey chip. Dark carries more alpha than light because a tint
+// over black loses more of itself than over white. No ring: WhatsApp's discs
+// are borderless, and a hairline on a filled disc only muddies the edge.
+const ATTACH_TILE_ALPHA = {
+  dark: { disc: 0.20 },
+  light: { disc: 0.14 },
+};
+
+const attachTileStyle = (option, isDarkMode) => {
+  const { disc } = ATTACH_TILE_ALPHA[isDarkMode ? 'dark' : 'light'];
+  return {
+    disc: `rgba(${option.tint},${disc})`,
+    glyph: isDarkMode ? option.glyphDark : option.glyphLight,
+  };
+};
+
+const styles = StyleSheet.create({
+  attachTilePressable: {
+    width: '100%',
+    alignItems: 'center',
+  },
+  attachTileDisc: {
+    // Squircle, not a circle: WhatsApp's discs are rounded squares, and squares
+    // line up far more evenly across a 4-column grid than circles do.
+    width: 58,
+    height: 58,
+    borderRadius: 19,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  attachTileLabel: {
+    fontSize: 12,
+    fontFamily: 'Roboto-Regular',
+    textAlign: 'center',
+    marginTop: 7,
+  },
+});
+
+// Date chip colours — shared by the inline day separator and the floating
+// sticky badge, which are the same chip in two places and had drifted into two
+// slightly different sets of literals.
+//
+// The dark values used to be rgba(25,40,55,·) — a blue-grey mixed for the old
+// #0B141A chat ground. On true black, next to the darkened received bubbles,
+// that chip was the palest thing on the screen: a date label was out-shouting
+// the messages. It now sits at the received-bubble value with a hairline, so it
+// reads as the same family of surface, one step quieter.
+const dateChipColors = (isDarkMode) => (isDarkMode
+  ? {
+      bg: 'rgba(21,30,35,0.94)',
+      border: 'rgba(233,237,239,0.10)',
+      text: 'rgba(233,237,239,0.78)',
+    }
+  : {
+      bg: 'rgba(240,242,245,0.96)',
+      border: 'rgba(0,0,0,0.06)',
+      text: '#5f6769',
+    });
+
+// Attachment tile — a tinted rounded-square disc carrying the glyph, with the
+// label plainly beneath it on the sheet (WhatsApp Android parity).
+//
+// The tint belongs to the disc alone. Colouring the whole tile, label included,
+// turned each option into a coloured card and made the row read as seven
+// competing surfaces instead of one control group.
+function AttachOptionTile({ tint, glyph, icon, label, labelColor }) {
   return (
-    <View
-      style={{
-        width: size,
-        height: size,
-        borderRadius: size / 2,
-        backgroundColor: bg,
-        alignItems: 'center',
-        justifyContent: 'center',
-      }}
-    >
-      <Ionicons name={icon} size={Math.round(size * 0.46)} color={color} />
-    </View>
+    <>
+      <View style={[styles.attachTileDisc, { backgroundColor: tint }]}>
+        <Ionicons name={icon} size={26} color={glyph} />
+      </View>
+      <Text numberOfLines={1} style={[styles.attachTileLabel, { color: labelColor }]}>
+        {label}
+      </Text>
+    </>
   );
 }
 
@@ -495,6 +568,19 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   const hasContent = Boolean(text.trim() || pendingMedia);
   const showAttachment = !hasContent;
   const [showSchedulePicker, setShowSchedulePicker] = useState(false);
+  // Composer pill surface. It used to be theme.colors.cardBackground for both
+  // modes, which broke at both ends now that the chat wallpaper is transparent
+  // (the screen sits on theme.colors.background):
+  //   dark  — cardBackground #16222C is a fairly light blue-grey; against the
+  //           true-black chat ground it read as a pale patch stuck to the
+  //           bottom rather than a control resting on the screen. A deeper
+  //           surface keeps the elevation without the glare.
+  //   light — cardBackground is #ffffff, the same as the background, so the
+  //           pill's only edge was a 0.08-opacity shadow.
+  // Both now get a hairline border, so the input's shape is defined in either
+  // theme instead of relying on the shadow alone.
+  const composerBg = isDarkMode ? '#121A20' : theme.colors.cardBackground;
+  const composerBorder = isDarkMode ? 'rgba(233,237,239,0.10)' : theme.colors.border;
   const iconColor = isDarkMode ? 'rgba(212,229,240,0.68)': '#111111';
   const inputTextColor = isDarkMode ? '#F2F8FC' : '#111111';
   const pendingTextColor = isDarkMode ? '#E8F2F8' : '#111111';
@@ -559,9 +645,11 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           borderRadius: 26,
           paddingHorizontal: 8,
           paddingVertical: 2,
-          backgroundColor: theme.colors.cardBackground,
+          backgroundColor: composerBg,
           borderWidth: 1.5,
-          borderColor: isInputFocused ? theme.colors.themeColor : 'transparent',
+          // Focus ring wins; otherwise the hairline keeps the pill readable on
+          // a same-coloured background (light) and un-glaring on black (dark).
+          borderColor: isInputFocused ? theme.colors.themeColor : composerBorder,
           justifyContent: 'center',
           overflow: 'hidden',
           shadowColor: theme.colors.shadow,
@@ -1171,20 +1259,47 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
 // A single tappable row inside the redesigned 3-dot menu. Uses a tinted
 // circular icon + label (+ optional sublabel) to match the production design
 // vocabulary already established by the ChatList action sheet.
-const ChatMenuItem = ({ label, sublabel, onPress, theme, isDanger = false }) => (
-  <TouchableOpacity onPress={onPress} activeOpacity={0.7} style={chatMenuStyles.menuItem}>
-    <View style={{ flex: 1 }}>
-      <Text style={[chatMenuStyles.menuItemLabel, { color: isDanger ? '#E06A6A' : theme.colors.primaryTextColor }]}>
-        {label}
-      </Text>
-      {sublabel ? (
-        <Text style={[chatMenuStyles.menuItemSub, { color: theme.colors.placeHolderTextColor }]}>
-          {sublabel}
-        </Text>
+// One row of the 3-dot dropdown: an icon on a neutral disc, then the label. The
+// `icon`/`iconLib` props were already being passed at every call site but the old
+// text-only row silently dropped them, which is why the menu read as a flat wall
+// of words.
+const MENU_ICON_LIBS = { Ionicons, MaterialCommunityIcons, MaterialIcons, FontAwesome6 };
+
+const ChatMenuItem = ({
+  label, sublabel, onPress, theme, isDark = false, isDanger = false,
+  icon, iconLib = 'Ionicons',
+}) => {
+  const Icon = MENU_ICON_LIBS[iconLib] || Ionicons;
+  // The glyph follows the theme's ink — white on the dark surface, near-black on
+  // the light one — instead of a per-item accent colour, so the four rows read as
+  // one list. Destructive rows are the single exception: those stay red, matching
+  // their label.
+  const glyph = isDanger ? '#E06A6A' : (isDark ? '#FFFFFF' : '#0B141A');
+  const disc = isDanger
+    ? '#E06A6A1F'
+    : (isDark ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.06)');
+  return (
+    <TouchableOpacity onPress={onPress} activeOpacity={0.65} style={chatMenuStyles.menuItem}>
+      {icon ? (
+        <View style={[chatMenuStyles.menuItemIcon, { backgroundColor: disc }]}>
+          <Icon name={icon} size={17} color={glyph} />
+        </View>
       ) : null}
-    </View>
-  </TouchableOpacity>
-);
+      {/* No flex:1 — the card is content-sized, so a stretching child would
+          fight the measurement and could collapse the label to nothing. */}
+      <View style={chatMenuStyles.menuItemTextWrap}>
+        <Text style={[chatMenuStyles.menuItemLabel, { color: isDanger ? '#E06A6A' : theme.colors.primaryTextColor }]}>
+          {label}
+        </Text>
+        {sublabel ? (
+          <Text style={[chatMenuStyles.menuItemSub, { color: theme.colors.placeHolderTextColor }]}>
+            {sublabel}
+          </Text>
+        ) : null}
+      </View>
+    </TouchableOpacity>
+  );
+};
 
 // Received-media privacy gate: see components/BlurGateImage.jsx — a constant
 // heavy blur layer cross-faded out by real download progress (a DYNAMIC
@@ -1234,9 +1349,11 @@ const retryStyles = StyleSheet.create({
 
 const chatMenuStyles = StyleSheet.create({
   // Popover container — fills the screen so taps outside dismiss
+  // Tap-catcher + scrim (its colour is theme-dependent, applied at the call
+  // site). Without a scrim the card had nothing to sit against and read as text
+  // floating on the conversation.
   popoverRoot: {
     flex: 1,
-    backgroundColor: 'transparent',
   },
   // The dropdown card itself — anchored near the top-right where the 3-dot
   // button lives. Compact width, soft elevation, hairline border for a
@@ -1247,9 +1364,12 @@ const chatMenuStyles = StyleSheet.create({
     right: 10,
     // Size to content — no fixed width. minWidth keeps short labels readable;
     // maxWidth caps a long label from stretching across the screen.
-    minWidth: 170,
-    maxWidth: 260,
-    borderRadius: 16,
+    // Sized to its content: the card is as wide as its longest label needs.
+    // minWidth keeps a short-label menu from collapsing to a sliver, maxWidth
+    // stops a long one from stretching across the screen.
+    minWidth: 190,
+    maxWidth: 280,
+    borderRadius: 18,
     paddingVertical: 6,
     borderWidth: StyleSheet.hairlineWidth,
     shadowColor: '#000',
@@ -1260,18 +1380,26 @@ const chatMenuStyles = StyleSheet.create({
   },
   popoverDivider: {
     height: StyleSheet.hairlineWidth,
-    marginVertical: 6,
-    marginHorizontal: 10,
+    marginVertical: 4,
+    marginHorizontal: 12,
   },
 
-  // Menu item rows — text-only, WhatsApp-style compact list
+  // Menu item rows — icon disc + label, comfortable 44pt-plus touch target
   menuItem: {
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    borderRadius: 10,
-    marginHorizontal: 4,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 12,
+    marginHorizontal: 6,
   },
-  menuItemLabel: { fontFamily: 'Roboto-Medium', fontSize: 14.5, letterSpacing: 0.1 },
+  menuItemIcon: {
+    width: 32, height: 32, borderRadius: 11,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  menuItemTextWrap: { flexShrink: 1 },
+  menuItemLabel: { fontFamily: 'Roboto-Medium', fontSize: 15, letterSpacing: 0.1 },
   menuItemSub: { fontFamily: 'Roboto-Regular', fontSize: 11.5, letterSpacing: 0.2, marginTop: 2 },
 
   // Confirm modal
@@ -1286,6 +1414,7 @@ const chatMenuStyles = StyleSheet.create({
     width: '100%',
     maxWidth: 360,
     borderRadius: 22,
+    borderWidth: StyleSheet.hairlineWidth,
     paddingVertical: 24,
     paddingHorizontal: 22,
     alignItems: 'center',
@@ -2645,16 +2774,6 @@ export default function ChatScreen({ navigation, route }) {
   // ── Mentions ──
   const isGroupChat = Boolean(chatData?.chatType === 'group' || chatData?.isGroup);
 
-  // ── Save Contact ──
-  const {
-    isUnknown: isPeerUnknownContact,
-    isSaving: isContactSaving,
-    isSyncing: isContactSyncing,
-    savedSuccessfully: contactSavedSuccessfully,
-    saveError: contactSaveError,
-    saveContact,
-  } = useSaveContact(!isGroupChat ? chatData?.peerUser : null);
-
   // Used to resolve status-reply preview owner names against the local
   // saved-contacts directory (saved name → phone number → server name).
   const { resolveName: resolveContactName } = useContactDirectory();
@@ -2714,7 +2833,10 @@ export default function ChatScreen({ navigation, route }) {
     const fallback = member?.fullName || peer?.fullName || peer?.name || userId;
     const phone = member?.mobileNumber
       || peer?.mobileNumber || peer?.mobile?.number || peer?.phone || null;
-    return resolveContactName(userId, fallback, phone);
+    return resolveContactName(userId, fallback, phone, {
+      username: member?.userName || peer?.userName || null,
+      hideContact: Boolean(member?.hideContact ?? peer?.hideContact ?? peer?.privacySettings?.hideContact),
+    });
   }, [currentUserId, groupMembersMap, chatData, resolveContactName]);
 
   // ── View Once viewer ──────────────────────────────────────────────────
@@ -3312,7 +3434,13 @@ export default function ChatScreen({ navigation, route }) {
       });
       if (!photosOk) return;
 
-      await MediaLibrary.createAssetAsync(await ensureSaveableFileUri(localUri, msg));
+      // Same album + same dialog-free path as an auto-download save, so a manual
+      // save never raises Android's "Allow … to modify this photo?" prompt and
+      // lands where the auto-saved media already lives.
+      await saveAssetToAlbum(
+        await ensureSaveableFileUri(localUri, msg),
+        (msg?.type || '').toLowerCase() === 'video' ? 'TalksTry Video' : 'TalksTry Images',
+      );
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
     } catch (error) {
@@ -4724,8 +4852,13 @@ export default function ChatScreen({ navigation, route }) {
     // Android (incl. the new architecture, where a manual scaleY:-1 inside an
     // inverted list was rendering mirrored).
     <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 }}>
+      {/* Same chip as every other date separator — it used to carry its own
+          slightly-different literals, so the empty state's "TODAY" did not
+          match the one a real conversation shows. */}
       <View style={{
-        backgroundColor: isDarkMode ? 'rgba(25,40,55,0.85)' : 'rgba(225,230,236,0.85)',
+        backgroundColor: dateChipColors(isDarkMode).bg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: dateChipColors(isDarkMode).border,
         paddingHorizontal: 14,
         paddingVertical: 5,
         borderRadius: 8,
@@ -4733,7 +4866,7 @@ export default function ChatScreen({ navigation, route }) {
       }}>
         <Text style={{
           fontSize: 11.5,
-          color: isDarkMode ? 'rgba(210,220,230,0.85)' : '#5f6769',
+          color: dateChipColors(isDarkMode).text,
           fontFamily: 'Roboto-Medium',
           letterSpacing: 0.1,
         }}>
@@ -4741,7 +4874,9 @@ export default function ChatScreen({ navigation, route }) {
         </Text>
       </View>
       <View style={{
-        backgroundColor: isDarkMode ? 'rgba(25,40,55,0.75)' : 'rgba(225,230,236,0.75)',
+        backgroundColor: dateChipColors(isDarkMode).bg,
+        borderWidth: StyleSheet.hairlineWidth,
+        borderColor: dateChipColors(isDarkMode).border,
         paddingHorizontal: 12,
         paddingVertical: 8,
         borderRadius: 8,
@@ -4768,10 +4903,13 @@ export default function ChatScreen({ navigation, route }) {
   // Render functions
   const renderDateBadge = useCallback((dateKey) => {
     const displayDate = getDateLabel(dateKey);
+    const chip = dateChipColors(isDarkMode);
     return (
       <View style={{ alignItems: 'center', marginVertical: 8 }}>
         <View style={{
-          backgroundColor: isDarkMode ? 'rgba(25,40,55,0.92)' : 'rgba(225,230,236,0.92)',
+          backgroundColor: chip.bg,
+          borderWidth: StyleSheet.hairlineWidth,
+          borderColor: chip.border,
           paddingHorizontal: 12,
           paddingVertical: 5,
           borderRadius: 8,
@@ -4783,7 +4921,7 @@ export default function ChatScreen({ navigation, route }) {
         }}>
           <Text style={{
             fontSize: 11.5,
-            color: isDarkMode ? 'rgba(210,220,230,0.85)' : '#5f6769',
+            color: chip.text,
             fontFamily: 'Roboto-Medium',
             letterSpacing: 0.1,
           }}>
@@ -6270,6 +6408,22 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   // Main message renderer
+  // The array the FlatList is CURRENTLY rendering, readable from inside
+  // renderChatsItem without adding it to that callback's dependency list.
+  //
+  // Two bugs met here and produced a date separator between nearly every
+  // message (with the raw "2026-08-25" key as its label):
+  //   1. the badge compared `msg` against `messages` — the FULL list — while
+  //      the FlatList renders `renderableMessages`, a FILTERED subset (rows
+  //      held back for translation). `index + 1` therefore pointed at a
+  //      different message than the one drawn below, so same-day rows looked
+  //      like day changes. How many rows were held back varied per chat open,
+  //      which is why it only happened "sometimes".
+  //   2. renderChatsItem's dependency list never included `messages`, so even
+  //      that comparison ran against a STALE array once new messages arrived.
+  // A ref sidesteps both: it is written every render and read at draw time.
+  const renderableMessagesRef = useRef([]);
+
   const renderChatsItem = useCallback(({ item: msg, index }) => {
     const messageKey = getMessageKey(msg);
     const isSelected = selectedMessage.some(sel => sameId(sel, messageKey));
@@ -6324,19 +6478,13 @@ export default function ChatScreen({ navigation, route }) {
     // line (WhatsApp footer). Other types keep the separate bottom meta row.
     const showInlineMeta = msg.type === 'text' && !isDeletedMessage;
 
-    const dateBadgeKey = shouldShowDateAbove(msg, index, messages);
+    const dateBadgeKey = shouldShowDateAbove(msg, index, renderableMessagesRef.current);
 
     // ── Call log entry (audio/video call, missed/outgoing/incoming) ──
     if (isCall) {
       return (
         <React.Fragment>
-          {dateBadgeKey && (
-            <View style={{ alignItems: 'center', paddingVertical: 8 }}>
-              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12 }}>
-                <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>{dateBadgeKey}</Text>
-              </View>
-            </View>
-          )}
+          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
           <View style={{ paddingHorizontal: 12, paddingVertical: 2 }}>
             <CallMessageBubble
               msg={msg}
@@ -6351,7 +6499,12 @@ export default function ChatScreen({ navigation, route }) {
 
     // ── System messages (group created, member joined/left/removed) ──
     if (isSystemMessage) {
-      const systemText = msg?.text || msg?.content || '';
+      // Group action notices render from their STRUCTURED event, so every name
+      // in the sentence follows THIS viewer's display rule (saved contact →
+      // number → @handle → account name) rather than the actor's account name
+      // that was frozen into `text` at write time. Rows written before the
+      // event existed fall back to that text.
+      const systemText = renderSystemMessage(msg, currentUserId) || msg?.text || msg?.content || '';
 
       // Org-2SV login code (read-only Talkstry Authenticator channel): a
       // RECEIVED-side (left-aligned) card — not a centered pill — with the CODE
@@ -6367,13 +6520,7 @@ export default function ChatScreen({ navigation, route }) {
         const otpAccent = theme?.colors?.primary || '#03b0a2';
         return (
           <React.Fragment>
-            {dateBadgeKey && (
-              <View style={{ alignItems: 'center', paddingVertical: 8 }}>
-                <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12 }}>
-                  <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>{dateBadgeKey}</Text>
-                </View>
-              </View>
-            )}
+            {dateBadgeKey && renderDateBadge(dateBadgeKey)}
             {/* Same geometry/colors as a normal RECEIVED text bubble (see the
                 generic bubble below: radius 8, top-left tail 3, #202C33 dark /
                 cardBackground light, same padding + shadow) — only the code
@@ -6451,13 +6598,7 @@ export default function ChatScreen({ navigation, route }) {
       }
       return (
         <React.Fragment>
-          {dateBadgeKey && (
-            <View style={{ alignItems: 'center', paddingVertical: 8 }}>
-              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 4, borderRadius: 12 }}>
-                <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Medium' }}>{dateBadgeKey}</Text>
-              </View>
-            </View>
-          )}
+          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
           <View style={{ alignItems: 'center', paddingVertical: 3, paddingHorizontal: 30 }}>
             <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 10, maxWidth: '85%' }}>
               <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
@@ -6514,7 +6655,10 @@ export default function ChatScreen({ navigation, route }) {
     const senderLabel = resolveContactName(
       msg.senderId,
       senderMeta.fullName || msg.senderName || 'Member',
-      senderMeta.mobileNumber
+      senderMeta.mobileNumber,
+      // Contact privacy — a hidden sender is "@handle" even to a member who has
+      // them saved. Passing these was missing, so the branch never fired here.
+      { username: senderMeta.userName || null, hideContact: Boolean(senderMeta.hideContact) },
     );
     // "~account name" for unsaved senders (null when the sender IS saved, or
     // when the server name is just the number again).
@@ -6523,6 +6667,8 @@ export default function ChatScreen({ navigation, route }) {
           userId: msg.senderId,
           phone: senderMeta.mobileNumber,
           pushName: senderMeta.fullName || msg.senderName,
+          // Suppresses the "~name" line for a hidden sender.
+          hideContact: Boolean(senderMeta.hideContact),
         })
       : null;
     const openSenderProfile = () => {
@@ -6623,8 +6769,16 @@ export default function ChatScreen({ navigation, route }) {
               : (isMyMessage ? sentBubbleBg : theme.colors.bubbleReceived),
             paddingVertical: (isMediaMessage && !msg.replyToMessageId) ? 3 : 6,
             paddingHorizontal: (isMediaMessage && !msg.replyToMessageId) ? 3 : 9,
-            borderWidth: isHighlighted ? 2 : 0,
-            borderColor: theme.colors.replyHighlight,
+            // Hairline on RECEIVED bubbles in light mode. The wallpaper no
+            // longer paints its own beige ground (it is transparent so the
+            // screen uses theme.colors.background), and in light mode that
+            // background and bubbleReceived are both #ffffff — a white bubble
+            // on white, held apart by a 0.08-opacity shadow alone, loses its
+            // edge. The hairline restores it without darkening the bubble.
+            borderWidth: isHighlighted
+              ? 2
+              : ((!isDarkMode && !isMyMessage && !isDeletedMessage) ? StyleSheet.hairlineWidth : 0),
+            borderColor: isHighlighted ? theme.colors.replyHighlight : theme.colors.border,
             shadowColor: theme.colors.shadow,
             shadowOffset: { width: 0, height: 1 },
             shadowOpacity: isDarkMode ? 0.2 : 0.08,
@@ -6737,6 +6891,7 @@ export default function ChatScreen({ navigation, route }) {
                   isOwnStatus={isOwnStatus}
                   chatColor={chatColor}
                   theme={theme}
+                  isDarkMode={isDarkMode}
                   onPress={handleOpenStatusFromChat}
                 />
               );
@@ -6829,6 +6984,7 @@ export default function ChatScreen({ navigation, route }) {
                   isMyMessage={isMyMessage}
                   chatColor={chatColor}
                   theme={theme}
+                  isDarkMode={isDarkMode}
                   onPress={(originalMsgId) => navigateToReplyParent(originalMsgId)}
                 />
               );
@@ -7083,6 +7239,9 @@ export default function ChatScreen({ navigation, route }) {
     return visible.length === messages.length ? messages : visible;
   }, [messages, language, languageReady, messageTranslations]);
 
+  // Written every render so renderChatsItem never reads a stale array.
+  renderableMessagesRef.current = Array.isArray(renderableMessages) ? renderableMessages : [];
+
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
   // media cell must re-render (e.g. a finished download replacing the blurred
@@ -7197,6 +7356,16 @@ export default function ChatScreen({ navigation, route }) {
   // load. See the "Messages List" block.
 
   const isBroadcastChat = Boolean(chatData?.chatType === 'broadcast' || chatData?.isBroadcast);
+  // Self chat ("Message yourself"): there is no "everyone" to clear a chat for —
+  // both sides of the thread are this account — so that action is not offered.
+  const isSelfChatOpen = isSelfChatId(chatData?.chatId || chatData?._id || route?.params?.chatId);
+
+  // Popover surfaces (3-dot dropdown + its confirm sheets). Dark mode paints a
+  // deeper near-black than the generic `cardBackground` so the card reads as a
+  // lit panel above the conversation instead of a grey slab; light mode stays
+  // white and separates with a hairline + shadow instead.
+  const menuSurface = isDarkMode ? '#0F1A21' : '#FFFFFF';
+  const menuBorder = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)';
   if (!chatData || (!chatData.peerUser && !chatData.isGroup && !isBroadcastChat)) {
     return (
       <View style={{ 
@@ -7294,10 +7463,13 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: theme.colors.background }}>
+    // Root carries the chat ground too: the wallpaper is absolutely
+    // positioned, so anything it does not cover (edges during the keyboard
+    // transition) would otherwise flash the app's plain background.
+    <View style={{ flex: 1, backgroundColor: theme.colors.chatBackground }}>
       <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
       <Reanimated.View style={[{ flex: 1 }, rootKeyboardStyle]}>
-        <ChatWallpaper isDarkMode={isDarkMode} />
+        <ChatWallpaper isDarkMode={isDarkMode} backgroundColor={theme.colors.chatBackground} />
         
         {/* Header */}
         <ChatHeaderPresence
@@ -7326,6 +7498,7 @@ export default function ChatScreen({ navigation, route }) {
           groupName={liveChannel?.chatName ?? (chatData?.chatName || chatData?.group?.name || chatData?.groupName)}
           groupAvatar={liveChannel?.chatAvatar !== undefined ? liveChannel.chatAvatar : (chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar)}
           memberCount={isBroadcastChat ? undefined : (liveMemberCount ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount))}
+          selectionCount={selectedMessage.length}
           rightActions={selectedMessage.length > 0 ? (() => {
             const selMsg = selectedMessage.length === 1
               ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))
@@ -7351,11 +7524,10 @@ export default function ChatScreen({ navigation, route }) {
             const canReport = selectedMessage.length === 1 && selMsg && !isOwnMsg && !selMsg?.isDeleted;
             const canCancelSchedule = selectedMessage.length === 1 && (selMsg?.status === 'scheduled' || selMsg?.status === 'processing') && isOwnMsg;
             return (
-              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                {/* Count */}
-                <Text style={{ fontFamily: "Roboto-SemiBold", fontSize: 18, color: theme.colors.primaryTextColor, marginRight: 16, marginLeft: 4 }}>
-                  {selectedMessage.length}
-                </Text>
+              // Selection actions only — the count lives in the header's own
+              // selection bar, and the icons stay compact so a fully-loaded
+              // toolbar (delete/copy/reply/forward/edit/info) still fits.
+              <View style={{ flexDirection: 'row', alignItems: 'center', flexShrink: 1 }}>
                 {/* Cancel Scheduled */}
                 {canCancelSchedule && (
                   <TouchableOpacity
@@ -7365,7 +7537,7 @@ export default function ChatScreen({ navigation, route }) {
                       clearSelectedMessages();
                       setReactionMsgId(null);
                     }}
-                    style={{ padding: 10 }}>
+                    style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
                     <Ionicons name="time-outline" size={22} color="#FF5252" />
                   </TouchableOpacity>
                 )}
@@ -7376,7 +7548,7 @@ export default function ChatScreen({ navigation, route }) {
                     setReactionMsgId(null);
                     handleDeleteSelected();
                   }}
-                  style={{ padding: 10 }}>
+                  style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
                   <Ionicons name="trash-outline" size={22} color={theme.colors.primaryTextColor} />
                 </TouchableOpacity>
                 {/* Copy — text messages AND media captions */}
@@ -7392,7 +7564,7 @@ export default function ChatScreen({ navigation, route }) {
                       clearSelectedMessages();
                       setReactionMsgId(null);
                     }}
-                    style={{ padding: 10 }}>
+                    style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
                     <Ionicons name="copy-outline" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
@@ -7405,8 +7577,8 @@ export default function ChatScreen({ navigation, route }) {
                       clearSelectedMessages();
                       startReply(selMsg);
                     }}
-                    style={{ padding: 10 }}>
-                    <Ionicons name="arrow-undo-outline" size={22} color={theme.colors.primaryTextColor} />
+                    style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
+                    <MaterialCommunityIcons name="reply" size={24} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
                 {/* Forward */}
@@ -7433,8 +7605,8 @@ export default function ChatScreen({ navigation, route }) {
                           messages: selectedMsgs,
                         });
                       }}
-                      style={{ padding: 10 }}>
-                      <Ionicons name="arrow-redo-outline" size={22} color={theme.colors.primaryTextColor} />
+                      style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
+                      <MaterialCommunityIcons name="share" size={24} color={theme.colors.primaryTextColor} />
                     </TouchableOpacity>
                   );
                 })()}
@@ -7446,7 +7618,7 @@ export default function ChatScreen({ navigation, route }) {
                       setReactionMsgId(null);
                       startEditMessage(selMsg);
                     }}
-                    style={{ padding: 10 }}>
+                    style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
                     <MaterialIcons name="edit" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
@@ -7470,7 +7642,7 @@ export default function ChatScreen({ navigation, route }) {
                         },
                       });
                     }}
-                    style={{ padding: 10 }}>
+                    style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
                     <Ionicons name="information-circle-outline" size={22} color={theme.colors.primaryTextColor} />
                   </TouchableOpacity>
                 )}
@@ -7482,7 +7654,7 @@ export default function ChatScreen({ navigation, route }) {
                       clearSelectedMessages();
                       handleReportMessage(selMsg);
                     }}
-                    style={{ padding: 10 }}>
+                    style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
                     <Ionicons name="flag-outline" size={22} color={theme.colors.danger} />
                   </TouchableOpacity>
                 )}
@@ -7490,7 +7662,8 @@ export default function ChatScreen({ navigation, route }) {
             );
           })() : (
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              {isBroadcastChat ? null : !isGroupChat ? (
+              {/* No calling yourself — the self chat has no peer to ring. */}
+              {isBroadcastChat || isSelfChatId(chatData.chatId || chatData?._id || route?.params?.chatId) ? null : !isGroupChat ? (
                 <CallButtons
                   peer={chatData.peerUser}
                   chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
@@ -7503,11 +7676,16 @@ export default function ChatScreen({ navigation, route }) {
                   <Ionicons name="notifications-off" size={20} color={theme.colors.placeHolderTextColor} />
                 </View>
               )}
+              {/* No filled circle behind the glyph: the video and call icons
+                  next to it are bare, so the chip made the menu look like a
+                  different KIND of control instead of the third icon in the
+                  row. Padding stays for the touch target. */}
               <TouchableOpacity
                 onPress={openChatMenu}
                 activeOpacity={0.7}
-                style={{ padding: 8, borderRadius: 20, backgroundColor: theme.colors.menuBackground }} >
-                <Ionicons name="ellipsis-vertical" size={18} color={theme.colors.primaryTextColor} />
+                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                style={{ padding: 8 }} >
+                <Ionicons name="ellipsis-vertical" size={20} color={theme.colors.primaryTextColor} />
               </TouchableOpacity>
             </View>
           )}
@@ -7609,24 +7787,9 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {/* Save Contact Banner — shown for unknown TalksTry users in 1:1 chats */}
-        {/* {!isGroupChat && (isPeerUnknownContact || contactSavedSuccessfully) && (
-          <SaveContactBanner
-            peerName={resolveContactName(
-              chatData?.peerUser?._id,
-              chatData?.peerUser?.fullName || chatData?.peerUser?.name || '',
-              chatData?.peerUser?.mobileNumber
-                || (chatData?.peerUser?.mobile?.number
-                  ? `${chatData.peerUser.mobile.code || ''}${chatData.peerUser.mobile.number}`
-                  : null),
-            )}
-            isSaving={isContactSaving}
-            isSyncing={isContactSyncing}
-            savedSuccessfully={contactSavedSuccessfully}
-            saveError={contactSaveError}
-            onSave={saveContact}
-          />
-        )} */}
+        {/* NOTE: the save-contact / sync-contacts affordance lives ONLY on the
+            user's profile screen (UserB) — a banner over the thread was noise
+            on every open. See useSaveContact + UserB.jsx. */}
 
         {/* Messages List — first-paint loading states render HERE (inside the
             messages region only) so the header above and the input bar/footer
@@ -7764,9 +7927,9 @@ export default function ChatScreen({ navigation, route }) {
               minWidth: 88,
               borderRadius: 14,
               overflow: 'hidden',
-              borderWidth: 1,
-              borderColor: isDarkMode ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.08)',
-              backgroundColor: isDarkMode ? 'rgba(25,40,55,0.92)' : 'rgba(225,230,236,0.96)',
+              borderWidth: StyleSheet.hairlineWidth,
+              borderColor: dateChipColors(isDarkMode).border,
+              backgroundColor: dateChipColors(isDarkMode).bg,
               shadowColor: theme.colors.shadow,
               shadowOffset: { width: 0, height: 2 },
               shadowOpacity: 0.16,
@@ -7778,7 +7941,7 @@ export default function ChatScreen({ navigation, route }) {
             <Text
               style={{
                 fontSize: 11,
-                color: isDarkMode ? 'rgba(233,245,255,0.96)' : '#4f5a60',
+                color: dateChipColors(isDarkMode).text,
                 fontFamily: 'Roboto-Medium',
                 textAlign: 'center',
                 paddingHorizontal: 12,
@@ -8162,7 +8325,16 @@ export default function ChatScreen({ navigation, route }) {
         {/* ─── REDESIGNED 3-DOT DROPDOWN (WhatsApp-style popover) ─── */}
         <Modal visible={showMenu} transparent animationType="none" onRequestClose={closeChatMenu} statusBarTranslucent>
           {/* Translucent tap-catcher — the dropdown floats over the chat */}
-          <TouchableOpacity activeOpacity={1} onPress={closeChatMenu} style={chatMenuStyles.popoverRoot}>
+          <TouchableOpacity
+            activeOpacity={1}
+            onPress={closeChatMenu}
+            style={[
+              chatMenuStyles.popoverRoot,
+              // Dark mode can take a heavier scrim; over a light UI the same
+              // value reads as a black wash, so it is lightened there.
+              { backgroundColor: isDarkMode ? 'rgba(0,0,0,0.42)' : 'rgba(0,0,0,0.18)' },
+            ]}
+          >
             {/* The dropdown card itself. transformOrigin via small offset and scale
                 + opacity gives the impression of popping out of the 3-dot icon. */}
             <Animated.View
@@ -8170,8 +8342,8 @@ export default function ChatScreen({ navigation, route }) {
               style={[
                 chatMenuStyles.popoverCard,
                 {
-                  backgroundColor: theme.colors.cardBackground,
-                  borderColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+                  backgroundColor: menuSurface,
+                  borderColor: menuBorder,
                   opacity: menuOpacityAnim,
                   transform: [
                     { scale: menuScaleAnim },
@@ -8184,18 +8356,18 @@ export default function ChatScreen({ navigation, route }) {
               <ChatMenuItem
                 icon="search-outline"
                 iconLib="Ionicons"
-                color="#4D7CFE"
                 label="Search"
                 onPress={() => { closeChatMenu(); setTimeout(() => handleToggleSearchBar(), 140); }}
                 theme={theme}
+                isDark={isDarkMode}
               />
               <ChatMenuItem
                 icon="person-outline"
                 iconLib="Ionicons"
-                color="#7C4DFF"
                 label="Contact info"
                 onPress={() => { closeChatMenu(); setTimeout(() => handleOpenContactInfo(), 140); }}
                 theme={theme}
+                isDark={isDarkMode}
               />
               {/* Load older messages — WhatsApp-style backfill of history from the
                   server. Only shown while older messages remain (hasMoreMessages). */}
@@ -8203,7 +8375,6 @@ export default function ChatScreen({ navigation, route }) {
                 <ChatMenuItem
                   icon="history"
                   iconLib="MaterialCommunityIcons"
-                  color="#4DB6AC"
                   label={isLoadingOlder ? 'Loading older messages…' : 'Load older messages'}
                   onPress={() => {
                     closeChatMenu();
@@ -8218,6 +8389,7 @@ export default function ChatScreen({ navigation, route }) {
                     }, 140);
                   }}
                   theme={theme}
+                  isDark={isDarkMode}
                 />
               )} */}
               <View style={[chatMenuStyles.popoverDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)' }]} />
@@ -8225,22 +8397,22 @@ export default function ChatScreen({ navigation, route }) {
               <ChatMenuItem
                 icon="delete-sweep-outline"
                 iconLib="MaterialCommunityIcons"
-                color="#E06A6A"
                 label="Clear chat"
                 onPress={handleClearChatOptions}
                 theme={theme}
+                isDark={isDarkMode}
                 isDanger
               />
-              {/* "Clear for everyone" is not offered in channels (broadcast) —
-                  only in one-to-one and group chats. */}
-              {!isBroadcastChat && (
+              {/* "Clear for everyone" is not offered in channels (broadcast), nor in
+                  the self chat — only in real one-to-one and group chats. */}
+              {!isBroadcastChat && !isSelfChatOpen && (
                 <ChatMenuItem
                   icon="broom"
                   iconLib="MaterialCommunityIcons"
-                  color="#E06A6A"
                   label="Clear for everyone"
                   onPress={handleDeleteForEveryone}
                   theme={theme}
+                  isDark={isDarkMode}
                   isDanger
                 />
               )}
@@ -8261,7 +8433,7 @@ export default function ChatScreen({ navigation, route }) {
             onPress={() => { if (!isClearingChat) setClearChatModalVisible(false); }}
             style={chatMenuStyles.confirmOverlay}
           >
-            <TouchableOpacity activeOpacity={1} style={[chatMenuStyles.confirmCard, { backgroundColor: theme.colors.cardBackground }]}>
+            <TouchableOpacity activeOpacity={1} style={[chatMenuStyles.confirmCard, { backgroundColor: menuSurface, borderColor: menuBorder }]}>
               <View style={chatMenuStyles.confirmIconWrap}>
                 <MaterialIcons name="delete-sweep" size={30} color="#E06A6A" />
               </View>
@@ -8311,7 +8483,7 @@ export default function ChatScreen({ navigation, route }) {
             onPress={() => { if (!isDeletingEveryone) setDeleteEveryoneModalVisible(false); }}
             style={chatMenuStyles.confirmOverlay}
           >
-            <TouchableOpacity activeOpacity={1} style={[chatMenuStyles.confirmCard, { backgroundColor: theme.colors.cardBackground }]}>
+            <TouchableOpacity activeOpacity={1} style={[chatMenuStyles.confirmCard, { backgroundColor: menuSurface, borderColor: menuBorder }]}>
               <View style={chatMenuStyles.confirmIconWrap}>
                 <MaterialCommunityIcons name="broom" size={30} color="#E06A6A" />
               </View>
@@ -8379,8 +8551,14 @@ export default function ChatScreen({ navigation, route }) {
         {showMediaOptions && (
           <Animated.View
             style={{
+              // Follows the theme background (the chat ground) instead of the
+              // lighter cardBackground — on dark that slab sat as a pale block
+              // under a true-black chat. The hairline is what separates it from
+              // the composer now that the two share a colour.
               height: mediaPanelHeightAnim,
-              backgroundColor: isDarkMode ? theme.colors.cardBackground : '#F0F2F5',
+              backgroundColor: theme.colors.background,
+              borderTopWidth: StyleSheet.hairlineWidth,
+              borderTopColor: theme.colors.borderColor,
               overflow: 'hidden',
             }}
           >
@@ -8404,10 +8582,11 @@ export default function ChatScreen({ navigation, route }) {
                   paddingHorizontal: 8,
                   paddingTop: 12,
                   paddingBottom: 12,
-                  rowGap: 18,
+                  rowGap: 10,
                 }}
               >
                 {MEDIA_PANEL_OPTIONS.map((item, idx) => {
+                  const attachTile = attachTileStyle(item, isDarkMode);
                   const press = mediaOptionPressAnims[item.key];
                   const entry = mediaOptionEntryAnims[idx];
                   return (
@@ -8415,7 +8594,7 @@ export default function ChatScreen({ navigation, route }) {
                       key={item.key}
                       style={{
                         width: '25%',
-                        alignItems: 'center',
+                        paddingHorizontal: 5,
                         opacity: entry,
                         transform: [
                           { scale: press },
@@ -8427,27 +8606,17 @@ export default function ChatScreen({ navigation, route }) {
                         onPressIn={() => handleMediaOptionPressIn(item.key)}
                         onPressOut={() => handleMediaOptionPressOut(item.key)}
                         onPress={() => handleMediaOptionSelect(item.key)}
-                        style={{ alignItems: 'center' }}
+                        style={styles.attachTilePressable}
                         accessibilityRole="button"
                         accessibilityLabel={item.label}
                       >
-                        <AttachOptionDisc
-                          color={item.color}
+                        <AttachOptionTile
+                          tint={attachTile.disc}
+                          glyph={attachTile.glyph}
                           icon={item.icon}
-                          size={48}
-                          bg={isDarkMode ? 'rgba(255,255,255,0.06)' : '#ffffff'}
+                          label={item.label}
+                          labelColor={theme.colors.primaryTextColor}
                         />
-                        <Text
-                          style={{
-                            marginTop: 7,
-                            fontSize: 12,
-                            color: theme.colors.secondaryTextColor,
-                            fontFamily: 'Roboto-Regular',
-                            textAlign: 'center',
-                          }}
-                        >
-                          {item.label}
-                        </Text>
                       </Pressable>
                     </Animated.View>
                   );
@@ -8583,7 +8752,13 @@ export default function ChatScreen({ navigation, route }) {
                         purpose: 'Allow photo access to save this media to your gallery.',
                       });
                       if (!photosOk) return;
-                      await MediaLibrary.createAssetAsync(await ensureSaveableFileUri(localUri, msg));
+                      // Same album + same dialog-free path as an auto-download save, so a manual
+      // save never raises Android's "Allow … to modify this photo?" prompt and
+      // lands where the auto-saved media already lives.
+      await saveAssetToAlbum(
+        await ensureSaveableFileUri(localUri, msg),
+        (msg?.type || '').toLowerCase() === 'video' ? 'TalksTry Video' : 'TalksTry Images',
+      );
                       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                       setViewerSavedToast(true);
                       if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);

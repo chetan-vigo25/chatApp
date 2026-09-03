@@ -3,7 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 
 const DB_NAME = 'TalksTry.db';
-const DB_VERSION = 14;
+const DB_VERSION = 15;
 
 // Where the destructive recreate stashes pending unsent messages, and where the
 // last init outcome is recorded for telemetry. See _deleteCorruptDB / _recordOutcome.
@@ -552,6 +552,7 @@ const runMigrations = async (db) => {
             last_message_id TEXT,
             last_message_is_edited INTEGER DEFAULT 0,
             last_message_is_deleted INTEGER DEFAULT 0,
+            last_message_system_event TEXT,
             unread_count INTEGER DEFAULT 0,
             is_pinned INTEGER DEFAULT 0,
             pinned_at TEXT,
@@ -753,6 +754,21 @@ const runMigrations = async (db) => {
       }
     }
 
+    // V15: group system notices ("X added Y") keep their STRUCTURED event on the
+    // chat row, so the cold-start list renders the names with this device's own
+    // address book instead of the actor's account name the server had to freeze
+    // into last_message_text.
+    if (currentVersion < 15) {
+      try {
+        await db.execAsync(`ALTER TABLE chats ADD COLUMN last_message_system_event TEXT;`);
+      } catch (e) {
+        // Already present (a partially-applied migration) — not a fault.
+        if (!/duplicate column/i.test(e?.message || '')) {
+          console.warn('[ChatDB] V15 migration warning:', e?.message);
+        }
+      }
+    }
+
     // The tracking module was removed — drop any leftover queued tracking rows
     // so they are never replayed as location fixes.
     try {
@@ -863,6 +879,8 @@ const rowToMsg = (row) => {
     isScheduled: Boolean(pp?.isScheduled),
     scheduleTime: pp?.scheduleTime || null,
     scheduleTimeLabel: pp?.scheduleTimeLabel || null,
+    // Group system event — see the payload writer above.
+    systemEvent: pp?.systemEvent || null,
     // Status reply / share — snapshot persisted in payload
     statusRef: pp?.statusRef || null,
     statusPreview: pp?.statusPreview || null,
@@ -1082,7 +1100,23 @@ let _writeChain = Promise.resolve();
 // (that would deadlock) — batch internals write through the passed tx/db handle
 // instead (as _runUpsertBatch / saveReplyData already do). No such nested call
 // exists in this module, so strict FIFO is safe here.
-const runExclusive = (task) => {
+// ── Write seal (account switch) ───────────────────────────────────────────
+// Between "the previous user signed out" and "the next user is stamped as the
+// owner", the cache belongs to NOBODY and must accept no writes. Without this
+// the wipe was racy: clearSyncData emptied the tables, then in-flight writers
+// from the OLD session (queued SqliteWriter jobs, ChatCache flushes, socket
+// handlers still draining) re-inserted the previous account's chats — the next
+// user opened the app and saw them. Sealing is a hard gate, not a hint: every
+// write funnels through runExclusive, so one flag closes all of them at once.
+let _writesSealed = false;
+const sealWrites = () => { _writesSealed = true; };
+const unsealWrites = () => { _writesSealed = false; };
+const areWritesSealed = () => _writesSealed;
+
+const runExclusive = (task, { bypassSeal = false } = {}) => {
+  // Sealed: drop the write. Callers get a resolved promise, so a stale writer
+  // finishes quietly instead of throwing into a realtime handler.
+  if (_writesSealed && !bypassSeal) return Promise.resolve(undefined);
   const next = _writeChain.then(task, task);
   _writeChain = next.catch(() => {}); // swallow so a failure never breaks the chain
   return next;
@@ -1123,29 +1157,55 @@ const runExclusiveWithRetry = async (task, attempts = 3) => {
 // batch. The retry then absorbs the brief window where one of those writers
 // already holds the WAL writer lock when our transaction starts. The task
 // MUST use the handle it is passed (`tx`), never the outer `db`.
-const _runCacheWrite = async (label, task, attempts = 4) => {
+/** One attempt at a dedicated-connection cache write. No retry, no mutex. */
+const _runCacheWriteOnce = async (task) => {
+  const db = await getDB();
+  if (!db) return;
+  if (typeof db.withExclusiveTransactionAsync === 'function') {
+    await db.withExclusiveTransactionAsync(async (tx) => { await task(tx); });
+  } else if (typeof db.withTransactionAsync === 'function') {
+    await db.withTransactionAsync(async () => { await task(db); });
+  } else {
+    await task(db);
+  }
+};
+
+/**
+ * Run a snapshot cache write (status feed, broadcasts, blocked contacts, …) on
+ * the dedicated connection, retrying on SQLITE_BUSY.
+ *
+ * The retry RE-ACQUIRES the global write mutex on every attempt instead of
+ * looping inside it. That matters: `BEGIN EXCLUSIVE` can only lose to ANOTHER
+ * connection (the reader's snapshot during a WAL checkpoint, or the previous
+ * exclusive transaction winding down). Sleeping while still holding the mutex
+ * blocked every other writer for the whole backoff AND gave the lock holder no
+ * chance to drain — so the retries reliably failed together and the write was
+ * dropped with a warning. Releasing between attempts lets the contending work
+ * finish, which is the only thing that actually clears the lock.
+ *
+ * Exponential backoff with jitter so several writers that collide don't line up
+ * and retry in lockstep. Best-effort by contract: these are replaceable
+ * snapshots, so a persistent lock warns and moves on rather than throwing into
+ * a realtime handler.
+ */
+const _runCacheWrite = async (label, task, { attempts = 6, bypassSeal = false } = {}) => {
+  let lastErr = null;
   for (let i = 1; i <= attempts; i++) {
     try {
-      const db = await getDB();
-      if (!db) return;
-      if (typeof db.withExclusiveTransactionAsync === 'function') {
-        await db.withExclusiveTransactionAsync(async (tx) => { await task(tx); });
-      } else if (typeof db.withTransactionAsync === 'function') {
-        await db.withTransactionAsync(async () => { await task(db); });
-      } else {
-        await task(db);
-      }
+      // `bypassSeal` must survive the unwrap: the full wipe is the one write
+      // allowed through a sealed session (account switch / deletion).
+      await runExclusiveBatch(() => _runCacheWriteOnce(task), { bypassSeal });
       return;
     } catch (e) {
-      const m = String(e?.message || '').toLowerCase();
-      if (m.includes('locked') && i < attempts) {
-        await new Promise((r) => setTimeout(r, 60 * i));
-        continue;
-      }
-      console.warn(`[ChatDB] ${label} failed:`, e?.message);
-      return;
+      lastErr = e;
+      if (!_isBusyError(e) || i === attempts) break;
+      // 40, 80, 160, 320, 640ms (+0-40ms jitter) ≈ 1.3s of real waiting, all of
+      // it with the mutex RELEASED.
+      const backoff = 40 * (2 ** (i - 1)) + Math.floor(Math.random() * 40);
+      await new Promise((r) => setTimeout(r, backoff));
     }
   }
+  console.warn(`[ChatDB] ${label} failed:`, lastErr?.message);
 };
 
 const upsertMessages = async (messages) => {
@@ -1339,6 +1399,12 @@ const _runInsert = async (db, msg, _retried = false) => {
     ...(msg.forwardedFrom ? { forwardedFrom: msg.forwardedFrom, _forwardedFrom: msg.forwardedFrom } : {}),
     // Preserve scheduled message data in payload
     ...(msg.isScheduled ? { isScheduled: true, scheduleTime: msg.scheduleTime, scheduleTimeLabel: msg.scheduleTimeLabel } : {}),
+    // Group system messages ("X added Y") carry a structured event so each
+    // viewer can render the NAMES from their own address book. The payload is
+    // an explicit allowlist, so without this line the event is dropped on the
+    // SQLite round-trip and a reload silently falls back to the server's
+    // frozen, account-name text.
+    ...(msg.systemEvent && typeof msg.systemEvent === 'object' ? { systemEvent: msg.systemEvent } : {}),
     // Carry forward existing reply data from old payload
     ...(existingReplyInPayload ? {
       _replyToMessageId: existingReplyInPayload._replyToMessageId,
@@ -2356,8 +2422,10 @@ const deduplicateChat = async (chatId) => {
   // Serialize the 4 maintenance DELETEs through the global write mutex + a
   // transaction so they neither interleave with a concurrent send/sync batch
   // (→ "database is locked") nor leave the chat half-deduped if interrupted.
-  return runExclusiveBatch(() =>
-    _runCacheWrite('deduplicateChat', async (db) => {
+  // NOTE: no outer runExclusiveBatch here — _runCacheWrite acquires the write
+  // mutex itself, once PER ATTEMPT, so it can release it between busy-retries.
+  // Wrapping it again would re-enter the same promise chain and deadlock.
+  return _runCacheWrite('deduplicateChat', async (db) => {
       // 1. Remove exact primary key duplicates (shouldn't happen but safety net)
       await db.runAsync(`DELETE FROM messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM messages WHERE chat_id = $c GROUP BY id) AND chat_id = $c`, { $c: chatId });
       // 2. Remove temp rows that have a server-confirmed version (by temp_id link)
@@ -2410,8 +2478,7 @@ const deduplicateChat = async (chatId) => {
             GROUP BY sender_id, CAST(timestamp / 15000 AS INTEGER)
           )
       `, { $c: chatId });
-    }),
-  );
+  });
 };
 
 const bulkUpdateStatus = async (chatId, newStatus, opts = {}) => {
@@ -2451,6 +2518,8 @@ const closeDB = async () => {
 // chained writer — the recurring "database is locked" on finalizeAsync during
 // reconnect storms (writes queued behind the flood met the checkpoint head-on).
 const closeCleanly = async () => {
+  // Bypasses the write seal: this is a checkpoint + close, not account data,
+  // and it is exactly what a logout needs to run while writes are sealed.
   await runExclusive(async () => {
     _dbInitPromise = null;
     // Close the reader first so the checkpoint/truncate on the primary isn't held
@@ -2460,7 +2529,7 @@ const closeCleanly = async () => {
     try { await _db.execAsync('PRAGMA wal_checkpoint(TRUNCATE);'); } catch {}
     await _drainThenClose(_db);
     _db = null;
-  }).catch(() => {});
+  }, { bypassSeal: true }).catch(() => {});
 };
 
 // ─── CHATLIST (chats table) ──────────────────────────────
@@ -2509,6 +2578,9 @@ const _chatToRow = (chat) => {
     $lmId: lm.serverMessageId || lm.messageId || lm.id || null,
     $lmEdited: lm.isEdited ? 1 : 0,
     $lmDeleted: lm.isDeleted ? 1 : 0,
+    // Group notice event, JSON — null for a normal message so it clears any
+    // notice the row was previously showing.
+    $lmSystemEvent: lm.systemEvent ? JSON.stringify(lm.systemEvent) : null,
     // 1 = the incoming chat object carries NO meaningful lastMessage (no
     // text, no id, no timestamp — e.g. a name-only hydrate row or a server
     // summary that hasn't caught up). The upsert then PRESERVES the stored
@@ -2563,6 +2635,9 @@ const _rowToChat = (row) => {
       messageId: row.last_message_id || null,
       isEdited: Boolean(row.last_message_is_edited),
       isDeleted: Boolean(row.last_message_is_deleted),
+      // Group notice ("X added Y") — buildLastMessageDisplay renders the names
+      // from this so the cold-start list matches the thread.
+      systemEvent: parseJSON(row.last_message_system_event) || null,
     },
     lastMessageAt: row.last_message_at || null,
     unreadCount: Number(row.unread_count || 0),
@@ -2582,7 +2657,7 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
   chat_name, chat_avatar,
   last_message_text, last_message_type, last_message_sender_id, last_message_sender_name,
   last_message_status, last_message_at, last_message_id,
-  last_message_is_edited, last_message_is_deleted,
+  last_message_is_edited, last_message_is_deleted, last_message_system_event,
   unread_count, is_pinned, pinned_at, is_muted, mute_until, is_archived,
   members, member_count, created_at, updated_at, raw_data
 ) VALUES (
@@ -2590,7 +2665,7 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
   $chatName, $chatAvatar,
   $lmText, $lmType, $lmSenderId, $lmSenderName,
   $lmStatus, $lmAt, $lmId,
-  $lmEdited, $lmDeleted,
+  $lmEdited, $lmDeleted, $lmSystemEvent,
   $unread, $pinned, $pinnedAt, $muted, $muteUntil, $archived,
   $members, $memberCount, $createdAt, $updatedAt, $rawData
 ) ON CONFLICT(chat_id) DO UPDATE SET
@@ -2609,6 +2684,7 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
   last_message_id = CASE WHEN $lmKeep = 1 THEN last_message_id ELSE $lmId END,
   last_message_is_edited = CASE WHEN $lmKeep = 1 THEN last_message_is_edited ELSE $lmEdited END,
   last_message_is_deleted = CASE WHEN $lmKeep = 1 THEN last_message_is_deleted ELSE $lmDeleted END,
+  last_message_system_event = CASE WHEN $lmKeep = 1 THEN last_message_system_event ELSE $lmSystemEvent END,
   unread_count = $unread, is_pinned = $pinned, pinned_at = $pinnedAt,
   is_muted = $muted, mute_until = $muteUntil, is_archived = $archived,
   members = COALESCE($members, members),
@@ -2791,6 +2867,7 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
       last_message_sender_id = $senderId, last_message_sender_name = $senderName,
       last_message_status = $status, last_message_at = $at, last_message_id = $id,
       last_message_is_edited = $edited, last_message_is_deleted = $deleted,
+      last_message_system_event = $systemEvent,
       updated_at = $now
     WHERE chat_id = $chatId`,
     {
@@ -2804,6 +2881,10 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
       $id: incomingMsgId,
       $edited: lm.isEdited ? 1 : 0,
       $deleted: lm.isDeleted ? 1 : 0,
+      // Written on EVERY last-message update (null included): a normal message
+      // following a group notice must clear the notice's event, or the row would
+      // keep rendering the old sentence over the new message's text.
+      $systemEvent: lm.systemEvent ? JSON.stringify(lm.systemEvent) : null,
       $now: now,
     }
   );
@@ -2962,6 +3043,81 @@ const updatePeerVerified = async (userId, isVerified) => {
       await db.runAsync(
         `UPDATE chats SET peer_user = $peer, raw_data = $raw, updated_at = $n WHERE chat_id = $id`,
         { $peer: JSON.stringify(peer), $raw: JSON.stringify(raw), $n: Date.now(), $id: row.chat_id }
+      );
+    }
+  });
+};
+
+/**
+ * Persist a peer's realtime profile patch into the cached 1:1 chat rows.
+ *
+ * `PATCH_PEER_PROFILE` alone only touches React state, so a `contact:updated`
+ * that arrived while the app was running was lost on the next cold start — the
+ * chat list read SQLite and got the PREVIOUS values back. That is what kept
+ * showing "@handle" after the peer had already switched their privacy toggle
+ * back OFF: the handle had been written into the cached row while it was ON,
+ * and nothing ever rewrote it.
+ *
+ * Only keys explicitly present in `patch` are written, so a partial event never
+ * blanks a field it said nothing about. `mobileNumber: ''` IS a meaningful
+ * value (the peer hid it) and is written as such.
+ */
+const updatePeerProfile = async (userId, patch = {}) => {
+  const uid = userId != null ? String(userId) : '';
+  if (!uid) return;
+  const has = (k) => Object.prototype.hasOwnProperty.call(patch, k) && patch[k] !== undefined;
+  if (!has('fullName') && !has('userName') && !has('hideContact')
+      && !has('mobileNumber') && !has('profileImage') && !has('about')) return;
+
+  await runExclusive(async () => {
+    const db = await getDB();
+    const rows = await db.getAllAsync(
+      `SELECT chat_id, peer_user, raw_data, chat_name, chat_avatar FROM chats WHERE is_group = 0`
+    );
+    for (const row of rows || []) {
+      const peer = parseJSON(row.peer_user);
+      const peerId = peer?._id || peer?.userId || peer?.id;
+      if (!peerId || String(peerId) !== uid) continue;
+
+      const raw = parseJSON(row.raw_data) || {};
+      if (has('fullName'))     peer.fullName = patch.fullName;
+      if (has('userName'))     peer.userName = patch.userName;
+      if (has('hideContact'))  peer.hideContact = !!patch.hideContact;
+      if (has('profileImage')) peer.profileImage = patch.profileImage;
+      if (has('about'))        peer.about = patch.about;
+      if (has('mobileNumber')) {
+        peer.mobileNumber = patch.mobileNumber;
+        // The structured number must go too — a resolver reading `mobile`
+        // would otherwise keep rendering a number the peer just hid.
+        peer.mobile = patch.mobileNumber ? peer.mobile : null;
+      }
+
+      if (raw.peerUser)  raw.peerUser  = { ...raw.peerUser, ...peer };
+      if (raw.otherUser) raw.otherUser = { ...raw.otherUser, ...peer };
+      if (has('mobileNumber')) raw.mobileNumber = patch.mobileNumber;
+
+      // chat_name is the denormalized list label. Refresh it only when we were
+      // actually given a name, and never overwrite a name the user typed for a
+      // group (this query is 1:1-only, so that cannot happen here).
+      const nextName = has('fullName') && patch.fullName ? patch.fullName : null;
+      const nextAvatar = has('profileImage') && patch.profileImage ? patch.profileImage : null;
+
+      await db.runAsync(
+        `UPDATE chats SET
+           peer_user = $peer,
+           raw_data = $raw,
+           chat_name = COALESCE($name, chat_name),
+           chat_avatar = COALESCE($avatar, chat_avatar),
+           updated_at = $n
+         WHERE chat_id = $id`,
+        {
+          $peer: JSON.stringify(peer),
+          $raw: JSON.stringify(raw),
+          $name: nextName,
+          $avatar: nextAvatar,
+          $n: Date.now(),
+          $id: row.chat_id,
+        }
       );
     }
   });
@@ -3142,24 +3298,57 @@ const getDBOwner = async () => {
 
 const setDBOwner = async (userId) => {
   if (!userId) return;
+  // Stamping the owner is what re-opens the cache for business: the DB now
+  // belongs to this user, so their writes are allowed again.
+  unsealWrites();
   try { await setSyncMeta(DB_OWNER_KEY, String(userId)); } catch {}
+};
+
+/**
+ * Guarantee the on-device cache belongs to `userId` before anything reads it.
+ *
+ * The session-reset path already wipes on a different-user login, but this is
+ * the backstop for every way that path can be missed (a crash mid-switch, a
+ * login flow that forgets `nextUserId`, an install predating the owner tag).
+ * Any read that renders account data should await it first: a mismatch wipes
+ * the cache instead of showing the previous account's chats.
+ *
+ * @returns {Promise<boolean>} true when the cache was wiped.
+ */
+const ensureDBOwnedBy = async (userId) => {
+  const uid = userId ? String(userId) : '';
+  if (!uid) return false;
+  let owner = null;
+  try { owner = await getDBOwner(); } catch { return false; }
+  if (owner && owner === uid) { unsealWrites(); return false; }
+  if (owner && owner !== uid) {
+    try { await clearSyncData(); } catch {}
+    await setDBOwner(uid);
+    return true;
+  }
+  // No tag at all (fresh install / pre-tag install): adopt the cache for this
+  // user rather than throwing away data that is almost certainly theirs.
+  await setDBOwner(uid);
+  return false;
 };
 
 const clearSyncData = async () => {
   // Full wipe — run as one exclusive, atomic transaction on the batch path so it
   // neither interleaves with a concurrent send/sync batch nor leaves the cache
   // half-cleared if interrupted.
-  return runExclusiveBatch(() =>
-    _runCacheWrite('clearSyncData', async (db) => {
-      await db.runAsync(`DELETE FROM chats`);
-      await db.runAsync(`DELETE FROM messages`);
-      await db.runAsync(`DELETE FROM message_status`);
-      await db.runAsync(`DELETE FROM reactions`);
-      await db.runAsync(`DELETE FROM chat_meta`);
-      await db.runAsync(`DELETE FROM message_replies`);
-      await db.runAsync(`DELETE FROM sync_meta`);
-    }),
-  ).finally(async () => {
+  // NOTE: no outer runExclusiveBatch here — _runCacheWrite acquires the write
+  // mutex itself, once PER ATTEMPT, so it can release it between busy-retries.
+  // Wrapping it again would re-enter the same promise chain and deadlock.
+  return _runCacheWrite('clearSyncData', async (db) => {
+    await db.runAsync(`DELETE FROM chats`);
+    await db.runAsync(`DELETE FROM messages`);
+    await db.runAsync(`DELETE FROM message_status`);
+    await db.runAsync(`DELETE FROM reactions`);
+    await db.runAsync(`DELETE FROM chat_meta`);
+    await db.runAsync(`DELETE FROM message_replies`);
+    await db.runAsync(`DELETE FROM sync_meta`);
+    // The wipe itself is the one write allowed through the seal.
+  }, { bypassSeal: true }).finally(async () => {
     // Drop the delete-for-me registry too — it is per-user and must not leak
     // across a different-user login / account deletion (the full-wipe callers).
     _deletedForMeSet = null;
@@ -3171,9 +3360,10 @@ const clearSyncData = async () => {
 // ── Broadcast status cache (official application updates) ─────────────────────
 
 /** Replace the cached broadcast set with the latest live list. */
-const saveBroadcasts = async (broadcasts = []) => runExclusiveBatch(() =>
-  // Snapshot is small (<=50) and fully authoritative — clear then insert as one
-  // exclusive, atomic transaction (`h` is the transaction handle).
+// Snapshot is small (<=50) and fully authoritative — clear then insert as one
+// exclusive, atomic transaction (`h` is the transaction handle).
+// No outer runExclusiveBatch: _runCacheWrite takes the mutex per attempt.
+const saveBroadcasts = async (broadcasts = []) =>
   _runCacheWrite('saveBroadcasts', async (h) => {
     const now = Date.now();
     await h.runAsync('DELETE FROM broadcasts;');
@@ -3190,8 +3380,7 @@ const saveBroadcasts = async (broadcasts = []) => runExclusiveBatch(() =>
         ],
       );
     }
-  }),
-);
+  });
 
 /** Load cached, non-expired broadcasts (newest first) for offline cold-render. */
 const loadBroadcasts = async () => {
@@ -3227,10 +3416,11 @@ const removeBroadcast = async (statusId) => {
 // authoritative snapshot replaces the cache on every successful fetch.
 
 /** Replace the cached contact status feed with the latest grouped list. */
-const saveStatusFeed = async (groups = []) => runExclusiveBatch(() =>
-  // Authoritative snapshot — clear + insert as one exclusive, atomic
-  // transaction so concurrent receipt / message writes can't interleave and
-  // lock it (`h` is the transaction handle).
+// Authoritative snapshot — clear + insert as one exclusive, atomic transaction
+// so concurrent receipt / message writes can't interleave and lock it
+// (`h` is the transaction handle).
+// No outer runExclusiveBatch: _runCacheWrite takes the mutex per attempt.
+const saveStatusFeed = async (groups = []) =>
   _runCacheWrite('saveStatusFeed', async (h) => {
     const now = Date.now();
     await h.runAsync('DELETE FROM status_feed;');
@@ -3248,8 +3438,48 @@ const saveStatusFeed = async (groups = []) => runExclusiveBatch(() =>
         ],
       );
     }
-  }),
-);
+  });
+
+/**
+ * Patch one owner's row in the cached status feed after a `contact:updated`.
+ *
+ * The feed is a server-rendered snapshot: the label ("@handle" or the number)
+ * is baked into `data` at fetch time. The server drops its own 60s feed cache
+ * when a peer toggles privacy, so the NEXT fetch is correct — this keeps the
+ * COLD render correct in the meantime, which is what the status list shows
+ * before the network call returns.
+ */
+const updateStatusFeedIdentity = async (userId, patch = {}) => {
+  const uid = userId != null ? String(userId) : '';
+  if (!uid) return;
+  await _runCacheWrite('updateStatusFeedIdentity', async (h) => {
+    const row = await h.getFirstAsync('SELECT data FROM status_feed WHERE user_id = ? LIMIT 1;', [uid]);
+    if (!row) return;
+    let g = null;
+    try { g = JSON.parse(row.data); } catch { return; }
+    if (!g) return;
+
+    const hides = Boolean(patch.hideContact);
+    const handle = patch.userName ? `@${patch.userName}` : null;
+    g.userName = patch.userName ?? g.userName ?? null;
+    g.hideContact = hides;
+    if (hides) {
+      // Mirror the server's own feed shape: label becomes the handle and the
+      // number is withheld entirely rather than left in the cache.
+      g.name = handle || g.name;
+      g.phone = null;
+      g.mobile = null;
+      g.isSavedContact = false;
+    } else {
+      if (patch.fullName) g.name = patch.fullName;
+      if (patch.mobileNumber) g.phone = patch.mobileNumber;
+    }
+    if (patch.profileImage) g.avatar = patch.profileImage;
+
+    await h.runAsync('UPDATE status_feed SET data = ?, updated_at = ? WHERE user_id = ?;',
+      [JSON.stringify(g), Date.now(), uid]);
+  });
+};
 
 /** Load the cached contact status feed (unseen-first, newest-first) for cold render. */
 const loadStatusFeed = async () => {
@@ -3270,18 +3500,19 @@ const saveBlockedContacts = async (contacts = []) => {
   // Authoritative snapshot — clear + insert as one exclusive, atomic transaction
   // so concurrent receipt / message writes can't interleave and lock it
   // (`h` is the transaction handle).
-  return runExclusiveBatch(() =>
-    _runCacheWrite('saveBlockedContacts', async (h) => {
-      await h.runAsync('DELETE FROM blocked_contacts;');
-      for (const c of contacts) {
-        const blockedAt = c.blockedAt ? new Date(c.blockedAt).getTime() : Date.now();
-        await h.runAsync(
-          'INSERT OR REPLACE INTO blocked_contacts (user_id, full_name, phone, profile_image, blocked_at) VALUES (?, ?, ?, ?, ?);',
-          [String(c.userId), c.fullName || null, c.phone || null, c.profileImage || null, blockedAt],
-        );
-      }
-    }),
-  );
+  // NOTE: no outer runExclusiveBatch here — _runCacheWrite acquires the write
+  // mutex itself, once PER ATTEMPT, so it can release it between busy-retries.
+  // Wrapping it again would re-enter the same promise chain and deadlock.
+  return _runCacheWrite('saveBlockedContacts', async (h) => {
+    await h.runAsync('DELETE FROM blocked_contacts;');
+    for (const c of contacts) {
+      const blockedAt = c.blockedAt ? new Date(c.blockedAt).getTime() : Date.now();
+      await h.runAsync(
+        'INSERT OR REPLACE INTO blocked_contacts (user_id, full_name, phone, profile_image, blocked_at) VALUES (?, ?, ?, ?, ?);',
+        [String(c.userId), c.fullName || null, c.phone || null, c.profileImage || null, blockedAt],
+      );
+    }
+  });
 };
 
 const loadBlockedContacts = async () => {
@@ -3372,9 +3603,10 @@ export default {
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById, getPeerIdentity,
   updateChatLastMessage, updateChatLastMessageStatusById, markChatLastMessageDeleted, updateChatUnread, incrementChatUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
-  updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, updatePeerVerified, deleteChatRow, getChatCount,
+  updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, updatePeerVerified, updatePeerProfile, updateStatusFeedIdentity, deleteChatRow, getChatCount,
   // Sync meta
-  getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner,
+  getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner, ensureDBOwnedBy,
+  sealWrites, unsealWrites, areWritesSealed,
   // Outbox + watermarks (V8)
   outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
   setPeerReadWatermark, getPeerReadWatermark,

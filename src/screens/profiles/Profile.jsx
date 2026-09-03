@@ -15,6 +15,7 @@ import { BACKEND_URL } from '@env';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
+import CopyFieldButton from '../../components/CopyFieldButton';
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -211,6 +212,9 @@ export default function Profile({ navigation }) {
           valueColor={displayPhone ? primaryText : themeColor}
           sub={subText}
           iconColor={themeColor}
+          // Copy the dial-able E.164-ish form, not the spaced display string.
+          copyValue={phoneNumber ? `${phoneCode || ''}${phoneNumber}` : ''}
+          copyLabel="Number"
           onPress={
             phoneNumber
               ? undefined
@@ -221,14 +225,14 @@ export default function Profile({ navigation }) {
         {userEmail ? (
           <>
             <View style={[styles.divider, { backgroundColor: divider }]} />
-            <ProfileRow icon="mail-outline" label="Email" value={userEmail} valueColor={primaryText} sub={subText} iconColor={themeColor} />
+            <ProfileRow icon="mail-outline" label="Email" value={userEmail} valueColor={primaryText} sub={subText} iconColor={themeColor} copyValue={userEmail} />
           </>
         ) : null}
 
         {userName ? (
           <>
             <View style={[styles.divider, { backgroundColor: divider }]} />
-            <ProfileRow icon="at-outline" label="Username" value={`@${userName}`} valueColor={primaryText} sub={subText} iconColor={themeColor} />
+            <ProfileRow icon="at-outline" label="Username" value={`@${userName}`} valueColor={primaryText} sub={subText} iconColor={themeColor} copyValue={userName} />
           </>
         ) : null}
       </ScrollView>
@@ -236,7 +240,7 @@ export default function Profile({ navigation }) {
   );
 }
 
-function ProfileRow({ icon, label, value, valueColor, sub, iconColor, onPress, editable, multiline }) {
+function ProfileRow({ icon, label, value, valueColor, sub, iconColor, onPress, editable, multiline, copyValue, copyLabel }) {
   const Wrapper = onPress ? TouchableOpacity : View;
   return (
     <Wrapper style={styles.row} onPress={onPress} activeOpacity={0.6}>
@@ -247,6 +251,7 @@ function ProfileRow({ icon, label, value, valueColor, sub, iconColor, onPress, e
         </Text>
         <Text style={[styles.rowLabel, { color: sub }]}>{label}</Text>
       </View>
+      {copyValue ? <CopyFieldButton value={copyValue} label={copyLabel || label} /> : null}
       {editable && onPress ? <Ionicons name="pencil" size={18} color={iconColor} /> : null}
     </Wrapper>
   );

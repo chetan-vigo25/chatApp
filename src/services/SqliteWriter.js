@@ -113,7 +113,25 @@ export const awaitDrain = () => {
   return _drainPromise;
 };
 
+/**
+ * Discard every queued write.
+ *
+ * Called on an account switch: the jobs still sitting here belong to the user
+ * who just signed out, and draining them AFTER the cache wipe is what put the
+ * previous account's chats back on screen for the next user. Pending callers
+ * resolve with undefined rather than reject — a dropped write on a cache that
+ * is being destroyed is not an error.
+ */
+export const dropPending = () => {
+  const dropped = _queue.length;
+  while (_queue.length > 0) {
+    const job = _queue.shift();
+    try { job.resolve(undefined); } catch {}
+  }
+  return dropped;
+};
+
 /** Diagnostics for dev logs. */
 export const stats = () => ({ depth: _queue.length, draining: _draining });
 
-export default { enqueue, awaitDrain, stats };
+export default { enqueue, awaitDrain, dropPending, stats };

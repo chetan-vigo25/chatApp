@@ -25,6 +25,7 @@ const ReplyBubble = React.memo(function ReplyBubble({
   onPress,
   chatColor,
   theme,
+  isDarkMode = false,
 }) {
   if (!replyToMessageId) return null;
 
@@ -57,7 +58,11 @@ const ReplyBubble = React.memo(function ReplyBubble({
         {
           backgroundColor: isMyMessage
             ? 'rgba(0,0,0,0.15)'
-            : (theme.colors.isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)'),
+            // `theme.colors.isDark` never existed — ThemeContext exposes
+            // `isDarkMode` on the provider, not inside `colors` — so this
+            // ALWAYS took the light branch and painted a dark wash on a dark
+            // bubble: the reply card was practically invisible in dark mode.
+            : (isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)'),
         },
       ]}
     >

@@ -1,9 +1,11 @@
 import React, { memo, useRef } from 'react';
+import { useSelector } from 'react-redux';
 import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react-native';
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import SegmentedRing from './SegmentedRing';
 import { useTranslatedText, needsSystemFont } from './Translate';
 import useDisplayName from '../hooks/useDisplayName';
+import { isSelfChat, selfChatLabel, selfIdentityOf } from '../utils/selfChat';
 
 const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
 const RING_SIZE   = 53; // outer ring diameter — leaves a small gap around the avatar
@@ -34,6 +36,10 @@ const ChatCard = ({
   // Canonical name resolution — the row re-renders by itself when the address
   // book changes (contact synced / saved / deleted).
   const { resolveName } = useDisplayName();
+  // Only the self-chat row reads this — my own handle/privacy toggle, which no
+  // chat row carries. Selecting the slice object keeps the subscription cheap
+  // (stable reference until the profile itself changes).
+  const myProfile = useSelector((state) => state.profile?.profileData);
 
   const animateTo = (value) => {
     Animated.spring(scale, {
@@ -71,6 +77,10 @@ const ChatCard = ({
     : getLastMessageText(item);
   const isBroadcast = Boolean(item?.chatType === 'broadcast' || item?.isBroadcast);
   const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
+  // Self chat ("Message yourself"): rendered as "<my number> (You)" so it is
+  // never confused with a contact row. Detected from the chatId shape, so a
+  // half-hydrated row (no peerUser yet) still labels correctly.
+  const isSelf = isSelfChat(item);
   // Verified badge: broadcast channels + admin-verified peer users. `isVerified`
   // rides at the top level (REST getChatList / realtime buildChatListItem); we
   // also fall back to peerUser.isVerified in case a normalization path kept it
@@ -92,12 +102,23 @@ const ChatCard = ({
   // name — so it must never win over the number for someone I never saved.
   const peerName = isBroadcast
     ? (item?.chatName || item?.broadcastChannel?.name || 'Channel')
+    : isSelf
+    ? selfChatLabel({
+        mobileNumber: peerMobile,
+        name: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
+        // My OWN privacy toggle — read live off the profile slice, not off the
+        // row (the server ships no `hideContact` on a self-chat peerUser).
+        ...selfIdentityOf(myProfile),
+      })
     : isGroup
       ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
       : resolveName({
           userId: item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId,
           phone: peerMobile,
           pushName: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
+          // Contact privacy — chat-list row is surface #1.
+          username: item?.peerUser?.userName || null,
+          hideContact: Boolean(item?.peerUser?.hideContact ?? item?.hideContact),
           fallback: 'Unknown',
         });
   // Broadcast channels render their logo just like a group avatar.
@@ -171,7 +192,7 @@ const ChatCard = ({
                 </View>
               )}
               {/* Online indicator (not for groups / channels) */}
-              {!isGroup && !isBroadcast && item?.peerUser?.isOnline && (
+              {!isGroup && !isBroadcast && !isSelf && item?.peerUser?.isOnline && (
                 <View style={[styles.onlineDot, { borderColor: theme.colors.background }]} />
               )}
             </View>

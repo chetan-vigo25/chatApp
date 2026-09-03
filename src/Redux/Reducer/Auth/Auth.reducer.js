@@ -4,13 +4,24 @@ import { authServices } from '../../Services/Auth/Auth.Services';
 // Async thunk for OTP generation
 export const generateOtpAction = createAsyncThunk(
   'auth/generateOtp',
-  async (mobile, { rejectWithValue }) => {
+  // `payload` is { mobileCode, number } — the country code and national number
+  // kept separate so the server can identify the exact account / VIP number.
+  async (payload, { rejectWithValue }) => {
     try {
-      const response = await authServices.generateOtp(mobile);
+      const response = await authServices.generateOtp(payload);
       // console.log("msg test", response)
       return { otpMessage: response.otpMessage, otpData: response.otpData };
     } catch (error) {
-      return rejectWithValue(error.message || "OTP generation failed");
+      // A non-200 from the server rejects with the message STRING (and the
+      // service has already toasted it) — a network failure rejects with an
+      // Error. Keep them distinguishable so the screen can show the server's
+      // explanation (e.g. a reserved VIP number / wrong country code) exactly
+      // once instead of a generic retry prompt.
+      const fromServer = typeof error === 'string';
+      return rejectWithValue({
+        message: fromServer ? error : error?.message || 'OTP generation failed',
+        alreadyNotified: fromServer,
+      });
     }
   }
 );
@@ -31,9 +42,10 @@ export const otpVerify = createAsyncThunk(
 
 export const resendOtp = createAsyncThunk(
   'auth/resendOtpService',
-  async ( { fullPhoneNumber }, { rejectWithValue }) => {
+  async (payload, { rejectWithValue }) => {
     try {
-      const response = await authServices.resendOtpService(fullPhoneNumber);
+      // Same { mobileCode, number } pair as generateOtp.
+      const response = await authServices.resendOtpService(payload);
       // console.log("resend otp responce",response)
       return response; // { otpMessage, otpData } — otpData carries the new OTP
     } catch (error) {
@@ -115,7 +127,7 @@ const authSlice = createSlice({
       })
       .addCase(generateOtpAction.rejected, (state, action) => {
         state.isLoading = false;
-        state.error = action.payload; // Store error message
+        state.error = action.payload?.message || action.payload; // Store error message
       })
 
       .addCase(otpVerify.pending, (state) => {
@@ -130,7 +142,7 @@ const authSlice = createSlice({
       })
       .addCase(otpVerify.rejected, (state, action) => {
         state.isLoading = false;
-        state.error = action.payload; // Store error message
+        state.error = action.payload?.message || action.payload; // Store error message
       })
 
       .addCase(linkedDevice.pending, (state) => {
@@ -147,7 +159,7 @@ const authSlice = createSlice({
       
       .addCase(linkedDevice.rejected, (state, action) => {
         state.isLoading = false;
-        state.error = action.payload; // Store error message
+        state.error = action.payload?.message || action.payload; // Store error message
       })
 
       .addCase(emailLogin.pending, (state) => {
@@ -175,7 +187,7 @@ const authSlice = createSlice({
       })
       .addCase(resendOtp.rejected, (state, action) => {
         state.isLoading = false;
-        state.error = action.payload; // Store error message
+        state.error = action.payload?.message || action.payload; // Store error message
       });
 
 

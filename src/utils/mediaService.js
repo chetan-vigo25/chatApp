@@ -265,8 +265,43 @@ const generateFilename = (originalUri, prefix = 'file', customExt = null) => {
   return `${prefix}_${timestamp}_${random}.${ext}`;
 };
 
+// Destinations already claimed by an IN-FLIGHT copy in this session. An album
+// copies its files CONCURRENTLY, so an "does this path exist?" check alone
+// races: two workers both see "free" and copy to the same path.
+const claimedCopyDestinations = new Set();
+
+// Pick a destination that no existing file and no concurrent copy owns.
+//
+// Album bug (Sep-2026): the destination was `${destDir}${suggestedName}` with
+// no uniqueness at all. Two picked photos that share a filename (the picker
+// hands out generic names like `image.jpg`, and the compressor's fallback name
+// is timestamp-based — identical for files prepared in the same millisecond)
+// landed on ONE path, so the second copy overwrote the first and BOTH album
+// items uploaded the same bytes → one photo shown for every tile. The original
+// name is still used whenever it is free, so shares/saves keep it.
+const reserveCopyDestination = async (destDir, filename) => {
+  const dot = filename.lastIndexOf('.');
+  const base = dot > 0 ? filename.slice(0, dot) : filename;
+  const ext = dot > 0 ? filename.slice(dot) : '';
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const candidate = attempt === 0
+      ? `${destDir}${filename}`
+      : `${destDir}${base}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}${attempt}${ext}`;
+    if (claimedCopyDestinations.has(candidate)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    const info = await FileSystem.getInfoAsync(candidate).catch(() => null);
+    if (info?.exists) continue;
+    claimedCopyDestinations.add(candidate);
+    return candidate;
+  }
+  const fallback = `${destDir}${base}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+  claimedCopyDestinations.add(fallback);
+  return fallback;
+};
+
 // Copy file to app folder
 export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = SENT_DIR, onProgress = null) => {
+  let claimedDestination = null;
   try {
     if (!inputUri) return null;
 
@@ -307,7 +342,8 @@ export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = 
       ? suggestedName.endsWith(ext) ? suggestedName : `${suggestedName}.${ext}`
       : generateFilename(normalizedUri, 'sent');
 
-    const destination = `${destDir}${filename}`;
+    const destination = await reserveCopyDestination(destDir, filename);
+    claimedDestination = destination;
 
     console.log('📋 Copying file:', {
       from: normalizedUri.substring(0, 50) + '...',
@@ -367,6 +403,10 @@ export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = 
   } catch (err) {
     console.warn('copyToAppFolder error:', err);
     return inputUri; // Return original as fallback
+  } finally {
+    // The written file itself now guards the path (the existence check above
+    // sees it) — the in-flight claim only had to survive the copy.
+    if (claimedDestination) claimedCopyDestinations.delete(claimedDestination);
   }
 };
 
@@ -449,6 +489,57 @@ export const downloadRemoteToReceived = async (remoteUrl, filename, onProgress =
   }
 };
 
+/**
+ * Save a downloaded file into the app's gallery album — WITHOUT the Android
+ * "Allow <app> to modify this photo?" system dialog.
+ *
+ * Where that dialog came from: the old flow created the asset first (landing it
+ * in DCIM/Pictures) and then MOVED it into the album with
+ * `addAssetsToAlbumAsync(..., copy=false)` / `createAlbumAsync(..., copy=false)`.
+ * On Android 11+ expo-media-library asks for a MediaStore write-request for any
+ * move, so every single media download popped a consent dialog.
+ *
+ * The fix is to never move an existing asset:
+ *   • album exists    → `createAssetAsync(uri, album)` writes the file STRAIGHT
+ *                       into the album (no existing asset is modified).
+ *   • album missing   → `createAlbumAsync(name, null, false, uri)` creates it
+ *                       from the FILE URI, so there is no asset id to ask about.
+ * Both paths skip `requestMediaLibraryActionPermission` in the native module —
+ * and, unlike passing `copy = true`, they leave no duplicate behind.
+ */
+export const saveAssetToAlbum = async (localUri, albumName = APP_FOLDER) => {
+  const normalized = normalizeUri(localUri);
+  if (!normalized) return null;
+
+  let album = null;
+  try { album = await MediaLibrary.getAlbumAsync(albumName); } catch (_) { album = null; }
+
+  if (album) {
+    return await MediaLibrary.createAssetAsync(normalized, album);
+  }
+
+  try {
+    // `asset` is deliberately null: passing one would make the native module
+    // treat this as a MOVE of that asset and raise the write-request dialog.
+    await MediaLibrary.createAlbumAsync(albumName, null, false, normalized);
+    const created = await MediaLibrary.getAlbumAsync(albumName).catch(() => null);
+    if (created) {
+      const page = await MediaLibrary.getAssetsAsync({
+        album: created, first: 1, sortBy: [MediaLibrary.SortBy.creationTime],
+      }).catch(() => null);
+      if (page?.assets?.length) return page.assets[0];
+    }
+    // Album made, asset lookup failed — the file IS saved; the caller only
+    // needs a truthy result.
+    return { uri: normalized };
+  } catch (albumErr) {
+    // Older devices / odd OEM MediaStore behaviour: fall back to a plain save
+    // (lands in DCIM instead of the album) rather than losing the file.
+    console.warn('Album save failed, saving without album:', albumErr?.message || albumErr);
+    return await MediaLibrary.createAssetAsync(normalized);
+  }
+};
+
 // Save file to media library
 export const saveFileToMediaLibrary = async (localUri, albumName = APP_FOLDER) => {
   try {
@@ -460,21 +551,7 @@ export const saveFileToMediaLibrary = async (localUri, albumName = APP_FOLDER) =
       return null;
     }
 
-    const normalized = normalizeUri(localUri);
-    const asset = await MediaLibrary.createAssetAsync(normalized);
-    
-    try {
-      const album = await MediaLibrary.getAlbumAsync(albumName);
-      if (album) {
-        await MediaLibrary.addAssetsToAlbumAsync([asset], album, false);
-      } else {
-        await MediaLibrary.createAlbumAsync(albumName, asset, false);
-      }
-    } catch (albumErr) {
-      console.warn('Album creation failed:', albumErr);
-    }
-    
-    return asset;
+    return await saveAssetToAlbum(localUri, albumName);
   } catch (err) {
     console.warn('saveFileToMediaLibrary failed:', err);
     return null;

@@ -22,6 +22,7 @@ import DeviceLinkSuccess from "../screens/ActiveDevice/SuccessScreen";
 import LinkDevice from "../screens/ActiveDevice/LinkDevice";
 import EditProfile from "../screens/profiles/EditProfile";
 import PersonalInfoEdit from "../screens/profiles/PersonalInfoEdit";
+import UsernameEdit from "../screens/profiles/UsernameEdit";
 import UserB from "../screens/profiles/UserB";
 import ChannelInfo from "../screens/chats/ChannelInfo";
 import ChatColorTheme from "../screens/chats/ChatColorTheme";
@@ -138,6 +139,7 @@ export default function RootNavigator() {
           <Stack.Screen name="Term" component={Term} />
           <Stack.Screen name="EditProfile" component={EditProfile} />
           <Stack.Screen name="PersonalInfoEdit" component={PersonalInfoEdit} />
+          <Stack.Screen name="UsernameEdit" component={UsernameEdit} />
           <Stack.Screen name="UserB" component={UserB} />
           <Stack.Screen name="ChannelInfo" component={ChannelInfo} />
           <Stack.Screen name="ChatColorTheme" component={ChatColorTheme} />

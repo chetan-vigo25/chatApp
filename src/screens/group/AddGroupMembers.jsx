@@ -7,9 +7,11 @@ import {
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
 import useContactSync from '../../contexts/useContactSync';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatActions } from '../../contexts/RealtimeChatContext';
 import { useDispatch } from 'react-redux';
 import { viewGroup } from '../../Redux/Reducer/Group/Group.reducer';
+import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
+import { MIN_DIRECTORY_QUERY } from '../../Redux/Services/Contact/Directory.Services';
 
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
@@ -30,7 +32,7 @@ function showToast(msg) {
 export default function AddGroupMembers({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
-  const { addGroupMembers } = useRealtimeChat();
+  const { addGroupMembers } = useRealtimeChatActions();
   const { matchedRegistered = [], isSyncing, refreshContacts } = useContactSync();
 
   const groupId = route.params?.groupId;
@@ -50,15 +52,53 @@ export default function AddGroupMembers({ navigation, route }) {
     return matchedRegistered.filter((c) => c?.userId && !existingSet.has(String(c.userId)));
   }, [matchedRegistered, existingMemberIds]);
 
-  const filteredContacts = useMemo(() => {
+  const localContacts = useMemo(() => {
     if (!searchQuery.trim()) return availableContacts;
     const q = searchQuery.toLowerCase();
     return availableContacts.filter((c) => {
       const name = (c?.fullName || c?.name || '').toLowerCase();
       const phone = (c?.mobileFormatted || '').toLowerCase();
-      return name.includes(q) || phone.includes(q);
+      const handle = (c?.userName || c?.username || '').toLowerCase();
+      return name.includes(q) || phone.includes(q) || handle.includes(q);
     });
   }, [availableContacts, searchQuery]);
+
+  // DIRECTORY. Everything above comes from the device phonebook, so a person
+  // whose number was never saved on this phone could not be added to the group
+  // at all. Search the registered-user directory by @username or mobile number
+  // for exactly those people — skipping anyone the local list already offers and
+  // anyone already in the group.
+  const excludeIds = useMemo(() => {
+    const s = new Set(existingMemberIds.map(String));
+    matchedRegistered.forEach((c) => c?.userId && s.add(String(c.userId)));
+    return s;
+  }, [existingMemberIds, matchedRegistered]);
+  const { results: directory, loading: dirLoading, searchable } =
+    useUserDirectorySearch(searchQuery, { excludeIds });
+
+  // A selected directory person stays in the list after the query moves on —
+  // they are already counted in `selectedContacts`, so dropping the row would
+  // leave a phantom in the count with no way to deselect.
+  const filteredContacts = useMemo(() => {
+    const rows = [...localContacts];
+    const seen = new Set(rows.map((c) => String(c.userId)));
+    const pushDir = (u) => {
+      const id = String(u.userId);
+      if (seen.has(id)) return;
+      seen.add(id);
+      rows.push({
+        userId: id,
+        fullName: u.name || u.userName || 'Unknown',
+        userName: u.userName || '',
+        profileImage: u.avatar || '',
+        mobileFormatted: u.mobileNumber || '',
+        fromDirectory: true,
+      });
+    };
+    selectedContacts.filter((c) => c.fromDirectory).forEach(pushDir);
+    directory.forEach(pushDir);
+    return rows;
+  }, [localContacts, directory, selectedContacts]);
 
   const toggleContact = useCallback((contact) => {
     setSelectedContacts((prev) => {
@@ -122,8 +162,16 @@ export default function AddGroupMembers({ navigation, route }) {
         </View>
         <View style={styles.contactInfo}>
           <Text style={[styles.contactName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>{name}</Text>
-          <Text style={[styles.contactSub, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
-            {item?.about || item?.mobileFormatted || ''}
+          <Text
+            style={[
+              styles.contactSub,
+              { color: item?.fromDirectory ? theme.colors.themeColor : theme.colors.placeHolderTextColor },
+            ]}
+            numberOfLines={1}
+          >
+            {item?.fromDirectory
+              ? (item?.mobileFormatted || (item?.userName ? `@${item.userName}` : 'Not in your contacts'))
+              : (item?.about || item?.mobileFormatted || '')}
           </Text>
         </View>
       </TouchableOpacity>
@@ -200,12 +248,20 @@ export default function AddGroupMembers({ navigation, route }) {
         <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
           <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
           <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-            placeholder="Search contacts..."
+            placeholder="Search contacts, @username or number"
             placeholderTextColor={theme.colors.placeHolderTextColor}
+            autoCapitalize="none"
+            autoCorrect={false}
             value={searchQuery}
             onChangeText={setSearchQuery}
             style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
           />
+          {/* Same in-bar "searching" cue as the contact picker: local matches
+              may already be listed, so an in-flight directory lookup would
+              otherwise be invisible. */}
+          {dirLoading && (
+            <ActivityIndicator size="small" color={theme.colors.themeColor} style={{ marginRight: 6 }} />
+          )}
           {searchQuery.length > 0 && (
             <TouchableOpacity onPress={() => setSearchQuery('')} activeOpacity={0.6}>
               <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
@@ -215,10 +271,12 @@ export default function AddGroupMembers({ navigation, route }) {
       </View>
 
       {/* Contact List */}
-      {isSyncing && availableContacts.length === 0 ? (
+      {(isSyncing || dirLoading) && filteredContacts.length === 0 ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={theme.colors.themeColor} />
-          <Text style={[styles.loadingText, { color: theme.colors.placeHolderTextColor }]}>Loading contacts...</Text>
+          <Text style={[styles.loadingText, { color: theme.colors.placeHolderTextColor }]}>
+            {dirLoading ? 'Searching...' : 'Loading contacts...'}
+          </Text>
         </View>
       ) : (
         <FlatList
@@ -236,6 +294,11 @@ export default function AddGroupMembers({ navigation, route }) {
               <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor }]}>
                 {availableContacts.length === 0 ? 'All contacts are already in this group' : 'No contacts found'}
               </Text>
+              {searchQuery.trim().length > 0 && !searchable && (
+                <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor, fontSize: 12, marginTop: 4 }]}>
+                  {`Type at least ${MIN_DIRECTORY_QUERY} characters to search by @username or mobile number`}
+                </Text>
+              )}
             </View>
           }
         />

@@ -31,7 +31,7 @@ export default function IncomingCallBanner() {
     call, accept, reject, expandIncoming,
   } = useCall();
   const insets = useSafeAreaInsets();
-  const { resolveName } = useContactDirectory();
+  const { resolveName, peerPrivacyOf } = useContactDirectory();
   // Theme-aware card: light surface + dark text in light mode, dark surface +
   // white text in dark mode. The red Decline / green Answer stay constant (they
   // read on both), matching WhatsApp.
@@ -75,7 +75,7 @@ export default function IncomingCallBanner() {
   const isGroup = !!call?.isGroup;
   const displayName = isGroup
     ? (call?.groupName || 'Group call')
-    : (resolveName(peer?.id, peer?.name, peer?.mobile || peer?.phone || peer?.mobileNumber) || peer?.name || 'Unknown');
+    : (resolveName(peer?.id, peer?.name, peer?.mobile || peer?.phone || peer?.mobileNumber, peerPrivacyOf(peer)) || peer?.name || 'Unknown');
   const subtitle = isGroup
     ? `Incoming group ${isVideo ? 'video' : 'voice'} call`
     : (isVideo ? 'Incoming video call' : 'Incoming voice call');

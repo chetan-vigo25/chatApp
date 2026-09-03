@@ -1,13 +1,15 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useCallback, useEffect, useState, useRef } from 'react';
+import { useSelector } from 'react-redux';
 import { Animated, Easing, Image, ScrollView, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react-native';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
 import { formatLastSeen } from '../services/lastSeenFormatter.service';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatSlice } from '../../contexts/RealtimeChatContext';
 import ContactDatabase from '../../services/ContactDatabase';
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import useDisplayName from '../../hooks/useDisplayName';
+import { isSelfChatId, selfChatLabel, selfIdentityOf } from '../../utils/selfChat';
 
 // Marquee for one-line header text: static while it fits; when it overflows
 // the available width it auto-scrolls right→left in a seamless loop (second
@@ -92,10 +94,22 @@ export default function ChatHeaderPresence({
   groupName,
   groupAvatar,
   memberCount,
+  // Selection toolbar: when > 0 the header drops the avatar/name/status block
+  // and renders WhatsApp's compact "back + count + actions" bar instead. With
+  // the name column still mounted the action icons had no room and the last
+  // one or two were pushed off the screen edge.
+  selectionCount = 0,
 }) {
   const { theme, isDarkMode } = useTheme();
+  // Self-chat header only — my own handle + contact-privacy toggle.
+  const myProfile = useSelector((state) => state.profile?.profileData);
   const { presence, lastSeenFormatted } = useUserPresence(isGroup ? null : user?._id);
-  const { state } = useRealtimeChat();
+  const realtimePresence = useRealtimeChatSlice(
+    useCallback((s) => ((!isGroup && user?._id) ? s?.presenceByUser?.[user._id] : null), [isGroup, user?._id]),
+  );
+  const realtimeTyping = useRealtimeChatSlice(
+    useCallback((s) => (chatId ? s?.typingStates?.[chatId] : null), [chatId]),
+  );
 
   // `namesVersion` changes whenever the address book changes, so saving the
   // contact while this chat is OPEN flips the header name immediately — no
@@ -116,6 +130,10 @@ export default function ChatHeaderPresence({
   // Live profile-photo override: reflect the peer's photo change in realtime
   // without leaving the chat. Resets when the peer changes.
   const [liveProfileImage, setLiveProfileImage] = useState(null);
+  // Live override for the peer's handle + contact-privacy flag, pushed by
+  // `contact:updated`. Null until the peer actually changes something, so the
+  // chat's own cached peerUser stays authoritative until then.
+  const [livePrivacy, setLivePrivacy] = useState(null);
   useEffect(() => {
     setLiveProfileImage(null);
     if (isGroup || !user?._id) return undefined;
@@ -126,6 +144,14 @@ export default function ChatHeaderPresence({
       if (!updatedId || updatedId !== String(user._id)) return;
       const image = data?.profileImage ?? data?.profilePicture;
       if (image !== undefined) setLiveProfileImage(image);
+      // Contact privacy: the header shows the peer's NUMBER for an unsaved
+      // contact, so it has to re-resolve the moment they hide it.
+      if (data?.userName !== undefined || data?.hideContact !== undefined) {
+        setLivePrivacy({
+          userName: data?.userName ?? null,
+          hideContact: Boolean(data?.hideContact),
+        });
+      }
     };
     const attach = () => {
       const s = getSocket?.();
@@ -141,8 +167,6 @@ export default function ChatHeaderPresence({
     };
   }, [isGroup, user?._id]);
 
-  const realtimePresence = (!isGroup && user?._id) ? state?.presenceByUser?.[user._id] : null;
-  const realtimeTyping = chatId ? state?.typingStates?.[chatId] : null;
   const isRealtimeTyping = Boolean(
     realtimeTyping?.isTyping &&
     !isGroup &&
@@ -183,8 +207,13 @@ export default function ChatHeaderPresence({
     ? 'typing...'
     : (memberCount ? `${memberCount} members` : 'tap here for group info');
 
+  // Self chat ("Message yourself"): there is no peer to be online, typing or last
+  // seen — the header shows the same one-line hint WhatsApp uses instead.
+  const isSelf = isSelfChatId(chatId);
+
   const statusText = isBroadcast
     ? 'tap here for channel info'
+    : isSelf ? 'Message yourself'
     : isGroup ? groupStatusText : peerStatusText;
   // ONE rule: my saved contact name → the peer's number → (only when no number
   // is known) the server profile name. `user.fullName` is the peer's OWN
@@ -201,6 +230,16 @@ export default function ChatHeaderPresence({
         userId: user?._id,
         phone: peerPhone,
         pushName: user?.fullName || user?.name,
+        // Contact privacy — the header is surface #2; without these the peer's
+        // number keeps showing after they hide it.
+        // Both spellings — a peer built from a directory search row carries
+        // `username`, a server peerUser carries `userName`.
+        username: livePrivacy
+          ? livePrivacy.userName
+          : (user?.userName || user?.username || user?.publicUsername || null),
+        hideContact: livePrivacy
+          ? livePrivacy.hideContact
+          : Boolean(user?.hideContact ?? user?.privacySettings?.hideContact),
         fallback: 'Unknown User',
       });
   // Prefer the live server photo (realtime override → chat's peerUser) so a
@@ -212,7 +251,18 @@ export default function ChatHeaderPresence({
     user?.profilePicture ||
     localContact?.profileImage ||
     null;
-  const displayName = isGroup ? (groupName || 'Group') : peerDisplayName;
+  const displayName = isGroup
+    ? (groupName || 'Group')
+    : isSelf
+      // Self chat: the "peer" is me, so my own privacy toggle decides the
+      // label. `user` here is the row's peer snapshot and carries no
+      // `hideContact`, so the profile slice is the source.
+      ? selfChatLabel({
+          mobileNumber: peerPhone,
+          name: user?.fullName || user?.name,
+          ...selfIdentityOf(myProfile),
+        })
+      : peerDisplayName;
 
   const isPeerOnline = !isGroup && normalizedStatus === 'online';
   const isTyping = isPeerTyping || isRealtimeTyping;
@@ -226,6 +276,21 @@ export default function ChatHeaderPresence({
   const statusColor = isTyping
     ? themeColor
     : isPeerOnline ? theme.colors.themeColor :subText;
+
+  if (selectionCount > 0) {
+    return (
+      <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
+        <TouchableOpacity onPress={onBack} activeOpacity={0.6} style={styles.backBtn}>
+          <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
+        </TouchableOpacity>
+        <Text style={[styles.selectionCount, { color: primaryText }]} numberOfLines={1}>
+          {selectionCount}
+        </Text>
+        <View style={styles.selectionSpacer} />
+        <View style={styles.selectionActions}>{rightActions}</View>
+      </View>
+    );
+  }
 
   return (
     <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
@@ -255,19 +320,23 @@ export default function ChatHeaderPresence({
             </Text>
           </View>
         )}
-        {isPeerOnline && !isGroup && (
+        {isPeerOnline && !isGroup && !isSelf && (
           <View style={[styles.onlineDot, { borderColor: bg }]} />
         )}
       </TouchableOpacity>
 
       <TouchableOpacity onPress={onPressProfile} activeOpacity={0.7} style={styles.textWrap}>
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <Text
-            numberOfLines={1}
-            style={[styles.nameText, { color: primaryText, flexShrink: 1 }]}
-          >
-            {displayName}
-          </Text>
+        <View style={styles.nameRow}>
+          {/* Marquee, not a clipped Text. The header's text column is narrow
+              (back + avatar on one side, video/call/menu on the other), so a
+              long name — or an international number like +971 444 4 44… —
+              was permanently truncated with no way to read the rest. The
+              status line already scrolled; the name now does too, and both
+              sit still when they fit. */}
+          <MarqueeText
+            text={displayName}
+            style={[styles.nameText, { color: primaryText }]}
+          />
           {isVerified && (
             <Ionicons name="checkmark-circle" size={15} color={themeColor} style={{ marginLeft: 4 }} />
           )}
@@ -297,26 +366,28 @@ const styles = StyleSheet.create({
     width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 8,
+    paddingHorizontal: 6,
     paddingVertical: Platform.OS === 'ios' ? 8 : 10,
-    gap: 8,
+    // Tightened from 8/8/46 — every dp saved here goes to the name + last-seen
+    // column, which is the part that was being cut off.
+    gap: 6,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   backBtn: {
-    width: 40, height: 40,
+    width: 34, height: 40,
     justifyContent: 'center', alignItems: 'center',
     borderRadius: 12,
   },
   avatarRing: {
-    width: 46, height: 46, borderRadius: 23,
+    width: 40, height: 40, borderRadius: 20,
     borderWidth: 2, padding: 1.5,
     alignItems: 'center', justifyContent: 'center',
   },
   avatarImg: {
-    width: '100%', height: '100%', borderRadius: 21,
+    width: '100%', height: '100%', borderRadius: 18,
   },
   avatarFallback: {
-    width: '100%', height: '100%', borderRadius: 21,
+    width: '100%', height: '100%', borderRadius: 18,
     alignItems: 'center', justifyContent: 'center',
   },
   avatarLetter: {
@@ -333,7 +404,12 @@ const styles = StyleSheet.create({
   },
   textWrap: {
     flex: 1,
+    minWidth: 0,
     paddingLeft: 4,
+  },
+  nameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   nameText: {
     fontFamily: 'Roboto-SemiBold',
@@ -352,6 +428,18 @@ const styles = StyleSheet.create({
   statusText: {
     fontFamily: 'Roboto-Medium',
     fontSize: 12,
+  },
+  selectionCount: {
+    fontFamily: 'Roboto-SemiBold',
+    fontSize: 18,
+    marginLeft: 2,
+    minWidth: 18,
+  },
+  selectionSpacer: { flex: 1, minWidth: 4 },
+  selectionActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexShrink: 1,
   },
   marqueeClip: {
     flex: 1,

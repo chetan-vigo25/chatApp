@@ -1744,8 +1744,12 @@ export default class NativeCallingSDK {
   // ---- screen share ----
   // Android: react-native-webrtc implements getDisplayMedia natively via
   // MediaProjection + its own bundled foreground service (WhatsApp-style
-  // whole-screen capture — needs FOREGROUND_SERVICE_MEDIA_PROJECTION in the
-  // app manifest). iOS: whole-screen capture needs a ReplayKit broadcast
+  // whole-screen capture). NOT SHIPPABLE AS-IS: the app no longer declares
+  // FOREGROUND_SERVICE_MEDIA_PROJECTION (removed from app.json — Play Console
+  // demands a declaration + demo video for it, and no UI ever exposed the
+  // feature), so starting the service would throw on Android 14+. Nothing
+  // calls this today. Re-add the permission + prebuild before wiring a share
+  // button. iOS: whole-screen capture needs a ReplayKit broadcast
   // extension the app doesn't ship, so getDisplayMedia rejects → reported as
   // `unsupported` and the UI shows the "not supported" alert. Receiving a
   // peer's shared screen works everywhere regardless.

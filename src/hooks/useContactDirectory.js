@@ -7,15 +7,17 @@ import {
   loadContactNames,
   invalidateContactNames,
   getContactNamesVersion,
+  getPeerIdentity,
 } from '../services/contactNameStore';
 
 /**
  * useContactDirectory
  * ───────────────────
  * Builds a userId → saved-contact map from the local ContactDatabase and
- * exposes a `resolveName(userId, fallbackName, phone)` helper that returns
- * the locally-saved name when available, otherwise the phone number, and
- * finally falls back to the supplied `fallbackName`.
+ * exposes a `resolveName(userId, fallbackName, phone, opts)` helper that returns
+ * the locally-saved name when available, then the peer's "@handle" if they hide
+ * their number, otherwise the phone number, and finally the supplied
+ * `fallbackName`. `opts` is `{ username, hideContact }` — see peerPrivacyOf.
  *
  *   const { resolveName } = useContactDirectory();
  *   const label = resolveName(item.userId, item.name, item.phone);
@@ -75,8 +77,41 @@ const loadDirectory = async (force = false) => {
  * `directory` is accepted for signature compatibility; the canonical store owns
  * the lookup index now.
  */
-export const resolveDisplayName = (directory, userId, fallbackName, phone) =>
-  resolveCanonicalName({ userId, phone, pushName: fallbackName });
+export const resolveDisplayName = (directory, userId, fallbackName, phone, opts = {}) =>
+  resolveCanonicalName({
+    userId,
+    phone,
+    pushName: fallbackName,
+    // Contact privacy. Accepted as a 5th arg so every existing 4-arg call site
+    // keeps working unchanged; the ones that have a peer object to hand
+    // (call logs, call info, the active call, the incoming banner) pass it via
+    // `peerPrivacyOf(peer)` below and get the "@handle" rule for free.
+    username: opts.username || null,
+    hideContact: Boolean(opts.hideContact),
+  });
+
+/**
+ * Pull the privacy bits off whatever peer shape a call surface happens to hold
+ * (a populated call-log peer, a call-machine participant, a chat peerUser).
+ * Keeps the extraction in ONE place instead of five slightly different spellings.
+ */
+export const peerPrivacyOf = (peer = {}) => {
+  if (!peer || typeof peer !== 'object') return { username: null, hideContact: false };
+  const handle = peer.userName || peer.username || peer.publicUsername || null;
+  const base = {
+    username: handle ? String(handle).trim() || null : null,
+    hideContact: Boolean(peer.hideContact ?? peer.privacySettings?.hideContact),
+  };
+  // A `contact:updated` that landed after this row was fetched wins. Call logs,
+  // status rows and the forward picker all hold server rows minutes old, so
+  // without this a peer's toggle would not reach them until a refetch.
+  const live = getPeerIdentity(peer._id || peer.userId || peer.id);
+  if (!live) return base;
+  return {
+    username: live.userName !== undefined ? live.userName : base.username,
+    hideContact: live.hideContact !== undefined ? live.hideContact : base.hideContact,
+  };
+};
 
 export default function useContactDirectory() {
   const [directory, setDirectory] = useState(_cachedDirectory || {});
@@ -108,11 +143,11 @@ export default function useContactDirectory() {
   }, []);
 
   const resolveName = useCallback(
-    (userId, fallbackName, phone) =>
-      resolveDisplayName(directory, userId, fallbackName, phone),
+    (userId, fallbackName, phone, opts) =>
+      resolveDisplayName(directory, userId, fallbackName, phone, opts),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [namesVersion]
   );
 
-  return { directory, resolveName, refresh, namesVersion };
+  return { directory, resolveName, refresh, namesVersion, peerPrivacyOf };
 }

@@ -5,7 +5,7 @@ import { Platform } from 'react-native';
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../Config/Https';
 import localStorageService from './LocalStorageService';
-import { toSecureMediaUri, mediaResolve } from '../utils/mediaService';
+import { toSecureMediaUri, mediaResolve, saveAssetToAlbum } from '../utils/mediaService';
 import { computeFileSha256 } from '../utils/fileHash';
 
 const API_PREFIX = 'user/media';
@@ -608,19 +608,14 @@ class MediaService {
       const { status } = await MediaLibrary.getPermissionsAsync();
       if (status !== 'granted') return null;
 
-      // Save to media library — this creates the file in:
-      // /storage/emulated/0/Android/media/com.chat.baatCheet/
-      const asset = await MediaLibrary.createAssetAsync(localPath);
-
-      // Create album with WhatsApp-style name
+      // WhatsApp-style album name, written to WITHOUT the Android
+      // "Allow <app> to modify this photo?" dialog. The old create-then-MOVE
+      // flow raised that consent prompt on Android 11+ for EVERY download —
+      // see saveAssetToAlbum for why the file is created inside the album
+      // instead of being moved into it.
       const albumName = type === 'video' ? 'TalksTry Video' : 'TalksTry Images';
-      const album = await MediaLibrary.getAlbumAsync(albumName);
-
-      if (album) {
-        await MediaLibrary.addAssetsToAlbumAsync([asset], album, false);
-      } else {
-        await MediaLibrary.createAlbumAsync(albumName, asset, false);
-      }
+      const asset = await saveAssetToAlbum(localPath, albumName);
+      if (!asset?.uri) return null;
 
       console.log('[MEDIA:GALLERY:SAVED]', { albumName, uri: asset.uri });
       return asset.uri;

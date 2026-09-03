@@ -8,7 +8,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useDispatch } from 'react-redux';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
-import { useRealtimeChat } from '../contexts/RealtimeChatContext';
+import { useRealtimeChatActions } from '../contexts/RealtimeChatContext';
 import { chatListData } from '../Redux/Reducer/Chat/Chat.reducer';
 import {
   verifyTwoStepPassword,
@@ -44,7 +44,7 @@ const LOCKOUT_UNTIL_KEY = '@chat/twoStepLockoutUntil';
 export default function AppLockGate() {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
-  const { removeChat } = useRealtimeChat();
+  const { removeChat } = useRealtimeChatActions();
   const { call, expandIncoming, accept: acceptCall, reject: rejectCall } = useCall();
   const insets = useSafeAreaInsets();
   const [enabled, setEnabled] = useState(false);

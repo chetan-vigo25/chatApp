@@ -38,7 +38,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import MlkitTranslate from '../../modules/expo-mlkit-translate';
 import { lookupUiString } from '../constant/uiStrings';
 import { hinglishToEnglish } from '../constant/hinglish';
-import { isTranslationOff } from '../constant/languages';
+import { isTranslationOff, NO_TRANSLATION } from '../constant/languages';
 
 export const LANGUAGE_STORAGE_KEY = 'app.language';
 /**
@@ -48,6 +48,24 @@ export const LANGUAGE_STORAGE_KEY = 'app.language';
 const CACHE_KEY = 'translation.cache.v3';
 /** Source language of every hard-coded string in this app. */
 export const SOURCE_LANGUAGE = 'en';
+
+/**
+ * The app's own CHROME stays English, always.
+ *
+ * Picking a language is a MESSAGE-translation preference: incoming messages are
+ * shown in the chosen language, but headers, labels, buttons and placeholders
+ * are not. Machine-translating the UI turned screen titles into text the user
+ * did not ask for ("Choose your language" → "अपनी भाषा चुनें") and made the app
+ * read inconsistently against the untranslatable parts (names, numbers, brand).
+ *
+ * Mechanically: only `from="auto"` requests — message BODIES, whose source
+ * language is unknown — still translate. Every UI string (source English, i.e.
+ * `from` unset) is returned as written.
+ */
+export const TRANSLATE_APP_UI = false;
+
+/** True when this request is app chrome rather than someone's message. */
+const isAppUiRequest = (from) => from !== 'auto';
 /** Disk cache ceiling — keeps AsyncStorage from growing without bound. */
 const MAX_CACHE_ENTRIES = 3000;
 /**
@@ -716,12 +734,16 @@ function loadLanguage() {
     languageLoadPromise = AsyncStorage.getItem(LANGUAGE_STORAGE_KEY)
       .then((saved) => {
         cachedHasPreference = Boolean(saved);
-        cachedLanguage = saved || SOURCE_LANGUAGE;
+        // No saved choice → "Don't translate" is the default, so the picker
+        // opens with it selected and nothing is ever translated until the user
+        // asks for it. (Was SOURCE_LANGUAGE, which showed English as the
+        // pre-selected row even though translation was off.)
+        cachedLanguage = saved || NO_TRANSLATION;
         return cachedLanguage;
       })
       .catch(() => {
         cachedHasPreference = false;
-        cachedLanguage = SOURCE_LANGUAGE;   // unreadable storage → documented fallback
+        cachedLanguage = NO_TRANSLATION;    // unreadable storage → default: translate nothing
         return cachedLanguage;
       });
   }
@@ -733,7 +755,7 @@ function loadLanguage() {
 loadLanguage();
 
 const LanguageContext = createContext({
-  language: SOURCE_LANGUAGE,
+  language: NO_TRANSLATION,
   setLanguage: async () => {},
   ready: false,
   // Explicit: a consumer rendered outside the provider must read "no
@@ -745,7 +767,7 @@ const LanguageContext = createContext({
 export function LanguageProvider({ children }) {
   // Lazy initialisers: a remount after hydration starts on the saved language
   // and is `ready` in its first render — no English frame, no re-fetch.
-  const [language, setLang] = useState(() => cachedLanguage || SOURCE_LANGUAGE);
+  const [language, setLang] = useState(() => cachedLanguage || NO_TRANSLATION);
   const [ready, setReady] = useState(() => cachedLanguage != null);
   const [hasPreference, setHasPreference] = useState(() => cachedHasPreference === true);
 
@@ -820,6 +842,7 @@ export function useT(text, from = SOURCE_LANGUAGE) {
     // core would answer 'skipped' anyway, but there is no reason to schedule
     // async work for a reader who asked for none.
     if (typeof text !== 'string'
+        || (!TRANSLATE_APP_UI && isAppUiRequest(from))
         || isTranslationOff(language)
         || (from !== 'auto' && language === SOURCE_LANGUAGE)) {
       setValue(text);
@@ -924,7 +947,7 @@ export async function translateNotificationBody(text, { messageType = 'text' } =
   if (messageType && messageType !== 'text') return null;
   if (cachedHasPreference !== true) return null;
 
-  const language = cachedLanguage || SOURCE_LANGUAGE;
+  const language = cachedLanguage || NO_TRANSLATION;
   if (isTranslationOff(language)) return null;
 
   // Free path: the chat list or the open thread already translated this string.
@@ -983,6 +1006,8 @@ function TText({ ignore, from, children, ...rest }) {
     const nothingToDo =
       ignore
       || source === null
+      // App chrome is never translated — see TRANSLATE_APP_UI.
+      || (!TRANSLATE_APP_UI && isAppUiRequest(from))
       || isTranslationOff(language)
       || (from !== 'auto' && language === SOURCE_LANGUAGE);
     if (nothingToDo) {
@@ -1005,7 +1030,10 @@ function TTextInput({ placeholder, ...rest }) {
 
   useEffect(() => {
     let alive = true;
+    // A placeholder is app chrome, so it follows the same rule as every other
+    // label: English, whatever the message-translation language is.
     if (typeof placeholder !== 'string'
+        || !TRANSLATE_APP_UI
         || isTranslationOff(language)
         || language === SOURCE_LANGUAGE) {
       setHint(placeholder);

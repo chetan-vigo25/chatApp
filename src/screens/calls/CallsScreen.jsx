@@ -199,7 +199,7 @@ export default function CallsScreen({ navigation }) {
   const {
     startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall, callBusy,
   } = useCall();
-  const { resolveName, refresh: refreshContacts } = useContactDirectory();
+  const { resolveName, refresh: refreshContacts, peerPrivacyOf } = useContactDirectory();
 
   const [items, setItems] = useState([]);
   const [page, setPage] = useState(1);
@@ -344,7 +344,7 @@ export default function CallsScreen({ navigation }) {
       const peers = (group.participants || [])
         .map((u) => (u && u._id ? {
           id: String(u._id),
-          name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u)),
+          name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u), peerPrivacyOf(u)),
           pushName: u.fullName || u.userName || null,
           mobile: peerPhoneOf(u),
           avatar: toSecureMediaUri(u.profileImageUrl || u.profileImage) || null,
@@ -360,7 +360,7 @@ export default function CallsScreen({ navigation }) {
     if (!p?._id) return;
     const peerObj = {
       id: String(p._id),
-      name: resolveName(String(p._id), p.fullName || p.userName || 'Unknown', peerPhoneOf(p)),
+      name: resolveName(String(p._id), p.fullName || p.userName || 'Unknown', peerPhoneOf(p), peerPrivacyOf(p)),
       pushName: p.fullName || p.userName || null,
       mobile: peerPhoneOf(p),
       avatar: toSecureMediaUri(p.profileImageUrl || p.profileImage) || null,
@@ -453,13 +453,13 @@ export default function CallsScreen({ navigation }) {
       // rows) is a frozen string list — only used when no user objects exist.
       const resolvedNames = (g.participants || [])
         .map((u) => (u && (u._id || u.userId)
-          ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u))
+          ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u), peerPrivacyOf(u))
           : null))
         .filter(Boolean);
       const names = resolvedNames.length ? resolvedNames : g.participantNames;
       name = g.groupName || (names && names.length ? names.join(', ') : 'Group call');
     } else {
-      name = resolveName(peerId, p.fullName || p.userName || 'Unknown', peerPhoneOf(p));
+      name = resolveName(peerId, p.fullName || p.userName || 'Unknown', peerPhoneOf(p), peerPrivacyOf(p));
       avatarUri = toSecureMediaUri(p.profileImageUrl || p.profileImage) || null;
     }
 

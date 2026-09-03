@@ -11,11 +11,29 @@ function showToast(message) {
     }
   }
 // Login function (existing)
-async function generateOtp(phoneNumber) {
+/**
+ * Request a login OTP.
+ *
+ * Accepts { mobileCode, number } — the country code and the national number as
+ * SEPARATE fields. The pair is what identifies an account (and a reserved VIP
+ * number) exactly: the same national digits can belong to different people, and
+ * to different VIP numbers, under different country codes. `userName` is still
+ * sent as the concatenated form because it is the key the OTP record is stored
+ * under and older server builds read it.
+ *
+ * A plain string is still accepted (an already-joined "+919876543210") so any
+ * remaining caller keeps working.
+ */
+async function generateOtp(payload) {
+    const { mobileCode, number } =
+        typeof payload === 'string' ? { mobileCode: '', number: payload } : (payload || {});
+    const userName = mobileCode ? `${mobileCode}${number}` : `${number}`;
     try {
         // Making API call to generate OTP
         const response = await apiCall("POST", "user/auth/send-otp", {
-            userName: `${phoneNumber}`,
+            userName,
+            mobileCode,
+            number,
         });
         if (response && response.message && typeof response.message === 'string') {
             if (response.statusCode === 200) {
@@ -64,12 +82,20 @@ async function generateOtp(phoneNumber) {
    }
  }
 
-export async function resendOtpService(fullPhoneNumber) {
-  
-    // console.log("payload resend OTP",fullPhoneNumber)
+/**
+ * Resend the login OTP. Takes the same { mobileCode, number } pair as
+ * generateOtp so the resend targets the exact same account and OTP record —
+ * a country-blind resend could otherwise hit a different country's number.
+ */
+export async function resendOtpService(payload) {
+    const { mobileCode, number } =
+        typeof payload === 'string' ? { mobileCode: '', number: payload } : (payload || {});
+    const userName = mobileCode ? `${mobileCode}${number}` : `${number}`;
     try {
     const response = await apiCall("POST", "user/auth/resend-otp", {
-        userName: `${fullPhoneNumber}`,
+        userName,
+        mobileCode,
+        number,
       });
   
       if (response && response.message && typeof response.message === 'string') {

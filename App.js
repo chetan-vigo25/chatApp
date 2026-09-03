@@ -29,7 +29,7 @@ import { ShareIntentProvider } from 'expo-share-intent';
 import { LanguageProvider } from './src/components/Translate';
  
 import 'react-native-gesture-handler';
-
+ 
 // Paper components (Portal/Dialog/Menu/Snackbar) render from Paper's own theme,
 // not ThemeContext — without this bridge they'd stay MD3-light in dark mode.
 // Must sit INSIDE ThemeProvider so it re-renders on theme switch.
@@ -50,7 +50,7 @@ const ThemedPaperProvider = ({ children }) => {
   };
   return <PaperProvider theme={paperTheme}>{children}</PaperProvider>;
 };
-
+ 
 export default function App() {
  
     useEffect(() => {

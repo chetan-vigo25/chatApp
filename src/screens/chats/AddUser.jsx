@@ -32,6 +32,9 @@ import * as SMS from 'expo-sms';
 import ProfilePreviewModal from "../../components/ProfilePreviewModal";
 import VerifiedBadge from "../../components/VerifiedBadge";
 import { useCall } from "../../calls/useCall";
+import { selfChatLabel, selfIdentityOf, SELF_CHAT_SUBTITLE } from "../../utils/selfChat";
+import { buildQuery, contactMatchScore } from "../../utils/contactSearch";
+import useUserDirectorySearch from "../../hooks/useUserDirectorySearch";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 // Only the SEARCH BAR collapses on scroll now (New Contact / New Group stay
@@ -159,6 +162,7 @@ export default function AddUser({ navigation }) {
   const scaleAnim = useRef(new Animated.Value(0)).current;
   const [searchQuery, setSearchQuery] = useState('');
   const { chatsData } = useSelector(state => state.chat || {});
+  const { profileData } = useSelector(state => state.profile || {});
 
   // Clear search when navigating away from this tab
   useFocusEffect(
@@ -313,6 +317,8 @@ export default function AddUser({ navigation }) {
       userId: contact.userId || resolvedId,
       name: localName,
       fullName: localName,
+      // Carry the public handle onto the peer under the key the resolvers read.
+      userName: contact.userName || contact.username || null,
       // Both keys — different consumers read different fields
       profileImage: image,
       profilePicture: image,
@@ -356,6 +362,7 @@ export default function AddUser({ navigation }) {
         ? { profileImage: normalizedUser.profileImage, profilePicture: normalizedUser.profileImage }
         : {}),
       _id: existingChat?.peerUser?._id || normalizedUser?._id || normalizedUser?.userId,
+      userName: existingChat?.peerUser?.userName || normalizedUser?.userName || null,
     };
     navigation.navigate('ChatScreen', { item: { ...existingChat, peerUser: mergedPeer } });
   }, [navigation]);
@@ -399,6 +406,7 @@ export default function AddUser({ navigation }) {
               profileImage: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
               profilePicture: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
               _id: serverPeer._id || normalizedUser?._id || normalizedUser?.userId,
+              userName: serverPeer.userName || normalizedUser?.userName || null,
             };
             navigation.navigate('ChatScreen', {
               item: { ...chatPayload, peerUser: mergedPeer },
@@ -499,19 +507,98 @@ export default function AddUser({ navigation }) {
   }, []);
 
   // ─── MEMOIZED FILTERED DATA ───
+  // Advanced search: one box, three identifier kinds — name, @username and
+  // mobile number (typed with or without a country code, spaces or dashes).
+  // The old filter did a plain substring test on the raw query, so "+91 774…"
+  // or "@handle" matched nothing. Matches are RANKED (exact handle / number /
+  // name first) and the list is ordered best-match-first while searching.
+  // The input stays instant; the RANKING runs on a debounced copy. Scoring a
+  // full phonebook on every keystroke is what makes a big contact list feel
+  // laggy while typing — 150ms is below the perception threshold for the list
+  // catching up, and collapses a burst of keystrokes into one pass.
+  const [appliedQuery, setAppliedQuery] = useState('');
+  useEffect(() => {
+    if (!searchQuery) { setAppliedQuery(''); return undefined; }
+    const t = setTimeout(() => setAppliedQuery(searchQuery), 150);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+
+  const parsedQuery = useMemo(() => buildQuery(appliedQuery), [appliedQuery]);
+
   const { registeredContacts, unregisteredContacts } = useMemo(() => {
-    const searchLower = (searchQuery || '').toLowerCase();
-    const filtered = matchedContacts.filter(contact =>
-      (contact.name || '').toLowerCase().includes(searchLower) ||
-      (contact.fullName || '').toLowerCase().includes(searchLower) ||
-      (contact.username || '').toLowerCase().includes(searchLower) ||
-      (contact.originalPhone || '').includes(searchQuery)
-    );
+    const rank = (contact) => contactMatchScore({
+      name: contact.name,
+      names: [contact.fullName, contact.displayName],
+      username: contact.username || contact.userName,
+      phones: [
+        contact.originalPhone, contact.phone, contact.number,
+        contact.mobileNumber, contact.phoneNumber, contact.normalizedPhone,
+      ],
+    }, parsedQuery);
+
+    let rows = matchedContacts.map((c) => ({ c, score: rank(c) })).filter((r) => r.score > 0);
+    if (!parsedQuery.isEmpty) {
+      rows = rows.sort((a, b) =>
+        (b.score - a.score)
+        || String(a.c.name || a.c.fullName || '').localeCompare(String(b.c.name || b.c.fullName || '')));
+    }
+    const filtered = rows.map((r) => r.c);
     return {
       registeredContacts: filtered.filter(c => !!c.userId),
       unregisteredContacts: filtered.filter(c => !c.userId),
     };
-  }, [matchedContacts, searchQuery]);
+  }, [matchedContacts, parsedQuery]);
+
+  // ─── Registered users who are NOT in my phonebook ───────────────────────
+  // Second tier of the same search box: the server directory answers by
+  // @username / mobile number for people the device never saved. Shown under
+  // its own heading BELOW the contact matches, never mixed into them.
+  const directoryExcludeIds = useMemo(() => {
+    const ids = new Set(
+      matchedContacts.map((c) => String(c.userId || '')).filter(Boolean),
+    );
+    const myId = profileData?._id || profileData?.id || profileData?.userId;
+    if (myId) ids.add(String(myId));
+    return ids;
+  }, [matchedContacts, profileData]);
+
+  const {
+    results: directoryUsers,
+    loading: directoryLoading,
+    searchable: directorySearchable,
+  } = useUserDirectorySearch(searchQuery, { excludeIds: directoryExcludeIds });
+
+  // Search is "busy" while EITHER wait is outstanding: the debounced local
+  // ranking has not caught up with the typed text yet, or the directory lookup
+  // is still in flight. Nothing to show once the query is cleared.
+  const isSearchBusy = Boolean(
+    searchQuery.trim().length > 0
+    && (appliedQuery !== searchQuery || (directorySearchable && directoryLoading)),
+  );
+
+  // Directory rows wear the same shape a contact row expects, so tapping one
+  // goes down the identical open/create-chat path.
+  const directoryContacts = useMemo(() => directoryUsers.map((u) => ({
+    _id: String(u.userId),
+    id: String(u.userId),
+    userId: String(u.userId),
+    type: 'registered',
+    fromDirectory: true,
+    name: u.name || (u.userName ? `@${u.userName}` : 'Unknown'),
+    fullName: u.name || '',
+    username: u.userName || '',
+    // Both spellings: `username` is the picker-row field, `userName` is what
+    // every name resolver (chat header, chat list, notifications) reads off a
+    // peerUser. A handle-created account has no real number, so losing the
+    // handle here left the header showing the account's stub number.
+    userName: u.userName || '',
+    hideContact: Boolean(u.hideContact),
+    phone: u.mobileNumber || '',
+    mobileNumber: u.mobileNumber || '',
+    profilePicture: u.avatar || '',
+    profileImage: u.avatar || '',
+    isVerified: Boolean(u.isVerified),
+  })), [directoryUsers]);
 
   const onSendInvitationPress = useCallback(async (contact) => {
     if (!contact) return;
@@ -681,18 +768,44 @@ export default function AddUser({ navigation }) {
       data.push({ type: 'syncInfo', time: lastSyncTime });
     }
 
-    if (registeredContacts.length === 0 && unregisteredContacts.length === 0) {
+    const searching = !parsedQuery.isEmpty;
+    const showDirectory = searching && directorySearchable
+      && (directoryLoading || directoryContacts.length > 0);
+
+    if (registeredContacts.length === 0 && unregisteredContacts.length === 0 && !showDirectory) {
       data.push({ type: 'empty' });
       return data;
     }
 
+    // 1️⃣ My contacts first — always the top of a search result.
     if (registeredContacts.length > 0) {
-      data.push({ type: 'sectionHeader', title: `Contacts on ${APP_TAG_NAME}`, count: registeredContacts.length });
+      data.push({
+        type: 'sectionHeader',
+        title: searching ? 'Your contacts' : `Contacts on ${APP_TAG_NAME}`,
+        count: registeredContacts.length,
+      });
       registeredContacts.forEach((c, i) => {
         data.push({ type: 'contact', contact: c, index: i, showInvite: false });
       });
-    } else {
+    } else if (!searching) {
       data.push({ type: 'sectionEmpty', title: 'No registered contacts' });
+    }
+
+    // 2️⃣ Then everyone else registered on the app, found by @username / number.
+    if (showDirectory) {
+      data.push({ type: 'spacer' });
+      data.push({
+        type: 'sectionHeader',
+        title: `Other people on ${APP_TAG_NAME}`,
+        count: directoryContacts.length || undefined,
+      });
+      if (directoryLoading && directoryContacts.length === 0) {
+        data.push({ type: 'sectionEmpty', title: 'Searching…' });
+      } else {
+        directoryContacts.forEach((c, i) => {
+          data.push({ type: 'contact', contact: c, index: i, showInvite: false, fromDirectory: true });
+        });
+      }
     }
 
     data.push({ type: 'spacer' });
@@ -702,12 +815,15 @@ export default function AddUser({ navigation }) {
       unregisteredContacts.forEach((c, i) => {
         data.push({ type: 'contact', contact: c, index: i, showInvite: true });
       });
-    } else {
+    } else if (!searching) {
       data.push({ type: 'sectionEmpty', title: 'No unregistered contacts' });
     }
 
     return data;
-  }, [registeredContacts, unregisteredContacts, lastSyncTime]);
+  }, [
+    registeredContacts, unregisteredContacts, lastSyncTime,
+    parsedQuery, directoryContacts, directoryLoading, directorySearchable,
+  ]);
 
   // ─── RENDER FUNCTIONS ───
 
@@ -789,13 +905,24 @@ export default function AddUser({ navigation }) {
           <Ionicons name="search-outline" size={18} color={theme.colors.placeHolderTextColor} style={{ marginLeft: 14 }} />
           <TextInput
             ref={searchInputRef}
-            placeholder="Search contacts..."
+            placeholder="Search name, @username or number"
             placeholderTextColor={theme.colors.placeHolderTextColor}
             value={searchQuery}
             onChangeText={setSearchQuery}
             style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
             returnKeyType="search"
           />
+          {/* Live "searching" state, right in the bar. It covers BOTH waits:
+              the local ranking still catching up with what was typed, and the
+              directory request in flight — so the user is never looking at a
+              half-finished list wondering whether that is the answer. */}
+          {isSearchBusy && (
+            <ActivityIndicator
+              size="small"
+              color={theme.colors.themeColor}
+              style={{ marginRight: searchQuery.length > 0 ? 8 : 14 }}
+            />
+          )}
           {searchQuery.length > 0 && (
             <TouchableOpacity onPress={() => setSearchQuery('')} activeOpacity={0.6} style={{ marginRight: 12 }}>
               <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
@@ -805,6 +932,42 @@ export default function AddUser({ navigation }) {
       </View>
     </Animated.View>
   );
+
+  // ─── "Message yourself" ──────────────────────────────────────────────────
+  // Your own account, presented as a contact you can open a chat with. It is NOT
+  // part of the synced phonebook (the server deliberately strips self from every
+  // contact list), so it is injected here as a pinned row — and hidden while a
+  // search is running unless the query actually matches your own name/number.
+  const selfContact = useMemo(() => {
+    const myId = profileData?._id || profileData?.id || profileData?.userId;
+    if (!myId) return null;
+    const mobileNumber = profileData?.mobile?.number
+      ? `${profileData.mobile.code || ''}${profileData.mobile.number}`
+      : (profileData?.mobileNumber || profileData?.userName || '');
+    return {
+      _id: String(myId),
+      userId: String(myId),
+      id: String(myId),
+      type: 'registered',
+      isSelf: true,
+      fullName: profileData?.fullName || '',
+      name: profileData?.fullName || '',
+      mobileNumber,
+      profileImage: profileData?.profileImage || '',
+    };
+  }, [profileData]);
+
+  const showSelfRow = useMemo(() => {
+    if (!selfContact) return false;
+    const q = (searchQuery || '').trim().toLowerCase();
+    if (!q) return true;
+    return [selfContact.fullName, selfContact.mobileNumber, 'you', 'message yourself']
+      .some((v) => String(v || '').toLowerCase().includes(q));
+  }, [selfContact, searchQuery]);
+
+  const openSelfChat = useCallback(() => {
+    if (selfContact) handleContactPress(selfContact);
+  }, [selfContact, handleContactPress]);
 
   // New Contact / New Group — rendered as the FlatList's ListHeaderComponent so
   // they scroll together with the contact list (sit above the sync bar + contacts).
@@ -837,6 +1000,37 @@ export default function AddUser({ navigation }) {
         </Text>
         <FontAwesome6 name="chevron-right" size={14} color={theme.colors.placeHolderTextColor} />
       </TouchableOpacity>
+
+      {showSelfRow && (
+        <TouchableOpacity
+          onPress={openSelfChat}
+          activeOpacity={0.7}
+          style={styles.selfRow}
+        >
+          {selfContact?.profileImage ? (
+            <Image source={{ uri: selfContact.profileImage }} style={styles.selfAvatar} />
+          ) : (
+            <View style={[styles.selfAvatar, styles.selfAvatarFallback, { backgroundColor: theme.colors.themeColor }]}>
+              <Ionicons name="person" size={20} color={theme.colors.textWhite} />
+            </View>
+          )}
+          <View style={{ flex: 1 }}>
+            <Text numberOfLines={1} style={[styles.selfName, { color: theme.colors.primaryTextColor }]}>
+              {selfChatLabel({
+                mobileNumber: selfContact?.mobileNumber,
+                name: selfContact?.fullName,
+                ...selfIdentityOf(profileData),
+              })}
+            </Text>
+            <Text numberOfLines={1} style={[styles.selfSubtitle, { color: theme.colors.placeHolderTextColor }]}>
+              {SELF_CHAT_SUBTITLE}
+            </Text>
+          </View>
+          <View style={[styles.selfBadge, { backgroundColor: theme.colors.themeColor + '18' }]}>
+            <Ionicons name="bookmark" size={13} color={theme.colors.themeColor} />
+          </View>
+        </TouchableOpacity>
+      )}
     </View>
   );
 
@@ -907,7 +1101,13 @@ export default function AddUser({ navigation }) {
             subTextColor={subTextColor}
             themeColor={themeColor}
             inviteBgColor={inviteBgColor}
-            displayPhone={getDisplayPhone(c)}
+            displayPhone={
+              item.fromDirectory
+                // A peer who hides their number has none to show — their handle
+                // is what identifies them, so it takes the subtitle's place.
+                ? (c.mobileNumber || (c.username ? `@${c.username}` : 'Registered'))
+                : getDisplayPhone(c)
+            }
             onPressContact={() => handleContactPressRef.current(c)}
             onPressAvatar={() => handleModalRef.current(c)}
             onPressInfo={() => navigationRef.current.navigate('UserB', { item: c })}
@@ -954,7 +1154,9 @@ export default function AddUser({ navigation }) {
 
   const keyExtractor = useCallback((item, index) => {
     if (item.type === 'contact') {
-      return `c-${item.contact.id || item.contact.userId || item.contact.hash || index}`;
+      // Directory rows are prefixed: the same person can legitimately appear
+      // in neither/one list, and a duplicate key would collapse two rows.
+      return `${item.fromDirectory ? 'd' : 'c'}-${item.contact.id || item.contact.userId || item.contact.hash || index}`;
     }
     return `${item.type}-${index}`;
   }, []);
@@ -1129,6 +1331,23 @@ const styles = StyleSheet.create({
     flex: 1,
     fontFamily: 'Roboto-SemiBold',
     fontSize: 15,
+  },
+
+  // ─── "Message yourself" row ───
+  selfRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 14,
+  },
+  selfAvatar: { width: 42, height: 42, borderRadius: 21 },
+  selfAvatarFallback: { alignItems: 'center', justifyContent: 'center' },
+  selfName: { fontFamily: 'Roboto-SemiBold', fontSize: 15 },
+  selfSubtitle: { fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: 2 },
+  selfBadge: {
+    width: 26, height: 26, borderRadius: 13,
+    alignItems: 'center', justifyContent: 'center',
   },
 
   // ─── SYNC BAR ───

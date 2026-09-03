@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   View, Text, Image, Animated, TouchableOpacity, ScrollView,
   Alert, Platform, ToastAndroid, ActivityIndicator, TextInput,
-  StatusBar, Dimensions, StyleSheet, KeyboardAvoidingView,
+  StatusBar, StyleSheet, KeyboardAvoidingView,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
 import * as ImagePicker from 'expo-image-picker';
@@ -13,29 +13,29 @@ import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { BACKEND_URL } from '@env';
-import { Feather, FontAwesome5, Ionicons, FontAwesome6 } from '@expo/vector-icons';
+import { Feather, Ionicons } from '@expo/vector-icons';
 
-const { width: SCREEN_W } = Dimensions.get('window');
-const HERO_H = Math.min(SCREEN_W * 0.7, 320);
+const NAME_MAX = 25;
+const ABOUT_MAX = 139;
+const AVATAR = 116;
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
   else Alert.alert('', message);
 }
 
-function HeroGradient() {
-  // ~1px bands so the fake gradient is smooth. A low count (14 → ~13px steps)
-  // shows visible horizontal STRIPS on the cover photo; ~1px steps are
-  // imperceptible. JS-only — no expo-linear-gradient dependency/rebuild.
-  const TOTAL = 180;
-  const BANDS = 180;
-  const bandH = TOTAL / BANDS;
+// Brand-teal header wash. Stacked 1px bands instead of expo-linear-gradient so
+// there is no native dependency/rebuild; a low band count shows visible strips.
+function HeaderWash({ height, color }) {
+  const BANDS = 90;
+  const bandH = height / BANDS;
   return (
-    <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, bottom: 0, justifyContent: 'flex-end' }}>
+    <View pointerEvents="none" style={StyleSheet.absoluteFill}>
       {Array.from({ length: BANDS }).map((_, i) => {
-        const t = (i + 1) / BANDS;
-        const alpha = Math.min(0.6, t * t * 0.7);
-        return <View key={i} style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
+        const t = i / (BANDS - 1);
+        // Fade the accent out toward the bottom so it lands on the page bg.
+        const alpha = (1 - t) * (1 - t);
+        return <View key={i} style={{ height: bandH, backgroundColor: color, opacity: alpha }} />;
       })}
     </View>
   );
@@ -44,6 +44,7 @@ function HeroGradient() {
 export default function EditProfile({ navigation, route }) {
   const { selectedCountry, phoneNumber, email } = route.params || {};
   const { theme, isDarkMode } = useTheme();
+  const insets = useSafeAreaInsets();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const [focusedInput, setFocusedInput] = useState(null);
   const [formErrors, setFormErrors] = useState({});
@@ -72,6 +73,20 @@ export default function EditProfile({ navigation, route }) {
     if (!profileData) dispatch(profileDetail());
   }, []);
 
+  // Seed the form from the server profile once it lands — without this the
+  // fields render empty on an edit and a blind save wipes the stored values.
+  const seededRef = useRef(false);
+  useEffect(() => {
+    if (!profileData || seededRef.current) return;
+    seededRef.current = true;
+    setForm(prev => ({
+      fullName: prev.fullName || profileData.fullName || '',
+      email: prev.email || profileData.email || '',
+      about: prev.about || profileData.about || '',
+      profileImage: prev.profileImage || profileData.profileImage || '',
+    }));
+  }, [profileData]);
+
   useEffect(() => {
     Animated.timing(fadeAnim, { toValue: 1, duration: 350, useNativeDriver: true }).start();
   }, []);
@@ -83,8 +98,14 @@ export default function EditProfile({ navigation, route }) {
 
   const validateForm = () => {
     const newErrors = {};
-    if (!form.fullName?.trim()) newErrors.fullName = 'Full Name is required';
+    if (!form.fullName?.trim()) newErrors.fullName = 'Full name is required';
     if (phoneNumber !== undefined && !phoneNumber?.trim()) newErrors.phoneNumber = 'Phone number is required';
+    // A number without its country code is ambiguous — the same digits are a
+    // different phone number in a different country — so the server rejects the
+    // pair. Catch it here instead of surfacing a server validation error.
+    if (phoneNumber?.trim() && !selectedCountry?.code) {
+      newErrors.phoneNumber = 'Country code is required with the phone number';
+    }
     setFormErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -121,7 +142,7 @@ export default function EditProfile({ navigation, route }) {
   };
 
   const showImagePickerOptions = () => {
-    Alert.alert('Profile Picture', 'Choose an option', [
+    Alert.alert('Profile Photo', 'Choose an option', [
       { text: 'Choose from Gallery', onPress: pickImage },
       { text: 'Cancel', style: 'cancel' },
     ], { cancelable: true });
@@ -191,7 +212,11 @@ export default function EditProfile({ navigation, route }) {
       email: form.email || email || '',
       about: form.about,
       profileImage: finalProfileImage,
-      ...(phoneNumber ? { mobile: { code: selectedCountry?.code || '', number: phoneNumber || '' } } : {}),
+      // Send the country code and national number together — never a dangling
+      // one. The pair is what identifies the number server-side.
+      ...(phoneNumber?.trim() && selectedCountry?.code
+        ? { mobile: { code: selectedCountry.code, number: phoneNumber.trim() } }
+        : {}),
     };
 
     try {
@@ -205,172 +230,200 @@ export default function EditProfile({ navigation, route }) {
     }
   };
 
-  // ─── Theme helpers ─────────────────────────
-  const pageBg = isDarkMode ? '#000000' : '#F4F5F7';
-  const cardBg = isDarkMode ? '#172533' : '#FFFFFF';
-  const borderClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
-  const primaryText = theme.colors.primaryTextColor;
-  const subText = theme.colors.placeHolderTextColor;
-  const themeColor = theme.colors.themeColor || '#03b0a2';
-  const inputBg = isDarkMode ? '#0f1923' : '#F4F5F7';
+  // ─── Theme tokens ─────────────────────────
+  const c = theme.colors;
+  const themeColor = c.themeColor || '#03b0a2';
+  // Dark mode paints a deep near-black page so the card reads as the only lit
+  // surface; the card itself stays a shade above it and the inputs a shade above
+  // the card (page < card < input) so the field boxes are visible without borders
+  // doing all the work.
+  const pageBg = isDarkMode ? '#050B0F' : c.background;
+  const cardBg = isDarkMode ? '#0F1A21' : '#FFFFFF';
+  const inputBg = isDarkMode ? '#16232C' : '#F4F5F7';
+  const borderClr = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.07)';
+  const inputBorder = isDarkMode ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.08)';
+  const primaryText = c.primaryTextColor;
+  const subText = c.secondaryTextColor;
 
   const imgSrc = getImageSource();
+  const headerTop = insets.top + 8;
+  const washH = headerTop + 200;
+
+  const displayNumber = useMemo(() => {
+    const code = selectedCountry?.code || profileData?.mobile?.code || '';
+    const num = phoneNumber || profileData?.mobile?.number || profileData?.userName || '';
+    return num ? `${code ? `${code} ` : ''}${num}` : '';
+  }, [selectedCountry, phoneNumber, profileData]);
+
+  const busy = isLoading || imageUploadLoader;
+  const canSave = !!form.fullName?.trim() && !busy;
 
   return (
     <Animated.View style={[styles.container, { opacity: fadeAnim, backgroundColor: pageBg }]}>
       <StatusBar translucent backgroundColor="transparent" barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-
-      {/* Floating back button */}
-      <View edges={['top']} style={styles.topBarSafe}>
-        <View style={styles.topBarRow}>
-          {/* <TouchableOpacity onPress={() => navigation.goBack()} style={styles.floatingBtn} activeOpacity={0.7}>
-            <FontAwesome6 name="arrow-left" size={18} color="#fff" />
-          </TouchableOpacity> */}
-          <Text style={styles.topBarTitle}>Edit Profile</Text>
-          <View style={{ width: 40 }} />
-        </View>
-      </View>
+      <HeaderWash height={washH} color={themeColor} />
 
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         style={{ flex: 1 }}
       >
-        <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 120 }}>
-          {/* ─── Hero ─── */}
-          <View style={[styles.hero, { backgroundColor: imgSrc ? '#000' : themeColor }]}>
-            {imgSrc ? (
-              <Image source={imgSrc} style={styles.heroImage} resizeMode="cover" />
-            ) : (
-              <View style={styles.heroFallback}>
-                <FontAwesome5 name="user-alt" size={88} color="rgba(255,255,255,0.85)" />
-              </View>
-            )}
-            <HeroGradient />
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          contentContainerStyle={{ paddingBottom: 32 }}
+        >
+          {/* ─── Header ─── */}
+          <View style={[styles.header, { paddingTop: headerTop }]}>
+            <Text style={styles.headerTitle}>Edit Profile</Text>
+            <Text style={styles.headerSubtitle}>
+              Add a photo and a name so people know it's you
+            </Text>
 
+            {/* Avatar + camera badge */}
             <TouchableOpacity
               onPress={showImagePickerOptions}
               disabled={imageUploadLoader}
               activeOpacity={0.85}
-              style={[styles.cameraFab, { backgroundColor: themeColor }]}
+              style={styles.avatarWrap}
             >
-              {imageUploadLoader ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Ionicons name="camera" size={20} color="#fff" />
-              )}
+              <View style={[styles.avatarRing, { borderColor: 'rgba(255,255,255,0.55)' }]}>
+                {imgSrc ? (
+                  <Image source={imgSrc} style={styles.avatarImg} resizeMode="cover" />
+                ) : (
+                  <View style={[styles.avatarImg, styles.avatarFallback]}>
+                    <Ionicons name="person" size={54} color="rgba(255,255,255,0.9)" />
+                  </View>
+                )}
+              </View>
+
+              <View style={[styles.cameraBadge, { backgroundColor: '#fff', borderColor: pageBg }]}>
+                {imageUploadLoader
+                  ? <ActivityIndicator size="small" color={themeColor} />
+                  : <Ionicons name="camera" size={18} color={themeColor} />}
+              </View>
             </TouchableOpacity>
 
-            <View style={styles.heroOverlay} pointerEvents="none">
-              <Text style={styles.heroName} numberOfLines={1}>
-                {form.fullName || profileData?.fullName || 'Welcome'}
-              </Text>
-              <Text style={styles.heroStatus} numberOfLines={1}>
-                Set up your profile
-              </Text>
-            </View>
+            {!!displayNumber && (
+              <Text style={styles.headerNumber} numberOfLines={1}>{displayNumber}</Text>
+            )}
           </View>
 
-          {/* ─── PROFILE section ─── */}
+          {/* ─── Form ─── */}
           <Text style={[styles.sectionLabel, { color: subText }]}>PROFILE</Text>
-          <View style={[styles.card, { backgroundColor: cardBg }]}>
-            <FieldRow
+          <View style={[styles.card, { backgroundColor: cardBg, borderColor: borderClr }]}>
+            <Field
               icon="person-outline"
-              themeColor={themeColor}
-              label="Full Name"
+              label="Full name"
+              placeholder="Your name"
               value={form.fullName}
-              onChangeText={(v) => handleChange('fullName', v)}
+              onChangeText={(v) => handleChange('fullName', v.slice(0, NAME_MAX))}
               focused={focusedInput === 'fullName'}
               onFocus={() => setFocusedInput('fullName')}
               onBlur={() => setFocusedInput(null)}
-              primaryText={primaryText}
-              subText={subText}
-              inputBg={inputBg}
-              borderClr={borderClr}
+              counter={`${form.fullName.length}/${NAME_MAX}`}
               error={formErrors.fullName}
+              autoCapitalize="words"
+              returnKeyType="next"
+              {...{ themeColor, primaryText, subText, inputBg, borderClr, inputBorder }}
             />
 
-            <View style={[styles.divider, { backgroundColor: borderClr }]} />
-
-            <FieldRow
+            <Field
               icon="information-circle-outline"
-              themeColor={themeColor}
               label="About"
+              placeholder="Hey there! I am using TalksTry."
               value={form.about}
-              onChangeText={(v) => handleChange('about', v)}
+              onChangeText={(v) => handleChange('about', v.slice(0, ABOUT_MAX))}
               focused={focusedInput === 'about'}
               onFocus={() => setFocusedInput('about')}
               onBlur={() => setFocusedInput(null)}
-              primaryText={primaryText}
-              subText={subText}
-              inputBg={inputBg}
-              borderClr={borderClr}
+              counter={`${form.about.length}/${ABOUT_MAX}`}
               error={formErrors.about}
+              multiline
+              {...{ themeColor, primaryText, subText, inputBg, borderClr, inputBorder }}
             />
           </View>
 
-          <Text style={[styles.helperText, { color: subText }]}>
-            Your profile is visible to people you chat with on TalksTry.
-          </Text>
+          <View style={styles.helperRow}>
+            <Ionicons name="lock-closed-outline" size={13} color={subText} style={{ marginTop: 1 }} />
+            <Text style={[styles.helperText, { color: subText }]}>
+              Your name and photo are visible to people you chat with on TalksTry.
+            </Text>
+          </View>
         </ScrollView>
-      </KeyboardAvoidingView>
 
-      {/* Save FAB */}
-      <TouchableOpacity
-        onPress={handleUpdateProfile}
-        disabled={isLoading || imageUploadLoader}
-        activeOpacity={0.85}
-        style={[
-          styles.saveFab,
-          {
-            backgroundColor: themeColor,
-            opacity: (isLoading || imageUploadLoader) ? 0.6 : 1,
-          },
-        ]}
-      >
-        {isLoading ? (
-          <ActivityIndicator size="small" color="#fff" />
-        ) : (
-          <Feather name="check" size={26} color="#fff" />
-        )}
-      </TouchableOpacity>
+        {/* ─── Save bar ─── */}
+        <View style={[
+          styles.saveBar,
+          { backgroundColor: pageBg, borderTopColor: borderClr, paddingBottom: Math.max(insets.bottom, 12) },
+        ]}>
+          <TouchableOpacity
+            onPress={handleUpdateProfile}
+            disabled={!canSave}
+            activeOpacity={0.85}
+            style={[styles.saveBtn, { backgroundColor: themeColor, opacity: canSave ? 1 : 0.45 }]}
+          >
+            {busy ? (
+              <ActivityIndicator size="small" color="#fff" />
+            ) : (
+              <>
+                <Feather name="check" size={18} color="#fff" />
+                <Text style={styles.saveBtnText}>Save Profile</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        </View>
+      </KeyboardAvoidingView>
     </Animated.View>
   );
 }
 
-// ─── Field row ───
-function FieldRow({
-  icon, themeColor, label, value, onChangeText, focused, onFocus, onBlur,
-  primaryText, subText, inputBg, borderClr, editable = true, keyboardType, error,
+// ─── Field ───
+function Field({
+  icon, themeColor, label, placeholder, value, onChangeText, focused, onFocus, onBlur,
+  primaryText, subText, inputBg, borderClr, inputBorder, editable = true, keyboardType, error,
+  counter, multiline, autoCapitalize, returnKeyType,
 }) {
+  const accent = error ? '#E53935' : themeColor;
   return (
     <View style={styles.fieldWrap}>
-      <View style={styles.fieldRow}>
-        <View style={[styles.rowIcon, { backgroundColor: themeColor + '18' }]}>
-          <Ionicons name={icon} size={18} color={themeColor} />
+      <View style={styles.fieldHead}>
+        <View style={[styles.rowIcon, { backgroundColor: accent + '1A' }]}>
+          <Ionicons name={icon} size={16} color={accent} />
         </View>
-        <View style={{ flex: 1 }}>
-          <Text style={[styles.fieldLabel, { color: subText }]}>{label}</Text>
-          <TextInput
-            value={value}
-            onChangeText={onChangeText}
-            onFocus={onFocus}
-            onBlur={onBlur}
-            editable={editable}
-            keyboardType={keyboardType}
-            placeholder={`Enter ${label.toLowerCase()}`}
-            placeholderTextColor={subText}
-            style={[
-              styles.fieldInput,
-              {
-                color: editable ? primaryText : subText,
-                borderColor: focused ? themeColor : 'transparent',
-                backgroundColor: focused ? inputBg : 'transparent',
-              },
-            ]}
-          />
-          {error ? <Text style={styles.errorText}>{error}</Text> : null}
-        </View>
+        <Text style={[styles.fieldLabel, { color: focused ? accent : subText }]}>{label}</Text>
+        {!!counter && <Text style={[styles.counter, { color: subText }]}>{counter}</Text>}
       </View>
+
+      <TextInput
+        value={value}
+        onChangeText={onChangeText}
+        onFocus={onFocus}
+        onBlur={onBlur}
+        editable={editable}
+        keyboardType={keyboardType}
+        multiline={multiline}
+        autoCapitalize={autoCapitalize}
+        returnKeyType={returnKeyType}
+        placeholder={placeholder}
+        placeholderTextColor={subText}
+        style={[
+          styles.fieldInput,
+          focused && styles.fieldInputFocused,
+          multiline && styles.fieldInputMultiline,
+          {
+            color: editable ? primaryText : subText,
+            borderColor: error ? '#E53935' : (focused ? themeColor : inputBorder),
+            backgroundColor: inputBg,
+          },
+        ]}
+      />
+
+      {error ? (
+        <View style={styles.errorRow}>
+          <Ionicons name="alert-circle" size={13} color="#E53935" />
+          <Text style={styles.errorText}>{error}</Text>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -378,77 +431,76 @@ function FieldRow({
 const styles = StyleSheet.create({
   container: { flex: 1 },
 
-  topBarSafe: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 100 },
-  topBarRow: {
-    flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: 10, paddingTop: 4, paddingBottom: 6,
+  header: { alignItems: 'center', paddingHorizontal: 24, paddingBottom: 6 },
+  headerTitle: {
+    color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 20, letterSpacing: 0.2,
   },
-  floatingBtn: {
-    width: 40, height: 40, borderRadius: 20,
-    backgroundColor: 'rgba(0,0,0,0.35)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  topBarTitle: {
-    flex: 1, textAlign: 'center', color: '#fff',
-    fontFamily: 'Roboto-SemiBold', fontSize: 16,
-    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  headerSubtitle: {
+    color: 'rgba(255,255,255,0.82)', fontFamily: 'Roboto-Regular', fontSize: 13,
+    marginTop: 6, textAlign: 'center', lineHeight: 18,
   },
 
-  hero: { width: '100%', height: HERO_H, position: 'relative', overflow: 'hidden' },
-  heroImage: { width: '100%', height: '100%' },
-  heroFallback: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  heroOverlay: { position: 'absolute', left: 20, right: 80, bottom: 18 },
-  heroName: {
-    color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 24,
-    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4,
+  avatarWrap: { marginTop: 22, width: AVATAR, height: AVATAR },
+  avatarRing: {
+    width: AVATAR, height: AVATAR, borderRadius: AVATAR / 2,
+    borderWidth: 3, overflow: 'hidden',
+    backgroundColor: 'rgba(255,255,255,0.18)',
   },
-  heroStatus: {
-    color: 'rgba(255,255,255,0.85)', fontFamily: 'Roboto-Regular', fontSize: 13, marginTop: 4,
-    textShadowColor: 'rgba(0,0,0,0.4)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
-  },
-  cameraFab: {
-    position: 'absolute', right: 18, bottom: 18,
-    width: 50, height: 50, borderRadius: 25,
+  avatarImg: { width: '100%', height: '100%' },
+  avatarFallback: { alignItems: 'center', justifyContent: 'center' },
+  cameraBadge: {
+    position: 'absolute', right: -2, bottom: -2,
+    width: 36, height: 36, borderRadius: 18, borderWidth: 2,
     alignItems: 'center', justifyContent: 'center',
-    elevation: 5,
-    shadowColor: '#000', shadowOpacity: 0.3, shadowOffset: { width: 0, height: 2 }, shadowRadius: 4,
+    elevation: 4,
+    shadowColor: '#000', shadowOpacity: 0.25, shadowOffset: { width: 0, height: 2 }, shadowRadius: 4,
+  },
+  headerNumber: {
+    color: '#fff', fontFamily: 'Roboto-Medium', fontSize: 16, marginTop: 14,
   },
 
   sectionLabel: {
-    fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 0.8,
-    marginTop: 18, marginBottom: 6, paddingHorizontal: 24,
+    fontFamily: 'Roboto-Medium', fontSize: 11, letterSpacing: 1,
+    marginTop: 26, marginBottom: 8, paddingHorizontal: 24,
   },
-  card: { marginHorizontal: 12, borderRadius: 14, overflow: 'hidden' },
-  divider: { height: StyleSheet.hairlineWidth, marginLeft: 64 },
+  card: {
+    marginHorizontal: 16, borderRadius: 18, borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 16, paddingVertical: 6, gap: 4,
+  },
 
-  fieldWrap: { paddingVertical: 8 },
-  fieldRow: {
-    flexDirection: 'row', alignItems: 'flex-start',
-    paddingVertical: 8, paddingHorizontal: 14, gap: 14,
-  },
+  fieldWrap: { paddingVertical: 12 },
+  fieldHead: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 8 },
   rowIcon: {
-    width: 36, height: 36, borderRadius: 18,
+    width: 28, height: 28, borderRadius: 14,
     alignItems: 'center', justifyContent: 'center',
-    marginTop: 6,
   },
-  fieldLabel: { fontFamily: 'Roboto-Regular', fontSize: 12 },
+  fieldLabel: { flex: 1, fontFamily: 'Roboto-Medium', fontSize: 13 },
+  counter: { fontFamily: 'Roboto-Regular', fontSize: 11 },
   fieldInput: {
-    marginTop: 2, paddingVertical: 8, paddingHorizontal: 8,
-    fontFamily: 'Roboto-Medium', fontSize: 15,
-    borderRadius: 8, borderWidth: 1,
+    paddingVertical: 13, paddingHorizontal: 14,
+    fontFamily: 'Roboto-Regular', fontSize: 15,
+    borderRadius: 12, borderWidth: 1,
   },
-  errorText: { color: '#E53935', fontFamily: 'Roboto-Medium', fontSize: 12, marginTop: 4 },
+  fieldInputFocused: { borderWidth: 1.5 },
+  fieldInputMultiline: { minHeight: 78, textAlignVertical: 'top' },
+  errorRow: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 6 },
+  errorText: { color: '#E53935', fontFamily: 'Roboto-Regular', fontSize: 12 },
 
-  helperText: {
-    fontFamily: 'Roboto-Regular', fontSize: 12,
-    paddingHorizontal: 24, marginTop: 14, textAlign: 'center',
+  helperRow: {
+    flexDirection: 'row', gap: 7, alignItems: 'flex-start',
+    paddingHorizontal: 26, marginTop: 16,
   },
+  helperText: { flex: 1, fontFamily: 'Roboto-Regular', fontSize: 12, lineHeight: 17 },
 
-  saveFab: {
-    position: 'absolute', bottom: 24, right: 20,
-    width: 58, height: 58, borderRadius: 29,
+  saveBar: {
+    paddingHorizontal: 16, paddingTop: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  saveBtn: {
+    height: 52, borderRadius: 26, flexDirection: 'row', gap: 8,
     alignItems: 'center', justifyContent: 'center',
-    elevation: 6,
-    shadowColor: '#000', shadowOpacity: 0.3, shadowOffset: { width: 0, height: 2 }, shadowRadius: 5,
+    elevation: 3,
+    shadowColor: '#000', shadowOpacity: 0.2, shadowOffset: { width: 0, height: 2 }, shadowRadius: 5,
   },
+  saveBtnText: { color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 16 },
 });

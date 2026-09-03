@@ -16,17 +16,19 @@ import {
 } from "react-native";
 import { useDispatch, useSelector } from "react-redux";
 import { useTheme } from "../../contexts/ThemeContext";
-import { useRealtimeChat } from "../../contexts/RealtimeChatContext";
+import { useRealtimeChatActions, useRealtimeChatLists } from "../../contexts/RealtimeChatContext";
 import { profileServices } from "../../Redux/Services/Profile/Profile.Services";
 import { blockUser, unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import { getSocket } from "../../Redux/Services/Socket/socket";
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import ContactDatabase from "../../services/ContactDatabase";
-import useSaveContact from "../../hooks/useSaveContact";
-import { findInDeviceContacts } from "../../services/SaveContactService";
+import useSaveContact, { SAVE_CONTACT_STATUS } from "../../hooks/useSaveContact";
+import { formatPhoneNumber } from "../../services/contactNameStore";
 import { useCall } from "../../calls/useCall";
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ReportBottomSheet from "../../components/ReportBottomSheet";
+import CopyFieldButton from "../../components/CopyFieldButton";
+import { formatLastSeen } from "../../presence/services/lastSeenFormatter.service";
 
 const { width } = Dimensions.get('window');
 const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
@@ -93,10 +95,10 @@ export default function UserB({ navigation, route }) {
   // Safe access to realtime context
   let muteChat, unmuteChat, chatList;
   try {
-    const realtime = useRealtimeChat();
-    muteChat = realtime.muteChat;
-    unmuteChat = realtime.unmuteChat;
-    chatList = realtime.chatList;
+    const actions = useRealtimeChatActions();
+    muteChat = actions.muteChat;
+    unmuteChat = actions.unmuteChat;
+    chatList = useRealtimeChatLists().chatList;
   } catch (e) {
     muteChat = () => {};
     unmuteChat = () => {};
@@ -114,7 +116,6 @@ export default function UserB({ navigation, route }) {
 
   // Local device-saved contact (from SQLite). When present, its name/phone wins.
   const [localContact, setLocalContact] = useState(null);
-  const [isInDeviceBook, setIsInDeviceBook] = useState(false);
   const [reloadVersion, setReloadVersion] = useState(0);
 
   // Force the system status bar visible whenever this screen is focused. Some
@@ -156,6 +157,16 @@ export default function UserB({ navigation, route }) {
         ...(image !== undefined ? { profileImage: image } : {}),
         ...(data?.about !== undefined ? { about: data.about } : {}),
         ...((data?.fullName || data?.name) ? { fullName: data.fullName || data.name } : {}),
+        // Username + contact privacy ride the SAME event as every other profile
+        // change, so this open profile screen flips from number to @handle (or
+        // back) live, with no re-navigation and no restart.
+        ...(data?.userName !== undefined ? { userName: data.userName } : {}),
+        ...(data?.hideContact !== undefined
+          ? { hideContact: Boolean(data.hideContact), privacySettings: { hideContact: Boolean(data.hideContact) } }
+          : {}),
+        // Server sends '' once the number is withheld — clear the cached copy
+        // rather than letting a stale one keep rendering.
+        ...(data?.phoneNumber !== undefined && !data.phoneNumber ? { mobile: null, email: '' } : {}),
       }));
     };
     const attach = () => {
@@ -182,46 +193,64 @@ export default function UserB({ navigation, route }) {
     return () => { cancelled = true; };
   }, [peerId, reloadVersion]);
 
-  // Defensive device-book check (covers contacts saved outside the app)
-  useEffect(() => {
-    let cancelled = false;
-    const phoneForCheck =
-      localContact?.normalizedPhone ||
-      (peerProfile?.mobile?.code && peerProfile?.mobile?.number
-        ? `${peerProfile.mobile.code}${peerProfile.mobile.number}`
-        : null);
-    if (!phoneForCheck) { setIsInDeviceBook(Boolean(localContact?.originalId)); return; }
-    findInDeviceContacts(phoneForCheck)
-      .then((match) => { if (!cancelled) setIsInDeviceBook(Boolean(match) || Boolean(localContact?.originalId)); })
-      .catch(() => { if (!cancelled) setIsInDeviceBook(Boolean(localContact?.originalId)); });
-    return () => { cancelled = true; };
-  }, [peerProfile?.mobile?.code, peerProfile?.mobile?.number, localContact?.originalId, localContact?.normalizedPhone]);
-
   // Phone: prefer device-saved number, then server's mobile
   const serverNumber = peerProfile?.mobile?.number || peer?.mobile?.number || '';
   const serverCode = peerProfile?.mobile?.code || peerProfile?.mobile?.countryCode || peer?.mobile?.code || peer?.mobile?.countryCode || '';
   const phoneNumber = localContact?.mobile?.number || localContact?.normalizedPhone || serverNumber;
   const countryCode = localContact?.mobile?.code || (localContact?.normalizedPhone ? '' : serverCode);
-  const displayPhone = localContact?.normalizedPhone
-    ? localContact.normalizedPhone
-    : (countryCode ? `${countryCode} ${phoneNumber}` : phoneNumber);
+  // ── Contact privacy ───────────────────────────────────────────────────────
+  // When this peer hides their contact details the number and the email must
+  // not be rendered — their "@handle" takes the number's place and the email
+  // row disappears.
+  //
+  // POLICY: the toggle hides them from EVERYONE, saved contacts included — a
+  // locally-saved name must not defeat it. This screen used to exempt saved
+  // contacts (`|| localContact?.fullName`), which is why a hidden peer still
+  // showed as "Chetan · +91…" here while every other surface had switched to
+  // "@handle". The exemption lives (or dies) in all four resolvers at once:
+  // contactNameStore.js, chat-website displayName.js and the backend's
+  // serializePublicUser.helper.js.
+  const peerHandle = peerProfile?.userName || peer?.userName || null;
+  const peerHidesContact = Boolean(
+    peerProfile?.privacySettings?.hideContact
+      ?? peerProfile?.hideContact
+      ?? peer?.hideContact
+  );
+  const revealContact = !peerHidesContact;
+
+  // One space between country code and number, never inside the number —
+  // formatPhoneNumber is the single place that rule lives.
+  const displayPhone = revealContact
+    ? formatPhoneNumber(
+        localContact?.normalizedPhone
+          || (countryCode ? `${countryCode}${phoneNumber}` : phoneNumber),
+      )
+    : '';
+  // What stands in for the number on the identifier line.
+  const displayHandle = (!revealContact && peerHandle) ? `@${peerHandle}` : '';
+  const peerEmail = revealContact ? (peerProfile?.email || peer?.email || '') : '';
 
   // Display info — apply the same rule used everywhere else:
-  //   1. Locally-saved contact name (device-saved wins)
-  //   2. Server's saved-contact name when this viewer has them synced
+  //   1. "@handle" when the peer hides their contact details (beats everything)
+  //   2. Locally-saved contact name (device-saved wins)
+  //   3. Server's saved-contact name when this viewer has them synced
   //      server-side (peerProfile.displayName + isSavedContact flag)
-  //   3. Formatted phone number
-  //   4. Server profile fullName (last-resort fallback)
+  //   4. Formatted phone number
+  //   5. Server profile fullName (last-resort fallback)
   const serverDisplayName =
     peerProfile?.isSavedContact ? peerProfile?.displayName : null;
   const displayName =
+    // Privacy FIRST — `displayHandle` is non-empty only while the peer hides
+    // their details, and then it outranks the saved name, exactly as in the
+    // canonical resolver.
+    displayHandle ||
     localContact?.fullName ||
     serverDisplayName ||
     displayPhone ||
     peerProfile?.fullName ||
     peer?.fullName ||
     peer?.name ||
-    peer?.username ||
+    peerHandle ||
     "User";
   const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
   const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
@@ -245,16 +274,25 @@ export default function UserB({ navigation, route }) {
   // Save Contact flow — only show button when not already in device
   const peerForSave = {
     _id: peerId,
-    fullName: peerProfile?.fullName || peer?.fullName || peer?.name || displayName,
+    // Prefill for the Save-Contact form. A hidden peer's own account name is
+    // exactly what the toggle withholds, so it must not be typed in for the
+    // user — the handle is what they are allowed to see.
+    fullName: peerHidesContact
+      ? displayName
+      : (peerProfile?.fullName || peer?.fullName || peer?.name || displayName),
     mobileNumber: serverNumber || phoneNumber,
     mobile: { code: serverCode || '', number: serverNumber || phoneNumber },
     profileImage: peerProfileImage || peerImage || '',
   };
   const {
+    status: saveContactStatus,
     isSaving: isSavingContact,
+    isSyncing: isSyncingContacts,
     saveError: saveContactError,
     savedSuccessfully: contactJustSaved,
     saveContact,
+    syncNow: syncContactsNow,
+    requestPermission: requestContactsAccess,
   } = useSaveContact(peerForSave);
 
   // After save succeeds, re-pull local contact + profile so UI reflects new state
@@ -263,6 +301,16 @@ export default function UserB({ navigation, route }) {
       const t = setTimeout(() => setReloadVersion((v) => v + 1), 600);
       return () => clearTimeout(t);
     }
+  }, [contactJustSaved]);
+
+  // "Contact saved" confirmation is a transient notice, not a permanent row —
+  // it clears itself after 3s so the profile settles back to its normal layout.
+  const [showSavedNotice, setShowSavedNotice] = useState(false);
+  useEffect(() => {
+    if (!contactJustSaved) return undefined;
+    setShowSavedNotice(true);
+    const t = setTimeout(() => setShowSavedNotice(false), 3000);
+    return () => clearTimeout(t);
   }, [contactJustSaved]);
 
   const pastelColors = ["#6C5CE7", "#00B894", "#E17055", "#0984E3", "#D63031", "#E84393", "#00CEC9"];
@@ -411,7 +459,19 @@ export default function UserB({ navigation, route }) {
   const subText = theme.colors.secondaryTextColor || theme.colors.placeHolderTextColor;
   const themeColor = theme.colors.themeColor;
   const isOnline = Boolean(peerProfile?.isOnline || peer?.isOnline);
-  const statusLine = isOnline ? 'online' : (lastSeen ? `last seen ${lastSeen}` : '');
+  // Presence goes through the ONE formatter the chat header uses, so this
+  // screen reads "last seen yesterday 4:20 PM" instead of the raw ISO string
+  // the server sends ("last seen 2026-09-03T07:20:30.107Z"). It already emits
+  // the "last seen " prefix, and turns a privacy-limited 'recently' into
+  // "last seen recently".
+  const statusLine = isOnline ? 'online' : (lastSeen ? formatLastSeen(lastSeen) : '');
+  // The line under the hero name. The handle stands in for a hidden number —
+  // but not when the handle IS the name above it (a hidden peer), which would
+  // print "@handle" twice; presence takes the slot instead.
+  const identifierLine =
+    displayPhone
+    || (displayHandle && displayHandle !== displayName ? displayHandle : '')
+    || statusLine;
 
   return (
     <View style={[styles.container, { backgroundColor: pageBg }]}>
@@ -493,10 +553,8 @@ export default function UserB({ navigation, route }) {
               )}
               {isOnline && <View style={styles.heroOnlineDot} />}
             </View>
-            {(displayPhone || statusLine) ? (
-              <Text style={styles.heroStatus} numberOfLines={1}>
-                {displayPhone ? displayPhone : statusLine}
-              </Text>
+            {identifierLine ? (
+              <Text style={styles.heroStatus} numberOfLines={1}>{identifierLine}</Text>
             ) : null}
           </View>
         </View>
@@ -528,34 +586,41 @@ export default function UserB({ navigation, route }) {
                 <Text style={[styles.phoneValue, { color: primaryText }]} selectable numberOfLines={1}>{displayPhone}</Text>
                 <Text style={[styles.fieldLabel, { color: subText }]}>Mobile</Text>
               </View>
+              {/* Copy the dial-able number, not the pretty-printed one. */}
+              <CopyFieldButton
+                value={countryCode ? `${countryCode}${phoneNumber}` : (phoneNumber || displayPhone)}
+                label="Number"
+              />
             </View>
           </View>
         ) : null}
 
         {/* ─── Email / Username ─── */}
-        {((peerProfile?.email || peer?.email) || (peer?.userName || peerProfile?.userName)) ? (
+        {(peerEmail || peerHandle) ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
-            {(peerProfile?.email || peer?.email) ? (
+            {peerEmail ? (
               <InfoRow
                 icon="mail-outline"
                 iconColor={themeColor}
-                value={peerProfile?.email || peer?.email}
+                value={peerEmail}
                 label="Email"
                 primary={primaryText}
                 sub={subText}
+                copyValue={peerEmail}
               />
             ) : null}
-            {(peerProfile?.email || peer?.email) && (peer?.userName || peerProfile?.userName) ? (
+            {peerEmail && peerHandle ? (
               <View style={[styles.divider, { backgroundColor: dividerClr }]} />
             ) : null}
-            {(peer?.userName || peerProfile?.userName) ? (
+            {peerHandle ? (
               <InfoRow
                 icon="at-outline"
                 iconColor={themeColor}
-                value={`@${peer?.userName || peerProfile?.userName}`}
+                value={`@${peerHandle}`}
                 label="Username"
                 primary={primaryText}
                 sub={subText}
+                copyValue={peerHandle}
               />
             ) : null}
           </View>
@@ -600,27 +665,66 @@ export default function UserB({ navigation, route }) {
           </View>
         </View>
 
-        {/* ─── Save Contact ─── */}
-        {!isInDeviceBook && !contactJustSaved && (
+        {/* ─── Sync / Save Contact ───
+            One row, three states in order: permission → sync → save. The sync
+            state shows even for a number already in the phone book, because an
+            unsynced device is exactly the case where the user cannot tell. Once
+            the sync lands the row turns into "Save to contacts" in place. */}
+        {/* Gated on the hook's status ALONE. The old extra `!isInDeviceBook`
+            guard double-gated the row against a stale local flag (and against
+            SQLite's original_id, which is not a device-saved marker), which is
+            why unsaved numbers showed no button after a sync. */}
+        {!contactJustSaved
+          && saveContactStatus !== SAVE_CONTACT_STATUS.CHECKING
+          && saveContactStatus !== SAVE_CONTACT_STATUS.SAVED && (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             <TouchableOpacity
-              style={[styles.card_row, { opacity: isSavingContact ? 0.6 : 1 }]}
+              style={[styles.card_row, { opacity: isSavingContact || isSyncingContacts ? 0.6 : 1 }]}
               activeOpacity={0.6}
-              disabled={isSavingContact}
-              onPress={saveContact}
+              disabled={isSavingContact || isSyncingContacts}
+              onPress={
+                saveContactStatus === SAVE_CONTACT_STATUS.PERMISSION
+                  ? requestContactsAccess
+                  : saveContactStatus === SAVE_CONTACT_STATUS.NEEDS_SYNC
+                    ? syncContactsNow
+                    : saveContact
+              }
             >
               <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
-                {isSavingContact ? (
+                {isSavingContact || isSyncingContacts ? (
                   <ActivityIndicator size="small" color={themeColor} />
                 ) : (
-                  <Ionicons name="person-add-outline" size={19} color={themeColor} />
+                  <Ionicons
+                    name={
+                      saveContactStatus === SAVE_CONTACT_STATUS.PERMISSION
+                        ? 'lock-closed-outline'
+                        : saveContactStatus === SAVE_CONTACT_STATUS.NEEDS_SYNC
+                          ? 'sync-outline'
+                          : 'person-add-outline'
+                    }
+                    size={19}
+                    color={themeColor}
+                  />
                 )}
               </View>
               <Text style={[styles.rowAction, { color: themeColor }]}>
-                {isSavingContact ? 'Saving…' : 'Save to contacts'}
+                {isSavingContact
+                  ? 'Saving…'
+                  : isSyncingContacts
+                    ? 'Syncing contacts…'
+                    : saveContactStatus === SAVE_CONTACT_STATUS.PERMISSION
+                      ? 'Allow contacts access'
+                      : saveContactStatus === SAVE_CONTACT_STATUS.NEEDS_SYNC
+                        ? 'Sync contacts'
+                        : 'Save to contacts'}
               </Text>
             </TouchableOpacity>
-            {saveContactError && !isSavingContact && (
+            {saveContactStatus === SAVE_CONTACT_STATUS.NEEDS_SYNC && !isSyncingContacts && (
+              <Text style={styles.errorText}>
+                Contacts are not synced on this device yet — sync first to see saved names.
+              </Text>
+            )}
+            {saveContactError && !isSavingContact && !isSyncingContacts && (
               <Text style={styles.errorText}>
                 {saveContactError === 'permission_denied'
                   ? 'Contacts permission denied. Enable it from Settings.'
@@ -630,13 +734,15 @@ export default function UserB({ navigation, route }) {
           </View>
         )}
 
-        {contactJustSaved && (
+        {/* Transient "saved" confirmation — theme surface + brand accent (never a
+            hardcoded green), auto-dismissed after 3s. */}
+        {showSavedNotice && (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             <View style={styles.card_row}>
-              <View style={[styles.rowIconWrap, { backgroundColor: '#22C55E18' }]}>
-                <Ionicons name="checkmark-circle" size={20} color="#22C55E" />
+              <View style={[styles.rowIconWrap, { backgroundColor: themeColor + '18' }]}>
+                <Ionicons name="checkmark-circle" size={20} color={themeColor} />
               </View>
-              <Text style={[styles.rowAction, { color: '#22C55E' }]}>Contact saved</Text>
+              <Text style={[styles.rowAction, { color: themeColor }]}>Contact saved</Text>
             </View>
           </View>
         )}
@@ -662,7 +768,7 @@ export default function UserB({ navigation, route }) {
                 )}
               </View>
               <Text style={[styles.rowAction, { color: '#EF4444' }]}>
-                {isPeerBlocked ? `Unblock ${peer?.fullName || 'user'}` : `Block ${peer?.fullName || 'user'}`}
+                {isPeerBlocked ? `Unblock ${displayName}` : `Block ${displayName}`}
               </Text>
             </TouchableOpacity>
             <View style={[styles.separator, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)' }]} />
@@ -674,7 +780,7 @@ export default function UserB({ navigation, route }) {
               <View style={[styles.rowIconWrap, { backgroundColor: '#EF444418' }]}>
                 <Ionicons name="flag-outline" size={19} color="#EF4444" />
               </View>
-              <Text style={[styles.rowAction, { color: '#EF4444' }]}>Report {peer?.fullName || 'user'}</Text>
+              <Text style={[styles.rowAction, { color: '#EF4444' }]}>Report {displayName}</Text>
             </TouchableOpacity>
           </View>
         ) : null}
@@ -709,7 +815,7 @@ function ActionColumn({ icon, label, color, onPress, disabled }) {
   );
 }
 
-function InfoRow({ icon, iconColor, value, label, primary, sub, onPress, multiline }) {
+function InfoRow({ icon, iconColor, value, label, primary, sub, onPress, multiline, copyValue, copyLabel }) {
   const Wrapper = onPress ? TouchableOpacity : View;
   return (
     <Wrapper style={styles.card_row} onPress={onPress} activeOpacity={0.6}>
@@ -726,6 +832,7 @@ function InfoRow({ icon, iconColor, value, label, primary, sub, onPress, multili
         </Text>
         <Text style={[styles.fieldLabel, { color: sub }]}>{label}</Text>
       </View>
+      {copyValue ? <CopyFieldButton value={copyValue} label={copyLabel || label} /> : null}
     </Wrapper>
   );
 }

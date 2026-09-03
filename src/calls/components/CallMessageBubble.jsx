@@ -53,6 +53,10 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
       userId: peer._id || peer.userId || peer.id,
       phone: peerMobile,
       pushName: peer.fullName || peer.name,
+      // Contact privacy — an outgoing call to a peer who hides their number
+      // rings out under their handle.
+      username: peer.userName || peer.publicUsername || null,
+      hideContact: Boolean(peer.hideContact ?? peer.privacySettings?.hideContact),
       fallback: 'Unknown',
     }),
     pushName: peer.fullName || peer.name || null,
@@ -80,9 +84,14 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
   // content), received = card surface (themed text). Mirrors the audio/text
   // bubbles in ChatScreen so a custom Appearance accent applies here too —
   // when no custom accent is set, fall back to WhatsApp's outgoing green.
+  // Received side reads the SAME token as every other incoming bubble
+  // (theme.colors.bubbleReceived). It used to be cardBackground / '#ffffff',
+  // which quietly drifted: once the received bubble was darkened for the
+  // true-black chat ground, a call log sat in the thread as a paler slab than
+  // the messages around it.
   const bubbleColor = isOutgoing
     ? ((chatColor && chatColor !== '#03b0a2') ? chatColor : '#03574f')
-    : (isDarkMode ? theme.colors.cardBackground : '#ffffff');
+    : theme.colors.bubbleReceived;
   const onBubble = isOutgoing ? '#ffffff' : theme.colors.primaryTextColor;
   const onBubbleSoft = isOutgoing ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;
   const missedColor = isOutgoing ? '#ffffff' : theme.colors.danger;
@@ -107,7 +116,13 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
         style={[
           styles.bubble,
           isOutgoing ? styles.bubbleOut : styles.bubbleIn,
-          { backgroundColor: bubbleColor },
+          {
+            backgroundColor: bubbleColor,
+            // Same hairline the text bubbles carry: in light mode the received
+            // surface and the chat background are both #ffffff.
+            borderWidth: (!isDarkMode && !isOutgoing) ? StyleSheet.hairlineWidth : 0,
+            borderColor: theme.colors.border,
+          },
         ]}
       >
         <View style={[styles.chip, { backgroundColor: chipBg }]}>

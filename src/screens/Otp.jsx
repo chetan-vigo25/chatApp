@@ -227,9 +227,9 @@ export default function Otp({ navigation, route }) {
             return;
           }
         
-          const fullPhoneNumber = `${selectedCountry.code}${phoneNumber}`;
+
         
-          dispatch(resendOtp({ fullPhoneNumber }))
+          dispatch(resendOtp({ mobileCode: selectedCountry.code, number: phoneNumber }))
             .unwrap()
             .then((payload) => {
               const otpMessage = payload?.otpMessage ?? payload;

@@ -8,6 +8,7 @@ import {
   emitLogoutCurrentDevice, clearLocalStorageAndDisconnect,
 } from '../Redux/Services/Socket/socket';
 import { isAppLockSuspended } from '../services/appLockGuard';
+import { clearDirectoryCache } from '../Redux/Services/Contact/Directory.Services';
 
 const AuthContext = createContext({});
 export const useAuth = () => useContext(AuthContext);
@@ -112,6 +113,10 @@ export const AuthProvider = ({ children }) => {
       }
       // 3) Clear ALL local storage + disconnect the socket (no token → can't re-auth).
       await clearLocalStorageAndDisconnect();
+      // 3b) Directory search results are privacy-resolved FOR THIS VIEWER (saved
+      //     names, numbers hidden from strangers), so they must never survive
+      //     into the next account signed in on this device.
+      try { clearDirectoryCache(); } catch (_) { /* ignore */ }
     } catch (error) {
       console.log('Logout error:', error);
     } finally {

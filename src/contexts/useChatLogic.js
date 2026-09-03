@@ -12,7 +12,9 @@ import { useImage } from "../contexts/ImageProvider";
 import { useFocusEffect } from "@react-navigation/native";
 import { normalizePresencePayload, normalizeStatus, PRESENCE_STATUS } from "../utils/presence";
 import { formatLastSeen } from "../presence/services/lastSeenFormatter.service";
-import { useRealtimeChat } from "./RealtimeChatContext";
+import { useRealtimeChatActions, useRealtimeChatSlice } from "./RealtimeChatContext";
+
+const selectInactiveGroupIds = (s) => s?.inactiveGroupIds;
 import localStorageService from '../services/LocalStorageService';
 import ChatDatabase from '../services/ChatDatabase';
 import ContactDatabase from '../services/ContactDatabase';
@@ -285,7 +287,11 @@ const prepareOutgoingMediaFile = async (file, messageType, { hd = false } = {}) 
       const compressed = await compressImage(prepared);
       if (compressed?.uri) {
         // Re-encode outputs JPEG — keep the extension honest.
-        const baseName = String(prepared.name || `image_${Date.now()}`)
+        // The fallback name must be UNIQUE per file: album files are prepared
+        // concurrently, so a plain `image_${Date.now()}` gave two photos the
+        // SAME name — they then overwrote each other in the Sent/ copy and both
+        // album items uploaded one photo's bytes.
+        const baseName = String(prepared.name || `image_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`)
           .replace(/\.(png|webp|heic|heif|jpeg|jpg)$/i, '');
         prepared = { ...prepared, ...compressed, name: `${baseName}.jpg` };
       }
@@ -351,7 +357,11 @@ export default function useChatLogic({ navigation, route }) {
   const networkTypeRef = useRef(networkType);
   networkTypeRef.current = networkType;
   const { pickMedia, pickMediaMultiple } = useImage();
-  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, restoreGroupMembership, inactiveGroupIds } = useRealtimeChat();
+  // Actions have a stable identity, and only the inactive-group map is read as
+  // state — so ChatScreen no longer re-renders for typing/presence/unread
+  // traffic in this or any other chat.
+  const { setActiveChat, markChatRead, onLocalOutgoingMessage, updateLocalLastMessagePreview, removeChat, restoreGroupMembership } = useRealtimeChatActions();
+  const inactiveGroupIds = useRealtimeChatSlice(selectInactiveGroupIds);
   const { currentGroup } = useSelector((s) => s.group || {});
 
   const deferRealtimeUpdate = useCallback((fn) => {
@@ -1228,6 +1238,14 @@ export default function useChatLogic({ navigation, route }) {
             profileImage: u.profileImage || m.profileImage || null,
             mobileNumber,
             role: m.role || 'member',
+            // Contact privacy, carried so group sender lines and the member
+            // list can apply the rule. Without these the resolver was called
+            // with `hideContact: false` for every member and a hidden member
+            // kept showing under the viewer's saved name for them.
+            userName: u.userName || u.username || m.userName || null,
+            hideContact: Boolean(
+              u.hideContact ?? u.privacySettings?.hideContact ?? m.hideContact ?? false,
+            ),
           };
         }
       });
@@ -1260,7 +1278,10 @@ export default function useChatLogic({ navigation, route }) {
               if (h) saved = byHash[h];
               if (!saved) saved = byPhone[onlyDigits(mobile)];
             }
-            if (saved) map[id].fullName = saved;
+            // A member who hides their details keeps the server's label
+            // ("@handle"): the toggle outranks this device's address book, so
+            // the saved name must NOT be overlaid for them.
+            if (saved && !map[id].hideContact) map[id].fullName = saved;
           });
         }
       } catch (_) { /* contacts optional — fall back to backend names */ }

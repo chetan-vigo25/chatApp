@@ -69,6 +69,9 @@ const ReceiptRow = ({ user, timestamp, palette }) => {
     phone: user?.mobileNumber
       || (user?.mobile?.number ? `${user.mobile.code || ''}${user.mobile.number}` : null),
     pushName: user?.fullName,
+    // Contact privacy — read/delivered lists name every recipient.
+    username: user?.userName || null,
+    hideContact: Boolean(user?.hideContact ?? user?.privacySettings?.hideContact),
     fallback: 'Unknown',
   }).trim();
   const initial = (fullName.charAt(0) || '?').toUpperCase();

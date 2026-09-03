@@ -34,7 +34,9 @@ import { useTheme } from '../contexts/ThemeContext';
 import { useCall } from '../calls/useCall';
 import { profileServices } from '../Redux/Services/Profile/Profile.Services';
 import ContactDatabase from '../services/ContactDatabase';
-import { resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
+import { resolveDisplayName as resolveCanonicalName, formatPhoneNumber } from '../services/contactNameStore';
+import CopyFieldButton from './CopyFieldButton';
+import { formatLastSeen } from '../presence/services/lastSeenFormatter.service';
 
 const { height: SCREEN_H } = Dimensions.get('window');
 
@@ -111,15 +113,30 @@ export default function UserDetailsSheet({
   // ONE rule: saved contact name → number → the user's own account name.
   // `fallbackName` arrives from the caller (often a server-provided name), so it
   // is treated as a push name, never as something that outranks the number.
+  // Contact privacy: when this peer hides their details and I have not saved
+  // them, the number must not appear here at all — their "@handle" takes its
+  // place. A locally-saved contact still sees the number: this device already
+  // holds it in its own address book (the same WhatsApp-parity ordering the
+  // canonical resolver uses).
+  const peerHandle = profile?.userName || profile?.publicUsername || null;
+  const peerHidesContact = Boolean(
+    profile?.hideContact ?? profile?.privacySettings?.hideContact
+  );
+  const revealContact = !peerHidesContact || Boolean(localContact?.fullName);
+
   const name =
     localContact?.fullName ||
     (profile?.isSavedContact ? profile?.displayName : null) ||
     resolveCanonicalName({
       userId: peerId,
-      phone: localContact?.normalizedPhone
-        || (profile?.mobile?.number
-          ? `${profile.mobile.code || profile.mobile.countryCode || ''}${profile.mobile.number}`
-          : null),
+      phone: revealContact
+        ? (localContact?.normalizedPhone
+          || (profile?.mobile?.number
+            ? `${profile.mobile.code || profile.mobile.countryCode || ''}${profile.mobile.number}`
+            : null))
+        : null,
+      username: peerHandle,
+      hideContact: peerHidesContact,
       pushName: fallbackName || profile?.fullName,
       fallback: 'User',
     });
@@ -133,12 +150,20 @@ export default function UserDetailsSheet({
   const about = profile?.about || '';
   const code = profile?.mobile?.code || profile?.mobile?.countryCode || '';
   const number = localContact?.normalizedPhone || profile?.mobile?.number || '';
-  const phone = localContact?.normalizedPhone
-    ? localContact.normalizedPhone
-    : (code ? `${code} ${number}` : number);
+  // Displayed number always goes through the one formatter: "+91-7742470999".
+  // Blank when withheld, so the Phone row below (gated on `!!phone`) drops out
+  // entirely rather than rendering an empty field.
+  const phone = revealContact
+    ? formatPhoneNumber(
+        localContact?.normalizedPhone || (code ? `${code}${number}` : number),
+      )
+    : '';
+  // What is shown in the number's place.
+  const handleLine = (!revealContact && peerHandle) ? `@${peerHandle}` : '';
   const isOnline = Boolean(profile?.isOnline);
   const lastSeen = profile?.lastSeen;
-  const statusLine = isOnline ? 'online' : (lastSeen ? `last seen ${lastSeen}` : '');
+  // Same formatter as the chat header — never the raw ISO timestamp.
+  const statusLine = isOnline ? 'online' : (lastSeen ? formatLastSeen(lastSeen) : '');
 
   const pageBg = theme.colors.background;
   const primaryText = theme.colors.primaryTextColor;
@@ -217,11 +242,23 @@ export default function UserDetailsSheet({
             </View>
           )}
 
-          {/* Phone */}
-          {!!phone && (
-            <View style={[styles.infoCard, { borderColor: dividerClr }]}>
-              <Text style={[styles.infoValue, { color: primaryText }]} numberOfLines={1}>{phone}</Text>
-              <Text style={[styles.infoLabel, { color: subText }]}>Mobile</Text>
+          {/* Phone — or the handle standing in for it when the peer hides it,
+              so the row carries an identity rather than silently vanishing. */}
+          {(!!phone || !!handleLine) && (
+            <View style={[styles.infoCard, styles.infoCardRow, { borderColor: dividerClr }]}>
+              <View style={styles.infoCardText}>
+                <Text style={[styles.infoValue, { color: primaryText }]} numberOfLines={1}>
+                  {phone || handleLine}
+                </Text>
+                <Text style={[styles.infoLabel, { color: subText }]}>
+                  {phone ? 'Mobile' : 'Username'}
+                </Text>
+              </View>
+              {/* Copy the raw identifier — dial-able number, or the bare handle. */}
+              <CopyFieldButton
+                value={phone ? (code ? `${code}${number}` : number) : peerHandle}
+                label={phone ? 'Number' : 'Username'}
+              />
             </View>
           )}
 
@@ -368,6 +405,8 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 12,
   },
+  infoCardRow: { flexDirection: 'row', alignItems: 'center' },
+  infoCardText: { flex: 1, minWidth: 0 },
   infoValue: {
     fontFamily: 'Roboto-Regular',
     fontSize: 16.5,

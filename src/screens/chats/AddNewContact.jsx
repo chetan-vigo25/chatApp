@@ -23,6 +23,7 @@ import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Servi
 import { getPhoneRule, isPhoneValid, phoneLengthHint } from "../../utils/phoneValidation";
 import { APP_TAG_NAME } from '@env';
 import { Ionicons } from '@expo/vector-icons';
+import { formatPhoneNumber } from '../../services/contactNameStore';
 
 const DEBOUNCE_DELAY = 500;
 // Minimum characters before we search by username (system-generated, e.g. "ballu1").
@@ -444,7 +445,7 @@ export default function AddNewContact({ navigation }) {
     const resultSubLabel =
       queryType === 'email' ? (searchResult?.user?.email || query.trim())
       : queryType === 'username' ? `@${searchResult?.user?.userName || query.trim()}`
-      : `${selectedCountry.code} ${phoneDigits}`;
+      : formatPhoneNumber(`${selectedCountry.code}${phoneDigits}`);
 
     // Helper line under the input, based on what the user is typing.
     const helperLine = (() => {

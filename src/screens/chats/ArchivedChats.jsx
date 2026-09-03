@@ -4,7 +4,7 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useTheme } from '../../contexts/ThemeContext';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatActions, useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
 import ChatCard from '../../components/ChatCard';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
@@ -19,7 +19,6 @@ const MUTE_OPTIONS = [
 export default function ArchivedChats({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const {
-    archivedChatList,
     requestChatInfo,
     pinChat,
     unpinChat,
@@ -28,7 +27,8 @@ export default function ArchivedChats({ navigation }) {
     archiveChat,
     unarchiveChat,
     applyChatClearedPreview,
-  } = useRealtimeChat();
+  } = useRealtimeChatActions();
+  const { archivedChatList } = useRealtimeChatLists();
 
   const [selectedChatItem, setSelectedChatItem] = useState(null);
   const [actionSheetVisible, setActionSheetVisible] = useState(false);
@@ -416,6 +416,8 @@ export default function ArchivedChats({ navigation }) {
         userId: selectedChatItem?.peerUser?._id || selectedChatItem?.peerUserId,
         phone: selectedChatItem?.mobileNumber || selectedChatItem?.peerUser?.mobileNumber,
         pushName: selectedChatItem?.peerUser?.fullName,
+        username: selectedChatItem?.peerUser?.userName || null,
+        hideContact: Boolean(selectedChatItem?.peerUser?.hideContact),
         fallback: 'Unknown User',
       });
   const previewImage = isGroupItem

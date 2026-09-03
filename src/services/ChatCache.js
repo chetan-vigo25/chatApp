@@ -13,6 +13,8 @@
  * and async to SQLite in the background.
  */
 
+import { compareChatsByActivity } from '../utils/chatOrder';
+
 // ─── Configuration ─────────────────────────────────────
 const MAX_MESSAGES_PER_CHAT = 50;
 const MAX_CACHED_CHATS_MESSAGES = 40; // Keep messages in memory for up to N chats.
@@ -375,6 +377,10 @@ const scheduleEviction = () => {
 // ─── Internal Helpers ──────────────────────────────────
 
 const rebuildSortedIds = () => {
+  // Same rule as the realtime reducer and the ChatList render path — see
+  // utils/chatOrder. This used to read only `lastMessageAt || timestamp` with
+  // no tie-break, so the cache could hand back a DIFFERENT order than the one
+  // the reducer produced for the very same chats.
   sortedChatIds = [...chatMap.entries()]
     .sort((a, b) => {
       const chatA = a[1];
@@ -382,10 +388,7 @@ const rebuildSortedIds = () => {
       // Pinned first
       if (chatA.isPinned && !chatB.isPinned) return -1;
       if (!chatA.isPinned && chatB.isPinned) return 1;
-      // Then by last message time (newest first)
-      const timeA = chatA.lastMessageAt ? new Date(chatA.lastMessageAt).getTime() : (chatA.timestamp ? new Date(chatA.timestamp).getTime() : 0);
-      const timeB = chatB.lastMessageAt ? new Date(chatB.lastMessageAt).getTime() : (chatB.timestamp ? new Date(chatB.timestamp).getTime() : 0);
-      return timeB - timeA;
+      return compareChatsByActivity(chatA, chatB);
     })
     .map(([id]) => id);
 };

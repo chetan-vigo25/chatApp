@@ -13,7 +13,7 @@ import { Ionicons, MaterialCommunityIcons, FontAwesome6 } from '@expo/vector-ico
 import { useDispatch, useSelector } from 'react-redux';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { viewGroup, deleteGroup, transferOwnership } from '../../Redux/Reducer/Group/Group.reducer';
-import { useRealtimeChat } from '../../contexts/RealtimeChatContext';
+import { useRealtimeChatActions } from '../../contexts/RealtimeChatContext';
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useCall } from '../../calls/useCall';
@@ -60,6 +60,14 @@ const getMemberUser = (m) => {
     email: u.email || m.email || null,
     mobile: u.mobileNumber || u.phoneNumber || u.phone || mobileFromObj || m.mobileNumber || m.phone || null,
     isVerified: Boolean(u.isVerified || m.isVerified),
+    // Contact privacy. These were NOT extracted before, so `resolveMemberName`
+    // below always received `username: null, hideContact: false` and the
+    // privacy branch could never fire — the group member list kept showing a
+    // hidden member under the viewer's saved name for them.
+    userName: u.userName || u.username || m.userName || null,
+    hideContact: Boolean(
+      u.hideContact ?? u.privacySettings?.hideContact ?? m.hideContact ?? false,
+    ),
   };
 };
 
@@ -69,7 +77,7 @@ export default function GroupInfo({ navigation, route }) {
   const dispatch = useDispatch();
   const { startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
   const { currentGroup, isLoading } = useSelector((s) => s.group);
-  const { leaveGroup, removeChat, removeGroupMember: socketRemoveMember, promoteGroupMember, demoteGroupMember } = useRealtimeChat();
+  const { leaveGroup, removeChat, removeGroupMember: socketRemoveMember, promoteGroupMember, demoteGroupMember } = useRealtimeChatActions();
   // Device contact directory (local SQLite only) — still read by other parts of
   // this screen; names themselves go through the canonical resolver.
   const { directory } = useContactDirectory();
@@ -82,6 +90,9 @@ export default function GroupInfo({ navigation, route }) {
       userId: u.id,
       phone: u.mobile,
       pushName: u.fullName,
+      // Contact privacy — group member list is surface #4.
+      username: u.userName || null,
+      hideContact: Boolean(u.hideContact),
       fallback: 'Member',
     });
   };
@@ -89,7 +100,11 @@ export default function GroupInfo({ navigation, route }) {
   // number, with the name they set on their own account shown beneath it.
   const resolveMemberPushName = (m) => {
     const u = getMemberUser(m);
-    return pushNameOf({ userId: u.id, phone: u.mobile, pushName: u.fullName });
+    // hideContact MUST be passed: a "~account name" printed beside a hidden
+    // member re-attaches the identity they just asked to withhold.
+    return pushNameOf({
+      userId: u.id, phone: u.mobile, pushName: u.fullName, hideContact: u.hideContact,
+    });
   };
   const fadeAnim = useRef(new Animated.Value(0)).current;
   // Scroll position drives the collapsing header: the solid header bar + title

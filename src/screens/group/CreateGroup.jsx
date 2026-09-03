@@ -9,6 +9,8 @@ import { Ionicons } from '@expo/vector-icons';
 import useContactSync from '../../contexts/useContactSync';
 import { useDispatch, useSelector } from 'react-redux';
 import { createGroup } from '../../Redux/Reducer/Group/Group.reducer';
+import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
+import { MIN_DIRECTORY_QUERY } from '../../Redux/Services/Contact/Directory.Services';
 
 const MAX_MEMBERS = 100;
 
@@ -54,16 +56,52 @@ export default function CreateGroup({ navigation }) {
     Animated.timing(fadeAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
   }, []);
 
-  const filteredContacts = useMemo(() => {
+  const localContacts = useMemo(() => {
     const registered = matchedRegistered.filter((c) => c?.userId);
     if (!searchQuery.trim()) return registered;
     const q = searchQuery.toLowerCase();
     return registered.filter((c) => {
       const name = (c?.fullName || c?.name || '').toLowerCase();
       const phone = (c?.mobileFormatted || '').toLowerCase();
-      return name.includes(q) || phone.includes(q);
+      const handle = (c?.userName || c?.username || '').toLowerCase();
+      return name.includes(q) || phone.includes(q) || handle.includes(q);
     });
   }, [matchedRegistered, searchQuery]);
+
+  // DIRECTORY. The list above is the device phonebook, so someone whose number
+  // was never saved on this phone could not be put in a new group at all.
+  // Search the registered-user directory by @username or mobile number for
+  // exactly those people, skipping anyone the local list already offers.
+  const excludeIds = useMemo(
+    () => new Set(matchedRegistered.filter((c) => c?.userId).map((c) => String(c.userId))),
+    [matchedRegistered],
+  );
+  const { results: directory, loading: dirLoading, searchable } =
+    useUserDirectorySearch(searchQuery, { enabled: step === 1, excludeIds });
+
+  // A selected directory person stays listed after the query moves on — they
+  // are already counted in `selectedContacts`, so dropping the row would leave a
+  // phantom in the count with no way to deselect it.
+  const filteredContacts = useMemo(() => {
+    const rows = [...localContacts];
+    const seen = new Set(rows.map((c) => String(c.userId)));
+    const pushDir = (u) => {
+      const id = String(u.userId);
+      if (seen.has(id)) return;
+      seen.add(id);
+      rows.push({
+        userId: id,
+        fullName: u.name || u.userName || 'Unknown',
+        userName: u.userName || '',
+        profileImage: u.avatar || '',
+        mobileFormatted: u.mobileNumber || '',
+        fromDirectory: true,
+      });
+    };
+    selectedContacts.filter((c) => c.fromDirectory).forEach(pushDir);
+    directory.forEach(pushDir);
+    return rows;
+  }, [localContacts, directory, selectedContacts]);
 
   // ─── CONTACT SELECTION ───
   const toggleContact = useCallback((contact) => {
@@ -159,8 +197,16 @@ export default function CreateGroup({ navigation }) {
           <Text style={[styles.contactName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
             {name}
           </Text>
-          <Text style={[styles.contactAbout, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
-            {item?.about || item?.mobileFormatted || ''}
+          <Text
+            style={[
+              styles.contactAbout,
+              { color: item?.fromDirectory ? theme.colors.themeColor : theme.colors.placeHolderTextColor },
+            ]}
+            numberOfLines={1}
+          >
+            {item?.fromDirectory
+              ? (item?.mobileFormatted || (item?.userName ? `@${item.userName}` : 'Not in your contacts'))
+              : (item?.about || item?.mobileFormatted || '')}
           </Text>
         </View>
       </TouchableOpacity>
@@ -228,12 +274,20 @@ export default function CreateGroup({ navigation }) {
         <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
           <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
           <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-            placeholder="Search contacts..."
+            placeholder="Search contacts, @username or number"
+            autoCapitalize="none"
+            autoCorrect={false}
             placeholderTextColor={theme.colors.placeHolderTextColor}
             value={searchQuery}
             onChangeText={setSearchQuery}
             style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
           />
+          {/* Same in-bar "searching" cue as the contact picker: local matches
+              may already be listed, so an in-flight directory lookup would
+              otherwise be invisible. */}
+          {dirLoading && (
+            <ActivityIndicator size="small" color={theme.colors.themeColor} style={{ marginRight: 6 }} />
+          )}
           {searchQuery.length > 0 && (
             <TouchableOpacity onPress={() => setSearchQuery('')} activeOpacity={0.6}>
               <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
@@ -243,10 +297,12 @@ export default function CreateGroup({ navigation }) {
       </View>
 
       {/* Contact List */}
-      {isSyncing && filteredContacts.length === 0 ? (
+      {(isSyncing || dirLoading) && filteredContacts.length === 0 ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={theme.colors.themeColor} />
-          <Text style={[styles.loadingText, { color: theme.colors.placeHolderTextColor }]}>Loading contacts...</Text>
+          <Text style={[styles.loadingText, { color: theme.colors.placeHolderTextColor }]}>
+            {dirLoading ? 'Searching...' : 'Loading contacts...'}
+          </Text>
         </View>
       ) : (
         <FlatList
@@ -262,6 +318,11 @@ export default function CreateGroup({ navigation }) {
             <View style={styles.emptyWrap}>
               <Ionicons name="people-outline" size={48} color={theme.colors.placeHolderTextColor} />
               <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor }]}>No contacts found</Text>
+              {searchQuery.trim().length > 0 && !searchable && (
+                <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor, fontSize: 12, marginTop: 4 }]}>
+                  {`Type at least ${MIN_DIRECTORY_QUERY} characters to search by @username or mobile number`}
+                </Text>
+              )}
             </View>
           }
         />

@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useSyncExternalStore } from 'react';
 import { AppState, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
@@ -6,6 +6,7 @@ import { getSocket, isSocketConnected, isSocketAuthed, subscribeSocketState } fr
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
+import { getChatActivityValue, compareChatsByActivity } from '../utils/chatOrder';
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
 import { shouldEmitReadAll } from '../utils/readAllThrottle';
@@ -16,6 +17,8 @@ import { useLocationTracking } from '../hooks/useLocationTracking';
 import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../services/MediaDownloadManager';
 import { shouldAutoDownloadNow, AUTO_DOWNLOAD_ENABLED } from '../services/autoDownloadSettings';
+import { setPeerIdentity } from '../services/contactNameStore';
+import { renderSystemMessage } from '../utils/systemMessage';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -391,6 +394,34 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
     };
   }
 
+  // ── Group system notice ("X added Y", "… changed the group name") ────────
+  // Rendered from the STRUCTURED event so the row names people by THIS viewer's
+  // display rule (saved contact → number → @handle → account name), exactly
+  // like the thread. `text` is frozen at write time from the actor's account
+  // name, so without this the list and the thread name the same person
+  // differently — and the list keeps naming a member who has since turned
+  // `hideContact` on. Falls back to `text` for rows written before the event.
+  if (messageType === 'system') {
+    const evt = rawLastMessage?.systemEvent || chat?.lastMessageSystemEvent || null;
+    const sysText = (evt?.type
+      ? renderSystemMessage({ systemEvent: evt, text: messageText }, currentUserId)
+      : '') || messageText || '';
+    return {
+      text: sysText,
+      icon: null,
+      prefix: '',
+      isEdited: false,
+      isDeleted: false,
+      fullText: sysText,
+      prefixText: '',
+      body: sysText,
+      suffixText: '',
+      // Never translate it: the sentence is OUR copy wrapped around real names,
+      // and a translator mangles the names.
+      translatable: false,
+    };
+  }
+
   // For group chats, the lastMessage.text already contains the sender prefix (e.g. "John: Hello")
   // so we should not add another "You:" prefix. For private chats, add "You:" if the sender is current user.
   const baseText = isGroupChat
@@ -446,15 +477,12 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
 };
 
 const sortByActivity = (chatMap, ids) => {
+  // Comparator lives in utils/chatOrder so the cache and the render fallback
+  // sort exactly the same way — see that file for why the key is a max and why
+  // the tie-break is mandatory on Hermes.
   return [...ids].sort((a, b) => {
-    const chatA = chatMap[a] || {};
-    const chatB = chatMap[b] || {};
-    const tsA = getChatTimestampValue(chatA);
-    const tsB = getChatTimestampValue(chatB);
-    if (tsB !== tsA) return tsB - tsA;
-    // Deterministic tie-break for identical activity timestamps (two messages in
-    // the same millisecond). JS Array.sort stability is not guaranteed across the
-    // engines we ship on (Hermes), so without this a re-sort could flip equal rows.
+    const cmp = compareChatsByActivity(chatMap[a] || {}, chatMap[b] || {});
+    if (cmp !== 0) return cmp;
     return String(a).localeCompare(String(b));
   });
 };
@@ -621,25 +649,8 @@ const normalizeStatus = (status) => {
   return 'offline';
 };
 
-const getChatTimestampValue = (chat = {}) => {
-  // Sort key = the most recent of EVERY activity field. This used to return the
-  // first truthy field (`timestamp`), which made re-sort intermittently fail:
-  // an incoming `message:new` advances `lastMessageAt` but NOT `timestamp`, so a
-  // row whose `timestamp` was set by an earlier hydrate/chat:list:update kept its
-  // stale sort position and never bubbled to the top — the row only moved when a
-  // separate chat:list:update happened to refresh `timestamp`. Taking the max
-  // makes ordering deterministic regardless of which path last touched the row.
-  // `updatedAt` is deliberately NOT part of the max: it's a server-doc touch
-  // time (mute/read/archive changes bump it), so a REST hydrate could float a
-  // stale chat above rows with genuinely newer messages. It only breaks the tie
-  // for rows that have no message activity at all (brand-new empty chat).
-  const messageActivity = Math.max(
-    toTimestamp(chat?.timestamp),
-    toTimestamp(chat?.lastMessageAt),
-    toTimestamp(chat?.lastMessage?.createdAt),
-  );
-  return messageActivity || toTimestamp(chat?.updatedAt);
-};
+// Single definition, shared with ChatCache and the ChatList render fallback.
+const getChatTimestampValue = getChatActivityValue;
 
 const getChatTimestampIso = (chat = {}) => {
   return (
@@ -791,6 +802,10 @@ const reducer = (state, action) => {
                 type: chat.lastMessageType || 'text',
                 messageType: chat.lastMessageType || 'text',
                 senderId: chat.lastMessageSender || null,
+                // A socket row carries the group notice's structured event as a
+                // FLAT field; fold it in so buildLastMessageDisplay finds it in
+                // the same place as on a REST row.
+                systemEvent: chat.lastMessageSystemEvent || null,
                 createdAt: chat.lastMessageAt
                   ? new Date(Number(chat.lastMessageAt) || chat.lastMessageAt).toISOString()
                   : null,
@@ -1089,7 +1104,10 @@ const reducer = (state, action) => {
     // The display name only updates the server-side fallback — a locally-saved
     // contact name still wins via the contact directory's resolveName().
     case 'PATCH_PEER_PROFILE': {
-      const { userId, profileImage, about, name, isVerified } = action.payload || {};
+      const {
+        userId, profileImage, about, name, isVerified,
+        userName, hideContact, mobileNumber,
+      } = action.payload || {};
       const uid = normalizeId(userId);
       if (!uid) return state;
 
@@ -1107,11 +1125,22 @@ const reducer = (state, action) => {
         if (about !== undefined) nextPeer.about = about;
         if (name) nextPeer.fullName = name;
         if (isVerified !== undefined) nextPeer.isVerified = !!isVerified;
+        // Contact privacy: the resolver needs BOTH the handle and the flag, and
+        // the cached number must be cleared when it is withheld — a stale
+        // mobileNumber left in the row would keep rendering after the peer hid
+        // it, and it would still be sitting in SQLite for anyone to read.
+        if (userName !== undefined) nextPeer.userName = userName;
+        if (hideContact !== undefined) nextPeer.hideContact = !!hideContact;
+        if (mobileNumber !== undefined) {
+          nextPeer.mobileNumber = mobileNumber;
+          if (!mobileNumber) nextPeer.mobile = null;
+        }
 
         chatMap[cid] = {
           ...chat,
           peerUser: nextPeer,
           otherUser: nextPeer,
+          ...(mobileNumber !== undefined ? { mobileNumber } : {}),
           ...(profileImage !== undefined ? { chatAvatar: profileImage } : {}),
           // ChatCard reads `item.isVerified || item.peerUser.isVerified` — a stale
           // top-level true would keep the badge visible after an admin removes it.
@@ -2190,7 +2219,7 @@ const reducer = (state, action) => {
 
     // ─── GROUP: Incoming group message — update chat list preview ───
     case 'INCOMING_GROUP_MESSAGE': {
-      const { chatId: rawChatId, groupId: rawGroupId, senderId, senderName, text, messageType, createdAt, messageId, groupName, groupAvatar, groupDescription } = action.payload || {};
+      const { chatId: rawChatId, groupId: rawGroupId, senderId, senderName, text, messageType, createdAt, messageId, groupName, groupAvatar, groupDescription, systemEvent } = action.payload || {};
       const normalizedChatId = normalizeId(rawChatId);
       const normalizedGroupId = normalizeId(rawGroupId);
 
@@ -2258,6 +2287,11 @@ const reducer = (state, action) => {
           messageId,
           serverMessageId: messageId,
           createdAt: lastMessageAt,
+          // Structured group notice — buildLastMessageDisplay renders the names
+          // from it. Explicitly nulled for a non-system message so the previous
+          // notice's event (kept by the spread above) can't relabel a normal
+          // message that followed it.
+          systemEvent: systemEvent || null,
           // A NEW message starts its own tick clock. The spread above kept the
           // PREVIOUS last message's status (often 'read'), so a fresh outgoing
           // group message rendered an instant blue tick in the list and the row
@@ -2575,10 +2609,54 @@ const reducer = (state, action) => {
   }
 };
 
-const RealtimeChatContext = createContext(null);
+// ─── Split contexts ───────────────────────────────────────────────────────────
+// One context carrying `state` re-rendered EVERY consumer on every typing tick,
+// presence heartbeat and unread bump — including the always-mounted tab bar and
+// banner host. The value is split three ways so a consumer subscribes only to
+// what it actually reads:
+//
+//   ActionsContext — the ~50 action callbacks. All useCallback-stable, so this
+//                    value's identity effectively never changes: action-only
+//                    consumers never re-render from realtime traffic at all.
+//   ListsContext   — { chatList, archivedChatList }, recomputed only when the
+//                    chat list itself changes.
+//   StoreContext   — an external store (useSyncExternalStore) over `state`, so
+//                    a consumer can select ONE slice and re-render only when
+//                    that slice changes, or take a ref and never re-render.
+//
+// `useRealtimeChat()` still returns the merged shape, so untouched callers keep
+// working — but it subscribes to everything, so prefer the narrow hooks.
+const RealtimeChatActionsContext = createContext(null);
+const RealtimeChatListsContext = createContext(null);
+const RealtimeChatStoreContext = createContext(null);
 
 export function RealtimeChatProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
+
+  // ─── External store over `state` ───
+  // `stateRef` is assigned during render so a selector reading it mid-render
+  // (and `useRealtimeChatStateRef` consumers) always sees the committed value;
+  // subscribers are notified after commit, which is what useSyncExternalStore
+  // expects.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const storeListenersRef = useRef(null);
+  if (storeListenersRef.current === null) storeListenersRef.current = new Set();
+
+  useEffect(() => {
+    storeListenersRef.current.forEach((listener) => {
+      try { listener(); } catch { /* a bad subscriber must not break the rest */ }
+    });
+  }, [state]);
+
+  const store = useMemo(() => ({
+    subscribe: (listener) => {
+      storeListenersRef.current.add(listener);
+      return () => storeListenersRef.current.delete(listener);
+    },
+    getSnapshot: () => stateRef.current,
+    stateRef,
+  }), []);
 
   // Mirror the set of left/removed groups into a cross-module registry so the
   // FCM service (including its headless background handler) can suppress
@@ -2646,8 +2724,8 @@ export function RealtimeChatProvider({ children }) {
   const deliveredEmittedRef = useRef(new Set());
   const currentUserIdRef = useRef(state.currentUserId);
   currentUserIdRef.current = state.currentUserId;
-  const stateRef = useRef(state);
-  stateRef.current = state;
+  // `stateRef` is declared with the external store near the top of the provider
+  // (it backs both this file's socket handlers and useRealtimeChatStateRef).
   // Bridge: hydrateChats is declared AFTER attachSocketListeners (which needs
   // it for the connect/foreground chat-list reconcile). Kept current via the
   // assignment right after hydrateChats' definition.
@@ -3010,6 +3088,10 @@ export function RealtimeChatProvider({ children }) {
           // Album fields — survive the SQLite round-trip via payload JSON
           mediaGroupId: source?.mediaGroupId || null,
           mediaItems: Array.isArray(source?.mediaItems) ? source.mediaItems : null,
+          // Group system event — see the group-message path below. Rides the
+          // payload JSON so the thread can re-render "X added Y" with names
+          // resolved locally after a reload.
+          systemEvent: (source?.systemEvent && typeof source.systemEvent === 'object') ? source.systemEvent : null,
           replyToMessageId: replyToMsgId,
           replyPreviewText,
           replyPreviewType,
@@ -4151,6 +4233,8 @@ export function RealtimeChatProvider({ children }) {
           groupName: data?.groupName || data?.group?.name || null,
           groupAvatar: data?.groupAvatar || data?.group?.avatar || null,
           groupDescription: data?.groupDescription || data?.group?.description || null,
+          // "X added Y" etc. — the chat-list row renders the names locally.
+          systemEvent: (data?.systemEvent && typeof data.systemEvent === 'object') ? data.systemEvent : null,
         },
       });
 
@@ -4225,6 +4309,11 @@ export function RealtimeChatProvider({ children }) {
           // Album fields — survive the SQLite round-trip via payload JSON
           mediaGroupId: data?.mediaGroupId || null,
           mediaItems: Array.isArray(data?.mediaItems) ? data.mediaItems : null,
+          // Group system event — lets the thread render "X added Y" with names
+          // resolved from THIS device's address book instead of the frozen
+          // account-name text the server had to bake in. Also rides the payload
+          // JSON, so it survives the SQLite round-trip.
+          systemEvent: (data?.systemEvent && typeof data.systemEvent === 'object') ? data.systemEvent : null,
           replyToMessageId: replyToMessageId || null,
           replyPreviewText: replyPreviewText || null,
           replyPreviewType: replyPreviewType || null,
@@ -4255,6 +4344,9 @@ export function RealtimeChatProvider({ children }) {
           status: data?.status || 'sent',
           createdAt,
           serverMessageId: resolvedMessageId,
+          // Group notice ("X added Y") — persisted so the cold-start list
+          // renders the names locally instead of the server's frozen text.
+          systemEvent: (data?.systemEvent && typeof data.systemEvent === 'object') ? data.systemEvent : null,
         }, {
           // Seed a correct GROUP row if it was deleted locally, so it restores
           // with the real name/image instead of a blank "private" placeholder.
@@ -4627,7 +4719,54 @@ export function RealtimeChatProvider({ children }) {
           profileImage: data?.profileImage ?? data?.profilePicture,
           about: data?.about,
           name: data?.fullName || data?.name,
+          // Public handle + contact-privacy state ride the SAME event as every
+          // other profile change (no parallel sync channel). Without these two
+          // the chat header of someone who just hid their number keeps
+          // rendering the cached number until reinstall.
+          userName: data?.userName ?? null,
+          hideContact: Boolean(data?.hideContact),
+          // '' when the peer hid it — the resolver treats an empty number as
+          // unknown and falls through to the handle.
+          mobileNumber: data?.phoneNumber ?? undefined,
         },
+      });
+
+      // …and persist it. The dispatch above only touches React state, so
+      // without this the patch was lost on the next cold start and the chat
+      // list re-read the PREVIOUS values out of SQLite — which is why a peer
+      // who turned their privacy toggle back OFF kept showing as "@handle".
+      ChatDatabase.updatePeerProfile(userId, {
+        fullName: data?.fullName ?? data?.name,
+        userName: data?.userName ?? null,
+        hideContact: Boolean(data?.hideContact),
+        mobileNumber: data?.phoneNumber,
+        profileImage: data?.profileImage ?? data?.profilePicture,
+        about: data?.about,
+      }).catch(() => {});
+
+      // The status list renders from its own cached snapshot, in which the
+      // label was baked by the server at fetch time. The backend drops its 60s
+      // feed cache on this same change, so the next fetch is right — this keeps
+      // the COLD render right until then.
+      ChatDatabase.updateStatusFeedIdentity(userId, {
+        fullName: data?.fullName ?? data?.name,
+        userName: data?.userName ?? null,
+        hideContact: Boolean(data?.hideContact),
+        mobileNumber: data?.phoneNumber,
+        profileImage: data?.profileImage ?? data?.profilePicture,
+      }).catch(() => {});
+
+      // …and record it centrally. THIS is what makes the change reach the
+      // surfaces that are not chat rows — status list, status viewers, likers,
+      // call logs, call info, forward picker, message info. They all render
+      // server rows fetched earlier, so each one holds the peer's PRE-toggle
+      // state; every resolver consults this overlay, so a single event corrects
+      // all of them at once and re-renders them (the version bump).
+      setPeerIdentity(userId, {
+        userName: data?.userName ?? null,
+        hideContact: Boolean(data?.hideContact),
+        fullName: data?.fullName ?? data?.name,
+        mobileNumber: data?.phoneNumber,
       });
     };
     socket.on('contact:updated', onContactUpdated);
@@ -4731,11 +4870,22 @@ export function RealtimeChatProvider({ children }) {
         payload: { groupId, previousAdmin: data?.previousAdmin, newAdmin: data?.newAdmin },
       });
     };
+    // The owner deleted the group → it is gone for EVERY member. Mark the
+    // membership ended FIRST (that is what disables the composer and makes a
+    // member sitting inside the thread stop treating it as a live chat), then
+    // drop the row. Removing the row alone left a member who had the group open
+    // typing into a chat that no longer exists.
     const onGroupDeleted = (payload) => {
       const data = payload?.data || payload;
       const groupId = normalizeId(data?.groupId);
       if (!groupId) return;
+      dispatch({ type: 'GROUP_MEMBERSHIP_ENDED', payload: { groupId } });
       dispatch({ type: 'REMOVE_CHAT', payload: groupId });
+      // REMOVE_CHAT only guards the in-memory list; SQLite is the source of
+      // truth on the next launch, so the row has to go from there too or the
+      // deleted group reappears after a restart.
+      ChatDatabase.deleteChatRow(groupId).catch(() => {});
+      performDurableChatClear(groupId).catch(() => {});
     };
 
     socket.on('group:admin:transferred', onGroupAdminTransferred);
@@ -5661,11 +5811,10 @@ export function RealtimeChatProvider({ children }) {
     });
   }, [state.archivedChatIds, state.chatMap, state.presenceByUser, state.typingStates, state.unreadByChat, state.highlightByChat, state.currentUserId]);
 
-  const value = useMemo(() => ({
-    state,
-    inactiveGroupIds: state.inactiveGroupIds,
-    chatList,
-    archivedChatList,
+  // Actions only — every entry is useCallback-stable, so this value's identity
+  // holds across realtime traffic and action-only consumers never re-render.
+  const actionsValue = useMemo(() => ({
+    // Chat lifecycle
     hydrateChats,
     setActiveChat,
     markChatRead,
@@ -5720,9 +5869,6 @@ export function RealtimeChatProvider({ children }) {
     getGroupStats,
     getGroupActivity,
   }), [
-    state,
-    chatList,
-    archivedChatList,
     hydrateChats,
     setActiveChat,
     markChatRead,
@@ -5771,17 +5917,96 @@ export function RealtimeChatProvider({ children }) {
     getGroupActivity,
   ]);
 
+  // The two derived lists, recomputed only when the chat list itself changes.
+  const listsValue = useMemo(
+    () => ({ chatList, archivedChatList }),
+    [chatList, archivedChatList],
+  );
+
   return (
-    <RealtimeChatContext.Provider value={value}>
-      {children}
-    </RealtimeChatContext.Provider>
+    <RealtimeChatStoreContext.Provider value={store}>
+      <RealtimeChatActionsContext.Provider value={actionsValue}>
+        <RealtimeChatListsContext.Provider value={listsValue}>
+          {children}
+        </RealtimeChatListsContext.Provider>
+      </RealtimeChatActionsContext.Provider>
+    </RealtimeChatStoreContext.Provider>
   );
 }
 
+const useStore = (hook) => {
+  const store = useContext(RealtimeChatStoreContext);
+  if (!store) throw new Error(`${hook} must be used within RealtimeChatProvider`);
+  return store;
+};
+
+/**
+ * The ~50 action callbacks. Stable identity — a consumer that only dispatches
+ * actions (and never reads state) re-renders zero times from realtime traffic.
+ * Prefer this over `useRealtimeChat()` wherever no state is read.
+ */
+export const useRealtimeChatActions = () => {
+  const actions = useContext(RealtimeChatActionsContext);
+  if (!actions) throw new Error('useRealtimeChatActions must be used within RealtimeChatProvider');
+  return actions;
+};
+
+/** `{ chatList, archivedChatList }` — re-renders only when a list changes. */
+export const useRealtimeChatLists = () => {
+  const lists = useContext(RealtimeChatListsContext);
+  if (!lists) throw new Error('useRealtimeChatLists must be used within RealtimeChatProvider');
+  return lists;
+};
+
+/**
+ * Select one slice of realtime state; re-renders only when THAT slice changes.
+ * `selector` must be stable (module scope or useCallback) and cheap — it runs
+ * on every store notification. `isEqual` defaults to Object.is, so a selector
+ * returning a fresh object each call must supply its own comparator.
+ */
+export const useRealtimeChatSlice = (selector, isEqual) => {
+  const store = useStore('useRealtimeChatSlice');
+  // Cache the last selected value so an unchanged slice returns an identical
+  // reference — without this, getSnapshot would return a new value on every
+  // notification and useSyncExternalStore would re-render regardless.
+  const lastRef = useRef({ hasValue: false, value: undefined });
+  const getSelection = useCallback(() => {
+    const next = selector(store.getSnapshot());
+    const last = lastRef.current;
+    if (last.hasValue) {
+      const same = isEqual ? isEqual(last.value, next) : Object.is(last.value, next);
+      if (same) return last.value;
+    }
+    lastRef.current = { hasValue: true, value: next };
+    return next;
+  }, [store, selector, isEqual]);
+  return useSyncExternalStore(store.subscribe, getSelection, getSelection);
+};
+
+/**
+ * A ref that always holds the current realtime state, WITHOUT subscribing.
+ * For consumers that read state only inside callbacks/effects (never during
+ * render) — they get fresh data and never re-render. Reading `.current` during
+ * render is a bug: the component won't update when the value changes.
+ */
+export const useRealtimeChatStateRef = () => useStore('useRealtimeChatStateRef').stateRef;
+
+/**
+ * Back-compat merged shape. Subscribes to the WHOLE state, so it re-renders on
+ * every typing tick and presence heartbeat — prefer the narrow hooks above.
+ */
 export const useRealtimeChat = () => {
-  const context = useContext(RealtimeChatContext);
-  if (!context) {
+  const actions = useContext(RealtimeChatActionsContext);
+  const lists = useContext(RealtimeChatListsContext);
+  const store = useContext(RealtimeChatStoreContext);
+  if (!actions || !lists || !store) {
     throw new Error('useRealtimeChat must be used within RealtimeChatProvider');
   }
-  return context;
+  const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  return useMemo(() => ({
+    ...actions,
+    ...lists,
+    state,
+    inactiveGroupIds: state.inactiveGroupIds,
+  }), [actions, lists, state]);
 };

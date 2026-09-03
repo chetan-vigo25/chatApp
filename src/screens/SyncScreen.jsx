@@ -145,11 +145,25 @@ const _performInitialRestore = async (userId, onProgress) => {
   // ── Step 1: Fetch chatlist (the ONLY thing gating entry to the app) ──
   onProgress(15, 'Fetching chats...');
   let chatList = [];
+  // "The server said this account has no chats" and "the request failed" are
+  // NOT the same thing. Both used to end up as an empty array, and the empty
+  // array then marked INITIAL_SYNC_COMPLETE — so one flaky fetch right after
+  // login (network still coming up) permanently recorded the account as
+  // restored, and the user landed on an empty chat list that only a manual
+  // pull-to-refresh could fill.
+  let fetchFailed = false;
   try {
     const response = await chatServices.chatListData('');
     chatList = response?.data?.docs || [];
   } catch (err) {
+    fetchFailed = true;
     console.warn('[Sync] chatlist fetch failed:', err?.message);
+  }
+
+  if (fetchFailed) {
+    // Nothing is marked done — the next launch retries the restore, and
+    // ChatList's own auto-fetch covers this session in the meantime.
+    return false;
   }
 
   if (chatList.length === 0) {

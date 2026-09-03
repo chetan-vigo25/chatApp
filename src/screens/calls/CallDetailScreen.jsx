@@ -131,7 +131,7 @@ export default function CallDetailScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const { startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
-  const { resolveName, directory } = useContactDirectory();
+  const { resolveName, directory, peerPrivacyOf } = useContactDirectory();
 
   const {
     peer = null,
@@ -181,7 +181,7 @@ export default function CallDetailScreen() {
       // realtime rows and is only used when no user objects are available.
       const resolved = (participants || [])
         .map((u) => (u && (u._id || u.userId)
-          ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u))
+          ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u), peerPrivacyOf(u))
           : null))
         .filter(Boolean);
       const names = resolved.length ? resolved : participantNames;
@@ -189,7 +189,7 @@ export default function CallDetailScreen() {
     }
     // Pass the peer's number so an unsaved caller shows as a number, not as the
     // account name they chose for themselves.
-    return resolveName(peerId, peer?.fullName || peer?.userName || 'Unknown', peerPhoneOf(peer));
+    return resolveName(peerId, peer?.fullName || peer?.userName || 'Unknown', peerPhoneOf(peer), peerPrivacyOf(peer));
   }, [isGroup, groupName, participants, participantNames, peer, peerId, resolveName]);
 
   // Newest-first, then bucket into day sections (Today / Yesterday / dated).
@@ -222,7 +222,7 @@ export default function CallDetailScreen() {
       const peers = (participants || [])
         .map((u) => (u && u._id ? {
           id: String(u._id),
-          name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u)),
+          name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u), peerPrivacyOf(u)),
           pushName: u.fullName || u.userName || null,
           mobile: peerPhoneOf(u),
           avatar: toSecureMediaUri(u.profileImageUrl || u.profileImage) || null,

@@ -100,6 +100,12 @@ const lightTheme = {
     // Message bubbles (WhatsApp-parity; sent bg is overridden by chatColor)
     bubbleSent: '#03574f',
     bubbleSentText: '#E9EDEF',
+    // Ground the chat thread sits on (wallpaper doodles are drawn over it).
+    // Deliberately NOT pure white: an off-white lets the white incoming
+    // bubbles read as bubbles instead of dissolving into the background, and
+    // the warm cast matches the doodle ink. Dark mode keeps the app's true
+    // black, so the chat is continuous with every other surface there.
+    chatBackground: '#F6F3EE',
     bubbleReceived: '#ffffff',
     bubbleDeleted: '#f5f5f5',
     bubbleMeta: '#5B6B75',
@@ -146,8 +152,14 @@ const darkTheme = {
     readReceipt: '#53BDEB',
     bubbleSent: '#03574f',
     bubbleSentText: '#E9EDEF',
-    bubbleReceived: '#202C33',
-    bubbleDeleted: '#182229',
+    // Darker than the old #202C33 / #182229. Those were picked for WhatsApp's
+    // #0B141A chat ground; this app's dark background is true black, and
+    // against it they read as pale blue-grey slabs rather than bubbles resting
+    // on the screen. These sit just far enough above black to keep the bubble
+    // shape (helped by the hairline the light theme uses) without glaring.
+    chatBackground: '#000000',
+    bubbleReceived: '#151E23',
+    bubbleDeleted: '#101519',
     bubbleMeta: '#8696a0',
     replyHighlight: '#FFC107',
     disabledOpacity: 0.55,

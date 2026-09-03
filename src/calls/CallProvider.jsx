@@ -93,7 +93,16 @@ const buildIncomingPeer = (from = {}) => {
   const pushName = from?.pushName || from?.name || null;
   return {
     id,
-    name: resolveCanonicalName({ userId: id, phone: mobile, pushName, fallback: 'Unknown' }),
+    // Contact privacy — the ring payload carries the caller's handle and the
+    // server withholds their number when hidden.
+    name: resolveCanonicalName({
+      userId: id,
+      phone: mobile,
+      pushName,
+      username: from?.userName || from?.publicUsername || null,
+      hideContact: Boolean(from?.hideContact),
+      fallback: 'Unknown',
+    }),
     pushName,
     mobile,
     avatar: from?.avatar || null,

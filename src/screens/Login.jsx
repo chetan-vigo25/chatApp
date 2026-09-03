@@ -93,9 +93,12 @@ export default function Login({ navigation }) {
       showToast(`Enter a valid ${selectedCountry?.name || ''} number (${phoneLengthHint(selectedCountry?.code)})`.replace('  ', ' '));
       return;
     }
-    const fullPhoneNumber = `${selectedCountry.code}${phoneNumber}`;
-    console.log('[LOGIN] generate OTP tapped →', fullPhoneNumber);
-    const result = await dispatch(generateOtpAction(fullPhoneNumber));
+    console.log('[LOGIN] generate OTP tapped →', `${selectedCountry.code}${phoneNumber}`);
+    // Country code and national number go separately: the same digits can be a
+    // different account — and a different reserved VIP number — per country.
+    const result = await dispatch(
+      generateOtpAction({ mobileCode: selectedCountry.code, number: phoneNumber })
+    );
     if (generateOtpAction.fulfilled.match(result)) {
       console.log('[LOGIN] OTP request succeeded');
       // The OTP is delivered only via SMS — it is never returned in the response,
@@ -108,7 +111,13 @@ export default function Login({ navigation }) {
       setPhoneNumber('');
     } else {
       console.log('[LOGIN] OTP request failed →', result?.error?.message || result?.payload);
-      showToast('Failed to generate OTP. Please try again.');
+      // The API layer already toasts a server-sent message (a reserved VIP
+      // number, a wrong country code, a disabled number). Only fall back to a
+      // generic prompt when nothing has been shown — otherwise the real
+      // explanation gets buried under a second, less useful toast.
+      if (!result?.payload?.alreadyNotified) {
+        showToast(result?.payload?.message || 'Failed to generate OTP. Please try again.');
+      }
     }
   };
 

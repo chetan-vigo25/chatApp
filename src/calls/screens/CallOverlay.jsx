@@ -74,7 +74,7 @@ export default function CallOverlay() {
   const { theme, isDarkMode } = useTheme();
   // Resolve the caller/callee name to the device's saved contact name (then
   // mobile number, then backend name) — same priority as the chat list.
-  const { resolveName } = useContactDirectory();
+  const { resolveName, peerPrivacyOf } = useContactDirectory();
   const c = theme.colors;
   // Palette for the opaque (audio / incoming / outgoing / ended) call screen,
   // which now sits on the WhatsApp chat wallpaper — so text/icons must read on a
@@ -170,7 +170,18 @@ export default function CallOverlay() {
         ? (asText(ident?.fullName) || asText(ident?.mobileNumber) || pName)
         : pName;
       const phone = asText(p.mobile) || asText(p.phone) || asText(ident?.mobileNumber) || null;
-      const name = resolveName(p.id, fallbackName, phone) || fallbackName || 'Member';
+      // Merge both identity sources before reading the privacy bits: the roster
+      // carries `hideContact` + `userName`, while the local chat row (`ident`)
+      // may only have one of them.
+      const rosterPrivacy = peerPrivacyOf(p);
+      const identPrivacy = peerPrivacyOf(ident);
+      const privacy = {
+        // Prefer whichever source actually HAS the value — a plain spread let a
+        // null from the roster wipe a handle the chat row knew about.
+        username: rosterPrivacy.username || identPrivacy.username,
+        hideContact: rosterPrivacy.hideContact || identPrivacy.hideContact,
+      };
+      const name = resolveName(p.id, fallbackName, phone, privacy) || fallbackName || 'Member';
       out[p.id] = name === p.name ? p : { ...p, name };
     });
     return out;
@@ -282,7 +293,7 @@ export default function CallOverlay() {
 
   const peer = call?.peer || {};
   // Saved contact name > mobile number > backend name.
-  const peerDisplayName = resolveName(peer?.id, peer?.name, peer?.mobile || peer?.phone || peer?.mobileNumber) || peer?.name || 'Unknown';
+  const peerDisplayName = resolveName(peer?.id, peer?.name, peer?.mobile || peer?.phone || peer?.mobileNumber, peerPrivacyOf(peer)) || peer?.name || 'Unknown';
   const joined = isGroup ? joinedCount(call?.participants) : 0;
   const isConference = !!call?.isConference;
   // Conference title: "<name> & N other(s)" (host/first peer + everyone else).

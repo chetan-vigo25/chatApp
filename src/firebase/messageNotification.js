@@ -97,10 +97,19 @@ export const displayGroupedMessage = async (data) => {
   // push name. Runs headless on a killed app, so load the index explicitly.
   await loadContactNames().catch(() => {});
   const serverSenderName = data?.senderName || data?.senderFullName || data?.name || data?.title || '';
+  // Contact privacy. FCM data values are always STRINGS, so the flag arrives as
+  // 'true'/'false' (or absent) and must be compared as text — `Boolean('false')`
+  // is true and would hide the number for everyone.
+  const senderHidesContact = String(data?.senderHideContact ?? '') === 'true';
   const senderName = resolveCanonicalName({
     userId: data?.senderId,
     phone: data?.senderMobile || data?.mobileNumber || null,
     pushName: serverSenderName,
+    // The resolver puts this branch AFTER the saved-contact check and BEFORE the
+    // number, so a sender who hides their number shows as "@handle" even if an
+    // older/cached payload still carries `senderMobile`.
+    username: data?.senderUserName || null,
+    hideContact: senderHidesContact,
     fallback: 'New message',
   });
   // Prefer the un-prefixed per-line preview (`lineBody`); MessagingStyle attaches

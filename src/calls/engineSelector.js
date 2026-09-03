@@ -19,10 +19,13 @@ export const CALL_NATIVE_ENGINE_IOS = true;
 // stays on the proven WebView engine until this is deliberately flipped. What
 // flipping gains on Android: real SCREEN SHARE (Android System WebView has no
 // getDisplayMedia, so the WebView engine can never share; react-native-webrtc
-// captures natively via MediaProjection + its bundled foreground service —
-// needs the FOREGROUND_SERVICE_MEDIA_PROJECTION permission already added to
-// app.json, i.e. a prebuild). Same protocol.js surface — flipping back is the
-// entire rollback story, OTA-able.
+// captures natively via MediaProjection + its bundled foreground service).
+// NOTE: screen share is currently DORMANT — FOREGROUND_SERVICE_MEDIA_PROJECTION
+// was removed from app.json because no UI ever exposed it (CallControls takes
+// onToggleScreenShare but renders no button) and Play Console requires a
+// declaration + demo video for it. Re-add the permission to app.json AND
+// prebuild before shipping a share button. Same protocol.js surface — flipping
+// back is the entire rollback story, OTA-able.
 //
 // FLIPPED ON for the EARPIECE bug: on the WebView engine an Android call can
 // only ever play on the LOUDSPEAKER. The System WebView renders WebRTC audio on

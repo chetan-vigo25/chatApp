@@ -9,15 +9,22 @@ import { subscribeContactsChanged } from './contactEvents';
  * ────────────────
  * THE single source of truth for "what name do we show for this user?".
  *
- * WhatsApp rule (the ONLY rule — every surface must go through here):
- *   1. The peer is in MY device contacts  → my saved name for them.
- *   2. Otherwise                          → their phone number, formatted.
- *   3. Group contexts additionally show their self-set profile name as a
- *      secondary "~push name" line (never as the primary identity).
- *   4. The server's profile name (`fullName` on any payload) is ONLY a push
+ * The ONLY rule — every surface must go through here:
+ *   1. The peer HIDES their contact details → their "@handle".
+ *   2. Else, the peer is in MY device contacts → my saved name for them.
+ *   3. Otherwise                          → their phone number, formatted.
+ *   4. Group contexts additionally show their self-set profile name as a
+ *      secondary "~push name" line (never as the primary identity) — and that
+ *      line is suppressed entirely for a hidden peer, since a "~name" beside a
+ *      withheld number re-attaches the identity they asked to hide.
+ *   5. The server's profile name (`fullName` on any payload) is ONLY a push
  *      name. It is never the primary label for an unsaved peer — that is the
  *      exact bug this store exists to prevent (a chat row showing "Chetan"
  *      when the user never saved that number).
+ *
+ * Rule 1 sits ABOVE rule 2 by policy: `hideContact` means "hide me from
+ * everyone", saved contacts included. See the POLICY SWITCH note on
+ * resolveDisplayName for how to flip that back to WhatsApp parity.
  *
  * Why a module-level store and not just a hook: names are rendered from pure
  * render paths (memoized list rows, notification composition, the headless
@@ -41,6 +48,7 @@ subscribeContactsChanged(() => { loadContactNames(true); });
 subscribeSessionReset(() => {
   _index = null;
   _loading = null;
+  _peerIdentity.clear();
   _version += 1;
   notify();
 });
@@ -99,6 +107,46 @@ export const loadContactNames = async (force = false) => {
     return _index;
   })();
   return _loading;
+};
+
+// ── Live peer identity overrides ──────────────────────────────────────────
+//
+// A `contact:updated` tells us a peer's handle / privacy flag / name / number
+// changed RIGHT NOW. Most surfaces (status list, status viewers, likers, call
+// logs, call info, forward picker, message info) render rows fetched from the
+// server earlier, so those rows carry the state as it was AT FETCH TIME. Having
+// each screen subscribe and patch its own list would mean the same fix written
+// a dozen times, and a thirteenth screen would silently miss it.
+//
+// Instead the change is recorded once here, and every resolver consults it —
+// so one socket event corrects every mounted surface at once. Bumping the
+// version re-renders them (screens already depend on it for saved-name changes).
+//
+// Session-scoped by design: it is a freshness overlay on server rows, not a
+// cache. The next fetch already carries the new values.
+const _peerIdentity = new Map();   // userId → { userName, hideContact, fullName, mobileNumber }
+
+/**
+ * Record a peer's current identity/privacy state and re-render every subscriber.
+ * Only defined keys are merged, so a partial event never blanks a known field.
+ */
+export const setPeerIdentity = (userId, patch = {}) => {
+  const uid = userId != null ? String(userId) : '';
+  if (!uid || !patch || typeof patch !== 'object') return;
+  const prev = _peerIdentity.get(uid) || {};
+  const next = { ...prev };
+  for (const k of ['userName', 'hideContact', 'fullName', 'mobileNumber']) {
+    if (patch[k] !== undefined) next[k] = k === 'hideContact' ? Boolean(patch[k]) : patch[k];
+  }
+  _peerIdentity.set(uid, next);
+  _version += 1;
+  notify();
+};
+
+/** The override for a peer, or null. */
+export const getPeerIdentity = (userId) => {
+  const uid = userId != null ? String(userId) : '';
+  return (uid && _peerIdentity.get(uid)) || null;
 };
 
 /**
@@ -171,25 +219,61 @@ export const isSavedContact = ({ userId, phone } = {}) =>
   Boolean(getSavedName({ userId, phone }));
 
 /**
- * Pretty-print a number for display: "+91 77424 70999".
- * Anything already carrying separators is returned untouched.
+ * Pretty-print a number for display: "+917742470999".
+ *
+ * NO separator at all — not a space, not a dash. The country code runs straight
+ * into the national number (user rule). libphonenumber's `formatInternational()`
+ * returns "+91 77424 70999", which read as a typo everywhere a number is shown
+ * (chat list, chat header, profile screen and modal), and both separators that
+ * were tried after it looked wrong too.
+ *
+ * A number that arrives already spaced or dashed is re-formatted rather than
+ * passed through, since that grouping is exactly what we are removing.
  */
 export const formatPhoneNumber = (raw) => {
   if (!raw) return '';
   const s = String(raw).trim();
   if (!s) return '';
-  if (/[\s()\-]/.test(s)) return s;          // already grouped by the source
-  const e164 = e164ForMatch(s) || (s.startsWith('+') ? s : null);
-  if (!e164) return s;
+
+  const compact = s.replace(/[\s()\-]/g, '');
+  const e164 = e164ForMatch(compact) || (compact.startsWith('+') ? compact : null);
+  if (!e164) return compact || s;
+
   try {
     // libphonenumber knows where the country code ends — a hand-rolled
     // `\+\d{1,3}` split is greedy and mangles "+917742470999" into
     // "+917 74247 0999".
     const parsed = parsePhoneNumberFromString(e164);
-    const pretty = parsed?.formatInternational?.();
-    if (pretty) return pretty;
+    if (parsed?.countryCallingCode && parsed?.nationalNumber) {
+      return `+${parsed.countryCallingCode}${parsed.nationalNumber}`;
+    }
   } catch { /* fall through to the raw E.164 */ }
   return e164;
+};
+
+/**
+ * Is `raw` actually a phone number we may show as someone's identity?
+ *
+ * `formatPhoneNumber` is deliberately forgiving — it echoes back whatever it
+ * was handed so a profile screen can print an odd-looking number rather than a
+ * blank. The NAME resolver cannot be that forgiving: an account created from a
+ * @handle carries a stub number ("404", "" or a couple of digits), and echoing
+ * that back made the chat header read "404" for a peer whose handle is
+ * "@error404". A string only counts as a number here if it canonicalises to
+ * E.164 (libphonenumber's isPossible() is enough, so test/simulator numbers
+ * still show).
+ */
+export const isDisplayablePhone = (raw) => {
+  if (!raw) return false;
+  const compact = String(raw).trim().replace(/[\s()\-]/g, '');
+  if (!compact) return false;
+  return Boolean(e164ForMatch(compact));
+};
+
+/** "error404" / "@error404" → "@error404"; anything empty → null. */
+const handleOf = (username) => {
+  const h = String(username || '').trim().replace(/^@+/, '');
+  return h ? `@${h}` : null;
 };
 
 /**
@@ -207,18 +291,92 @@ export const resolveDisplayName = ({
   userId = null,
   phone = null,
   pushName = null,
+  username = null,
+  hideContact = false,
   fallback = 'Unknown',
 } = {}) => {
+  // A live `contact:updated` outranks whatever the caller's row was fetched
+  // with — that row may be minutes old (status list, call logs, forward picker).
+  const live = getPeerIdentity(userId);
+  if (live) {
+    if (live.hideContact !== undefined) hideContact = live.hideContact;
+    if (live.userName !== undefined) username = live.userName;
+    // A number the peer has since hidden must not be rendered from a stale row.
+    if (live.hideContact) phone = null;
+    else if (live.mobileNumber) phone = live.mobileNumber;
+    if (live.fullName) pushName = live.fullName;
+  }
+
+  // ── Contact privacy — FIRST, by policy ───────────────────────────────────
+  // The peer hides their contact details → show their public handle, and show
+  // it even to someone who has them saved in this device's phonebook. The
+  // saved-name check below is deliberately AFTER this one: the toggle means
+  // "hide my name and number from everyone", so a local address-book entry must
+  // not defeat it. The server sends the same "@handle" as `displayName`; this
+  // branch is what stops the LOCAL saved name from overriding it.
+  //
+  // POLICY SWITCH: moving these lines back BELOW the saved check restores
+  // WhatsApp parity ("saved contacts keep seeing the number") — and must be
+  // done in all three resolvers at once, including
+  // chat-backend/src/helpers/serializePublicUser.helper.js.
+  // The caller's row may not carry `hideContact` at all — `chat:create`'s
+  // peerUser, the directory-search row and the AddNewContact payload all omit
+  // it. But a row whose NAME is exactly the peer's own "@handle" is the server
+  // telling us the same thing: `serializePublicUser` writes that substitution
+  // only for a peer who hides their details. Reading it as the privacy flag is
+  // what keeps a handle-created account ("@test4422441", number withheld or a
+  // stub) from opening as a phone number or a phonebook nickname.
+  //
+  // Requiring the handle to be present on the SAME row is what separates this
+  // from the stale-redaction case below: a cached row that outlived the peer's
+  // toggle carries the old "@handle" name but not the matching `userName`.
+  const ownHandle = handleOf(username);
+  const isSelfRedacted = Boolean(ownHandle)
+    && String(pushName || '').trim().toLowerCase() === ownHandle.toLowerCase();
+  if (isSelfRedacted) hideContact = true;
+
+  if (hideContact && username) return ownHandle || fallback;
+
   const saved = getSavedName({ userId, phone });
   if (saved) return saved;
 
-  const formatted = formatPhoneNumber(phone);
-  if (formatted) return formatted;
+  // Self-healing guard for a STALE redacted name.
+  //
+  // While the peer had the toggle ON, the server substituted "@handle" into the
+  // name fields — and the clients cached that value (SQLite rows, status
+  // snapshots, call-log entries). When the peer turns the toggle back OFF those
+  // caches still hold "@handle", so without this the handle would keep showing
+  // on every surface that reads a cached name until the row was refetched.
+  //
+  // A real profile name never starts with "@", so an "@…" push name while
+  // `hideContact` is false can only be that leftover. Drop it and fall through
+  // to the number, exactly as before the feature existed.
+  const isHandlePush = /^@/.test(String(pushName || '').trim());
+  const cleanPush = !hideContact && isHandlePush ? null : pushName;
 
-  // No number known (username-created accounts, half-hydrated rows). Only here
-  // may the server's profile name surface.
-  const push = String(pushName || '').trim();
+  // Only a REAL number may outrank the peer's own identity. A stub like "404"
+  // is not a number, it is what a handle-created account has instead of one.
+  if (isDisplayablePhone(phone)) {
+    const formatted = formatPhoneNumber(phone);
+    if (formatted) return formatted;
+  }
+
+  // No number known — handle-created accounts, half-hydrated rows. The peer's
+  // PUBLIC HANDLE is their identity here and outranks the push name: a handle
+  // is chosen once and unique, while `fullName` is a self-set label the peer can
+  // change to anything (that is the whole reason it never outranks a number).
+  if (ownHandle) return ownHandle;
+
+  // No number, no handle. Only here may the server's profile name surface.
+  const push = String(cleanPush || '').trim();
   if (push) return push;
+
+  // Last chance before "Unknown": the push name we just discarded as a stale
+  // redaction is all we have. That happens when a caller forgot to pass the
+  // peer's privacy bits — the peer really does hide their details, so the
+  // server sent "@handle" and no number, and dropping it left nothing. A handle
+  // is a correct label; "Unknown" never is.
+  if (isHandlePush) return String(pushName).trim();
 
   return fallback;
 };
@@ -228,10 +386,20 @@ export const resolveDisplayName = ({
  * Returns null when the peer is saved (their saved name is the whole identity)
  * or when the server name adds nothing over what is already shown.
  */
-export const resolvePushNameLabel = ({ userId = null, phone = null, pushName = null } = {}) => {
+export const resolvePushNameLabel = ({
+  userId = null, phone = null, pushName = null, hideContact = false,
+} = {}) => {
+  // A live `contact:updated` outranks the caller's row here too, so a member
+  // who hides mid-session loses the "~name" line without a refetch.
+  const live = getPeerIdentity(userId);
+  if (live && live.hideContact !== undefined) hideContact = live.hideContact;
+
   const push = String(pushName || '').trim();
   if (!push) return null;
   if (getSavedName({ userId, phone })) return null;      // saved → no ~name
+  // A "~account name" printed beside a hidden number re-attaches an identity the
+  // peer just asked to withhold, so the secondary label is suppressed entirely.
+  if (hideContact) return null;
   if (onlyDigits(push) && onlyDigits(push) === onlyDigits(phone)) return null; // it IS the number
   return `~${push}`;
 };
@@ -241,11 +409,14 @@ export default {
   invalidateContactNames,
   subscribeContactNames,
   getContactNamesVersion,
+  setPeerIdentity,
+  getPeerIdentity,
   isContactIndexReady,
   getSavedName,
   getSavedAvatar,
   isSavedContact,
   formatPhoneNumber,
+  isDisplayablePhone,
   resolveDisplayName,
   resolvePushNameLabel,
 };

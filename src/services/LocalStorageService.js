@@ -146,6 +146,16 @@ class LocalStorageService {
     const base = String(filename || `${mediaId || Date.now()}`)
       .replace(/[/\\:*?"<>|]/g, '_')
       .trim() || `${mediaId || Date.now()}`;
+    // Per-media SUBFOLDER, not a bare `${chatDir}${base}`: two attachments of
+    // one album routinely share a filename (`image.jpg`, `IMG_0001.jpg`), and
+    // a flat path let the second download overwrite the first — every tile of
+    // the album then opened the SAME photo. The file itself keeps the original
+    // name inside its folder, so saves/shares still carry the real filename.
+    if (mediaId) {
+      const mediaDir = `${chatDir}${String(mediaId).replace(/[^A-Za-z0-9_-]/g, '')}/`;
+      await ensureDir(mediaDir);
+      return `${mediaDir}${base}`;
+    }
     return `${chatDir}${base}`;
   }
 

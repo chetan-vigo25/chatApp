@@ -46,6 +46,7 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
   isOwnStatus,
   chatColor,
   theme,
+  isDarkMode = false,
   onPress,
 }) {
   // Hooks run unconditionally (before any early return) — React rule.
@@ -107,7 +108,9 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
   // Card background — sits one layer "deeper" than the bubble so the quote
   // feels recessed. The numeric values mirror ReplyBubble exactly so both
   // cards have the same visual weight when stacked.
-  const isDark = !!theme?.colors?.isDark;
+  // Same fix as ReplyBubble: `theme.colors.isDark` is not a real token, so
+  // this card used to render its light-mode wash inside a dark bubble.
+  const isDark = isDarkMode;
   const cardBg = isMyMessage
     ? 'rgba(0,0,0,0.13)'
     : (isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.045)');
