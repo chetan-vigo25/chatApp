@@ -30,6 +30,9 @@ import {
 export default function useUserDirectorySearch(query, { enabled = true, excludeIds, delayMs = 350 } = {}) {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
+  // Which normalized query the current `rows` answer. Lets callers tell
+  // "no results yet" (debounce still pending) apart from "no results".
+  const [settledKey, setSettledKey] = useState('');
   const searchable = isSearchableQuery(query);
   const key = normalizeQuery(query);
 
@@ -61,7 +64,9 @@ export default function useUserDirectorySearch(query, { enabled = true, excludeI
         .then((users) => {
           if (!alive || seqRef.current !== seq) return;
           setRows(users);
+          setSettledKey(key);
         })
+        .catch(() => { if (alive && seqRef.current === seq) setSettledKey(key); })
         .finally(() => { if (alive && seqRef.current === seq) setLoading(false); });
     }, delayMs);
     return () => { alive = false; clearTimeout(timer); };
@@ -83,5 +88,6 @@ export default function useUserDirectorySearch(query, { enabled = true, excludeI
   // DERIVED, not written from the effect: a query that just became too short
   // shows nothing on the same render, with no extra pass.
   const active = enabled && searchable;
-  return { results, loading: active && loading && !cached, searchable };
+  const settled = active && (Boolean(cached) || settledKey === key);
+  return { results, loading: active && loading && !cached, searchable, settled };
 }

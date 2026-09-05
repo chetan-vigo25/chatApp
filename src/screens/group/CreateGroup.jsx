@@ -37,7 +37,10 @@ export default function CreateGroup({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
   const { isCreating } = useSelector((state) => state.group);
-  const { matchedRegistered = [], isSyncing } = useContactSync();
+  const { matchedRegistered = [], isSyncing, ensureContactsSynced } = useContactSync();
+  // Auto-sync so the member picker is never empty for a user who never opened
+  // the Contact list (or whose sync is stale).
+  useEffect(() => { ensureContactsSynced?.({ reason: 'create_group_open' }); }, [ensureContactsSynced]);
 
   // ─── STEP STATE ───
   const [step, setStep] = useState(1); // 1 = select contacts, 2 = group details
@@ -76,8 +79,12 @@ export default function CreateGroup({ navigation }) {
     () => new Set(matchedRegistered.filter((c) => c?.userId).map((c) => String(c.userId))),
     [matchedRegistered],
   );
-  const { results: directory, loading: dirLoading, searchable } =
-    useUserDirectorySearch(searchQuery, { enabled: step === 1, excludeIds });
+  // Sequential: local (synchronous) matches paint first; the directory is asked
+  // right after and its people are appended below them.
+  const directoryEnabled = step === 1 && searchQuery.trim().length > 0;
+  const { results: directory, loading: dirLoading, searchable, settled: dirSettled } =
+    useUserDirectorySearch(searchQuery, { enabled: directoryEnabled, excludeIds });
+  const dirPending = directoryEnabled && searchable && (dirLoading || !dirSettled);
 
   // A selected directory person stays listed after the query moves on — they
   // are already counted in `selectedContacts`, so dropping the row would leave a
@@ -297,11 +304,11 @@ export default function CreateGroup({ navigation }) {
       </View>
 
       {/* Contact List */}
-      {(isSyncing || dirLoading) && filteredContacts.length === 0 ? (
+      {isSyncing && filteredContacts.length === 0 && !searchQuery.trim() ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={theme.colors.themeColor} />
           <Text style={[styles.loadingText, { color: theme.colors.placeHolderTextColor }]}>
-            {dirLoading ? 'Searching...' : 'Loading contacts...'}
+            Loading contacts...
           </Text>
         </View>
       ) : (
@@ -317,7 +324,9 @@ export default function CreateGroup({ navigation }) {
           ListEmptyComponent={
             <View style={styles.emptyWrap}>
               <Ionicons name="people-outline" size={48} color={theme.colors.placeHolderTextColor} />
-              <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor }]}>No contacts found</Text>
+              <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor }]}>
+                {dirPending ? 'Searching other people on the app…' : 'No contacts found'}
+              </Text>
               {searchQuery.trim().length > 0 && !searchable && (
                 <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor, fontSize: 12, marginTop: 4 }]}>
                   {`Type at least ${MIN_DIRECTORY_QUERY} characters to search by @username or mobile number`}

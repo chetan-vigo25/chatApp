@@ -149,11 +149,14 @@ export default function GroupInfo({ navigation, route }) {
         .unwrap()
         .catch((err) => {
           const msg = String(err?.message || err || '');
-          if (/not a member|NOT_GROUP_MEMBER/i.test(msg)) {
+          const gone = /not found|has been deleted/i.test(msg);
+          if (gone || /not a member|NOT_GROUP_MEMBER/i.test(msg)) {
             removeChat(groupId);
             const altId = routeItem?.chatId || routeItem?._id;
             if (altId && altId !== groupId) removeChat(altId);
-            showToast('You are no longer a member of this group');
+            // The owner deleting the group and being removed from it are two
+            // different messages — say which one actually happened.
+            showToast(gone ? 'This group has been deleted' : 'You are no longer a member of this group');
             navigation.goBack();
           }
         });

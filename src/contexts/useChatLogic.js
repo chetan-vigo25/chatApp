@@ -1990,7 +1990,18 @@ export default function useChatLogic({ navigation, route }) {
           const fetchGroupDetails = (attempt) => {
             dispatch(viewGroup({ groupId: grpId, silent: attempt > 0 }))
               .unwrap()
-              .catch(() => {
+              .catch((err) => {
+                const msg = String(err?.message || err || '');
+                // TERMINAL failures — retrying can never succeed:
+                //   • the owner deleted the group (404), or
+                //   • this user is no longer a member (403).
+                // Before this, both were retried like a transient error and the
+                // screen was left on a group that no longer exists. Drop the
+                // local row instead, the same self-heal GroupInfo does.
+                if (/not found|has been deleted|not a member|NOT_GROUP_MEMBER/i.test(msg)) {
+                  try { removeChat(grpId); } catch (_) { /* best-effort */ }
+                  return;
+                }
                 if (attempt < 2) {
                   setTimeout(() => fetchGroupDetails(attempt + 1), 1500 * (attempt + 1));
                 }

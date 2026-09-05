@@ -459,12 +459,12 @@ export default function UserB({ navigation, route }) {
   const subText = theme.colors.secondaryTextColor || theme.colors.placeHolderTextColor;
   const themeColor = theme.colors.themeColor;
   const isOnline = Boolean(peerProfile?.isOnline || peer?.isOnline);
-  // Presence goes through the ONE formatter the chat header uses, so this
-  // screen reads "last seen yesterday 4:20 PM" instead of the raw ISO string
-  // the server sends ("last seen 2026-09-03T07:20:30.107Z"). It already emits
-  // the "last seen " prefix, and turns a privacy-limited 'recently' into
-  // "last seen recently".
-  const statusLine = isOnline ? 'online' : (lastSeen ? formatLastSeen(lastSeen) : '');
+  // The backend hands back a raw ISO timestamp; never print it. This screen is
+  // full-width, so it gets the long phrasing ("last seen today at 12:50 PM")
+  // rather than the chat header's compact one.
+  const statusLine = isOnline
+    ? 'online'
+    : (lastSeen ? formatLastSeen(lastSeen, 'everyone', { style: 'long' }) : '');
   // The line under the hero name. The handle stands in for a hidden number —
   // but not when the handle IS the name above it (a hidden peer), which would
   // print "@handle" twice; presence takes the slot instead.

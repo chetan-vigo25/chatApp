@@ -51,7 +51,10 @@ export async function viewGroup(payload) {
   // refreshes retry on failure and must not toast on every attempt.
   const { silent, ...body } = payload || {};
   try {
-    const response = await apiCall('POST', 'user/group/view', body);
+    // `silent` also has to reach apiCall: without it the shared interceptor
+    // toasted on every background retry (and on the expected 404 for a group
+    // that was just deleted).
+    const response = await apiCall('POST', 'user/group/view', body, { silent: Boolean(silent) });
     if (response?.statusCode === 200) {
       return response;
     }

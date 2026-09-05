@@ -556,6 +556,44 @@ const getExistingNumbers = async () => {
   });
 };
 
+// Map<E.164, saved name> — lets the delta sync spot a contact that was
+// RENAMED on the device (same number, new label), which a number-only diff
+// cannot see.
+const getExistingNameMap = async () => {
+  return withDB(async (db) => {
+    const rows = await db.getAllAsync('SELECT phone_number, full_name FROM contacts');
+    return new Map(rows.map(r => [r.phone_number, r.full_name || '']));
+  });
+};
+
+// Apply device-side renames locally, right away (before/without the server
+// round trip). Only the saved label + display-formatted phone change; the
+// registered/unregistered state and everything server-owned stay as they are.
+const updateContactNames = async (items) => {
+  if (!Array.isArray(items) || items.length === 0) return;
+  return runExclusive(() => withDB(async (db) => {
+    const now = Date.now();
+    for (const c of items) {
+      const e164 = c?.phoneNumber || c?.normalizedPhone;
+      if (!e164) continue;
+      try {
+        await db.runAsync(
+          'UPDATE contacts SET full_name = $full_name, phone = COALESCE($phone, phone), updated_at = $updated_at WHERE phone_number = $phone_number',
+          {
+            $full_name: c.fullName || c.name || null,
+            $phone: c.originalPhone || c.phone || null,
+            $updated_at: now,
+            $phone_number: e164,
+          },
+        );
+      } catch (err) {
+        console.warn('[ContactDB] rename update error for', e164, err?.message);
+      }
+    }
+    emitContactsChanged('rename');
+  }));
+};
+
 const clearAllContacts = async () => {
   return runExclusive(() => withDB(async (db) => {
     await db.execAsync('DELETE FROM contacts; DELETE FROM contact_sync_meta;');
@@ -670,6 +708,8 @@ export default {
   getContactDisplay,
   removeContacts,
   getExistingNumbers,
+  getExistingNameMap,
+  updateContactNames,
   clearAllContacts,
   removeStaleContacts,
   searchContacts,

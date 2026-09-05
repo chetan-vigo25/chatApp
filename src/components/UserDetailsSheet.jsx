@@ -162,8 +162,10 @@ export default function UserDetailsSheet({
   const handleLine = (!revealContact && peerHandle) ? `@${peerHandle}` : '';
   const isOnline = Boolean(profile?.isOnline);
   const lastSeen = profile?.lastSeen;
-  // Same formatter as the chat header — never the raw ISO timestamp.
-  const statusLine = isOnline ? 'online' : (lastSeen ? formatLastSeen(lastSeen) : '');
+  // Raw ISO from the API — format it, never render the timestamp itself.
+  const statusLine = isOnline
+    ? 'online'
+    : (lastSeen ? formatLastSeen(lastSeen, 'everyone', { style: 'long' }) : '');
 
   const pageBg = theme.colors.background;
   const primaryText = theme.colors.primaryTextColor;

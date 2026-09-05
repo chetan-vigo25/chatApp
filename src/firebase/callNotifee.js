@@ -1,7 +1,7 @@
 import { Platform, DeviceEventEmitter } from 'react-native';
 import { requireOptionalNativeModule } from 'expo-modules-core';
 import { CALL_PUSH_EVENTS } from './callEvents';
-import { loadContactNames, resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
+import { loadContactNames, resolveDisplayName as resolveCanonicalName, handleFromRedactedName } from '../services/contactNameStore';
 
 /**
  * WhatsApp-style incoming-call notification for Android (background / killed /
@@ -307,16 +307,44 @@ export const displayIncomingCallNotifee = async (data) => {
   // FCM/VoIP data values are STRINGS, so the flag arrives as 'true' — compare as
   // text (`Boolean('false')` is true and would hide the number for everyone).
   const callerHidesContact = String(data?.callerHideContact ?? '') === 'true';
-  const resolvedCallerName = resolveCanonicalName({
-    userId: data?.callerId,
-    phone: data?.callerMobile || data?.senderMobile || null,
-    pushName: data?.callerPushName || data?.callerName || data?.title,
-    // Without this the chain falls from a withheld number to `callerPushName`,
-    // the caller's own account name — which is what the handle replaces. This is
-    // the full-screen lock-screen ring, so it is the surface that matters most.
-    username: data?.callerUserName || null,
-    hideContact: callerHidesContact,
-    fallback: 'Incoming call',
+  const callerPush = data?.callerPushName || data?.callerName || data?.title;
+  // This banner resolves the caller INDEPENDENTLY of the in-app ring (it runs
+  // headless, off the push payload alone), so it has to reach the same answer
+  // from less information. When the payload ships no `callerUserName`, take the
+  // handle out of the redacted name: without it the chain fell through to my
+  // SAVED contact name, and the Android CallStyle banner rang as "Test4422"
+  // while the in-app full-screen UI — which gets the bits over the socket —
+  // correctly said "@test4422441".
+  const callerHandle = data?.callerUserName || handleFromRedactedName(callerPush);
+  // `callerDisplayName` means "the app already resolved this, use it verbatim".
+  // Only the IN-APP re-post sets it (CallProvider's pop-up effect), and there
+  // the peer's identity is fully known — handle, privacy flag and all. Re-deriving
+  // a name from the few fields that survive the hop is strictly lossier: it is
+  // what made the CallStyle banner say "Test4422" (my saved contact name) next
+  // to a full-screen UI that correctly said "@test4422441". The headless push
+  // path below is the one that genuinely has to re-resolve.
+  const resolvedCallerName = String(data?.callerDisplayName || '').trim()
+    || resolveCanonicalName({
+      userId: data?.callerId,
+      phone: data?.callerMobile || data?.senderMobile || null,
+      pushName: callerPush,
+      // Without this the chain falls from a withheld number to `callerPushName`,
+      // the caller's own account name — which is what the handle replaces. This is
+      // the full-screen lock-screen ring, so it is the surface that matters most.
+      username: callerHandle,
+      hideContact: callerHidesContact,
+      fallback: 'Incoming call',
+    });
+  if (__DEV__) console.log('[CALL][notif] posting call notification', {
+    src: data?._src || 'fcm-push',
+    callId: data?.callId,
+    resolved: resolvedCallerName,
+    in_displayName: data?.callerDisplayName,
+    in_callerName: data?.callerName,
+    in_pushName: data?.callerPushName,
+    in_userName: data?.callerUserName,
+    in_hideContact: data?.callerHideContact,
+    in_mobile: data?.callerMobile,
   });
   const call = {
     callId: data?.callId,
@@ -464,7 +492,13 @@ export const displayMissedCallNotification = async (data = {}) => {
         userId: data.callerId || data.senderId,
         phone: data.callerMobile || data.senderMobile || null,
         pushName: data.callerPushName || data.callerName || data.senderName || data.title,
-        username: data.callerUserName || data.senderUserName || null,
+        // Same inference as the ringing notification above — a missed call must
+        // not name the caller differently than the ring that produced it.
+        username: data.callerUserName
+          || data.senderUserName
+          || handleFromRedactedName(
+            data.callerPushName || data.callerName || data.senderName || data.title,
+          ),
         hideContact: String(data.callerHideContact ?? data.senderHideContact ?? '') === 'true',
         fallback: 'Someone',
       });

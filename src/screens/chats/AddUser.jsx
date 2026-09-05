@@ -171,6 +171,14 @@ export default function AddUser({ navigation }) {
     }, [])
   );
 
+  // Auto-sync on focus: never-synced / empty / stale contacts get fetched
+  // without the user having to press Refresh (see ensureContactsSynced).
+  useFocusEffect(
+    useCallback(() => {
+      ensureContactsSynced?.({ reason: 'contact_list_focus' });
+    }, [ensureContactsSynced])
+  );
+
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedChatItem, setSelectedChatItem] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -205,6 +213,7 @@ export default function AddUser({ navigation }) {
     inviteResponse,
     clearInviteResponse,
     refreshContacts,
+    ensureContactsSynced,
     loadContacts
   } = useContactSync();
 
@@ -317,8 +326,6 @@ export default function AddUser({ navigation }) {
       userId: contact.userId || resolvedId,
       name: localName,
       fullName: localName,
-      // Carry the public handle onto the peer under the key the resolvers read.
-      userName: contact.userName || contact.username || null,
       // Both keys — different consumers read different fields
       profileImage: image,
       profilePicture: image,
@@ -362,7 +369,6 @@ export default function AddUser({ navigation }) {
         ? { profileImage: normalizedUser.profileImage, profilePicture: normalizedUser.profileImage }
         : {}),
       _id: existingChat?.peerUser?._id || normalizedUser?._id || normalizedUser?.userId,
-      userName: existingChat?.peerUser?.userName || normalizedUser?.userName || null,
     };
     navigation.navigate('ChatScreen', { item: { ...existingChat, peerUser: mergedPeer } });
   }, [navigation]);
@@ -406,7 +412,6 @@ export default function AddUser({ navigation }) {
               profileImage: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
               profilePicture: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
               _id: serverPeer._id || normalizedUser?._id || normalizedUser?.userId,
-              userName: serverPeer.userName || normalizedUser?.userName || null,
             };
             navigation.navigate('ChatScreen', {
               item: { ...chatPayload, peerUser: mergedPeer },
@@ -516,12 +521,10 @@ export default function AddUser({ navigation }) {
   // full phonebook on every keystroke is what makes a big contact list feel
   // laggy while typing — 150ms is below the perception threshold for the list
   // catching up, and collapses a burst of keystrokes into one pass.
-  const [appliedQuery, setAppliedQuery] = useState('');
-  useEffect(() => {
-    if (!searchQuery) { setAppliedQuery(''); return undefined; }
-    const t = setTimeout(() => setAppliedQuery(searchQuery), 150);
-    return () => clearTimeout(t);
-  }, [searchQuery]);
+  // No timer any more: `useDeferredValue` lets the keystroke paint first and
+  // runs the ranking in the very next (interruptible) render — a small
+  // phonebook filters within the same frame, a huge one never blocks typing.
+  const appliedQuery = React.useDeferredValue(searchQuery);
 
   const parsedQuery = useMemo(() => buildQuery(appliedQuery), [appliedQuery]);
 
@@ -562,19 +565,27 @@ export default function AddUser({ navigation }) {
     return ids;
   }, [matchedContacts, profileData]);
 
+  // SEQUENTIAL: the phonebook answers first, instantly, and is painted on its
+  // own. Only AFTER the local pass has settled for the typed text does the
+  // server directory get asked; its rows are appended BELOW the contact
+  // matches (never mixed in), so the list is never held hostage by a network
+  // wait and local matches are always the top of the result.
+  const localSettled = appliedQuery === searchQuery;
+  // Directory runs in the BACKGROUND from the first searchable keystroke (own
+  // 350ms debounce inside the hook) — it never waits on the local pass, and the
+  // local pass never waits on it.
+  const directoryEnabled = true;
   const {
     results: directoryUsers,
     loading: directoryLoading,
     searchable: directorySearchable,
-  } = useUserDirectorySearch(searchQuery, { excludeIds: directoryExcludeIds });
+    settled: directorySettled,
+  } = useUserDirectorySearch(searchQuery, { enabled: directoryEnabled, excludeIds: directoryExcludeIds });
 
-  // Search is "busy" while EITHER wait is outstanding: the debounced local
-  // ranking has not caught up with the typed text yet, or the directory lookup
-  // is still in flight. Nothing to show once the query is cleared.
-  const isSearchBusy = Boolean(
-    searchQuery.trim().length > 0
-    && (appliedQuery !== searchQuery || (directorySearchable && directoryLoading)),
-  );
+  // The in-bar spinner only covers the LOCAL ranking catching up (≤150ms). The
+  // directory wait is shown inline in its own section, so a list of contact
+  // matches is never overlaid with a loader the user has to sit through.
+  const isSearchBusy = Boolean(searchQuery.trim().length > 0 && !localSettled);
 
   // Directory rows wear the same shape a contact row expects, so tapping one
   // goes down the identical open/create-chat path.
@@ -587,12 +598,6 @@ export default function AddUser({ navigation }) {
     name: u.name || (u.userName ? `@${u.userName}` : 'Unknown'),
     fullName: u.name || '',
     username: u.userName || '',
-    // Both spellings: `username` is the picker-row field, `userName` is what
-    // every name resolver (chat header, chat list, notifications) reads off a
-    // peerUser. A handle-created account has no real number, so losing the
-    // handle here left the header showing the account's stub number.
-    userName: u.userName || '',
-    hideContact: Boolean(u.hideContact),
     phone: u.mobileNumber || '',
     mobileNumber: u.mobileNumber || '',
     profilePicture: u.avatar || '',
@@ -769,8 +774,13 @@ export default function AddUser({ navigation }) {
     }
 
     const searching = !parsedQuery.isEmpty;
-    const showDirectory = searching && directorySearchable
-      && (directoryLoading || directoryContacts.length > 0);
+    // Directory section appears only in tier 2 (no registered contact matched).
+    // While its lookup is pending/in flight it shows "Searching…" instead of
+    // flashing the empty state for the debounce window.
+    const directoryPending = directoryEnabled && directorySearchable
+      && (directoryLoading || !directorySettled);
+    const showDirectory = searching && directoryEnabled && directorySearchable
+      && (directoryPending || directoryContacts.length > 0);
 
     if (registeredContacts.length === 0 && unregisteredContacts.length === 0 && !showDirectory) {
       data.push({ type: 'empty' });
@@ -799,7 +809,7 @@ export default function AddUser({ navigation }) {
         title: `Other people on ${APP_TAG_NAME}`,
         count: directoryContacts.length || undefined,
       });
-      if (directoryLoading && directoryContacts.length === 0) {
+      if (directoryPending && directoryContacts.length === 0) {
         data.push({ type: 'sectionEmpty', title: 'Searching…' });
       } else {
         directoryContacts.forEach((c, i) => {
@@ -823,6 +833,7 @@ export default function AddUser({ navigation }) {
   }, [
     registeredContacts, unregisteredContacts, lastSyncTime,
     parsedQuery, directoryContacts, directoryLoading, directorySearchable,
+    directoryEnabled, directorySettled,
   ]);
 
   // ─── RENDER FUNCTIONS ───

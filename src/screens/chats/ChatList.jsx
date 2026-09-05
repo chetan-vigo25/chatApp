@@ -1854,10 +1854,10 @@ export default function ChatList({ navigation }) {
             ]}
           >
             {[
-              { label: 'Profile', icon: 'person-outline', route: 'ProfileTab' },
+              { label: 'New group', icon: 'people-circle-outline', route: 'CreateGroup' },
+              { label: 'Contact list', icon: 'people-outline', route: 'ContactsTab' },
+              { label: 'Linked devices', icon: 'qr-code-outline', route: 'LinkDevice' },
               { label: 'Settings', icon: 'settings-outline', route: 'SettingsTab' },
-              { label: 'Linked Devices', icon: 'qr-code-outline', route: 'LinkDevice' },
-              { label: 'Link Contacts', icon: 'people-outline', route: 'ContactsTab' },
             ].map((it) => (
               <TouchableOpacity
                 key={it.route}

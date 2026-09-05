@@ -18,7 +18,7 @@ import { ensureFirebaseApp } from './config';
 // the startup permission screen still owns the notification prompt.
 import { isNotificationPromptHeld } from '../features/permissions/notificationPromptGate';
 import { translateNotificationBody } from '../components/Translate';
-import { loadContactNames, resolveDisplayName as resolveCallerName } from '../services/contactNameStore';
+import { loadContactNames, resolveDisplayName as resolveCallerName, handleFromRedactedName } from '../services/contactNameStore';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -247,6 +247,15 @@ const presentIncomingCallNotification = async (data) => {
       userId: data?.callerId,
       phone: data?.callerMobile || null,
       pushName: data?.callerPushName || data?.callerName || data?.title,
+      // Same two fields callNotifee's ring + missed-call notifications already
+      // pass. Without them this notification alone fell from a withheld number
+      // to the caller's own account name, so the ONE surface that names an
+      // incoming call on iOS disagreed with every other one.
+      // FCM data values arrive as STRINGS, so the flag is compared as text —
+      // `Boolean('false')` is true and would hide the number for everyone.
+      username: data?.callerUserName
+        || handleFromRedactedName(data?.callerPushName || data?.callerName || data?.title),
+      hideContact: String(data?.callerHideContact ?? '') === 'true',
       fallback: 'Incoming call',
     });
     await Notifications.scheduleNotificationAsync({

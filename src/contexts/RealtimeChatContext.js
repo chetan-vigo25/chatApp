@@ -4723,7 +4723,13 @@ export function RealtimeChatProvider({ children }) {
           // other profile change (no parallel sync channel). Without these two
           // the chat header of someone who just hid their number keeps
           // rendering the cached number until reinstall.
-          userName: data?.userName ?? null,
+          // `?? undefined`, NEVER `?? null`: every sink below skips an
+          // undefined key but STORES a null one. A partial `contact:updated`
+          // (an avatar or about change that ships no `userName`) therefore
+          // erased the peer's handle app-wide — and with `hideContact` true the
+          // resolver then also drops the number, so it fell all the way through
+          // to the caller's raw account name.
+          userName: data?.userName ?? undefined,
           hideContact: Boolean(data?.hideContact),
           // '' when the peer hid it — the resolver treats an empty number as
           // unknown and falls through to the handle.
@@ -4737,7 +4743,7 @@ export function RealtimeChatProvider({ children }) {
       // who turned their privacy toggle back OFF kept showing as "@handle".
       ChatDatabase.updatePeerProfile(userId, {
         fullName: data?.fullName ?? data?.name,
-        userName: data?.userName ?? null,
+        userName: data?.userName ?? undefined,
         hideContact: Boolean(data?.hideContact),
         mobileNumber: data?.phoneNumber,
         profileImage: data?.profileImage ?? data?.profilePicture,
@@ -4763,7 +4769,7 @@ export function RealtimeChatProvider({ children }) {
       // state; every resolver consults this overlay, so a single event corrects
       // all of them at once and re-renders them (the version bump).
       setPeerIdentity(userId, {
-        userName: data?.userName ?? null,
+        userName: data?.userName ?? undefined,
         hideContact: Boolean(data?.hideContact),
         fullName: data?.fullName ?? data?.name,
         mobileNumber: data?.phoneNumber,

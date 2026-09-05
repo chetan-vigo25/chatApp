@@ -32,7 +32,7 @@ import CallOverlay from './screens/CallOverlay';
 // incoming calls). Re-enable this import + the <IncomingCallBanner /> render below.
 // import IncomingCallBanner from './components/IncomingCallBanner';
 import PrivacyOverlay from '../components/PrivacyOverlay';
-import { resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
+import { resolveDisplayName as resolveCanonicalName, setPeerIdentity } from '../services/contactNameStore';
 import CallTimer from './components/CallTimer';
 import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
@@ -84,13 +84,46 @@ export const useCall = () => useContext(CallContext) || {};
 // address book — so the name shown on the ring screen, the native CallKeep /
 // CallStyle UI and the call log is resolved HERE: my saved contact name → the
 // caller's number → only then whatever name the server sent.
-const buildIncomingPeer = (from = {}) => {
+const buildIncomingPeer = (from = {}, prevPeer = null) => {
   const id = from?.id ? String(from.id) : null;
+  // ONE ring can produce SEVERAL `call:incoming` events, and they are not all
+  // the same shape — observed 2026-09-05: the first carried
+  // `{ userName, hideContact, mobile }`, a second one 400ms later carried only
+  // `{ name, pushName, mobile, avatar }`. Rebuilding from the thin one dropped
+  // the handle and the privacy flag, the name re-resolved to my saved contact,
+  // and the banner visibly flipped "@test4422441" → "Test4422" mid-ring.
+  // So a repeat event for the SAME caller may only ADD information.
+  const carry = (prevPeer && prevPeer.id && id && String(prevPeer.id) === String(id))
+    ? prevPeer
+    : null;
   const mobile = from?.mobile
     || from?.mobileNumber
     || (from?.mobileObj?.number ? `${from.mobileObj.code || ''}${from.mobileObj.number}` : null)
+    || carry?.mobile
     || null;
-  const pushName = from?.pushName || from?.name || null;
+  const pushName = from?.pushName || from?.name || carry?.pushName || null;
+  const username = from?.userName || from?.publicUsername || from?.username
+    || carry?.userName
+    || null;
+  const hideContact = Boolean(
+    from?.hideContact
+    ?? from?.privacySettings?.hideContact
+    ?? carry?.hideContact,
+  );
+  // The ring payload is the FRESHEST identity that exists for this peer — the
+  // server minted it for this ring, seconds ago. So publish it to the shared
+  // overlay rather than only consuming it: a stale or half-written entry there
+  // (a partial `contact:updated` that blanked the handle) otherwise keeps
+  // poisoning every OTHER surface for the rest of the session, and it is what
+  // made the resolver fall past the "@handle" rule to the raw account name.
+  // Only write what we actually have — never blank a known field.
+  if (id && (username || from?.hideContact !== undefined || mobile)) {
+    setPeerIdentity(id, {
+      ...(username ? { userName: username } : {}),
+      ...(from?.hideContact !== undefined ? { hideContact } : {}),
+      ...(mobile ? { mobileNumber: mobile } : {}),
+    });
+  }
   return {
     id,
     // Contact privacy — the ring payload carries the caller's handle and the
@@ -99,13 +132,23 @@ const buildIncomingPeer = (from = {}) => {
       userId: id,
       phone: mobile,
       pushName,
-      username: from?.userName || from?.publicUsername || null,
-      hideContact: Boolean(from?.hideContact),
+      username,
+      hideContact,
       fallback: 'Unknown',
     }),
     pushName,
     mobile,
     avatar: from?.avatar || null,
+    // The privacy bits ride ON the peer, not just into the name above. Every
+    // downstream call surface — the ring banner, the mini banner, the overlay
+    // header, the call buttons and the call-log bubble — re-resolves from this
+    // object via `peerPrivacyOf(peer)`. Without these it re-resolved with
+    // `{ username: null, hideContact: false }`, which threw away the "@handle"
+    // this function had just worked out and fell back to the caller's number —
+    // and for a handle-created account that number is a stub ("4422441"), so
+    // the banner rang as "+914422441" for a peer whose name is "@test4422441".
+    userName: username,
+    hideContact,
   };
 };
 
@@ -1673,7 +1716,29 @@ export const CallProvider = ({ children }) => {
           && (snap.awaitingEngine || stagedFresh || (snap.peer?.id && String(payload?.from?.id) === String(snap.peer.id)))) {
           const realId = payload?.callId || null;
           if (__DEV__) console.log('[CALL] WebRTC incoming reconciled', { realId, pendingAccept: snap.pendingAccept });
-          dispatch({ type: ACT.RECONCILE_CALLID, callId: realId, peer: payload?.from?.name ? { name: payload.from.name } : null });
+          // The engine event's `from.name` is a RAW server name — the same kind of
+          // push name buildIncomingPeer resolves at ring time, NOT a display name.
+          // Merging it straight into the peer overwrote the resolved identity a
+          // few seconds into the ring: the banner showed "@jangid" correctly and
+          // then flipped to "Chetan" (a phonebook entry for the caller's number)
+          // the moment this landed, while `userName`/`hideContact` sat untouched
+          // on the very same peer. So run it through the same resolver, with the
+          // identity we already hold — a raw name can refine the peer, never
+          // demote it.
+          const enginePushName = payload?.from?.name || null;
+          const reconciledPeer = enginePushName
+            ? {
+                name: resolveCanonicalName({
+                  userId: snap.peer?.id || payload?.from?.id || null,
+                  phone: snap.peer?.mobile || null,
+                  pushName: enginePushName,
+                  username: snap.peer?.userName || null,
+                  hideContact: Boolean(snap.peer?.hideContact),
+                  fallback: snap.peer?.name || 'Unknown',
+                }),
+              }
+            : null;
+          dispatch({ type: ACT.RECONCILE_CALLID, callId: realId, peer: reconciledPeer });
           // If the user already tapped Accept while waiting, accept now.
           if (realId && snap.pendingAccept) {
             // isGroup/peerId ride along for the native engine's direct-accept
@@ -1742,7 +1807,7 @@ export const CallProvider = ({ children }) => {
         // and the next call's applyInitialCallRoute() was a silent no-op, i.e.
         // it kept whatever route the ringtone left behind (the loudspeaker).
         initialRouteAppliedRef.current = false;
-        const peer = buildIncomingPeer(payload?.from);
+        const peer = buildIncomingPeer(payload?.from, stateRef.current?.peer);
         // Group calls may arrive with a member roster; otherwise it's a 1:1.
         const members = Array.isArray(payload?.members) ? payload.members
           .map((m) => ({ id: m?.id ? String(m.id) : null, name: m?.name || 'Unknown', avatar: null }))
@@ -3199,7 +3264,7 @@ export const CallProvider = ({ children }) => {
     endedRef.current = false;
     acceptingRef.current = false; // new ring → a previous call's accept lock must never block this one
     initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
-    const peer = buildIncomingPeer({ ...(payload?.from || {}), id: callerId });
+    const peer = buildIncomingPeer({ ...(payload?.from || {}), id: callerId }, stateRef.current?.peer);
     const members = Array.isArray(payload?.members) ? payload.members.map(String).filter(Boolean) : [];
     const others = members
       .filter((id) => id !== callerId && id !== myId)
@@ -3317,9 +3382,19 @@ export const CallProvider = ({ children }) => {
       // ringtone: the call notification channel rings. Engine is warmed so a quick
       // Accept connects fast; the ring timeout still auto-misses if unanswered.
       displayIncomingCallNotifee({
+        _src: 'notificationOnly',
         callId: payload?.callId,
         callerId,
         callerName: isGroup ? (payload?.groupName || 'Group call') : (peer?.name || 'Unknown'),
+        // Same as the other two posters: `peer.name` already went through the
+        // full resolver with the ring payload's identity, so hand it over
+        // rather than making the notification re-derive one from less.
+        callerDisplayName: isGroup
+          ? (payload?.groupName || 'Group call')
+          : (peer?.name || null),
+        callerUserName: peer?.userName || null,
+        callerHideContact: peer?.hideContact ? 'true' : 'false',
+        callerMobile: peer?.mobile || null,
         callerImage: peer?.avatar || null,
         callType: payload?.media || 'audio',
       });
@@ -3675,6 +3750,14 @@ export const CallProvider = ({ children }) => {
           pushName: from.pushName || inv.callerPushName || from.name || inv.callerName || null,
           mobile: from.mobile || from.mobileNumber || inv.callerMobile || null,
           avatar: from.avatar || inv.callerImage || null,
+          // This is the app-foreground recovery path, so it rebuilds `from`
+          // field by field — and it has to carry the privacy bits too, or a
+          // call recovered here rings under a different name than the same
+          // call arriving live through onSignalIncoming.
+          userName: from.userName || from.publicUsername || inv.callerUserName || null,
+          hideContact: Boolean(
+            from.hideContact ?? from.privacySettings?.hideContact ?? inv.callerHideContact,
+          ),
         },
         callId: inv.callId || null,
         media: inv.media || inv.callType || 'audio',
@@ -4142,9 +4225,24 @@ export const CallProvider = ({ children }) => {
       stopRinging();
       if (__DEV__) console.log('[CALL][APP] app backgrounded mid-ring → handing the ring back to the OS notification', { callId: id });
       displayIncomingCallNotifee({
+        _src: 'handBack',
         callId: id,
         callerId: snap.peer?.id,
         callerName: snap.isGroup ? (snap.groupName || 'Group call') : (snap.peer?.name || 'Unknown'),
+        // `snap.peer.name` is ALREADY resolved (buildIncomingPeer ran the full
+        // saved-name → number → handle chain on the socket payload, which carries
+        // the privacy bits the FCM data never had). Hand the answer over instead
+        // of letting the notification re-derive a worse one from the leftovers —
+        // that re-derivation is what printed my saved contact name "Test4422" on
+        // the banner while the full-screen UI said "@test4422441".
+        callerDisplayName: snap.isGroup
+          ? (snap.groupName || 'Group call')
+          : (snap.peer?.name || null),
+        // Passed too, so the headless re-resolve still lands correctly if the
+        // display name is ever missing.
+        callerUserName: snap.peer?.userName || null,
+        callerHideContact: snap.peer?.hideContact ? 'true' : 'false',
+        callerMobile: snap.peer?.mobile || null,
         callerImage: snap.peer?.avatar || null,
         callType: snap.media === 'video' ? 'video' : 'audio',
         media: snap.media,
@@ -4199,11 +4297,21 @@ export const CallProvider = ({ children }) => {
       // The notification channel carries the ringtone; silence the in-app one
       // so a foreground ring does not play two at once.
       stopRinging();
-      if (__DEV__) console.log(`[CALL][APP] re-posting the OS call pop-up (${why})`, { callId: id });
+      if (__DEV__) console.log(`[CALL][APP] re-posting the OS call pop-up (${why})`,
+        { callId: id, name: snap.peer?.name, handle: snap.peer?.userName, hideContact: snap.peer?.hideContact });
       displayIncomingCallNotifee({
+        _src: 'popUp',
         callId: id,
         callerId: snap.peer?.id,
         callerName: snap.isGroup ? (snap.groupName || 'Group call') : (snap.peer?.name || 'Unknown'),
+        // `snap.peer.name` is ALREADY resolved — hand the answer over instead of
+        // letting the notification re-derive a worse one from the leftovers.
+        callerDisplayName: snap.isGroup
+          ? (snap.groupName || 'Group call')
+          : (snap.peer?.name || null),
+        callerUserName: snap.peer?.userName || null,
+        callerHideContact: snap.peer?.hideContact ? 'true' : 'false',
+        callerMobile: snap.peer?.mobile || null,
         callerImage: snap.peer?.avatar || null,
         callType: snap.media === 'video' ? 'video' : 'audio',
         media: snap.media,

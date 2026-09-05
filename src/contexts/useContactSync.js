@@ -580,6 +580,17 @@ export const useContactSync = () => {
     const prevHash = await ContactDatabase.getContactsHash();
     const initialDone = await ContactDatabase.isInitialSyncDone();
     if (!force && initialDone && prevHash && prevHash === contactsHash) {
+      // Same numbers — but a device-side RENAME still needs applying. Cheap
+      // local name diff; pushes to the server through the delta path.
+      try {
+        const nameMap = await ContactDatabase.getExistingNameMap();
+        const renamed = e164Contacts.filter((c) => nameMap.has(c.phoneNumber)
+          && (nameMap.get(c.phoneNumber) || '').trim() !== (c.fullName || '').trim());
+        if (renamed.length) {
+          fullSyncInProgressRef.current = false;
+          return runDeltaSyncRef.current?.({ reason: `${reason}_rename`, silent });
+        }
+      } catch (_) { /* fall through to plain cache paint */ }
       await applyFromDB();
       fullSyncInProgressRef.current = false;
       return;
@@ -703,6 +714,7 @@ export const useContactSync = () => {
   // After the first full sync, subsequent syncs send ONLY the numbers added since
   // last time (+ a removed list) — not the whole phonebook. Adding one contact
   // costs one small round-trip, not a full re-upload + re-match.
+  const runDeltaSyncRef = useRef(null);
   const runDeltaSync = useCallback(async ({ reason = 'delta', silent = true } = {}) => {
     if (!socket?.emit) throw new Error('Socket not available for delta sync');
 
@@ -710,24 +722,32 @@ export const useContactSync = () => {
     const numbers = e164Contacts.map((c) => c.phoneNumber);
     const contactsHash = contactHasher.computeContactListHash(numbers);
 
+    // Diff the device set against what we already hold locally — numbers AND
+    // saved names. A contact renamed in Google Contacts / SIM keeps its number,
+    // so the number-only hash used to call that "nothing changed" and the old
+    // label stuck on every screen (and on the server) until a fresh install.
+    const nameMap = await ContactDatabase.getExistingNameMap(); // Map<E.164, name>
+    const deviceSet = new Set(numbers);
+    const added = e164Contacts.filter((c) => !nameMap.has(c.phoneNumber));
+    const removed = [...nameMap.keys()].filter((n) => !deviceSet.has(n));
+    const renamed = e164Contacts.filter((c) => nameMap.has(c.phoneNumber)
+      && (nameMap.get(c.phoneNumber) || '').trim() !== (c.fullName || '').trim());
+
     // Nothing changed since last sync → ZERO network.
     const prevHash = await ContactDatabase.getContactsHash();
-    if (prevHash && prevHash === contactsHash) {
+    if (added.length === 0 && removed.length === 0 && renamed.length === 0) {
+      if (prevHash !== contactsHash) await ContactDatabase.setContactsHash(contactsHash);
       await applyFromDB();
       return;
     }
 
-    // Diff the device set against what we already hold locally.
-    const existing = await ContactDatabase.getExistingNumbers(); // Set<E.164>
-    const deviceSet = new Set(numbers);
-    const added = e164Contacts.filter((c) => !existing.has(c.phoneNumber));
-    const removed = [...existing].filter((n) => !deviceSet.has(n));
-
-    // No structural change (e.g. only a saved-name edit) → just record the hash.
-    if (added.length === 0 && removed.length === 0) {
-      await ContactDatabase.setContactsHash(contactsHash);
+    // Renames apply LOCALLY first so the list is correct on this very refresh,
+    // even if the server round-trip below is slow or fails. The same rows also
+    // ride in the incremental frame: the backend merges by phoneNumber and
+    // overwrites fullName, so the server copy (and its reverse-index) updates too.
+    if (renamed.length) {
+      await ContactDatabase.updateContactNames(renamed);
       await applyFromDB();
-      return;
     }
 
     if (mountedRef.current) {
@@ -738,7 +758,7 @@ export const useContactSync = () => {
     try {
       const clientInfo = await getClientInfo();
       const toPayloadItem = (c) => ({ id: c.id, originalId: c.id, fullName: c.fullName || null, phoneNumber: c.phoneNumber });
-      const addedItems = added.map(toPayloadItem);
+      const addedItems = [...added, ...renamed].map(toPayloadItem);
 
       const applyResponse = async (parsed) => {
         const deduped = dedupeByNumberOrId(normalizeIncomingContacts(parsed.contacts));
@@ -784,6 +804,9 @@ export const useContactSync = () => {
 
       // Drop removed contacts locally.
       if (removed.length) await ContactDatabase.removeContacts(removed);
+      // The server echo carries the local (device) name, so upsert can't undo the
+      // rename — but re-assert it anyway in case the echo omitted the row.
+      if (renamed.length) await ContactDatabase.updateContactNames(renamed);
 
       // Record the new full-set hash + sync time.
       const now = Date.now();
@@ -800,6 +823,7 @@ export const useContactSync = () => {
       if (mountedRef.current) setIsSyncing(false);
     }
   }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
+  runDeltaSyncRef.current = runDeltaSync;
 
   // ─── INCREMENTAL REFRESH ───
 
@@ -1016,6 +1040,46 @@ export const useContactSync = () => {
     return runDeltaSync({ reason: 'pull_to_refresh', silent: false });
   }, [isConnected, runFullSync, runDeltaSync]);
 
+  // ─── PUBLIC: ensureContactsSynced (screen-open auto sync) ───
+  // Called when a contact-driven screen gains focus (Contact list, New group,
+  // Add members). Guarantees the user never has to hit Refresh to see synced
+  // people:
+  //   • never synced             → first-time sync (preview + background full)
+  //   • synced but local empty   → FORCED full re-match (hash short-circuit skipped)
+  //   • synced but stale (> max) → silent delta sync
+  //   • fresh                    → nothing (zero network)
+  // Offline → queues a pending refresh, flushed on reconnect.
+  const ensureSyncInProgressRef = useRef(false);
+  const ensureContactsSynced = useCallback(async ({ maxAgeMs = 6 * 60 * 60 * 1000, reason = 'screen_focus' } = {}) => {
+    if (ensureSyncInProgressRef.current) return;
+    ensureSyncInProgressRef.current = true;
+    try {
+      if (!isConnected) {
+        await AsyncStorage.setItem(STORAGE_KEYS.PENDING_REFRESH, 'true');
+        return;
+      }
+      const initialDone = await ContactDatabase.isInitialSyncDone();
+      if (!initialDone) {
+        await syncContacts({ reason: `${reason}_first_time` });
+        return;
+      }
+      const cached = await applyFromDB();
+      if (!cached || cached.length === 0) {
+        await runFullSync({ reason: `${reason}_empty_local`, silent: false, force: true });
+        return;
+      }
+      const meta = await ContactDatabase.getSyncMetadata().catch(() => null);
+      const syncedAt = meta?.syncedAt ? new Date(meta.syncedAt).getTime() : 0;
+      if (!syncedAt || Date.now() - syncedAt > maxAgeMs) {
+        await runDeltaSync({ reason: `${reason}_stale`, silent: true });
+      }
+    } catch (err) {
+      console.warn('[useContactSync] ensureContactsSynced failed:', err?.message);
+    } finally {
+      ensureSyncInProgressRef.current = false;
+    }
+  }, [isConnected, syncContacts, applyFromDB, runFullSync, runDeltaSync]);
+
   // ─── PUBLIC: processContacts ───
 
   const processContacts = useCallback(async () => {
@@ -1202,6 +1266,7 @@ export const useContactSync = () => {
     syncContacts,
     processContacts,
     refreshContacts,
+    ensureContactsSynced,
     loadContacts,
     handleSenInvatation,
     lastSyncSessionId,

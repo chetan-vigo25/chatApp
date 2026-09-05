@@ -277,6 +277,25 @@ const handleOf = (username) => {
 };
 
 /**
+ * The peer's handle when a FRESH server payload has redacted their name.
+ *
+ * `serializePublicUser` substitutes "@handle" into the name fields only for a
+ * peer who hides their contact details, and a real profile name never starts
+ * with "@" — so an "@handle" on a payload minted right now (a ring push, a
+ * search response) IS the privacy flag, even when the payload forgot to ship
+ * `callerHideContact` / `hideContact` beside it.
+ *
+ * Feed the result to `resolveDisplayName`'s `username` and its `isSelfRedacted`
+ * branch does the rest. Use it ONLY on payloads that are fresh: a CACHED row's
+ * "@handle" can be a leftover from before the peer turned the toggle back off,
+ * which is what the stale-redaction guard below exists to discard.
+ */
+export const handleFromRedactedName = (pushName) => {
+  const s = String(pushName || '').trim();
+  return /^@[^@\s]+$/.test(s) ? s.slice(1) : null;
+};
+
+/**
  * THE resolver. Every display surface calls this.
  *
  *   resolveDisplayName({ userId, phone, pushName })
@@ -300,7 +319,12 @@ export const resolveDisplayName = ({
   const live = getPeerIdentity(userId);
   if (live) {
     if (live.hideContact !== undefined) hideContact = live.hideContact;
-    if (live.userName !== undefined) username = live.userName;
+    // A nullish handle in the overlay means "this event said nothing about the
+    // handle", not "this peer has no handle" — it must not erase one the caller
+    // passed in. Assigning it blind turned a partial `contact:updated` into an
+    // app-wide identity wipe: no handle, and (with hideContact set) no number
+    // either, so every surface fell through to the peer's raw account name.
+    if (live.userName) username = live.userName;
     // A number the peer has since hidden must not be rendered from a stale row.
     if (live.hideContact) phone = null;
     else if (live.mobileNumber) phone = live.mobileNumber;
@@ -417,6 +441,7 @@ export default {
   isSavedContact,
   formatPhoneNumber,
   isDisplayablePhone,
+  handleFromRedactedName,
   resolveDisplayName,
   resolvePushNameLabel,
 };

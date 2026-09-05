@@ -33,7 +33,8 @@ export default function AddGroupMembers({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const dispatch = useDispatch();
   const { addGroupMembers } = useRealtimeChatActions();
-  const { matchedRegistered = [], isSyncing, refreshContacts } = useContactSync();
+  const { matchedRegistered = [], isSyncing, refreshContacts, ensureContactsSynced } = useContactSync();
+  useEffect(() => { ensureContactsSynced?.({ reason: 'add_members_open' }); }, [ensureContactsSynced]);
 
   const groupId = route.params?.groupId;
   const existingMemberIds = route.params?.existingMemberIds || [];
@@ -73,8 +74,12 @@ export default function AddGroupMembers({ navigation, route }) {
     matchedRegistered.forEach((c) => c?.userId && s.add(String(c.userId)));
     return s;
   }, [existingMemberIds, matchedRegistered]);
-  const { results: directory, loading: dirLoading, searchable } =
-    useUserDirectorySearch(searchQuery, { excludeIds });
+  // Sequential: local (synchronous) matches paint first; the directory is asked
+  // right after and its people are appended below them.
+  const directoryEnabled = searchQuery.trim().length > 0;
+  const { results: directory, loading: dirLoading, searchable, settled: dirSettled } =
+    useUserDirectorySearch(searchQuery, { enabled: directoryEnabled, excludeIds });
+  const dirPending = directoryEnabled && searchable && (dirLoading || !dirSettled);
 
   // A selected directory person stays in the list after the query moves on —
   // they are already counted in `selectedContacts`, so dropping the row would
@@ -271,11 +276,11 @@ export default function AddGroupMembers({ navigation, route }) {
       </View>
 
       {/* Contact List */}
-      {(isSyncing || dirLoading) && filteredContacts.length === 0 ? (
+      {isSyncing && filteredContacts.length === 0 && !searchQuery.trim() ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={theme.colors.themeColor} />
           <Text style={[styles.loadingText, { color: theme.colors.placeHolderTextColor }]}>
-            {dirLoading ? 'Searching...' : 'Loading contacts...'}
+            Loading contacts...
           </Text>
         </View>
       ) : (
@@ -292,7 +297,9 @@ export default function AddGroupMembers({ navigation, route }) {
             <View style={styles.emptyWrap}>
               <Ionicons name="people-outline" size={48} color={theme.colors.placeHolderTextColor} />
               <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor }]}>
-                {availableContacts.length === 0 ? 'All contacts are already in this group' : 'No contacts found'}
+                {availableContacts.length === 0
+                  ? 'All contacts are already in this group'
+                  : (dirPending ? 'Searching other people on the app…' : 'No contacts found')}
               </Text>
               {searchQuery.trim().length > 0 && !searchable && (
                 <Text style={[styles.emptyText, { color: theme.colors.placeHolderTextColor, fontSize: 12, marginTop: 4 }]}>
