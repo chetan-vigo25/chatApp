@@ -6698,6 +6698,17 @@ export default function useChatLogic({ navigation, route }) {
             reconcile(response);
             return resolve(response);
           } else if (response && response.status === false) {
+            // The server's reason used to die inside the reject() — and because
+            // the online path resolves optimistically before the ack lands,
+            // nothing was ever attached to catch it. A rejected send left a red
+            // retry icon with no way to find out why.
+            console.warn('[send:ack:rejected]', sendEvent, {
+              messageType: payload?.messageType,
+              tempId,
+              code: response?.code || response?.data?.code || null,
+              message: response?.message || response?.data?.message || null,
+              errors: response?.errors || response?.data?.errors || null,
+            });
             updateMessageStatus(tempId, 'failed');
             return reject(new Error(response.message || 'send failed'));
           } else {
@@ -7244,41 +7255,59 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     const tempId = `temp_contact_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const messageId = generateClientMessageId();
     const timestamp = new Date().toISOString();
     const senderDeviceId = await getOrCreateDeviceId();
 
+    // The server validates this object with Joi, and its optional string fields
+    // are plain `string` — NOT `.allow(null)` / `.allow('')`. Sending
+    // `userId: null` for an unregistered contact (i.e. most of them) failed the
+    // whole emit with:
+    //   VALIDATION_ERROR  "contact.userId" must be a string  (type string.base)
+    // Joi aborts on the first error, so a falsy placeholder in ANY of these
+    // would have done the same. Omit an absent optional field rather than
+    // filling it with null/''. Every reader here already treats a missing key
+    // and an empty one identically (renderContactMessage's `contact.userId ||
+    // null` / `contact.profileImage || …` chains).
     const contactData = {
       fullName: name,
-      countryCode: countryCode || '',
       mobileNumber: phone,
-      userId: userId || null,
-      profileImage: profileImage || '',
       isRegistered: !!isRegistered,
+      ...(countryCode ? { countryCode } : {}),
+      ...(userId ? { userId: String(userId) } : {}),
+      ...(profileImage ? { profileImage: String(profileImage) } : {}),
     };
 
     const isGrpContact = chatData?.chatType === 'group' || chatData?.isGroup;
+    // Wire shape must match handleSendText / sendLocationMessage EXACTLY, minus
+    // the type-specific body. This payload used to carry a client-generated
+    // `messageId` (no other sender does — the server assigns the id and echoes
+    // it, `clientMessageId`/`tempId` is the idempotency key) plus `mediaId` and
+    // null-valued media fields, and the server rejected the whole emit. The
+    // rejection was then swallowed (see the catch below), so the card sat in
+    // the thread looking sent while nothing had left the device.
     const payload = {
-      chatId: chatIdRef.current,
-      messageId,
+      receiverId: isGrpContact ? null : (chatData.peerUser?._id || null),
+      messageType: 'contact',
       chatType: chatData?.chatType || 'private',
-      ...(isGrpContact && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
+      text: name,
+      mediaUrl: profileImage || '',
+      // The card rides in mediaMeta — the ONE field every message type already
+      // round-trips through the backend and SQLite. A top-level `contact` key
+      // is kept alongside for servers that read it, but it is not load-bearing:
+      // an unknown key is silently dropped on the way through, which is why the
+      // peer had nothing to render. normalizeIncomingMessage (useChatLogic.js
+      // :2382) already accepts either spelling.
+      mediaMeta: contactData,
+      contact: contactData,
+      replyTo: null,
+      forwardedFrom: null,
+      chatId: chatIdRef.current,
       senderId: currentUserIdRef.current,
       senderName: currentUserNameRef.current || '',
       senderDeviceId,
-      receiverId: isGrpContact ? null : (chatData.peerUser?._id || null),
-      messageType: 'contact',
-      text: name,
-      contact: contactData,
-      mediaId: null,
-      mediaUrl: null,
-      mediaThumbnailUrl: null,
-      mediaMeta: {},
-      replyTo: null,
-      forwardedFrom: null,
       tempId,
       createdAt: timestamp,
-      timestamp: new Date(timestamp).getTime(),
+      ...(isGrpContact && { groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current }),
     };
 
     onLocalOutgoingMessage({
@@ -7295,7 +7324,9 @@ export default function useChatLogic({ navigation, route }) {
     const localMsg = {
       id: tempId,
       tempId,
-      serverMessageId: messageId,
+      // No fabricated serverMessageId. Stamping a client `msg_*` id here made
+      // every later action (reply / react / delete / info) address the message
+      // by an id the server has never seen. It is filled in by the ack.
       type: 'contact',
       mediaType: 'contact',
       text: name,
@@ -7308,7 +7339,9 @@ export default function useChatLogic({ navigation, route }) {
       senderId: currentUserIdRef.current,
       senderType: 'self',
       receiverId: chatData.peerUser?._id || null,
-      status: 'sent',
+      // Clock until the server confirms, same as text/media/location. A pre-ack
+      // 'sent' is the tick that lied here.
+      status: 'sending',
       createdAt: timestamp,
       timestamp: new Date(timestamp).getTime(),
       synced: false,
@@ -7321,20 +7354,23 @@ export default function useChatLogic({ navigation, route }) {
     // Write to SQLite in background (non-blocking)
     ChatDatabase.upsertMessage({ ...localMsg, chatId: chatIdRef.current }).catch(() => {});
 
-    // Fire-and-forget socket send — message already shown via optimistic UI
-    const socket = socketRef.current || getSocket();
-    if (!socket || !isSocketConnected()) {
+    // Fire-and-forget socket send — message already shown via optimistic UI.
+    // NO offline pre-check here on purpose. This used to bail out with
+    // 'failed' whenever the socket was momentarily down, dropping the contact
+    // for good — the exact behaviour sendMessageViaSocket was changed to stop
+    // doing. It buffers an offline emit in pendingEmitQueue and replays it with
+    // the same ack on reconnect, so let it own that decision, like every other
+    // sender does.
+    // A rejected send is a FAILED send. This used to flip the row to 'sent' on
+    // rejection, which is precisely why a contact that never reached the server
+    // still showed a tick.
+    sendMessageViaSocket(payload, tempId).catch((err) => {
+      console.warn('[sendContactMessage] send failed:', err?.message || err);
       updateMessageStatus(tempId, 'failed');
-      checkAndReconnectSocket();
-      return { success: false, tempId };
-    }
-
-    sendMessageViaSocket(payload, tempId).catch(() => {
-      updateMessageStatus(tempId, 'sent', { messageId });
     });
 
     return { success: true, tempId };
-  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, getOrCreateDeviceId, updateMessageStatus, checkAndReconnectSocket]);
+  }, [chatData.peerUser, deduplicateMessages, onLocalOutgoingMessage, saveMessagesToLocal, sendMessageViaSocket, getOrCreateDeviceId, updateMessageStatus]);
 
   /* ========== FIXED: Text input change handler with proper typing ========== */
   const handleTextChange = useCallback((value) => {

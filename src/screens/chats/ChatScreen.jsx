@@ -81,6 +81,7 @@ import ReactionDetailSheet from '../../components/ReactionDetailSheet';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
 import ContactDatabase from '../../services/ContactDatabase';
+import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import * as ScreenCapture from 'expo-screen-capture';
 import { apiCall } from '../../Config/Https';
 import { BACKEND_URL } from '@env';
@@ -4266,18 +4267,28 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
 
-      // Extract country code and clean number
+      // Split the dial code off with libphonenumber-js — the same parser
+      // ContactHasher.toE164 and contact sync already use, so a shared contact
+      // and a synced one describe the same number identically.
+      //
+      // The old rule was `match(/^(\+\d{1,3})(.+)$/)`, and `\d{1,3}` is greedy:
+      // it ALWAYS took three digits. Every Indian number came out split as
+      // "+917" / "878121033" — a dial code that doesn't exist and a national
+      // number missing its leading digit, on the card and in the payload.
       const phoneClean = primaryPhone.replace(/[\s\-()]/g, '');
       let countryCode = '';
       let mobileNumber = phoneClean;
-      if (phoneClean.startsWith('+')) {
-        // Try to split country code (assume 1-3 digits after +)
-        const match = phoneClean.match(/^(\+\d{1,3})(.+)$/);
-        if (match) {
-          countryCode = match[1];
-          mobileNumber = match[2];
-        }
+      const parsedPhone = (() => {
+        try { return parsePhoneNumberFromString(phoneClean, 'IN'); } catch { return null; }
+      })();
+      if (parsedPhone?.countryCallingCode && parsedPhone?.nationalNumber) {
+        countryCode = `+${parsedPhone.countryCallingCode}`;
+        mobileNumber = String(parsedPhone.nationalNumber);
       }
+      // Unparseable: leave the number whole rather than guess a split. The card
+      // renders `countryCode ? \`${countryCode} ${mobileNumber}\` : mobileNumber`,
+      // so an empty code shows the full number as typed — wrong-looking is
+      // better than wrong.
 
       // Check if this contact is registered in the app — match against the
       // synced contact directory in SQLite (source of truth for contact sync).

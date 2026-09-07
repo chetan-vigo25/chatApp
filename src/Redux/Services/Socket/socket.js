@@ -935,6 +935,18 @@ const attachCoreSocketListeners = (navigation) => {
     const failedClientId = info.clientMessageId || info.tempId;
     const failedEvent = payload?.event || info.event || '';
     const SEND_EVENTS = ['message:send', 'message:reply', 'message:quote', 'group:message:send'];
+    if (failedClientId && SEND_EVENTS.includes(failedEvent)) {
+      // The typed reason was being dropped on the floor: the row flipped to
+      // 'failed' and the code/message/field-errors that say WHY never reached
+      // a log. Warn before acting on it.
+      console.warn('[socket:error:send]', failedEvent, {
+        clientMessageId: failedClientId,
+        code: info.code || null,
+        message: info.message || null,
+        errors: info.errors || info.details || null,
+        retryable: info.retryable,
+      });
+    }
     if (failedClientId && SEND_EVENTS.includes(failedEvent) && info.retryable !== true) {
       try {
         const ChatDatabase = require('../../../services/ChatDatabase').default
