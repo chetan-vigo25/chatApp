@@ -101,8 +101,22 @@ const ReactionPicker = React.memo(({
   themeColor,
   currentReactions,
   currentUserId,
+  // Controlled full-emoji sheet. The quick bar now lives INSIDE MenuPopover's
+  // Modal; opening the full sheet from there would nest a Modal in a Modal, so
+  // the host closes the popover and drives the sheet from the screen root
+  // instead. Left uncontrolled (props omitted) the picker behaves as before.
+  fullKeyboardVisible,
+  onOpenFullKeyboard,
+  onCloseFullKeyboard,
+  style,
 }) => {
   const [showFullKeyboard, setShowFullKeyboard] = useState(false);
+  const fullControlled = fullKeyboardVisible !== undefined;
+  const fullOpen = fullControlled ? !!fullKeyboardVisible : showFullKeyboard;
+  const closeFull = useCallback(() => {
+    if (fullControlled) onCloseFullKeyboard?.();
+    else setShowFullKeyboard(false);
+  }, [fullControlled, onCloseFullKeyboard]);
   const [recentEmojis, setRecentEmojis] = useState(['👍', '❤️', '😂', '😮', '🙏']);
   const sectionListRef = useRef(null);
 
@@ -138,14 +152,14 @@ const ReactionPicker = React.memo(({
 
   const handleFullSelect = useCallback((emoji) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setShowFullKeyboard(false);
+    closeFull();
     // Add to recent emojis (keep last 20)
     setRecentEmojis(prev => {
       const filtered = prev.filter(e => e !== emoji);
       return [emoji, ...filtered].slice(0, 20);
     });
     onSelect?.(emoji);
-  }, [onSelect]);
+  }, [onSelect, closeFull]);
 
   const renderSectionHeader = useCallback(({ section: { title, icon } }) => (
     <View style={[
@@ -190,7 +204,9 @@ const ReactionPicker = React.memo(({
     );
   }, [handleFullSelect, currentReactions, currentUserId, themeColor]);
 
-  if (!visible) return null;
+  // `visible` gates only the quick bar — the full sheet can outlive it when the
+  // host drives it (popover closes, sheet opens at the screen root).
+  if (!visible && !fullOpen) return null;
 
   // Check which emojis the current user has reacted with for quick picker
   const userReactedEmojis = new Set();
@@ -203,6 +219,7 @@ const ReactionPicker = React.memo(({
   return (
     <>
       {/* Quick picker bar - WhatsApp style */}
+      {visible && (
       <View
         style={[
           styles.pickerContainer,
@@ -210,6 +227,7 @@ const ReactionPicker = React.memo(({
             alignSelf: isMyMessage ? 'flex-end' : 'flex-start',
             backgroundColor: isDarkMode ? '#1F2C34' : '#FFFFFF',
           },
+          style,
         ]}
       >
         {QUICK_EMOJIS.map((emoji) => {
@@ -234,7 +252,8 @@ const ReactionPicker = React.memo(({
         <TouchableOpacity
           onPress={() => {
             Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            setShowFullKeyboard(true);
+            if (onOpenFullKeyboard) onOpenFullKeyboard();
+            else setShowFullKeyboard(true);
           }}
           style={[
             styles.plusButton,
@@ -249,17 +268,19 @@ const ReactionPicker = React.memo(({
           />
         </TouchableOpacity>
       </View>
+      )}
 
       {/* Full emoji keyboard modal - WhatsApp style */}
       <Modal
-        visible={showFullKeyboard}
+        visible={fullOpen}
         transparent
         animationType="slide"
-        onRequestClose={() => setShowFullKeyboard(false)}
+        onRequestClose={closeFull}
+        statusBarTranslucent
       >
         <Pressable
           style={styles.fullOverlay}
-          onPress={() => setShowFullKeyboard(false)}
+          onPress={closeFull}
         >
           <KeyboardAvoidingView
             behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -293,7 +314,7 @@ const ReactionPicker = React.memo(({
                   Emojis
                 </Text>
                 <TouchableOpacity
-                  onPress={() => setShowFullKeyboard(false)}
+                  onPress={closeFull}
                   style={styles.closeButton}
                 >
                   <Ionicons 

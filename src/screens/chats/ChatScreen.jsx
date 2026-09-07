@@ -78,6 +78,7 @@ import BlurGateImage from '../../components/BlurGateImage';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
+import MenuPopover, { menuCardHeight } from '../../components/MenuPopover';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
 import ContactDatabase from '../../services/ContactDatabase';
@@ -101,6 +102,14 @@ import { renderSystemMessage } from '../../utils/systemMessage';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
+
+// Long-press action popover geometry.
+// The wrapper has to fit the quick-reaction pill (6 × 40 pt emoji buttons + a
+// 36 pt "+" + padding ≈ 286), which is wider than the action card — so the
+// wrapper is sized to the pill and `alignItems` pins both to the bubble's side.
+const MENU_WRAP_W = Math.min(290, SCREEN_WIDTH - 24);
+// pill 44 + its 6 pt top margin + the 8 pt gap down to the card.
+const MENU_PICKER_H = 58;
 const MIN_MEDIA_BUBBLE_WIDTH = 120;
 const MAX_MEDIA_BUBBLE_HEIGHT = 280;
 const MIN_MEDIA_BUBBLE_HEIGHT = 96;
@@ -2723,16 +2732,40 @@ export default function ChatScreen({ navigation, route }) {
     });
   }, [handleSelectMention, text, handleTextChange, handleTextChangeForMentions]);
 
-  // Reaction state
+  // Reaction state.
+  // `reactionMsgId` marks the message whose long-press menu is open. It stays
+  // in lockstep with `menuFor` below so every existing dismissal path (back
+  // press, scroll, tap-elsewhere, selection-toolbar actions) keeps working.
   const [reactionMsgId, setReactionMsgId] = useState(null);
   const [reactionDetailModal, setReactionDetailModal] = useState({ visible: false, reactions: null, selectedEmoji: null, messageId: null });
   const reactionScaleAnims = useRef({}).current;
+
+  // ─── LONG-PRESS ACTION POPOVER ───
+  // { msg, key, isMyMessage, rect } — the whole message object, not just its
+  // id, so the actions run without a second lookup and the row list can be
+  // filtered per message type.
+  const [menuFor, setMenuFor] = useState(null);
+  // The full emoji sheet is hoisted OUT of the popover: opening it from inside
+  // MenuPopover's Modal would nest a Modal in a Modal.
+  const [fullEmojiFor, setFullEmojiFor] = useState(null);
+  // messageKey -> row view, so a long press anywhere in a row (bubble, media,
+  // album cell) can measure the SAME rect.
+  const messageRowRefs = useRef({});
+
+  const closeMessageMenu = useCallback(() => {
+    setMenuFor(null);
+    setReactionMsgId(null);
+  }, []);
 
   // Hardware/gesture back while the selection toolbar (or floating reaction
   // row) is up dismisses ONLY the selection — never the screen itself
   // (WhatsApp parity). Falls through to normal navigation otherwise.
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (menuFor) {
+        closeMessageMenu();
+        return true;
+      }
       if ((selectedMessage?.length || 0) > 0 || reactionMsgId) {
         clearSelectedMessages?.();
         setReactionMsgId(null);
@@ -2741,7 +2774,7 @@ export default function ChatScreen({ navigation, route }) {
       return false;
     });
     return () => sub.remove();
-  }, [selectedMessage, reactionMsgId, clearSelectedMessages]);
+  }, [selectedMessage, reactionMsgId, menuFor, closeMessageMenu, clearSelectedMessages]);
 
   // Resolve userId to display name — saved contact name (matched by id / phone
   // hash) first, then member/peer name, then phone number.
@@ -5449,18 +5482,43 @@ export default function ChatScreen({ navigation, route }) {
     );
   };
 
-  // Long-press on a media bubble (image/video/file/album) opens the SAME
-  // actions as any other bubble: message selected → top toolbar (reply,
-  // forward, delete, info, …) + floating reaction row. Media-file specific
-  // actions (share / save) live in the fullscreen viewer's header.
+  // Long-press on ANY bubble (text, media, album, call log, …) opens the same
+  // anchored action popover: a quick-reaction pill over a card of actions.
+  // Media-file specific actions (share / save) still live in the fullscreen
+  // viewer's header.
+  //
+  // While a multi-select is already running, a long press behaves like a tap
+  // and toggles the row instead — the selection toolbar owns the actions then.
   const openMessageActionsFor = (msg) => {
     const key = getMessageKey(msg);
     if (!key) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    setReactionMsgId((prev) => (prev === key ? null : key));
-    if (!selectedMessage.includes(key)) {
+
+    if ((selectedMessage?.length || 0) > 0) {
       handleToggleSelectMessages(key);
+      return;
     }
+
+    const isMine = msg?.senderType ? msg.senderType === 'self' : sameId(msg.senderId, currentUserId);
+    const open = (rect) => {
+      setMenuFor({ msg, key, isMyMessage: isMine, rect });
+      setReactionMsgId(key);
+    };
+
+    const row = messageRowRefs.current[key];
+    if (row?.measureInWindow) {
+      // measureInWindow gives WINDOW coordinates, which is exactly what the
+      // statusBarTranslucent Modal overlay is laid out in.
+      row.measureInWindow((x, y, width, height) => {
+        if (typeof y !== 'number' || Number.isNaN(y)) {
+          open(null);
+          return;
+        }
+        open({ x: x || 0, y, width: width || SCREEN_WIDTH, height: height || 0 });
+      });
+      return;
+    }
+    open(null);
   };
 
   const renderImageMessage = (msg, isMyMessage, progress, messageKey, downloadState) => {
@@ -6531,12 +6589,13 @@ export default function ChatScreen({ navigation, route }) {
       <React.Fragment>
         <SwipeReplyRow isMyMessage={isMyMessage} disabled={isDeletedMessage || isSystemMessage} onReply={() => startReply(msg)}>
         <Pressable
+          // The popover anchors to THIS row, so a long press on any child
+          // (bubble, media, album cell) resolves to the same rect.
+          ref={(r) => {
+            if (r) messageRowRefs.current[messageKey] = r;
+            else delete messageRowRefs.current[messageKey];
+          }}
           onPress={() => {
-            if (reactionMsgId) {
-              setReactionMsgId(null);
-              clearSelectedMessages();
-              return;
-            }
             if (selectedMessage.length > 0) {
               handleToggleSelectMessages(messageKey);
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -6551,18 +6610,8 @@ export default function ChatScreen({ navigation, route }) {
               toggleReaction(messageKey, '❤️');
             }
           }}
-          onLongPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-            // WhatsApp style: actions appear in the TOP bar (header rightActions
-            // selection toolbar) + a floating emoji reaction row above the message.
-            // Select the message (drives the top toolbar) for ANY message incl.
-            // tombstones (top toolbar then offers Delete). Emoji picker itself is
-            // gated to non-deleted messages.
-            setReactionMsgId(prev => prev === messageKey ? null : messageKey);
-            if (!selectedMessage.includes(messageKey)) {
-              handleToggleSelectMessages(messageKey);
-            }
-          }}
+          // System rows / date separators have no actions worth a menu.
+          onLongPress={isSystemMessage ? undefined : () => openMessageActionsFor(msg)}
           delayLongPress={300}
           style={{
             flexDirection: isGroupReceived ? "row" : "column",
@@ -6973,24 +7022,9 @@ export default function ChatScreen({ navigation, route }) {
 
           </View>
 
-          {/* Floating emoji reaction picker — WhatsApp style (over the message) */}
-          <ReactionPicker
-            visible={reactionMsgId === messageKey && !isDeletedMessage}
-            isMyMessage={isMyMessage}
-            isDarkMode={isDarkMode}
-            themeColor={theme.colors.themeColor}
-            currentReactions={msg?.reactions}
-            currentUserId={currentUserId}
-            onSelect={(emoji) => {
-              toggleReaction(messageKey, emoji);
-              setReactionMsgId(null);
-              clearSelectedMessages();
-            }}
-            onClose={() => {
-              setReactionMsgId(null);
-              clearSelectedMessages();
-            }}
-          />
+          {/* The quick-reaction pill now rides ABOVE the long-press action card
+              inside MenuPopover (rendered once at the screen root), so it is
+              anchored to the pressed bubble instead of living in every row. */}
 
           {/* WhatsApp-style reaction pill — overlaps bottom edge of bubble */}
           {!isDeletedMessage && (
@@ -7013,7 +7047,7 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, reactionMsgId, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor]);
 
   /**
    * Rows held back from their FIRST paint while their translation resolves.
@@ -7307,6 +7341,239 @@ export default function ChatScreen({ navigation, route }) {
     if (!chatPeerId) return;
     blockDispatch(unblockUser(String(chatPeerId)));
   };
+
+  // ─── LONG-PRESS MENU: what a single message can actually do ───
+  // One vocabulary for BOTH surfaces — this popover and the selection-mode
+  // header toolbar — so they can never drift apart.
+  const messageActionCaps = useCallback((msg) => {
+    if (!msg) return null;
+    const isOwn = msg.senderType ? msg.senderType === 'self' : sameId(msg.senderId, currentUserId);
+    const deletedFor = msg.deletedFor;
+    const deletedForMe = Array.isArray(deletedFor)
+      ? deletedFor.some((id) => sameId(id, currentUserId))
+      : (typeof deletedFor === 'string'
+        ? (deletedFor.toLowerCase() === 'everyone' || sameId(deletedFor, currentUserId))
+        : false);
+    const isDeleted = Boolean(msg.isDeleted) || deletedForMe;
+    const isViewOnce = Boolean(msg.isViewOnce || msg.payload?.isViewOnce);
+    // Canonical server id. Rows rehydrated from SQLite / history sync (common
+    // in GROUP chats) carry it in `id`/`messageId` with `serverMessageId`
+    // unset, so all three are tried before an action is hidden.
+    const serverActionId = [msg.serverMessageId, msg.messageId, msg.id]
+      .map((v) => (v == null ? '' : String(v)))
+      .find((v) => v && !v.startsWith('temp_')) || null;
+    const status = String(msg.status || '').toLowerCase();
+    const isScheduled = status === 'scheduled' || status === 'processing';
+    const isTextish = msg.type === 'text' || msg.type === undefined;
+    return {
+      isOwn,
+      isDeleted,
+      serverActionId,
+      canReply: !isDeleted && !isScheduled,
+      canForward: !isDeleted && !isViewOnce && Boolean(serverActionId),
+      canCopy: !isDeleted && !isViewOnce && Boolean(msg.text && String(msg.text).trim().length > 0),
+      canEdit: isOwn && isTextish && !isDeleted && Boolean(serverActionId),
+      canInfo: isOwn && !isDeleted && Boolean(serverActionId),
+      canReport: !isOwn && !isDeleted,
+      canCancelSchedule: isScheduled && isOwn,
+      canReact: !isDeleted && !isScheduled,
+    };
+  }, [currentUserId]);
+
+  const menuCaps = useMemo(() => messageActionCaps(menuFor?.msg), [menuFor, messageActionCaps]);
+
+  // Only the rows this app actually implements, filtered down to the ones that
+  // make sense for THIS message. Reply / Forward / Copy lead (≈90% of taps),
+  // destructive rows come last.
+  const menuActions = useMemo(() => {
+    if (!menuFor || !menuCaps) return [];
+    const msg = menuFor.msg;
+    const key = menuFor.key;
+    const caps = menuCaps;
+    const rows = [];
+
+    if (caps.canReply) {
+      rows.push({
+        id: 'reply',
+        label: 'Reply',
+        icon: 'arrow-undo-outline',
+        onPress: () => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          clearSelectedMessages();
+          startReply(msg);
+        },
+      });
+    }
+
+    if (caps.canForward) {
+      rows.push({
+        id: 'forward',
+        label: 'Forward',
+        icon: 'arrow-redo-outline',
+        onPress: () => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          clearSelectedMessages();
+          navigation.navigate('ForwardMessage', {
+            messageIds: [caps.serverActionId],
+            messages: [msg],
+          });
+        },
+      });
+    }
+
+    if (caps.canCopy) {
+      rows.push({
+        id: 'copy',
+        label: 'Copy',
+        icon: 'copy-outline',
+        onPress: () => {
+          // Raw text only — no "edited" suffix, no timestamp; for a media
+          // message this is the caption.
+          const Clipboard = require('expo-clipboard');
+          Clipboard.setStringAsync(msg?.text || '');
+          if (Platform.OS === 'android') {
+            const { ToastAndroid: T } = require('react-native');
+            T.show('Copied', T.SHORT);
+          }
+          clearSelectedMessages();
+        },
+      });
+    }
+
+    if (caps.canEdit) {
+      rows.push({
+        id: 'edit',
+        label: 'Edit',
+        icon: 'create-outline',
+        onPress: () => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+          // Normalise the id: startEditMessage reads `serverMessageId`, which
+          // history-synced rows may not carry even though they are acked.
+          startEditMessage({ ...msg, serverMessageId: caps.serverActionId });
+        },
+      });
+    }
+
+    if (caps.canInfo) {
+      rows.push({
+        id: 'info',
+        label: 'Message info',
+        icon: 'information-circle-outline',
+        onPress: () => {
+          clearSelectedMessages();
+          navigation.navigate('MessageInfo', {
+            messageId: caps.serverActionId,
+            chatId: msg.chatId || chatData?.chatId || chatData?._id,
+            message: { text: msg.text, mediaUrl: msg.mediaUrl, type: msg.type },
+          });
+        },
+      });
+    }
+
+    // The way into multi-select — the selection header then offers Forward /
+    // Delete across every message the user goes on to tap.
+    rows.push({
+      id: 'select',
+      label: 'Select messages',
+      icon: 'checkmark-circle-outline',
+      onPress: () => {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        if (!selectedMessage.includes(key)) handleToggleSelectMessages(key);
+      },
+    });
+
+    if (caps.canCancelSchedule) {
+      rows.push({
+        id: 'cancel-schedule',
+        label: 'Cancel schedule',
+        icon: 'time-outline',
+        danger: true,
+        onPress: () => {
+          cancelScheduledMessage(caps.serverActionId || msg.id);
+          clearSelectedMessages();
+        },
+      });
+    }
+
+    if (caps.canReport) {
+      rows.push({
+        id: 'report',
+        label: 'Report',
+        icon: 'flag-outline',
+        danger: true,
+        onPress: () => {
+          clearSelectedMessages();
+          handleReportMessage(msg);
+        },
+      });
+    }
+
+    // Delete is really two actions — the prompt offers "for me" / "for
+    // everyone" rather than the card carrying both rows.
+    rows.push({
+      id: 'delete',
+      label: 'Delete',
+      icon: 'trash-outline',
+      danger: true,
+      onPress: () => {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+        clearSelectedMessages();
+        promptDeleteSingleMessage(msg);
+      },
+    });
+
+    return rows;
+  }, [
+    menuFor, menuCaps, navigation, chatData, selectedMessage,
+    startReply, startEditMessage, clearSelectedMessages, handleToggleSelectMessages,
+    cancelScheduledMessage, handleReportMessage, promptDeleteSingleMessage,
+  ]);
+
+  // Where the popover sits. Prefer just below the pressed row, flip above when
+  // the card would run off the bottom, and clamp into the safe area either way.
+  const menuAnchor = useMemo(() => {
+    if (!menuFor) return null;
+    const win = Dimensions.get('window');
+    const screenW = win.width || SCREEN_WIDTH;
+    const screenH = win.height || 800;
+    const GAP = 8;
+    const EDGE = 12;
+    const cardH = menuCardHeight(menuActions.length);
+    const pickerH = menuCaps?.canReact ? MENU_PICKER_H : 0;
+    const totalH = cardH + pickerH;
+    const own = !!menuFor.isMyMessage;
+
+    // A row taller than the screen has no sane anchor — clamp the REFERENCE
+    // point, not the result, so the menu still lands next to what was pressed.
+    const rect = menuFor.rect || {
+      x: 0, y: screenH * 0.35, width: screenW, height: 0,
+    };
+    const refY = Math.max(insets.top + GAP, Math.min(rect.y, screenH * 0.6));
+    const refBottom = Math.min(refY + (rect.height || 0), screenH * 0.72);
+
+    const minTop = insets.top + GAP;
+    const maxTop = Math.max(minTop, screenH - insets.bottom - totalH - GAP);
+    const below = refBottom + GAP;
+    const preferred = (below + totalH + GAP < screenH - insets.bottom)
+      ? below
+      : refY - totalH - GAP;
+    const top = Math.max(minTop, Math.min(preferred, maxTop));
+
+    // Hug the pressed row's own side so the card reads as attached to it.
+    const rawLeft = own
+      ? (rect.x || 0) + (rect.width || screenW) - MENU_WRAP_W - EDGE
+      : (rect.x || 0) + EDGE;
+    const left = Math.max(GAP, Math.min(rawLeft, screenW - MENU_WRAP_W - GAP));
+
+    return {
+      top,
+      left,
+      // An explicit width is what makes alignItems mean anything — without it
+      // the absolute box shrinks to the card and the pill can never sit flush.
+      width: MENU_WRAP_W,
+      alignItems: own ? 'flex-end' : 'flex-start',
+    };
+  }, [menuFor, menuActions.length, menuCaps, insets.top, insets.bottom]);
 
   return (
     // Root carries the chat ground too: the wallpaper is absolutely
@@ -7720,7 +7987,7 @@ export default function ChatScreen({ navigation, route }) {
             onEndReached={!isSearching ? loadMoreMessages : undefined}
             onEndReachedThreshold={0.3}
 
-            onScroll={(e) => { if (reactionMsgId) { setReactionMsgId(null); clearSelectedMessages(); } handleScroll(e); }}
+            onScroll={(e) => { if (menuFor) closeMessageMenu(); handleScroll(e); }}
             onScrollBeginDrag={handleScrollBeginDrag}
             onScrollEndDrag={handleScrollEndDrag}
             onMomentumScrollBegin={handleMomentumScrollBegin}
@@ -8771,6 +9038,58 @@ export default function ChatScreen({ navigation, route }) {
             }}
           />
         </Modal>
+      {/* Long-press action popover — quick-reaction pill over an action card,
+          anchored to the pressed row. Rendered ONCE here, not per message. */}
+      <MenuPopover
+        visible={!!menuFor}
+        onClose={closeMessageMenu}
+        items={menuActions}
+        anchor={menuAnchor}
+      >
+        {menuCaps?.canReact && (
+          <ReactionPicker
+            visible
+            isMyMessage={!!menuFor?.isMyMessage}
+            isDarkMode={isDarkMode}
+            themeColor={theme.colors.themeColor}
+            currentReactions={menuFor?.msg?.reactions}
+            currentUserId={currentUserId}
+            // The wrapper is pill-width, so the pill pins to the same side the
+            // card does instead of drifting to the opposite edge.
+            style={{ alignSelf: menuFor?.isMyMessage ? 'flex-end' : 'flex-start', marginBottom: 8 }}
+            onSelect={(emoji) => {
+              if (menuFor?.key) toggleReaction(menuFor.key, emoji);
+              closeMessageMenu();
+            }}
+            onClose={closeMessageMenu}
+            // Hoist the full emoji sheet out of this Modal — see below.
+            fullKeyboardVisible={false}
+            onOpenFullKeyboard={() => {
+              const target = menuFor?.key || null;
+              closeMessageMenu();
+              setFullEmojiFor(target);
+            }}
+            onCloseFullKeyboard={() => {}}
+          />
+        )}
+      </MenuPopover>
+
+      {/* Full emoji keyboard for a reaction. Lives at the screen root because
+          the "+" that opens it sits inside MenuPopover's Modal, and a Modal
+          inside a Modal is unreliable on Android. */}
+      <ReactionPicker
+        visible={false}
+        fullKeyboardVisible={!!fullEmojiFor}
+        onCloseFullKeyboard={() => setFullEmojiFor(null)}
+        isDarkMode={isDarkMode}
+        themeColor={theme.colors.themeColor}
+        currentUserId={currentUserId}
+        onSelect={(emoji) => {
+          if (fullEmojiFor) toggleReaction(fullEmojiFor, emoji);
+          setFullEmojiFor(null);
+        }}
+      />
+
       {/* Reaction Detail Sheet — shows who reacted */}
       <ReactionDetailSheet
         visible={reactionDetailModal.visible}
