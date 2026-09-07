@@ -54,7 +54,7 @@ import { Audio } from 'expo-av';
 import { Video, ResizeMode } from '../../components/ExpoAvVideoCompat';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import Reanimated, { useAnimatedStyle } from 'react-native-reanimated';
+import Reanimated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated';
 import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
@@ -62,6 +62,7 @@ import localStorageService from '../../services/LocalStorageService';
 import { mediaDownloadSigned, toSecureMediaUri, mediaResolve, saveAssetToAlbum } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import ChatWallpaper from '../../components/ChatWallpaper';
+import AttachmentSheet from '../../components/AttachmentSheet';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import MentionText from '../../components/MentionText';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
@@ -183,74 +184,8 @@ const looksLikeCode = (text = '') => {
   }
   return signals >= 2 && (signals + indented * 0.5) / nonEmpty.length >= 0.5;
 };
-const MEDIA_PANEL_SHEET_HEIGHT = 218; // exact content height — no dead space below the tiles
 const AUDIO_RECORDING_MAX_MS = 120000;
 
-// Attachment tiles — WhatsApp Android attachment panel (user-supplied
-// reference screenshot): a tinted rounded-square DISC holding the glyph alone,
-// with the label sitting plainly on the sheet below it.
-//
-// The previous version wrapped glyph AND label inside one tinted surface, so
-// each option read as a coloured card rather than an icon. WhatsApp keeps the
-// colour on the disc only — the label is ordinary sheet text — which is what
-// makes the row scan as icons-with-captions instead of a sticker sheet.
-//
-// Colours are vivid (the disc is a low-alpha wash of the same hue), one per
-// type so hue alone identifies the action without reading. Location keeps the
-// brand teal — WhatsApp's green is never used here (brand rule).
-//
-// `glyphDark` / `glyphLight` exist because one hue cannot hold contrast on both
-// a near-black and a white sheet: dark gets the lighter step of the hue, light
-// the deeper one.
-const MEDIA_PANEL_OPTIONS = [
-  { key: 'gallery',  label: 'Gallery',  icon: 'images',        iconFamily: 'Ionicons', tint: '99,102,241',  glyphDark: '#8E90F8', glyphLight: '#4F46E5' },
-  { key: 'camera',   label: 'Camera',   icon: 'camera',        iconFamily: 'Ionicons', tint: '236,72,153',  glyphDark: '#F472B6', glyphLight: '#DB2777' },
-  { key: 'video',    label: 'Video',    icon: 'videocam',      iconFamily: 'Ionicons', tint: '239,68,68',   glyphDark: '#F87171', glyphLight: '#DC2626' },
-  { key: 'document', label: 'Document', icon: 'document-text', iconFamily: 'Ionicons', tint: '139,92,246',  glyphDark: '#A78BFA', glyphLight: '#7C3AED' },
-  { key: 'audio',    label: 'Audio',    icon: 'headset',       iconFamily: 'Ionicons', tint: '245,158,11',  glyphDark: '#FBBF24', glyphLight: '#B45309' },
-  { key: 'contact',  label: 'Contact',  icon: 'person',        iconFamily: 'Ionicons', tint: '59,130,246',  glyphDark: '#60A5FA', glyphLight: '#2563EB' },
-  { key: 'location', label: 'Location', icon: 'location',      iconFamily: 'Ionicons', tint: '3,176,162',   glyphDark: '#5FD8CA', glyphLight: '#0E9A8D' },
-];
-
-// Shared recipe for every disc, so the hues above are the ONLY thing that
-// varies. The disc is the tile's own hue at low alpha — a soft well the glyph
-// sits in, not a grey chip. Dark carries more alpha than light because a tint
-// over black loses more of itself than over white. No ring: WhatsApp's discs
-// are borderless, and a hairline on a filled disc only muddies the edge.
-const ATTACH_TILE_ALPHA = {
-  dark: { disc: 0.20 },
-  light: { disc: 0.14 },
-};
-
-const attachTileStyle = (option, isDarkMode) => {
-  const { disc } = ATTACH_TILE_ALPHA[isDarkMode ? 'dark' : 'light'];
-  return {
-    disc: `rgba(${option.tint},${disc})`,
-    glyph: isDarkMode ? option.glyphDark : option.glyphLight,
-  };
-};
-
-const styles = StyleSheet.create({
-  attachTilePressable: {
-    width: '100%',
-    alignItems: 'center',
-  },
-  attachTileDisc: {
-    // Squircle, not a circle: WhatsApp's discs are rounded squares, and squares
-    // line up far more evenly across a 4-column grid than circles do.
-    width: 58,
-    height: 58,
-    borderRadius: 19,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  attachTileLabel: {
-    fontSize: 12,
-    fontFamily: 'Roboto-Regular',
-    textAlign: 'center',
-    marginTop: 7,
-  },
-});
 
 // Date chip colours — shared by the inline day separator and the floating
 // sticky badge, which are the same chip in two places and had drifted into two
@@ -273,24 +208,6 @@ const dateChipColors = (isDarkMode) => (isDarkMode
       text: '#5f6769',
     });
 
-// Attachment tile — a tinted rounded-square disc carrying the glyph, with the
-// label plainly beneath it on the sheet (WhatsApp Android parity).
-//
-// The tint belongs to the disc alone. Colouring the whole tile, label included,
-// turned each option into a coloured card and made the row read as seven
-// competing surfaces instead of one control group.
-function AttachOptionTile({ tint, glyph, icon, label, labelColor }) {
-  return (
-    <>
-      <View style={[styles.attachTileDisc, { backgroundColor: tint }]}>
-        <Ionicons name={icon} size={26} color={glyph} />
-      </View>
-      <Text numberOfLines={1} style={[styles.attachTileLabel, { color: labelColor }]}>
-        {label}
-      </Text>
-    </>
-  );
-}
 
 // Theme-aware chat wallpaper. Rendered as a tiled SVG doodle pattern
 // (WhatsApp-style) — see components/ChatWallpaper. No raster image assets.
@@ -1620,8 +1537,21 @@ export default function ChatScreen({ navigation, route }) {
   // against the keyboard (no nav-bar gap). Clamped at 0 so resting layout is unchanged.
   const { height: kbHeightSV } = useReanimatedKeyboardAnimation();
   const insets = useSafeAreaInsets();
+  // How much of the attachment sheet is currently on screen. AttachmentSheet
+  // writes it every frame and the chat content pads by it, so the composer
+  // rides up above the sheet exactly the way it rides above the keyboard.
+  // Clamped by the sheet to its half-state height — see components/AttachmentSheet.
+  const attachLift = useSharedValue(0);
+  // The sheet is an in-screen overlay, not a Modal, so it sizes itself against
+  // the screen's own box. RootNavigator's SafeAreaView has already applied both
+  // insets to that box, which is why nothing is subtracted here.
+  const [screenHeight, setScreenHeight] = useState(0);
+
   const rootKeyboardStyle = useAnimatedStyle(() => ({
-    paddingBottom: Math.max(0, Math.abs(kbHeightSV.value) - insets.bottom),
+    // Keyboard and attachment sheet are never up at the same time (the
+    // paperclip dismisses the keyboard first), but they share one padding so
+    // whichever is open lifts the composer by exactly its own height.
+    paddingBottom: Math.max(0, Math.abs(kbHeightSV.value) - insets.bottom) + attachLift.value,
   }), [insets.bottom]);
   const [isAtTop, setIsAtTop] = useState(false);
   const [isAtLatest, setIsAtLatest] = useState(true);
@@ -1730,18 +1660,6 @@ export default function ChatScreen({ navigation, route }) {
   const isUserScrollingRef = useRef(false);
   const topVisibleIndexRef = useRef(-1);
   const scrollBtnAnim = useRef(new Animated.Value(0)).current;
-  const mediaBackdropAnim = useRef(new Animated.Value(0)).current;
-  const mediaSheetAnim = useRef(new Animated.Value(MEDIA_PANEL_SHEET_HEIGHT)).current;
-  // Panel HEIGHT animates too (JS driver — layout prop), so the composer glides
-  // up/down with the panel like a keyboard instead of jumping.
-  const mediaPanelHeightAnim = useRef(new Animated.Value(0)).current;
-  const mediaOptionEntryAnims = useRef(MEDIA_PANEL_OPTIONS.map(() => new Animated.Value(0))).current;
-  const mediaOptionPressAnims = useRef(
-    MEDIA_PANEL_OPTIONS.reduce((acc, item) => {
-      acc[item.key] = new Animated.Value(1);
-      return acc;
-    }, {})
-  ).current;
 
   const viewabilityConfig = useRef({ 
     itemVisiblePercentThreshold: 12,
@@ -4126,39 +4044,17 @@ export default function ChatScreen({ navigation, route }) {
     return `${mm}:${ss}`;
   }, [recordingDurationMs]);
 
-  const mediaPanelClosingRef = useRef(false);
   // Location share can take several seconds for a GPS fix — surface progress.
   const [fetchingLocation, setFetchingLocation] = useState(false);
 
+  // AttachmentSheet owns its own open/close animation and stays mounted through
+  // the slide-out, so closing is just a state flip here. The callback still
+  // runs after the flip so an option's action (picker, camera, GPS) fires with
+  // the sheet already on its way out.
   const closeMediaPanelAnimated = useCallback((afterClose) => {
-    if (mediaPanelClosingRef.current) return;
-    mediaPanelClosingRef.current = true;
-
-    Animated.parallel([
-      Animated.timing(mediaPanelHeightAnim, {
-        toValue: 0,
-        duration: 220,
-        easing: Easing.bezier(0.4, 0, 1, 1),
-        useNativeDriver: false,
-      }),
-      Animated.timing(mediaBackdropAnim, {
-        toValue: 0,
-        duration: 180,
-        easing: Easing.bezier(0.4, 0, 1, 1),
-        useNativeDriver: true,
-      }),
-      Animated.timing(mediaSheetAnim, {
-        toValue: MEDIA_PANEL_SHEET_HEIGHT,
-        duration: 220,
-        easing: Easing.bezier(0.4, 0, 1, 1),
-        useNativeDriver: true,
-      }),
-    ]).start(() => {
-      closeMediaOptions();
-      mediaPanelClosingRef.current = false;
-      if (typeof afterClose === 'function') afterClose();
-    });
-  }, [closeMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaPanelHeightAnim]);
+    closeMediaOptions();
+    if (typeof afterClose === 'function') afterClose();
+  }, [closeMediaOptions]);
 
   const handleToggleMediaOptions = useCallback(() => {
     if (showMediaOptions) {
@@ -4171,25 +4067,6 @@ export default function ChatScreen({ navigation, route }) {
     openMediaOptions();
   }, [showMediaOptions, closeMediaPanelAnimated, openMediaOptions]);
 
-  const handleMediaOptionPressIn = useCallback((key) => {
-    const scale = mediaOptionPressAnims[key];
-    if (!scale) return;
-    Animated.timing(scale, {
-      toValue: 0.92,
-      duration: 90,
-      useNativeDriver: true,
-    }).start();
-  }, [mediaOptionPressAnims]);
-
-  const handleMediaOptionPressOut = useCallback((key) => {
-    const scale = mediaOptionPressAnims[key];
-    if (!scale) return;
-    Animated.timing(scale, {
-      toValue: 1,
-      duration: 120,
-      useNativeDriver: true,
-    }).start();
-  }, [mediaOptionPressAnims]);
 
   const handleCameraCapture = useCallback(async () => {
     // Camera backgrounds the app; suspend the app lock so returning isn't a re-lock.
@@ -4441,7 +4318,41 @@ export default function ChatScreen({ navigation, route }) {
     }
   }, [isConnected, sendContactMessage]);
 
-  const handleMediaOptionSelect = useCallback((key) => {
+  /**
+   * Media picked inside AttachmentSheet's own gallery grid.
+   *
+   * Deliberately the SAME branch useChatLogic.handlePickMedia takes for a
+   * system-picker result, so the two sources cannot drift:
+   *   • one photo/video → staged into the composer's pending-media strip, which
+   *     is what carries the View Once "1" toggle; the user still taps send.
+   *   • several        → an album, uploaded immediately through sendMediaGroup.
+   * Nothing about the upload, the optimistic row, or the socket emit changes —
+   * only where the file objects came from.
+   */
+  const handleSheetSendMedia = useCallback((files) => {
+    if (!files?.length) return;
+    if (files.length === 1) {
+      const file = files[0];
+      setPendingMedia({
+        file,
+        type: String(file.type || '').startsWith('video') ? 'video' : 'image',
+      });
+      return;
+    }
+    sendMediaGroup({ files, caption: '' })
+      .catch((err) => console.warn('[sendMediaGroup] sheet-send error:', err?.message));
+  }, [setPendingMedia, sendMediaGroup]);
+
+  // The sheet's folder FAB — hands off to the OS picker for anything the
+  // Recents grid does not surface (other apps' albums, cloud providers).
+  const handleSheetOpenSystemPicker = useCallback(() => {
+    handlePickMedia('image').catch((err) => console.warn('[handlePickMedia] sheet folder error:', err?.message));
+  }, [handlePickMedia]);
+
+  const handleMediaOptionSelect = useCallback((option) => {
+    // AttachmentSheet hands over the whole option object; every other call site
+    // still passes the bare key.
+    const key = typeof option === 'string' ? option : option?.id;
     const run = async () => {
       if (key === 'gallery') {
         await handlePickMedia('image');
@@ -4475,6 +4386,10 @@ export default function ChatScreen({ navigation, route }) {
     };
 
     closeMediaPanelAnimated(() => {
+      // The action fires while the sheet is still sliding out. Android can
+      // reject a picker launched against a detaching view — ImageProvider's
+      // launchImageLibrarySafe already waits out the interaction and retries
+      // that exact error, so nothing is delayed here.
       run().catch((error) => {
         console.error('media option action error', error);
       });
@@ -4488,48 +4403,18 @@ export default function ChatScreen({ navigation, route }) {
     handleShareLocation,
   ]);
 
-  const mediaPanelPanResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_, gestureState) => gestureState.dy > 8 && Math.abs(gestureState.dy) > Math.abs(gestureState.dx),
-    onPanResponderMove: (_, gestureState) => {
-      const next = Math.max(0, gestureState.dy);
-      mediaSheetAnim.setValue(next);
-      const opacity = Math.max(0, Math.min(1, 1 - (next / MEDIA_PANEL_SHEET_HEIGHT)));
-      mediaBackdropAnim.setValue(opacity);
-    },
-    onPanResponderRelease: (_, gestureState) => {
-      if (gestureState.dy > MEDIA_PANEL_SHEET_HEIGHT * 0.35 || gestureState.vy > 0.9) {
-        closeMediaPanelAnimated();
-        return;
-      }
-      Animated.parallel([
-        Animated.timing(mediaSheetAnim, {
-          toValue: 0,
-          duration: 160,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: true,
-        }),
-        Animated.timing(mediaBackdropAnim, {
-          toValue: 1,
-          duration: 140,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: true,
-        }),
-      ]).start();
-    },
-  }), [closeMediaPanelAnimated, mediaBackdropAnim, mediaSheetAnim]);
 
-  // Hardware back with the media panel (or emoji panel) open closes ONLY the
-  // panel — the screen navigates back only when nothing is open (keyboard-parity:
-  // back dismisses the "keyboard replacement" first). Registered AFTER the
-  // selection-toolbar handler, so this runs FIRST (LIFO) — panels close before
-  // selection is considered.
+  // Hardware back with the emoji panel open closes ONLY the panel — the screen
+  // navigates back only when nothing is open (keyboard-parity: back dismisses
+  // the "keyboard replacement" first). Registered AFTER the selection-toolbar
+  // handler, so this runs FIRST (LIFO) — the panel closes before selection is
+  // considered.
+  // The attachment sheet is NOT handled here any more — it registers its own
+  // handler while it is up (and therefore runs first, LIFO), because back has
+  // to collapse full → half before it is allowed to close.
   useEffect(() => {
-    if (!showMediaOptions && !showEmojiPanel) return undefined;
+    if (!showEmojiPanel) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (showMediaOptions) {
-        closeMediaPanelAnimated();
-        return true;
-      }
       if (showEmojiPanel) {
         setShowEmojiPanel(false);
         return true;
@@ -4537,7 +4422,7 @@ export default function ChatScreen({ navigation, route }) {
       return false;
     });
     return () => sub.remove();
-  }, [showMediaOptions, showEmojiPanel, closeMediaPanelAnimated]);
+  }, [showEmojiPanel]);
 
 
   // The live keyboard movement is driven by react-native-keyboard-controller via
@@ -4576,56 +4461,6 @@ export default function ChatScreen({ navigation, route }) {
 
   // emojiPanelAnim no longer needed — emoji panel is inline below input bar
 
-  useEffect(() => {
-    if (!showMediaOptions) {
-      mediaBackdropAnim.setValue(0);
-      mediaSheetAnim.setValue(MEDIA_PANEL_SHEET_HEIGHT);
-      mediaPanelHeightAnim.setValue(0);
-      mediaOptionEntryAnims.forEach((anim) => anim.setValue(0));
-      return;
-    }
-
-    mediaBackdropAnim.setValue(0);
-    mediaSheetAnim.setValue(MEDIA_PANEL_SHEET_HEIGHT);
-    mediaPanelHeightAnim.setValue(0);
-    mediaOptionEntryAnims.forEach((anim) => anim.setValue(0));
-
-    // ONE smooth ease-out slide (WhatsApp feel) — no springs anywhere in the
-    // open sequence: overshoot/bounce on the sheet or the tiles read as the
-    // screen "fluctuating".
-    Animated.parallel([
-      Animated.timing(mediaPanelHeightAnim, {
-        toValue: MEDIA_PANEL_SHEET_HEIGHT,
-        duration: 260,
-        easing: Easing.bezier(0.2, 0, 0, 1),
-        useNativeDriver: false, // height is a layout prop
-      }),
-      Animated.timing(mediaBackdropAnim, {
-        toValue: 1,
-        duration: 220,
-        easing: Easing.bezier(0.2, 0, 0, 1),
-        useNativeDriver: true,
-      }),
-      Animated.timing(mediaSheetAnim, {
-        toValue: 0,
-        duration: 260,
-        easing: Easing.bezier(0.2, 0, 0, 1),
-        useNativeDriver: true,
-      }),
-    ]).start();
-
-    Animated.stagger(
-      15,
-      mediaOptionEntryAnims.map((anim) =>
-        Animated.timing(anim, {
-          toValue: 1,
-          duration: 160,
-          easing: Easing.out(Easing.quad),
-          useNativeDriver: true,
-        }),
-      ),
-    ).start();
-  }, [showMediaOptions, mediaBackdropAnim, mediaSheetAnim, mediaPanelHeightAnim, mediaOptionEntryAnims]);
 
   useEffect(() => () => {
     clearStickyDateHideTimer();
@@ -7466,10 +7301,20 @@ export default function ChatScreen({ navigation, route }) {
     // Root carries the chat ground too: the wallpaper is absolutely
     // positioned, so anything it does not cover (edges during the keyboard
     // transition) would otherwise flash the app's plain background.
-    <View style={{ flex: 1, backgroundColor: theme.colors.chatBackground }}>
+    // GestureHandlerRootView is required for AttachmentSheet's pan: this screen
+    // is a stack route, NOT inside the tab navigator's root, and without one the
+    // pan silently never fires.
+    <GestureHandlerRootView
+      style={{ flex: 1, backgroundColor: theme.colors.chatBackground }}
+      onLayout={(e) => setScreenHeight(e.nativeEvent.layout.height)}
+    >
       <StatusBar backgroundColor={theme.colors.background} barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
+      {/* OUTSIDE the animated view on purpose. The wallpaper is resizeMode
+          "repeat"; while it lived inside the container whose padding animates,
+          Android re-tiled the whole screen every frame of every keyboard and
+          sheet transition. It is a full-screen background that never moves. */}
+      <ChatWallpaper isDarkMode={isDarkMode} backgroundColor={theme.colors.chatBackground} />
       <Reanimated.View style={[{ flex: 1 }, rootKeyboardStyle]}>
-        <ChatWallpaper isDarkMode={isDarkMode} backgroundColor={theme.colors.chatBackground} />
         
         {/* Header */}
         <ChatHeaderPresence
@@ -8546,86 +8391,6 @@ export default function ChatScreen({ navigation, route }) {
           </View>
         )}
 
-        {/* Media panel — INLINE below the input bar (keyboard-replacement,
-            WhatsApp style): the composer stays visible above the panel. */}
-        {showMediaOptions && (
-          <Animated.View
-            style={{
-              // Follows the theme background (the chat ground) instead of the
-              // lighter cardBackground — on dark that slab sat as a pale block
-              // under a true-black chat. The hairline is what separates it from
-              // the composer now that the two share a colour.
-              height: mediaPanelHeightAnim,
-              backgroundColor: theme.colors.background,
-              borderTopWidth: StyleSheet.hairlineWidth,
-              borderTopColor: theme.colors.borderColor,
-              overflow: 'hidden',
-            }}
-          >
-            <Animated.View
-              {...mediaPanelPanResponder.panHandlers}
-              style={{
-                flex: 1,
-                opacity: mediaBackdropAnim,
-                transform: [{ translateY: mediaSheetAnim }],
-              }}
-            >
-              {/* Grip handle — swipe-down or grip drag dismisses. */}
-              <View style={{ alignItems: 'center', paddingTop: 10, paddingBottom: 4 }}>
-                <View style={{ width: 36, height: 4, borderRadius: 2, backgroundColor: isDarkMode ? 'rgba(233,237,239,0.28)' : 'rgba(0,0,0,0.16)' }} />
-              </View>
-
-              <View
-                style={{
-                  flexDirection: 'row',
-                  flexWrap: 'wrap',
-                  paddingHorizontal: 8,
-                  paddingTop: 12,
-                  paddingBottom: 12,
-                  rowGap: 10,
-                }}
-              >
-                {MEDIA_PANEL_OPTIONS.map((item, idx) => {
-                  const attachTile = attachTileStyle(item, isDarkMode);
-                  const press = mediaOptionPressAnims[item.key];
-                  const entry = mediaOptionEntryAnims[idx];
-                  return (
-                    <Animated.View
-                      key={item.key}
-                      style={{
-                        width: '25%',
-                        paddingHorizontal: 5,
-                        opacity: entry,
-                        transform: [
-                          { scale: press },
-                          { translateY: entry.interpolate({ inputRange: [0, 1], outputRange: [10, 0] }) },
-                        ],
-                      }}
-                    >
-                      <Pressable
-                        onPressIn={() => handleMediaOptionPressIn(item.key)}
-                        onPressOut={() => handleMediaOptionPressOut(item.key)}
-                        onPress={() => handleMediaOptionSelect(item.key)}
-                        style={styles.attachTilePressable}
-                        accessibilityRole="button"
-                        accessibilityLabel={item.label}
-                      >
-                        <AttachOptionTile
-                          tint={attachTile.disc}
-                          glyph={attachTile.glyph}
-                          icon={item.icon}
-                          label={item.label}
-                          labelColor={theme.colors.primaryTextColor}
-                        />
-                      </Pressable>
-                    </Animated.View>
-                  );
-                })}
-              </View>
-            </Animated.View>
-          </Animated.View>
-        )}
-
         {/* View Once viewer — streams from the single-use URL; nothing is ever
             written to FileSystem/cache. Closing is final (server already
             marked the view consumed). Screen capture is blocked while open. */}
@@ -9030,6 +8795,19 @@ export default function ChatScreen({ navigation, route }) {
 
       {/* Schedule Time Picker is rendered inside ChatInputBar */}
       </Reanimated.View>
-    </View>
+
+      {/* A SIBLING of the padded view, never a child: inside it, the padding
+          the sheet causes would shrink its own container and it would chase
+          itself up the screen. */}
+      <AttachmentSheet
+        visible={showMediaOptions}
+        containerHeight={screenHeight}
+        liftSV={attachLift}
+        onClose={closeMediaOptions}
+        onSelectOption={handleMediaOptionSelect}
+        onSendMedia={handleSheetSendMedia}
+        onOpenSystemPicker={handleSheetOpenSystemPicker}
+      />
+    </GestureHandlerRootView>
   );
 }

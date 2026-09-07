@@ -2,7 +2,7 @@
   "expo": {
     "name": "TalksTry",
     "slug": "baatCheet",
-    "version": "1.3.6",
+    "version": "1.3.7",
     "orientation": "portrait",
     "scheme": "talkstry",
     "userInterfaceStyle": "automatic",
@@ -26,7 +26,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chat.baatCheet",
-      "buildNumber": "13",
+      "buildNumber": "14",
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
@@ -138,10 +138,20 @@
             "NSExtensionActivationSupportsMovieWithMaxCount": 30,
             "NSExtensionActivationSupportsFileWithMaxCount": 30
           },
-          "androidIntentFilters": ["text/*", "image/*", "video/*", "*/*"],
-          "androidMultiIntentFilters": ["image/*", "video/*", "*/*"]
+          "androidIntentFilters": [
+            "text/*",
+            "image/*",
+            "video/*",
+            "*/*"
+          ],
+          "androidMultiIntentFilters": [
+            "image/*",
+            "video/*",
+            "*/*"
+          ]
         }
       ],
+      "./plugins/withReadMediaImagesFix",
       "./plugins/withCallFullScreen",
       "./plugins/withCallFcmService",
       "./plugins/withCallOnNewIntent",
