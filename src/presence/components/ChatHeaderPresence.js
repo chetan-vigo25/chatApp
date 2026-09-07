@@ -19,7 +19,17 @@ const MARQUEE_SPEED = 40; // px per second
 
 function MarqueeText({ text, style }) {
   const [containerW, setContainerW] = useState(0);
-  const [textW, setTextW] = useState(0);
+  // The measured width is remembered TOGETHER WITH the string it was measured
+  // for, and a width belonging to a different string counts as "not measured
+  // yet" (0). That pairing is what breaks a feedback loop: the clip below is
+  // narrowed to the measured width, so once it has been narrowed for a short
+  // string, a longer one lays out INSIDE that narrow box, reports the narrow
+  // width, and the clip can never grow back. Statuses go "online" → "last seen
+  // 11:00 AM", and the header was left showing "last…" forever. Dropping back
+  // to 0 on a new string forces one unconstrained (flex:1) pass first, so the
+  // natural width is always measured against the full column.
+  const [measured, setMeasured] = useState({ text: null, w: 0 });
+  const textW = measured.text === text ? measured.w : 0;
   const scrollX = useRef(new Animated.Value(0)).current;
   const overflow = containerW > 0 && textW > containerW + 2;
 
@@ -46,13 +56,13 @@ function MarqueeText({ text, style }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overflow, textW, containerW, text]);
 
-  // Shrink-to-fit once the natural text width is known. With a plain flex:1
-  // the clip always ate the WHOLE text column, so anything rendered beside the
-  // marquee — the verified badge — was shoved to the far right of the header,
-  // sitting against the video-call button instead of next to the name. Giving
-  // the clip an explicit width of the text and letting flexShrink cap it at
-  // the space available keeps the marquee behaviour (a long name still
-  // overflows and scrolls) while short names hug their badge.
+  // Shrink-to-fit once the natural width of THIS string is known. With a plain
+  // flex:1 the clip always ate the WHOLE text column, so anything rendered
+  // beside the marquee — the verified badge — was shoved to the far right of
+  // the header, sitting against the video-call button instead of next to the
+  // name. An explicit width of the text, capped by flexShrink at the space
+  // available, keeps the marquee behaviour (a long name still overflows and
+  // scrolls) while short names hug their badge.
   const clipStyle = textW > 0
     ? { flexGrow: 0, flexShrink: 1, flexBasis: 'auto', width: textW }
     : { flex: 1 };
@@ -75,7 +85,10 @@ function MarqueeText({ text, style }) {
         <Text
           numberOfLines={1}
           style={style}
-          onLayout={(e) => setTextW(Math.ceil(e.nativeEvent.layout.width))}
+          onLayout={(e) => {
+            const w = Math.ceil(e.nativeEvent.layout.width);
+            setMeasured((prev) => (prev.text === text && prev.w === w ? prev : { text, w }));
+          }}
         >
           {text}
         </Text>

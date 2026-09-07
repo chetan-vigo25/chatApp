@@ -100,9 +100,10 @@ const CLOSE_MS = 180;
 const VELOCITY_PROJECTION = 0.2;
 
 /**
- * The 2x4 attach grid. Eight tiles is not decoration — the grid lays out four
- * per row and 8 fills ATTACH_H exactly, so keep the count a multiple of 4 or
- * re-derive ATTACH_H.
+ * The attach grid: four tiles per row, wrapping. ATTACH_H is sized for exactly
+ * TWO rows, so any count from 5 to 8 fits (a short last row just leaves a gap
+ * on the right, as WhatsApp's does). Drop to 4 or fewer, or go past 8, and
+ * ATTACH_H must be re-derived — see the geometry block above.
  *
  * `id` is the key ChatScreen's option handler already switches on, so the
  * existing gallery / camera / video / document / audio / contact / location
@@ -122,7 +123,6 @@ export const ATTACH_OPTIONS = [
   { id: 'audio',    label: 'Audio',    icon: 'headset',       dark: '#FFB74D', light: '#EF6C00' },
   { id: 'contact',  label: 'Contact',  icon: 'person',        dark: '#5FC3F5', light: '#039BE5' },
   { id: 'location', label: 'Location', icon: 'location',      dark: '#7BD98A', light: '#43A047' },
-  { id: 'poll',     label: 'Poll',     icon: 'stats-chart',   dark: '#4DD0C4', light: '#00897B' },
 ];
 
 const AnimatedFlatList = Reanimated.FlatList;
@@ -220,6 +220,10 @@ export default function AttachmentSheet({
 
   const [sending, setSending] = useState(false);
   const [albumOpen, setAlbumOpen] = useState(false);
+  // View once — the same "1" affordance the composer's pending-media strip
+  // carries, offered here so a multi-select can be sent view-once without
+  // going through the composer one item at a time.
+  const [viewOnce, setViewOnce] = useState(false);
 
   // Set true on SETUP, not just false on cleanup. A cleanup-only version leaks
   // across any remount that reuses the ref — Fast Refresh and StrictMode both
@@ -295,6 +299,7 @@ export default function AttachmentSheet({
       openedRef.current = false;
       selection.clear();
       setAlbumOpen(false);
+      setViewOnce(false);
     }
   }, [visible, selection]);
 
@@ -353,7 +358,7 @@ export default function AttachmentSheet({
     if (!mounted || !visible) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       if (albumOpen) { setAlbumOpen(false); return true; }
-      if (selectedCount > 0) { selection.clear(); return true; }
+      if (selectedCount > 0) { selection.clear(); setViewOnce(false); return true; }
       if (expanded) { collapseToHalf(); return true; }
       requestClose();
       return true;
@@ -402,15 +407,17 @@ export default function AttachmentSheet({
       const byId = new Map(media.assets.map((asset) => [asset.id, asset]));
       const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
       const files = await normalizeLibraryAssets(ordered);
+      const once = viewOnce;
       selection.clear();
+      setViewOnce(false);
       requestClose();
-      if (files.length) callbacks.current.onSendMedia?.(files);
+      if (files.length) callbacks.current.onSendMedia?.(files, { viewOnce: once });
     } catch (err) {
       console.warn('[AttachmentSheet] send failed', err?.message || err);
     } finally {
       if (aliveRef.current) setSending(false);
     }
-  }, [media.assets, requestClose, selection, sending]);
+  }, [media.assets, requestClose, selection, sending, viewOnce]);
 
   const handleOptionPress = useCallback((option) => {
     requestClose();
@@ -868,6 +875,29 @@ export default function AttachmentSheet({
         </TouchableOpacity>
       )}
 
+      {/* View once — sits beside the send FAB so the choice is made at the same
+          moment as the send, exactly like the composer's pending-media strip.
+          Same "1" disc, filled when armed, so the two read as one control. */}
+      {showSendFab && (
+        <TouchableOpacity
+          style={[styles.viewOnceFab, {
+            backgroundColor: viewOnce ? accent : colors.surface,
+            borderColor: viewOnce ? accent : colors.divider,
+          }]}
+          onPress={() => setViewOnce((on) => !on)}
+          accessibilityRole="button"
+          accessibilityState={{ selected: viewOnce }}
+          accessibilityLabel={viewOnce ? 'View once on' : 'View once'}
+        >
+          <Text style={[styles.viewOnceText, {
+            color: viewOnce ? '#fff' : colors.primaryTextColor,
+            fontFamily: fonts.bold,
+          }]}>
+            1
+          </Text>
+        </TouchableOpacity>
+      )}
+
       {showSendFab && (
         <TouchableOpacity
           style={[styles.fab, styles.sendFab, { backgroundColor: accent, borderColor: colors.divider }]}
@@ -1034,6 +1064,18 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
   },
   sendFab: {},
+  viewOnceFab: {
+    position: 'absolute',
+    right: 80,
+    bottom: 31,
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1.5,
+  },
+  viewOnceText: { fontSize: 13 },
   sendCount: {
     position: 'absolute',
     top: -2,

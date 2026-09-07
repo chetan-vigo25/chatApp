@@ -18,6 +18,8 @@ import { useTheme } from '../../contexts/ThemeContext';
 import { getMessageInfo } from '../../Redux/Services/Chat/Chat.Services';
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
+import useDisplayName from '../../hooks/useDisplayName';
+import { useRealtimeChatSlice } from '../../contexts/RealtimeChatContext';
 
 const READ_BLUE = '#53BDEB';
 const GRAY_LIGHT = '#8696A0';
@@ -61,24 +63,97 @@ const Tick = ({ status, size = 16, isDarkMode }) => {
   return <Ionicons name="checkmark" size={size} color={gray} />;
 };
 
-const ReceiptRow = ({ user, timestamp, palette }) => {
-  // Read/delivered lists show the same identity as the rest of the app:
-  // saved contact name → number → the recipient's own account name.
-  const fullName = resolveCanonicalName({
-    userId: user?._id || user?.userId,
-    phone: user?.mobileNumber
-      || (user?.mobile?.number ? `${user.mobile.code || ''}${user.mobile.number}` : null),
-    pushName: user?.fullName,
+// A receipt entry is not one fixed shape. The user fields may sit at the top
+// level ({ userId, fullName, ... }), be nested under `user`/`userInfo`, arrive
+// as a Mongo-POPULATED `userId` (an object, not an id string — the same shape
+// GroupInfo's getMemberUser unwraps), or the entry may be nothing but the id
+// string, as the socket receipts are (ChatSocketProvider's _appendReader rows).
+//
+// Getting this wrong is not cosmetic: it decides what reaches the resolver.
+// Reading `entry.user` blindly gave `undefined` for the flat shape, which lost
+// the userId too and printed "Unknown"; leaving a populated `userId` object in
+// place made every store lookup miss, so a peer who is NOT hiding lost their
+// saved name and number and fell through to their account name.
+const normalizeReceipt = (entry) => {
+  if (!entry) return { userId: null, fullName: null, phone: null, timestamp: null };
+  if (typeof entry === 'string') return { userId: entry, fullName: null, phone: null, timestamp: null };
+
+  const populated = (typeof entry.userId === 'object' && entry.userId !== null) ? entry.userId : null;
+  const u = populated || entry.user || entry.userInfo || entry;
+  // A populated user carries `mobile: { code, number }` (code includes the '+');
+  // flatter payloads carry a plain string under one of several names.
+  const mobileObj = (u?.mobile && typeof u.mobile === 'object') ? u.mobile : null;
+  const mobileFromObj = mobileObj?.number ? `${mobileObj.code || ''}${mobileObj.number}` : null;
+
+  return {
+    userId: u?._id
+      || (typeof entry.userId === 'string' ? entry.userId : null)
+      || u?.userId
+      || entry?._id
+      || null,
+    fullName: u?.fullName || u?.name || u?.displayName || entry?.fullName || entry?.name || null,
+    phone: u?.mobileNumber || u?.phoneNumber || u?.phone || mobileFromObj
+      || entry?.mobileNumber || entry?.phone || null,
+    profileImage: u?.profileImage || u?.profilePic || u?.avatar || entry?.profileImage || null,
+    userName: u?.userName || u?.username || u?.publicUsername
+      || entry?.userName || entry?.publicUsername || null,
+    hideContact: Boolean(
+      u?.hideContact ?? u?.privacySettings?.hideContact ?? entry?.hideContact ?? false,
+    ),
+    timestamp: entry?.timestamp || entry?.readAt || entry?.deliveredAt || entry?.at || null,
+  };
+};
+
+// The message-info API row is NOT a privacy-serialized user: it ships the raw
+// fullName and omits `userName` / `hideContact`, so a peer with "Hide phone
+// number & email" ON came back as plain "Chetan" here while the chat list and
+// chat header — which name from the chat row's `peerUser` — correctly showed
+// "@jangid". The receipt row is the same person, so the chat's own identity is
+// layered underneath the API row to supply what it left out.
+//
+// hideContact is OR-ed, never overwritten: if EITHER source says the peer is
+// hiding, the peer is hiding. Privacy fails closed; a payload that simply
+// forgot the flag must not be read as consent to show the name.
+const mergeIdentity = (who, local) => {
+  if (!local) return who;
+  return {
+    ...who,
+    fullName: who.fullName || local.fullName,
+    phone: who.phone || local.phone,
+    profileImage: who.profileImage || local.profileImage,
+    userName: who.userName || local.userName,
+    hideContact: Boolean(who.hideContact || local.hideContact),
+  };
+};
+
+const ReceiptRow = ({ entry, timestamp, palette, resolveName, identityById }) => {
+  const parsed = normalizeReceipt(entry);
+  const who = mergeIdentity(parsed, identityById?.[String(parsed.userId)] || null);
+  const resolve = resolveName || resolveCanonicalName;
+
+  // ONE rule, shared with every other naming surface (chat list, chat screen,
+  // group member list): saved contact name → number → the peer's own account
+  // name — and, ahead of all of it, contact privacy. A peer with "Hide phone
+  // number & email" ON is shown as "@handle" here exactly as they are
+  // everywhere else; that is the promise PrivacyAccount makes to them
+  // ("Everyone sees @username instead of your name and number"), so this screen
+  // must not second-guess the resolver and substitute the account name back in.
+  const fullName = resolve({
+    userId: who.userId,
+    phone: who.phone,
+    pushName: who.fullName,
     // Contact privacy — read/delivered lists name every recipient.
-    username: user?.userName || null,
-    hideContact: Boolean(user?.hideContact ?? user?.privacySettings?.hideContact),
+    username: who.userName || null,
+    hideContact: who.hideContact,
     fallback: 'Unknown',
   }).trim();
-  const initial = (fullName.charAt(0) || '?').toUpperCase();
+
+  // "@chetan" → "C": the marker is not an identity, the letter after it is.
+  const initial = (fullName.replace(/^@/, '').charAt(0) || '?').toUpperCase();
   return (
     <View style={[styles.row, { borderBottomColor: palette.divider, backgroundColor: palette.surface }]}>
-      {user?.profileImage ? (
-        <Image source={{ uri: user.profileImage }} style={styles.avatar} />
+      {who.profileImage ? (
+        <Image source={{ uri: who.profileImage }} style={styles.avatar} />
       ) : (
         <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: palette.brand }]}>
           <Text style={[styles.avatarInitial, { color: '#fff' }]}>{initial}</Text>
@@ -109,7 +184,47 @@ export default function MessageInfoScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const { theme, isDarkMode } = useTheme();
+  // Binds this screen to the contact directory: the hook loads the index (the
+  // bare resolver does not) and re-renders on `contact:updated`, so a receipt
+  // row shows the saved contact name instead of a raw number/account name even
+  // when the screen opens before the address book has hydrated.
+  const { resolveName, namesVersion } = useDisplayName();
   const { messageId, chatId, message } = route.params || {};
+
+  // The chat this message belongs to, straight from the realtime store — the
+  // same row the chat list names from, and the only place the client reliably
+  // holds each participant's privacy state (see mergeIdentity above).
+  const chatSelector = useCallback(
+    (state) => (chatId ? (state?.chatMap?.[String(chatId)] || null) : null),
+    [chatId],
+  );
+  const chatEntry = useRealtimeChatSlice(chatSelector);
+
+  // userId → that participant's identity row. Covers the 1:1 peer and, for a
+  // group, every member — flat or with a populated `userId` object.
+  const identityById = useMemo(() => {
+    const map = {};
+    const add = (candidate) => {
+      if (!candidate || typeof candidate !== 'object') return;
+      const ident = normalizeReceipt(candidate);
+      if (ident.userId) map[String(ident.userId)] = ident;
+    };
+    add(chatEntry?.peerUser);
+    // ChatList reads `peerUser.hideContact ?? chat.hideContact` — the flag can
+    // sit on the row itself, so fold that in rather than losing it.
+    const peerId = normalizeReceipt(chatEntry?.peerUser || {}).userId;
+    if (peerId && map[String(peerId)] && chatEntry?.hideContact) {
+      map[String(peerId)] = { ...map[String(peerId)], hideContact: true };
+    }
+    const members = Array.isArray(chatEntry?.members)
+      ? chatEntry.members
+      : (Array.isArray(chatEntry?.participants) ? chatEntry.participants : []);
+    members.forEach((m) => {
+      add(m);
+      if (m && typeof m.userId === 'object') add(m.userId);
+    });
+    return map;
+  }, [chatEntry]);
 
   // Resolve a stable palette regardless of which theme keys exist.
   const palette = useMemo(() => {
@@ -218,7 +333,13 @@ export default function MessageInfoScreen() {
     if (readers.length === 0) {
       data.push({ kind: 'empty', key: 'empty-read', label: 'Not read yet' });
     } else {
-      readers.forEach((r) => data.push({ kind: 'row', key: `r-${r.userId}-${r.timestamp || ''}`, ...r }));
+      // The entry is carried whole rather than spread: spreading it flattened
+      // the receipt onto the list item and left `item.user` undefined for the
+      // flat API shape, which is what made every name read "Unknown".
+      readers.forEach((r, i) => {
+        const { userId, timestamp } = normalizeReceipt(r);
+        data.push({ kind: 'row', key: `r-${userId || i}-${timestamp || ''}`, entry: r, timestamp });
+      });
     }
     data.push({
       kind: 'section', key: 'sec-delivered', status: 'delivered',
@@ -228,7 +349,10 @@ export default function MessageInfoScreen() {
     if (delivered.length === 0) {
       data.push({ kind: 'empty', key: 'empty-delivered', label: 'Not delivered yet' });
     } else {
-      delivered.forEach((d) => data.push({ kind: 'row', key: `d-${d.userId}-${d.timestamp || ''}`, ...d }));
+      delivered.forEach((d, i) => {
+        const { userId, timestamp } = normalizeReceipt(d);
+        data.push({ kind: 'row', key: `d-${userId || i}-${timestamp || ''}`, entry: d, timestamp });
+      });
     }
     return data;
   }, [isGroup, readers, delivered]);
@@ -268,8 +392,16 @@ export default function MessageInfoScreen() {
         </Text>
       );
     }
-    return <ReceiptRow user={item.user} timestamp={item.timestamp} palette={palette} />;
-  }, [info, previewText, palette, isDarkMode]);
+    return (
+      <ReceiptRow
+        entry={item.entry}
+        timestamp={item.timestamp}
+        palette={palette}
+        resolveName={resolveName}
+        identityById={identityById}
+      />
+    );
+  }, [info, previewText, palette, isDarkMode, resolveName, namesVersion, identityById]);
 
   return (
     <View style={[styles.container, { backgroundColor: palette.background }]}>

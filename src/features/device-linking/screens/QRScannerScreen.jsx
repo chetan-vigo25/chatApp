@@ -66,7 +66,7 @@ function BrandLockup({ theme, onDark = false, style }) {
             },
           ]}
         >
-          <Image source={require('../../../../assets/icon.png')} style={lockupStyles.logo} />
+          <Image source={require('../../../../assets/icon0.png')} style={lockupStyles.logo} />
         </View>
       </View>
       <Text style={[lockupStyles.word, { color: onDark ? '#fff' : theme.colors.primaryTextColor }]}>

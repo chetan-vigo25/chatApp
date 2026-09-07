@@ -191,7 +191,7 @@ export default function LinkedDevicesScreen({ navigation }) {
         <TouchableOpacity onPress={() => navigation.goBack()} activeOpacity={0.6} style={styles.backBtn}>
           <FontAwesome6 name="arrow-left" size={20} color={primaryText} />
         </TouchableOpacity>
-        <Image source={require('../../../../assets/icon.png')} style={styles.headerLogo} />
+        <Image source={require('../../../../assets/icon0.png')} style={styles.headerLogo} />
         <Text style={[styles.headerTitle, { color: primaryText }]}>
           Talks<Text style={{ color: brand }}>Try</Text>
           <Text style={{ color: subText }}>  ·  Linked devices</Text>

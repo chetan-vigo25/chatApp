@@ -1020,6 +1020,51 @@ const AudioSeekBar = React.memo(function AudioSeekBar({
   );
 });
 
+/**
+ * Avatar for a shared contact — the card bubble and the detail sheet both use it.
+ *
+ * The person glyph is not only the "contact has no photo" case, it is also the
+ * fallback for a photo that FAILS TO LOAD. Both call sites used to test
+ * `image ? <Image/> : <glyph/>`, which only asks whether the URL string is
+ * empty. A registered contact carries a real profileImage URL, but the
+ * backend's avatar route 302s to a presigned S3 object that can be gone
+ * (NoSuchKey) — so the <Image> was mounted, never painted, and left a blank
+ * hole where the avatar belongs on BOTH the sender's and the receiver's copy.
+ * onError is what closes that gap.
+ */
+const ContactAvatar = React.memo(function ContactAvatar({ uri, size, iconSize, bgColor, iconColor }) {
+  const [failed, setFailed] = useState(false);
+  // Every other avatar in the app normalizes through toSecureMediaUri; the
+  // contact card was the one that didn't. It absolutizes relative /uploads/
+  // paths, remaps a URL baked with a dev/LAN host onto the current backend,
+  // and upgrades http:// to https:// — that last one matters here, because iOS
+  // App Transport Security silently refuses a cleartext image while Android
+  // debug loads it happily. A contact photo served over http therefore showed
+  // on Android and left a hole on iOS.
+  const src = uri ? toSecureMediaUri(uri) : '';
+
+  // FlatList recycles rows, so the same mounted avatar can be handed a
+  // different contact's photo — a stuck `failed` would blank a perfectly good
+  // one. Reset the attempt whenever the source changes.
+  useEffect(() => { setFailed(false); }, [src]);
+
+  const radius = size / 2;
+  if (!src || failed) {
+    return (
+      <View style={{ width: size, height: size, borderRadius: radius, backgroundColor: bgColor, alignItems: 'center', justifyContent: 'center' }}>
+        <Ionicons name="person" size={iconSize} color={iconColor} />
+      </View>
+    );
+  }
+  return (
+    <Image
+      source={{ uri: src }}
+      style={{ width: size, height: size, borderRadius: radius }}
+      onError={() => setFailed(true)}
+    />
+  );
+});
+
 const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme, isDarkMode, onClose, onMessageContact }) {
   if (!data) return null;
 
@@ -1101,13 +1146,13 @@ const ContactDetailSheet = React.memo(function ContactDetailSheet({ data, theme,
           <Ionicons name="arrow-back" size={24} color={accentColor} />
         </Pressable>
 
-        {image ? (
-          <Image source={{ uri: image }} style={{ width: 80, height: 80, borderRadius: 40 }} />
-        ) : (
-          <View style={{ width: 80, height: 80, borderRadius: 40, backgroundColor: accentColor + '20', alignItems: 'center', justifyContent: 'center' }}>
-            <Ionicons name="person" size={40} color={accentColor} />
-          </View>
-        )}
+        <ContactAvatar
+          uri={image}
+          size={80}
+          iconSize={40}
+          bgColor={accentColor + '20'}
+          iconColor={accentColor}
+        />
         <Text style={{ fontSize: 20, color: textColor, fontFamily: 'Roboto-SemiBold', marginTop: 12 }}>{name}</Text>
         {isRegistered && (
           <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
@@ -4373,19 +4418,40 @@ export default function ChatScreen({ navigation, route }) {
    * Nothing about the upload, the optimistic row, or the socket emit changes —
    * only where the file objects came from.
    */
-  const handleSheetSendMedia = useCallback((files) => {
+  const handleSheetSendMedia = useCallback((files, options = {}) => {
     if (!files?.length) return;
+    const typeOf = (file) => (String(file.type || '').startsWith('video') ? 'video' : 'image');
+
+    // View once goes out as ONE MESSAGE PER FILE, deliberately.
+    //
+    // The server contract carries `viewOnce` on a single media row that
+    // persists with no media URLs (see sendMedia's isViewOnceSend branch);
+    // album rows carry mediaItems[] and have no view-once form at all. Sending
+    // them individually reuses that proven path instead of inventing a payload
+    // the backend does not implement — and it matches WhatsApp, where a
+    // view-once media is always its own bubble.
+    //
+    // Chained rather than fired in parallel so the bubbles land in the order
+    // the user picked them, and so N uploads do not start at once.
+    if (options.viewOnce) {
+      files.reduce(
+        (chain, file) => chain.then(() => (
+          sendMedia({ file, type: typeOf(file), viewOnce: true })
+            .catch((err) => console.warn('[sendMedia] view-once sheet-send error:', err?.message))
+        )),
+        Promise.resolve(),
+      );
+      return;
+    }
+
     if (files.length === 1) {
       const file = files[0];
-      setPendingMedia({
-        file,
-        type: String(file.type || '').startsWith('video') ? 'video' : 'image',
-      });
+      setPendingMedia({ file, type: typeOf(file) });
       return;
     }
     sendMediaGroup({ files, caption: '' })
       .catch((err) => console.warn('[sendMediaGroup] sheet-send error:', err?.message));
-  }, [setPendingMedia, sendMediaGroup]);
+  }, [setPendingMedia, sendMedia, sendMediaGroup]);
 
   // The sheet's folder FAB — hands off to the OS picker for anything the
   // Recents grid does not surface (other apps' albums, cloud providers).
@@ -4426,7 +4492,9 @@ export default function ChatScreen({ navigation, route }) {
         await handleShareLocation();
         return;
       }
-      Alert.alert('Coming soon', 'Poll sharing will be available soon.');
+      // Every tile in ATTACH_OPTIONS is handled above, so this is unreachable
+      // today — it only fires if a new tile is added without a branch here.
+      console.warn('[ChatScreen] unhandled attachment option:', key);
     };
 
     closeMediaPanelAnimated(() => {
@@ -6260,13 +6328,13 @@ export default function ChatScreen({ navigation, route }) {
       <View style={{ width: Math.min(280, MAX_MEDIA_BUBBLE_WIDTH), borderRadius: 12, overflow: 'hidden' }}>
         {/* Contact card top — tappable */}
         <Pressable onPress={openContactDetail} style={{ flexDirection: 'row', alignItems: 'center', padding: 10 }}>
-          {profileImage ? (
-            <Image source={{ uri: profileImage }} style={{ width: 46, height: 46, borderRadius: 23 }} />
-          ) : (
-            <View style={{ width: 46, height: 46, borderRadius: 23, backgroundColor: isMyMessage ? 'rgba(255,255,255,0.2)' : (theme.colors.themeColor + '20'), alignItems: 'center', justifyContent: 'center' }}>
-              <Ionicons name="person" size={24} color={isMyMessage ? '#fff' : theme.colors.themeColor} />
-            </View>
-          )}
+          <ContactAvatar
+            uri={profileImage}
+            size={46}
+            iconSize={24}
+            bgColor={isMyMessage ? 'rgba(255,255,255,0.2)' : (theme.colors.themeColor + '20')}
+            iconColor={isMyMessage ? '#fff' : theme.colors.themeColor}
+          />
           <View style={{ flex: 1, marginLeft: 10 }}>
             <Text style={{ color: textColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }} numberOfLines={1}>
               {contactName}

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Text, Animated, Dimensions, AppState, Image } from 'react-native';
+import { StyleSheet, View, Text, Animated, AppState, Image } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../contexts/ThemeContext';
 import { APP_TAG_NAME } from '@env';
@@ -9,8 +9,6 @@ import { bootstrapSession, getStoredSession } from '../services/sessionManager';
 import ChatDatabase from '../services/ChatDatabase';
 import { shouldShowPermissionIntro } from '../features/permissions';
 
-const { width } = Dimensions.get('window');
- 
 export default function Splash({ navigation }) {
     const { theme } = useTheme();
     const deviceInfo = useDeviceInfo();
@@ -159,28 +157,48 @@ export default function Splash({ navigation }) {
                     autoPlay
                     loop
                 /> */}
-                <View style={{ width: 220, height: 220 }}>
+                <View style={{ width:100, height: 100 }}>
                     <Image source={require('../../assets/icon0.png')} resizeMode='contain' style={{ width:'100%', height:"100%" }} />
                 </View>
             </Animated.View>
            
-            <View style={styles.versionContainer}>
-                <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 12, color: theme.colors.primaryTextColor, textAlign: 'center'}}> © 2026 {APP_TAG_NAME}</Text>
-            </View>
+            {/* Bottom wordmark — "from <brand>", the same shape WhatsApp uses for
+                its "from Meta" lockup. The name is the brand accent, the kicker a
+                muted secondary so the eye lands on the name. */}
+            <Animated.View style={[styles.brandContainer, { opacity: fadeAnim }]}>
+                <Text style={[styles.brandKicker, { color: theme.colors.secondaryTextColor }]}>from</Text>
+                <Text style={[styles.brandName, { color: theme.colors.themeColor }]}>{APP_TAG_NAME}</Text>
+            </Animated.View>
         </SafeAreaView>
     );
 }
  
 const styles = StyleSheet.create({
-    versionContainer: {
+    brandContainer: {
         position: 'absolute',
-        bottom: 30,
-        left: '50%',
-        right: '50%',
-        transform: [{ translateX: -width * 0.25 }],
-        width: width * 0.5,
+        bottom: 40,
+        left: 0,
+        right: 0,
         alignItems: 'center',
         justifyContent: 'center',
+    },
+    brandKicker: {
+        // fontWeight backs up fontFamily: the Roboto files are not actually
+        // registered (App.js imports useFonts but never calls it), so the
+        // family name alone would silently fall back to the system face.
+        fontFamily: 'Roboto-Regular',
+        fontWeight: '400',
+        fontSize: 14,
+        letterSpacing: 0.2,
+        textAlign: 'center',
+    },
+    brandName: {
+        fontFamily: 'Roboto-Bold',
+        fontWeight: '700',
+        fontSize: 22,
+        letterSpacing: 0.3,
+        marginTop: 4,
+        textAlign: 'center',
     },
 });
  

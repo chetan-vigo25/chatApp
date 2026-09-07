@@ -79,8 +79,8 @@
         "color": "#03b0a2"
       },
       "adaptiveIcon": {
-        "foregroundImage": "./assets/icon.png",
-        "backgroundColor": "#ffffff"
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#f5ead8"
       },
       "softwareKeyboardLayoutMode": "adjustResize"
     },

@@ -24,7 +24,7 @@
  * time, at send, by utils/deviceMedia.normalizeLibraryAsset.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState, InteractionManager, Platform } from 'react-native';
+import { AppState, InteractionManager, PermissionsAndroid, Platform } from 'react-native';
 import * as MediaLibrary from 'expo-media-library';
 
 import { ensurePermission, PERMISSION_IDS } from '../features/permissions/ensurePermission';
@@ -69,6 +69,40 @@ export default function useDeviceMediaLibrary({ enabled }) {
 
   // ── Permission ────────────────────────────────────────────────────────────
 
+  /**
+   * Ask ANDROID what the visual-media grant really is.
+   *
+   * expo-media-library's `accessPrivileges` cannot be trusted to mean what it
+   * says. It reports ALL only when EVERY permission in the requested set came
+   * back granted — and that set includes ACCESS_MEDIA_LOCATION (declared in
+   * this app's manifest), plus READ_MEDIA_AUDIO on an unscoped call. Miss any
+   * one of those and it falls through to a check of
+   * READ_MEDIA_VISUAL_USER_SELECTED alone, which Android 14+ grants whenever
+   * visual access is granted AT ALL — "Allow all" included. So full photo
+   * access with, say, ACCESS_MEDIA_LOCATION denied is reported as `limited`,
+   * and the picker would show a "Allow all photos" prompt to a user who had
+   * already allowed all photos.
+   *
+   * READ_MEDIA_IMAGES / READ_MEDIA_VIDEO are the only honest signal: either is
+   * granted → the app can see the whole library, full stop.
+   */
+  const readAndroidVisualAccess = useCallback(async () => {
+    if (Platform.OS !== 'android' || Number(Platform.Version) < 33) return null;
+    try {
+      const [images, video, userSelected] = await Promise.all([
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO),
+        PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_MEDIA_VISUAL_USER_SELECTED),
+      ]);
+      if (images || video) return 'all';
+      if (userSelected) return 'limited';
+      return 'none';
+    } catch (err) {
+      console.warn('[mediaLibrary] direct permission check failed', err?.message || err);
+      return null;
+    }
+  }, []);
+
   // Scoped to photo+video: the unscoped call also checks READ_MEDIA_AUDIO on
   // Android 13+, so an app holding exactly the permissions this grid needs
   // would be reported as denied.
@@ -78,16 +112,26 @@ export default function useDeviceMediaLibrary({ enabled }) {
   // manifest — a stale install must still show whatever it CAN read.
   const readPermission = useCallback(async () => {
     if (Platform.OS !== 'android') return MediaLibrary.getPermissionsAsync();
+
+    let status;
     try {
-      const status = await MediaLibrary.getPermissionsAsync(false, ['photo', 'video']);
+      status = await MediaLibrary.getPermissionsAsync(false, ['photo', 'video']);
       manifestMissingPhotosRef.current = false;
-      return status;
     } catch (err) {
       manifestMissingPhotosRef.current = /manifest/i.test(String(err?.message || ''));
       console.warn('[mediaLibrary] scoped permission check failed', err?.message || err);
-      return MediaLibrary.getPermissionsAsync();
+      status = await MediaLibrary.getPermissionsAsync();
     }
-  }, []);
+
+    // Android's own answer wins over expo's summary — see the note above.
+    const actual = await readAndroidVisualAccess();
+    if (!actual) return status;
+    return {
+      ...status,
+      granted: actual !== 'none' ? true : Boolean(status?.granted),
+      accessPrivileges: actual,
+    };
+  }, [readAndroidVisualAccess]);
 
   // ── Fetching ──────────────────────────────────────────────────────────────
 
