@@ -465,11 +465,13 @@ export default function CallOverlay() {
                 selfAvatar={selfAvatar}
                 micOn={call?.micOn !== false}
                 // HOST-ONLY: long-press a tile → Remove from call (backend
-                // re-validates, so this is UI gating only).
-                onParticipantLongPress={isCallHost && call?.isConference ? (p) => {
+                // re-validates, so this is UI gating only). `isCallHost` already
+                // means "multi-party call AND I am the host", so a plain GROUP
+                // call gets the same host controls a conference does.
+                onParticipantLongPress={isCallHost ? (p) => {
                   Alert.alert(
                     'Remove from call',
-                    `Remove ${p?.name || 'this participant'} from the conference?`,
+                    `Remove ${p?.name || 'this participant'} from the call?`,
                     [
                       { text: 'Cancel', style: 'cancel' },
                       { text: 'Remove', style: 'destructive', onPress: () => removeFromCall?.(p.id) },

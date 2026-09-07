@@ -132,6 +132,20 @@ const rosterFrom = (peers = []) => {
   return map;
 };
 
+/**
+ * A GROUP call and a CONFERENCE are the same multi-party call.
+ *
+ * `isConference` used to gate every host / roster / conference-signaling
+ * feature, which left a plain group call (one that never had anyone added
+ * mid-call) with no host, no authoritative roster, no kick, and no per-member
+ * mute state — the backend broadcasts all of it for group rings too. Every one
+ * of those gates now asks THIS question instead, so the two behave identically.
+ *
+ * The `isConference` flag itself is still meaningful, but only for WORDING
+ * ("Conference call" vs "3 in call") — never for capability.
+ */
+export const isMultiParty = (s) => !!(s && (s.isConference || s.isGroup));
+
 // Count peers who currently have media flowing (joined).
 export const joinedCount = (participants = {}) =>
   Object.values(participants).filter((p) => p && p.joined).length;
@@ -174,6 +188,11 @@ export function callReducer(state, action) {
         peers: list,
         participants: rosterFrom(list),
         isGroup,
+        // The dialer hosts the call. The backend is still authoritative (it can
+        // migrate the host when someone leaves, via call:conference:host) but
+        // host-only affordances must work from the first second of the call,
+        // long before any roster broadcast could arrive.
+        hostId: isGroup && action.selfId ? String(action.selfId) : null,
         groupId: groupId || null,
         groupName: groupName || null,
         media,
@@ -258,7 +277,12 @@ export function callReducer(state, action) {
         participants: rosterFrom(list),
         isGroup: group || !!isConference,
         isConference: !!isConference,
-        hostId: hostId ? String(hostId) : null,
+        // Server-named host wins; otherwise the caller is the host, which is
+        // true for every group ring and lets the callee's UI reason about who
+        // owns the call before the first roster broadcast.
+        hostId: hostId ? String(hostId)
+          : ((group || !!isConference) && (peer?.id || list[0]?.id)
+            ? String(peer?.id || list[0].id) : null),
         groupId: groupId || null,
         groupName: groupName || null,
         media,
@@ -401,8 +425,14 @@ export function callReducer(state, action) {
       });
       return {
         ...state,
-        isConference: true,
+        // `isConference` is now WORDING ONLY (isMultiParty drives capability),
+        // so a roster broadcast must not rename a group call into a "conference".
+        // A call that was already multi-party keeps its identity; only a 1:1 that
+        // an invite promoted becomes a conference here.
+        isConference: state.isConference || !state.isGroup,
         isGroup: true, // conference reuses the multi-party grid/controls
+        // Server-named host wins; otherwise keep whoever we already believe hosts
+        // the call (the dialer / the caller — see START_OUTGOING and INCOMING).
         hostId: roster.hostId ? String(roster.hostId) : state.hostId,
         participants: next,
       };

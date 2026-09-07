@@ -7923,9 +7923,25 @@ export default function ChatScreen({ navigation, route }) {
                   peer={chatData.peerUser}
                   chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
                 />
-              ) : null /* GROUP CALLS TEMPORARILY DISABLED — re-enable by restoring
-                 <GroupCallButtons peers={groupCallPeers} groupId={...}
-                 groupName={...} groupAvatar={...} /> here. */}
+              ) : (
+                /* Group chat → the WhatsApp-style camera+chevron control:
+                   Voice call / Video call (rings every other member) and
+                   "Select people" (rings only a chosen subset). Always
+                   rendered for a group — when the member list hasn't loaded
+                   yet the tap explains, instead of the button not existing.
+                   groupId uses the same fallback chain as handleOpenContactInfo,
+                   because the picker sheets re-fetch members with viewGroup({ groupId }). */
+                <GroupCallButtons
+                  peers={groupCallPeers}
+                  groupId={chatData?.groupId || chatData?.group?._id || chatData?.chatId
+                    || chatData?._id || route?.params?.chatId}
+                  groupName={liveChannel?.chatName
+                    ?? (chatData?.chatName || chatData?.group?.name || chatData?.groupName)}
+                  groupAvatar={liveChannel?.chatAvatar !== undefined
+                    ? liveChannel.chatAvatar
+                    : (chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar)}
+                />
+              )}
               {isChatMuted && (
                 <View style={{ marginRight: 8 }}>
                   <Ionicons name="notifications-off" size={20} color={theme.colors.placeHolderTextColor} />

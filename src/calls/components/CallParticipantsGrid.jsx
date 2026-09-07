@@ -109,9 +109,12 @@ export default function CallParticipantsGrid({
                 {statusLabel(p, ringing)}
               </Text>
 
-              {/* Mic state is only known for YOURSELF — the roster carries no
-                  per-member mute flag, so a remote tile never claims one. */}
-              {p.isSelf && micOn === false ? (
+              {/* Muted. Your own state comes from the local toggle; a remote
+                  member's comes from the server roster (`audioEnabled`), which
+                  the backend broadcasts for group calls and conferences alike.
+                  A member whose roster entry predates the flag is `undefined`,
+                  never false, so an unknown state never shows a false badge. */}
+              {(p.isSelf ? micOn === false : p.audioEnabled === false) ? (
                 <View style={styles.micBadge}>
                   <Ionicons name="mic-off" size={13} color="#fff" />
                 </View>

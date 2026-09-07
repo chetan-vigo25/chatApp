@@ -32,29 +32,32 @@ const callIdDialTime = (callId) => {
   return m ? Number(m[1]) : NaN;
 };
 
-// A CONFERENCE keeps ONE callId for the WHOLE life of the call, so the epoch
-// embedded in `sig_<hostId>_<ms>` is when the conference STARTED — not when this
-// particular invite was minted. A member who left and is re-added ten minutes in
-// gets a genuinely live ring whose callId "looks" ten minutes old, and the
-// dial-time fallback below then declared it stale (or merely aged, which routes
-// through a server verify that a cold boot can lose). JS therefore never built
-// the INCOMING state, while iOS had ALREADY put the CallKit screen up from the
-// VoIP push — the user saw the incoming call, answered it, and nothing joined
-// ("audio connecting…" forever). For a conference only the backend `ts` is
-// meaningful; with no `ts` we fail OPEN (ring) rather than swallow a live invite.
-const isConferencePush = (data) => {
-  const v = data && data.isConference;
-  return v === true || v === 1 || v === '1' || v === 'true';
-};
+// A MULTI-PARTY call (conference OR group) keeps ONE callId for the WHOLE life
+// of the call, so the epoch embedded in `sig_<hostId>_<ms>` is when the call
+// STARTED — not when this particular invite was minted. A member who left and is
+// re-added ten minutes in gets a genuinely live ring whose callId "looks" ten
+// minutes old, and the dial-time fallback below then declared it stale (or merely
+// aged, which routes through a server verify that a cold boot can lose). JS
+// therefore never built the INCOMING state, while iOS had ALREADY put the CallKit
+// screen up from the VoIP push — the user saw the incoming call, answered it, and
+// nothing joined ("audio connecting…" forever).
+//
+// This carve-out originally covered `isConference` only. Group calls hit exactly
+// the same reused-id re-invite path (they are the same multi-party call — see
+// isMultiParty in callMachine), so a re-invited GROUP member's push was still
+// being swallowed. For either, only the backend `ts` is meaningful; with no `ts`
+// we fail OPEN (ring) rather than swallow a live invite.
+const truthy = (v) => v === true || v === 1 || v === '1' || v === 'true';
+const isMultiPartyPush = (data) => !!data && (truthy(data.isConference) || truthy(data.isGroup));
 
 // The moment this push was MINTED, in epoch ms — NaN when unknowable.
 // Prefer the backend sent-at stamp (`data.ts`); when it's missing/garbled —
 // notably on the notification-tap REPLAY path — fall back to the dial time
-// embedded in the signaling callId, except for a conference (see above).
+// embedded in the signaling callId, except for a multi-party call (see above).
 const callPushMintedAt = (data) => {
   const ts = Number(data && data.ts);
   if (Number.isFinite(ts) && ts > 0) return ts;
-  if (isConferencePush(data)) return NaN;
+  if (isMultiPartyPush(data)) return NaN;
   const dialTs = callIdDialTime(data && data.callId);
   return (Number.isFinite(dialTs) && dialTs > 0) ? dialTs : NaN;
 };

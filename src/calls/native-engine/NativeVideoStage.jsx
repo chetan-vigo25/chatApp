@@ -151,15 +151,22 @@ function CallGroupGrid({
     if (self && pid === self) return; // never a second "You" tile
     seen.add(pid);
     const r = byPeer.get(pid);
+    // The server roster is authoritative for a peer's camera: a paused track
+    // can linger after they turn the camera off, so an `videoEnabled: false`
+    // member shows their avatar even while a stale stream is still attached.
+    const camOn = p.videoEnabled !== false;
     others.push({
       key: `p:${pid}`,
       id: p.id,
       name: p.name || 'Member',
       avatar: p.avatar,
-      stream: r && r.hasVideo ? r.stream : null,
+      stream: camOn && r && r.hasVideo ? r.stream : null,
       status: tileStatus(p),
       joined: !!p.joined,
       dim: !!p.left,
+      // Roster-driven mute (broadcast for group calls and conferences alike).
+      // `undefined` on an older roster entry means UNKNOWN, never muted.
+      muted: p.audioEnabled === false,
       speaking: !!p.joined && !p.left && pid === String(activeSpeakerId),
     });
   });

@@ -37,7 +37,7 @@ import CallTimer from './components/CallTimer';
 import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
 import {
-  callReducer, initialCallState, CALL_STATUS, ACT, deriveOutcome, MAX_PARTICIPANTS,
+  callReducer, initialCallState, CALL_STATUS, ACT, deriveOutcome, MAX_PARTICIPANTS, isMultiParty,
 } from './state/callMachine';
 import { CALL_RING_DURATION_SECONDS } from '@env';
 import { getCallToken, clearCachedCallToken, getServerRingDurationSec, getServerRecordingConfig } from './services/callTokenService';
@@ -1291,7 +1291,7 @@ export const CallProvider = ({ children }) => {
       // to timeout). These are ADDITIVE — the 1:1 emits still go out exactly as
       // before, so a backend without these handlers is unaffected (the acks just
       // time out) and 1:1 calls never reach this branch at all.
-      if (snap.isConference) {
+      if (isMultiParty(snap)) {
         if (reason === 'rejected' && snap.direction === 'incoming') {
           conferenceReject({ callId: snap.signalId }).catch(() => {});
         } else if (snap.answeredAt) {
@@ -1668,7 +1668,7 @@ export const CallProvider = ({ children }) => {
           // left the re-added member on "Connecting…" forever.
           const expectingReinvite = snap.status === CALL_STATUS.INCOMING
             || snap.pendingAccept
-            || (snap.isConference && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED);
+            || (isMultiParty(snap) && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED);
           if (payload?.callId
             && re.ids.includes(String(payload.callId))
             && Date.now() - re.ts < 60000
@@ -1785,7 +1785,7 @@ export const CallProvider = ({ children }) => {
           const ownGroupRing = !!payload?.isGroup && !differentGroup && (
             (pGid && sGid && pGid === sGid)
             || (payload?.callId && snap.callId && String(payload.callId) === String(snap.callId))
-            || !!snap.isConference
+            || isMultiParty(snap)
           );
           if (ownGroupRing) {
             if (__DEV__) console.log('[CALL][APP] group re-ring for the call we are already on — ignored (NOT declined)', { callId: payload?.callId, groupId: payload?.groupId });
@@ -2340,6 +2340,8 @@ export const CallProvider = ({ children }) => {
       groupId: opts.groupId || null,
       groupName: opts.groupName || null,
       signalId,
+      // We dialled, so we host this group call (see START_OUTGOING).
+      selfId: myId,
       nowMs: Date.now(),
     });
 
@@ -2561,7 +2563,7 @@ export const CallProvider = ({ children }) => {
     // no busy record exists for them. Emitted IN ADDITION to `call:accept` (never
     // instead of it) so nothing changes for a backend that doesn't implement it —
     // the ack simply times out and resolves optimistically. 1:1 never reaches here.
-    if (snap.isConference && snap.signalId) {
+    if (isMultiParty(snap) && snap.signalId) {
       conferenceAccept({ callId: snap.signalId, operationId: conferenceOpIdRef.current })
         .catch(() => {});
     }
@@ -2702,7 +2704,7 @@ export const CallProvider = ({ children }) => {
     // Conference HOST tapping End → choose (WhatsApp-style): just leave (host
     // migrates, call continues) or end the whole conference. Backend enforces
     // host-only on `call:conference:end` regardless of what the client claims.
-    if (snap.isConference && snap.status === CALL_STATUS.ACTIVE && snap.signalId
+    if (isMultiParty(snap) && snap.status === CALL_STATUS.ACTIVE && snap.signalId
       && myId && snap.hostId && String(snap.hostId) === String(myId)) {
       Alert.alert('You are the call host', 'Leave the call, or end it for everyone?', [
         { text: 'Cancel', style: 'cancel' },
@@ -2726,11 +2728,11 @@ export const CallProvider = ({ children }) => {
   // HOST-ONLY kick — backend validates; a non-host gets a FORBIDDEN ack.
   const removeFromCall = useCallback(async (targetUserId) => {
     const snap = stateRef.current;
-    if (!snap.isConference || !snap.signalId || !targetUserId) return;
+    if (!isMultiParty(snap) || !snap.signalId || !targetUserId) return;
     try {
       const ack = await conferenceRemove({ callId: snap.signalId, targetUserId: String(targetUserId) });
       if (ack?.error === 'FORBIDDEN') {
-        Alert.alert('Conference call', 'Only the host can remove a participant.');
+        Alert.alert('Group call', 'Only the host can remove a participant.');
       }
     } catch (_) { /* offline — roster broadcast reconciles on reconnect */ }
   }, []);
@@ -2745,7 +2747,7 @@ export const CallProvider = ({ children }) => {
     const ckId = snap.signalId || snap.callId;
     if (ckId) nativeCall.setMuted(ckId, !next);
     // Conference: mirror the mute into the backend roster so every tile shows it.
-    if (snap.isConference && snap.signalId) {
+    if (isMultiParty(snap) && snap.signalId) {
       conferenceMedia({ callId: snap.signalId, audioEnabled: next }).catch(() => {});
     }
   }, [sendCmd]);
@@ -2763,7 +2765,7 @@ export const CallProvider = ({ children }) => {
       const ok = await ensureMediaPermissions('video');
       if (ok !== true) return;
       sendCmd({ cmd: CMD.TOGGLE_CAMERA, on: true });
-      if (snap.isConference && snap.signalId) {
+      if (isMultiParty(snap) && snap.signalId) {
         conferenceMedia({ callId: snap.signalId, videoEnabled: true }).catch(() => {});
       }
       return;
@@ -2772,7 +2774,7 @@ export const CallProvider = ({ children }) => {
     sendCmd({ cmd: CMD.TOGGLE_CAMERA, on: next });
     // Conference: publish the per-participant video state so peers' tiles flip
     // between live video and the avatar tile.
-    if (snap.isConference && snap.signalId) {
+    if (isMultiParty(snap) && snap.signalId) {
       conferenceMedia({ callId: snap.signalId, videoEnabled: next }).catch(() => {});
     }
   }, [sendCmd, ensureMediaPermissions]);
@@ -2854,7 +2856,7 @@ export const CallProvider = ({ children }) => {
         if (ack && Array.isArray(ack.busyUserIds) && ack.busyUserIds.length) {
           const names = ack.busyUserIds
             .map((id) => (invitees.find((p) => String(p.id) === String(id))?.name) || 'Someone');
-          Alert.alert('Conference call', `${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} currently on another call.`);
+          Alert.alert('Group call', `${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} currently on another call.`);
         }
       }).catch(() => {});
     } else {
@@ -3195,7 +3197,11 @@ export const CallProvider = ({ children }) => {
       //  • ≥5s of LOCAL time since the end also qualifies: the stale
       //    re-deliveries this guard exists for land within ~1-2s of the end;
       //    a host re-adding someone is always slower than that.
-      const conferenceReinvite = !!payload?.isConference
+      // GROUP calls reuse their callId for re-invites exactly as conferences do
+      // (same multi-party call — see isMultiParty), so a member re-added to a
+      // group call was being swallowed here by the id the guard blacklisted at
+      // their earlier leave. The exception now covers both.
+      const conferenceReinvite = (!!payload?.isConference || !!payload?.isGroup)
         && (Number(payload?.ts || 0) > (re.ts || 0)
           || Date.now() - (re.ts || 0) > 5000);
       // 1:1-ONLY guard. A conference invite must never be suppressed by it: the
@@ -3289,7 +3295,12 @@ export const CallProvider = ({ children }) => {
     // Remember which conference INVITE this ring belongs to, so accept/reject can
     // settle that exact invite server-side. Cleared for a non-conference ring so a
     // stale id can never ride along on the next call.
-    conferenceOpIdRef.current = isConferenceRing
+    // Kept for ANY multi-party ring, not just an isConference-flagged one: the
+    // accept path now emits call:conference:accept for group calls too, and the
+    // server settles that invite BY operationId (see CONFERENCE_CALL_SERVER_CHANGES
+    // §5). Dropping it on a group ring left the invite unsettled — the member
+    // joined the media room but never appeared in the broadcast roster.
+    conferenceOpIdRef.current = (isConferenceRing || isGroup)
       ? (payload?.operationId || payload?.inviteId || null)
       : null;
     // Foreground incoming call → present ONLY the OS push notification (CallStyle
@@ -3865,7 +3876,7 @@ export const CallProvider = ({ children }) => {
         // Mid-conference reconnect: pull the authoritative roster so a socket
         // gap can never leave the grid stale.
         const snap = stateRef.current;
-        if (snap.isConference && snap.signalId
+        if (isMultiParty(snap) && snap.signalId
             && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
           conferenceState({ callId: snap.signalId }).then((ack) => {
             if (ack?.active && ack.roster) { onConferenceRoster(ack.roster); return; }
@@ -3978,13 +3989,15 @@ export const CallProvider = ({ children }) => {
     // path, seconds old) still rings instantly.
     {
       const age = callPushAgeMs(data);
-      // CONFERENCE invites get a wider direct-ring window (25s vs 12s): the
-      // backend `ts` is mint-time so it can't be a stale-flush ghost, but a
-      // cold RN boot on a slow device easily eats >12s after the VoIP push —
-      // and the pull fallback needs auth+socket the boot may not have yet.
-      // isStaleCallPush above still drops anything past the ring window.
-      const isConfPush = data?.isConference === '1' || data?.isConference === true;
-      const agedWindow = isConfPush ? 25000 : AGED_CALL_PUSH_MS;
+      // MULTI-PARTY invites (conference AND group — same reused-id call) get a
+      // wider direct-ring window (25s vs 12s): the backend `ts` is mint-time so
+      // it can't be a stale-flush ghost, but a cold RN boot on a slow device
+      // easily eats >12s after the VoIP push — and the pull fallback needs
+      // auth+socket the boot may not have yet. isStaleCallPush above still drops
+      // anything past the ring window.
+      const truthyFlag = (v) => v === '1' || v === true || v === 1 || v === 'true';
+      const isMultiPush = truthyFlag(data?.isConference) || truthyFlag(data?.isGroup);
+      const agedWindow = isMultiPush ? 25000 : AGED_CALL_PUSH_MS;
       if (Number.isFinite(age) && age > agedWindow) {
         if (__DEV__) console.log('[CALL][APP] aged call push — verifying with server before ringing', { callId: data?.callId, ageSec: Math.round(age / 1000) });
         cancelAllIncomingCallNotifee();
@@ -4737,7 +4750,7 @@ export const CallProvider = ({ children }) => {
     inviteMoreToCall,
     removeFromCall,
     // Host check for UI gating (backend re-validates every host-only action).
-    isCallHost: !!(state.isConference && state.hostId && myId && String(state.hostId) === String(myId)),
+    isCallHost: !!(isMultiParty(state) && state.hostId && myId && String(state.hostId) === String(myId)),
     toggleSpeaker,
     resumeAudio,
     minimize,
