@@ -36,6 +36,7 @@ import ChatDatabase from '../../services/ChatDatabase';
 import ContactDatabase from '../../services/ContactDatabase';
 import { primeDeviceContactsIndex } from '../../services/SaveContactService';
 import { subscribeSessionReset } from '../../services/sessionEvents';
+import { prewarmChat, prewarmChats } from '../../services/ChatPrewarm';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { orderChatsForDisplay } from '../../utils/chatOrder';
@@ -464,18 +465,14 @@ export default function ChatList({ navigation }) {
     navigation.navigate('ChatScreen', { item });
 
     if (!chatId) return;
-    if (ChatCache.hasMessages(chatId)) return; // cache already warm
 
-    // Fire-and-forget preload. Honors the per-chat tombstone. Any error
-    // (including a hang during schema migration) is swallowed silently —
-    // ChatScreen will read SQLite directly once it's ready.
-    (async () => {
-      try {
-        const clearedAt = (await ChatDatabase.getClearedAt(chatId)) || 0;
-        const msgs = await ChatDatabase.loadMessages(chatId, { limit: 30, afterTimestamp: clearedAt });
-        if (msgs && msgs.length > 0) ChatCache.setMessages(chatId, msgs);
-      } catch {}
-    })();
+    // Last-resort warm. The list-level prewarm below normally has this thread
+    // in memory well before the tap, so this is usually a no-op hit; it only
+    // does real work for a chat below the prewarm cut-off (deep in the list, or
+    // reached from search). It still races ChatScreen's own mount and will
+    // usually lose that race — which is fine, ChatScreen reads SQLite itself.
+    // The point is that the row is warm for the NEXT open.
+    prewarmChat(chatId);
   }, [navigation]);
   const [isDeletingChat, setIsDeletingChat] = useState(false);
   const [imageViewerVisible, setImageViewerVisible] = useState(false);
@@ -562,6 +559,29 @@ export default function ChatList({ navigation }) {
   }, [searchQuery, dedupedChatList, activeFilter, namesVersion, myProfile]);
 
   const isSearching = searchQuery.trim() !== '';
+
+  // ── PREWARM THE TOP THREADS ───────────────────────────────────────────────
+  // ChatScreen paints instantly only on a ChatCache HIT (a synchronous Map
+  // lookup it can use on its very first render). Warming at tap time — what
+  // openChat used to do — always lost the race against ChatScreen's own mount,
+  // so the cache was cold on exactly the open it was meant to accelerate.
+  //
+  // Do the read HERE instead, while the user is still scanning the list. The
+  // pass waits for interactions to settle and yields between chats, so it costs
+  // nothing visible; by the time a row is tapped its messages are in memory.
+  //
+  // Keyed on the top ids only (not the chat objects) so unrelated churn —
+  // typing flags, presence, unread counts, the 30s timeTick — doesn't re-run
+  // it. Not run while searching: the filtered order isn't what the user will
+  // return to, and prewarmChat's own recency memo skips repeat work anyway.
+  const prewarmKey = useMemo(
+    () => (isSearching ? '' : filteredChats.slice(0, 10).map((c) => c?.chatId || c?._id).filter(Boolean).join(',')),
+    [filteredChats, isSearching]
+  );
+  useEffect(() => {
+    if (!prewarmKey) return;
+    prewarmChats(prewarmKey.split(','));
+  }, [prewarmKey]);
 
   // listOrderSignature + LayoutAnimation removed — causes jank on low-end devices
 

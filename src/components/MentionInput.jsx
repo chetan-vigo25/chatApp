@@ -120,7 +120,11 @@ const MentionSuggestions = React.memo(function MentionSuggestions({
         )}
         style={{ maxHeight: MAX_DROPDOWN_HEIGHT }}
         keyboardShouldPersistTaps="always"
-        showsVerticalScrollIndicator={false}
+        // The list is taller than its box by design; these keep the gesture on
+        // Android where the parent is itself inside scrollable chat furniture.
+        nestedScrollEnabled
+        showsVerticalScrollIndicator
+        bounces={false}
         getItemLayout={(_, index) => ({
           length: SUGGESTION_ITEM_HEIGHT,
           offset: SUGGESTION_ITEM_HEIGHT * index,
@@ -241,15 +245,22 @@ export function useMentions(groupMembers, currentUserId) {
     const cursorPos = cursorPositionRef.current || currentText.length;
     const after = currentText.slice(cursorPos);
 
-    const mentionText = `@${member.displayName} `;
+    // A member who hides their contact details is ALREADY named "@jangid" (the
+    // server substitutes the handle for the name), so prefixing the trigger
+    // blind produced "@@jangid" in the message — and the map was then keyed on
+    // "@jangid" while the text held "jangid", so extractMentionsFromText could
+    // not match it back and the mention was never highlighted or delivered.
+    // One canonical form: the label is always stored WITHOUT the leading "@".
+    const label = String(member.displayName || '').replace(/^@+/, '').trim();
+    const mentionText = `@${label} `;
     const newText = before + mentionText + after;
 
     // Track this mention
     setMentionsMap((prev) => {
       const next = new Map(prev);
-      next.set(member.displayName, {
+      next.set(label, {
         userId: member.userId,
-        displayName: member.displayName,
+        displayName: label,
       });
       return next;
     });
@@ -290,10 +301,13 @@ export function useMentions(groupMembers, currentUserId) {
 // ── Styles ──
 const styles = StyleSheet.create({
   suggestionsContainer: {
-    position: 'absolute',
-    bottom: '100%',
-    left: 10,
-    right: 10,
+    // Laid out in normal flow directly above the composer — NOT absolutely
+    // positioned outside it. Android only dispatches touches to children inside
+    // their parent's bounds, so an overlay hanging above the input bar drew
+    // correctly but swallowed every scroll gesture (iOS does not clip, which is
+    // why the same code scrolled fine there).
+    marginHorizontal: 10,
+    marginBottom: 6,
     borderRadius: 12,
     borderWidth: 0.5,
     overflow: 'hidden',
@@ -302,8 +316,6 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: -2 },
     shadowOpacity: 0.15,
     shadowRadius: 8,
-    zIndex: 100,
-    marginBottom: 4,
   },
   suggestionItem: {
     flexDirection: 'row',

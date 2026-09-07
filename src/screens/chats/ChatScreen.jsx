@@ -550,14 +550,14 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   };
 
   return (
+    // Column, not row: the mention dropdown is a real child laid out ABOVE the
+    // composer instead of an absolutely-positioned overlay hanging outside this
+    // view. Android clips touch dispatch to a parent's bounds, so the old
+    // `position:absolute; bottom:100%` list drew fine but received no touches —
+    // it could not be scrolled at all, while iOS (which does not clip) worked.
     <View
       style={{
-        flexDirection: 'row',
-        alignItems: 'flex-end',
-        paddingHorizontal: 10,
-        paddingTop: 8,
-        paddingBottom: Platform.OS === 'ios' ? 12 : 10,
-        // backgroundColor: theme.colors.background,
+        flexDirection: 'column',
         backgroundColor: 'transparent',
         overflow: 'visible',
         borderWidth: 0,
@@ -565,6 +565,15 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
       }}
     >
       {mentionSuggestionsNode}
+      <View
+        style={{
+          flexDirection: 'row',
+          alignItems: 'flex-end',
+          paddingHorizontal: 10,
+          paddingTop: 8,
+          paddingBottom: Platform.OS === 'ios' ? 12 : 10,
+        }}
+      >
       <Animated.View
         style={{
           flex: 1,
@@ -800,6 +809,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           </Animated.View>
         </TouchableOpacity>
       </Animated.View>
+      </View>
 
       {/* Schedule Time Picker */}
       <ScheduleTimePicker
@@ -5137,6 +5147,39 @@ export default function ChatScreen({ navigation, route }) {
   }, []);
 
   // Helper: split a text string on @mention boundaries for highlighting
+  // WhatsApp names a mention for the VIEWER, not for whoever typed it: a saved
+  // contact shows as "@Priyansh", an unsaved one as "@~Brijesh" (the tilde marks
+  // the person's own profile name rather than a name you chose), and someone
+  // hiding their details as "@jangid". The raw "@name" the sender typed is only
+  // the anchor — what gets drawn is resolved per viewer from the same address
+  // book the group sender label uses, so the two always agree.
+  const mentionLabelFor = (mention) => {
+    const stored = String(mention?.displayName || '').replace(/^@+/, '').trim();
+    const uid = mention?.userId ? String(mention.userId) : null;
+    if (!uid) return stored ? `@${stored}` : null;
+
+    const member = groupMembersMap?.[uid] || {};
+    const peer = !chatData?.isGroup ? chatData?.peerUser : null;
+    const phone = member.mobileNumber || peer?.mobileNumber || peer?.mobile?.number || null;
+    const pushName = member.fullName || peer?.fullName || stored;
+    const hideContact = Boolean(
+      member.hideContact ?? peer?.hideContact ?? peer?.privacySettings?.hideContact,
+    );
+    const username = member.userName || peer?.userName || null;
+
+    // `pushNameOf` returns "~Name" ONLY for an unsaved, non-hidden peer and null
+    // otherwise — exactly the tilde rule — so it is the first choice, with the
+    // canonical resolver (saved name → number → "@handle") behind it.
+    const tilde = resolveContactPushName({ userId: uid, phone, pushName, hideContact });
+    const label = tilde
+      || resolveContactName(uid, pushName || stored, phone, { username, hideContact });
+
+    const text = String(label || stored || '').trim();
+    if (!text) return null;
+    // A hidden peer already resolves to "@handle"; don't prefix a second "@".
+    return text.startsWith('@') ? text : `@${text}`;
+  };
+
   const renderTextWithMentions = (textStr, mentions, baseColor, mentionColor, keyPrefix) => {
     if (!mentions || mentions.length === 0 || !textStr) {
       return <Text style={{ color: baseColor }}>{textStr}</Text>;
@@ -5148,24 +5191,45 @@ export default function ChatScreen({ navigation, route }) {
     if (mentionNames.length === 0) {
       return <Text style={{ color: baseColor }}>{textStr}</Text>;
     }
-    // Escape regex special chars and build pattern
-    const escaped = mentionNames.map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    // Escape regex special chars and build pattern. Longest name first, so
+    // "@ram kumar" is not cut short by a member also called "@ram".
+    const escaped = [...mentionNames]
+      .sort((a, b) => b.length - a.length)
+      .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
     const pattern = new RegExp(`(@(?:${escaped.join('|')}))`, 'g');
     const parts = textStr.split(pattern);
     if (parts.length <= 1) {
       return <Text style={{ color: baseColor }}>{textStr}</Text>;
     }
+    // token → what THIS viewer should see. A Map, not a Set: lookup beats
+    // re-testing the /g pattern (whose `test` advances lastIndex, so the old
+    // code had to reset it by hand on every branch and a miss silently rendered
+    // a mention as plain text), and it carries the resolved label along.
+    const labelByToken = new Map();
+    mentions.forEach((m) => {
+      if (!m?.displayName) return;
+      labelByToken.set(`@${m.displayName}`, mentionLabelFor(m));
+    });
+
     return parts.map((part, i) => {
-      if (pattern.test(part)) {
-        // Reset regex lastIndex after test
-        pattern.lastIndex = 0;
+      if (labelByToken.has(part)) {
         return (
-          <Text key={`${keyPrefix}_m${i}`} style={{ color: mentionColor, fontFamily: 'Roboto-SemiBold' }}>
-            {part}
+          <Text
+            key={`${keyPrefix}_m${i}`}
+            style={{
+              color: mentionColor,
+              // fontWeight, not just the family: the Roboto files are never
+              // registered (App.js imports useFonts but never calls it), so
+              // 'Roboto-SemiBold' alone silently fell back to the regular face
+              // and the mention rendered at the same weight as the message.
+              fontFamily: 'Roboto-Bold',
+              fontWeight: '700',
+            }}
+          >
+            {labelByToken.get(part) || part}
           </Text>
         );
       }
-      pattern.lastIndex = 0;
       return <Text key={`${keyPrefix}_t${i}`} style={{ color: baseColor }}>{part}</Text>;
     });
   };
@@ -8047,7 +8111,14 @@ export default function ChatScreen({ navigation, route }) {
               flexGrow: 1,
             }}
             showsVerticalScrollIndicator={false}
-            initialNumToRender={15}
+            // First-paint budget. renderChatsItem builds a message bubble inline
+            // (media tiles, reply quote, reactions, status ticks) rather than
+            // rendering a memoized row component, so each row is expensive and
+            // the initial batch is rendered SYNCHRONOUSLY before the screen can
+            // show anything. 15 rows was several frames of work on mid-range
+            // Android; 8 fills a screen and the rest stream in via
+            // maxToRenderPerBatch on the very next tick.
+            initialNumToRender={8}
             keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
 
             ListHeaderComponent={renderTypingIndicator}

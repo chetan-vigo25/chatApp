@@ -7,7 +7,9 @@ import * as Haptics from 'expo-haptics';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useCall } from '../useCall';
 import { useTheme } from '../../contexts/ThemeContext';
+import { useAuth } from '../../contexts/AuthContext';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import useCallRoster from '../useCallRoster';
 import { CALL_STATUS, joinedCount } from '../state/callMachine';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import CallAvatar from '../components/CallAvatar';
@@ -19,7 +21,6 @@ import PulsingRing from '../components/PulsingRing';
 import CallMiniBanner from '../components/CallMiniBanner';
 import AddParticipantSheet from '../components/AddParticipantSheet';
 import ConferenceAddPeopleSheet from '../components/ConferenceAddPeopleSheet';
-import ChatDatabase from '../../services/ChatDatabase';
 
 const END_TEXT = {
   completed: 'Call ended',
@@ -46,35 +47,15 @@ export default function CallOverlay() {
   // Mid-call "Add participant" member picker (group calls).
   const [showAddSheet, setShowAddSheet] = useState(false);
 
-  // Local identity fallback for roster entries that arrived as bare ids
-  // ("Member"): the 1:1 chat row for that peer already stores their name /
-  // number exactly as the chat list shows them. Looked up once per id;
-  // null-cached so a missing chat doesn't re-query every render.
-  const [peerIdentityMap, setPeerIdentityMap] = useState({});
-  const participantsForIdentity = call?.participants;
-  useEffect(() => {
-    const all = Object.values(participantsForIdentity || {});
-    const missing = all.filter((p) => p?.id
-      && (!p.name || p.name === 'Member' || p.name === 'Unknown')
-      && !p.mobile
-      && peerIdentityMap[p.id] === undefined);
-    if (!missing.length) return undefined;
-    let alive = true;
-    (async () => {
-      const updates = {};
-      for (const p of missing) {
-        updates[p.id] = await ChatDatabase.getPeerIdentity(p.id).catch(() => null);
-      }
-      if (alive) setPeerIdentityMap((prev) => ({ ...prev, ...updates }));
-    })();
-    return () => { alive = false; };
-  }, [participantsForIdentity, peerIdentityMap]);
-
   const insets = useSafeAreaInsets();
   const { theme, isDarkMode } = useTheme();
   // Resolve the caller/callee name to the device's saved contact name (then
   // mobile number, then backend name) — same priority as the chat list.
   const { resolveName, peerPrivacyOf } = useContactDirectory();
+  // Your own tile in the group grid ("You") — the roster only carries other people.
+  const { user } = useAuth();
+  const selfAvatar = user?.profileImage || user?.profilePicture
+    || user?.profilePic || user?.avatar || null;
   const c = theme.colors;
   // Palette for the opaque (audio / incoming / outgoing / ended) call screen,
   // which now sits on the WhatsApp chat wallpaper — so text/icons must read on a
@@ -133,59 +114,25 @@ export default function CallOverlay() {
   const minimized = !!call?.minimized;
 
   // What the group roster grid actually SHOWS:
-  //  • receiver, once answered → ONLY people actually connected (no own tile,
-  //    no "Connecting…" ghosts for members who never picked up);
+  //  • receiver, once answered → ONLY people actually connected (no
+  //    "Connecting…" ghosts for members who never picked up);
   //  • caller (and the pre-answer incoming ring) → the invited roster, with
   //    "Ringing…" until each member joins — the ring-window sweep removes
   //    non-answerers so nothing rings forever.
   // Names are resolved through the device contact directory (roster entries
-  // from the socket payload only carry ids).
-  const gridParticipants = (() => {
-    if (!isGroup) return call?.participants || {};
-    const all = call?.participants || {};
-    const receiverConnectedOnly = call?.direction === 'incoming'
-      && (accepted0 || status === CALL_STATUS.ACTIVE);
-    const out = {};
-    Object.values(all).forEach((p) => {
-      if (!p || !p.id) return;
-      if (receiverConnectedOnly && !p.joined) return;
-      // Product rule: saved contact → the locally saved name; unsaved → their
-      // mobile number; NEVER the bare "Member" label when we know anything
-      // better. Number sources, in order: roster mobile (backend identity),
-      // then the local 1:1 chat row for this peer (peerIdentityMap). resolveName
-      // already prefers saved name > phone > fallback.
-      const ident = peerIdentityMap[p.id] || null;
-      // Identity fields can arrive as a { code, number } mobile OBJECT from
-      // older payloads/cached rows — coerce everything to a string here so the
-      // tile label can never render "[object Object]".
-      const asText = (v) => {
-        if (!v) return null;
-        if (typeof v === 'string') return v.trim() || null;
-        if (typeof v === 'object') return `${v.code || ''}${v.number || ''}`.trim() || null;
-        return String(v);
-      };
-      const pName = asText(p.name);
-      const genericName = !pName || pName === 'Member' || pName === 'Unknown';
-      const fallbackName = genericName
-        ? (asText(ident?.fullName) || asText(ident?.mobileNumber) || pName)
-        : pName;
-      const phone = asText(p.mobile) || asText(p.phone) || asText(ident?.mobileNumber) || null;
-      // Merge both identity sources before reading the privacy bits: the roster
-      // carries `hideContact` + `userName`, while the local chat row (`ident`)
-      // may only have one of them.
-      const rosterPrivacy = peerPrivacyOf(p);
-      const identPrivacy = peerPrivacyOf(ident);
-      const privacy = {
-        // Prefer whichever source actually HAS the value — a plain spread let a
-        // null from the roster wipe a handle the chat row knew about.
-        username: rosterPrivacy.username || identPrivacy.username,
-        hideContact: rosterPrivacy.hideContact || identPrivacy.hideContact,
-      };
-      const name = resolveName(p.id, fallbackName, phone, privacy) || fallbackName || 'Member';
-      out[p.id] = name === p.name ? p : { ...p, name };
-    });
-    return out;
-  })();
+  // from the socket payload only carry ids). useCallRoster is shared with the
+  // VIDEO tile grid (NativeVideoStage), so a conference shows the same names on
+  // voice and on video.
+  // The connected-only filter is a GROUP rule; a 1:1 call still passes its raw
+  // roster straight through (ConferenceAddPeopleSheet reads it to count who is
+  // already connected when a 1:1 is being converted into a conference).
+  const receiverConnectedOnly = isGroup
+    && call?.direction === 'incoming'
+    && (accepted0 || status === CALL_STATUS.ACTIVE);
+  const gridParticipants = useCallRoster(
+    call?.participants,
+    { connectedOnly: receiverConnectedOnly },
+  );
 
   // "Add participant" is available on a LIVE group call (host ringing included —
   // the host is already in the room while others ring) — AND on a live 1:1
@@ -506,11 +453,17 @@ export default function CallOverlay() {
           <View style={styles.identity}>
             <Text style={[styles.subtitle, { color: onBgSoft }]}>{subtitle}</Text>
             <Text style={[styles.groupName, { color: onBg }]} numberOfLines={1}>{groupTitle}</Text>
-            <View style={styles.gridWrap}>
+            {/* The grid only claims the flexible space once there is actually
+                someone to show — before anyone joins, the title/status stays
+                vertically centred instead of being pushed up by an empty box. */}
+            <View style={Object.keys(gridParticipants).length ? styles.gridWrap : null}>
               <CallParticipantsGrid
                 participants={gridParticipants}
                 ringing={ringing}
                 activeSpeakerId={call?.activeSpeakerId || null}
+                selfId={selfId}
+                selfAvatar={selfAvatar}
+                micOn={call?.micOn !== false}
                 // HOST-ONLY: long-press a tile → Remove from call (backend
                 // re-validates, so this is UI gating only).
                 onParticipantLongPress={isCallHost && call?.isConference ? (p) => {
@@ -696,7 +649,10 @@ const styles = StyleSheet.create({
     maxWidth: '82%',
     textAlign: 'center',
   },
-  gridWrap: { width: '100%' },
+  // The tiled grid sizes its rows as a PERCENTAGE of this box, so it needs a
+  // real height — flex:1 gives it everything left between the title and the
+  // controls. Without it every tile would collapse to zero.
+  gridWrap: { width: '100%', flex: 1, paddingHorizontal: 8 },
   mediaRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10 },
   mediaText: { color: 'rgba(255,255,255,0.8)', fontFamily: 'Roboto-Regular', fontSize: 13 },
   activeTimer: { marginTop: 18, fontSize: 16 },

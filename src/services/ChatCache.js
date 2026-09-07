@@ -130,7 +130,14 @@ export const getMessages = (chatId) => {
   const entry = messageStore.get(id);
   if (entry) {
     entry.lastAccess = Date.now();
-    return entry.messages;
+    // COPY, never the live array. `addMessage` mutates `entry.messages` in
+    // place (unshift on insert, index assignment on update), so handing the
+    // internal array to a caller that puts it in React state produces a
+    // reference whose CONTENTS change without the reference changing — React
+    // then skips the re-render and the screen silently goes stale. The chat
+    // screen seeds its first paint from here, so this must be a snapshot.
+    // At MAX_MESSAGES_PER_CHAT (50) the copy is free.
+    return entry.messages.slice();
   }
   return [];
 };

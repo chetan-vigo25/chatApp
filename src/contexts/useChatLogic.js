@@ -77,6 +77,12 @@ subscribeUserChanged(() => { _cachedUserInfo = null; });
 const _lastChatSyncAt = new Map();
 subscribeSessionReset(() => { _lastChatSyncAt.clear(); });
 subscribeUserChanged(() => { _lastChatSyncAt.clear(); });
+// Synchronous peek at the module-level user cache. Populated by the first
+// getCachedUserInfo() of the session (chat list, sync screen, a prior chat
+// open), so by the time any chat is opened it is essentially always warm.
+// Returns null when it isn't — callers must fall back to the async read.
+const getCachedUserInfoSync = () => _cachedUserInfo || null;
+
 const getCachedUserInfo = async () => {
   if (_cachedUserInfo) return _cachedUserInfo;
   try {
@@ -555,6 +561,9 @@ export default function useChatLogic({ navigation, route }) {
   const presenceCheckInterval = useRef(null);
   const hasSyncedRef = useRef(false);
   const chatIdRef = useRef(null);
+  // True until the chat-init effect has run once. Guards the seed against the
+  // effect's unconditional list reset. See the init effect below.
+  const isFirstInitRunRef = useRef(true);
   const currentUserIdRef = useRef(null);
   const currentUserNameRef = useRef('');
   const groupMembersMapRef = useRef({});
@@ -648,17 +657,63 @@ export default function useChatLogic({ navigation, route }) {
   const localSaveTimeoutRef = useRef(null);
   const socketHandlerRegistryRef = useRef(new Map());
 
+  // ── SYNCHRONOUS FIRST-PAINT SEED ──────────────────────────────────────────
+  // The whole point: paint real bubbles in the FIRST render, the way WhatsApp
+  // does, instead of mounting empty and filling in from an effect.
+  //
+  // Everything below is derived with zero awaits. `chatData.chatId` comes
+  // straight off the route item the chat list passed in, and the user id is
+  // read from the module cache — so for a normal list tap the chat id is known
+  // before React commits, and ChatCache.getMessages() is a plain Map lookup.
+  //
+  // The chat id MUST be computed exactly the way initializeChat computes
+  // `generatedChatId`, or the derive effect below would filter the seeded rows
+  // out against a different id. Where it can't be derived deterministically
+  // (a brand-new group with no id yet, or a private chat before the user cache
+  // is warm) we seed nothing and fall back to the old async path — correctness
+  // first, speed second.
+  const seed = useMemo(() => {
+    const isGrp = chatData.chatType === 'group' || chatData.isGroup;
+    const isBcast = chatData.chatType === 'broadcast' || Boolean(chatData.isBroadcast);
+    const cachedUser = getCachedUserInfoSync();
+    const uid = cachedUser ? (cachedUser._id || cachedUser.id) : null;
+    let cid = chatData.chatId || routeChatId || null;
+    if (!cid) {
+      if (isGrp) cid = chatData.groupId || chatData.group?._id || null; // NEVER the grp_<now> fallback
+      else if (!isBcast && uid && chatData.peerUser?._id) cid = buildPrivateChatId(uid, chatData.peerUser._id);
+    }
+    if (!cid) return { chatId: null, userId: uid, messages: [] };
+    const cached = ChatCache.hasMessages(cid) ? ChatCache.getMessages(cid) : [];
+    return { chatId: cid, userId: uid, messages: Array.isArray(cached) ? cached : [] };
+    // Deliberately computed ONCE per mount: this is a first-paint seed, not a
+    // live subscription. Every later update flows through initializeChat and
+    // the normal SQLite/socket paths.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const hasSeed = seed.messages.length > 0;
+
   // State
   const [text, setText] = useState("");
   const [search, setSearch] = useState("");
   const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const [messages, setMessages] = useState([]);
-  const [allMessages, setAllMessages] = useState([]);
+  const [messages, setMessages] = useState(seed.messages);
+  const [allMessages, setAllMessages] = useState(seed.messages);
   const [scheduledMessages, setScheduledMessages] = useState([]);
   const [selectedMessage, setSelectedMessages] = useState([]);
-  const [currentUserId, setCurrentUserId] = useState(null);
-  const [chatId, setChatId] = useState(null);
-  const [isLoadingInitial, setIsLoadingInitial] = useState(true);
+  const [currentUserId, setCurrentUserId] = useState(seed.userId);
+  // Seeding the id (not just the messages) is what makes the seed survive: the
+  // derive effect below bails out and CLEARS `messages` while `chatId` is null,
+  // which would wipe the seeded rows on the very first commit.
+  const [chatId, setChatId] = useState(seed.chatId);
+  // A seeded chat is, by definition, already loaded — never show it a spinner.
+  const [isLoadingInitial, setIsLoadingInitial] = useState(!hasSeed);
+  // Lazy ref init (idempotent, runs only on the first render): the hot paths
+  // read chatIdRef/currentUserIdRef/allMessagesRef, not state, so leaving them
+  // null while the seeded state was already painted would make a message that
+  // arrives in that first tick fail its chat-id check and be dropped.
+  if (seed.chatId && chatIdRef.current === null) chatIdRef.current = seed.chatId;
+  if (seed.userId && currentUserIdRef.current === null) currentUserIdRef.current = seed.userId;
+  if (hasSeed && allMessagesRef.current.length === 0) allMessagesRef.current = seed.messages;
   const [userStatus, setUserStatus] = useState("");
   const [lastSeen, setLastSeen] = useState(null);
   const [customStatus, setCustomStatus] = useState("");
@@ -677,7 +732,7 @@ export default function useChatLogic({ navigation, route }) {
   const [isBackfilling, setIsBackfilling] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isManualReloading, setIsManualReloading] = useState(false);
-  const [isLoadingFromLocal, setIsLoadingFromLocal] = useState(true);
+  const [isLoadingFromLocal, setIsLoadingFromLocal] = useState(!hasSeed);
   const [hasLoadedFromAPI, setHasLoadedFromAPI] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const [searchResults, setSearchResults] = useState([]);
@@ -1635,9 +1690,20 @@ export default function useChatLogic({ navigation, route }) {
   useEffect(() => {
     if (chatData.peerUser || isGroupInit || isBroadcastInit) {
       console.log('🔄 Initializing chat:', isBroadcastInit ? `broadcast:${chatData.chatId}` : isGroupInit ? `group:${chatData.groupId || chatData.chatId}` : `user:${chatData.peerUser?._id}`);
-      
-      setMessages([]);
-      setAllMessages([]);
+
+      // Clearing here is what makes a chat SWITCH not flash the previous
+      // thread. But on the very first run of a SEEDED mount there is no
+      // previous thread — the rows on screen are this chat's own cache — and
+      // wiping them would undo the whole point of the synchronous seed: the
+      // user would see bubbles for one frame, then a spinner. Skip exactly
+      // that one case; every re-run still clears normally.
+      const skipInitialClear = isFirstInitRunRef.current && hasSeed && seed.chatId
+        && String(seed.chatId) === String(chatData.chatId || routeChatId || seed.chatId);
+      isFirstInitRunRef.current = false;
+      if (!skipInitialClear) {
+        setMessages([]);
+        setAllMessages([]);
+      }
       // New chat lifecycle → the change-gate must start clean, or the first
       // rows loaded for this chat can be swallowed as a "no change" no-op.
       lastMessagesFingerprintRef.current = '';
@@ -2477,6 +2543,35 @@ export default function useChatLogic({ navigation, route }) {
       basePayload.outcome = basePayload.outcome || cd.outcome || 'completed';
       basePayload.durationSec = Math.max(0, Number(basePayload.durationSec ?? cd.durationSec) || 0);
     }
+    // @mentions ride at the TOP level of the send payload (handleSendText below),
+    // never inside `payload` — and this normalizer rebuilds the message field by
+    // field, so it silently dropped them. The SENDER kept its own optimistic
+    // copy, which is why a mention rendered bold for the sender and as plain
+    // text for every receiver. Carry them through here, and stash them in the
+    // payload as well: `messages` has no mentions column, so the JSON payload is
+    // what survives a reload.
+    //
+    // displayName is preserved VERBATIM. The highlighter matches on the literal
+    // "@" + displayName token, so rewriting it here (trimming a leading "@", for
+    // instance) would stop older messages from matching their own text.
+    const incomingMentions = (() => {
+      const raw = Array.isArray(apiMsg?.mentions) ? apiMsg.mentions
+        : (Array.isArray(apiMsg?.payload?.mentions) ? apiMsg.payload.mentions
+          : (Array.isArray(apiMsg?.mentionedUsers) ? apiMsg.mentionedUsers : null));
+      if (!raw || raw.length === 0) return null;
+      const cleaned = raw
+        .filter((m) => m && typeof m === 'object')
+        .map((m) => ({
+          userId: m.userId != null ? String(m.userId) : (m._id != null ? String(m._id) : null),
+          displayName: m.displayName || m.fullName || m.name || null,
+          startIndex: Number.isFinite(Number(m.startIndex)) ? Number(m.startIndex) : null,
+          length: Number.isFinite(Number(m.length)) ? Number(m.length) : null,
+        }))
+        .filter((m) => m.displayName);
+      return cleaned.length > 0 ? cleaned : null;
+    })();
+    if (incomingMentions) basePayload.mentions = incomingMentions;
+
     const normalizedPayload = normalizeMessagePayloadWithDownloadFlag(
       resolvedMessageType,
       {
@@ -2566,6 +2661,7 @@ export default function useChatLogic({ navigation, route }) {
         ? MEDIA_DOWNLOAD_STATUS.DOWNLOADED
         : MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED,
       reactions: sanitizeReactions(apiMsg?.reactions),
+      mentions: incomingMentions,
       isEdited: Boolean(apiMsg?.isEdited || apiMsg?.editedAt || apiMsg?.is_edited || pendingEdit),
       editedAt: (pendingEdit ? pendingEdit.editedAt : null) || apiMsg?.editedAt || apiMsg?.edited_at || null,
       isForwarded: Boolean(apiMsg?.isForwarded || apiMsg?.is_forwarded || apiMsg?.forwarded || apiMsg?.forwardedFrom || apiMsg?.forwarded_from || apiMsg?.forwardedMessage || apiMsg?.isForwardedMessage),
@@ -3010,7 +3106,15 @@ export default function useChatLogic({ navigation, route }) {
         if (!isFirstRender) {
           try { await SqliteWriter.awaitDrain(); } catch {}
         }
-        const clearedAt = await ChatDatabase.getClearedAt(cid) || 0;
+        // Prefer the memoized value: this read gates the message query, so an
+        // await here is a SERIAL round-trip in front of the one that actually
+        // produces bubbles. The prewarm (and any prior open) has already
+        // populated it, so on the path that matters this costs nothing.
+        // `null` means "never read" — 0 is a real value, so don't conflate them.
+        const clearedAtMemo = ChatDatabase.getClearedAtSync(cid);
+        const clearedAt = clearedAtMemo !== null
+          ? clearedAtMemo
+          : ((await ChatDatabase.getClearedAt(cid)) || 0);
         // First paint reads one small screenful (INITIAL_PAGE_SIZE) for the
         // fastest possible render. Once the user has scrolled up and grown the
         // window, read AT LEAST that many rows so this re-read preserves the

@@ -4804,6 +4804,21 @@ export const CallProvider = ({ children }) => {
               peer={state.peer}
               cameraOn={state.cameraOn !== false}
               remoteCameraOn={state.isGroup ? true : state.remoteCameraOn !== false}
+              // Group/conference: the stage draws the participant GRID (self
+              // included as a tile), so it needs the roster and your own
+              // identity — CallOverlay only puts the top bar and controls over it.
+              isGroup={!!state.isGroup}
+              isVideo={state.media === 'video'}
+              participants={state.participants}
+              // Receiver, once answered: only show people actually connected —
+              // no "Connecting…" ghosts for members who never picked up.
+              rosterConnectedOnly={state.direction === 'incoming'
+                && (!!state.accepted || state.status === CALL_STATUS.ACTIVE)}
+              selfId={myId}
+              selfName={myName || 'You'}
+              selfAvatar={user?.profileImage || user?.profilePicture || user?.profilePic || user?.avatar || null}
+              micOn={state.micOn !== false}
+              activeSpeakerId={state.activeSpeakerId}
             />
           ) : (
             <CallEngineWebView

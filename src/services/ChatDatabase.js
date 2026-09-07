@@ -111,7 +111,24 @@ const getDB = async () => {
   }
 };
 
+// `clearedAt` gates every message read, so refreshMessagesFromDB awaits it
+// BEFORE it can even issue the message query — two serial round-trips on the
+// first-paint critical path. It only ever changes when the user clears a chat,
+// so memoize it: `clearChat` writes through, and `getClearedAtSync` lets the
+// open path skip the await entirely for any chat already read this session.
+const _clearedAtCache = new Map();
+
+const _invalidateMemoryCaches = () => {
+  // Any handle teardown (logout, account switch, corrupt-DB recreate) can change
+  // what the file holds — drop every in-memory memo so nothing survives it.
+  try { _clearedAtCache.clear(); } catch {}
+};
+
 const _closeReadDB = async () => {
+  // Every teardown path (_safeClose on recreate, closeDB, closeCleanly on
+  // logout) funnels through here, so this is the one place that reliably
+  // invalidates the in-memory memos.
+  _invalidateMemoryCaches();
   const r = _readDb;
   _readDb = null;
   _readDbInitPromise = null;
@@ -142,18 +159,28 @@ const getReadDB = async () => {
   _readDbInitPromise = (async () => {
     const primary = await getDB(); // ensures file exists + migrations have run
     try {
+      // `useNewConnection: true` is REQUIRED and is the whole point of this
+      // function. expo-sqlite caches the NATIVE connection by (path, options);
+      // opening the same DB_NAME with the same options hands back a fresh JS
+      // wrapper around the WRITER'S connection. Statements serialize per native
+      // connection, so without this flag every "reader" query queued behind
+      // whatever the writer was doing — which is exactly what made opening a
+      // chat sit on a spinner during the post-login/reconnect write storm.
+      // The `handle === primary` guard below could never catch it either:
+      // openDatabaseSync always constructs a new SQLiteDatabase object, so the
+      // identity check was always false and the fallback never fired.
+      //
+      // With a genuinely separate connection, WAL gives real read concurrency:
+      // this reader sees the last committed snapshot immediately, never blocked
+      // by an in-flight write. Still no `PRAGMA query_only = ON` — the flag is
+      // connection-scoped and harmless here, but it costs nothing to omit and
+      // keeps this handle usable if a future caller needs a write.
+      const OPEN_OPTS = { useNewConnection: true };
       const handle = _track(typeof SQLite.openDatabaseSync === 'function'
-        ? SQLite.openDatabaseSync(DB_NAME)
-        : await SQLite.openDatabaseAsync(DB_NAME));
-      // CRITICAL: expo-sqlite caches connections by (name, options). Because the
-      // writer and this reader open the SAME name with the SAME options,
-      // openDatabaseSync hands back the *same* underlying connection — it is NOT
-      // an independent handle. So we must NOT set `PRAGMA query_only = ON` here:
-      // that pragma is connection-scoped and would flip the SHARED connection
-      // read-only, making every writer statement fail with "attempt to write a
-      // readonly database" (the presence-cache / status-flush errors). If we did
-      // get the very same JS instance back, there's no concurrency to gain —
-      // fall back to the primary and skip the dedicated reader entirely.
+        ? SQLite.openDatabaseSync(DB_NAME, OPEN_OPTS)
+        : await SQLite.openDatabaseAsync(DB_NAME, OPEN_OPTS));
+      // Belt and braces: if some future expo-sqlite really does hand back the
+      // same JS instance, there is no concurrency to gain — use the primary.
       if (handle === primary) {
         _readDb = null;
         _readerUnavailable = true;
@@ -2306,14 +2333,32 @@ const clearChat = async (chatId, clearedAt = null) => {
     } else {
       await db.runAsync(`DELETE FROM messages WHERE chat_id = $c`, { $c: chatId });
     }
-    await db.runAsync(`INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at) VALUES ($c, $t, $n)`, { $c: chatId, $t: clearedAt || Date.now(), $n: Date.now() });
+    const effectiveClearedAt = clearedAt || Date.now();
+    await db.runAsync(`INSERT OR REPLACE INTO chat_meta (chat_id, cleared_at, updated_at) VALUES ($c, $t, $n)`, { $c: chatId, $t: effectiveClearedAt, $n: Date.now() });
+    // Write through, or the next open would read a stale 0 from the memo and
+    // repaint the history the user just cleared.
+    _clearedAtCache.set(String(chatId), effectiveClearedAt);
   });
+};
+
+// Synchronous read of the memoized value. Returns `null` (NOT 0) when this chat
+// has never been read — callers must treat null as "unknown, go async", because
+// 0 is a legitimate value meaning "never cleared".
+const getClearedAtSync = (chatId) => {
+  if (!chatId) return 0;
+  const v = _clearedAtCache.get(String(chatId));
+  return v === undefined ? null : v;
 };
 
 const getClearedAt = async (chatId) => {
   if (!chatId) return 0;
+  const key = String(chatId);
+  const cached = _clearedAtCache.get(key);
+  if (cached !== undefined) return cached;
   const r = await _readQuery((db) => db.getFirstAsync(`SELECT cleared_at FROM chat_meta WHERE chat_id = $c`, { $c: chatId }));
-  return r?.cleared_at || 0;
+  const val = r?.cleared_at || 0;
+  _clearedAtCache.set(key, val);
+  return val;
 };
 
 const getMessageCount = async (chatId) => {
@@ -3593,7 +3638,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,
