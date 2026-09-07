@@ -10760,11 +10760,14 @@ export default function useChatLogic({ navigation, route }) {
     return 'offline';
   }, [isPeerTyping, userStatus, lastSeen, customStatus]);
 
-  const openMediaOptions = () => {
+  // Memoized because AttachmentSheet's render path keys off these: an identity
+  // that changes on every keystroke would ripple into the media grid's
+  // renderItem and cost a reconcile of every visible tile per character typed.
+  const openMediaOptions = useCallback(() => {
     Keyboard.dismiss();
     setShowMediaOptions(true);
-  };
-  const closeMediaOptions = () => setShowMediaOptions(false);
+  }, []);
+  const closeMediaOptions = useCallback(() => setShowMediaOptions(false), []);
   const closeMediaViewer = useCallback(() => setMediaViewer({ visible: false, uri: null, type: null }), []);
   
   const handlePickMedia = useCallback(async (type) => {

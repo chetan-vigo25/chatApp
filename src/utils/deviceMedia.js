@@ -18,7 +18,15 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 
 /** One screenful and a bit — the grid pages in as the user scrolls. */
-export const MEDIA_PAGE_SIZE = 60;
+export const MEDIA_PAGE_SIZE = 48;
+
+/**
+ * How much of the head to re-read when the library reports a change.
+ * A capture adds one item; a screenshot burst or a chat download adds a
+ * handful. Re-reading a couple of rows is enough to find them and costs a
+ * fraction of a full reload, which is the whole point of the observer.
+ */
+export const MEDIA_HEAD_PAGE_SIZE = 24;
 
 /** Seconds → "0:42" / "1:05:03". The grid renders this string verbatim. */
 export const formatMediaDuration = (seconds) => {

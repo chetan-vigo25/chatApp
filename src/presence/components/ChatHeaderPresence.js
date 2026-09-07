@@ -46,6 +46,17 @@ function MarqueeText({ text, style }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [overflow, textW, containerW, text]);
 
+  // Shrink-to-fit once the natural text width is known. With a plain flex:1
+  // the clip always ate the WHOLE text column, so anything rendered beside the
+  // marquee — the verified badge — was shoved to the far right of the header,
+  // sitting against the video-call button instead of next to the name. Giving
+  // the clip an explicit width of the text and letting flexShrink cap it at
+  // the space available keeps the marquee behaviour (a long name still
+  // overflows and scrolls) while short names hug their badge.
+  const clipStyle = textW > 0
+    ? { flexGrow: 0, flexShrink: 1, flexBasis: 'auto', width: textW }
+    : { flex: 1 };
+
   return (
     // Horizontal ScrollView (scrolling disabled) = an UNBOUNDED-width content
     // box, so the text lays out at its natural width and onLayout reports the
@@ -56,7 +67,7 @@ function MarqueeText({ text, style }) {
       horizontal
       scrollEnabled={false}
       showsHorizontalScrollIndicator={false}
-      style={styles.marqueeClip}
+      style={[styles.marqueeClip, clipStyle]}
       onLayout={(e) => setContainerW(Math.floor(e.nativeEvent.layout.width))}
       pointerEvents="none"
     >
@@ -338,7 +349,7 @@ export default function ChatHeaderPresence({
             style={[styles.nameText, { color: primaryText }]}
           />
           {isVerified && (
-            <Ionicons name="checkmark-circle" size={15} color={themeColor} style={{ marginLeft: 4 }} />
+            <Ionicons name="checkmark-circle" size={15} color={themeColor} style={styles.verifiedBadge} />
           )}
         </View>
         <View style={styles.statusRow}>
@@ -411,6 +422,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
   },
+  // Never let the badge be the thing that gives up width when a long name
+  // shrinks the marquee — it stays glued to the end of the name.
+  verifiedBadge: {
+    marginLeft: 4,
+    flexShrink: 0,
+  },
   nameText: {
     fontFamily: 'Roboto-SemiBold',
     fontSize: 16,
@@ -442,7 +459,6 @@ const styles = StyleSheet.create({
     flexShrink: 1,
   },
   marqueeClip: {
-    flex: 1,
     overflow: 'hidden',
   },
   marqueeRow: {

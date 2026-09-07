@@ -34,10 +34,17 @@
  * and a picker pick travel the identical sendMedia / sendMediaGroup path — no
  * new API surface, no new socket events.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import {
   ActivityIndicator,
-  AppState,
+  Alert,
   BackHandler,
   Dimensions,
   Platform,
@@ -49,7 +56,6 @@ import {
   View,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { Image } from 'expo-image';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Reanimated, {
   Easing,
@@ -63,17 +69,12 @@ import Reanimated, {
   withSpring,
   withTiming,
 } from 'react-native-reanimated';
-import * as MediaLibrary from 'expo-media-library';
 
 import { useTheme } from '../contexts/ThemeContext';
-import { ensurePermission, PERMISSION_IDS } from '../features/permissions/ensurePermission';
-import permissionManager from '../features/permissions/data/PermissionManager';
-import {
-  formatMediaDuration,
-  loadDeviceAlbums,
-  loadDeviceMedia,
-  normalizeLibraryAssets,
-} from '../utils/deviceMedia';
+import useDeviceMediaLibrary from '../hooks/useDeviceMediaLibrary';
+import { createSelectionStore } from '../utils/mediaSelectionStore';
+import { normalizeLibraryAssets } from '../utils/deviceMedia';
+import MediaGridCell from './MediaGridCell';
 
 const SCREEN_W = Dimensions.get('window').width;
 
@@ -128,6 +129,18 @@ const AnimatedFlatList = Reanimated.FlatList;
 
 const CAMERA_CELL = { id: '__camera__', kind: 'camera' };
 
+// Row pitch for getItemLayout. Fixed, so VirtualizedList can jump straight to
+// any scroll offset instead of measuring its way there — the difference
+// between a smooth fling and a stuttering one on a 10k-item roll.
+const ROW_H = TILE + GUTTER;
+
+const MEDIA_SELECT_LIMIT = 30;
+
+/** Subscribe to just the selection COUNT — a number, so it never over-renders. */
+function useSelectionCount(store) {
+  return useSyncExternalStore(store.subscribe, store.getCount);
+}
+
 export default function AttachmentSheet({
   visible,
   onClose,
@@ -142,6 +155,14 @@ export default function AttachmentSheet({
   const colors = theme.colors;
   const fonts = theme.fonts;
   const accent = chatColor || colors.themeColor;
+
+  // Host callbacks behind a ref so every handler below can be declared with []
+  // deps and stay referentially stable for the sheet's whole life. Without
+  // this, a host that re-creates `onClose` each render (a chat screen
+  // re-rendering per keystroke, say) would change `renderItem`'s identity and
+  // make VirtualizedList reconcile every visible tile on every keypress.
+  const callbacks = useRef({ onClose, onSelectOption, onSendMedia, onOpenSystemPicker });
+  callbacks.current = { onClose, onSelectOption, onSendMedia, onOpenSystemPicker };
 
   // Kept alive through the 180ms close animation, so the sheet can slide out
   // after the host has already flipped `visible` to false.
@@ -181,44 +202,46 @@ export default function AttachmentSheet({
   const closingRef = useRef(false);
   const listRef = useRef(null);
 
-  // ── Media state ───────────────────────────────────────────────────────────
-  const [assets, setAssets] = useState([]);
-  const [cursor, setCursor] = useState(null);
-  const [hasNextPage, setHasNextPage] = useState(true);
-  const [loadingPage, setLoadingPage] = useState(false);
-  const [mediaError, setMediaError] = useState(null);
-  const [permissionGranted, setPermissionGranted] = useState(null); // null = unknown
-  // 'all' | 'limited' | 'none'. Android 14's "Select photos" and iOS's
-  // limited library both land here, and under them the grid legitimately
-  // shows only what the user hand-picked — possibly nothing at all.
-  const [accessPrivileges, setAccessPrivileges] = useState(null);
-  const [picked, setPicked] = useState([]);      // asset ids, in tap order
+  // ── Media ─────────────────────────────────────────────────────────────────
+  // Permission, paging and the native change observer all live in the hook, so
+  // this component never touches MediaLibrary directly. `enabled` is the only
+  // input: closed sheet, zero listeners and zero queries.
+  const media = useDeviceMediaLibrary({ enabled: mounted && visible });
+
+  // Selection lives OUTSIDE React on purpose — see utils/mediaSelectionStore.
+  // Held in a ref so its identity is stable for the life of the sheet, which is
+  // what lets `renderItem` and every cell prop stay referentially stable.
+  const selectionRef = useRef(null);
+  if (selectionRef.current === null) {
+    selectionRef.current = createSelectionStore({ limit: MEDIA_SELECT_LIMIT });
+  }
+  const selection = selectionRef.current;
+  const selectedCount = useSelectionCount(selection);
+
   const [sending, setSending] = useState(false);
-  const [albums, setAlbums] = useState([]);
-  const [album, setAlbum] = useState(null);      // null = Recents
   const [albumOpen, setAlbumOpen] = useState(false);
 
-  const loadingRef = useRef(false);
   // Set true on SETUP, not just false on cleanup. A cleanup-only version leaks
-  // across any remount that reuses the ref — React Fast Refresh and StrictMode
-  // both run cleanup→setup on the same instance — leaving `alive` false for the
-  // rest of the session, so every guarded load below silently no-ops and the
-  // grid stays empty while the (unguarded) album list still populates.
+  // across any remount that reuses the ref — Fast Refresh and StrictMode both
+  // run cleanup→setup on the same instance — leaving `alive` false for the rest
+  // of the session, so every guarded write below would silently no-op.
   const aliveRef = useRef(true);
   useEffect(() => {
     aliveRef.current = true;
     return () => { aliveRef.current = false; };
   }, []);
 
-  const gridData = useMemo(() => [CAMERA_CELL, ...assets], [assets]);
-  const pickedSet = useMemo(() => new Set(picked), [picked]);
+  // The camera tile is data, not a header, so it scrolls with the grid and
+  // shares its recycling. Rebuilt only when the asset array identity changes —
+  // which the hook does only on a real insert, never on selection.
+  const gridData = useMemo(() => [CAMERA_CELL, ...media.assets], [media.assets]);
 
   // ── Open / close ──────────────────────────────────────────────────────────
   const requestClose = useCallback(() => {
     if (closingRef.current) return;
     closingRef.current = true;
-    onClose?.();
-  }, [onClose]);
+    callbacks.current.onClose?.();
+  }, []);
 
   useEffect(() => {
     if (visible) {
@@ -270,10 +293,10 @@ export default function AttachmentSheet({
   useEffect(() => {
     if (!visible) {
       openedRef.current = false;
-      setPicked([]);
+      selection.clear();
       setAlbumOpen(false);
     }
-  }, [visible]);
+  }, [visible, selection]);
 
   // `ty` is seeded from a FULL_H computed BEFORE the host had measured itself,
   // so it starts far above the real closed position. Re-park it every time
@@ -330,214 +353,69 @@ export default function AttachmentSheet({
     if (!mounted || !visible) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
       if (albumOpen) { setAlbumOpen(false); return true; }
-      if (picked.length > 0) { setPicked([]); return true; }
+      if (selectedCount > 0) { selection.clear(); return true; }
       if (expanded) { collapseToHalf(); return true; }
       requestClose();
       return true;
     });
     return () => sub.remove();
-  }, [mounted, visible, expanded, albumOpen, picked.length, collapseToHalf, requestClose]);
-
-  // ── Media loading ─────────────────────────────────────────────────────────
-  const resetAndLoad = useCallback(async (albumId) => {
-    if (!aliveRef.current) return;
-    setAssets([]);
-    setCursor(null);
-    setHasNextPage(true);
-    setMediaError(null);
-    loadingRef.current = true;
-    setLoadingPage(true);
-    try {
-      const page = await loadDeviceMedia({ albumId });
-      if (!aliveRef.current) return;
-      setAssets(page.assets);
-      setCursor(page.endCursor);
-      setHasNextPage(page.hasNextPage);
-    } catch (err) {
-      // An empty grid reads as "you have no photos", which is a lie when the
-      // media query itself failed — say which one it was and offer a retry.
-      console.warn('[AttachmentSheet] media load failed', err?.message || err);
-      if (aliveRef.current) {
-        setHasNextPage(false);
-        setMediaError(err?.message || 'Could not read your media library.');
-      }
-    } finally {
-      loadingRef.current = false;
-      if (aliveRef.current) setLoadingPage(false);
-    }
-  }, []);
-
-  const loadNextPage = useCallback(async () => {
-    if (loadingRef.current || !hasNextPage || !cursor || !permissionGranted) return;
-    loadingRef.current = true;
-    setLoadingPage(true);
-    try {
-      const page = await loadDeviceMedia({ after: cursor, albumId: album?.id });
-      if (!aliveRef.current) return;
-      setAssets((prev) => {
-        const seen = new Set(prev.map((a) => a.id));
-        return [...prev, ...page.assets.filter((a) => !seen.has(a.id))];
-      });
-      setCursor(page.endCursor);
-      setHasNextPage(page.hasNextPage);
-    } catch (err) {
-      console.warn('[AttachmentSheet] media page failed', err?.message || err);
-    } finally {
-      loadingRef.current = false;
-      if (aliveRef.current) setLoadingPage(false);
-    }
-  }, [album?.id, cursor, hasNextPage, permissionGranted]);
-
-  // Set when the running BUILD cannot read photos at all: on Android 13+
-  // expo-media-library throws from a granular permission request whose
-  // manifest entry is missing, so a scoped call is also the cheapest probe for
-  // "was READ_MEDIA_IMAGES compiled into this APK".
-  const manifestMissingPhotosRef = useRef(false);
-
-  // Scoped to photo+video: the unscoped call also checks READ_MEDIA_AUDIO on
-  // Android 13+, so an app holding exactly the permissions this grid needs
-  // would still be reported as denied.
-  //
-  // It falls back to the unscoped call rather than failing, because the scoped
-  // form throws outright when a granular permission is absent from the
-  // manifest — and a stale install with no READ_MEDIA_IMAGES must still show
-  // whatever it CAN read (videos, user-selected photos) instead of nothing.
-  const readPhotoPermission = useCallback(async () => {
-    if (Platform.OS !== 'android') return MediaLibrary.getPermissionsAsync();
-    try {
-      const status = await MediaLibrary.getPermissionsAsync(false, ['photo', 'video']);
-      manifestMissingPhotosRef.current = false;
-      return status;
-    } catch (err) {
-      manifestMissingPhotosRef.current = /manifest/i.test(String(err?.message || ''));
-      console.warn('[AttachmentSheet] scoped photo permission check failed', err?.message || err);
-      return MediaLibrary.getPermissionsAsync();
-    }
-  }, []);
-
-  // Status is CHECKED, never requested, on open: raising a system dialog in the
-  // middle of the slide-in looks broken, and the paperclip is also the way to
-  // Location or Contact — neither of which needs the photo library. A denied
-  // state gets an inline "Allow access" button instead, which goes through the
-  // app's own ensurePermission (settings fallback and all).
-  // Re-reads the grant: returning from the app settings page (or the photo
-  // picker) changes it behind the app's back, and nothing else would notice.
-  const [refreshTick, setRefreshTick] = useState(0);
-
-  useEffect(() => {
-    if (!visible) return undefined;
-    const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') setRefreshTick((t) => t + 1);
-    });
-    return () => sub.remove();
-  }, [visible]);
-
-  useEffect(() => {
-    if (!visible) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const status = await readPhotoPermission();
-        const ok = Boolean(status?.granted) || status?.accessPrivileges === 'limited';
-        if (cancelled) return;
-        setPermissionGranted(ok);
-        setAccessPrivileges(status?.accessPrivileges || null);
-        if (ok) {
-          resetAndLoad(album?.id);
-          loadDeviceAlbums().then((list) => { if (!cancelled) setAlbums(list); });
-        }
-      } catch (err) {
-        if (!cancelled) setPermissionGranted(false);
-      }
-    })();
-    return () => { cancelled = true; };
-    // `album` is handled by its own effect below — re-running here would double-load.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, refreshTick]);
-
-  const requestPhotoAccess = useCallback(async () => {
-    const ok = await ensurePermission(PERMISSION_IDS.PHOTOS, {
-      purpose: 'Allow access to your photos and videos to share them in chats.',
-    });
-    setPermissionGranted(ok);
-    // The grant may well be "Selected photos" rather than "Allow all", so the
-    // privileges have to be re-read — `ok` alone cannot tell the two apart, and
-    // the difference decides whether an empty grid means "no photos" or "you
-    // haven't picked any yet".
-    try {
-      const status = await readPhotoPermission();
-      setAccessPrivileges(status?.accessPrivileges || null);
-    } catch { /* privileges stay unknown; the grid still loads */ }
-    if (ok) {
-      resetAndLoad(album?.id);
-      loadDeviceAlbums().then(setAlbums);
-    }
-  }, [album?.id, resetAndLoad, readPhotoPermission]);
-
-  // Android 14 / iOS limited access: re-open the OS picker so the user can
-  // widen (or change) the set of photos this app is allowed to see. This is the
-  // affordance WhatsApp shows in the same situation — without it a limited
-  // grant is a dead end, because the app can never ask for more from inside.
-  const manageSelection = useCallback(async () => {
-    try {
-      await MediaLibrary.presentPermissionsPickerAsync(['photo', 'video']);
-    } catch (err) {
-      console.warn('[AttachmentSheet] permission picker unavailable', err?.message || err);
-    }
-    try {
-      const status = await readPhotoPermission();
-      setAccessPrivileges(status?.accessPrivileges || null);
-      setPermissionGranted(Boolean(status?.granted) || status?.accessPrivileges === 'limited');
-    } catch { /* keep whatever we had */ }
-    resetAndLoad(album?.id);
-    loadDeviceAlbums().then(setAlbums).catch(() => {});
-  }, [album?.id, resetAndLoad, readPhotoPermission]);
-
-  // The ONLY route from limited access to the full library.
-  //
-  // Once the user picks "Select photos", Android marks READ_MEDIA_IMAGES
-  // USER_FIXED: every later request re-opens the photo picker to amend the
-  // selection, and the "Allow all" choice is never offered again. No API can
-  // re-raise it — the app's permission page is where that switch lives. This is
-  // the same "full access" escape hatch WhatsApp puts on its picker; without it
-  // a single "Select photos" tap is permanent.
-  const openAppSettings = useCallback(() => {
-    permissionManager.openSettings();
-  }, []);
+  }, [mounted, visible, expanded, albumOpen, selectedCount, selection, collapseToHalf, requestClose]);
 
   const chooseAlbum = useCallback((next) => {
     setAlbumOpen(false);
-    setAlbum(next);
-    setPicked([]);
-    resetAndLoad(next?.id);
-  }, [resetAndLoad]);
+    selection.clear();
+    media.selectAlbum(next);
+  }, [media, selection]);
+
+  const toggleAlbumDropdown = useCallback(() => {
+    // Albums are fetched on first open, never on sheet open: counting them
+    // walks every row in MediaStore. See useDeviceMediaLibrary.ensureAlbums.
+    media.ensureAlbums();
+    setAlbumOpen((open) => !open);
+  }, [media]);
 
   // ── Selection ─────────────────────────────────────────────────────────────
+  // Stable for the life of the sheet: `selection` is a ref, so this identity
+  // never changes and neither does any cell's onPress prop.
   const togglePick = useCallback((id) => {
-    setPicked((prev) => (prev.includes(id) ? prev.filter((p) => p !== id) : [...prev, id]));
-  }, []);
+    // `toggle` refuses past the limit rather than silently dropping the tap —
+    // an unresponsive tile reads as a broken grid.
+    if (!selection.toggle(id)) {
+      Alert.alert('Limit reached', `You can send up to ${MEDIA_SELECT_LIMIT} items at once.`);
+    }
+  }, [selection]);
 
+  /**
+   * Resolve ORIGINALS — and only now.
+   *
+   * The grid has been rendering the OS's own thumbnail-sized decodes all along;
+   * this is the first and only point where full-resolution assets are touched,
+   * for the handful the user actually picked. On iOS that means resolving each
+   * ph:// identifier to a real file, which is why it is emphatically not
+   * something to do per visible tile.
+   */
   const handleSend = useCallback(async () => {
-    if (sending || picked.length === 0) return;
+    const ids = selection.getIds();
+    if (sending || ids.length === 0) return;
     setSending(true);
     try {
-      const byId = new Map(assets.map((a) => [a.id, a]));
-      const ordered = picked.map((id) => byId.get(id)).filter(Boolean);
+      const byId = new Map(media.assets.map((asset) => [asset.id, asset]));
+      const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
       const files = await normalizeLibraryAssets(ordered);
-      setPicked([]);
+      selection.clear();
       requestClose();
-      if (files.length) onSendMedia?.(files);
+      if (files.length) callbacks.current.onSendMedia?.(files);
     } catch (err) {
       console.warn('[AttachmentSheet] send failed', err?.message || err);
     } finally {
       if (aliveRef.current) setSending(false);
     }
-  }, [assets, onSendMedia, picked, requestClose, sending]);
+  }, [media.assets, requestClose, selection, sending]);
 
   const handleOptionPress = useCallback((option) => {
     requestClose();
-    onSelectOption?.(option);
-  }, [onSelectOption, requestClose]);
+    callbacks.current.onSelectOption?.(option);
+  }, [requestClose]);
 
   const handleCameraCell = useCallback(() => {
     handleOptionPress({ id: 'camera' });
@@ -545,8 +423,8 @@ export default function AttachmentSheet({
 
   const handleFolder = useCallback(() => {
     requestClose();
-    onOpenSystemPicker?.();
-  }, [onOpenSystemPicker, requestClose]);
+    callbacks.current.onOpenSystemPicker?.();
+  }, [requestClose]);
 
   // ── Gestures ──────────────────────────────────────────────────────────────
   // A plain FlatList carries no gesture-handler handler, so
@@ -629,74 +507,74 @@ export default function AttachmentSheet({
   }));
 
   // ── Render ────────────────────────────────────────────────────────────────
+  //
+  // `renderCell` MUST NOT depend on the selection. Every prop it passes is
+  // either a primitive or something stable for the life of the sheet, so its
+  // identity survives every tap — which is what stops VirtualizedList from
+  // re-running the whole rendered window each time a checkbox changes. Each
+  // MediaGridCell subscribes to its own order instead.
+  const cellTheme = useMemo(() => ({
+    surface: colors.surface,
+    accent,
+    labelFont: fonts.medium,
+  }), [colors.surface, accent, fonts.medium]);
+
   const renderCell = useCallback(({ item }) => {
     if (item.kind === 'camera') {
       return (
         <TouchableOpacity
           activeOpacity={0.85}
           onPress={handleCameraCell}
-          style={[styles.cell, styles.cameraCell, { backgroundColor: colors.surface }]}
+          style={[styles.cell, styles.cameraCell, { backgroundColor: cellTheme.surface }]}
           accessibilityRole="button"
           accessibilityLabel="Open camera"
         >
           <Ionicons name="camera-outline" size={26} color={colors.primaryTextColor} />
-          <Text style={[styles.cameraLabel, { color: colors.primaryTextColor, fontFamily: fonts.medium }]}>
+          <Text style={[styles.cameraLabel, { color: colors.primaryTextColor, fontFamily: cellTheme.labelFont }]}>
             Camera
           </Text>
         </TouchableOpacity>
       );
     }
 
-    const isPicked = pickedSet.has(item.id);
-    const order = isPicked ? picked.indexOf(item.id) + 1 : 0;
-    const isVideo = item.mediaType === MediaLibrary.MediaType.video || item.mediaType === 'video';
-
     return (
-      <TouchableOpacity
-        activeOpacity={0.85}
-        onPress={() => togglePick(item.id)}
-        style={styles.cell}
-        accessibilityRole="button"
-        accessibilityState={{ selected: isPicked }}
-        accessibilityLabel={isVideo ? 'Video' : 'Photo'}
-      >
-        <View style={[styles.thumb, { backgroundColor: colors.surface }]}>
-          <Image
-            source={{ uri: item.uri }}
-            style={StyleSheet.absoluteFill}
-            contentFit="cover"
-            cachePolicy="memory-disk"
-            transition={0}
-            recyclingKey={item.id}
-          />
-          {isVideo && (
-            <View style={styles.durationChip}>
-              <Ionicons name="videocam" size={10} color="#fff" />
-              <Text style={[styles.duration, { fontFamily: fonts.medium }]}>
-                {formatMediaDuration(item.duration)}
-              </Text>
-            </View>
-          )}
-          {isPicked && (
-            <>
-              <View style={[styles.pickOverlay, { borderColor: accent }]} />
-              <View style={[styles.pickBadge, { backgroundColor: accent }]}>
-                <Text style={[styles.pickBadgeText, { fontFamily: fonts.bold }]}>{order}</Text>
-              </View>
-            </>
-          )}
-        </View>
-      </TouchableOpacity>
+      <MediaGridCell
+        id={item.id}
+        uri={item.uri}
+        isVideo={item.mediaType === 'video'}
+        duration={item.duration}
+        size={TILE}
+        gutter={GUTTER}
+        store={selection}
+        onPress={togglePick}
+        accent={cellTheme.accent}
+        surface={cellTheme.surface}
+        labelFont={cellTheme.labelFont}
+      />
     );
-  }, [accent, colors, fonts, handleCameraCell, picked, pickedSet, togglePick]);
+  }, [cellTheme, colors.primaryTextColor, handleCameraCell, selection, togglePick]);
 
   const keyExtractor = useCallback((item) => item.id, []);
 
+  // Every row is the same height, so offsets are arithmetic rather than
+  // measurement — no layout pass per row while flinging a long roll.
+  //
+  // `index` here is the ROW index, not the item index: with numColumns set,
+  // FlatList's getItemCount returns ceil(items / numColumns) and hands
+  // VirtualizedList one array per row, but passes getItemLayout straight
+  // through. Dividing by COLS again would give four consecutive rows the same
+  // offset and wreck every scroll position.
+  const getItemLayout = useCallback((_data, index) => ({
+    length: ROW_H,
+    offset: ROW_H * index,
+    index,
+  }), []);
+
   if (!mounted) return null;
 
-  const isLimitedAccess = accessPrivileges === 'limited';
-  const showFolderFab = expanded && picked.length === 0 && permissionGranted;
-  const showSendFab = picked.length > 0;
+  const isLimitedAccess = media.isLimited;
+  const showFolderFab = expanded && selectedCount === 0 && media.permissionGranted;
+  const showSendFab = selectedCount > 0;
 
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
@@ -745,8 +623,7 @@ export default function AttachmentSheet({
 
               <TouchableOpacity
                 style={styles.albumButton}
-                onPress={() => setAlbumOpen((v) => !v)}
-                disabled={!albums.length}
+                onPress={toggleAlbumDropdown}
                 accessibilityRole="button"
                 accessibilityLabel="Choose album"
               >
@@ -754,15 +631,13 @@ export default function AttachmentSheet({
                   numberOfLines={1}
                   style={[styles.albumLabel, { color: colors.primaryTextColor, fontFamily: fonts.semibold }]}
                 >
-                  {album?.title || 'Recents'}
+                  {media.album?.title || 'Recents'}
                 </Text>
-                {albums.length > 0 && (
-                  <Ionicons
-                    name={albumOpen ? 'chevron-up' : 'chevron-down'}
-                    size={16}
-                    color={colors.primaryTextColor}
-                  />
-                )}
+                <Ionicons
+                  name={albumOpen ? 'chevron-up' : 'chevron-down'}
+                  size={16}
+                  color={colors.primaryTextColor}
+                />
               </TouchableOpacity>
 
               <View style={[styles.hdBadge, { borderColor: colors.border }]}>
@@ -770,10 +645,10 @@ export default function AttachmentSheet({
               </View>
             </Reanimated.View>
 
-            {isLimitedAccess && permissionGranted ? (
+            {isLimitedAccess && media.permissionGranted ? (
               <TouchableOpacity
                 style={[styles.limitedBar, { backgroundColor: colors.surface, borderColor: colors.divider }]}
-                onPress={openAppSettings}
+                onPress={media.openSettings}
                 accessibilityRole="button"
                 accessibilityLabel="Allow access to all photos"
               >
@@ -790,14 +665,14 @@ export default function AttachmentSheet({
               </TouchableOpacity>
             ) : null}
 
-            {permissionGranted === false ? (
+            {media.permissionGranted === false ? (
               <View style={styles.permissionWrap}>
                 <Ionicons name="images-outline" size={34} color={colors.secondaryTextColor} />
                 <Text style={[styles.permissionText, { color: colors.secondaryTextColor, fontFamily: fonts.regular }]}>
                   Allow photo access to pick from your gallery.
                 </Text>
                 <TouchableOpacity
-                  onPress={requestPhotoAccess}
+                  onPress={media.requestAccess}
                   style={[styles.permissionBtn, { backgroundColor: accent }]}
                   accessibilityRole="button"
                 >
@@ -822,35 +697,39 @@ export default function AttachmentSheet({
                   overScrollMode="never"
                   bounces={false}
                   showsVerticalScrollIndicator={false}
+                  getItemLayout={getItemLayout}
                   removeClippedSubviews
+                  // ~6 rows: enough to fill the sheet at both snap points
+                  // without paying for anything below the fold on open.
                   initialNumToRender={24}
-                  windowSize={7}
-                  maxToRenderPerBatch={16}
+                  windowSize={5}
+                  maxToRenderPerBatch={12}
+                  updateCellsBatchingPeriod={50}
                   onEndReachedThreshold={0.6}
-                  onEndReached={loadNextPage}
+                  onEndReached={media.loadMore}
                   contentContainerStyle={{ paddingRight: GUTTER, paddingBottom: PICKER_SHIFT + 96 }}
                   // The camera cell means `data` is never empty, so
                   // ListEmptyComponent can never fire — both the spinner and
                   // the empty note belong in the footer.
                   ListFooterComponent={
-                    loadingPage ? (
+                    media.loading ? (
                       <View style={styles.footerLoader}>
                         <ActivityIndicator size="small" color={colors.secondaryTextColor} />
                       </View>
-                    ) : mediaError ? (
+                    ) : media.error ? (
                       <View style={styles.emptyWrap}>
                         <Text style={[styles.emptyText, { color: colors.secondaryTextColor, fontFamily: fonts.regular }]}>
-                          {mediaError}
+                          {media.error}
                         </Text>
                         <TouchableOpacity
-                          onPress={() => resetAndLoad(album?.id)}
+                          onPress={media.retry}
                           style={[styles.permissionBtn, { backgroundColor: accent }]}
                           accessibilityRole="button"
                         >
                           <Text style={[styles.permissionBtnText, { fontFamily: fonts.semibold }]}>Retry</Text>
                         </TouchableOpacity>
                       </View>
-                    ) : manifestMissingPhotosRef.current && assets.length === 0 ? (
+                    ) : media.manifestMissingPhotos && media.assets.length === 0 ? (
                       <View style={styles.emptyWrap}>
                         <Text style={[styles.emptyText, { color: colors.secondaryTextColor, fontFamily: fonts.regular }]}>
                           This installed build can&apos;t read your photos — the photo
@@ -866,12 +745,12 @@ export default function AttachmentSheet({
                       // they say the app should look like WhatsApp.
                       <View style={styles.emptyWrap}>
                         <Text style={[styles.emptyText, { color: colors.secondaryTextColor, fontFamily: fonts.regular }]}>
-                          {assets.length === 0
+                          {media.assets.length === 0
                             ? "This app can only see photos you pick for it, and none are picked yet."
                             : "This app can only see the photos you picked for it."}
                         </Text>
                         <TouchableOpacity
-                          onPress={openAppSettings}
+                          onPress={media.openSettings}
                           style={[styles.permissionBtn, { backgroundColor: accent }]}
                           accessibilityRole="button"
                         >
@@ -879,13 +758,13 @@ export default function AttachmentSheet({
                             Allow all photos
                           </Text>
                         </TouchableOpacity>
-                        <TouchableOpacity onPress={manageSelection} accessibilityRole="button">
+                        <TouchableOpacity onPress={media.manageSelection} accessibilityRole="button">
                           <Text style={[styles.linkText, { color: accent, fontFamily: fonts.semibold }]}>
-                            {assets.length === 0 ? 'Or pick photos' : 'Or pick more photos'}
+                            {media.assets.length === 0 ? 'Or pick photos' : 'Or pick more photos'}
                           </Text>
                         </TouchableOpacity>
                       </View>
-                    ) : assets.length === 0 ? (
+                    ) : media.assets.length === 0 ? (
                       <View style={styles.emptyWrap}>
                         <Text style={[styles.emptyText, { color: colors.secondaryTextColor, fontFamily: fonts.regular }]}>
                           No photos or videos here.
@@ -945,8 +824,8 @@ export default function AttachmentSheet({
       {albumOpen && expanded && (
         <View style={[styles.albumSheet, { top: HEADER_H + HANDLE_H + PICKER_H, backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
           <ScrollView bounces={false} style={{ maxHeight: 260 }}>
-            {[{ id: null, title: 'Recents' }, ...albums].map((a) => {
-              const active = (album?.id || null) === (a.id || null);
+            {[{ id: null, title: 'Recents' }, ...media.albums].map((a) => {
+              const active = (media.album?.id || null) === (a.id || null);
               return (
                 <TouchableOpacity
                   key={a.id || 'recents'}
@@ -995,7 +874,7 @@ export default function AttachmentSheet({
           onPress={handleSend}
           disabled={sending}
           accessibilityRole="button"
-          accessibilityLabel={`Send ${picked.length} item${picked.length === 1 ? '' : 's'}`}
+          accessibilityLabel={`Send ${selectedCount} item${selectedCount === 1 ? '' : 's'}`}
         >
           {sending ? (
             <ActivityIndicator size="small" color="#fff" />
@@ -1004,7 +883,7 @@ export default function AttachmentSheet({
               <Ionicons name="send" size={20} color="#fff" />
               <View style={[styles.sendCount, { backgroundColor: colors.cardBackground }]}>
                 <Text style={[styles.sendCountText, { color: accent, fontFamily: fonts.bold }]}>
-                  {picked.length}
+                  {selectedCount}
                 </Text>
               </View>
             </>
@@ -1099,40 +978,8 @@ const styles = StyleSheet.create({
   },
   cameraCell: { alignItems: 'center', justifyContent: 'center', gap: 6 },
   cameraLabel: { fontSize: 12 },
-  thumb: { flex: 1 },
-
-  durationChip: {
-    position: 'absolute',
-    left: 4,
-    bottom: 4,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 3,
-    paddingHorizontal: 5,
-    paddingVertical: 2,
-    borderRadius: 4,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-  },
-  duration: { fontSize: 10, color: '#fff' },
-
-  pickOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    borderWidth: 3,
-    backgroundColor: 'rgba(0,0,0,0.25)',
-  },
-  pickBadge: {
-    position: 'absolute',
-    top: 5,
-    right: 5,
-    minWidth: 20,
-    height: 20,
-    borderRadius: 10,
-    paddingHorizontal: 5,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  pickBadgeText: { fontSize: 11, color: '#fff' },
-
+  // Tile visuals live in components/MediaGridCell — only the camera tile,
+  // which is not a media cell, is styled here.
   permissionWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32, gap: 12 },
   permissionText: { fontSize: 13, textAlign: 'center' },
   permissionBtn: { paddingHorizontal: 18, paddingVertical: 9, borderRadius: 20 },
