@@ -1157,7 +1157,11 @@ export const CallProvider = ({ children }) => {
   // count + "audio confirmed" latch (audioResumed). Ref-only — never renders.
   const outgoingAudioRecoveryRef = useRef({ timer: null, attempts: 0, confirmed: false });
 
-  const finalizeEnd = useCallback((reason, message) => {
+  // `opts.leaveOnly` — I am LEAVING a multi-party call that carries on without
+  // me (the host's "Leave call"). It suppresses the broadcast `call:end` only;
+  // everything else (busy lock via call:conference:leave, engine teardown, call
+  // log, UI reset) is unchanged. See the emit block below for why.
+  const finalizeEnd = useCallback((reason, message, opts) => {
     if (endedRef.current) return;
     endedRef.current = true;
     // Kill any pending outgoing-audio recovery pass — it must never fire after
@@ -1279,6 +1283,22 @@ export const CallProvider = ({ children }) => {
         rejectCallSignal({ callId: snap.signalId, callerId: snap.peer.id });
       } else if (snap.direction === 'outgoing' && !snap.answeredAt) {
         cancelCall({ callId: snap.signalId, toUserIds: otherIds });
+      } else if (opts?.leaveOnly && snap.isConference) {
+        // LEAVING a real CONFERENCE that continues without me. `call:end` is the
+        // 1:1 "this call is over" vocabulary, broadcast to every other member —
+        // and a backend is entitled to read it from the HOST as "end it for
+        // everyone". Leaving is expressed by call:conference:leave (emitted just
+        // below), which the server contract requires to remove us from the roster
+        // AND release our busy lock. "End for everyone" is a different, explicit
+        // action (call:conference:end) and still sends both.
+        //
+        // Deliberately gated on isConference, NOT isMultiParty: a plain GROUP
+        // call has no conference record on this backend, so conference:leave
+        // would notify nobody and never release the busy lock. There, `call:end`
+        // is the only vocabulary — and it is safe, because every client's
+        // onSignalEnded group carve-out turns `call:ended {by}` into "drop that
+        // one participant", not "end the call".
+        if (__DEV__) console.log('[CALL][APP] leaving a multi-party call — conference:leave only, no broadcast call:end');
       } else {
         endCallSignal({ callId: snap.signalId, otherUserIds: otherIds });
       }
@@ -1325,7 +1345,7 @@ export const CallProvider = ({ children }) => {
       const durationSec = durationStartMs ? Math.max(0, Math.round((Date.now() - durationStartMs) / 1000)) : 0;
       const isGroup = !!snap.isGroup;
       const participantIds = (snap.peers || []).map((p) => p.id).filter(Boolean);
-      const chatId = isGroup ? null : (snap.chatId || deriveChatId(myId, snap.peer.id));
+      const chatId = isGroup ? (snap.chatId || null) : (snap.chatId || deriveChatId(myId, snap.peer.id));
       const payload = {
         callId,
         // For a group call there is no single peer; backend keeps peerId null
@@ -1473,10 +1493,31 @@ export const CallProvider = ({ children }) => {
     ringTimeoutRef.current = setTimeout(() => {
       ringTimeoutRef.current = null;
       const snap = stateRef.current;
+      // GROUP: the ring window closing can NEVER end a call somebody already
+      // joined — it only clears the members who never answered. This was the one
+      // terminal path without that carve-out (onSignalTimeout / onSignalCancelled
+      // / onSignalRejected / onSignalEnded all have it), and it is why the CALLER
+      // of a group call would drop on their own while everyone else kept talking:
+      // the caller's status stays OUTGOING until remote media reaches THEM, and
+      // the timeout is only cleared by `call:accepted`. On a conference the accept
+      // is settled through the roster (call:conference:accept), so if the server
+      // does not ALSO emit the 1:1 `call:accepted` to the caller, nothing cleared
+      // this timer — and it fired "No answer" on a call that was fully live.
+      // Anyone joined (roster, or our own answeredAt/ACTIVE) means the call is up.
+      if (snap.isGroup) {
+        const anyJoined = Object.values(snap.participants || {}).some((p) => p && p.joined);
+        if (anyJoined || snap.answeredAt || snap.status === CALL_STATUS.ACTIVE) {
+          if (__DEV__) console.log('[CALL][APP][group] ring window closed on a LIVE call — dropping only the unanswered');
+          Object.values(snap.participants || {})
+            .filter((p) => p && !p.joined)
+            .forEach((p) => removeGroupParticipant(p.id));
+          return;
+        }
+      }
       if (snap.status === CALL_STATUS.OUTGOING) finalizeEnd('cancelled', 'No answer');
       else if (snap.status === CALL_STATUS.INCOMING) finalizeEnd('missed');
     }, getRingTimeoutMs());
-  }, [clearRingTimeout, finalizeEnd]);
+  }, [clearRingTimeout, finalizeEnd, removeGroupParticipant]);
 
   const armMediaWatchdog = useCallback(() => {
     clearMediaWatchdog();
@@ -2133,10 +2174,35 @@ export const CallProvider = ({ children }) => {
         if (payload && typeof payload === 'object') rtcStatsRef.current = payload;
         break;
       }
-      case 'rejected': { finalizeEnd('rejected'); break; }
+      // NOTE on these two: they are the MEDIA-LAYER twins of onSignalRejected /
+      // onSignalCancelled, and unlike those they had no group carve-out — so a
+      // single member declining, or one withdrawn invite, ended the call for
+      // EVERYONE. A multi-party call only ends when nobody is left.
+      case 'rejected': {
+        const snap = stateRef.current;
+        if (snap.isGroup) {
+          const id = payload?.id || payload?.peerId || payload?.userId;
+          // Attributed decline → drop only them (roster empty ends the call).
+          if (id) { removeGroupParticipant(String(id), 'rejected'); break; }
+          // Unattributed decline on a call we are already IN says nothing about
+          // us — the engine cannot tell us whose it was, so it cannot end us.
+          if (snap.answeredAt || snap.status === CALL_STATUS.ACTIVE) break;
+        }
+        finalizeEnd('rejected');
+        break;
+      }
       case 'cancelled': {
+        const snap = stateRef.current;
+        // A cancel withdraws ONE member's invite; on a group call we already
+        // answered it can never mean "end the call" (same rule as
+        // onSignalCancelled, which was fixed for exactly this).
+        if (snap.isGroup && snap.answeredAt) {
+          const id = payload?.id || payload?.peerId || payload?.userId;
+          if (id) removeGroupParticipant(String(id), 'cancelled');
+          break;
+        }
         // caller gave up before we answered → missed for the callee
-        finalizeEnd(stateRef.current.direction === 'incoming' ? 'missed' : 'cancelled');
+        finalizeEnd(snap.direction === 'incoming' ? 'missed' : 'cancelled');
         break;
       }
       case 'peerleft': {
@@ -2245,7 +2311,7 @@ export const CallProvider = ({ children }) => {
       }
       default: break;
     }
-  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording, upgradeUiToVideo, applyInitialCallRoute]);
+  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording, upgradeUiToVideo, applyInitialCallRoute, removeGroupParticipant]);
 
   // ---- public actions ----
   // `peerOrPeers` is a single peer object OR an array (group, up to
@@ -2262,7 +2328,13 @@ export const CallProvider = ({ children }) => {
     if (!list.length) return;
     // Cap the group size (including self).
     const peers = list.slice(0, MAX_PARTICIPANTS - 1);
-    const isGroup = peers.length > 1;
+    // Group intent is DECLARED by the caller, not inferred from how many members
+    // happened to resolve. Inferring it (peers.length > 1) meant any short or
+    // half-loaded roster silently downgraded a group call into a 1:1 call to
+    // whoever loaded first — wrong ring payload, wrong audio route, wrong UI, and
+    // no error anywhere. Every group entry point now passes `isGroup: true`;
+    // the length check stays as the fallback for callers that don't.
+    const isGroup = opts.isGroup === true || peers.length > 1;
 
     // Contact-block gate (1:1 only): never ring when either side blocked the other.
     // Group calls let the backend silently drop blocked members. This mirrors the
@@ -2317,7 +2389,12 @@ export const CallProvider = ({ children }) => {
     }
     endedRef.current = false;
     initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
-    const chatId = isGroup ? null : (opts.chatId || deriveChatId(myId, peers[0].id));
+    // A GROUP call now carries its thread id when the caller knows it (the chat
+    // header and the in-thread call bubble both do). The backend needs it — plus
+    // groupId, always sent — to post the WhatsApp-style "call" message into the
+    // GROUP thread; with chatId hard-null it had no thread to write to, which is
+    // why call bubbles only ever appeared in 1:1 chats.
+    const chatId = isGroup ? (opts.chatId || null) : (opts.chatId || deriveChatId(myId, peers[0].id));
     const wantSpeaker = media === 'video' || isGroup;
     // App-socket signaling id (busy lock + call:* events). Distinct from the
     // calling-service callId that the engine returns for WebRTC.
@@ -2579,7 +2656,37 @@ export const CallProvider = ({ children }) => {
           // instead of running a fake timer until the 30s watchdog. The
           // server's companion call:ended event covers this too; both are
           // idempotent through endedRef.
-          if (ack?.ended) { finalizeEnd('completed', 'Call already ended'); return; }
+          //
+          // MULTI-PARTY CAVEAT (the "accept karte hi cut" on iOS CallKit):
+          // `call:accept` is attributed through the callee's 1:1 BUSY record,
+          // which — as the comment above says — knows nothing about conference
+          // MEMBERSHIP. A group/conference reuses ONE immortal callId, so an
+          // earlier leg or a settled earlier invite on that same id is
+          // legitimately "ended" server-side while the call itself is very much
+          // alive. Believing that ack tore the user out of the call the instant
+          // they answered — worst on iOS, where CallKit had already put a
+          // connected call on screen. Ask the roster-authoritative endpoint
+          // before ending, and fail OPEN when it can't answer: a genuinely dead
+          // call is still ended by the connect watchdog and by call:ended.
+          if (ack?.ended) {
+            // Only a REAL server-side conference can be cross-checked here. A
+            // plain group call has no conference record (conference:state answers
+            // {active:false} for it unconditionally), so asking would always come
+            // back "dead" and end a perfectly healthy call — see the reconnect
+            // handler for the same trap. For those, the 1:1 busy record IS the
+            // authority, exactly as it is for a 1:1 call.
+            if (live.isConference && live.signalId) {
+              const st = await conferenceState({ callId: live.signalId }).catch(() => null);
+              if (st?.active) {
+                if (__DEV__) console.log('[CALL][APP][accept] 1:1 ack said "ended" but the conference is LIVE — staying in the call');
+                return;
+              }
+              if (st && st.active === false) { finalizeEnd('completed', 'Call already ended'); return; }
+              return; // no/late ack — the watchdogs own it from here
+            }
+            finalizeEnd('completed', 'Call already ended');
+            return;
+          }
           // We genuinely LOST a multi-device race — clear our accepted marker so
           // the companion `call:cancelled-elsewhere` is allowed to dismiss us.
           if (ack?.answeredElsewhere) { myAcceptedCallRef.current = { id: null, ts: 0 }; return; }
@@ -2704,11 +2811,20 @@ export const CallProvider = ({ children }) => {
     // Conference HOST tapping End → choose (WhatsApp-style): just leave (host
     // migrates, call continues) or end the whole conference. Backend enforces
     // host-only on `call:conference:end` regardless of what the client claims.
-    if (isMultiParty(snap) && snap.status === CALL_STATUS.ACTIVE && snap.signalId
+    // Gate on "the call is LIVE for somebody", not on "my own media is up": the
+    // caller's status stays OUTGOING until remote media reaches THEM, so a host
+    // who hung up during that window skipped this prompt entirely and fell
+    // through to the broadcast `call:end` below — ending the call for members
+    // who were already talking. Anyone joined means Leave/End is the right ask.
+    const someoneJoined = Object.values(snap.participants || {}).some((p) => p && p.joined);
+    if (isMultiParty(snap) && snap.signalId
+      && (snap.status === CALL_STATUS.ACTIVE || someoneJoined)
       && myId && snap.hostId && String(snap.hostId) === String(myId)) {
       Alert.alert('You are the call host', 'Leave the call, or end it for everyone?', [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Leave call', onPress: () => finalizeEnd('completed') },
+        // Leave: the call carries on for everyone else — the host migrates
+        // server-side. Must NOT broadcast call:end (see finalizeEnd).
+        { text: 'Leave call', onPress: () => finalizeEnd('completed', undefined, { leaveOnly: true }) },
         {
           text: 'End for everyone',
           style: 'destructive',
@@ -3888,6 +4004,21 @@ export const CallProvider = ({ children }) => {
             // un-answered invite that really is dead still ends on its own — the
             // ring timeout and the server's cancel/timeout events both cover it.
             const live = stateRef.current;
+            // `active:false` may only END the call when this call really IS a
+            // server-side CONFERENCE. Proven in the field: a plain GROUP call has
+            // NO conference record on the backend (`call:conference:accept` comes
+            // back "conference not found or ended", and this very endpoint answers
+            // `{active:false, member:false}`) — that means "no conference exists",
+            // NOT "your call is over". Trusting it killed a healthy group call a
+            // second after the user answered, the moment the socket reconnected.
+            // `isConference` is only set by an isConference ring payload or a real
+            // roster broadcast, so it is exactly the "the server knows about this
+            // conference" test. A dead call is still ended by call:ended, the
+            // connect watchdog and the ring timeout.
+            if (!live.isConference) {
+              if (ack?.active === false && __DEV__) console.log('[CALL][APP] conference:state says inactive but this is a plain GROUP call (no conference record) — ignoring');
+              return;
+            }
             if (ack?.active === false && live.answeredAt) finalizeEnd('completed');
             else if (ack?.active === false && __DEV__) console.log('[CALL][APP] conference reports inactive but we are still RINGING — letting the ring stand');
           }).catch(() => {});

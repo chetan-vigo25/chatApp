@@ -572,6 +572,22 @@ export function peekTranslation(text, language, from = SOURCE_LANGUAGE) {
 }
 
 /**
+ * SYNCHRONOUS "is this string a translation candidate at all?" — no work, no
+ * network, no model, no promise.
+ *
+ * `peekTranslation` returning null is AMBIGUOUS: it means "not cached", which
+ * covers both "still to be translated" and "will never be translated" (already
+ * in the reader's script, romanized-mixed, translation off). A caller that
+ * wants to show a translating indicator has to tell those apart, otherwise it
+ * flashes a loader over every message that needed nothing done to it.
+ *
+ * Same planner as the real call, so it can never disagree with it.
+ */
+export function willTranslate(text, language, from = SOURCE_LANGUAGE) {
+  return !resolveRequest(text, language, from).skip;
+}
+
+/**
  * Translate one string and report WHAT happened.
  *
  *   { text, status }

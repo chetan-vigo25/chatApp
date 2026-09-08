@@ -221,16 +221,29 @@ badal jata tha. Do cheezein isse rokti hain:
    `peekTranslation()` (synchronous disk cache). Jo message pehle translate ho
    chuka hai wo **pehle hi frame me** translated paint hota hai.
 
-2. **`renderableMessages`** — jis message ka translation abhi nahi hai, uski row
-   FlatList ko di hi nahi jati. On-device translation milliseconds ki hai, to
-   row bas thodi der baad aati hai — original kabhi flash nahi hota.
+2. **`translatingKeys` + `<TranslatingBubble />`** — jis message ka translation
+   abhi nahi aaya, uski **row apni jagah par rehti hai** (time, ticks,
+   reactions sab), sirf uska **body** ek shimmer loader se replace ho jata hai.
+   Translation aate hi loader ki jagah translated text aa jata hai — original
+   kabhi flash nahi hota.
 
-`TRANSLATION_FIRST_PAINT_HOLD_MS` (700ms) safety net hai: iske baad row original
-text ke saath dikh jati hai. **Message kabhi permanently invisible nahi hona
-chahiye** — translation fail ho, model download ho raha ho, kuch bhi ho.
+   Pehle ye rows FlatList ko di hi nahi jati thi. Language badalne par uska
+   nateeja bura tha: poora thread khali, phir messages English me wapas, phir
+   translate. Isliye ab **chhupaya nahi jata, loader dikhaya jata hai**.
+
+`TRANSLATION_LOADER_MAX_MS` (2000ms) safety net hai: iske baad bubble original
+text ke saath dikh jati hai. **Message kabhi permanently loader ke peeche nahi
+phansna chahiye** — translation fail ho, model download ho raha ho, kuch bhi ho.
+
+Loader sirf wahan aata hai jahan translation **sach me hogi**:
+`willTranslate()` (synchronous, wahi planner jo asli call use karti hai) pehle
+poochha jata hai, warna reader ki apni script wale har message par ek frame ka
+loader flash hota. Aur jo slot `'skipped'` aata hai wo ref me jata hai (koi
+re-render nahi), isliye effect ke aakhir me `translationHoldTick` bump hota hai
+taaki loader turant hat jaye.
 
 Pehli translation model ko RAM me load karti hai, isliye wo slow ho sakti hai.
-Device pe hold time tune karna pad sakta hai.
+Device pe ye deadline tune karni pad sakti hai.
 
 ---
 

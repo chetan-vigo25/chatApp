@@ -346,11 +346,19 @@ export function callReducer(state, action) {
         participants: {
           ...state.participants,
           [id]: {
+            // Spread FIRST so nothing the roster already knew is silently lost:
+            // this used to rebuild the entry from scratch, wiping `audioEnabled`
+            // / `videoEnabled` / `confStatus` — so a member who was muted flashed
+            // un-muted (and a camera-off tile flashed live) the moment their
+            // media arrived and this action rebuilt them.
+            ...existing,
             id,
             name: existing.name || invited.name || action.name || 'Unknown',
             mobile: existing.mobile || invited.mobile || null,
             avatar: existing.avatar || invited.avatar || action.avatar || null,
             joined: true,
+            // They are here — clear any stale "Left" flag from an earlier exit.
+            left: false,
           },
         },
       };

@@ -25,7 +25,9 @@ const { width: SCREEN_W } = Dimensions.get('window');
  * Always rendered for a group — when the member list hasn't loaded yet the tap
  * explains, instead of the buttons silently not existing.
  */
-export default function GroupCallButtons({ peers = [], groupId, groupName, groupAvatar }) {
+export default function GroupCallButtons({
+  peers = [], groupId, groupName, groupAvatar, memberCount = 0, chatId = null,
+}) {
   const { theme, isDarkMode } = useTheme();
   const {
     startGroupAudioCall, startGroupVideoCall, maxParticipants = 4, callBusy,
@@ -37,8 +39,18 @@ export default function GroupCallButtons({ peers = [], groupId, groupName, group
 
   const cleanPeers = (peers || []).filter((p) => p && p.id);
 
-  const dial = useCallback((media, list) => {
+  // `full` = "ring the whole group" (the menu's Voice/Video). A subset chosen in
+  // the picker is deliberate and must never be second-guessed here.
+  const dial = useCallback((media, list, full = false) => {
     const clean = (list || []).filter((p) => p && p.id);
+    // startCall infers isGroup from peers.length > 1, so ringing a PARTIALLY
+    // loaded roster does not fail loudly — it quietly places a 1:1 call to
+    // whoever resolved first. If the group is known to have more members than we
+    // managed to resolve, say so instead of placing the wrong call.
+    if (full && memberCount > 1 && clean.length < memberCount - 1) {
+      Alert.alert('Group call', 'Group members are still loading. Please try again in a moment.');
+      return;
+    }
     const trimmed = clean.slice(0, maxParticipants - 1);
     const dropped = clean.length - trimmed.length;
     if (!trimmed.length) {
@@ -46,7 +58,9 @@ export default function GroupCallButtons({ peers = [], groupId, groupName, group
       return;
     }
     const start = media === 'video' ? startGroupVideoCall : startGroupAudioCall;
-    const go = () => start?.(trimmed, { groupId, groupName });
+    // isGroup is DECLARED — never inferred from trimmed.length (a 2-person
+    // group must still ring as a GROUP call, not as a 1:1).
+    const go = () => start?.(trimmed, { groupId, groupName, chatId, isGroup: true });
     if (dropped > 0) {
       Alert.alert(
         'Group call',
@@ -56,7 +70,7 @@ export default function GroupCallButtons({ peers = [], groupId, groupName, group
     } else {
       go();
     }
-  }, [maxParticipants, groupId, groupName, startGroupAudioCall, startGroupVideoCall]);
+  }, [maxParticipants, groupId, groupName, startGroupAudioCall, startGroupVideoCall, memberCount, chatId]);
 
   const openMenu = useCallback(() => {
     const node = anchorRef.current;
@@ -77,9 +91,9 @@ export default function GroupCallButtons({ peers = [], groupId, groupName, group
     if (action === 'voice') {
       // Small delay lets the menu Modal fully dismiss before an Alert/call UI
       // takes over (stacked-modal issues on Android).
-      setTimeout(() => dial('audio', cleanPeers), 160);
+      setTimeout(() => dial('audio', cleanPeers, true), 160);
     } else if (action === 'video') {
-      setTimeout(() => dial('video', cleanPeers), 160);
+      setTimeout(() => dial('video', cleanPeers, true), 160);
     } else if (action === 'select') {
       setTimeout(() => setPickerVisible(true), 160);
     }

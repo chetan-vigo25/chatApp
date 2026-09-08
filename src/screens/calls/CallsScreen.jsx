@@ -18,6 +18,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import { Ionicons, MaterialIcons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
+import { directionMeta, CALL_RED } from '../../calls/callDirectionMeta';
 import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
@@ -76,27 +77,8 @@ const buildSections = (groups) => {
   return sections;
 };
 
-// WhatsApp call-direction indicator. Uses the Material Design call glyphs
-// (the same ones WhatsApp Android uses) and colors by whether the call
-// actually connected — green when answered, red when not:
-//   outgoing answered      → call-made            (green ↗ with corner)
-//   outgoing not answered  → call-missed-outgoing (red ↗)
-//   incoming answered      → call-received        (green ↙ with corner)
-//   incoming missed/decl.  → call-missed          (red ↙)
-const CALL_GREEN = '#1DAB61'; // WhatsApp connected-call green
-const CALL_RED = '#F15C6D';   // WhatsApp missed-call red
-
-const directionMeta = (direction, outcome) => {
-  const connected = outcome === 'completed';
-  if (direction === 'outgoing') {
-    return connected
-      ? { icon: 'call-made', color: CALL_GREEN }
-      : { icon: 'call-missed-outgoing', color: CALL_RED };
-  }
-  return connected
-    ? { icon: 'call-received', color: CALL_GREEN }
-    : { icon: 'call-missed', color: CALL_RED };
-};
+// Direction glyph + color come from callDirectionMeta — shared with the call
+// detail screen and the in-thread call bubble.
 
 // Only a genuinely missed incoming call turns the contact name red (WhatsApp
 // reserves the red name for "Missed call", not for calls you declined yourself).
@@ -177,6 +159,10 @@ const groupCalls = (items) => {
       peer: it.peerId && typeof it.peerId === 'object' ? it.peerId : null,
       isGroup: !!it.isGroup,
       groupName: it.groupName || null,
+      // Carried so a group REDIAL (here and on the detail screen) can pass
+      // groupId through to startCall — it is what the mid-call member picker
+      // re-fetches with, and it rides the ring payload to every callee.
+      groupId: it.groupId || null,
       // Server rows populate `participants` (user objects); realtime rows carry
       // `participantNames` only. Keep both so we can label + redial.
       participants: Array.isArray(it.participants) ? it.participants : [],
@@ -351,7 +337,10 @@ export default function CallsScreen({ navigation }) {
         } : null))
         .filter(Boolean);
       if (!peers.length) return;
-      const opts = { groupName: group.groupName };
+      // groupId feeds the mid-call "Add participant" member picker (it re-fetches
+      // with viewGroup) and rides the ring payload; isGroup is declared so a
+      // 2-person group redial still rings as a GROUP call.
+      const opts = { groupId: group.groupId || null, groupName: group.groupName, isGroup: true };
       if (media === 'video') startGroupVideoCall?.(peers, opts);
       else startGroupAudioCall?.(peers, opts);
       return;
@@ -379,6 +368,7 @@ export default function CallsScreen({ navigation }) {
       peer: g.peer,
       isGroup: g.isGroup,
       groupName: g.groupName,
+      groupId: g.groupId,
       participants: g.participants,
       participantNames: g.participantNames,
       calls,
@@ -532,11 +522,6 @@ export default function CallsScreen({ navigation }) {
               >
                 {isSelected && <Ionicons name="checkmark" size={15} color="#fff" />}
               </View>
-            ) : g.isGroup ? (
-              /* GROUP CALLS TEMPORARILY DISABLED — no redial button on group
-                 call-log rows. Re-enable by removing this `g.isGroup ? null :`
-                 branch so groups get the same redial button as 1-1. */
-              null
             ) : (
               <TouchableOpacity
                 onPress={() => redial(g, g.media)}

@@ -1159,8 +1159,9 @@ export default function ChatList({ navigation }) {
             });
           });
           if (!peers.length) return;
-          if (media === 'video') startGroupVideoCall?.(peers, { groupId, groupName });
-          else startGroupAudioCall?.(peers, { groupId, groupName });
+          const opts = { groupId, groupName, isGroup: true };
+          if (media === 'video') startGroupVideoCall?.(peers, opts);
+          else startGroupAudioCall?.(peers, opts);
         } catch (e) {
           // group/view already surfaces its own failure toast
         }

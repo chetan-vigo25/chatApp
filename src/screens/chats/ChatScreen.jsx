@@ -92,12 +92,14 @@ import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket
 import CallButtons from '../../calls/components/CallButtons';
 import { isSelfChatId } from '../../utils/selfChat';
 import GroupCallButtons from '../../calls/components/GroupCallButtons';
+import { useCall } from '../../calls/useCall';
 import CallMessageBubble from '../../calls/components/CallMessageBubble';
 // Message-body text only. Everything else on this screen keeps React
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
-import { translateDetailed, ensureTranslationCacheReady, peekTranslation, getRetryDelay, needsSystemFont, useLanguage } from "../../components/Translate";
+import { translateDetailed, ensureTranslationCacheReady, peekTranslation, willTranslate, getRetryDelay, needsSystemFont, useLanguage } from "../../components/Translate";
 import { isTranslationOff } from "../../constant/languages";
+import TranslatingBubble from "../../components/TranslatingBubble";
 import { renderSystemMessage } from '../../utils/systemMessage';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
@@ -123,25 +125,25 @@ const TRANSLATION_MAX_ATTEMPTS = 3;
 /** Floor for the self-heal timer, so a flapping network can't busy-loop it. */
 const TRANSLATION_RETRY_MIN_MS = 6000;
 /**
- * How long a message may be withheld from its first paint while its translation
- * resolves. Past it the row renders in the ORIGINAL language rather than
- * staying invisible — a message is never lost to a slow translation.
+ * How long a bubble may show the translating placeholder before it gives up and
+ * renders the ORIGINAL text instead. A message is never lost to a slow (or
+ * failed, or still-downloading) translation — the loader is a wait, not a wall.
  *
- * On-device translation is milliseconds, so for most messages this never
- * matters at all.
+ * On-device translation is milliseconds once the model is warm, so for most
+ * messages the placeholder never even paints. The window that made this visible
+ * is the one right after the reader CHANGES language: every message on screen
+ * needs a fresh pass, and the first few run while ML Kit is still spinning up.
  *
- * It was 2500ms, sized for a CLOUD fallback and its network round trip. That
- * fallback no longer exists — everything is on-device now — so the only thing
- * the extra seconds bought was a message that took two and a half seconds to
- * appear.
- *
- * Applies to the FIRST PAINT of already-loaded history only. A message that
- * ARRIVES while the screen is open is never held: see `arrivedLive` in
- * renderableMessages. Waiting on a translation before showing a message that
- * just came in is the opposite of realtime, and the original-then-swap it
- * avoids is by far the smaller problem.
+ * This used to be an 800ms window during which the row was not drawn AT ALL,
+ * sized for "on-device is fast enough that nobody notices a hidden row". They
+ * did notice: a language switch blanked the thread and then popped the messages
+ * back in English before finally translating them. The row now keeps its place
+ * and shows TranslatingBubble in the same window, which is what buys the extra
+ * time here — a visible loader is far cheaper to wait on than a missing message.
  */
-const TRANSLATION_FIRST_PAINT_HOLD_MS = 800;
+const TRANSLATION_LOADER_MAX_MS = 2000;
+/** Shared empty set for "no bubble is waiting on a translation". */
+const NO_TRANSLATING_KEYS = new Set();
 
 /**
  * Which rows the message translator is allowed to touch.
@@ -1681,6 +1683,20 @@ export default function ChatScreen({ navigation, route }) {
   // `language` had not changed. This tick is that missing trigger.
   const [translationRetryTick, setTranslationRetryTick] = useState(0);
   const translationRetryTimerRef = useRef(null);
+  /**
+   * Placeholder bookkeeping (see the `translatingKeys` memo further down).
+   *
+   * `translationHoldRef` is slot → the moment its loader must give up and let
+   * the original text through, so a message is never stuck behind a spinner.
+   * The tick is what makes the memo re-run for changes that live in REFS and
+   * therefore re-render nothing on their own: a deadline expiring, and a
+   * message coming back as "nothing to translate" (which lands in
+   * translationSkipRef). Without the second one a same-language message would
+   * sit under a loader for the full deadline for no reason at all.
+   */
+  const translationHoldRef = useRef(new Map());   // messageKey::lang → deadline ms
+  const holdTimerRef = useRef(null);
+  const [translationHoldTick, setTranslationHoldTick] = useState(0);
   const [isRecordingAudio, setIsRecordingAudio] = useState(false);
   const [recordingDurationMs, setRecordingDurationMs] = useState(0);
   const audioRecordingRef = useRef(null);
@@ -2398,7 +2414,8 @@ export default function ChatScreen({ navigation, route }) {
    * original and being swapped a tick later by the effect below.
    *
    * Returns undefined when there is nothing cached — the caller then decides
-   * whether to hold the row back (see renderableMessages) or show the original.
+   * whether to show the translating loader (see translatingKeys) or the
+   * original.
    */
   const translationFor = useCallback((msg, messageKey) => {
     if (!languageReady) return undefined;
@@ -2485,6 +2502,11 @@ export default function ChatScreen({ navigation, route }) {
     // A result is therefore only discarded when the screen unmounted or the
     // reader changed language, both of which outlive a single effect run.
     let deferred = false;
+    // A slot answered "nothing to translate" is recorded in a REF, so it
+    // re-renders nothing — and its bubble would keep showing the translating
+    // placeholder until the deadline expired. Remember that it happened and
+    // nudge the memo once the flush is done.
+    let skipped = false;
     // Results are collected and committed in ONE setState per flush rather than
     // one per message. Committing individually re-rendered the whole FlatList
     // once per translated bubble — opening a chat with 50 of them meant 50 full
@@ -2547,9 +2569,14 @@ export default function ChatScreen({ navigation, route }) {
       }
       // 'skipped' / 'unchanged' — a definitive "nothing to show", so stop asking.
       translationSkipRef.current.add(slot);
+      skipped = true;
     })).then(() => {
       // Land whatever is still batched, even if the flush timer has not run.
       if (flushTimer != null) { clearTimeout(flushTimer); commit(); }
+
+      // Drop the placeholder off every bubble that turned out to need no
+      // translation at all.
+      if (skipped && translationMountedRef.current) setTranslationHoldTick((n) => n + 1);
 
       // Self-heal. Anything still owed a translation — deferred because its
       // on-device model is still downloading, or failed with retries left — gets
@@ -2772,6 +2799,15 @@ export default function ChatScreen({ navigation, route }) {
     resetMentions,
     membersList: mentionMembersList,
   } = useMentions(isGroupChat ? groupMembersMap : null, currentUserId);
+
+  // Tapping an in-thread call bubble in a GROUP re-dials the whole group.
+  // Both live up here because `groupCallPeers` is computed far below (after the
+  // early returns, so it cannot be a hook) while renderMessage — which needs it
+  // — is defined above that. The ref carries the roster across without joining
+  // renderMessage's dependency array, which a freshly-built array would
+  // invalidate on every single render of the message list.
+  const { startGroupAudioCall, startGroupVideoCall } = useCall();
+  const groupCallPeersRef = useRef([]);
 
   const handleTextChangeWithMentions = useCallback((newText) => {
     handleTextChange(newText);
@@ -6450,15 +6486,97 @@ export default function ChatScreen({ navigation, route }) {
   // Two bugs met here and produced a date separator between nearly every
   // message (with the raw "2026-08-25" key as its label):
   //   1. the badge compared `msg` against `messages` — the FULL list — while
-  //      the FlatList renders `renderableMessages`, a FILTERED subset (rows
-  //      held back for translation). `index + 1` therefore pointed at a
-  //      different message than the one drawn below, so same-day rows looked
-  //      like day changes. How many rows were held back varied per chat open,
-  //      which is why it only happened "sometimes".
+  //      the FlatList rendered a FILTERED subset (rows held back for
+  //      translation). `index + 1` therefore pointed at a different message
+  //      than the one drawn below, so same-day rows looked like day changes.
+  //      How many rows were held back varied per chat open, which is why it
+  //      only happened "sometimes". Nothing is filtered out any more — a
+  //      waiting row shows TranslatingBubble instead of vanishing — but the ref
+  //      still guards (2).
   //   2. renderChatsItem's dependency list never included `messages`, so even
   //      that comparison ran against a STALE array once new messages arrived.
   // A ref sidesteps both: it is written every render and read at draw time.
   const renderableMessagesRef = useRef([]);
+
+  /**
+   * Bubbles that are waiting on their translation right now.
+   *
+   * The requirement is "no intermediate original-language render": a message
+   * must appear already in the reader's language, not appear in the sender's
+   * and change a tick later.
+   *
+   * This USED to be done by filtering those rows out of the list until the
+   * translation landed. That is what made a language switch look broken: the
+   * thread emptied, then the messages came back in English, then — a beat
+   * later — in the chosen language. The row now stays exactly where it is,
+   * keeping its timestamp, ticks and reactions, and only its BODY is swapped
+   * for TranslatingBubble until the real sentence is ready.
+   *
+   * Every entry carries a deadline (TRANSLATION_LOADER_MAX_MS). If translation
+   * is slow, fails, or the on-device model is still downloading, the bubble
+   * falls back to the sender's text: a message must NEVER be stuck behind a
+   * loader.
+   *
+   * Live-arriving messages are placeholdered too, deliberately. The bubble
+   * itself appears the instant the message does — only the sentence inside it
+   * waits — so realtime is intact, and the reader is spared an English flash
+   * followed by a swap.
+   */
+  const translatingKeys = useMemo(() => {
+    if (!languageReady) return NO_TRANSLATING_KEYS;
+    if (!Array.isArray(messages) || messages.length === 0) return NO_TRANSLATING_KEYS;
+
+    const now = Date.now();
+    let earliestDeadline = Infinity;
+    const holds = translationHoldRef.current;
+    const pending = new Set();
+
+    messages.forEach((msg, index) => {
+      const key = getMessageKey(msg, index);
+      const slot = `${key}::${language}`;
+      // Resolved one way or the other — drop any hold so the map stays small.
+      if (messageTranslations[slot] != null) { holds.delete(slot); return; }
+      if (translationSkipRef.current.has(slot)) { holds.delete(slot); return; }
+      if (!shouldTranslateMessage(msg)) return;
+      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
+      if (!body) return;
+      if (peekTranslation(body, language, 'auto')) return;   // cache hit, paints translated
+      // peek returning null is ambiguous — "not translated YET" and "will never
+      // be translated" look identical. Ask the planner directly, or every
+      // message already in the reader's own script would flash a loader for a
+      // frame before the effect came back with "nothing to do".
+      if (!willTranslate(body, language, 'auto')) return;
+
+      const deadline = holds.get(slot) ?? (now + TRANSLATION_LOADER_MAX_MS);
+      if (!holds.has(slot)) holds.set(slot, deadline);
+      if (now >= deadline) return;                           // waited long enough
+      earliestDeadline = Math.min(earliestDeadline, deadline);
+      pending.add(key);
+    });
+
+    // Wake up exactly when the soonest deadline expires so those bubbles stop
+    // waiting and show what the sender wrote.
+    if (earliestDeadline !== Infinity) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = setTimeout(
+        () => setTranslationHoldTick((n) => n + 1),
+        Math.max(earliestDeadline - now, 16),
+      );
+    }
+    // One shared empty Set keeps the identity stable, so a chat with nothing to
+    // translate never re-renders its rows over this.
+    return pending.size === 0 ? NO_TRANSLATING_KEYS : pending;
+  }, [messages, language, languageReady, messageTranslations, translationHoldTick, shouldTranslateMessage]);
+
+  useEffect(() => () => clearTimeout(holdTimerRef.current), []);
+
+  // Nothing is withheld from the list any more (see translatingKeys above), so
+  // the FlatList renders every message and the date-badge lookups below read
+  // the very same array.
+  const renderableMessages = messages;
+
+  // Written every render so renderChatsItem never reads a stale array.
+  renderableMessagesRef.current = Array.isArray(renderableMessages) ? renderableMessages : [];
 
   const renderChatsItem = useCallback(({ item: msg, index }) => {
     const messageKey = getMessageKey(msg);
@@ -6527,6 +6645,24 @@ export default function ChatScreen({ navigation, route }) {
               peer={chatData?.peerUser}
               chatId={chatData?.chatId || chatData?._id || route?.params?.chatId}
               timeText={msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
+              isGroup={isGroupChat}
+              // A group thread has no single peer to ring back — hand the bubble
+              // the same roster + intent the header call button uses. Omitted
+              // (null) until the roster resolves, which leaves the bubble inert
+              // rather than placing a call to a partial group.
+              onCallBack={isGroupChat ? (media) => {
+                const peers = groupCallPeersRef.current || [];
+                if (!peers.length) return;
+                const opts = {
+                  groupId: chatData?.groupId || chatData?.group?._id || chatData?.chatId
+                    || chatData?._id || route?.params?.chatId,
+                  groupName: chatData?.chatName || chatData?.group?.name || chatData?.groupName,
+                  chatId: chatData?.chatId || chatData?._id || route?.params?.chatId,
+                  isGroup: true,
+                };
+                if (media === 'video') startGroupVideoCall?.(peers, opts);
+                else startGroupAudioCall?.(peers, opts);
+              } : null}
             />
           </View>
         </React.Fragment>
@@ -7025,6 +7161,10 @@ export default function ChatScreen({ navigation, route }) {
               // a preview card ABOVE the text (inside the same bubble). The card
               // fetches its own metadata and renders only once resolved.
               const linkHref = getFirstLinkHref(msg.text);
+              // This body is still being translated — draw the loader in its
+              // place rather than the sender's sentence, which would only be
+              // replaced a tick later. See the translatingKeys memo.
+              const isTranslating = translatingKeys.has(messageKey);
               return (
                 <View>
                   {!!linkHref && (
@@ -7043,7 +7183,16 @@ export default function ChatScreen({ navigation, route }) {
                       (time+ticks is wide), overlapping the text. */}
                   <View style={{ flexDirection: 'row', alignItems: 'flex-end' }}>
                     <View style={{ flexShrink: 1 }}>
-                      {renderRichMessageText(msg, isMyMessage, messageKey, translationFor(msg, messageKey))}
+                      {isTranslating ? (
+                        <TranslatingBubble
+                          text={msg.text}
+                          isMyMessage={isMyMessage}
+                          isDarkMode={isDarkMode}
+                          theme={theme}
+                        />
+                      ) : (
+                        renderRichMessageText(msg, isMyMessage, messageKey, translationFor(msg, messageKey))
+                      )}
                     </View>
                     {renderMessageMeta(msg, isMyMessage, { inline: true })}
                   </View>
@@ -7179,90 +7328,20 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys]);
 
-  /**
-   * Rows held back from their FIRST paint while their translation resolves.
-   *
-   * The requirement is "no intermediate original-language render": a message
-   * must appear already in the reader's language, not appear in the sender's
-   * and change a tick later. Since ML Kit runs on-device, that resolution is
-   * milliseconds — short enough to simply not draw the row yet.
-   *
-   * Every hold carries a deadline. If translation is slow, fails, or the model
-   * is still downloading, the row appears anyway with its original text: a
-   * message must NEVER be permanently invisible because of translation.
-   */
-  const translationHoldRef = useRef(new Map());   // messageKey::lang → deadline ms
-  const [, setHoldTick] = useState(0);
-  const holdTimerRef = useRef(null);
-  /**
-   * When this screen opened. Anything stamped at or after it arrived LIVE and
-   * is never withheld — a message that just came in has to appear now, not
-   * after a translation resolves. The hold only ever applied to history that
-   * was already on screen.
-   */
-  const screenOpenedAtRef = useRef(Date.now());
-
-  useEffect(() => () => clearTimeout(holdTimerRef.current), []);
-
-  const renderableMessages = useMemo(() => {
-    if (!Array.isArray(messages) || messages.length === 0) return messages;
-    // English reader + nothing to translate is the common case; skip all of it.
-    if (!languageReady) return messages;
-
-    const now = Date.now();
-    let earliestDeadline = Infinity;
-    const holds = translationHoldRef.current;
-
-    const visible = messages.filter((msg, index) => {
-      const key = getMessageKey(msg, index);
-      const slot = `${key}::${language}`;
-      // Resolved one way or the other — drop any hold so the map stays small.
-      if (messageTranslations[slot] != null) { holds.delete(slot); return true; }
-      if (translationSkipRef.current.has(slot)) { holds.delete(slot); return true; }
-      if (!shouldTranslateMessage(msg)) return true;
-      const body = typeof msg.text === 'string' ? msg.text.trim() : '';
-      if (!body) return true;
-      // Arrived while the user was looking at this chat → show it immediately
-      // and let the translation swap in. Realtime beats flicker.
-      const stamp = new Date(msg.timestamp || msg.createdAt || 0).getTime();
-      const arrivedLive = stamp >= screenOpenedAtRef.current;
-      if (arrivedLive) return true;
-      // resolveRequest says "skipped" for same-script pairs; peek returning null
-      // is ambiguous, so lean on the effect's skip set plus the deadline below.
-      if (peekTranslation(body, language, 'auto')) return true; // cache hit, paints translated
-
-      const deadline = holds.get(slot) ?? (now + TRANSLATION_FIRST_PAINT_HOLD_MS);
-      if (!holds.has(slot)) holds.set(slot, deadline);
-      if (now >= deadline) return true;                         // waited long enough
-      earliestDeadline = Math.min(earliestDeadline, deadline);
-      return false;
-    });
-
-    // Wake up exactly when the soonest hold expires so those rows appear.
-    if (earliestDeadline !== Infinity) {
-      clearTimeout(holdTimerRef.current);
-      holdTimerRef.current = setTimeout(
-        () => setHoldTick((n) => n + 1),
-        Math.max(earliestDeadline - now, 16),
-      );
-    }
-    return visible.length === messages.length ? messages : visible;
-  }, [messages, language, languageReady, messageTranslations]);
-
-  // Written every render so renderChatsItem never reads a stale array.
-  renderableMessagesRef.current = Array.isArray(renderableMessages) ? renderableMessages : [];
 
   // FlatList extraData for media rows. Its identity changes only when one of
   // the download/upload/failed maps changes, which is exactly when a mounted
   // media cell must re-render (e.g. a finished download replacing the blurred
   // placeholder with the local file:// image). It also carries
   // messageTranslations + language: a translation landing must re-render the
-  // whole row, otherwise the bubble keeps painting the original text.
+  // whole row, otherwise the bubble keeps painting the original text — and
+  // translatingKeys, so a bubble picks up (and later drops) its translating
+  // loader without waiting to be recycled.
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys]
   );
 
   // Typing indicator
@@ -7442,10 +7521,16 @@ export default function ChatScreen({ navigation, route }) {
         avatar: img ? toSecureMediaUri(img) : null,
       });
     });
-    // A chat opened from the chat LIST often carries no members on chatData —
-    // fall back to groupMembersMap (built from the viewGroup fetch dispatched on
-    // open), otherwise the header call buttons would silently do nothing.
-    if (!out.length && groupMembersMap && typeof groupMembersMap === 'object') {
+    // MERGE, never fall back. `chatData.members` and `groupMembersMap` are two
+    // partial views of the same roster: a chat opened from the chat LIST often
+    // carries no members on chatData, and chatData can also carry a SUBSET whose
+    // other entries have no populated userId. This used to be gated on
+    // `!out.length`, so a chatData list that resolved even ONE member skipped
+    // groupMembersMap entirely — and a 6-person group dialled as a 1:1 call
+    // ("call went only to @ahmed"), because startCall decides isGroup from
+    // peers.length > 1. Taking the union of both sources is what makes the
+    // dialled roster the full group.
+    if (groupMembersMap && typeof groupMembersMap === 'object') {
       Object.keys(groupMembersMap).forEach((sid) => {
         if (sid === String(currentUserId) || seen.has(sid)) return;
         seen.add(sid);
@@ -7461,6 +7546,8 @@ export default function ChatScreen({ navigation, route }) {
     }
     return out;
   })();
+  // Plain assignment (not a hook) — safe this far down the component.
+  groupCallPeersRef.current = groupCallPeers;
   const messagingDisabledText = !memberCanSend
     ? 'You are restricted from sending messages'
     : 'Only admins can send messages';
@@ -7940,6 +8027,12 @@ export default function ChatScreen({ navigation, route }) {
                   groupAvatar={liveChannel?.chatAvatar !== undefined
                     ? liveChannel.chatAvatar
                     : (chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar)}
+                  // Lets the button refuse to ring a half-resolved roster (which
+                  // startCall would silently downgrade to a 1:1 call).
+                  memberCount={liveMemberCount
+                    ?? (chatData?.group?.memberCount || chatData?.members?.length || chatData?.memberCount || 0)}
+                  // Lets the backend post the "call" message into THIS thread.
+                  chatId={chatData?.chatId || chatData?._id || route?.params?.chatId}
                 />
               )}
               {isChatMuted && (
@@ -8107,8 +8200,10 @@ export default function ChatScreen({ navigation, route }) {
           <View style={{ flex: 1 }}>
           <FlatList
             ref={flatListRef}
-            // Held-back rows are excluded here, so a message never paints in
-            // the sender's language and then switches. See renderableMessages.
+            // Every message is here. A bubble still waiting on its translation
+            // renders TranslatingBubble in place of its text, so nothing is
+            // hidden and nothing paints in the sender's language first. See
+            // the translatingKeys memo.
             data={renderableMessages}
             keyExtractor={getMessageKey}
             renderItem={renderChatsItem}

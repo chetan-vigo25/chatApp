@@ -11,28 +11,12 @@ import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import { getCallStats, deleteCalls } from '../../calls/services/callLogService';
+import { directionMeta, isConnectedOutcome as isConnected, CALL_GREEN, CALL_RED } from '../../calls/callDirectionMeta';
 import CallAvatar from '../../calls/components/CallAvatar';
 import VerifiedBadge from '../../components/VerifiedBadge';
 
-const CALL_GREEN = '#1DAB61'; // WhatsApp connected-call green
-const CALL_RED = '#F15C6D';   // WhatsApp missed-call red
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-// "Connected" = the call actually went through; everything else is a red entry.
-const isConnected = (outcome) => outcome === 'completed';
-
-// Direction arrow glyph + color (mirrors the call-list row).
-const directionMeta = (direction, outcome) => {
-  const connected = isConnected(outcome);
-  if (direction === 'outgoing') {
-    return connected
-      ? { icon: 'call-made', color: CALL_GREEN }
-      : { icon: 'call-missed-outgoing', color: CALL_RED };
-  }
-  return connected
-    ? { icon: 'call-received', color: CALL_GREEN }
-    : { icon: 'call-missed', color: CALL_RED };
-};
 
 // Long-form, WhatsApp-style descriptor for a single call event.
 //   completed  → "Incoming voice call" / "Outgoing video call"
@@ -137,6 +121,7 @@ export default function CallDetailScreen() {
     peer = null,
     isGroup = false,
     groupName = null,
+    groupId = null,
     participants = [],
     participantNames = null,
     calls = [],
@@ -229,7 +214,7 @@ export default function CallDetailScreen() {
         } : null))
         .filter(Boolean);
       if (!peers.length) return;
-      const opts = { groupName };
+      const opts = { groupId, groupName, isGroup: true };
       if (media === 'video') startGroupVideoCall?.(peers, opts);
       else startGroupAudioCall?.(peers, opts);
       return;
@@ -244,7 +229,7 @@ export default function CallDetailScreen() {
     };
     if (media === 'video') startVideoCall?.(peerObj);
     else startAudioCall?.(peerObj);
-  }, [isGroup, participants, groupName, peerId, peer, name, avatarUri, resolveName,
+  }, [isGroup, participants, groupId, groupName, peerId, peer, name, avatarUri, resolveName,
     startAudioCall, startVideoCall, startGroupAudioCall, startGroupVideoCall]);
 
   const peerObjForNav = useMemo(() => ({
@@ -347,30 +332,26 @@ export default function CallDetailScreen() {
               <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Message</Text>
             </TouchableOpacity>
           ) : null}
-          {/* GROUP CALLS TEMPORARILY DISABLED — 1-1 redial only. Re-enable
-              group redial by dropping the `!isGroup &&` guards below. */}
-          {!isGroup ? (
-            <TouchableOpacity
-              style={[styles.actionBtn, { backgroundColor: c.surface }, callBusy && { opacity: 0.4 }]}
-              activeOpacity={0.75}
-              disabled={callBusy}
-              onPress={() => redial('audio')}
-            >
-              <Ionicons name="call" size={21} color={c.themeColor} />
-              <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Audio</Text>
-            </TouchableOpacity>
-          ) : null}
-          {!isGroup ? (
-            <TouchableOpacity
-              style={[styles.actionBtn, { backgroundColor: c.surface }, callBusy && { opacity: 0.4 }]}
-              activeOpacity={0.75}
-              disabled={callBusy}
-              onPress={() => redial('video')}
-            >
-              <Ionicons name="videocam" size={21} color={c.themeColor} />
-              <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Video</Text>
-            </TouchableOpacity>
-          ) : null}
+          {/* Redial — for a GROUP row this rings every participant the log
+              recorded (redial() rebuilds them and declares isGroup). */}
+          <TouchableOpacity
+            style={[styles.actionBtn, { backgroundColor: c.surface }, callBusy && { opacity: 0.4 }]}
+            activeOpacity={0.75}
+            disabled={callBusy}
+            onPress={() => redial('audio')}
+          >
+            <Ionicons name="call" size={21} color={c.themeColor} />
+            <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Audio</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.actionBtn, { backgroundColor: c.surface }, callBusy && { opacity: 0.4 }]}
+            activeOpacity={0.75}
+            disabled={callBusy}
+            onPress={() => redial('video')}
+          >
+            <Ionicons name="videocam" size={21} color={c.themeColor} />
+            <Text style={[styles.actionLabel, { color: c.primaryTextColor }]}>Video</Text>
+          </TouchableOpacity>
           {!isGroup && peerId ? (
             <TouchableOpacity
               style={[styles.actionBtn, { backgroundColor: c.surface }]}

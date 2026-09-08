@@ -102,11 +102,12 @@ export default function ProfilePreviewModal({
   const initial = (name || '?').charAt(0).toUpperCase();
 
   const showMessage = typeof onMessage === 'function';
-  // Call/video: 1-1 only. GROUP CALLS TEMPORARILY DISABLED (was: groups also
-  // showed them, ringing all members) — re-enable by dropping the `&& !isGroup`
-  // guards below. Broadcast channels never show call actions.
-  const showCall = typeof onCall === 'function' && !isBroadcast && !isGroup;
-  const showVideo = typeof onVideo === 'function' && !isBroadcast && !isGroup;
+  // Call/video appear whenever the PARENT supplied a handler — for a group that
+  // handler rings every member. Broadcast channels never show call actions, and
+  // a parent with nothing to dial simply passes no handler (AddUser/NewCallScreen
+  // both pass isGroup={false}, so only the chat list reaches the group path).
+  const showCall = typeof onCall === 'function' && !isBroadcast;
+  const showVideo = typeof onVideo === 'function' && !isBroadcast;
   const showInfo = typeof onInfo === 'function';
   const hasActions = showMessage || showCall || showVideo || showInfo;
 

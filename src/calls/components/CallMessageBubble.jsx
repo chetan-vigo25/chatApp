@@ -1,13 +1,16 @@
 import React, { useCallback } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
-import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../useCall';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
+import { directionMeta, isConnectedOutcome, CALL_RED_ON_ACCENT } from '../callDirectionMeta';
 
 /**
  * In-thread "call" entry, WhatsApp style. Rendered by ChatScreen for messages of
- * type 'call'. It is a SIDE-ALIGNED chat bubble — right for the outgoing leg
+ * type 'call'. Works in 1:1 AND group threads — a group bubble reads "Group
+ * voice/video call" and dials through the `onCallBack` the screen supplies
+ * (there is no single peer to ring). It is a SIDE-ALIGNED chat bubble — right for the outgoing leg
  * (sender), left for the incoming leg (receiver) — NOT centered. The whole
  * bubble taps to call the peer back. Render details ride in msg.payload.
  *
@@ -23,7 +26,9 @@ const fmtDuration = (sec) => {
   return `${m}:${ss}`;
 };
 
-export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
+export default function CallMessageBubble({
+  msg, peer, chatId, timeText, isGroup = false, onCallBack: onCallBackProp = null,
+}) {
   const { theme, isDarkMode, chatColor } = useTheme();
   const { startAudioCall, startVideoCall, callBusy } = useCall();
 
@@ -37,9 +42,14 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
   const isVideo = media === 'video';
   const isOutgoing = direction === 'outgoing';
   const kind = isVideo ? 'video' : 'voice';
-  // "Missed" framing (red) only applies to the party who didn't answer — the
-  // callee. The caller's own unanswered/cancelled leg reads neutrally.
-  const isMissed = (outcome === 'missed' || outcome === 'cancelled') && !isOutgoing;
+  const connected = isConnectedOutcome(outcome);
+  // Red "Missed" FRAMING is narrower than "didn't connect": it belongs only to
+  // the callee who never picked up. A call you declined yourself reads
+  // neutrally as "Declined call", and the caller's own unanswered leg reads
+  // neutrally too — matching the calls list, which reserves red text for a
+  // genuinely missed incoming call. The ARROW is separate: it goes red for
+  // every unconnected call on both sides.
+  const isMissed = !isOutgoing && (outcome === 'missed' || outcome === 'cancelled');
 
   const peerMobile = peer?.mobileNumber
     || (peer?.mobile?.number ? `${peer.mobile.code || ''}${peer.mobile.number}` : null)
@@ -64,21 +74,33 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
     avatar: peer.profileImage || peer.profilePicture || null,
   } : null;
 
+  // Call back. A GROUP thread has no single peer to ring, and the roster lives
+  // on the screen rendering this bubble — so the caller passes `onCallBack` and
+  // this component stays dumb about how a group is dialled. 1:1 keeps its own
+  // peer-based path.
   const onCallBack = useCallback(() => {
+    if (onCallBackProp) { onCallBackProp(isVideo ? 'video' : 'audio'); return; }
     if (!peerObj?.id) return;
     if (isVideo) startVideoCall?.(peerObj, chatId);
     else startAudioCall?.(peerObj, chatId);
-  }, [peerObj, isVideo, chatId, startAudioCall, startVideoCall]);
+  }, [onCallBackProp, peerObj, isVideo, chatId, startAudioCall, startVideoCall]);
+  // Nothing to dial (a group bubble with no roster yet) → don't offer the tap.
+  const canCallBack = !!onCallBackProp || !!peerObj?.id;
 
-  // Direction arrow: green for connected, red for a missed/unanswered call.
-  const arrowName = isMissed ? 'call-missed' : (isOutgoing ? 'call-made' : 'call-received');
+  // Direction arrow: one shared convention with the calls list and the call
+  // detail screen (green ↗/↙ when the call connected, red ↗/↙ when it did not),
+  // so the same call never reads as two different states in two places.
+  const { icon: arrowName, color: arrowStateColor } = directionMeta(direction, outcome);
 
   let label;
-  if (outcome === 'completed') label = isVideo ? 'Video call' : 'Voice call';
+  const groupKind = isVideo ? 'Group video call' : 'Group voice call';
+  if (outcome === 'completed') label = isGroup ? groupKind : (isVideo ? 'Video call' : 'Voice call');
   else if (outcome === 'rejected') label = isOutgoing ? 'Call declined' : 'Declined call';
   else if (isMissed) label = `Missed ${kind} call`;
-  else if (outcome === 'cancelled' && isOutgoing) label = 'Cancelled call';
-  else label = isVideo ? 'Video call' : 'Voice call';
+  else if (outcome === 'cancelled') label = 'Cancelled call';
+  else if (outcome === 'missed') label = 'No answer';
+  else if (outcome === 'failed') label = 'Call not connected';
+  else label = isGroup ? groupKind : (isVideo ? 'Video call' : 'Voice call');
 
   // WhatsApp bubble surfaces: sent = the user's chosen chat accent (white
   // content), received = card surface (themed text). Mirrors the audio/text
@@ -94,15 +116,21 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
     : theme.colors.bubbleReceived;
   const onBubble = isOutgoing ? '#ffffff' : theme.colors.primaryTextColor;
   const onBubbleSoft = isOutgoing ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;
-  const missedColor = isOutgoing ? '#ffffff' : theme.colors.danger;
-  const labelColor = isMissed ? missedColor : onBubble;
-  const arrowColor = isMissed
-    ? missedColor
-    : (isOutgoing ? 'rgba(255,255,255,0.9)' : '#1DAB61');
+  const labelColor = isMissed ? theme.colors.danger : onBubble;
+  // The state color reads on the received surface as-is; on the outgoing bubble
+  // it sits on dark green, so connected keeps the bubble's own white and the
+  // unanswered red is lifted to stay legible.
+  const arrowColor = isOutgoing
+    ? (connected ? 'rgba(255,255,255,0.9)' : CALL_RED_ON_ACCENT)
+    : arrowStateColor;
 
-  // Round icon chip — tinted to the call media, like WhatsApp's call-log glyph.
-  const chipBg = isOutgoing ? 'rgba(255,255,255,0.18)' : (theme.colors.themeColor + '1F');
-  const chipColor = isOutgoing ? '#ffffff' : theme.colors.themeColor;
+  // Round icon chip — tinted to the call state, like WhatsApp's call-log glyph:
+  // themed for a connected call, red for one that never went through.
+  const chipStateColor = isOutgoing
+    ? '#ffffff'
+    : (connected ? theme.colors.themeColor : arrowStateColor);
+  const chipBg = isOutgoing ? 'rgba(255,255,255,0.18)' : (chipStateColor + '1F');
+  const chipColor = chipStateColor;
 
   const durationText = outcome === 'completed' ? fmtDuration(payload.durationSec) : '';
   const metaText = [timeText, durationText].filter(Boolean).join('  ·  ');
@@ -112,7 +140,7 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
       <TouchableOpacity
         activeOpacity={0.85}
         onPress={onCallBack}
-        disabled={callBusy}
+        disabled={callBusy || !canCallBack}
         style={[
           styles.bubble,
           isOutgoing ? styles.bubbleOut : styles.bubbleIn,
@@ -134,7 +162,7 @@ export default function CallMessageBubble({ msg, peer, chatId, timeText }) {
             {label}
           </Text>
           <View style={styles.metaRow}>
-            <MaterialCommunityIcons name={arrowName} size={13} color={arrowColor} style={styles.metaArrow} />
+            <MaterialIcons name={arrowName} size={14} color={arrowColor} style={styles.metaArrow} />
             <Text style={[styles.meta, { color: onBubbleSoft }]} numberOfLines={1}>
               {metaText}
             </Text>

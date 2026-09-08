@@ -241,8 +241,20 @@ export default function GroupInfo({ navigation, route }) {
   }, [groupId, dispatch]);
 
   // ─── DATA ───
-  const apiGroup = currentGroup?.group;
-  const apiMembers = currentGroup?.members;
+  // The redux `currentGroup` slice is GLOBAL — it holds whichever group was
+  // viewed last. Reading it without checking WHICH group it holds meant this
+  // screen could render (and, worse, DIAL) another group's roster, or a
+  // half-loaded one: a 6-person group whose slice had resolved a single member
+  // dialled that one person, and startCall infers isGroup from peers.length > 1,
+  // so the group call silently became a 1:1 ("call went only to @ahmed").
+  // SelectPeopleSheet / AddParticipantSheet already apply exactly this guard.
+  // On a mismatch we treat the data as NOT loaded — the viewGroup dispatched on
+  // mount fills it in a moment later.
+  const loadedGroupId = currentGroup?.group?._id || currentGroup?.group?.id || null;
+  const groupDataReady = !!loadedGroupId && !!groupId
+    && String(loadedGroupId) === String(groupId);
+  const apiGroup = groupDataReady ? currentGroup?.group : null;
+  const apiMembers = groupDataReady ? currentGroup?.members : null;
   const groupName = apiGroup?.name || routeItem?.chatName || routeItem?.group?.name || 'Group';
   const groupAvatarUrl = apiGroup?.avatar || routeItem?.chatAvatar || routeItem?.group?.avatar;
   const description = apiGroup?.description || routeItem?.group?.description || '';
@@ -268,7 +280,11 @@ export default function GroupInfo({ navigation, route }) {
 
   // ─── STATS ───
   const adminCount = members.filter((m) => m.role === 'admin').length;
-  const memberCount = members.length;
+  // Until the fetch for THIS group lands, `members` is deliberately empty (see
+  // groupDataReady) — show the count the chat row already knew instead of "0".
+  const memberCount = members.length
+    || routeItem?.group?.memberCount || routeItem?.memberCount
+    || (Array.isArray(routeItem?.members) ? routeItem.members.length : 0);
 
   // Start a group audio/video call with every other participant (WhatsApp parity).
   const startGroupCall = (media) => {
@@ -279,8 +295,20 @@ export default function GroupInfo({ navigation, route }) {
       })
       .filter(Boolean)
       .filter((p) => String(p.id) !== String(currentUserId));
+    // Never dial a roster that isn't fully loaded: startCall decides
+    // isGroup from peers.length > 1, so a partial list does not fail loudly —
+    // it quietly places a 1:1 call to whoever happened to load first.
+    if (!groupDataReady) {
+      showToast('Group members are still loading. Please try again in a moment.');
+      if (groupId) dispatch(viewGroup({ groupId }));
+      return;
+    }
     if (!peers.length) { showToast('No participants to call'); return; }
-    const opts = { groupName };
+    // groupId matters as much as the name: it is what the mid-call "Add
+    // participant" sheet re-fetches members with (viewGroup), and what the
+    // ring payload carries to every callee. Without it the call falls back to
+    // the ad-hoc contacts picker instead of the group's own member list.
+    const opts = { groupId, groupName, isGroup: true };
     if (media === 'video') startGroupVideoCall?.(peers, opts);
     else startGroupAudioCall?.(peers, opts);
   };
@@ -556,8 +584,27 @@ export default function GroupInfo({ navigation, route }) {
             <Ionicons name="chatbubble" size={22} color={theme.colors.themeColor} />
             <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Message</Text>
           </TouchableOpacity>
-          {/* GROUP CALLS TEMPORARILY DISABLED — re-enable by restoring the
-              Audio + Video quick-action buttons here (onPress startGroupCall). */}
+          {/* Group audio / video call — rings every other participant.
+              Dimmed and inert while another call is in progress (callBusy),
+              same rule as the chat-header call button. */}
+          <TouchableOpacity
+            onPress={() => startGroupCall('audio')}
+            disabled={callBusy}
+            activeOpacity={0.7}
+            style={[styles.quickBtn, { backgroundColor: cardBg }, callBusy && styles.quickBtnDisabled]}
+          >
+            <Ionicons name="call" size={22} color={theme.colors.themeColor} />
+            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Audio</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => startGroupCall('video')}
+            disabled={callBusy}
+            activeOpacity={0.7}
+            style={[styles.quickBtn, { backgroundColor: cardBg }, callBusy && styles.quickBtnDisabled]}
+          >
+            <Ionicons name="videocam" size={22} color={theme.colors.themeColor} />
+            <Text style={[styles.quickBtnLabel, { color: theme.colors.themeColor }]}>Video</Text>
+          </TouchableOpacity>
         </View>
 
         {/* ═══ DESCRIPTION CARD ═══ */}
