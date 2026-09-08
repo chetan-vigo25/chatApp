@@ -20,6 +20,7 @@ import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import VerifiedBadge from '../../components/VerifiedBadge';
+import GroupMemberSheet from '../../components/GroupMemberSheet';
 import useDisplayName from '../../hooks/useDisplayName';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
@@ -60,6 +61,7 @@ const getMemberUser = (m) => {
     email: u.email || m.email || null,
     mobile: u.mobileNumber || u.phoneNumber || u.phone || mobileFromObj || m.mobileNumber || m.phone || null,
     isVerified: Boolean(u.isVerified || m.isVerified),
+    about: u.about || u.bio || u.status || null,
     // Contact privacy. These were NOT extracted before, so `resolveMemberName`
     // below always received `username: null, hideContact: false` and the
     // privacy branch could never fire — the group member list kept showing a
@@ -75,7 +77,10 @@ export default function GroupInfo({ navigation, route }) {
   const { theme, isDarkMode } = useTheme();
   const insets = useSafeAreaInsets();
   const dispatch = useDispatch();
-  const { startGroupAudioCall, startGroupVideoCall, callBusy } = useCall();
+  const { startGroupAudioCall, startGroupVideoCall, startAudioCall, startVideoCall, callBusy } = useCall();
+  // Status feed: "View status" appears on a member's sheet only when they have
+  // a live status in the viewer's feed (privacy already applied server-side).
+  const contactStatuses = useSelector((s) => s.status?.contactStatuses) || [];
   const { currentGroup, isLoading } = useSelector((s) => s.group);
   const { leaveGroup, removeChat, removeGroupMember: socketRemoveMember, promoteGroupMember, demoteGroupMember } = useRealtimeChatActions();
   // Device contact directory (local SQLite only) — still read by other parts of
@@ -370,13 +375,64 @@ export default function GroupInfo({ navigation, route }) {
       { text: 'Transfer', onPress: async () => { try { await dispatch(transferOwnership({ groupId, newOwnerId: user.id })).unwrap(); showToast('Ownership transferred'); setTimeout(() => dispatch(viewGroup({ groupId })), 500); } catch (e) { console.error(e); } setTransferModalVisible(false); } },
     ]);
   };
+  // Every other member opens the sheet (web parity): profile, message, calls and
+  // status are for everyone; the admin rows inside are permission-gated.
   const openMemberAction = (member) => {
     const user = getMemberUser(member);
-    if (String(user.id) === String(currentUserId)) return;
-    if (member.role === 'owner' || String(user.id) === String(ownerId)) return;
-    if (!canRemoveMembers && !canPromoteDemote) return;
+    if (!user.id || String(user.id) === String(currentUserId)) return;
     setSelectedMember(member);
     setMemberActionVisible(true);
+  };
+
+  const closeMemberAction = () => { setMemberActionVisible(false); setSelectedMember(null); };
+
+  // Open (or start) the 1:1 chat with a member — same param shape the contact
+  // screens use; ChatScreen resolves the chatId itself.
+  const openMemberChat = (member) => {
+    const user = getMemberUser(member);
+    if (!user.id) return;
+    const displayName = resolveMemberName(member);
+    closeMemberAction();
+    navigation.navigate('ChatScreen', {
+      user: {
+        _id: user.id, userId: user.id, id: user.id,
+        name: displayName, fullName: displayName,
+        profilePicture: user.profileImage || '',
+        profileImage: user.profileImage || '',
+      },
+      chatId: null,
+      hasExistingChat: false,
+    });
+  };
+
+  const dialMember = (member, media) => {
+    const user = getMemberUser(member);
+    if (!user.id || callBusy) return;
+    const peer = { id: String(user.id), name: resolveMemberName(member), avatar: user.profileImage || null };
+    closeMemberAction();
+    if (media === 'video') startVideoCall?.(peer); else startAudioCall?.(peer);
+  };
+
+  const memberStatusGroup = (member) => {
+    const user = getMemberUser(member);
+    if (!user.id) return null;
+    const g = contactStatuses.find((x) => String(x.userId) === String(user.id));
+    return g && Array.isArray(g.statuses) && g.statuses.length ? g : null;
+  };
+
+  const openMemberStatus = (member) => {
+    const g = memberStatusGroup(member);
+    if (!g) return;
+    const user = getMemberUser(member);
+    closeMemberAction();
+    navigation.navigate('StatusViewer', {
+      statuses: g.statuses || [],
+      startIndex: 0,
+      isMine: false,
+      userName: resolveMemberName(member),
+      userImage: g.avatar || g.profileImage || user.profileImage,
+      userId: g.userId,
+    });
   };
 
   // Tapping a member's avatar opens their full profile details page.
@@ -413,7 +469,7 @@ export default function GroupInfo({ navigation, route }) {
       <TouchableOpacity
         key={user.id || member._id || index}
         onPress={() => openMemberAction(member)}
-        activeOpacity={(canRemoveMembers || canPromoteDemote) && !isSelf && !memberIsOwner ? 0.6 : 1}
+        activeOpacity={isSelf ? 1 : 0.6}
         style={styles.memberRow}
       >
         {/* Avatar — tap opens the member's profile details page */}
@@ -464,7 +520,7 @@ export default function GroupInfo({ navigation, route }) {
         )}
 
         {/* Chevron for actionable members */}
-        {(canRemoveMembers || canPromoteDemote) && !isSelf && !memberIsOwner && (
+        {!isSelf && (
           <Ionicons name="chevron-forward" size={16} color={theme.colors.placeHolderTextColor} style={{ marginLeft: 4 }} />
         )}
       </TouchableOpacity>
@@ -716,63 +772,51 @@ export default function GroupInfo({ navigation, route }) {
         payload={{ reportType: 'group', groupId }}
       />
 
-      {/* ═══ MEMBER ACTION MODAL ═══ */}
-      <Modal transparent visible={memberActionVisible} onRequestClose={() => { setMemberActionVisible(false); setSelectedMember(null); }} animationType="fade">
-        <TouchableOpacity activeOpacity={1} onPress={() => { setMemberActionVisible(false); setSelectedMember(null); }} style={styles.modalOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: theme.colors.cardBackground || theme.colors.menuBackground }]}>
-            {(() => {
-              const u = getMemberUser(selectedMember);
-              const c = getAvatarColor(u.fullName);
-              return (
-                <View style={styles.modalHeader}>
-                  {u.profileImage ? <Image source={{ uri: u.profileImage }} style={styles.modalAvatar} /> : (
-                    <View style={[styles.modalAvatar, { backgroundColor: c }]}><Text style={styles.modalAvatarText}>{(u.fullName || '?').charAt(0).toUpperCase()}</Text></View>
-                  )}
-                  <View style={{ flex: 1 }}>
-                    <Text style={[styles.modalName, { color: theme.colors.primaryTextColor }]}>{u.fullName}</Text>
-                    {u.email ? <Text style={[styles.modalEmail, { color: theme.colors.placeHolderTextColor }]}>{u.email}</Text> : null}
-                    {selectedMember?.role ? <Text style={[styles.modalRole, { color: theme.colors.placeHolderTextColor }]}>Role: {selectedMember.role}</Text> : null}
-                  </View>
-                </View>
-              );
-            })()}
-
-            <View style={[styles.modalDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)' }]} />
-
-            {canPromoteDemote && selectedMember?.role !== 'owner' && (
-              selectedMember?.role === 'admin' ? (
-                <TouchableOpacity onPress={() => handleDemoteMember(selectedMember)} style={styles.modalOption}>
-                  <Ionicons name="arrow-down-circle-outline" size={20} color="#F0A030" />
-                  <Text style={[styles.modalOptionText, { color: '#F0A030' }]}>Remove Admin</Text>
-                </TouchableOpacity>
-              ) : (
-                <TouchableOpacity onPress={() => handlePromoteMember(selectedMember)} style={styles.modalOption}>
-                  <Ionicons name="arrow-up-circle-outline" size={20} color={theme.colors.themeColor} />
-                  <Text style={[styles.modalOptionText, { color: theme.colors.themeColor }]}>Make Admin</Text>
-                </TouchableOpacity>
-              )
-            )}
-
-            {canRemoveMembers && selectedMember?.role !== 'owner' && String(getMemberUser(selectedMember).id) !== String(ownerId) && (
-              <TouchableOpacity onPress={() => handleRemoveMember(selectedMember)} style={styles.modalOption}>
-                <Ionicons name="person-remove-outline" size={20} color={theme.colors.danger} />
-                <Text style={[styles.modalOptionText, { color: theme.colors.danger }]}>Remove from Group</Text>
-              </TouchableOpacity>
-            )}
-
-            {canTransferOwnership && (
-              <TouchableOpacity onPress={() => { setMemberActionVisible(false); setSelectedMember(null); setTimeout(() => handleTransferOwnership(selectedMember), 300); }} style={styles.modalOption}>
-                <MaterialCommunityIcons name="account-switch" size={20} color={theme.colors.themeColor} />
-                <Text style={[styles.modalOptionText, { color: theme.colors.themeColor }]}>Make Group Owner</Text>
-              </TouchableOpacity>
-            )}
-
-            <TouchableOpacity onPress={() => { setMemberActionVisible(false); setSelectedMember(null); }} style={[styles.modalOption, { justifyContent: 'center', marginTop: 6 }]}>
-              <Text style={{ fontFamily: 'Roboto-Medium', fontSize: 15, color: theme.colors.placeHolderTextColor }}>Cancel</Text>
-            </TouchableOpacity>
-          </TouchableOpacity>
-        </TouchableOpacity>
-      </Modal>
+      {/* ═══ MEMBER SHEET — WhatsApp-style draggable bottom sheet (web parity) ═══ */}
+      {(() => {
+        if (!selectedMember) return <GroupMemberSheet visible={false} onClose={closeMemberAction} />;
+        const u = getMemberUser(selectedMember);
+        const name = resolveMemberName(selectedMember);
+        const pushName = resolveMemberPushName(selectedMember);
+        const targetRole = selectedMember.role === 'owner' || String(u.id) === String(ownerId) ? 'owner' : (selectedMember.role || 'member');
+        // Backend rules mirrored (server re-checks): promote/demote + transfer
+        // are OWNER-only; remove is owner (any non-owner) or admin (members only).
+        const showPromote = isOwner && targetRole === 'member';
+        const showDemote = isOwner && targetRole === 'admin';
+        const showTransfer = isOwner && targetRole !== 'owner';
+        const showRemove = targetRole !== 'owner' && (isOwner || (isAdmin && targetRole === 'member'));
+        const statusGroup = memberStatusGroup(selectedMember);
+        const unseen = statusGroup ? (statusGroup.statuses || []).filter((st) => !st.isViewed).length : 0;
+        // The Alert-based handlers close the sheet themselves; the sheet has
+        // already dismissed by the time they run, so a short defer keeps the
+        // native Alert from racing the Modal teardown (iOS modal-swap freeze).
+        const deferred = (fn) => () => setTimeout(() => fn(selectedMember), 250);
+        return (
+          <GroupMemberSheet
+            visible={memberActionVisible}
+            onClose={closeMemberAction}
+            name={name}
+            subtitle={pushName || (u.userName ? `@${u.userName}` : null)}
+            about={u.about}
+            image={u.profileImage || null}
+            avatarColor={getAvatarColor(name)}
+            roleLabel={targetRole === 'owner' ? 'Owner' : targetRole === 'admin' ? 'Admin' : null}
+            isVerified={!!u.isVerified}
+            callBusy={callBusy}
+            hasStatus={!!statusGroup}
+            statusUnseen={unseen}
+            onMessage={() => openMemberChat(selectedMember)}
+            onAudioCall={() => dialMember(selectedMember, 'audio')}
+            onVideoCall={() => dialMember(selectedMember, 'video')}
+            onViewStatus={() => openMemberStatus(selectedMember)}
+            onViewProfile={() => openMemberProfile(selectedMember)}
+            onPromote={showPromote ? deferred(handlePromoteMember) : undefined}
+            onDemote={showDemote ? deferred(handleDemoteMember) : undefined}
+            onTransfer={showTransfer ? deferred(handleTransferOwnership) : undefined}
+            onRemove={showRemove ? deferred(handleRemoveMember) : undefined}
+          />
+        );
+      })()}
 
       {/* ═══ TRANSFER OWNERSHIP MODAL ═══ */}
       <Modal transparent visible={transferModalVisible} onRequestClose={() => setTransferModalVisible(false)} animationType="fade">
@@ -927,7 +971,7 @@ const styles = StyleSheet.create({
   modalEmail: { fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: 1 },
   modalRole: { fontFamily: 'Roboto-Medium', fontSize: 11, marginTop: 2, textTransform: 'capitalize' },
   modalDivider: { height: StyleSheet.hairlineWidth, marginBottom: 8 },
-  modalOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 14, gap: 12 },
+  modalOption: { flexDirection: 'row', alignItems: 'center', paddingVertical: 14, paddingHorizontal: 18, gap: 12 },
   modalOptionText: { fontFamily: 'Roboto-Medium', fontSize: 15 },
 
   // Transfer Modal

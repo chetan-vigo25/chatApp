@@ -38,7 +38,9 @@ import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
 import {
   callReducer, initialCallState, CALL_STATUS, ACT, deriveOutcome, MAX_PARTICIPANTS, isMultiParty,
+  rehydrateCallState,
 } from './state/callMachine';
+import * as callSession from './callSessionKeeper';
 import { CALL_RING_DURATION_SECONDS } from '@env';
 import { getCallToken, clearCachedCallToken, getServerRingDurationSec, getServerRecordingConfig } from './services/callTokenService';
 import { recordCall } from './services/callLogService';
@@ -48,7 +50,7 @@ import nativeCall from './services/nativeCallService';
 import { registerVoipPush } from './services/voipPushService';
 import {
   ringCall, cancelCall, acceptCallSignal, rejectCallSignal, endCallSignal,
-  registerCallSignalListeners, pullPendingCalls, buildCallDeviceInfo,
+  registerCallSignalListeners, pullPendingCalls, syncCallState, buildCallDeviceInfo,
   conferenceInvite, conferenceMedia, conferenceState, conferenceEnd, conferenceRemove,
   conferenceAccept, conferenceReject, conferenceLeave,
 } from './services/callSignalService';
@@ -265,7 +267,18 @@ export const CallProvider = ({ children }) => {
   const myId = rawMyId ? String(rawMyId) : null;
   const myName = user?.fullName || user?.name || '';
 
-  const [state, dispatch] = useReducer(callReducer, initialCallState);
+  // Boot straight into any call that is still running behind a torn-down UI
+  // (Android: the task was swiped out of Recents mid-call, which unmounts this
+  // whole tree while the foreground service keeps the process + media engine
+  // alive — see callSessionKeeper). Doing it in the reducer INITIALIZER, not a
+  // mount effect, means the first render already holds the call, so stateRef
+  // (initialised from it) is correct before any handler can read it. A pure
+  // read of the keeper's snapshot; returns initialCallState when nothing lives.
+  const [state, dispatch] = useReducer(
+    callReducer,
+    initialCallState,
+    (init) => rehydrateCallState(callSession.peekSession(), init),
+  );
   // Flips the instant a call-start begins (before the async permission/connect
   // awaits and the START_OUTGOING dispatch). Folded into `callBusy` so EVERY
   // call button in the app dims immediately on the first tap, instead of only
@@ -404,6 +417,11 @@ export const CallProvider = ({ children }) => {
   });
 
   useEffect(() => { stateRef.current = state; }, [state]);
+
+  // Hand every committed state to the session keeper, so the snapshot it is left
+  // holding when this tree unmounts is the last real one. That snapshot is what
+  // a call swiped out of Recents is restored from when the user re-opens the app.
+  useEffect(() => { callSession.publish(state); }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
 
   // This device's id — used to ignore a `call:cancelled-elsewhere` whose
@@ -1344,8 +1362,21 @@ export const CallProvider = ({ children }) => {
       const durationStartMs = snap.connectedAt || snap.answeredAt;
       const durationSec = durationStartMs ? Math.max(0, Math.round((Date.now() - durationStartMs) / 1000)) : 0;
       const isGroup = !!snap.isGroup;
-      const participantIds = (snap.peers || []).map((p) => p.id).filter(Boolean);
-      const chatId = isGroup ? (snap.chatId || null) : (snap.chatId || deriveChatId(myId, snap.peer.id));
+      // Group roster for the log: UNIQUE ids, never self (the incoming leg can
+      // carry self when myId was not yet hydrated at ring time).
+      const uniquePeers = [];
+      const seenPeerIds = new Set();
+      (snap.peers || []).forEach((p) => {
+        const id = p?.id ? String(p.id) : null;
+        if (!id || seenPeerIds.has(id) || (myId && id === String(myId))) return;
+        seenPeerIds.add(id);
+        uniquePeers.push(p);
+      });
+      const participantIds = uniquePeers.map((p) => String(p.id));
+      // A group's thread id IS its groupId — fall back to it so a leg that never
+      // learned the chatId (incoming ring / Calls-tab redial) still posts a
+      // thread-addressable log.
+      const chatId = isGroup ? (snap.chatId || snap.groupId || null) : (snap.chatId || deriveChatId(myId, snap.peer.id));
       const payload = {
         callId,
         // For a group call there is no single peer; backend keeps peerId null
@@ -1405,10 +1436,10 @@ export const CallProvider = ({ children }) => {
         durationSec,
         isGroup,
         groupName: snap.groupName || null,
-        participantNames: isGroup ? (snap.peers || []).map((p) => p.name).filter(Boolean) : undefined,
+        participantNames: isGroup ? uniquePeers.map((p) => p.name).filter(Boolean) : undefined,
         // Populated-user shape so the Calls screen can redial a group instantly,
         // matching the backend `listCalls` `participants` populate.
-        participants: isGroup ? (snap.peers || []).map((p) => ({
+        participants: isGroup ? uniquePeers.map((p) => ({
           _id: p.id,
           fullName: p.name || null,
           profileImageUrl: p.avatar || null,
@@ -1873,7 +1904,8 @@ export const CallProvider = ({ children }) => {
           groupId: payload?.groupId || null,
           groupName: payload?.groupName || null,
           media: payload?.media || 'audio',
-          chatId: isGroup ? null : deriveChatId(myId, peer.id),
+          // Group thread id == groupId (see useChatLogic group chat keying).
+          chatId: isGroup ? (payload?.groupId || null) : deriveChatId(myId, peer.id),
           nowMs: Date.now(),
         });
         // iOS with CallKit: displayIncomingCall below makes CALLKIT the ringer —
@@ -2394,7 +2426,7 @@ export const CallProvider = ({ children }) => {
     // groupId, always sent — to post the WhatsApp-style "call" message into the
     // GROUP thread; with chatId hard-null it had no thread to write to, which is
     // why call bubbles only ever appeared in 1:1 chats.
-    const chatId = isGroup ? (opts.chatId || null) : (opts.chatId || deriveChatId(myId, peers[0].id));
+    const chatId = isGroup ? (opts.chatId || opts.groupId || null) : (opts.chatId || deriveChatId(myId, peers[0].id));
     const wantSpeaker = media === 'video' || isGroup;
     // App-socket signaling id (busy lock + call:* events). Distinct from the
     // calling-service callId that the engine returns for WebRTC.
@@ -2805,6 +2837,12 @@ export const CallProvider = ({ children }) => {
 
   const hangup = useCallback(() => {
     const snap = stateRef.current;
+    // EVERY teardown initiated by THIS device funnels through here — an in-app
+    // End tap, a CallKit / ongoing-notification End, an internal watchdog. Trace
+    // it: without this a call that vanished shows only finalizeEnd's `[CALL] end`
+    // and there is no way to tell who asked for it, which is exactly the hole
+    // that made an OS-side teardown look identical to the user hanging up.
+    if (__DEV__) console.log('[CALL][APP] hangup() invoked', { platform: Platform.OS, status: snap.status, signalId: snap.signalId, callId: snap.callId });
     // Ringing incoming (not yet answered) → decline. Once answered (accepted,
     // connecting) or active → a normal hangup tear-down.
     if (snap.status === CALL_STATUS.INCOMING && !snap.accepted) { reject(); return; }
@@ -3703,6 +3741,9 @@ export const CallProvider = ({ children }) => {
     const snap = stateRef.current;
     if (snap.isGroup) {
       const by = payload?.by != null ? String(payload.by) : null;
+      // The server now relays `call:ended` to the ender too (contract §2). Our
+      // own end is a plain (idempotent) finalize — never "drop my own tile".
+      if (by && myId && by === String(myId)) { finalizeEnd('completed'); return; }
       // The HOST hanging up before we joined the media room cancels the whole
       // thing for us (nothing to connect to); once we're connected the media
       // layer ('ended'/peerLeft) is authoritative for a host exit.
@@ -3715,7 +3756,47 @@ export const CallProvider = ({ children }) => {
       return;
     }
     finalizeEnd('completed');
-  }, [finalizeEnd, removeGroupParticipant, dismissGhostRing]);
+  }, [finalizeEnd, removeGroupParticipant, dismissGhostRing, myId]);
+
+  // ── Reliability contract §4: reconcile the LIVE call with the server ───────
+  // Terminal signals are delivered once. If our socket was down / the app was
+  // backgrounded at that instant, the peer's end/reject/cancel never reached us
+  // and we sit on "Calling…" (forever, if already ACTIVE) or a ghost ring. Ask
+  // the server what it thinks of the call we hold; act ONLY on an authoritative
+  // `ended` (never on a timeout / unauthenticated ack), and only if we still
+  // hold the same call after the round trip.
+  const reconcileLiveCall = useCallback(async (source = 'unknown') => {
+    const snap = stateRef.current;
+    if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    const id = snap.signalId || snap.callId;
+    if (!id) return;
+    // A call dialled a moment ago may not have reached the server yet (the
+    // ring emit is queued behind the same reconnect) — don't race our own ring.
+    if (Date.now() - (snap.startedAt || 0) < 3000) return;
+    let ack = null;
+    try { ack = await syncCallState({ callId: id }); } catch (_) { return; }
+    if (!ack || ack.ok === false || ack.timedOut) return; // not server truth
+    if (ack.status !== 'ended') return;                    // live — leave it alone
+    const live = stateRef.current;
+    if (live.status === CALL_STATUS.IDLE || live.status === CALL_STATUS.ENDED) return;
+    const ids = [live.signalId, live.callId].filter(Boolean).map(String);
+    if (!ids.includes(String(ack.callId || id))) return; // we moved on to another call
+    // Map the server's contract reason onto our finalize outcome vocabulary.
+    const incoming = live.direction === 'incoming';
+    const answered = !!live.answeredAt || live.status === CALL_STATUS.ACTIVE;
+    let reason = 'completed';
+    switch (ack.endReason) {
+      case 'rejected': reason = incoming ? 'missed' : 'rejected'; break;
+      case 'cancelled': reason = incoming ? 'missed' : 'cancelled'; break;
+      case 'missed': reason = incoming ? 'missed' : 'cancelled'; break;
+      case 'failed': reason = answered ? 'completed' : 'failed'; break;
+      default: reason = answered ? 'completed' : (incoming ? 'missed' : 'cancelled');
+    }
+    if (__DEV__) console.log('[CALL][APP] call:sync says ENDED — clearing stuck call', { source, id, endReason: ack.endReason, endedBy: ack.endedBy, reason });
+    finalizeEnd(reason, reason === 'failed' ? 'Call ended' : undefined);
+  }, [finalizeEnd]);
+  const reconcileLiveCallRef = useRef(reconcileLiveCall);
+  reconcileLiveCallRef.current = reconcileLiveCall;
   // Caller-only safety net: the server says the callee is unreachable (logged
   // out / deactivated / deleted / blocked / no active session). The ring ack
   // usually catches this first; this covers the case where the event lands after
@@ -3923,6 +4004,24 @@ export const CallProvider = ({ children }) => {
     dispatch({ type: ACT.CONFERENCE_SYNC, roster: payload, selfId: myId ? String(myId) : null });
   }, [myId]);
 
+  // Granular mute/camera/status change for ONE member. The backend emits this
+  // alone on call:conference:media (no roster broadcast follows), so it has to
+  // be merged here rather than waiting for a full roster that never comes.
+  const onConferenceParticipantUpdated = useCallback((payload) => {
+    const snap = stateRef.current;
+    if (!payload?.callId || String(payload.callId) !== String(snap.signalId || '')) return;
+    if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
+    if (Array.isArray(payload.participants)) return onConferenceRoster(payload);
+    if (!payload.userId || (myId && String(payload.userId) === String(myId))) return;
+    dispatch({
+      type: ACT.PARTICIPANT_MEDIA,
+      id: String(payload.userId),
+      audioEnabled: typeof payload.audioEnabled === 'boolean' ? payload.audioEnabled : undefined,
+      videoEnabled: typeof payload.videoEnabled === 'boolean' ? payload.videoEnabled : undefined,
+      status: payload.status || undefined,
+    });
+  }, [myId, onConferenceRoster]);
+
   const onConferenceConverted = useCallback((payload) => {
     // Our live 1:1 just became a conference (the OTHER side added someone).
     onConferenceRoster(payload);
@@ -3974,7 +4073,7 @@ export const CallProvider = ({ children }) => {
       onConferenceRoster,
       onConferenceParticipantJoined: onConferenceRoster, // roster follows; joined event is informational
       onConferenceParticipantLeft,
-      onConferenceParticipantUpdated: onConferenceRoster,
+      onConferenceParticipantUpdated,
       onConferenceHostChanged,
       onConferenceEnded,
       onConferenceRemoved,
@@ -3989,6 +4088,9 @@ export const CallProvider = ({ children }) => {
         // On every (re)connect while IDLE, recover any still-ringing invite the
         // device may have missed while offline / killed (XR-2 / APP-5).
         pullStillRingingInvites();
+        // …and while NOT idle, reconcile the call we hold with the server — a
+        // terminal event lost during the socket gap is corrected here (§4).
+        reconcileLiveCallRef.current('reconnect');
         // Mid-conference reconnect: pull the authoritative roster so a socket
         // gap can never leave the grid stale.
         const snap = stateRef.current;
@@ -4027,7 +4129,7 @@ export const CallProvider = ({ children }) => {
       wasConnected = connected;
     });
     return () => { unsub(); unsubState(); };
-  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, onConferenceRemoved, finalizeEnd]);
+  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantUpdated, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, onConferenceRemoved, finalizeEnd]);
 
   // ---- incoming call from an FCM PUSH (callee offline / app backgrounded) ----
   // The push wakes the device; we reuse onSignalIncoming (which shows the ring +
@@ -4640,7 +4742,7 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     if (!isAuthenticated) return undefined;
     const pullIfIdle = () => {
-      if (stateRef.current.status !== CALL_STATUS.IDLE) return;
+      if (stateRef.current.status !== CALL_STATUS.IDLE) { reconcileLiveCallRef.current('foreground'); return; }
       if (Date.now() - lastRingPullRef.current < 3000) return;
       lastRingPullRef.current = Date.now();
       pullStillRingingInvites();
@@ -4658,9 +4760,21 @@ export const CallProvider = ({ children }) => {
 
   // Native engine events ride the SAME handler the WebView's postMessage path
   // feeds — the two engines are interchangeable behind the protocol.js surface.
+  //
+  // Routed through callSessionKeeper rather than subscribed directly: the keeper
+  // holds the one permanent engine subscription, so events are never dropped in
+  // the window where no provider is mounted (Android swipe-away). Anything that
+  // happened in that window comes back here as `missed` and is replayed through
+  // the very same handler, so a peer hangup / join / media drop that occurred
+  // while the UI was gone lands with the full provider logic — call log, timers,
+  // teardown — instead of a second, divergent implementation of all of it.
   useEffect(() => {
     if (!isNativeCallEngine()) return undefined;
-    return nativeEngine.subscribe((type, payload) => onEngineEventRef.current(type, payload));
+    const missed = callSession.attach((type, payload) => onEngineEventRef.current(type, payload));
+    missed.forEach(([type, payload]) => {
+      try { onEngineEventRef.current(type, payload); } catch (_) { /* */ }
+    });
+    return () => { callSession.detach(); };
   }, []);
 
   // mount/teardown engine with auth
@@ -4794,6 +4908,12 @@ export const CallProvider = ({ children }) => {
           pushAcceptPendingRef.current = false;
           return;
         }
+        // ACTIVE / OUTGOING — a real End on the CallKit screen (lock screen or
+        // the notch), or iOS reaping a call it no longer considers valid. This
+        // was the ONE branch here that tore a LIVE call down silently, so an
+        // OS-side kill was indistinguishable in the logs from the user hanging
+        // up in-app. Name it.
+        if (__DEV__) console.log('[CALL][APP] native (CallKit) end on a LIVE call → hangup', { platform: Platform.OS, endedCallId, status: snap.status, signalId: snap.signalId, callId: snap.callId });
         actionsRef.current.hangup && actionsRef.current.hangup();
       },
       onToggleMute: (callId, muted) => {

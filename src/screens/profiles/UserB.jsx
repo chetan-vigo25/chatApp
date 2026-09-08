@@ -29,6 +29,9 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import ReportBottomSheet from "../../components/ReportBottomSheet";
 import CopyFieldButton from "../../components/CopyFieldButton";
 import { formatLastSeen } from "../../presence/services/lastSeenFormatter.service";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getCommonGroups } from "../../Redux/Services/Group/Group.Services";
+import useDisplayName from "../../hooks/useDisplayName";
 
 const { width } = Dimensions.get('window');
 const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
@@ -116,6 +119,11 @@ export default function UserB({ navigation, route }) {
 
   // Local device-saved contact (from SQLite). When present, its name/phone wins.
   const [localContact, setLocalContact] = useState(null);
+  // ── Groups in common (WhatsApp parity, mirrors the web info drawer) ──
+  const [commonGroups, setCommonGroups] = useState([]);
+  const [commonGroupsLoading, setCommonGroupsLoading] = useState(false);
+  const [selfUserId, setSelfUserId] = useState(null);
+  const { resolveName: resolveMemberName } = useDisplayName();
   const [reloadVersion, setReloadVersion] = useState(0);
 
   // Force the system status bar visible whenever this screen is focused. Some
@@ -322,6 +330,71 @@ export default function UserB({ navigation, route }) {
   }
 
   const avatarBgColor = getUserColor(peerId || displayName);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem('userInfo');
+        const me = raw ? JSON.parse(raw) : null;
+        if (alive) setSelfUserId(me?._id || me?.id || null);
+      } catch { /* self id is only used for the "You" label */ }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!peerId) { setCommonGroups([]); return undefined; }
+    let alive = true;
+    setCommonGroupsLoading(true);
+    getCommonGroups(peerId)
+      .then((groups) => { if (alive) setCommonGroups(groups); })
+      .catch(() => { if (alive) setCommonGroups([]); })
+      .finally(() => { if (alive) setCommonGroupsLoading(false); });
+    return () => { alive = false; };
+  }, [peerId, reloadVersion]);
+
+  // Member names go through the ONE display rule (saved name → number → push
+  // name; @username when the member hides their contact); "You" last.
+  const commonGroupMemberLine = useCallback((g) => {
+    const names = [];
+    let self = false;
+    for (const m of g?.members || []) {
+      const id = m?._id || m?.userId;
+      if (selfUserId && String(id) === String(selfUserId)) { self = true; continue; }
+      const mobileObj = m?.mobile && typeof m.mobile === 'object' ? m.mobile : null;
+      const phone = m?.mobileNumber || (mobileObj?.number ? `${mobileObj.code || ''}${mobileObj.number}` : null);
+      names.push(resolveMemberName({
+        userId: id,
+        phone,
+        pushName: m?.fullName,
+        username: m?.userName || null,
+        hideContact: Boolean(m?.hideContact ?? m?.privacySettings?.hideContact),
+        fallback: 'Member',
+      }));
+    }
+    names.sort((a, b) => a.localeCompare(b));
+    if (self) names.push('You');
+    return names.join(', ');
+  }, [selfUserId, resolveMemberName]);
+
+  // Open the group's thread: prefer the live chat-list row (carries unread /
+  // last-message state); otherwise hand ChatScreen a minimal group item.
+  const openCommonGroup = useCallback((g) => {
+    const gid = String(g?._id || '');
+    if (!gid) return;
+    const row = (chatList || []).find((c) => {
+      const cid = c?.groupId || c?.group?._id || c?.chatId || c?._id;
+      return cid && String(cid) === gid && (c?.chatType === 'group' || c?.isGroup);
+    });
+    navigation.navigate('ChatScreen', {
+      item: row || {
+        _id: gid, chatId: gid, groupId: gid, chatType: 'group', isGroup: true,
+        chatName: g.name, groupName: g.name, chatAvatar: g.avatar || null,
+        group: { _id: gid, name: g.name, avatar: g.avatar || null, memberCount: g.memberCount },
+      },
+    });
+  }, [chatList, navigation]);
 
   // Handlers
   const handleMessage = useCallback(() => {
@@ -625,6 +698,46 @@ export default function UserB({ navigation, route }) {
             ) : null}
           </View>
         ) : null}
+
+        {/* ─── Groups in common (always shown; empty state like the web) ─── */}
+        {peerId ? (() => {
+          const n = commonGroups.length;
+          const isSelfPage = selfUserId && String(selfUserId) === String(peerId);
+          const plural = `${n} group${n === 1 ? '' : 's'}`;
+          const title = commonGroupsLoading && !n
+            ? (isSelfPage ? 'Groups' : 'Groups in common')
+            : (isSelfPage ? `You are in ${plural}` : `${plural} in common`);
+          return (
+            <View style={[styles.card, { backgroundColor: cardBg }]}>
+              <Text style={[styles.sectionTitle, { color: subText }]}>{title}</Text>
+              {!n ? (
+                <Text style={[styles.sectionEmpty, { color: subText }]}>
+                  {commonGroupsLoading ? 'Loading…' : (isSelfPage ? 'You are not in any group yet.' : 'No groups in common.')}
+                </Text>
+              ) : commonGroups.map((g, i) => (
+                <TouchableOpacity
+                  key={g._id}
+                  onPress={() => openCommonGroup(g)}
+                  activeOpacity={0.6}
+                  style={[styles.groupRow, i > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: dividerClr }]}
+                >
+                  {g.avatar ? (
+                    <Image source={{ uri: g.avatar }} style={styles.groupAvatar} />
+                  ) : (
+                    <View style={[styles.groupAvatar, { backgroundColor: themeColor + '22', alignItems: 'center', justifyContent: 'center' }]}>
+                      <Ionicons name="people" size={22} color={themeColor} />
+                    </View>
+                  )}
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={[styles.rowValue, { color: primaryText }]} numberOfLines={1}>{g.name || 'Group'}</Text>
+                    <Text style={[styles.fieldLabel, { color: subText }]} numberOfLines={1}>{commonGroupMemberLine(g)}</Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={16} color={subText} />
+                </TouchableOpacity>
+              ))}
+            </View>
+          );
+        })() : null}
 
         {/* ─── Notifications (Mute toggle) ─── */}
         {chatId ? (
@@ -985,6 +1098,10 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: 'rgba(128,128,128,0.18)',
   },
+  sectionTitle: { fontFamily: 'Roboto-Medium', fontSize: 13, paddingHorizontal: 14, paddingTop: 12, paddingBottom: 4 },
+  sectionEmpty: { fontFamily: 'Roboto-Regular', fontSize: 14, paddingHorizontal: 14, paddingVertical: 12 },
+  groupRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10, paddingHorizontal: 14 },
+  groupAvatar: { width: 46, height: 46, borderRadius: 23 },
   card_row: {
     flexDirection: 'row',
     alignItems: 'center',

@@ -125,6 +125,8 @@ export const uuidForCall = (callId) => {
 // `uuid`). Without this the JS uuid map would mint a DIFFERENT uuid for the same
 // call, so endCall(callId) couldn't dismiss the CallKit screen the native side
 // put up — it would linger after the call ended. Idempotent; no-op on empty args.
+const displayedIncoming = new Map(); // uuid → ts (see displayIncomingCall)
+const INCOMING_DEDUPE_MS = 45000;
 export const registerCallUuid = (callId, uuid) => {
   const key = String(callId || '');
   const u = String(uuid || '');
@@ -141,6 +143,7 @@ export const registerCallUuid = (callId, uuid) => {
     markSelfEnded(old);
     delete uuidToId[old];
   }
+  if (old && old !== u) displayedIncoming.delete(old);
   idToUuid[key] = u;
   uuidToId[u] = key;
   clearSelfEnded(u);
@@ -151,7 +154,7 @@ const callIdForUuid = (uuid) => uuidToId[String(uuid || '')] || null;
 const forget = (callId) => {
   const key = String(callId || '');
   const u = idToUuid[key];
-  if (u) { delete uuidToId[u]; }
+  if (u) { delete uuidToId[u]; displayedIncoming.delete(u); }
   delete idToUuid[key];
   outgoingReported.delete(key);
 };
@@ -224,11 +227,23 @@ export const setup = async () => {
   return isAvailable();
 };
 
+// uuids this JS side has ALREADY reported as incoming (cleared on end/forget).
+// iOS logs showed `reportNewIncomingCall` twice within <1s for one logical
+// call: once from the socket ring, once from the engine/VoIP path under a
+// second id. A repeat report for the same uuid only errors inside CallKit; a
+// report under a NEW uuid while another incoming is live puts up a second
+// CallKit call (the "two banners / ghost call" failure). Single-call app →
+// one live incoming CallKit call at a time.
 export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
   if (!isAvailable()) return;
   try {
     const u = uuidForCall(callId);
+    const now = Date.now();
+    for (const [k, ts] of displayedIncoming) if (now - ts > INCOMING_DEDUPE_MS) displayedIncoming.delete(k);
+    if (displayedIncoming.has(u)) return; // same call, already ringing natively
+    if (displayedIncoming.size > 0) return; // another incoming is live — never stack a 2nd CallKit call
     clearSelfEnded(u);
+    displayedIncoming.set(u, now);
     RNCallKeep.displayIncomingCall(u, String(handle || name || 'call'), name || 'Incoming call', 'generic', !!hasVideo);
   } catch (_) { /* no-op */ }
 };
@@ -310,8 +325,16 @@ export const answerIncomingCall = (callId) => {
  */
 export const endCall = (callId, endedReason = 0) => {
   if (!isAvailable()) return;
+  // Only end a uuid CallKit actually knows. finalizeEnd files an end for BOTH
+  // the signalId and the WebRTC callId; the one never registered with CallKit
+  // used to get a freshly MINTED uuid here → CXEndCallAction on an unknown
+  // call → "Error requesting transaction … Code=4" on every hang-up. The
+  // endAllCalls() sweep that follows still covers any ghost.
+  const known = idToUuid[String(callId || '')];
+  if (!known) { forget(callId); return; }
   try {
-    const u = uuidForCall(callId);
+    const u = known;
+    displayedIncoming.delete(u);
     if (endedReason > 0 && typeof RNCallKeep.reportEndCallWithUUID === 'function') {
       RNCallKeep.reportEndCallWithUUID(u, endedReason);
     } else {
@@ -333,6 +356,7 @@ export const endCall = (callId, endedReason = 0) => {
 export const endAllCalls = () => {
   if (!isAvailable()) return;
   try { RNCallKeep.endAllCalls(); } catch (_) { /* no-op */ }
+  displayedIncoming.clear();
   for (const key of Object.keys(idToUuid)) markSelfEnded(idToUuid[key]);
   for (const key of Object.keys(idToUuid)) forget(key);
 };

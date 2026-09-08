@@ -12,6 +12,11 @@ import {
 } from '../../components/Translate';
 import { LANGUAGES, NO_TRANSLATION, NO_TRANSLATION_OPTION } from '../../constant/languages';
 
+// Estimated-progress tuning (see the `progress` state below).
+const PROGRESS_CEILING = 0.92;   // never claim "done" before the native side says so
+const PROGRESS_TAU_S = 25;       // seconds to reach ~63%
+const PROGRESS_SETTLE_MS = 350;  // how long the full bar is shown before the tick
+
 /**
  * Choose language.
  *
@@ -36,6 +41,13 @@ export default function ChooseLanguage({ navigation }) {
   // The row currently fetching a model, so only it shows a spinner.
   const [busyCode, setBusyCode] = useState(null);
   const [failedCode, setFailedCode] = useState(null);
+  // 0..1 progress for the busy row. ML Kit's downloadModelIfNeeded reports
+  // completion only (no byte counts on either platform), so this is an
+  // ESTIMATE: a time-based curve that climbs quickly at first, slows as it
+  // nears the ceiling, and snaps to 100% the moment the native promise
+  // settles. It is honest about motion (the download IS progressing) without
+  // claiming a precision the SDK cannot give.
+  const [progress, setProgress] = useState(0);
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -61,6 +73,21 @@ export default function ChooseLanguage({ navigation }) {
   // language the user picked afterwards.
   const pickSeqRef = useRef(0);
 
+  // Tick the estimated progress while a row is busy. τ ≈ 25s: a 30MB model on
+  // an ordinary connection lands around there, so most real downloads finish
+  // while the bar is still visibly moving rather than parked at the ceiling.
+  useEffect(() => {
+    if (!busyCode) return undefined;
+    const startedAt = Date.now();
+    setProgress(0);
+    const timer = setInterval(() => {
+      const t = (Date.now() - startedAt) / 1000;
+      const estimate = Math.min(PROGRESS_CEILING, 1 - Math.exp(-t / PROGRESS_TAU_S));
+      setProgress(estimate);
+    }, 250);
+    return () => clearInterval(timer);
+  }, [busyCode]);
+
   const onPick = useCallback(async (code) => {
     setFailedCode(null);
     // Neither English (the app's own language) nor "Don't translate" needs a
@@ -68,16 +95,38 @@ export default function ChooseLanguage({ navigation }) {
     // and nothing that can fail.
     if (code === SOURCE_LANGUAGE || code === NO_TRANSLATION) { setLanguage(code); return; }
 
+    // A model that is already on the device needs no download — apply it at
+    // once. Showing the progress bar here (it used to) made a plain re-select
+    // look like a fresh 30MB fetch. The list state is checked first for an
+    // instant answer, then the native side for the case where the listing
+    // failed or is stale.
+    let onDevice = downloaded.includes(code);
+    if (!onDevice) {
+      try {
+        const models = await getDownloadedLanguages();
+        onDevice = Array.isArray(models) && models.includes(code);
+        if (onDevice && aliveRef.current) setDownloaded(models);
+      } catch { /* fall through to the download path */ }
+    }
+    if (onDevice) { setLanguage(code, { requireWifi: false }); return; }
+
     pickSeqRef.current += 1;
     const seq = pickSeqRef.current;
     setBusyCode(code);
     // requireWifi false: the user tapped this row and the size is on screen.
     const ok = await setLanguage(code, { requireWifi: false });
     if (!aliveRef.current || pickSeqRef.current !== seq) return;
+    if (ok) {
+      // Let the bar visibly reach 100% before the row flips to "selected" —
+      // a jump from 60% straight to a tick reads as if something was skipped.
+      setProgress(1);
+      await new Promise((r) => setTimeout(r, PROGRESS_SETTLE_MS));
+      if (!aliveRef.current || pickSeqRef.current !== seq) return;
+    }
     setBusyCode(null);
     if (!ok) setFailedCode(code);
     refreshDownloaded();
-  }, [setLanguage, refreshDownloaded]);
+  }, [setLanguage, refreshDownloaded, downloaded]);
 
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.placeHolderTextColor;
@@ -218,7 +267,26 @@ export default function ChooseLanguage({ navigation }) {
                     {/* The English name and the model's state share this line —
                         a 30MB download should be visible BEFORE the tap. */}
                     {isBusy ? (
-                      <Text style={[styles.rowSub, { color: themeColor }]}>Downloading language…</Text>
+                      <View>
+                        <View style={styles.rowSubLine}>
+                          <Text style={[styles.rowSub, { color: themeColor }]}>Downloading language…</Text>
+                          <Text ignore style={[styles.rowSub, styles.rowPct, { color: themeColor }]}>
+                            {` ${Math.round(progress * 100)}%`}
+                          </Text>
+                        </View>
+                        <View
+                          style={[styles.track, { backgroundColor: divider }]}
+                          accessibilityRole="progressbar"
+                          accessibilityValue={{ min: 0, max: 100, now: Math.round(progress * 100) }}
+                        >
+                          <View
+                            style={[
+                              styles.fill,
+                              { backgroundColor: themeColor, width: `${Math.max(2, progress * 100)}%` },
+                            ]}
+                          />
+                        </View>
+                      </View>
                     ) : failedCode === item.code ? (
                       <Text style={[styles.rowSub, { color: theme.colors.danger || '#E5484D' }]}>
                         Download failed — tap to retry
@@ -233,7 +301,9 @@ export default function ChooseLanguage({ navigation }) {
                     )}
                   </View>
                   {isBusy ? (
-                    <ActivityIndicator size="small" color={themeColor} />
+                    progress >= 1
+                      ? <Ionicons name="checkmark-circle" size={22} color={themeColor} />
+                      : <ActivityIndicator size="small" color={themeColor} />
                   ) : selected ? (
                     <Ionicons name="checkmark-circle" size={22} color={themeColor} />
                   ) : needsModel ? (
@@ -298,6 +368,9 @@ const styles = StyleSheet.create({
   rowLabel: { fontFamily: 'Roboto-Medium', fontSize: 16 },
   rowSub: { fontFamily: 'Roboto-Regular', fontSize: 12.5, marginTop: 2 },
   rowSubLine: { flexDirection: 'row', alignItems: 'center' },
+  rowPct: { fontFamily: 'Roboto-Medium', fontVariant: ['tabular-nums'] },
+  track: { height: 4, borderRadius: 2, overflow: 'hidden', marginTop: 7, marginRight: 4 },
+  fill: { height: '100%', borderRadius: 2 },
 
   empty: { alignItems: 'center', paddingTop: 60, gap: 10 },
   emptyText: { fontFamily: 'Roboto-Regular', fontSize: 14 },

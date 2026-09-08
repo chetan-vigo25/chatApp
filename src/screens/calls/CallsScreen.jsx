@@ -327,7 +327,14 @@ export default function CallsScreen({ navigation }) {
   const redial = useCallback((group, media) => {
     if (group.isGroup) {
       // Rebuild the participant list from the populated server records.
+      const seenIds = new Set();
       const peers = (group.participants || [])
+        .filter((u) => {
+          const id = u && u._id ? String(u._id) : null;
+          if (!id || seenIds.has(id)) return false;
+          seenIds.add(id);
+          return true;
+        })
         .map((u) => (u && u._id ? {
           id: String(u._id),
           name: resolveName(String(u._id), u.fullName || u.userName || 'Member', peerPhoneOf(u), peerPrivacyOf(u)),
@@ -340,7 +347,9 @@ export default function CallsScreen({ navigation }) {
       // groupId feeds the mid-call "Add participant" member picker (it re-fetches
       // with viewGroup) and rides the ring payload; isGroup is declared so a
       // 2-person group redial still rings as a GROUP call.
-      const opts = { groupId: group.groupId || null, groupName: group.groupName, isGroup: true };
+      // chatId = groupId so the server writes the "Group voice call" bubble into
+      // the group thread for a redial from here too.
+      const opts = { groupId: group.groupId || null, groupName: group.groupName, isGroup: true, chatId: group.groupId || null };
       if (media === 'video') startGroupVideoCall?.(peers, opts);
       else startGroupAudioCall?.(peers, opts);
       return;
@@ -446,7 +455,9 @@ export default function CallsScreen({ navigation }) {
           ? resolveName(String(u._id || u.userId), u.fullName || u.userName || '', peerPhoneOf(u), peerPrivacyOf(u))
           : null))
         .filter(Boolean);
-      const names = resolvedNames.length ? resolvedNames : g.participantNames;
+      // Unique names only — a roster that repeats a member must never read
+      // "Ali, Ali, Sara".
+      const names = [...new Set((resolvedNames.length ? resolvedNames : (g.participantNames || [])).filter(Boolean))];
       name = g.groupName || (names && names.length ? names.join(', ') : 'Group call');
     } else {
       name = resolveName(peerId, p.fullName || p.userName || 'Unknown', peerPhoneOf(p), peerPrivacyOf(p));

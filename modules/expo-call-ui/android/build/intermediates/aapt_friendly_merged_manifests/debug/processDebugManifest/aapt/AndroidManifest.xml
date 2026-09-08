@@ -34,11 +34,21 @@
             android:name="expo.modules.callui.CallActionReceiver"
             android:exported="false" />
 
-        <!-- Persistent active-call notification (duration timer + Hang up). -->
+        <!--
+         Persistent active-call notification (duration timer + Hang up).
+         stopWithTask="false" is what lets a call outlive the app's UI: when the
+         user swipes the app out of Recents mid-call the Activity is destroyed,
+         but this service (and with it the process, the JS runtime and the WebRTC
+         engine) keeps running, so the call continues and stays controllable from
+         its notification. With the default (true) the OS would tear the service
+         down with the task and kill the call. See CallForegroundService
+         .onTaskRemoved and src/calls/callSessionKeeper.js.
+        -->
         <service
             android:name="expo.modules.callui.CallForegroundService"
             android:exported="false"
-            android:foregroundServiceType="microphone|camera" />
+            android:foregroundServiceType="microphone|camera"
+            android:stopWithTask="false" />
     </application>
 
 </manifest>

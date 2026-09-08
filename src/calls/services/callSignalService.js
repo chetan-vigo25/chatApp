@@ -237,6 +237,25 @@ export const pullPendingCalls = () => new Promise((resolve) => {
   setTimeout(() => done({ ok: true, calls: [], timedOut: true }), PENDING_PULL_ACK_TIMEOUT_MS);
 });
 
+// Reliability contract §3/§4: ask the server for the AUTHORITATIVE state of the
+// call we believe is in progress. Called on every socket (re)connect and every
+// foreground while a call is live. A `{ status: 'ended' }` answer means the
+// terminal event was lost (socket down / backgrounded at that instant) — the
+// provider runs finalizeEnd so a stuck "Calling…"/ghost ring self-heals.
+// A no-ack timeout / not-authenticated ack is NOT server truth: callers must
+// only act on `ok !== false && !timedOut`.
+const SYNC_ACK_TIMEOUT_MS = 4000;
+export const syncCallState = ({ callId }) => new Promise((resolve) => {
+  let settled = false;
+  const done = (res) => { if (!settled) { settled = true; resolve(res || { ok: false, timedOut: true }); } };
+  if (__DEV__) console.log('[CALL][APP][signal] → emit call:sync', { callId });
+  emitSocketEvent('call:sync', { callId }, (res) => {
+    if (__DEV__) console.log('[CALL][APP][signal] ← call:sync ACK', res);
+    done(res);
+  }, { queueIfOffline: false });
+  setTimeout(() => done({ ok: false, timedOut: true }), SYNC_ACK_TIMEOUT_MS);
+});
+
 /**
  * Attach the server→client call event listeners to the CURRENT socket instance.
  * Returns an unsubscribe. Re-call this whenever the socket (re)connects so a new

@@ -186,7 +186,23 @@ export async function uploadGroupAvatar(formData) {
 }
 
 // Export as groupServices object
+// ============================================
+// GROUPS IN COMMON (1:1 contact info) — every group both the viewer and
+// `userId` are in, each with its member list (already privacy-redacted
+// server-side). Silent: the info page shows an empty state, never a toast.
+// ============================================
+export async function getCommonGroups(userId) {
+  if (!userId) return [];
+  try {
+    const response = await apiCall('POST', 'user/group/common', { userId }, { silent: true });
+    return Array.isArray(response?.data?.groups) ? response.data.groups : [];
+  } catch (error) {
+    throw error;
+  }
+}
+
 export const groupServices = {
+  getCommonGroups,
   createGroup,
   updateGroup,
   viewGroup,

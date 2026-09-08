@@ -569,14 +569,24 @@ export const forgetMissedCall = (callId) => {
 };
 
 // ===== foreground events (app open) =====
+// The CallStyle action listener is installed ONCE and never removed. It used to
+// be tied to the caller's cleanup (App.js unmount), which is wrong for a call
+// that outlives the UI: swiping the app out of Recents mid-call unmounts the
+// React tree while the foreground service keeps the process and the call alive
+// — and with the listener gone, Hang up on the ongoing-call notification
+// reached nothing, leaving live media with no way to end it. Registration is
+// idempotent, so repeated calls (re-login, a remounted App) reuse the one
+// listener rather than stacking duplicates that would fire each action twice.
+let callUiActionSub = null;
 export const registerNotifeeForeground = () => {
   // CallStyle backend: listen to the native module's action events.
   if (isCallUi()) {
+    if (callUiActionSub) return () => {};
     try {
-      const sub = getCallUi().addListener('onCallAction', (e) => {
+      callUiActionSub = getCallUi().addListener('onCallAction', (e) => {
         if (e?.action) emitCallAction(e.action, e);
       });
-      return () => { try { sub?.remove(); } catch (_) { /* */ } };
+      return () => {};
     } catch (err) {
       console.warn('[callNotif] CallUi listener failed:', err?.message);
       return () => {};

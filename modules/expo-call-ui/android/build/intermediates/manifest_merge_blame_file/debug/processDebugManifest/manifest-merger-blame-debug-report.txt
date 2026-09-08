@@ -33,7 +33,7 @@
 25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:20-90
 26
 27    <application>
-27-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:3-31:17
+27-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:3-39:17
 28
 29        <!--
 30         Receives the Decline / Hang-up taps from the CallStyle notifications.
@@ -46,15 +46,26 @@
 35            android:exported="false" />
 35-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:24:7-31
 36
-37        <!-- Persistent active-call notification (duration timer + Hang up). -->
-38        <service
-38-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:27:5-30:59
-39            android:name="expo.modules.callui.CallForegroundService"
-39-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:28:7-44
-40            android:exported="false"
-40-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:29:7-31
-41            android:foregroundServiceType="microphone|camera" />
-41-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:30:7-56
-42    </application>
-43
-44</manifest>
+37        <!--
+38         Persistent active-call notification (duration timer + Hang up).
+39         stopWithTask="false" is what lets a call outlive the app's UI: when the
+40         user swipes the app out of Recents mid-call the Activity is destroyed,
+41         but this service (and with it the process, the JS runtime and the WebRTC
+42         engine) keeps running, so the call continues and stays controllable from
+43         its notification. With the default (true) the OS would tear the service
+44         down with the task and kill the call. See CallForegroundService
+45         .onTaskRemoved and src/calls/callSessionKeeper.js.
+46        -->
+47        <service
+47-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:34:5-38:59
+48            android:name="expo.modules.callui.CallForegroundService"
+48-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:35:7-44
+49            android:exported="false"
+49-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:36:7-31
+50            android:foregroundServiceType="microphone|camera"
+50-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:38:7-56
+51            android:stopWithTask="false" />
+51-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:37:7-35
+52    </application>
+53
+54</manifest>

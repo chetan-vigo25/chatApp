@@ -177,6 +177,31 @@ export default function CallDetailScreen() {
     return resolveName(peerId, peer?.fullName || peer?.userName || 'Unknown', peerPhoneOf(peer), peerPrivacyOf(peer));
   }, [isGroup, groupName, participants, participantNames, peer, peerId, resolveName]);
 
+  // Group call roster for the "Members" section: UNIQUE by id, resolved via
+  // the display rule; the frozen `participantNames` list is the fallback for
+  // realtime rows that carry no user objects. The viewer is always part of a
+  // group call, so the count shown is members + You.
+  const groupMembers = useMemo(() => {
+    if (!isGroup) return [];
+    const seen = new Set();
+    const out = [];
+    (participants || []).forEach((u) => {
+      const id = u && (u._id || u.userId) ? String(u._id || u.userId) : null;
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      out.push({
+        id,
+        name: resolveName(id, u.fullName || u.userName || 'Member', peerPhoneOf(u), peerPrivacyOf(u)),
+        avatar: toSecureMediaUri(u.profileImageUrl || u.profileImage) || null,
+      });
+    });
+    if (!out.length && Array.isArray(participantNames)) {
+      [...new Set(participantNames.filter(Boolean))].forEach((n, i) => out.push({ id: `name_${i}`, name: n, avatar: null }));
+    }
+    return out;
+  }, [isGroup, participants, participantNames, resolveName, peerPrivacyOf]);
+  const memberCount = isGroup ? groupMembers.length + 1 : 0;
+
   // Newest-first, then bucket into day sections (Today / Yesterday / dated).
   const sections = useMemo(() => {
     const sorted = [...(calls || [])].sort((a, b) => {
@@ -312,6 +337,11 @@ export default function CallDetailScreen() {
               {phone}
             </Text>
           ) : null}
+          {isGroup && memberCount > 1 ? (
+            <Text style={[styles.heroPhone, { color: c.placeHolderTextColor }]} numberOfLines={1}>
+              {memberCount} members in this call
+            </Text>
+          ) : null}
           {lastCall ? (
             <Text style={[styles.heroSub, { color: c.placeHolderTextColor }]}>
               {total} call{total === 1 ? '' : 's'}
@@ -404,6 +434,35 @@ export default function CallDetailScreen() {
             </View>
           </View>
         ) : null} */}
+
+        {/* ── Group call members (who was in this call) ── */}
+        {isGroup && groupMembers.length ? (
+          <View style={styles.section}>
+            <Text style={[styles.sectionLabel, { color: c.placeHolderTextColor }]}>
+              {memberCount} members
+            </Text>
+            <View style={[styles.sectionCard, { backgroundColor: c.cardBackground, borderColor: c.borderColor }]}>
+              <View style={[styles.memberRow, { borderBottomColor: c.borderColor, borderBottomWidth: StyleSheet.hairlineWidth }]}>
+                <View style={[styles.memberSelf, { backgroundColor: `${c.themeColor}26` }]}>
+                  <Ionicons name="person" size={18} color={c.themeColor} />
+                </View>
+                <Text style={[styles.memberName, { color: c.primaryTextColor }]} numberOfLines={1}>You</Text>
+              </View>
+              {groupMembers.map((m, idx) => (
+                <View
+                  key={m.id}
+                  style={[
+                    styles.memberRow,
+                    idx < groupMembers.length - 1 && { borderBottomColor: c.borderColor, borderBottomWidth: StyleSheet.hairlineWidth },
+                  ]}
+                >
+                  <CallAvatar uri={m.avatar} name={m.name} id={m.id} size={38} />
+                  <Text style={[styles.memberName, { color: c.primaryTextColor }]} numberOfLines={1}>{m.name}</Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        ) : null}
 
         {/* ── Per-call history ── */}
         {sections.map((section) => (
@@ -680,6 +739,9 @@ const styles = StyleSheet.create({
   modalConfirmText: { fontSize: 15, fontFamily: 'Roboto-SemiBold', color: '#fff' },
 
   section: { paddingHorizontal: 12, marginBottom: 18 },
+  memberRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 10, gap: 12 },
+  memberSelf: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center' },
+  memberName: { flex: 1, fontSize: 15, fontFamily: 'Roboto-Regular' },
   sectionLabel: {
     fontSize: 13, fontFamily: 'Roboto-Medium',
     marginBottom: 8, marginLeft: 4, textTransform: 'none',

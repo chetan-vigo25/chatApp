@@ -37,9 +37,6 @@ import androidx.core.content.ContextCompat
  * up), so the Android 12+ background-FGS-start restriction does not apply.
  */
 class CallForegroundService : Service() {
-  // Remembered so onTaskRemoved (app swiped away) can signal a hangup for THIS call.
-  private var currentCallId: String? = null
-
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -54,7 +51,6 @@ class CallForegroundService : Service() {
       stopSelf()
       return START_NOT_STICKY
     }
-    currentCallId = callId
     val name = intent.getStringExtra(EXTRA_CALLER_NAME)?.takeIf { it.isNotBlank() } ?: "Ongoing call"
     val image = intent.getStringExtra(EXTRA_CALLER_IMAGE)
     val type = intent.getStringExtra(EXTRA_CALL_TYPE) ?: "audio"
@@ -200,22 +196,27 @@ class CallForegroundService : Service() {
   }
 
   // ── App swiped away from Recents during an ACTIVE call ──
-  // The call media lives in the app's WebView, which dies with the task, so the
-  // call itself cannot survive a kill (that needs native WebRTC). What we CAN do
-  // is fail gracefully: best-effort signal a hangup into JS while the process is
-  // briefly still alive — CallProvider's HANGUP handler emits `call:end` so the
-  // OTHER party isn't left frozen on a dead call — then guarantee the persistent
-  // "ongoing call" notification is cleared so no ghost lingers for a call that no
-  // longer exists. (The reliable peer-cleanup is the backend treating this
-  // device's socket disconnect as call-end; this is the client's best effort.)
+  // The call KEEPS RUNNING. Removing the task destroys the Activity, and React
+  // Native responds by unloading its surface — so the whole React tree unmounts
+  // — but neither touches the process. This foreground service is what keeps the
+  // process alive, and everything the call actually runs on lives in module
+  // singletons that have no UI to unmount with: the native WebRTC engine and its
+  // mediasoup transports, the signaling sockets, and the mic/camera capture this
+  // service's foreground types cover. The user keeps full control from this
+  // notification — body tap re-opens the call screen, Hang up ends the call.
+  //
+  // (This deliberately no longer hangs up. It used to, because the call's media
+  // ran inside a WebView that died with the task; the engine has since moved to
+  // native react-native-webrtc — see engineSelector.js — so the media survives.)
+  //
+  // Two things make that survival real, and neither is here:
+  //   • android:stopWithTask="false" in the manifest, or the OS destroys this
+  //     service right after this callback and takes the process with it;
+  //   • callSessionKeeper.js on the JS side, which owns the engine subscription
+  //     across the unmount so a call that ENDS while no UI is mounted still
+  //     releases the mic and clears this notification, and so a re-opened app
+  //     re-adopts the running call instead of booting into an empty idle state.
   override fun onTaskRemoved(rootIntent: Intent?) {
-    try {
-      currentCallId?.takeIf { it.isNotBlank() }?.let {
-        CallUiBus.dispatch(mapOf("action" to "hangup", "callId" to it))
-      }
-    } catch (_: Exception) { /* JS bridge may already be tearing down */ }
-    stopForegroundCompat()
-    stopSelf()
     super.onTaskRemoved(rootIntent)
   }
 

@@ -110,6 +110,8 @@ export const ACT = {
   // Server-authoritative conference roster sync (call:conference:roster) —
   // merges statuses/media flags into `participants`, sets host + flags.
   CONFERENCE_SYNC: 'CONFERENCE_SYNC',
+  // Granular per-member mute/camera/status merge (call:conference:participant:updated).
+  PARTICIPANT_MEDIA: 'PARTICIPANT_MEDIA',
   SET_FLAG: 'SET_FLAG',
   CAMERA_CHANGED: 'CAMERA_CHANGED',
   NEEDS_UNMUTE: 'NEEDS_UNMUTE',
@@ -445,6 +447,27 @@ export function callReducer(state, action) {
         participants: next,
       };
     }
+    case ACT.PARTICIPANT_MEDIA: {
+      // Per-member mute/camera/status merge from the backend's granular
+      // `participant:updated` event. A mute toggle emits ONLY this event (no
+      // full roster follows), so dropping it — as the full-roster-only guard
+      // used to — meant a remote member's mic-off badge never showed here.
+      if (state.status === CALL_STATUS.ENDED || state.status === CALL_STATUS.IDLE) return state;
+      const id = action.id ? String(action.id) : null;
+      if (!id || !state.participants[id]) return state;
+      const patch = {};
+      if (typeof action.audioEnabled === 'boolean') patch.audioEnabled = action.audioEnabled;
+      if (typeof action.videoEnabled === 'boolean') patch.videoEnabled = action.videoEnabled;
+      if (action.status) {
+        patch.confStatus = action.status;
+        patch.joined = action.status === 'CONNECTED';
+      }
+      if (!Object.keys(patch).length) return state;
+      return {
+        ...state,
+        participants: { ...state.participants, [id]: { ...state.participants[id], ...patch } },
+      };
+    }
     case ACT.ACTIVE_SPEAKER: {
       // Ignore once the call is over — a late relay must not resurrect a highlight.
       if (state.status === CALL_STATUS.ENDED || state.status === CALL_STATUS.IDLE) return state;
@@ -489,4 +512,29 @@ export function deriveOutcome(state, reason) {
   if (wasActive) return 'completed';
   // ended before answer: caller = cancelled, callee = missed
   return state.direction === 'outgoing' ? 'cancelled' : 'missed';
+}
+
+// ---- session rehydration (call outlives the React tree) ----
+// On Android a mid-call swipe from Recents destroys the Activity, which unloads
+// the RN surface and unmounts this whole provider — while the call's foreground
+// service keeps the PROCESS, the JS runtime and the module-level media engine
+// alive. When the user re-opens the app the provider mounts fresh, so it must
+// RE-ADOPT the still-running session instead of booting into IDLE (which would
+// leave live media with no UI, and no one to end it).
+//
+// The snapshot is the provider's own last committed state, so it is restored
+// verbatim except for the UI-presentation flags: the surfaces they described
+// (floating PiP, expanded ring screen, a swiped-away banner) belong to a React
+// tree that no longer exists, so the call comes back as a plain full-screen call.
+// Returns `fallback` unchanged when there is nothing live to restore.
+export function rehydrateCallState(snapshot, fallback = initialCallState) {
+  if (!snapshot) return fallback;
+  if (snapshot.status === CALL_STATUS.IDLE || snapshot.status === CALL_STATUS.ENDED) return fallback;
+  return {
+    ...initialCallState,
+    ...snapshot,
+    minimized: false,
+    incomingExpanded: false,
+    bannerDismissed: false,
+  };
 }
