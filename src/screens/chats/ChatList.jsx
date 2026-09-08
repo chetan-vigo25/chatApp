@@ -14,6 +14,7 @@ import {
   Alert,
   StyleSheet,
   Dimensions,
+  BackHandler,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTheme } from '../../contexts/ThemeContext';
@@ -441,6 +442,23 @@ export default function ChatList({ navigation }) {
     setSelectionMode(true);
     setSelectedChatIds((prev) => (prev.includes(chatId) ? prev : [...prev, chatId]));
   }, []);
+
+  // Android hardware back clears the selection first (WhatsApp behavior).
+  // Without this the back press fell through to the navigator and — this being
+  // the root tab — closed the app while chats were still selected. Only
+  // swallowed WHILE something is selected; with an empty selection back keeps
+  // its default meaning (leave the app).
+  useFocusEffect(useCallback(() => {
+    const onBack = () => {
+      if (selectionMode || selectedChatIds.length > 0) {
+        exitSelectionMode();
+        return true;
+      }
+      return false;
+    };
+    const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+    return () => sub.remove();
+  }, [selectionMode, selectedChatIds.length, exitSelectionMode]));
 
   // Load current user id once — used to gate tick rendering to outgoing last-messages only
   useEffect(() => {
@@ -1768,9 +1786,17 @@ export default function ChatList({ navigation }) {
       ) : (
       <View style={styles.header}>
         <View style={styles.headerLeft}>
-          <View style={styles.headerLogoWrap}>
+          {/* Logo mark — replaced by the wordmark below (WhatsApp shows the
+              app NAME here, not its icon). Kept for an easy switch back. */}
+          {/* <View style={styles.headerLogoWrap}>
             <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
-          </View>
+          </View> */}
+          <Text
+            style={[styles.headerBrand, { color: theme.colors.themeColor }]}
+            numberOfLines={1}
+          >
+            {String(APP_TAG_NAME || 'TalksTry')}
+          </Text>
           {/* {Number(realtimeState?.totalUnread || 0) > 0 && (
             <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
               <Text style={styles.unreadBadgeText}>
@@ -2848,6 +2874,17 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontFamily: 'Roboto-Regular',
     marginTop: 20,
+  },
+  // Wordmark in place of the logo mark — same optical height as the old 38px
+  // icon so the header does not jump.
+  headerBrand: {
+    fontSize: 23,
+    fontFamily: 'Poppins-Bold',
+    // Poppins sits optically lighter than Roboto at the same weight, so the
+    // platform weight is pushed up too (iOS honours it on the Bold face).
+    fontWeight: '700',
+    letterSpacing: 0.2,
+    includeFontPadding: false,
   },
   headerLogoWrap: {
     width: 38, height: 38, borderRadius: 12,

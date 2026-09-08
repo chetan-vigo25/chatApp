@@ -3,6 +3,7 @@ import {
   Modal, View, Text, TouchableOpacity, FlatList, StyleSheet,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -23,6 +24,7 @@ const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 
 export default function AddParticipantSheet({ visible, onClose, groupId, existingIds = [], onInvite }) {
   const { theme, isDarkMode } = useTheme();
+  const insets = useSafeAreaInsets();
   const { user } = useAuth();
   const myId = user?._id ? String(user._id) : null;
   const dispatch = useDispatch();
@@ -84,10 +86,23 @@ export default function AddParticipantSheet({ visible, onClose, groupId, existin
   const accent = c.themeColor || '#03b0a2';
 
   return (
-    <Modal visible={!!visible} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal
+      visible={!!visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onClose}
+      statusBarTranslucent
+    >
       <View style={styles.backdrop}>
         <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={onClose} />
-        <View style={[styles.card, { backgroundColor: cardBg }]}>
+        {/* The app draws edge-to-edge (navigationBarTranslucent), so a FIXED
+            paddingBottom left the "Ring N members" button underneath the gesture
+            bar / navigation bar. Pad by the real inset instead, with a floor for
+            devices that report none. Same treatment as ConferenceAddPeopleSheet. */}
+        <View style={[
+          styles.card,
+          { backgroundColor: cardBg, paddingBottom: Math.max(insets.bottom, 16) },
+        ]}>
           <View style={styles.header}>
             <Text style={[styles.title, { color: primary }]}>Add participant</Text>
             <TouchableOpacity onPress={onClose} hitSlop={styles.hit}>
@@ -148,7 +163,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 20,
     paddingHorizontal: 18,
     paddingTop: 16,
-    paddingBottom: 28,
+    // paddingBottom is applied inline from the safe-area inset (see render).
     maxHeight: '70%',
   },
   header: {

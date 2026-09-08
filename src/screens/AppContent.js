@@ -18,6 +18,11 @@ export default function AppContent() {
     'Roboto-Medium': require('../../assets/fonts/Roboto-Medium.ttf'),
     'Roboto-Regular': require('../../assets/fonts/Roboto-Regular.ttf'),
     'Roboto-SemiBold': require('../../assets/fonts/Roboto-SemiBold.ttf'),
+    // Brand wordmark only (chat list header). Poppins reads better than Roboto
+    // at display weight; the .ttf files were already in assets but unregistered,
+    // so `fontFamily: 'Poppins-*'` silently fell back to the system font.
+    'Poppins-Bold': require('../../assets/fonts/Poppins-Bold.ttf'),
+    'Poppins-SemiBold': require('../../assets/fonts/Poppins-SemiBold.ttf'),
   });
 
   // Hold the first frame until the persisted theme is read — otherwise dark

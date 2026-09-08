@@ -20,7 +20,7 @@ import {
   Keyboard,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
-import { APP_TAG_NAME } from '@env';
+import { APP_TAG_NAME, ANDROID_DOWNLOAD_LINK, IOS_DOWNLOAD_LINK } from '@env';
 import useContactSync from "../../contexts/useContactSync";
 import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
 import { FontAwesome6, FontAwesome5, AntDesign, MaterialCommunityIcons, FontAwesome, Ionicons } from '@expo/vector-icons';
@@ -611,7 +611,31 @@ export default function AddUser({ navigation }) {
     const contactId = contact.id || contact.userId || contact.hash || Date.now().toString();
     setInvitingContactId(contactId);
 
-    const message = "Hey! Join me on this chat app. Download it now!";
+    // Invite copy, built entirely from env so a rebrand or a new store listing
+    // changes the invite without touching this screen:
+    //   • APP_TAG_NAME          — the app's name
+    //   • ANDROID_DOWNLOAD_LINK — Play Store listing
+    //   • IOS_DOWNLOAD_LINK     — App Store listing
+    // BOTH links go out, because the invite is an SMS to a phone number: we
+    // know nothing about the recipient's device, so sending only the inviter's
+    // own platform link would dead-end half of the invites. A missing link is
+    // dropped rather than printed empty, and with neither configured the
+    // message still reads as a complete sentence.
+    const appName = String(APP_TAG_NAME || 'TalksTry').trim();
+    const androidLink = String(ANDROID_DOWNLOAD_LINK || '').trim();
+    const iosLink = String(IOS_DOWNLOAD_LINK || '').trim();
+    const intro = `Hi I'm using ${appName} for free messages, voice and video calls. Join me`;
+    let message;
+    if (androidLink && iosLink) {
+      // Labelled lines — two bare URLs run together are unreadable, and every
+      // SMS client (and the `sms:` body param, which is URL-encoded below)
+      // carries newlines fine.
+      message = `${intro}\nAndroid: ${androidLink}\niPhone: ${iosLink}`;
+    } else if (androidLink || iosLink) {
+      message = `${intro}\n${androidLink || iosLink}`;
+    } else {
+      message = `${intro} on ${appName}!`;
+    }
     const phone = contact.phone || contact.number || contact.originalPhone;
 
     if (!phone) {

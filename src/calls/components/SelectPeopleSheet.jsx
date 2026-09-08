@@ -4,6 +4,7 @@ import {
   Platform, ToastAndroid, Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useDispatch, useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -34,6 +35,7 @@ export default function SelectPeopleSheet({
   visible, onClose, groupId, groupName, groupAvatar, peers = [], onStart,
 }) {
   const { theme, isDarkMode } = useTheme();
+  const insets = useSafeAreaInsets();
   const { user } = useAuth();
   const myId = user?._id ? String(user._id) : null;
   const dispatch = useDispatch();
@@ -109,10 +111,23 @@ export default function SelectPeopleSheet({
   const avatarUri = groupAvatar ? toSecureMediaUri(groupAvatar) : null;
 
   return (
-    <Modal visible={!!visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal
+      visible={!!visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+      statusBarTranslucent
+    >
       <View style={styles.backdrop}>
         <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={onClose} />
-        <View style={[styles.card, { backgroundColor: cardBg }]}>
+        {/* The app draws edge-to-edge (navigationBarTranslucent), so a FIXED
+            paddingBottom left the Voice/Video buttons underneath the gesture
+            bar / navigation bar. Pad by the real inset instead, with a floor for
+            devices that report none. Same treatment as ConferenceAddPeopleSheet. */}
+        <View style={[
+          styles.card,
+          { backgroundColor: cardBg, paddingBottom: Math.max(insets.bottom, 16) },
+        ]}>
           <View style={[styles.grabber, { backgroundColor: rowBorder }]} />
 
           {/* Group header: avatar · name + "Select people" · collapse chevron */}
@@ -204,7 +219,7 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 20,
     paddingHorizontal: 18,
     paddingTop: 8,
-    paddingBottom: 24,
+    // paddingBottom is applied inline from the safe-area inset (see render).
     maxHeight: '78%',
   },
   grabber: {

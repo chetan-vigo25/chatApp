@@ -33,6 +33,62 @@ const privateChatLabel = (chat) => resolveCanonicalName({
   fallback: 'Unknown',
 });
 
+// Mongo ids arrive as strings, `{ _id }` refs or `{ $oid }` — flatten them so
+// two spellings of the same id never read as two different chats.
+const normalizeId = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  const candidate = value?._id || value?.id || value?.userId || value?.$oid;
+  return candidate ? String(candidate) : null;
+};
+
+// Identity of the CONVERSATION, not of the row that carries it.
+// Redux (REST docs), the realtime store and the SQLite hydrate each key a chat
+// differently (`_id` / `chatId` / an aliased peer row), so deduping on those
+// fields let the same person or group show up twice in this picker. A group is
+// its groupId, a 1-1 chat is its peer — that is stable across all three
+// sources; only a row with neither falls back to its own id.
+const chatIdentityKey = (chat) => {
+  if (!chat) return null;
+  const isGroup = chat.chatType === 'group' || chat.isGroup;
+  if (isGroup) {
+    const gid = normalizeId(chat.groupId || chat.group?._id || chat.group);
+    if (gid) return `g_${gid}`;
+  } else {
+    const pid = normalizeId(
+      chat.peerUser?._id || chat.peerUser?.userId || chat.peerUser?.id
+      || chat.peerUserId || chat.participantId
+      || chat.otherUser?._id || chat.otherUser?.userId
+    );
+    if (pid) return `p_${pid}`;
+  }
+  const cid = normalizeId(chat._id || chat.chatId);
+  return cid ? `c_${cid}` : null;
+};
+
+// Later source wins, but only where it actually has a value — a realtime row
+// with a not-yet-hydrated name/avatar must not blank out what REST already had.
+const mergeChatRows = (base, next) => {
+  if (!base) return next;
+  if (!next) return base;
+  const out = { ...base };
+  for (const [k, v] of Object.entries(next)) {
+    if (v === undefined || v === null || v === '') continue;
+    out[k] = v;
+  }
+  const basePeer = base.peerUser || base.otherUser || null;
+  const nextPeer = next.peerUser || next.otherUser || null;
+  if (basePeer || nextPeer) {
+    const peer = { ...(basePeer || {}) };
+    for (const [k, v] of Object.entries(nextPeer || {})) {
+      if (v === undefined || v === null || v === '') continue;
+      peer[k] = v;
+    }
+    out.peerUser = peer;
+  }
+  return out;
+};
+
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
   '#E84393', '#00CEC9', '#FDCB6E', '#D63031',
@@ -69,16 +125,17 @@ export default function ForwardMessageScreen({ navigation, route }) {
     const realtimeList = Array.isArray(realtimeChatList) ? realtimeChatList : [];
     const reduxList = Array.isArray(chatsData) ? chatsData : [];
 
-    // Deduplicate: use a Map keyed by chatId, prefer realtime version
+    // Deduplicate on the conversation's identity (peer / group), not on the
+    // row's id field — the two sources spell that id differently, so keying on
+    // it rendered every chat twice. Realtime is applied last so it wins.
     const chatMap = new Map();
-    for (const chat of reduxList) {
-      const id = chat?._id || chat?.chatId || chat?.peerUser?._id;
-      if (id) chatMap.set(String(id), chat);
-    }
-    for (const chat of realtimeList) {
-      const id = chat?._id || chat?.chatId || chat?.peerUser?._id;
-      if (id) chatMap.set(String(id), chat);
-    }
+    const put = (chat) => {
+      const key = chatIdentityKey(chat);
+      if (!key) return;
+      chatMap.set(key, mergeChatRows(chatMap.get(key), chat));
+    };
+    for (const chat of reduxList) put(chat);
+    for (const chat of realtimeList) put(chat);
     return [...chatMap.values()];
   }, [realtimeChatList, chatsData]);
 
@@ -116,7 +173,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
     return privateChatLabel(chat);
   };
   const getChatAvatar = (chat) => {
-    if (chat?.chatType === 'group') return chat.chatAvatar || chat.group?.avatar || chat.groupAvatar;
+    if (chat?.chatType === 'group' || chat?.isGroup) return chat.chatAvatar || chat.group?.avatar || chat.groupAvatar;
     // chatAvatar fallback: chat-list rows carry the peer's image as chatAvatar
     // even when the local peerUser object wasn't hydrated with one.
     return chat?.peerUser?.profileImage || chat?.chatAvatar;
@@ -154,7 +211,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const chat = allChats.find(c => getChatId(c) === chatId);
         if (!chat) continue;
 
-        const isGroup = chat?.chatType === 'group';
+        // Same group test the list/render use — a row that only carries
+        // `isGroup` (realtime/SQLite rows do) must not be sent down the 1-1 path.
+        const isGroup = chat?.chatType === 'group' || chat?.isGroup;
         const receiverId = isGroup ? null : (chat?.peerUser?._id || chatId);
         const groupId = isGroup ? (chat.groupId || chat.group?._id || chatId) : null;
 
@@ -277,7 +336,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const targetChat = allChats.find(c => getChatId(c) === targetChatId);
 
         if (targetChat) {
-          const isGroup = targetChat?.chatType === 'group';
+          const isGroup = targetChat?.chatType === 'group' || targetChat?.isGroup;
           const navChatId = isGroup
             ? (targetChat.groupId || targetChat.group?._id || targetChat._id || targetChat.chatId)
             : `u_${[String(currentUserId), String(targetChat?.peerUser?._id || 'unknown')].sort().join('_')}`;
