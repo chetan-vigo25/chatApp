@@ -154,7 +154,13 @@ const callIdForUuid = (uuid) => uuidToId[String(uuid || '')] || null;
 const forget = (callId) => {
   const key = String(callId || '');
   const u = idToUuid[key];
-  if (u) { delete uuidToId[u]; displayedIncoming.delete(u); }
+  if (u) {
+    delete uuidToId[u];
+    displayedIncoming.delete(u);
+    answeredUuids.delete(String(u).toLowerCase());
+    const pend = pendingStart.get(String(u).toLowerCase());
+    if (pend) { if (pend.timer) clearTimeout(pend.timer); pendingStart.delete(String(u).toLowerCase()); }
+  }
   delete idToUuid[key];
   outgoingReported.delete(key);
 };
@@ -168,6 +174,10 @@ const forget = (callId) => {
 // forever) it rejected the call the user was in the middle of answering.
 // Remember what we ended ourselves so the echo can be dropped at the source —
 // the only place that can tell "I filed this" from "the user pressed End".
+// uuids we have already filed a CXAnswerCallAction for — see answerIncomingCall.
+const answeredUuids = new Map(); // uuid(lower) → ts
+const ANSWERED_TTL_MS = 30000;
+
 const selfEnded = new Map(); // uuid → ts
 const SELF_ENDED_TTL_MS = 15000;
 const markSelfEnded = (uuid) => {
@@ -259,14 +269,55 @@ export const startOutgoingCall = (callId, handle, name, hasVideo = false) => {
   } catch (_) { /* no-op */ }
 };
 
+// ── startCall → connectedAt handshake (iOS) ────────────────────────────────
+// `RNCallKeep.startCall` files a CXStartCallAction through CXCallController
+// .request — ASYNCHRONOUS. `reportOutgoingCall(with:connectedAt:)` on a uuid
+// whose start action has NOT been performed yet is silently DISCARDED by
+// CallKit, so reporting connected in the same tick registered the call but lost
+// the connectedAt that drives the timer: the caller's Dynamic Island / green
+// pill sat frozen at 0:00 for the whole call. Wait for the first moment CallKit
+// admits it knows the uuid — `didReceiveStartCallAction` — then report. The
+// timeout is the backstop for the (rare) case that event never arrives.
+const pendingStart = new Map(); // uuid(lower) → { uuid, timer }
+const START_ACTION_TIMEOUT_MS = 2000;
+let startActionWired = false;
+
+const reportConnectedNow = (uuidLower) => {
+  const entry = pendingStart.get(uuidLower);
+  if (!entry) return; // already reported — the event and the timeout both fired
+  pendingStart.delete(uuidLower);
+  if (entry.timer) clearTimeout(entry.timer);
+  try {
+    if (typeof RNCallKeep.reportConnectingOutgoingCallWithUUID === 'function') {
+      RNCallKeep.reportConnectingOutgoingCallWithUUID(entry.uuid);
+    }
+    if (typeof RNCallKeep.reportConnectedOutgoingCallWithUUID === 'function') {
+      RNCallKeep.reportConnectedOutgoingCallWithUUID(entry.uuid);
+    }
+  } catch (_) { /* no-op */ }
+};
+
+// Installed ONCE and never removed — deliberately NOT part of registerEvents,
+// whose unsubscribe removes listeners by event name and would take this with it
+// on every provider unmount, mid-call.
+const wireStartAction = () => {
+  if (startActionWired || !isAvailable() || Platform.OS !== 'ios') return;
+  startActionWired = true;
+  try {
+    RNCallKeep.addEventListener('didReceiveStartCallAction', ({ callUUID } = {}) => {
+      reportConnectedNow(String(callUUID || '').toLowerCase());
+    });
+  } catch (_) { startActionWired = false; }
+};
+
 /**
  * Register an OUTGOING call with CallKit ONCE IT HAS CONNECTED (remote media
  * arrived). Gives the caller the native ongoing-call presence — green status-bar
  * notch / Dynamic Island indicator, background keep-alive, and hang-up from the
  * lock screen — WITHOUT the dial-time CXStartCallAction-timeout drop, because the
- * whole ringing window had no CallKit call. We create the call and report it
- * connected+active in the same tick so it never sits in an unfulfilled
- * "connecting" state. iOS only; idempotent per callId (startCall on an existing
+ * whole ringing window had no CallKit call. The call is created and then reported
+ * connected once CallKit has actually performed the start action, so it neither
+ * sits in an unfulfilled "connecting" state nor loses its connectedAt. iOS only; idempotent per callId (startCall on an existing
  * uuid is a no-op on the native side); safe no-op when CallKit is unavailable.
  */
 export const reportOutgoingConnected = (callId, handle, name, hasVideo = false) => {
@@ -276,14 +327,16 @@ export const reportOutgoingConnected = (callId, handle, name, hasVideo = false) 
   outgoingReported.add(key);
   const uuid = uuidForCall(callId);
   try {
+    wireStartAction();
+    const key2 = String(uuid).toLowerCase();
+    pendingStart.set(key2, {
+      uuid,
+      timer: setTimeout(() => reportConnectedNow(key2), START_ACTION_TIMEOUT_MS),
+    });
     RNCallKeep.startCall(uuid, String(handle || name || 'call'), name || 'Call', 'generic', !!hasVideo);
-    if (typeof RNCallKeep.reportConnectingOutgoingCallWithUUID === 'function') {
-      RNCallKeep.reportConnectingOutgoingCallWithUUID(uuid);
-    }
-    if (typeof RNCallKeep.reportConnectedOutgoingCallWithUUID === 'function') {
-      RNCallKeep.reportConnectedOutgoingCallWithUUID(uuid);
-    }
-    RNCallKeep.setCurrentCallActive(uuid);
+    // NO setCurrentCallActive here: it is `if (isIOS) return;` inside the
+    // package — a pure no-op on iOS. An outgoing CallKit call goes active on
+    // connectedAt being reported, which is exactly what the handshake above does.
   } catch (_) { /* no-op */ }
 };
 
@@ -311,6 +364,16 @@ export const setMuted = (callId, muted) => {
 export const answerIncomingCall = (callId) => {
   if (!isAvailable()) return;
   const u = idToUuid[String(callId || '')] || uuidForCall(callId);
+  // ONE CXAnswerCallAction per ring. The accept path can reach here twice for a
+  // single tap (in-app accept + the replayed/CallKit-originated accept), and
+  // performAnswerCallAction auto-fulfils, so the second action lands on a call
+  // CallKit has already answered — it errors natively AND echoes a second
+  // `answerCall` event, driving a duplicate accept() run through the provider.
+  const key = String(u).toLowerCase();
+  const now = Date.now();
+  for (const [k, ts] of answeredUuids) if (now - ts > ANSWERED_TTL_MS) answeredUuids.delete(k);
+  if (answeredUuids.has(key)) return;
+  answeredUuids.set(key, now);
   try { RNCallKeep.answerIncomingCall(u); } catch (_) { /* no-op */ }
 };
 
