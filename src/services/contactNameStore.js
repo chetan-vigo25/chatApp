@@ -277,6 +277,16 @@ const handleOf = (username) => {
 };
 
 /**
+ * The peer's PUBLIC handle as a display label, or null when they have none.
+ *
+ * Exported for surfaces that show the handle ALONGSIDE the resolved name (the
+ * call screens) rather than instead of it. Callers must suppress it when it
+ * equals the primary label — a peer who hides their details already resolves TO
+ * their handle, and printing it twice is the "@ravina / ~@ravina" duplication.
+ */
+export const publicHandleLabel = (username) => handleOf(username);
+
+/**
  * The peer's handle when a FRESH server payload has redacted their name.
  *
  * `serializePublicUser` substitutes "@handle" into the name fields only for a
@@ -411,7 +421,7 @@ export const resolveDisplayName = ({
  * or when the server name adds nothing over what is already shown.
  */
 export const resolvePushNameLabel = ({
-  userId = null, phone = null, pushName = null, hideContact = false,
+  userId = null, phone = null, pushName = null, username = null, hideContact = false,
 } = {}) => {
   // A live `contact:updated` outranks the caller's row here too, so a member
   // who hides mid-session loses the "~name" line without a refetch.
@@ -425,6 +435,26 @@ export const resolvePushNameLabel = ({
   // peer just asked to withhold, so the secondary label is suppressed entirely.
   if (hideContact) return null;
   if (onlyDigits(push) && onlyDigits(push) === onlyDigits(phone)) return null; // it IS the number
+
+  // A "@handle" is NOT an account name — it is the substitution the server
+  // writes INSTEAD of one, for a peer who hides their details. Tilde-ing it
+  // produces "~@ravina", which both re-states the primary label and claims the
+  // handle is a self-set profile name. `resolveDisplayName` already infers the
+  // privacy flag from this same shape (see `isSelfRedacted` / `isHandlePush`);
+  // without the matching inference here, the "~" line rendered for exactly the
+  // peers whose `hideContact` check above is meant to suppress it — and only
+  // until the group roster loaded and set the flag for real, which is what made
+  // the line flash for a second and then vanish.
+  if (push.startsWith('@')) return null;
+
+  // The general form of the same rule, and what this function's contract
+  // promises: a secondary line that repeats the primary one adds nothing. It
+  // fires whenever the primary label falls through to the account name itself
+  // (no saved contact and no displayable number), where "Ravina / ~Ravina"
+  // is just the name twice.
+  const primary = resolveDisplayName({ userId, phone, pushName, username, hideContact, fallback: '' });
+  if (primary && primary.trim().toLowerCase() === push.toLowerCase()) return null;
+
   return `~${push}`;
 };
 
@@ -442,6 +472,7 @@ export default {
   formatPhoneNumber,
   isDisplayablePhone,
   handleFromRedactedName,
+  publicHandleLabel,
   resolveDisplayName,
   resolvePushNameLabel,
 };

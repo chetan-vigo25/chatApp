@@ -5208,7 +5208,7 @@ export default function ChatScreen({ navigation, route }) {
     // `pushNameOf` returns "~Name" ONLY for an unsaved, non-hidden peer and null
     // otherwise — exactly the tilde rule — so it is the first choice, with the
     // canonical resolver (saved name → number → "@handle") behind it.
-    const tilde = resolveContactPushName({ userId: uid, phone, pushName, hideContact });
+    const tilde = resolveContactPushName({ userId: uid, phone, pushName, username, hideContact });
     const label = tilde
       || resolveContactName(uid, pushName || stored, phone, { username, hideContact });
 
@@ -6836,7 +6836,10 @@ export default function ChatScreen({ navigation, route }) {
           userId: msg.senderId,
           phone: senderMeta.mobileNumber,
           pushName: senderMeta.fullName || msg.senderName,
-          // Suppresses the "~name" line for a hidden sender.
+          // Both privacy signals. The roster can still be loading on first
+          // paint, so these are empty for a moment — the resolver infers the
+          // same thing from an "@handle" push name rather than relying on them.
+          username: senderMeta.userName || null,
           hideContact: Boolean(senderMeta.hideContact),
         })
       : null;

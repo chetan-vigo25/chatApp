@@ -159,6 +159,9 @@ function CallGroupGrid({
       key: `p:${pid}`,
       id: p.id,
       name: p.name || 'Member',
+      // Resolved by useCallRoster, and already null when it would just repeat
+      // the name — see the name chip below.
+      handle: p.handle || null,
       avatar: p.avatar,
       stream: camOn && r && r.hasVideo ? r.stream : null,
       status: tileStatus(p),
@@ -255,6 +258,9 @@ function CallGroupGrid({
 
               <View style={styles.gNameChip}>
                 <Text style={styles.gNameText} numberOfLines={1}>{t.name}</Text>
+                {t.handle ? (
+                  <Text style={styles.gHandleText} numberOfLines={1}>{t.handle}</Text>
+                ) : null}
               </View>
 
               {/* Mic state is only known for YOURSELF — the roster carries no
@@ -561,6 +567,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.45)',
   },
   gNameText: { color: '#fff', fontFamily: 'Roboto-Medium', fontSize: 12 },
+  gHandleText: { color: 'rgba(255,255,255,0.72)', fontFamily: 'Roboto-Regular', fontSize: 11 },
   gMicBadge: {
     position: 'absolute',
     right: 8,

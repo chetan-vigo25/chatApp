@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import useContactDirectory from '../hooks/useContactDirectory';
 import ChatDatabase from '../services/ChatDatabase';
+import { publicHandleLabel } from '../services/contactNameStore';
 
 /**
  * useCallRoster — resolves a raw call roster into DISPLAY-READY participants.
@@ -21,7 +22,12 @@ import ChatDatabase from '../services/ChatDatabase';
  * @param {boolean} opts.connectedOnly  drop anyone who has not joined yet — used
  *   by the RECEIVER once answered, so they never see "Connecting…" ghosts for
  *   members who never picked up.
- * @returns {object} the same map shape, with `name` resolved.
+ * @returns {object} the same map shape, with `name` resolved and `handle` set.
+ *
+ * Each entry also gets a `handle` ("@ravina") — the peer's PUBLIC username, for
+ * call surfaces that show it as a secondary line under the name. It is null
+ * whenever it would add nothing: no username on record, or the resolved `name`
+ * IS the handle already (which is what a peer hiding their details resolves to).
  */
 export default function useCallRoster(participants, { connectedOnly = false } = {}) {
   const { resolveName, peerPrivacyOf } = useContactDirectory();
@@ -87,7 +93,15 @@ export default function useCallRoster(participants, { connectedOnly = false } = 
       hideContact: rosterPrivacy.hideContact || identPrivacy.hideContact,
     };
     const name = resolveName(p.id, fallbackName, phone, privacy) || fallbackName || 'Member';
-    out[p.id] = name === p.name ? p : { ...p, name };
+    // Secondary "@handle" line. Suppressed when the name already IS the handle,
+    // so a peer who hides their details is never labelled "@ravina / @ravina".
+    const rawHandle = publicHandleLabel(privacy.username);
+    const handle = rawHandle && rawHandle.toLowerCase() !== String(name).trim().toLowerCase()
+      ? rawHandle
+      : null;
+    out[p.id] = (name === p.name && handle === (p.handle ?? null))
+      ? p
+      : { ...p, name, handle };
   });
   return out;
 }

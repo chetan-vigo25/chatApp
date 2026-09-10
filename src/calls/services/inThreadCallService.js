@@ -41,8 +41,18 @@ export const appendCallEntry = async ({
 
   const text = labelFor(media, direction, outcome);
 
+  // `call_<callId>` is EXACTLY the clientMessageId the backend stamps on the
+  // canonical call message it fans out (see
+  // docs/GROUP_CALL_THREAD_MESSAGE_SERVER_CHANGES.md §3.1, captured verbatim).
+  // Keying the optimistic row by it is what makes the server's copy REPLACE
+  // this one instead of landing beside it as a second bubble — ChatDatabase's
+  // cleanBeforeUpsert rule 0 deletes any row held under an incoming message's
+  // clientMessageId. Get this string wrong and the thread shows the call twice.
+  const clientMessageId = `call_${callId}`;
+
   const msg = {
-    id: `call_${callId}_${selfId || 'me'}`,
+    id: clientMessageId,
+    clientMessageId,
     type: 'call',
     mediaType: 'call',
     text,
@@ -61,7 +71,10 @@ export const appendCallEntry = async ({
       kind: 'call',
       callId,
       media: media === 'video' ? 'video' : 'audio',
-      direction,
+      // `direction` is deliberately NOT stored (same rule the backend follows —
+      // §4.2 of that doc). It is viewer-relative, so a stored value would be
+      // wrong for anyone but the device that wrote it; CallMessageBubble
+      // derives it from senderId vs the authenticated user instead.
       outcome,
       durationSec: Math.max(0, Number(durationSec) || 0),
     },

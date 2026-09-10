@@ -1021,6 +1021,21 @@ const cleanBeforeUpsert = async (db, msg) => {
       { $cmid: String(msg.clientMessageId), $id: id }
     );
   }
+  //    Call rows get a THIRD bridge, on the call's own id. Every leg of a call
+  //    writes an optimistic local row keyed `call_<callId>` so the bubble is
+  //    instant, and the backend later fans out its canonical copy. That copy is
+  //    supposed to carry `clientMessageId: "call_<callId>"` (the rule above
+  //    catches it), but a leg whose server payload omits it would otherwise
+  //    leave the optimistic row behind as a duplicate bubble. `callId` is one
+  //    immortal id for the whole call, so matching on it collapses them
+  //    regardless. Scoped to type='call' — no other row has a payload callId.
+  const incomingCallId = msg?.payload?.callId || msg?.callDetails?.callId || null;
+  if (incomingCallId && (msg.type === 'call' || msg.messageType === 'call')) {
+    await db.runAsync(
+      `DELETE FROM messages WHERE type = 'call' AND id != $id AND (id = $local OR client_message_id = $local)`,
+      { $local: `call_${String(incomingCallId)}`, $id: id }
+    );
+  }
 
   // 1. If we know the tempId→serverId link, remove the temp row
   if (serverId && tempId && serverId !== tempId) {
@@ -3724,6 +3739,35 @@ const repairSenderTypes = async (userId) => {
   }
 };
 
+/**
+ * Delete the client-invented "X joined" system rows.
+ *
+ * The chat screen used to inject one on every `group:member:joined` socket
+ * broadcast — an event the server re-emits on reconnect and group sync — and
+ * keyed each row `sys_joined_<uid>_<Date.now()>`, so every re-delivery landed
+ * as a NEW row. Threads accumulated the same "X joined" line over and over.
+ *
+ * That injection is gone (see useChatLogic), but the rows it already wrote are
+ * still on disk. Matching on the `sys_joined_` id prefix is deliberately
+ * narrow: it can only ever hit rows this client generated itself. Genuine
+ * membership lines come from the server under its own message ids and carry a
+ * structured `systemEvent`, so nothing durable is touched.
+ */
+const purgeInjectedJoinedRows = async () => {
+  try {
+    const db = await getDB();
+    const res = await db.runAsync(
+      `DELETE FROM messages WHERE type = 'system' AND id LIKE 'sys_joined_%';`,
+    );
+    const n = res?.changes || 0;
+    if (n > 0) console.log(`[ChatDB] purged ${n} injected "joined" system row(s)`);
+    return n;
+  } catch (e) {
+    console.warn('[ChatDB] purgeInjectedJoinedRows failed:', e?.message);
+    return 0;
+  }
+};
+
 // Legacy aliases
 const saveMessageSync = upsertMessage;
 const saveMessages = upsertMessages;
@@ -3736,7 +3780,7 @@ export default {
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
-  repairSenderTypes,
+  repairSenderTypes, purgeInjectedJoinedRows,
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById, getPeerIdentity,

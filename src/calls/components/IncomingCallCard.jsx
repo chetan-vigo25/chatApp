@@ -21,7 +21,7 @@ import CallAvatar from './CallAvatar';
 const SWIPE_ACCEPT_DY = -70; // drag this far up = accept
 
 export default function IncomingCallCard({
-  peer, displayName, media, onAccept, onReject,
+  peer, displayName, handle = null, media, onAccept, onReject,
 }) {
   const isVideo = media === 'video';
   const { theme, isDarkMode } = useTheme();
@@ -93,6 +93,11 @@ export default function IncomingCallCard({
         <Text style={[styles.name, { color: onBg }]} numberOfLines={1}>
           {displayName || peer?.name || 'Unknown'}
         </Text>
+        {/* Public "@handle". The caller passes null when it would only repeat
+            the name above (a peer who hides their details resolves TO it). */}
+        {handle ? (
+          <Text style={[styles.handle, { color: onBgSoft }]} numberOfLines={1}>{handle}</Text>
+        ) : null}
         <View style={styles.mediaRow}>
           <Ionicons name={isVideo ? 'videocam' : 'call'} size={15} color={onBgSoft} />
           <Text style={[styles.mediaText, { color: onBgSoft }]}>
@@ -143,6 +148,13 @@ const styles = StyleSheet.create({
     fontSize: 30,
     maxWidth: '85%',
     textAlign: 'center',
+  },
+  handle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 16,
+    maxWidth: '85%',
+    textAlign: 'center',
+    marginTop: 3,
   },
   mediaRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10 },
   mediaText: { fontFamily: 'Roboto-Regular', fontSize: 15 },

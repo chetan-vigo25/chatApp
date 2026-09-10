@@ -4534,22 +4534,19 @@ export function RealtimeChatProvider({ children }) {
       const userId = normalizeId(data?.userId);
       if (!groupId || !userId) return;
       const memberName = data?.username || data?.fullName || data?.name || '';
+      // Membership-only update (member list / count). The chat-thread and
+      // chat-list line for a real membership change is delivered by the server
+      // as a durable, seq-ordered system message (`members_added` and friends),
+      // so we do NOT inject an ephemeral one here — exactly the rule
+      // onGroupMemberLeft below already follows.
+      //
+      // This event is re-emitted on reconnect and group sync, so the ephemeral
+      // line that used to be dispatched here re-wrote the chat-list preview to
+      // "X joined" long after the fact, and its thread counterpart persisted a
+      // fresh duplicate row every time.
       dispatch({
         type: 'GROUP_MEMBER_JOINED',
         payload: { groupId, userId, username: memberName, timestamp: data?.timestamp },
-      });
-      // Update chat list preview with system message
-      dispatch({
-        type: 'INCOMING_GROUP_MESSAGE',
-        payload: {
-          chatId: groupId,
-          groupId,
-          senderId: null,
-          senderName: null,
-          text: memberName ? `${memberName} joined` : 'A member joined',
-          messageType: 'system',
-          createdAt: data?.timestamp || new Date().toISOString(),
-        },
       });
     };
 
@@ -5272,6 +5269,9 @@ export function RealtimeChatProvider({ children }) {
     if (!uid || repairedSenderTypesForRef.current === String(uid)) return;
     repairedSenderTypesForRef.current = String(uid);
     ChatDatabase.repairSenderTypes(uid).catch(() => {});
+    // Same one-shot slot: clear the "X joined" rows the old client-side
+    // injection left behind (the injection itself is gone).
+    ChatDatabase.purgeInjectedJoinedRows().catch(() => {});
   }, [state.currentUserId]);
 
   useEffect(() => {

@@ -10,6 +10,7 @@ import { useTheme } from '../../contexts/ThemeContext';
 import { useAuth } from '../../contexts/AuthContext';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import useCallRoster from '../useCallRoster';
+import { publicHandleLabel } from '../../services/contactNameStore';
 import { CALL_STATUS, joinedCount } from '../state/callMachine';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import CallAvatar from '../components/CallAvatar';
@@ -241,6 +242,14 @@ export default function CallOverlay() {
   const peer = call?.peer || {};
   // Saved contact name > mobile number > backend name.
   const peerDisplayName = resolveName(peer?.id, peer?.name, peer?.mobile || peer?.phone || peer?.mobileNumber, peerPrivacyOf(peer)) || peer?.name || 'Unknown';
+  // The peer's public "@handle", shown as a secondary line under their name.
+  // Null when they have none, or when the name IS the handle already — a peer
+  // who hides their details resolves to it, and printing it twice says nothing.
+  const peerHandle = (() => {
+    const h = publicHandleLabel(peerPrivacyOf(peer).username);
+    if (!h) return null;
+    return h.toLowerCase() === String(peerDisplayName).trim().toLowerCase() ? null : h;
+  })();
   const joined = isGroup ? joinedCount(call?.participants) : 0;
   const isConference = !!call?.isConference;
   // Conference title: "<name> & N other(s)" (host/first peer + everyone else).
@@ -443,6 +452,7 @@ export default function CallOverlay() {
         <IncomingCallCard
           peer={peer}
           displayName={peerDisplayName}
+          handle={peerHandle}
           media={call?.media}
           onAccept={accept}
           onReject={reject}
@@ -541,6 +551,9 @@ export default function CallOverlay() {
               both at once. */}
           <View style={styles.header}>
             <Text style={[styles.headerName, { color: onBg }]} numberOfLines={1}>{peerDisplayName}</Text>
+            {peerHandle ? (
+              <Text style={[styles.headerHandle, { color: onBgSoft }]} numberOfLines={1}>{peerHandle}</Text>
+            ) : null}
             {timerRunning ? (
               <CallTimer startMs={call?.connectedAt || call?.answeredAt} style={[styles.headerStatus, { color: onBgSoft }]} />
             ) : (
@@ -613,6 +626,13 @@ const styles = StyleSheet.create({
     fontSize: 22,
     textAlign: 'center',
     maxWidth: '100%',
+  },
+  headerHandle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 14,
+    textAlign: 'center',
+    maxWidth: '100%',
+    marginTop: 1,
   },
   headerStatus: {
     fontFamily: 'Roboto-Regular',

@@ -5809,36 +5809,24 @@ export default function useChatLogic({ navigation, route }) {
       ChatDatabase.upsertMessage({ ...systemMsg, chatId: currentChatId }).catch(() => {});
     };
     registerSocketHandler('group:joined', onGroupJoinedForChat);
-    registerSocketHandler('group:member:joined', (data) => {
-      const source = data?.data || data;
-      const gid = source?.groupId || source?.group?._id;
-      if (!gid || (!sameId(gid, currentChatId) && !sameId(gid, groupOwnId))) return;
-      const memberName = source?.username || source?.fullName || source?.name || '';
-      const sysId = source?.messageId || `sys_joined_${source?.userId || ''}_${Date.now()}`;
-      const sysText = memberName ? `${memberName} joined` : 'A member joined';
-
-      const alreadyExists = allMessagesRef.current?.some(m =>
-        (m.id === sysId || m.text === sysText) && m.type === 'system'
-      );
-      if (alreadyExists) return;
-
-      const systemMsg = {
-        id: sysId,
-        tempId: sysId,
-        type: 'system',
-        messageType: 'system',
-        text: sysText,
-        senderId: null,
-        senderType: 'system',
-        status: 'sent',
-        chatId: currentChatId,
-        createdAt: source?.timestamp ? new Date(source.timestamp).toISOString() : new Date().toISOString(),
-        timestamp: source?.timestamp || Date.now(),
-      };
-
-      setAllMessages(prev => [...prev, systemMsg]);
-      ChatDatabase.upsertMessage({ ...systemMsg, chatId: currentChatId }).catch(() => {});
-    });
+    // NOTE: `group:member:joined` deliberately writes NOTHING into the thread.
+    //
+    // It is a MEMBERSHIP broadcast (roster / member count), not a chat event,
+    // and the server re-emits it on reconnect and group sync — so injecting a
+    // line here printed "X joined" again on every re-delivery. Worse, the row
+    // was keyed `sys_joined_<uid>_<Date.now()>`, a NEW id each time, so each
+    // copy persisted as its own SQLite row; the only guard was a text scan of
+    // the loaded window, which misses as soon as the earlier copy scrolls out
+    // of it or the screen is reopened.
+    //
+    // Real membership changes already arrive as DURABLE, seq-ordered system
+    // messages from the server (`members_added` / `member_removed` /
+    // `member_left` / `group_created` — see utils/systemMessage.js), which
+    // survive reload and read correctly for every viewer. `group:member:left`
+    // was already fixed this way; this is the same rule.
+    //
+    // The roster still updates: RealtimeChatContext handles GROUP_MEMBER_JOINED,
+    // and GroupInfo listens for its own member-list refresh.
     registerSocketHandler('group:member:left', (data) => {
       const source = data?.data || data;
       const gid = source?.groupId || source?.group?._id;

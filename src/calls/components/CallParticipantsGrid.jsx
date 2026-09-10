@@ -102,6 +102,14 @@ export default function CallParticipantsGrid({
               <Text style={[styles.name, { color: onBg }]} numberOfLines={1}>
                 {p.name || 'Unknown'}
               </Text>
+              {/* Public "@handle" under the name. useCallRoster nulls it out
+                  when it would only repeat the name above, so this line never
+                  shows the same identity twice. */}
+              {p.handle ? (
+                <Text style={[styles.handle, { color: onBgSoft }]} numberOfLines={1}>
+                  {p.handle}
+                </Text>
+              ) : null}
               <Text
                 style={[styles.status, { color: onBgSoft }, p.joined && !p.isSelf && styles.statusActive]}
                 numberOfLines={1}
@@ -157,6 +165,13 @@ const styles = StyleSheet.create({
     fontFamily: 'Roboto-Medium',
     fontSize: 15,
     marginTop: 10,
+    maxWidth: '100%',
+    textAlign: 'center',
+  },
+  handle: {
+    fontFamily: 'Roboto-Regular',
+    fontSize: 12,
+    marginTop: 1,
     maxWidth: '100%',
     textAlign: 'center',
   },

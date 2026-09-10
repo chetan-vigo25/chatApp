@@ -44,6 +44,7 @@ import * as callSession from './callSessionKeeper';
 import { CALL_RING_DURATION_SECONDS } from '@env';
 import { getCallToken, clearCachedCallToken, getServerRingDurationSec, getServerRecordingConfig } from './services/callTokenService';
 import { recordCall } from './services/callLogService';
+import { appendCallEntry } from './services/inThreadCallService';
 import { uploadRecordingChunk, finalizeRecording } from './services/callRecordingService';
 import { playRingtone, playRingback, stopRingtone } from './services/ringtoneService';
 import nativeCall from './services/nativeCallService';
@@ -1436,11 +1437,36 @@ export const CallProvider = ({ children }) => {
       const qualitySnapshot = rtcStatsRef.current;
       rtcStatsRef.current = null; // never leak into the next call
       mediaRoomRef.current = null; // ditto — the next call joins its own room
+      // OPTIMISTIC in-thread bubble — written to SQLite RIGHT NOW, before the
+      // network is touched at all.
+      //
+      // The canonical call message is created SERVER-side off `/call/log` and
+      // fanned out over the socket, so the bubble used to appear only after
+      // hang-up → device-info fetch → POST → server write → fan-out → socket.
+      // Every hop in that chain is variance, which is why the entry looked
+      // instant on one platform and seconds late on another for the very same
+      // call. Rendering locally first removes the round trip from the UX, the
+      // same way an outgoing text message never waits for its ack.
+      //
+      // This does NOT duplicate the server's copy: the row is keyed
+      // `call_<callId>`, which is exactly the `clientMessageId` the backend
+      // stamps, so cleanBeforeUpsert replaces it when the real message lands
+      // (with a second bridge on payload.callId as a safety net).
+      appendCallEntry({
+        callId,
+        peerId: isGroup ? null : snap.peer?.id,
+        chatId,
+        media: snap.media,
+        direction: snap.direction,
+        outcome,
+        durationSec,
+        myId,
+      }).catch(() => { /* best-effort — the server copy is the durable one */ });
+
       // recordCall persists the durable CallLog AND (for a 1:1 outgoing leg)
       // drops the canonical WhatsApp-style "call" message into the chat thread
       // server-side, which messageService fans out to BOTH parties' chat screen
-      // + chat-list summary in realtime. We no longer write a local-only
-      // in-thread row here — that would duplicate the fanned-out message.
+      // + chat-list summary in realtime.
       (async () => {
         try {
           if (qualitySnapshot) payload.qualityMetrics = qualitySnapshot;
