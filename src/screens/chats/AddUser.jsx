@@ -22,7 +22,7 @@ import {
 import { useTheme } from "../../contexts/ThemeContext";
 import { APP_TAG_NAME, ANDROID_DOWNLOAD_LINK, IOS_DOWNLOAD_LINK } from '@env';
 import useContactSync from "../../contexts/useContactSync";
-import { getSocket, isSocketConnected, reconnectSocket } from "../../Redux/Services/Socket/socket";
+import useOpenUserChat, { normalizeChatUser } from "../../hooks/useOpenUserChat";
 import { FontAwesome6, FontAwesome5, AntDesign, MaterialCommunityIcons, FontAwesome, Ionicons } from '@expo/vector-icons';
 import { useSelector } from "react-redux";
 import { useFocusEffect } from '@react-navigation/native';
@@ -219,22 +219,15 @@ export default function AddUser({ navigation }) {
 
   // ─── ALL EXISTING LOGIC (UNCHANGED) ───
 
-  const normalizeId = (value) => {
-    if (value == null) return null;
-    if (typeof value === 'string' || typeof value === 'number') return String(value);
-    if (typeof value === 'object') {
-      if (value?._id?.$oid) return String(value._id.$oid);
-      const candidate = value?._id || value?.id || value?.userId || value?.$oid || null;
-      return candidate == null ? null : String(candidate);
-    }
-    return null;
-  };
-
-  const sameId = (left, right) => {
-    const a = normalizeId(left);
-    const b = normalizeId(right);
-    return Boolean(a && b && a === b);
-  };
+  /**
+   * Open (or create) the chat for a tapped person.
+   *
+   * The whole flow — existing-chat lookup, the socket `chat:create` that stops
+   * a duplicate chat doc being minted, the local-name merge, the double-tap
+   * guard and every fallback — lives in useOpenUserChat, shared with the chat
+   * list's search results so the two screens can never drift apart.
+   */
+  const { openUserChat } = useOpenUserChat({ chats: chatsData });
 
   // Entrance fade removed — the container now renders at opacity 1 from the
   // first frame (see fadeAnim init) so a remount (e.g. after the permission
@@ -274,21 +267,11 @@ export default function AddUser({ navigation }) {
       phoneNumber: discoveredData.phoneNumber || discoveredData.hash,
     };
 
-    const existingChat = chatsData?.find((chat) => {
-      if (!chat || chat.chatType === 'group' || chat.isGroup) return false;
-      const peerIds = [
-        chat?.peerUser?._id, chat?.peerUser?.userId,
-        chat?.otherUser?._id, chat?.otherUser?.userId,
-      ];
-      const candidates = [discovered?.userId, discovered?._id, discovered?.id].filter(Boolean);
-      return peerIds.some((pid) => candidates.some((c) => sameId(pid, c)));
-    });
-
-    if (existingChat) {
-      navigation.navigate('ChatScreen', { item: existingChat });
-    } else if (discovered?._id || discovered?.userId) {
-      // Create the chat first so we don't end up with a duplicate later
-      createChatThenNavigate(discovered).catch(() => {});
+    // The number turned out to belong to a real account — from here it is the
+    // ordinary tap flow: open the existing chat, or create one first so a
+    // second chat doc can never be minted by the first message.
+    if (discovered?._id || discovered?.userId) {
+      openUserChat(discovered).catch(() => {});
     } else {
       navigation.navigate('ChatScreen', { user: discovered });
     }
@@ -311,173 +294,25 @@ export default function AddUser({ navigation }) {
     else Alert.alert('Info', msg);
   };
 
-  const normalizeChatUser = useCallback((contact) => {
-    if (!contact) return null;
-    const resolvedId = contact._id || contact.userId || contact.id || null;
-    // Prefer the locally-saved name (device contact / SQLite) so the chat
-    // header matches what the user has in their phonebook.
-    const localName =
-      contact.fullName || contact.name || contact.displayName || contact.username || 'Unknown';
-    const image = contact.profileImage || contact.profilePicture || contact.avatar || '';
-    return {
-      ...contact,
-      _id: resolvedId,
-      id: contact.id || resolvedId,
-      userId: contact.userId || resolvedId,
-      name: localName,
-      fullName: localName,
-      // Both keys — different consumers read different fields
-      profileImage: image,
-      profilePicture: image,
-    };
-  }, []);
-
-  // Guards against double-tap creating multiple chats
-  const openChatInFlightRef = useRef(false);
-
-  // Find an existing chat for a given user across every shape the chat list
-  // might use (peerUser._id, peerUser.userId, otherUser, members[]).
-  const findExistingChat = useCallback((normalizedUser) => {
-    if (!normalizedUser || !Array.isArray(chatsData)) return null;
-    const candidates = [normalizedUser._id, normalizedUser.userId, normalizedUser.id]
-      .filter(Boolean);
-    if (candidates.length === 0) return null;
-
-    return chatsData.find((chat) => {
-      if (!chat || chat.chatType === 'group' || chat.isGroup) return false;
-      const peerIds = [
-        chat?.peerUser?._id,
-        chat?.peerUser?.userId,
-        chat?.otherUser?._id,
-        chat?.otherUser?.userId,
-        chat?.user?._id,
-        chat?.user?.userId,
-      ];
-      return peerIds.some((pid) => candidates.some((c) => sameId(pid, c)));
-    }) || null;
-  }, [chatsData]);
-
-  // Open an existing chat — pass the SAME `item` shape the chat list uses,
-  // but override peerUser fields with the local (device/SQLite) name & image
-  // so the header matches what the user has saved in their phonebook.
-  const navigateToExistingChat = useCallback((existingChat, normalizedUser) => {
-    const mergedPeer = {
-      ...(existingChat?.peerUser || {}),
-      // Local fields win — these come from the device contact / SQLite row
-      ...(normalizedUser?.fullName ? { fullName: normalizedUser.fullName, name: normalizedUser.fullName } : {}),
-      ...(normalizedUser?.profileImage
-        ? { profileImage: normalizedUser.profileImage, profilePicture: normalizedUser.profileImage }
-        : {}),
-      _id: existingChat?.peerUser?._id || normalizedUser?._id || normalizedUser?.userId,
-    };
-    navigation.navigate('ChatScreen', { item: { ...existingChat, peerUser: mergedPeer } });
-  }, [navigation]);
-
-  // Create a chat on the backend, then navigate with the resulting chat object.
-  // Without this step the screen opens with chatId=null and the backend can
-  // create a second chat doc when the first message is sent → "duplicate chat".
-  const createChatThenNavigate = useCallback(async (normalizedUser) => {
-    return new Promise(async (resolve) => {
-      try {
-        if (!isSocketConnected()) {
-          await reconnectSocket(navigation);
-          await new Promise(r => setTimeout(r, 500));
-        }
-        const socket = getSocket();
-        if (!socket) {
-          // Last-resort fallback: open with user only
-          navigation.navigate('ChatScreen', { user: normalizedUser });
-          return resolve();
-        }
-
-        let settled = false;
-        const cleanup = () => {
-          socket.off('chat:create:response', onResponse);
-          clearTimeout(timer);
-        };
-        const onResponse = (response) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          const chatPayload = response?.data;
-          if (response?.status && chatPayload) {
-            // Merge server peerUser with the local contact name/image so the
-            // header reflects the user's saved phonebook entry, not the
-            // sign-up name from the server.
-            const serverPeer = chatPayload.peerUser || {};
-            const mergedPeer = {
-              ...serverPeer,
-              fullName: normalizedUser?.fullName || serverPeer.fullName || 'Unknown',
-              name: normalizedUser?.fullName || serverPeer.fullName || 'Unknown',
-              profileImage: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
-              profilePicture: normalizedUser?.profileImage || serverPeer.profileImage || serverPeer.profilePicture || '',
-              _id: serverPeer._id || normalizedUser?._id || normalizedUser?.userId,
-            };
-            navigation.navigate('ChatScreen', {
-              item: { ...chatPayload, peerUser: mergedPeer },
-            });
-          } else {
-            navigation.navigate('ChatScreen', { user: normalizedUser });
-          }
-          resolve();
-        };
-        const timer = setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          // Timeout — open chat with user-only payload as fallback
-          navigation.navigate('ChatScreen', { user: normalizedUser });
-          resolve();
-        }, 8000);
-
-        socket.on('chat:create:response', onResponse);
-        socket.emit('chat:create', { userId: normalizedUser._id || normalizedUser.userId });
-      } catch (err) {
-        console.warn('[AddUser] createChat error:', err?.message);
-        navigation.navigate('ChatScreen', { user: normalizedUser });
-        resolve();
-      }
-    });
-  }, [navigation]);
-
+  /**
+   * The one branch only this screen has: a phonebook number that is not a known
+   * account yet. `discoverContact` asks the server who it belongs to, and the
+   * discover effect above resumes the ordinary flow.
+   */
   const handleContactPress = useCallback(async (contact) => {
     if (!contact) return;
-    if (openChatInFlightRef.current) return; // prevent double-tap duplicates
-    openChatInFlightRef.current = true;
+    const outcome = await openUserChat(contact);
+    if (outcome !== 'unregistered') return;
 
-    try {
-      const normalizedUser = normalizeChatUser(contact);
-
-      // 1. Already have a chat? → open it (same nav pattern as ChatList → no duplicate screen)
-      const existingChat = findExistingChat(normalizedUser);
-      if (existingChat) {
-        navigateToExistingChat(existingChat, normalizedUser);
-        return;
-      }
-
-      const isRegistered = normalizedUser?.type === 'registered' || !!normalizedUser?.userId;
-
-      // 2. Registered user, no existing chat → create chat first, then navigate
-      if (isRegistered && (normalizedUser?._id || normalizedUser?.userId)) {
-        await createChatThenNavigate(normalizedUser);
-        return;
-      }
-
-      // 3. Unregistered (only number known) → discover then handle in discoverResponse effect
-      const discoverNumber = normalizedUser?.phoneNumber || normalizedUser?.hash;
-      if (discoverNumber && discoverContact) {
-        try { await discoverContact(discoverNumber); }
-        catch (err) { showMessage(err?.message || 'Failed to discover contact.'); }
-        return;
-      }
-
-      // 4. Last resort
-      navigation.navigate('ChatScreen', { user: normalizedUser });
-    } finally {
-      // Allow next press shortly after — covers fast-back-and-tap-again
-      setTimeout(() => { openChatInFlightRef.current = false; }, 600);
+    const discoverNumber = contact?.phoneNumber || contact?.hash;
+    if (discoverNumber && discoverContact) {
+      try { await discoverContact(discoverNumber); }
+      catch (err) { showMessage(err?.message || 'Failed to discover contact.'); }
+      return;
     }
-  }, [normalizeChatUser, findExistingChat, navigateToExistingChat, createChatThenNavigate, discoverContact, navigation]);
+
+    navigation.navigate('ChatScreen', { user: normalizeChatUser(contact) });
+  }, [openUserChat, discoverContact, navigation]);
 
   const handleRefresh = useCallback(async () => {
     if (refreshing || isSyncing) return;

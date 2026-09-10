@@ -41,6 +41,10 @@ import { prewarmChat, prewarmChats } from '../../services/ChatPrewarm';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { orderChatsForDisplay } from '../../utils/chatOrder';
+import { buildQuery, contactMatchScore } from '../../utils/contactSearch';
+import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
+import useOpenUserChat from '../../hooks/useOpenUserChat';
+import UserSearchRow from '../../components/UserSearchRow';
 import { getUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 import {
   DELETED_PWD_SET_KEY,
@@ -55,8 +59,9 @@ const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 // Debug switch for tracing WHERE the chat list comes from (SQLite cache vs the
 // REST API). The list renders from SQLite (via the realtime context); the API
-// is only hit when SQLite is empty (first login), on pull-to-refresh, or to
-// hydrate a brand-new chat missing its name/avatar. Flip to false to silence.
+// is hit once per launch to reconcile that snapshot with the server, when
+// SQLite is empty (first login), on pull-to-refresh, and to hydrate a
+// brand-new chat missing its name/avatar. Flip to false to silence.
 const DEBUG_CHAT_SOURCE = true;
 const cllog = (...args) => { if (DEBUG_CHAT_SOURCE) console.log('[CHAT-SOURCE]', ...args); };
 
@@ -67,6 +72,24 @@ const cllog = (...args) => { if (DEBUG_CHAT_SOURCE) console.log('[CHAT-SOURCE]',
 // race, so the delay is 0 there and behavior is unchanged.
 const MODAL_TRANSITION_MS = Platform.OS === 'ios' ? 450 : 0;
 const afterModalDismiss = (fn) => setTimeout(fn, MODAL_TRANSITION_MS);
+
+/**
+ * Which user's chat list has already been reconciled with the SERVER in this
+ * app process (see the cold-start effect in the component).
+ *
+ * Module scope on purpose: ChatList mounts and unmounts as the user moves
+ * around the tabs, and a per-instance ref would refetch the whole list every
+ * time they came back to Chats.
+ */
+let coldStartReconciledFor = null;
+/**
+ * Let the local-first paint land before asking the server anything. The point
+ * of the cold-start refresh is to be invisible — the list is already on screen
+ * by the time it runs.
+ */
+const COLD_START_REFRESH_DELAY_MS = 700;
+/** Post-launch networks are flaky (token just written, socket still coming up). */
+const COLD_START_REFRESH_MAX_ATTEMPTS = 3;
 const waitModalDismiss = () => new Promise((resolve) => setTimeout(resolve, MODAL_TRANSITION_MS));
 
 const MUTE_OPTIONS = [
@@ -254,8 +277,16 @@ const dedupeChatsByPeer = (list, currentUserId, contactMap) => {
 // A non-blocking background refresh on focus still keeps it fresh, and it is
 // cleared on session reset so contact names never leak across account switches.
 let _contactMapCache = null;
+/**
+ * The same read, kept as ROWS rather than a name map — that is what search
+ * needs. A row carries the number and the local name, so a saved contact you
+ * have never messaged can still be found by typing either. Same lifetime and
+ * the same session-reset wipe as the map above; they are filled together.
+ */
+let _registeredContactsCache = null;
 subscribeSessionReset(() => {
   _contactMapCache = null;
+  _registeredContactsCache = null;
 });
 
 // Shallow content equality so a background refresh that produced an identical
@@ -402,6 +433,9 @@ export default function ChatList({ navigation }) {
   // shown in the contact list). Refreshed whenever the screen regains focus, so
   // a contact saved/renamed elsewhere is reflected on return.
   const [contactMap, setContactMap] = useState(_contactMapCache);
+  // Saved contacts as rows — the pool chat-list search offers people from when
+  // they have no chat yet (see userSearchResults).
+  const [registeredContacts, setRegisteredContacts] = useState(_registeredContactsCache || []);
 
   // Multi-select state (WhatsApp-style "delete for me" of multiple chats)
   const [selectionMode, setSelectionMode] = useState(false);
@@ -578,6 +612,137 @@ export default function ChatList({ navigation }) {
 
   const isSearching = searchQuery.trim() !== '';
 
+  /* ── Search that reaches past the chats you already have ──────────────────
+   *
+   * The box used to filter the existing rows and stop there: to message someone
+   * new you had to leave, open the contact picker, and search again — the same
+   * query, in a second place. So the results now continue past the last chat
+   * with the people you could start one WITH, and tapping one lands in the
+   * thread exactly as the picker does (see useOpenUserChat — it is literally
+   * the same call, which is what keeps a second chat from being minted).
+   *
+   * Two pools, because no single one covers all three identifiers:
+   *   • SAVED CONTACTS, matched locally — the only pool that can match a NAME,
+   *     since the server directory has no idea what this device calls people.
+   *     Free: it is a filter over rows already in memory.
+   *   • THE SERVER DIRECTORY — @username and mobile number, i.e. people who are
+   *     not in this phonebook at all. Debounced, ≥3 chars, cached.
+   *
+   * Anyone already showing as a chat row is dropped from both, so the list
+   * never offers the same person twice.
+   */
+  const LOCAL_USER_RESULT_LIMIT = 8;
+
+  // Every peer this account already has a thread with — archived included, so a
+  // chat you archived does not come back as a "new" person.
+  const chatPeerIds = useMemo(() => {
+    const ids = new Set();
+    if (currentUserId) ids.add(String(currentUserId));
+    const collect = (list) => {
+      (Array.isArray(list) ? list : []).forEach((chat) => {
+        if (!chat || chat.chatType === 'group' || chat.isGroup) return;
+        [
+          chat?.peerUser?._id,
+          chat?.peerUser?.userId,
+          chat?.otherUser?._id,
+          chat?.otherUser?.userId,
+          peerIdOf(chat, currentUserId),
+        ].forEach((id) => { if (id) ids.add(String(id)); });
+      });
+    };
+    collect(effectiveChatList);
+    collect(effectiveArchivedChatList);
+    return ids;
+  }, [effectiveChatList, effectiveArchivedChatList, currentUserId]);
+
+  const localUserMatches = useMemo(() => {
+    if (!isSearching || registeredContacts.length === 0) return [];
+    const q = buildQuery(searchQuery);
+    const scored = [];
+    registeredContacts.forEach((c) => {
+      const id = String(c?.userId || '');
+      if (!id || chatPeerIds.has(id)) return;
+      // Same ranking the contact picker uses, so one query orders both screens
+      // the same way. No username field here — a saved contact row has a name
+      // and numbers; the directory pass below is what matches @handles.
+      const score = contactMatchScore(
+        { name: c.fullName || c.name, phones: [c.phone, c.phoneNumber, c.number, c.mobile?.number] },
+        q,
+      );
+      if (score > 0) scored.push({ score, contact: c });
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, LOCAL_USER_RESULT_LIMIT).map(({ contact }) => ({
+      id: String(contact.userId),
+      name: contact.fullName || contact.name || contact.phone || '',
+      subtitle: contact.phone || contact.phoneNumber || '',
+      avatarUri: contact.profileImage || contact.profilePicture || '',
+      isVerified: Boolean(contact.isVerified),
+      contact,
+    }));
+  }, [isSearching, searchQuery, registeredContacts, chatPeerIds]);
+
+  const directoryExcludeIds = useMemo(() => {
+    const ids = new Set(chatPeerIds);
+    localUserMatches.forEach((u) => ids.add(String(u.id)));
+    return ids;
+  }, [chatPeerIds, localUserMatches]);
+
+  const { results: directoryResults, loading: directoryLoading } = useUserDirectorySearch(
+    searchQuery,
+    { enabled: isSearching, excludeIds: directoryExcludeIds },
+  );
+
+  const userSearchResults = useMemo(() => {
+    if (!isSearching) return [];
+    const rows = [...localUserMatches];
+    (directoryResults || []).forEach((u) => {
+      const id = String(u?.userId || '');
+      if (!id) return;
+      const handle = u?.userName ? `@${String(u.userName).replace(/^@+/, '')}` : '';
+      const label = u?.name || handle || u?.mobileNumber || 'Unknown';
+      rows.push({
+        id,
+        name: label,
+        // Show the OTHER identifier below the name — the handle when we led
+        // with the name, the number when the handle is all there is.
+        subtitle: (u?.name && handle) ? handle : (u?.mobileNumber || handle || ''),
+        avatarUri: u?.avatar || '',
+        isVerified: Boolean(u?.isVerified),
+        contact: {
+          _id: id,
+          userId: id,
+          type: 'registered',
+          fullName: label,
+          name: label,
+          profileImage: u?.avatar || '',
+          profilePicture: u?.avatar || '',
+          mobileNumber: u?.mobileNumber || '',
+          userName: u?.userName || '',
+          isVerified: Boolean(u?.isVerified),
+        },
+      });
+    });
+    return rows;
+  }, [isSearching, localUserMatches, directoryResults]);
+
+  // Tapping one of those rows opens (or creates) the chat — the contact
+  // picker's flow, unchanged. Archived chats are in the pool too, so an
+  // archived thread is reopened rather than duplicated.
+  const openChatSearchPool = useMemo(
+    () => [...(effectiveChatList || []), ...(effectiveArchivedChatList || [])],
+    [effectiveChatList, effectiveArchivedChatList],
+  );
+  const { openUserChat, openingUserId } = useOpenUserChat({ chats: openChatSearchPool });
+
+  const handleUserResultPress = useCallback(async (row) => {
+    if (!row?.contact) return;
+    await openUserChat(row.contact);
+    // The thread is the destination now — leaving the query behind means
+    // coming back to the full list, not to a stale search.
+    setSearchQuery('');
+  }, [openUserChat]);
+
   // ── PREWARM THE TOP THREADS ───────────────────────────────────────────────
   // ChatScreen paints instantly only on a ChatCache HIT (a synchronous Map
   // lookup it can use on its very first render). Warming at tap time — what
@@ -640,12 +805,19 @@ export default function ChatList({ navigation }) {
 
       const loadOnce = async () => {
         const registered = await ContactDatabase.loadRegisteredContacts();
+        const rows = Array.isArray(registered) ? registered.filter((c) => c?.userId) : [];
         const map = {};
-        for (const c of registered || []) {
-          if (!c?.userId) continue;
+        for (const c of rows) {
           const fullName = String(c.fullName || c.name || '').trim();
           if (!fullName) continue;
           map[String(c.userId)] = { fullName, profileImage: c.profileImage || c.profilePicture || null };
+        }
+        // The rows ride along with the map: one read, two consumers (row names
+        // and search). Length is a good enough change test — the map comparison
+        // below already covers a rename.
+        if (rows.length !== (_registeredContactsCache?.length || 0)) {
+          _registeredContactsCache = rows;
+          setRegisteredContacts(rows);
         }
         return map;
       };
@@ -850,6 +1022,62 @@ export default function ChatList({ navigation }) {
     }, [realtimeChatList])
   );
 
+  // ── Cold start: paint local, then reconcile with the server ───────────────
+  //
+  // The list is local-first, which is what makes it appear instantly. But the
+  // local snapshot is only as good as whatever last wrote it, and rows can be
+  // created WITHOUT server identity — a socket message for a chat this install
+  // has never fetched creates a row with no group/channel name, no avatar, no
+  // pin state and no delivery ticks. That is the "Group" / "Channel" list with
+  // missing ticks users saw on a fresh install.
+  //
+  // Nothing ever corrected it, because the first-load effect above settles the
+  // moment ANY rows exist — its job is only "the list must not be empty". So
+  // the sole path to server truth was the user pulling to refresh, which is
+  // exactly why pulling fixed everything.
+  //
+  // This runs the SAME call pull-to-refresh makes, once per app launch, a beat
+  // after first paint and with NO spinner: the user's own gesture is the only
+  // thing that should ever show one. It is keyed by user id, so a different
+  // account logging in on this device reconciles again.
+  useEffect(() => {
+    if (!currentUserId) return undefined;                    // wait until we know who we are
+    if (coldStartReconciledFor === currentUserId) return undefined;
+    // The empty-list chain above is already fetching the very same thing —
+    // don't ask twice on a cold start that had nothing cached at all.
+    if (firstLoadAttemptsRef.current > 0) {
+      coldStartReconciledFor = currentUserId;
+      return undefined;
+    }
+
+    let cancelled = false;
+    let attempts = 0;
+    let timer = null;
+
+    const run = async () => {
+      timer = null;
+      attempts += 1;
+      try {
+        cllog('🌐 CHAT LIST: cold start → background REST reconcile (chatListData)', {
+          attempt: attempts,
+        });
+        await dispatch(chatListData('')).unwrap();
+        if (!cancelled) coldStartReconciledFor = currentUserId;
+        return;
+      } catch (err) {
+        cllog('⚠️ CHAT LIST: cold-start reconcile failed', { message: err?.message || String(err) });
+      }
+      if (cancelled || attempts >= COLD_START_REFRESH_MAX_ATTEMPTS) return;
+      timer = setTimeout(run, 1500 * attempts);            // 1.5s, 3s
+    };
+
+    timer = setTimeout(run, COLD_START_REFRESH_DELAY_MS);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [currentUserId, dispatch]);
+
   // When a chat appears without a resolved peer (e.g. a brand-new chat created
   // by an incoming message, which arrives over the socket with no name/avatar),
   // refetch the chat list so the row is fully hydrated (name / number / avatar)
@@ -922,12 +1150,16 @@ export default function ChatList({ navigation }) {
     if (newChatRefetchTimerRef.current) clearTimeout(newChatRefetchTimerRef.current);
   }, []);
 
-  // Pull-to-refresh: the ONLY time API is called after initial sync
+  // Pull-to-refresh: the user's own "get me the truth" gesture. It is no longer
+  // the ONLY server call after the initial sync — the cold-start effect above
+  // makes the same one, silently, once per launch.
   const handleRefresh = async () => {
     setRefreshing(true);
     try {
       cllog('🌐 CHAT LIST: pull-to-refresh → REST API call (chatListData)');
       await dispatch(chatListData(''));
+      // This IS the reconcile — don't have the cold-start effect repeat it.
+      if (currentUserId) coldStartReconciledFor = currentUserId;
     } catch (err) {
       console.warn('Failed to refresh chats:', err);
     } finally {
@@ -1581,6 +1813,9 @@ export default function ChatList({ navigation }) {
 
   const renderEmptyComponent = () => {
     if (isSearching) {
+      // People to start a chat with ARE results — the section below carries
+      // them, so an empty-state block on top of it would contradict itself.
+      if (userSearchResults.length > 0 || directoryLoading) return null;
       return (
         <View style={styles.emptyWrap}>
           <View style={[styles.emptyIconCircle, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}>
@@ -1607,6 +1842,52 @@ export default function ChatList({ navigation }) {
         <Text style={[styles.emptySubtitle, { color: theme.colors.placeHolderTextColor }]}>
           Start a new chat by tapping the button below
         </Text>
+      </View>
+    );
+  };
+
+  /**
+   * The "…and here is who else you could message" tail of a search.
+   *
+   * A footer rather than more list items: the rows are few (capped and
+   * debounced), and keeping them out of `data` leaves the chat list's own
+   * keyExtractor, getItemLayout and selection logic untouched.
+   */
+  const renderUserSearchResults = () => {
+    if (!isSearching) return null;
+    if (userSearchResults.length === 0) {
+      if (!directoryLoading) return null;
+      return (
+        <View style={styles.userSearchLoading}>
+          <ActivityIndicator size="small" color={theme.colors.themeColor} />
+        </View>
+      );
+    }
+
+    return (
+      <View style={styles.userSearchWrap}>
+        <Text style={[styles.userSearchHeader, { color: theme.colors.placeHolderTextColor }]}>
+          Not in your chats
+        </Text>
+        {userSearchResults.map((row) => (
+          <UserSearchRow
+            key={`usr_${row.id}`}
+            name={row.name}
+            subtitle={row.subtitle}
+            avatarUri={row.avatarUri}
+            isVerified={row.isVerified}
+            busy={openingUserId === row.id}
+            textColor={theme.colors.primaryTextColor}
+            subTextColor={theme.colors.placeHolderTextColor}
+            themeColor={theme.colors.themeColor}
+            onPress={() => handleUserResultPress(row)}
+          />
+        ))}
+        {directoryLoading ? (
+          <View style={styles.userSearchLoading}>
+            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+          </View>
+        ) : null}
       </View>
     );
   };
@@ -1847,6 +2128,10 @@ export default function ChatList({ navigation }) {
             onRefresh={handleRefresh}
             ListHeaderComponent={listHeader}
             ListEmptyComponent={renderEmptyComponent}
+            ListFooterComponent={renderUserSearchResults}
+            // Without this the first tap on a search result only dismisses the
+            // keyboard, and the row looks unresponsive.
+            keyboardShouldPersistTaps="handled"
             style={{ width: '100%' }}
             contentContainerStyle={styles.listContent}
             removeClippedSubviews={Platform.OS === 'android'}
@@ -2445,6 +2730,25 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontFamily: 'Roboto-Medium',
     letterSpacing: 0.1,
+  },
+
+  // ─── SEARCH: PEOPLE WITHOUT A CHAT YET ───
+  userSearchWrap: {
+    paddingTop: 6,
+    paddingBottom: 12,
+  },
+  userSearchHeader: {
+    fontFamily: 'Roboto-Medium',
+    fontSize: 12,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 6,
+  },
+  userSearchLoading: {
+    paddingVertical: 14,
+    alignItems: 'center',
   },
 
   // ─── ARCHIVE ROW ───

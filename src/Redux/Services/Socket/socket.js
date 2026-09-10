@@ -157,6 +157,11 @@ const isTokenErrorPayload = (payload = {}) => {
 };
 
 const isAuthConnectError = (error) => {
+  // socket.io attaches the server middleware's rejection payload to `error.data`
+  // (that's how `next(new Error(...))` with extra fields arrives). Check it with
+  // the same rules as an in-band auth failure so an expired-token handshake is
+  // still recognised even when `message` is a generic label.
+  if (error?.data && isTokenErrorPayload(error.data)) return true;
   const message = String(error?.message || error?.description || error || '');
   return TOKEN_ERROR_REGEX.test(message);
 };
@@ -555,6 +560,18 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
           };
 
           const onConnectError = (error) => {
+            // Only an AUTH-shaped handshake rejection means anything here. A
+            // plain transport failure ("websocket error", "xhr poll error",
+            // "timeout") is a radio blip that socket.io is already retrying
+            // underneath us — aborting the attempt on it burned all three
+            // retries in a few seconds and produced the endless
+            // "socket reauthentication attempt failed" loop against a token
+            // that was perfectly valid (REST kept working throughout). Let the
+            // connect-phase timeout be the only thing that gives up.
+            if (!isAuthConnectError(error)) {
+              console.log('⏳ reauth: ignoring transient connect_error (socket.io still retrying):', error?.message || error);
+              return;
+            }
             finalize(new Error(error?.message || 'Socket connect_error during reauthentication'));
           };
 
@@ -579,7 +596,9 @@ const requestSocketReauthentication = async (reason = 'unknown', navigation = cu
           // Use .once() to avoid listener leaks across retry attempts.
           socketRef.once('reauthenticated', onReauthenticated);
           socketRef.once('reauthentication_failed', onReauthFailed);
-          socketRef.once('connect_error', onConnectError);
+          // .on (not .once): onConnectError ignores transient errors, so it has
+          // to survive them. cleanup() removes it with .off on every exit path.
+          socketRef.on('connect_error', onConnectError);
 
           timeoutHandle = setTimeout(() => {
             console.log('⏱️ reauthentication timeout occurred (will retry)', {
@@ -762,7 +781,18 @@ const attachCoreSocketListeners = (navigation) => {
     // (screen off, Wi-Fi/data toggle). Logged at log-level — NOT console.error —
     // so React Native's LogBox doesn't surface a red "websocket error" overlay
     // for an expected, self-healing event. The reconnect logic recovers silently.
-    console.log('🔌 socket connect_error (will retry):', error?.message || error);
+    // engine.io buries the ACTUAL cause (ECONNREFUSED, timeout, TLS mismatch,
+    // an HTTP status from a proxy) in `description`/`context` and only surfaces
+    // the useless label "websocket error" as `message` — log all of it, or a
+    // real server-side failure is indistinguishable from a radio blip.
+    console.log('🔌 socket connect_error (will retry):', {
+      message: error?.message || String(error),
+      type: error?.type,
+      description: error?.description?.message || error?.description,
+      statusCode: error?.context?.status ?? error?.description?.status,
+      transport: socket?.io?.engine?.transport?.name,
+      url: SOCKET_URL,
+    });
     updateSocketState({
       status: 'connect_error',
       connected: false,
@@ -1151,7 +1181,20 @@ export const initSocket = async (deviceInfo, navigation) => {
 
     updateSocketState({ status: 'connecting', connected: false, lastError: null });
     socket = io(SOCKET_URL, {
-      transports: ['websocket', 'polling'],
+      // Polling FIRST, then upgrade. A raw WebSocket handshake is materially
+      // more fragile than HTTP long-polling on a mobile radio: carrier/Wi-Fi
+      // handoff, NAT re-mapping and OS socket suspension (iOS especially) kill
+      // an opening WS outright, which surfaced as an endless generic
+      // `connect_error: websocket error` while plain REST kept working. Polling
+      // tolerates those blips, and engine.io transparently upgrades to
+      // WebSocket once the connection is stable — so this is a reorder, not a
+      // capability change (the server accepts both: SOCKET_WEBSOCKET_ONLY=false).
+      transports: ['polling', 'websocket'],
+      upgrade: true,
+      // Must stay false: rememberUpgrade caches "websocket worked last time"
+      // and makes the NEXT connect skip polling and go straight to a raw WS —
+      // which is exactly the fragile path we just moved off.
+      rememberUpgrade: false,
       auth: authPayload,
       reconnection: true,
       // Never give up reconnecting. The old cap (10 attempts ≈ a minute of bad
@@ -1161,7 +1204,12 @@ export const initSocket = async (deviceInfo, navigation) => {
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 7000,
-      timeout: 12000,
+      // Jitter the backoff so a tower/Wi-Fi flap doesn't have every client
+      // retrying in lockstep on the same tick.
+      randomizationFactor: 0.5,
+      // Handshake budget. 12s was tight for a first polling round-trip on a
+      // congested/slow radio, and a timeout here counts as a connect failure.
+      timeout: 20000,
       autoConnect: true,
     });
 
@@ -1200,6 +1248,33 @@ const emitBackToForeground = () => {
   startPresenceHeartbeat();
 };
 
+// Connectivity-driven reconnect. socket.io's backoff can be sitting on a timer
+// of up to reconnectionDelayMax, and on mobile that timer is often *stale*: the
+// OS froze it while the app was suspended or while the radio was down, so after
+// the network returns the app can sit "disconnected" for seconds with nothing
+// in flight. Watching NetInfo lets us kick a connect attempt on the exact edge
+// where it can actually succeed. Best-effort and idempotent — socket.connect()
+// on an already-connected/connecting socket is a no-op.
+const setupNetworkReconnect = (navigation) => {
+  let unsub = () => {};
+  let wasOnline = true;
+  try {
+    const NetInfo = require('@react-native-community/netinfo').default;
+    unsub = NetInfo.addEventListener((state) => {
+      const online = !!state?.isConnected && state?.isInternetReachable !== false;
+      const cameBack = online && !wasOnline;
+      wasOnline = online;
+      if (!cameBack) return;
+      if (!socket || socket.connected || reauthPromise) return;
+      console.log('📶 network back — kicking socket reconnect');
+      reconnectSocket(navigation).catch(() => {});
+    });
+  } catch (e) {
+    console.warn('network reconnect wiring skipped (non-fatal):', e?.message);
+  }
+  return () => { try { unsub(); } catch (_) { /* */ } };
+};
+
 export const setupAppStateListener = (navigation) => {
   const handleAppStateChange = async (nextAppState) => {
     const goingBackground = nextAppState.match(/inactive|background/);
@@ -1228,9 +1303,11 @@ export const setupAppStateListener = (navigation) => {
   // so register it here and fold its teardown into the returned cleanup — every
   // existing caller (AuthContext) then gets lock-aware presence for free.
   const unsubLock = setupDeviceLockPresence();
+  const unsubNet = setupNetworkReconnect(navigation);
   return () => {
     subscription.remove();
     try { unsubLock(); } catch (_) { /* */ }
+    try { unsubNet(); } catch (_) { /* */ }
   };
 };
 
@@ -1395,18 +1472,34 @@ export const reconnectSocket = async (navigation) => {
         resolve();
       };
       const onErr = (err) => {
+        // Same rule as the reauth path: a transport-level error is not a reason
+        // to stop waiting — socket.io is retrying with backoff underneath, and
+        // the 8s timer above is the real deadline. Only an auth-shaped
+        // handshake rejection short-circuits.
         if (settled) return;
+        if (!isAuthConnectError(err)) return;
         settled = true;
         clearTimeout(timer);
         socket.off('connect', onOk);
+        socket.off('connect_error', onErr);
         reject(err);
       };
       socket.once('connect', onOk);
-      socket.once('connect_error', onErr);
+      socket.on('connect_error', onErr);
     });
     return socket;
-  } catch (_err) {
-    // Simple reconnect failed, try full reauthentication
+  } catch (err) {
+    // Escalate to a full reauthentication ONLY when the failure actually looks
+    // like an auth problem. Escalating on a plain "reconnect timeout" (bad
+    // signal, backgrounded radio) was the head of the reauth loop: every
+    // foreground on a flaky network kicked off a reauth that then failed on its
+    // own transport errors, while the access token was never the problem. On a
+    // network failure we simply hand the socket back to socket.io's own
+    // infinite-retry manager, which is already working the problem.
+    if (!isAuthConnectError(err)) {
+      console.log('🔁 reconnectSocket: network failure, leaving retry to socket.io:', err?.message || err);
+      return socket;
+    }
     return requestSocketReauthentication('manual_reconnect', navigation);
   }
 };

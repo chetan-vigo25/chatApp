@@ -321,6 +321,24 @@ class NativeCallEngine {
       this._post(EVT.CONNECT_ERROR, { message: 'react-native-webrtc native module unavailable (rebuild the dev client)' });
       return;
     }
+    // HARD GUARD: a call is already ESTABLISHED on this engine. Everything below
+    // can end it — _connectFresh hangs up an established room outright, and even
+    // the reuse path falls through to a rebuild when the liveness probe fails on
+    // a socket that idled in the background. Both mean the media server drops the
+    // peer, i.e. the call dies. That is what killed an ongoing Android call the
+    // moment the app was re-opened (the remounted UI has engineReady=false, so
+    // its pre-warm/foreground connect fired straight into the live call).
+    // A joined room never needs a connect: socket.io reconnects on its own and
+    // the SDK's 'connect' handler calls _resume() to restore the room media. So
+    // refresh the credentials in place and report ready.
+    if (this._sdk && this._sdk._room && this._sdk._room.joined) {
+      if (typeof token === 'string' && token.split('.').length === 3) this._sdk._token = token;
+      if (Array.isArray(iceServers) && iceServers.length) this._sdk._fallbackIceServers = iceServers;
+      this._log('connect: a LIVE call is in progress — refusing to rebuild the engine socket');
+      this._post(EVT.ENGINE_READY, { screenShare: this._screenShareSupported() });
+      return;
+    }
+
     // REUSE a live, registered SDK when the identity + server are unchanged.
     // The old unconditional teardown dropped the PRE-WARMED socket at every
     // call start (server logs: connected → disconnected → connected) and

@@ -216,6 +216,18 @@ const PEER_REDIAL_GUARD_MS = 4000;
 // guarantees the call still ends even if no server signal arrives.
 const RECONNECT_TIMEOUT_MS = 7000;
 
+// The same bound for a call whose app is NOT in the foreground (screen locked,
+// app switched away). Everything the 7s assumes stops being true there: iOS
+// throttles timers and networking the instant the screen locks, so an ICE
+// renegotiation that takes ~1s in the foreground can take tens of seconds
+// behind the lock screen — and the local watchdog firing first ends a call the
+// SERVER still holds open, on BOTH devices. That is the "lock button dabate hi
+// call cut" report. Backgrounded, we therefore stop being the one who decides:
+// hold the "Reconnecting…" state and let the authoritative server signal
+// (call:ended after its 5s peer-disconnect grace) end the call. This stays only
+// as the backstop for "no signal ever arrived", which is why it is still bounded.
+const RECONNECT_TIMEOUT_BG_MS = 45000;
+
 // When a call ends with a reason the user needs to READ (busy / unavailable /
 // blocked-by-admin / declined / failed), keep the end screen up at least this
 // long before auto-returning to chat. A plain hang-up resets fast.
@@ -259,7 +271,12 @@ export const getBlockRelation = (peerId) => {
 };
 
 export const CallProvider = ({ children }) => {
-  const { user, isAuthenticated } = useAuth();
+  // `authRestoring` (AuthContext isLoading) matters as much as isAuthenticated here:
+  // on a FRESH MOUNT — including the Android remount after the task was swiped out
+  // of Recents mid-call — isAuthenticated starts `false` and only flips true once
+  // checkLoginStatus() has read AsyncStorage. Treating that window as a logout tore
+  // the engine down under a call that was still running (see the auth effect below).
+  const { user, isAuthenticated, isLoading: authRestoring } = useAuth();
   // Stored user shape varies by login era/platform (_id vs id vs userId) —
   // an iOS build hit "missing user identity" because the persisted user
   // object had no `_id`, so never depend on a single field name here.
@@ -284,7 +301,11 @@ export const CallProvider = ({ children }) => {
   // call button in the app dims immediately on the first tap, instead of only
   // after the outgoing state commits. Cleared when startCall settles/aborts.
   const [starting, setStarting] = useState(false);
-  const [engineReady, setEngineReady] = useState(false);
+  // A call ADOPTED at boot means the engine is already connected and carrying it (the
+  // keeper only holds a session while the engine is live), so start from "ready":
+  // that keeps the pre-warm connect below a no-op instead of having it rebuild the
+  // engine socket underneath a running call.
+  const [engineReady, setEngineReady] = useState(() => !!callSession.peekSession());
   const [presenceMap, setPresenceMap] = useState({}); // { userId: bool }
   // Whether the platform supports app-controlled audio output routing (Android
   // WebView); false on iOS WKWebView where the OS routes speaker/earpiece.
@@ -297,7 +318,7 @@ export const CallProvider = ({ children }) => {
 
   const webRef = useRef(null);
   const stateRef = useRef(state);
-  const engineReadyRef = useRef(false);
+  const engineReadyRef = useRef(engineReady);
   const endedRef = useRef(false);
   // Synchronous re-entrancy guard for startCall. `callBusy`/`stateRef.status`
   // only flip to non-IDLE AFTER the START_OUTGOING dispatch commits — but
@@ -947,6 +968,17 @@ export const CallProvider = ({ children }) => {
   const doConnect = useCallback(async () => {
     if (IS_EXPO_GO) return;
     if (connectingRef.current || engineReadyRef.current) return;
+    // NEVER rebuild the engine underneath a call whose media is already up. A
+    // CONNECT re-registers (and, when the idle socket fails the liveness probe,
+    // REBUILDS) the SDK socket — and the media server drops the peer that socket
+    // owns, which ends the call. That is exactly what "Android: re-open the app
+    // and the ongoing call disconnects" was: the remount left engineReady false,
+    // so the pre-warm/foreground connect fired into a live call. A live room needs
+    // no warming — socket.io's own reconnect + the SDK's _resume() recover it.
+    // Scoped to ACTIVE on purpose: an INCOMING/OUTGOING call still NEEDS this
+    // connect (answering from the banner after the socket idled in the background
+    // relies on it), and the engine has its own live-room guard for the rest.
+    if (stateRef.current?.status === CALL_STATUS.ACTIVE) return;
     connectingRef.current = true;
     try {
       // One quick retry on the token mint: a locked-device CallKit answer boots
@@ -1616,14 +1648,32 @@ export const CallProvider = ({ children }) => {
   // "Connection lost" rather than leaving a live-looking but dead call on screen.
   const armReconnectWatchdog = useCallback(() => {
     clearReconnectWatchdog();
-    reconnectWatchdogRef.current = setTimeout(() => {
+    const armedAt = Date.now();
+    const tick = () => {
       reconnectWatchdogRef.current = null;
       const snap = stateRef.current;
       if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
       if (!snap.reconnecting) return; // recovered already
-      if (__DEV__) console.log('[CALL] reconnect watchdog — media never recovered → ending');
+      const elapsedMs = Date.now() - armedAt;
+      // Not foregrounded → the blip is expected and recovery is slow (see
+      // RECONNECT_TIMEOUT_BG_MS). Keep holding instead of ending the call.
+      if (AppState.currentState !== 'active' && elapsedMs < RECONNECT_TIMEOUT_BG_MS) {
+        if (__DEV__) {
+          console.log('[CALL] reconnect watchdog — app not foregrounded, holding (server decides)', {
+            platform: Platform.OS, appState: AppState.currentState, elapsedMs,
+          });
+        }
+        reconnectWatchdogRef.current = setTimeout(tick, RECONNECT_TIMEOUT_MS);
+        return;
+      }
+      if (__DEV__) {
+        console.log('[CALL] reconnect watchdog — media never recovered → ending', {
+          platform: Platform.OS, appState: AppState.currentState, elapsedMs,
+        });
+      }
       finalizeEnd('failed', 'Connection lost');
-    }, RECONNECT_TIMEOUT_MS);
+    };
+    reconnectWatchdogRef.current = setTimeout(tick, RECONNECT_TIMEOUT_MS);
   }, [clearReconnectWatchdog, finalizeEnd]);
 
   // Flip the live call's UI to VIDEO (mid-call upgrade — self camera on, or the
@@ -2263,6 +2313,11 @@ export const CallProvider = ({ children }) => {
         // authoritative signals above.
         if (snap.answeredAt && (snap.status === CALL_STATUS.ACTIVE || snap.accepted)) {
           if (!snap.reconnecting) {
+            if (__DEV__) {
+              console.log('[CALL][APP] peerLeft on a live 1:1 → reconnecting', {
+                platform: Platform.OS, appState: AppState.currentState, signalId: snap.signalId, callId: snap.callId,
+              });
+            }
             dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: true });
             armReconnectWatchdog();
             // A recovery restart mid-reconnect would fight the rejoin — drop
@@ -2284,6 +2339,11 @@ export const CallProvider = ({ children }) => {
         if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) break;
         if (!snap.answeredAt) break;
         if (!snap.reconnecting) {
+          if (__DEV__) {
+            console.log('[CALL][APP] mediaDown → reconnecting', {
+              platform: Platform.OS, appState: AppState.currentState, signalId: snap.signalId, callId: snap.callId,
+            });
+          }
           dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: true });
           armReconnectWatchdog();
           // Nudge the transport to renegotiate immediately (in addition to any
@@ -4779,6 +4839,16 @@ export const CallProvider = ({ children }) => {
 
   // mount/teardown engine with auth
   useEffect(() => {
+    // Auth is still being RESTORED from storage — not a logout. On every fresh
+    // mount isAuthenticated starts false, and on Android that mount can happen
+    // MID-CALL (the task was swiped out of Recents, the foreground service kept
+    // the process + engine + media alive, and re-opening the app rebuilds the
+    // React tree). Running the logout teardown in that window called
+    // nativeEngine.shutdown() → sdk.hangup() on the call that was still running:
+    // transports closed, the peer's client saw us leave, and the backend ended
+    // the call a moment after the app came back. Wait for checkLoginStatus() to
+    // settle; a REAL logout has isLoading false and still tears down below.
+    if (authRestoring) return undefined;
     if (!isAuthenticated) {
       setEngineReady(false);
       connectingRef.current = false;
@@ -4802,7 +4872,7 @@ export const CallProvider = ({ children }) => {
       if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
       clearRingTimeout();
     };
-  }, [isAuthenticated, clearRingTimeout, stopRinging]);
+  }, [isAuthenticated, authRestoring, clearRingTimeout, stopRinging]);
 
   // Native call UI (CallKit / ConnectionService) — inert no-op unless
   // react-native-callkeep is installed and the app rebuilt. Maps OS actions
