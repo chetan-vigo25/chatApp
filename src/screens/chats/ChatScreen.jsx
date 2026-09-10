@@ -40,6 +40,8 @@ import { useTheme, onColorFor, metaOnColorFor, sentBubbleBgFor } from "../../con
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
+import { isOutgoingMessage } from "../../utils/messageDirection";
+import { mentionsOf, inferMentionsFromText, splitTextOnMentions } from "../../utils/mentions";
 import { useSelector, useDispatch } from "react-redux";
 import { unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import ChatHeaderPresence from "../../presence/components/ChatHeaderPresence";
@@ -65,7 +67,6 @@ import ReportBottomSheet from '../../components/ReportBottomSheet';
 import ChatWallpaper from '../../components/ChatWallpaper';
 import AttachmentSheet from '../../components/AttachmentSheet';
 import MentionSuggestions, { useMentions } from '../../components/MentionInput';
-import MentionText from '../../components/MentionText';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
 import ScheduleTimePicker from '../../components/ScheduleTimePicker';
 import ReplyBubble from '../../components/ReplyBubble';
@@ -172,8 +173,7 @@ const isTranslatableMessage = (msg) => (
   Boolean(msg)
   && msg.type === 'text'
   && !msg.isDeleted
-  && !msg.mentions
-  && !msg.payload?.mentions
+  && !mentionsOf(msg)
   && typeof msg.text === 'string'
   && !containsCode(msg.text)
 );
@@ -2396,7 +2396,7 @@ export default function ChatScreen({ navigation, route }) {
    * be rendered differently on every recipient's device.
    */
   const isOwnMessage = useCallback((msg) => (
-    msg?.senderType ? msg.senderType === 'self' : sameId(msg?.senderId, currentUserId)
+    isOutgoingMessage(msg, currentUserId)
   ), [currentUserId]);
 
   const shouldTranslateMessage = useCallback((msg) => (
@@ -3282,7 +3282,7 @@ export default function ChatScreen({ navigation, route }) {
     // Resolve URI. For received notes we STREAM from the remote URL when the
     // file isn't downloaded yet (WhatsApp-style) instead of blocking on a full
     // download — expo-av plays remote https progressively.
-    const isSender = msg?.senderType === 'self' || msg?.senderId === currentUserId;
+    const isSender = isOutgoingMessage(msg, currentUserId);
     let uri = null;
 
     if (isSender) {
@@ -3405,7 +3405,7 @@ export default function ChatScreen({ navigation, route }) {
 
   // Resolve a local file URI for a message (sender or receiver)
   const resolveLocalFileUri = async (msg) => {
-    const isSenderMsg = msg?.senderType === 'self' || msg?.senderId === currentUserId;
+    const isSenderMsg = isOutgoingMessage(msg, currentUserId);
     if (isSenderMsg) {
       const directUris = [
         msg?.localUri,
@@ -4672,7 +4672,7 @@ export default function ChatScreen({ navigation, route }) {
     if (lastAutoScrollIdRef.current === latestId) return;
     lastAutoScrollIdRef.current = latestId;
 
-    const isMine = latest?.senderType === 'self' || (currentUserId && latest?.senderId === currentUserId);
+    const isMine = isOutgoingMessage(latest, currentUserId);
     if (!isMine && !isAtLatest) return;
 
 
@@ -5218,57 +5218,43 @@ export default function ChatScreen({ navigation, route }) {
     return text.startsWith('@') ? text : `@${text}`;
   };
 
+  // Renders ONE run of message text, highlighting only the "@name" tokens
+  // inside it. Everything else keeps the ordinary bubble style — "@User Ballu
+  // hi" is a single bold token followed by a plain " hi".
+  //
+  // Segmentation lives in utils/mentions so the sender's optimistic bubble and
+  // the receiver's reloaded one cannot drift apart; this function only decides
+  // how a segment LOOKS and what label it shows.
   const renderTextWithMentions = (textStr, mentions, baseColor, mentionColor, keyPrefix) => {
-    if (!mentions || mentions.length === 0 || !textStr) {
-      return <Text style={{ color: baseColor }}>{textStr}</Text>;
+    const segments = splitTextOnMentions(textStr, mentions);
+    if (segments.length === 0) return null;
+    if (segments.length === 1 && segments[0].type === 'text') {
+      return <Text style={{ color: baseColor }}>{segments[0].content}</Text>;
     }
-    // Build a set of mentioned display names
-    const mentionNames = mentions
-      .filter((m) => m.displayName)
-      .map((m) => m.displayName);
-    if (mentionNames.length === 0) {
-      return <Text style={{ color: baseColor }}>{textStr}</Text>;
-    }
-    // Escape regex special chars and build pattern. Longest name first, so
-    // "@ram kumar" is not cut short by a member also called "@ram".
-    const escaped = [...mentionNames]
-      .sort((a, b) => b.length - a.length)
-      .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    const pattern = new RegExp(`(@(?:${escaped.join('|')}))`, 'g');
-    const parts = textStr.split(pattern);
-    if (parts.length <= 1) {
-      return <Text style={{ color: baseColor }}>{textStr}</Text>;
-    }
-    // token → what THIS viewer should see. A Map, not a Set: lookup beats
-    // re-testing the /g pattern (whose `test` advances lastIndex, so the old
-    // code had to reset it by hand on every branch and a miss silently rendered
-    // a mention as plain text), and it carries the resolved label along.
-    const labelByToken = new Map();
-    mentions.forEach((m) => {
-      if (!m?.displayName) return;
-      labelByToken.set(`@${m.displayName}`, mentionLabelFor(m));
-    });
 
-    return parts.map((part, i) => {
-      if (labelByToken.has(part)) {
-        return (
-          <Text
-            key={`${keyPrefix}_m${i}`}
-            style={{
-              color: mentionColor,
-              // fontWeight, not just the family: the Roboto files are never
-              // registered (App.js imports useFonts but never calls it), so
-              // 'Roboto-SemiBold' alone silently fell back to the regular face
-              // and the mention rendered at the same weight as the message.
-              fontFamily: 'Roboto-Bold',
-              fontWeight: '700',
-            }}
-          >
-            {labelByToken.get(part) || part}
-          </Text>
-        );
+    return segments.map((seg, i) => {
+      if (seg.type !== 'mention') {
+        return <Text key={`${keyPrefix}_t${i}`} style={{ color: baseColor }}>{seg.content}</Text>;
       }
-      return <Text key={`${keyPrefix}_t${i}`} style={{ color: baseColor }}>{part}</Text>;
+      return (
+        <Text
+          key={`${keyPrefix}_m${i}`}
+          style={{
+            color: mentionColor,
+            // fontWeight, not just the family: the Roboto files are never
+            // registered (App.js imports useFonts but never calls it), so
+            // 'Roboto-SemiBold' alone silently fell back to the regular face
+            // and the mention rendered at the same weight as the message.
+            fontFamily: 'Roboto-Bold',
+            fontWeight: '700',
+          }}
+        >
+          {/* The token in `text` is the anchor; the LABEL is re-resolved from
+              this viewer's address book, so the same message reads "@Priyansh"
+              for one person and "@~Brijesh" for another. */}
+          {mentionLabelFor(seg) || seg.content}
+        </Text>
+      );
     });
   };
 
@@ -5291,7 +5277,12 @@ export default function ChatScreen({ navigation, route }) {
     const baseColor = isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.primaryTextColor);
     const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
     const mentionColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
-    const msgMentions = msg?.mentions || msg?.payload?.mentions;
+    // Metadata first. The roster fallback covers rows that reached this device
+    // without it — anything stored before the ingest carried the array, or a
+    // server that doesn't echo it back — by matching "@name" against the
+    // members of THIS conversation. It can only ever miss, never mislabel.
+    const msgMentions = mentionsOf(msg)
+      || (isGroupChat ? inferMentionsFromText(displayText, groupMembersMap) : null);
 
     const handleMeasureLayout = (event) => {
       const lineCount = event?.nativeEvent?.lines?.length || 0;
@@ -5669,7 +5660,7 @@ export default function ChatScreen({ navigation, route }) {
       return;
     }
 
-    const isMine = msg?.senderType ? msg.senderType === 'self' : sameId(msg.senderId, currentUserId);
+    const isMine = isOutgoingMessage(msg, currentUserId);
     const open = (rect) => {
       setMenuFor({ msg, key, isMyMessage: isMine, rect });
       setReactionMsgId(key);
@@ -6583,9 +6574,12 @@ export default function ChatScreen({ navigation, route }) {
   const renderChatsItem = useCallback(({ item: msg, index }) => {
     const messageKey = getMessageKey(msg);
     const isSelected = selectedMessage.some(sel => sameId(sel, messageKey));
-    const isMyMessage = msg?.senderType
-      ? msg.senderType === 'self'
-      : sameId(msg.senderId, currentUserId);
+    // Which side this row renders on. Resolved from the row's OWN participant
+    // ids against the authenticated user (see utils/messageDirection), never
+    // from a side that was frozen in at write time — so the answer is identical
+    // on first paint, on reopen, and regardless of whether the user id or the
+    // message resolved first.
+    const isMyMessage = isOutgoingMessage(msg, currentUserId);
     const highlightedId = searchResults[currentSearchIndex]?.serverMessageId || searchResults[currentSearchIndex]?.id || searchResults[currentSearchIndex]?.tempId;
     const isSearchHighlighted = isSearching && searchResults.length > 0 && currentSearchIndex >= 0 && sameId(highlightedId, messageKey);
     // Match against every identifier the parent might have stored — same set
@@ -6644,6 +6638,7 @@ export default function ChatScreen({ navigation, route }) {
           <View style={{ paddingHorizontal: 12, paddingVertical: 2 }}>
             <CallMessageBubble
               msg={msg}
+              currentUserId={currentUserId}
               peer={chatData?.peerUser}
               chatId={chatData?.chatId || chatData?._id || route?.params?.chatId}
               timeText={msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
@@ -7349,9 +7344,15 @@ export default function ChatScreen({ navigation, route }) {
   // whole row, otherwise the bubble keeps painting the original text — and
   // translatingKeys, so a bubble picks up (and later drops) its translating
   // loader without waiting to be recycled.
+  //
+  // currentUserId rides along for the same reason. Which SIDE a bubble sits on
+  // is `senderId === me`, and on a cold start `me` resolves from disk after the
+  // seeded bubbles have already painted. Without it here those mounted cells
+  // keep their first verdict — every row stuck on the received side — until
+  // something unrelated recycles them.
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId]
   );
 
   // Typing indicator
@@ -7576,7 +7577,7 @@ export default function ChatScreen({ navigation, route }) {
   // header toolbar — so they can never drift apart.
   const messageActionCaps = useCallback((msg) => {
     if (!msg) return null;
-    const isOwn = msg.senderType ? msg.senderType === 'self' : sameId(msg.senderId, currentUserId);
+    const isOwn = isOutgoingMessage(msg, currentUserId);
     const deletedFor = msg.deletedFor;
     const deletedForMe = Array.isArray(deletedFor)
       ? deletedFor.some((id) => sameId(id, currentUserId))
@@ -7855,7 +7856,7 @@ export default function ChatScreen({ navigation, route }) {
             const selMsg = selectedMessage.length === 1
               ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))
               : null;
-            const isOwnMsg = selMsg && sameId(selMsg?.senderId, currentUserId);
+            const isOwnMsg = Boolean(selMsg) && isOutgoingMessage(selMsg, currentUserId);
             const msgStatus = (selMsg?.status || '').toLowerCase();
             const isSeen = msgStatus === 'seen' || msgStatus === 'read';
             // Canonical server id for actions that hit the server (edit / info).
@@ -8991,7 +8992,7 @@ export default function ChatScreen({ navigation, route }) {
               </TouchableOpacity>
               <View style={{ flex: 1, marginLeft: 12 }}>
                 <Text style={{ color: '#fff', fontSize: 15, fontFamily: 'Roboto-SemiBold' }} numberOfLines={1}>
-                  {localMediaViewer.message?.senderId === currentUserId
+                  {isOutgoingMessage(localMediaViewer.message, currentUserId)
                     ? 'You'
                     : resolveContactName(
                         localMediaViewer.message?.senderId,

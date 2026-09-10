@@ -9,6 +9,7 @@ import {
 } from '../Redux/Services/Socket/socket';
 import { isAppLockSuspended } from '../services/appLockGuard';
 import { clearDirectoryCache } from '../Redux/Services/Contact/Directory.Services';
+import { setCurrentUser, setCurrentUserId } from '../services/currentUser';
 
 const AuthContext = createContext({});
 export const useAuth = () => useContext(AuthContext);
@@ -58,6 +59,10 @@ export const AuthProvider = ({ children }) => {
       const rawUser = userInfo || userData;
       if (rawUser && accessToken && deviceId) {
         const parsedUser = JSON.parse(rawUser);
+        // Publish BEFORE anything else in the session starts ingesting: every
+        // "is this message mine?" check reads this store synchronously, and a
+        // message that lands while it is still empty renders on the wrong side.
+        setCurrentUser(parsedUser);
         setUser(parsedUser);
         setIsAuthenticated(true);
 
@@ -86,6 +91,7 @@ export const AuthProvider = ({ children }) => {
       if (tokens.refreshToken) await AsyncStorage.setItem('refreshToken', tokens.refreshToken);
       if (tokens.deviceId) await AsyncStorage.setItem('deviceId', tokens.deviceId);
 
+      setCurrentUser(userData);
       setUser(userData);
       setIsAuthenticated(true);
 
@@ -122,6 +128,7 @@ export const AuthProvider = ({ children }) => {
     } finally {
       // 4) ALWAYS clear React auth state so every isAuthenticated-gated subscription
       //    unmounts and the user can never receive call events after logout.
+      setCurrentUserId(null);
       setUser(null);
       setIsAuthenticated(false);
     }

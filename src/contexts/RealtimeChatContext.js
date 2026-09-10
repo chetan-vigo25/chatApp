@@ -20,6 +20,11 @@ import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../services/MediaDo
 import { shouldAutoDownloadNow, AUTO_DOWNLOAD_ENABLED } from '../services/autoDownloadSettings';
 import { setPeerIdentity } from '../services/contactNameStore';
 import { renderSystemMessage } from '../utils/systemMessage';
+import {
+  getCurrentUserId, setCurrentUserId as publishCurrentUserId, primeCurrentUser,
+} from '../services/currentUser';
+import { computeSenderType } from '../utils/messageDirection';
+import { normalizeMentions } from '../utils/mentions';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -2767,7 +2772,7 @@ export function RealtimeChatProvider({ children }) {
   // doesn't emit 'delivered' twice.
   const deliveredEmittedRef = useRef(new Set());
   const currentUserIdRef = useRef(state.currentUserId);
-  currentUserIdRef.current = state.currentUserId;
+  currentUserIdRef.current = state.currentUserId || getCurrentUserId() || null;
   // `stateRef` is declared with the external store near the top of the provider
   // (it backs both this file's socket handlers and useRealtimeChatStateRef).
   // Bridge: hydrateChats is declared AFTER attachSocketListeners (which needs
@@ -3001,8 +3006,14 @@ export function RealtimeChatProvider({ children }) {
       // Strip schedule flags for delivered scheduled messages so chat list shows them as normal
       // normalizeId both sides — a populated sender object stringifies to
       // "[object Object]" and would make our own echo look incoming.
-      const isSelf = Boolean(source?.senderId) && Boolean(currentUserIdRef.current)
-        && normalizeId(source.senderId) === normalizeId(currentUserIdRef.current);
+      // Fall back to the module-level identity store: this handler runs on
+      // every socket frame, including ones that land before the provider's own
+      // async `userInfo` read resolves. With a null viewer id EVERY message
+      // looks like someone else's, and that verdict used to be frozen into the
+      // row's sender_type.
+      const viewerId = currentUserIdRef.current || getCurrentUserId();
+      const isSelf = Boolean(source?.senderId) && Boolean(viewerId)
+        && normalizeId(source.senderId) === normalizeId(viewerId);
       if (!isSelf && (source?.isScheduled || source?.data?.isScheduled)) {
         if (source) { source.isScheduled = false; source.scheduleTime = null; source.scheduleTimeLabel = null; source.status = source.status === 'scheduled' ? 'sent' : source.status; }
         if (source?.data) { source.data.isScheduled = false; source.data.scheduleTime = null; source.data.scheduleTimeLabel = null; }
@@ -3104,10 +3115,12 @@ export function RealtimeChatProvider({ children }) {
           tempId: normalized.tempId || null,
           chatId: normalized.chatId,
           senderId: normalized.senderId,
-          // Pin the bubble side at write time — rows without sender_type fall
-          // back to a senderId comparison at render, which breaks if the id
-          // forms ever diverge; self echoes must never render as received.
-          senderType: isSelf ? 'self' : 'other',
+          // Record the side ONLY when the viewer is actually known. Writing a
+          // guessed 'other' here is permanent (the upsert COALESCEs this
+          // column), which is what pinned whole threads to the received side;
+          // null instead leaves the row to be resolved from senderId vs the
+          // authenticated user at render time.
+          senderType: computeSenderType(normalized.senderId, viewerId),
           text: normalized.text || '',
           type: source?.messageType || source?.type || 'text',
           status: normalized.status || 'sent',
@@ -3139,6 +3152,13 @@ export function RealtimeChatProvider({ children }) {
           // payload JSON so the thread can re-render "X added Y" with names
           // resolved locally after a reload.
           systemEvent: (source?.systemEvent && typeof source.systemEvent === 'object') ? source.systemEvent : null,
+          // @mentions. THIS is the path a mention normally arrives on — the
+          // chat screen's own ingest only runs while that screen is mounted,
+          // so a group mention received with the thread closed came through
+          // here, and this object never carried the array. The row was written
+          // without it and the bubble rendered "@User Ballu hi" as flat text
+          // for the receiver while the sender's own copy stayed highlighted.
+          mentions: normalizeMentions(source) || normalizeMentions(normalized),
           replyToMessageId: replyToMsgId,
           replyPreviewText,
           replyPreviewType,
@@ -4367,6 +4387,11 @@ export function RealtimeChatProvider({ children }) {
           // account-name text the server had to bake in. Also rides the payload
           // JSON, so it survives the SQLite round-trip.
           systemEvent: (data?.systemEvent && typeof data.systemEvent === 'object') ? data.systemEvent : null,
+          // @mentions — a group thread is where they actually get used, and
+          // this is the write that lands when the thread is not open. Without
+          // it the row reloads as flat text and the highlight the sender saw
+          // never reaches anyone else.
+          mentions: normalizeMentions(data),
           replyToMessageId: replyToMessageId || null,
           replyPreviewText: replyPreviewText || null,
           replyPreviewType: replyPreviewType || null,
@@ -5222,18 +5247,32 @@ export function RealtimeChatProvider({ children }) {
 
   useEffect(() => {
     const loadCurrentUser = async () => {
-      try {
-        const raw = await AsyncStorage.getItem('userInfo');
-        if (!raw) return;
-        const user = JSON.parse(raw);
-        const userId = user?._id || user?.id || null;
-        dispatch({ type: 'SET_CURRENT_USER', payload: userId });
-      } catch {
-        // noop
-      }
+      // primeCurrentUser reads (and caches) `userInfo` once for the whole app,
+      // so every synchronous "is this mine?" check anywhere has the id as soon
+      // as this resolves — not just the ones with the provider in scope.
+      const userId = await primeCurrentUser();
+      if (!userId) return;
+      dispatch({ type: 'SET_CURRENT_USER', payload: userId });
     };
     loadCurrentUser();
   }, []);
+
+  // Mirror the provider's id into the app-wide store. SET_CURRENT_USER also
+  // fires on login and account switch, and the store must never lag behind it.
+  useEffect(() => {
+    if (state.currentUserId) publishCurrentUserId(state.currentUserId);
+  }, [state.currentUserId]);
+
+  // One-time repair of rows whose sender_type was decided before this id was
+  // known (they were all stamped 'other'). Rendering already ignores a stale
+  // value, so this only tidies the column for readers that still consult it.
+  const repairedSenderTypesForRef = useRef(null);
+  useEffect(() => {
+    const uid = state.currentUserId;
+    if (!uid || repairedSenderTypesForRef.current === String(uid)) return;
+    repairedSenderTypesForRef.current = String(uid);
+    ChatDatabase.repairSenderTypes(uid).catch(() => {});
+  }, [state.currentUserId]);
 
   useEffect(() => {
     const unsubscribeReset = subscribeSessionReset(() => {

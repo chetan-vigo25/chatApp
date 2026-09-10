@@ -1400,7 +1400,11 @@ const _runInsert = async (db, msg, _retried = false) => {
   let existingReplyInPayload = null;
   let existingStatusInPayload = null;
   let existingViewOnceInPayload = null;
-  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview || !msg.viewOnce) {
+  let existingMentionsInPayload = null;
+  const incomingMentions = Array.isArray(msg.mentions) && msg.mentions.length
+    ? msg.mentions
+    : (Array.isArray(msg.payload?.mentions) && msg.payload.mentions.length ? msg.payload.mentions : null);
+  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview || !msg.viewOnce || !incomingMentions) {
     try {
       const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id LIMIT 1`, { $id: id });
       if (ex?.payload) {
@@ -1408,6 +1412,7 @@ const _runInsert = async (db, msg, _retried = false) => {
         if (ep?._replyToMessageId) existingReplyInPayload = ep;
         if (ep?.statusRef || ep?.statusPreview) existingStatusInPayload = ep;
         if (ep?.isViewOnce || ep?.viewOnce) existingViewOnceInPayload = ep;
+        if (Array.isArray(ep?.mentions) && ep.mentions.length) existingMentionsInPayload = ep.mentions;
       }
     } catch {}
   }
@@ -1432,6 +1437,16 @@ const _runInsert = async (db, msg, _retried = false) => {
     // SQLite round-trip and a reload silently falls back to the server's
     // frozen, account-name text.
     ...(msg.systemEvent && typeof msg.systemEvent === 'object' ? { systemEvent: msg.systemEvent } : {}),
+    // @mentions. `messages` has no mentions column, so the payload JSON is the
+    // ONLY thing that survives a reload — and because this object is an
+    // explicit allowlist, a writer that puts the array at the TOP level of the
+    // message (which is where the socket contract carries it) had it silently
+    // dropped, leaving the receiver with flat, unhighlighted text.
+    // Carried forward too: a later partial upsert (a delivered/seen tick) omits
+    // the array, and must not strip the highlighting off an existing bubble.
+    ...(incomingMentions
+      ? { mentions: incomingMentions }
+      : (existingMentionsInPayload ? { mentions: existingMentionsInPayload } : {})),
     // Carry forward existing reply data from old payload
     ...(existingReplyInPayload ? {
       _replyToMessageId: existingReplyInPayload._replyToMessageId,
@@ -3670,6 +3685,45 @@ const getPresenceCacheMany = async (userIds = []) => {
   }
 };
 
+/**
+ * Re-derive `sender_type` from the row's own participant ids.
+ *
+ * The column is a CACHE of "senderId === me", decided at write time. Rows
+ * ingested before the authenticated id was known were stamped 'other', and
+ * because every upsert writes it as COALESCE($sender_type, sender_type) that
+ * wrong value is permanent — which pinned outgoing messages to the received
+ * side on every reopen.
+ *
+ * Rendering no longer trusts the column (utils/messageDirection compares the
+ * ids first), so this is a cleanup rather than the fix: it repairs rows on disk
+ * for the readers that still consult the column directly, and it costs two
+ * indexed UPDATEs that touch only rows that are actually wrong.
+ */
+const repairSenderTypes = async (userId) => {
+  const me = userId == null ? null : String(userId);
+  if (!me) return 0;
+  try {
+    const db = await getDB();
+    const mine = await db.runAsync(
+      `UPDATE messages SET sender_type = 'self'
+        WHERE sender_id = ? AND (sender_type IS NULL OR sender_type != 'self');`,
+      [me],
+    );
+    const theirs = await db.runAsync(
+      `UPDATE messages SET sender_type = 'other'
+        WHERE sender_id IS NOT NULL AND sender_id != ?
+          AND (sender_type IS NULL OR sender_type != 'other');`,
+      [me],
+    );
+    const fixed = (mine?.changes || 0) + (theirs?.changes || 0);
+    if (fixed > 0) console.log(`[ChatDB] repairSenderTypes fixed ${fixed} row(s)`);
+    return fixed;
+  } catch (e) {
+    console.warn('[ChatDB] repairSenderTypes failed:', e?.message);
+    return 0;
+  }
+};
+
 // Legacy aliases
 const saveMessageSync = upsertMessage;
 const saveMessages = upsertMessages;
@@ -3682,6 +3736,7 @@ export default {
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,
   saveReplyData, getReplyData,
+  repairSenderTypes,
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById, getPeerIdentity,

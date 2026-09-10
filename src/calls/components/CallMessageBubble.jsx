@@ -5,6 +5,7 @@ import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../useCall';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 import { directionMeta, isConnectedOutcome, CALL_RED_ON_ACCENT } from '../callDirectionMeta';
+import { resolveDirection, hasResolvableIdentity } from '../../utils/messageDirection';
 
 /**
  * In-thread "call" entry, WhatsApp style. Rendered by ChatScreen for messages of
@@ -28,6 +29,7 @@ const fmtDuration = (sec) => {
 
 export default function CallMessageBubble({
   msg, peer, chatId, timeText, isGroup = false, onCallBack: onCallBackProp = null,
+  currentUserId = null,
 }) {
   const { theme, isDarkMode, chatColor } = useTheme();
   const { startAudioCall, startVideoCall, callBusy } = useCall();
@@ -35,10 +37,18 @@ export default function CallMessageBubble({
   const payload = msg?.payload || {};
   const media = payload.media === 'video' ? 'video' : 'audio';
   const outcome = payload.outcome || 'completed';
-  // Direction is derived per-viewer: my own outgoing leg authored this message,
-  // so senderType 'self' ⇒ outgoing. One canonical message reads correctly on
-  // both ends without storing a viewer-relative direction.
-  const direction = payload.direction || (msg?.senderType === 'self' ? 'outgoing' : 'incoming');
+  // Direction is derived per-viewer from the row's participant ids against the
+  // authenticated user — the SAME rule every other bubble uses, so a call log
+  // lands on the same side as a message from the same person.
+  //
+  // `payload.direction` is only a fallback. It is written by whichever device
+  // logged the call, which makes it viewer-relative: correct for the device
+  // that wrote it, and wrong for any copy that reached this device another way
+  // (a restore, a sync, a second device on the same account). The ids are not
+  // viewer-relative, so they are checked first.
+  const direction = hasResolvableIdentity(msg, currentUserId)
+    ? resolveDirection(msg, currentUserId)
+    : (payload.direction || resolveDirection(msg, currentUserId));
   const isVideo = media === 'video';
   const isOutgoing = direction === 'outgoing';
   const kind = isVideo ? 'video' : 'voice';

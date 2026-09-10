@@ -2074,7 +2074,7 @@ export default function ChatList({ navigation }) {
             <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
           </View> */}
           <Text
-            style={[styles.headerBrand, { color: theme.colors.themeColor }]}
+            style={[styles.headerBrand, { color: isDarkMode ? theme.colors.textWhite : theme.colors.themeColor }]}
             numberOfLines={1}
           >
             {String(APP_TAG_NAME || 'TalksTry')}

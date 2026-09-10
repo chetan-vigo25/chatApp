@@ -57,6 +57,11 @@ import { computeFileSha256, MAX_HASH_BYTES } from '../utils/fileHash';
 import SqliteWriter from "../services/SqliteWriter";
 import { pauseBackgroundSyncFor } from "../services/syncPriority";
 import { subscribeSessionReset, subscribeUserChanged } from "../services/sessionEvents";
+import {
+  getCurrentUserId, setCurrentUser, primeCurrentUser, subscribeCurrentUser,
+} from "../services/currentUser";
+import { computeSenderType, isOutgoingMessage } from "../utils/messageDirection";
+import { normalizeMentions } from "../utils/mentions";
 
 // Module-level cache of the logged-in user (id + display name). `initializeChat`
 // used to `await AsyncStorage.getItem("userInfo")` on EVERY chat open before it
@@ -67,6 +72,10 @@ import { subscribeSessionReset, subscribeUserChanged } from "../services/session
 let _cachedUserInfo = null;
 subscribeSessionReset(() => { _cachedUserInfo = null; });
 subscribeUserChanged(() => { _cachedUserInfo = null; });
+// Priming the app-wide identity store the moment this module loads is what
+// makes bubble alignment independent of arrival order: every ingest path can
+// then ask "who am I?" synchronously instead of stamping a guess onto the row.
+primeCurrentUser();
 
 // Per-chat "last on-open server delta-sync" timestamp, MODULE-LEVEL so it survives
 // ChatScreen unmount/remount (rapid open→close→reopen remounts the screen). WhatsApp
@@ -82,7 +91,8 @@ subscribeUserChanged(() => { _lastChatSyncAt.clear(); });
 // getCachedUserInfo() of the session (chat list, sync screen, a prior chat
 // open), so by the time any chat is opened it is essentially always warm.
 // Returns null when it isn't — callers must fall back to the async read.
-const getCachedUserInfoSync = () => _cachedUserInfo || null;
+const getCachedUserInfoSync = () => _cachedUserInfo
+  || (getCurrentUserId() ? { _id: getCurrentUserId() } : null);
 
 const getCachedUserInfo = async () => {
   if (_cachedUserInfo) return _cachedUserInfo;
@@ -90,6 +100,8 @@ const getCachedUserInfo = async () => {
     const raw = await AsyncStorage.getItem("userInfo");
     if (!raw) return null;
     _cachedUserInfo = JSON.parse(raw);
+    // Keep the app-wide store in step — other ingest paths read it synchronously.
+    setCurrentUser(_cachedUserInfo);
     return _cachedUserInfo;
   } catch {
     return null;
@@ -216,9 +228,10 @@ const isDeletedForUser = (deletedFor, userId) => {
   return false;
 };
 
-const computeSenderType = (senderId, currentUserId) => (
-  sameId(senderId, currentUserId) ? 'self' : 'other'
-);
+// `computeSenderType` is imported from utils/messageDirection. It returns null
+// — not 'other' — when the viewer id is not yet known, which is deliberate: the
+// column is written with COALESCE, so a speculative 'other' would be permanent,
+// while null leaves the row to be resolved from its ids at render time.
 
 // Sanitize reactions from any source (API, SQLite, socket) into { emoji: { count, users } }
 const sanitizeReactions = (raw) => {
@@ -1269,8 +1282,27 @@ export default function useChatLogic({ navigation, route }) {
   // Keep refs in sync
   useEffect(() => {
     chatIdRef.current = chatId;
-    currentUserIdRef.current = currentUserId;
+    // Never downgrade a known id back to null: the hot ingest paths read this
+    // ref to decide which side a row belongs on, and a momentary null is what
+    // stamps an outgoing message as received.
+    currentUserIdRef.current = currentUserId || getCurrentUserId() || null;
   }, [chatId, currentUserId]);
+
+  // The authenticated id can land AFTER the first messages are already on
+  // screen (a cold start reads it from disk while the seeded bubbles paint).
+  // Adopting it here re-runs every viewer-relative derivation — bubble side
+  // included — so alignment settles correctly no matter which arrived first.
+  useEffect(() => {
+    const adopt = (userId) => {
+      if (!userId) return;
+      currentUserIdRef.current = userId;
+      // `prev ||` — initializeChat's own read is authoritative for this mount;
+      // this only fills the gap before it lands.
+      setCurrentUserId((prev) => prev || userId);
+    };
+    adopt(getCurrentUserId());
+    return subscribeCurrentUser(adopt);
+  }, []);
 
   // Keep allMessagesRef in sync for stale-closure-safe reads
   useEffect(() => {
@@ -1777,7 +1809,7 @@ export default function useChatLogic({ navigation, route }) {
         .filter(msg =>
           msg.chatId === chatIdRef.current &&
           msg.senderId &&
-          msg.senderId !== currentUserIdRef.current &&
+          !isOutgoingMessage(msg, currentUserIdRef.current) &&
           msg.status !== 'seen'
         )
         .map(msg => msg.serverMessageId || msg.id || msg.tempId)
@@ -1927,6 +1959,7 @@ export default function useChatLogic({ navigation, route }) {
       setCurrentUserId(userId);
       currentUserIdRef.current = userId;
       currentUserNameRef.current = userName;
+      setCurrentUser(user);
 
       const isGrpInit = chatData.chatType === 'group' || chatData.isGroup;
       const generatedChatId = chatData.chatId || routeChatId || (isGrpInit
@@ -2555,7 +2588,9 @@ export default function useChatLogic({ navigation, route }) {
     // Call entries carry render details in `callDetails` over the wire (REST /
     // sync) or already in `payload` (realtime). Normalize both into the payload
     // shape CallMessageBubble reads (kind/media/outcome/durationSec). Direction
-    // is derived per-viewer from senderType, so it is intentionally NOT stored.
+    // is derived per-viewer from senderId vs the authenticated user (see
+    // utils/messageDirection), so it is intentionally NOT stored — a stored
+    // direction is only ever correct for the device that wrote it.
     if (resolvedMessageType === 'call') {
       const cd = apiMsg?.callDetails || {};
       basePayload.kind = 'call';
@@ -2563,33 +2598,12 @@ export default function useChatLogic({ navigation, route }) {
       basePayload.outcome = basePayload.outcome || cd.outcome || 'completed';
       basePayload.durationSec = Math.max(0, Number(basePayload.durationSec ?? cd.durationSec) || 0);
     }
-    // @mentions ride at the TOP level of the send payload (handleSendText below),
-    // never inside `payload` — and this normalizer rebuilds the message field by
-    // field, so it silently dropped them. The SENDER kept its own optimistic
-    // copy, which is why a mention rendered bold for the sender and as plain
-    // text for every receiver. Carry them through here, and stash them in the
-    // payload as well: `messages` has no mentions column, so the JSON payload is
-    // what survives a reload.
-    //
-    // displayName is preserved VERBATIM. The highlighter matches on the literal
-    // "@" + displayName token, so rewriting it here (trimming a leading "@", for
-    // instance) would stop older messages from matching their own text.
-    const incomingMentions = (() => {
-      const raw = Array.isArray(apiMsg?.mentions) ? apiMsg.mentions
-        : (Array.isArray(apiMsg?.payload?.mentions) ? apiMsg.payload.mentions
-          : (Array.isArray(apiMsg?.mentionedUsers) ? apiMsg.mentionedUsers : null));
-      if (!raw || raw.length === 0) return null;
-      const cleaned = raw
-        .filter((m) => m && typeof m === 'object')
-        .map((m) => ({
-          userId: m.userId != null ? String(m.userId) : (m._id != null ? String(m._id) : null),
-          displayName: m.displayName || m.fullName || m.name || null,
-          startIndex: Number.isFinite(Number(m.startIndex)) ? Number(m.startIndex) : null,
-          length: Number.isFinite(Number(m.length)) ? Number(m.length) : null,
-        }))
-        .filter((m) => m.displayName);
-      return cleaned.length > 0 ? cleaned : null;
-    })();
+    // @mentions ride at the TOP level of the send payload (handleSendText
+    // below), never inside `payload` — and this normalizer rebuilds the message
+    // field by field, so they have to be carried across explicitly. They are
+    // stashed in the payload as well: `messages` has no mentions column, so the
+    // payload JSON is what survives a reload. See utils/mentions.
+    const incomingMentions = normalizeMentions(apiMsg);
     if (incomingMentions) basePayload.mentions = incomingMentions;
 
     const normalizedPayload = normalizeMessagePayloadWithDownloadFlag(
@@ -2795,7 +2809,7 @@ export default function useChatLogic({ navigation, route }) {
     const normalized = filtered.map(raw => {
       const msg = normalizeIncomingMessage(raw);
       if (msg.senderId) {
-        msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+        msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current) || msg.senderType || null;
       }
       msg.chatId = msg.chatId || chatIdRef.current;
       return msg;
@@ -2843,7 +2857,7 @@ export default function useChatLogic({ navigation, route }) {
       .map(raw => {
           const msg = normalizeIncomingMessage(raw);
           msg.chatId = msg.chatId || effectiveChatId;
-          if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+          if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current) || msg.senderType || null;
           return msg;
         });
 
@@ -2894,7 +2908,7 @@ export default function useChatLogic({ navigation, route }) {
           const id = msg.serverMessageId || msg.id || msg.tempId;
           if (!id || !visibleMessageIds.includes(id)) return false;
           if (msg.chatId !== chatIdRef.current) return false;
-          if (!msg.senderId || msg.senderId === currentUserIdRef.current) return false;
+          if (!msg.senderId || isOutgoingMessage(msg, currentUserIdRef.current)) return false;
           // Skip scheduled/processing/cancelled/failed — not real messages, don't emit read
           if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return false;
           return msg.status !== 'seen' && msg.status !== 'read';
@@ -2963,7 +2977,7 @@ export default function useChatLogic({ navigation, route }) {
         .filter(msg =>
           (msg.chatId === chatIdRef.current) &&
           msg.senderId &&
-          msg.senderId !== currentUserIdRef.current &&
+          !isOutgoingMessage(msg, currentUserIdRef.current) &&
           // Skip scheduled/processing/cancelled/failed — not real messages, don't emit read
           msg.status !== 'scheduled' && msg.status !== 'processing' && msg.status !== 'cancelled' && msg.status !== 'failed' &&
           msg.status !== 'seen' && msg.status !== 'read'
@@ -3253,7 +3267,7 @@ export default function useChatLogic({ navigation, route }) {
         if (dbScheduled.length > 0) {
           const enrichedScheduled = dbScheduled
             .filter(m => sameId(m.senderId, currentUser)) // sender-only
-            .map(m => ({ ...m, senderType: computeSenderType(m.senderId, currentUser) }));
+            .map(m => ({ ...m, senderType: computeSenderType(m.senderId, currentUser) || m.senderType || null }));
           if (enrichedScheduled.length > 0) {
             setScheduledMessages(prev => {
               // Collect ALL known IDs from existing scheduled messages
@@ -3322,7 +3336,9 @@ export default function useChatLogic({ navigation, route }) {
           return {
             ...msg,
             status,
-            senderType: computeSenderType(msg.senderId, currentUser),
+            // Re-derived on every read, so a row that was written before the
+            // viewer id was known stops being stuck on the wrong side.
+            senderType: computeSenderType(msg.senderId, currentUser) || msg.senderType || null,
             ...(replyPreviewText && !msg.replyPreviewText ? { replyPreviewText } : {}),
             ...(replyPreviewType && !msg.replyPreviewType ? { replyPreviewType } : {}),
             ...(replySenderId && !msg.replySenderId ? { replySenderId } : {}),
@@ -3671,7 +3687,7 @@ export default function useChatLogic({ navigation, route }) {
         toWrite.push({
           ...msg,
           chatId: msg.chatId || chatIdRef.current,
-          senderType: msg.senderType || computeSenderType(msg.senderId, currentUserIdRef.current),
+          senderType: computeSenderType(msg.senderId, currentUserIdRef.current) || msg.senderType || null,
         });
       }
       if (toWrite.length > 0) {
@@ -4252,7 +4268,7 @@ export default function useChatLogic({ navigation, route }) {
       .map(raw => {
         const msg = normalizeIncomingMessage(raw);
         msg.chatId = msg.chatId || chatIdRef.current;
-        if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current);
+        if (msg.senderId) msg.senderType = computeSenderType(msg.senderId, currentUserIdRef.current) || msg.senderType || null;
         return msg;
       });
     await ChatDatabase.upsertMessages(normalized);
@@ -7797,7 +7813,10 @@ export default function useChatLogic({ navigation, route }) {
       chatId: msg?.chatId || chatIdRef.current,
     });
     if (receivedMessage.senderId) {
-      receivedMessage.senderType = sameId(receivedMessage.senderId, currentUserIdRef.current) ? 'self' : 'other';
+      // computeSenderType, not a bare ternary: with the viewer id not yet
+      // resolved a ternary stamps a permanent 'other' onto our own echo.
+      receivedMessage.senderType = computeSenderType(receivedMessage.senderId, currentUserIdRef.current)
+        || receivedMessage.senderType || null;
     }
 
     // Anti-resurrection: a message the user delete-for-me'd must not come back via
@@ -10278,7 +10297,7 @@ export default function useChatLogic({ navigation, route }) {
       const isRealMediaId = (v) => v != null && String(v).length > 0 && !/^temp_/i.test(String(v));
       const stuck = (allMessagesRef.current || []).filter((m) => (
         m?.tempId
-        && m?.senderType === 'self'
+        && isOutgoingMessage(m, currentUserIdRef.current)
         && sameChatId(m?.chatId || cid, cid)
         && ['sending', 'uploading', 'uploaded'].includes(String(m?.status))
         && ['image', 'video', 'audio', 'file', 'album'].includes(String(m?.type || m?.mediaType))
@@ -10839,7 +10858,7 @@ export default function useChatLogic({ navigation, route }) {
             return !ids.some(id => seenIds.has(id));
           }).map(m => ({
             ...m,
-            senderType: m.senderId && sameId(m.senderId, currentUserIdRef.current) ? 'self' : 'other',
+            senderType: computeSenderType(m.senderId, currentUserIdRef.current) || m.senderType || null,
           }));
           if (newOnes.length === 0) return prev;
           const merged = [...prev, ...newOnes];

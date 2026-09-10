@@ -1,6 +1,8 @@
 import { DeviceEventEmitter } from 'react-native';
 import moment from 'moment';
 import ChatDatabase from '../../services/ChatDatabase';
+import { getCurrentUserId } from '../../services/currentUser';
+import { computeSenderType } from '../../utils/messageDirection';
 
 /**
  * Writes a WhatsApp-style "call" entry into the local chat thread (SQLite) so it
@@ -29,18 +31,26 @@ export const appendCallEntry = async ({
 
   const nowIso = new Date().toISOString();
   const isOutgoing = direction === 'outgoing';
-  const senderId = isOutgoing ? (myId || null) : (peerId || null);
+  // A call entry must carry BOTH participant ids: the chat screen decides which
+  // side to render it on by comparing them against the authenticated user, the
+  // same way it does for a message. Falling back to the identity store keeps
+  // that true when a call is logged before the caller had `myId` in scope.
+  const selfId = myId || getCurrentUserId() || null;
+  const senderId = isOutgoing ? selfId : (peerId || null);
+  const receiverId = isOutgoing ? (peerId || null) : selfId;
 
   const text = labelFor(media, direction, outcome);
 
   const msg = {
-    id: `call_${callId}_${myId || 'me'}`,
+    id: `call_${callId}_${selfId || 'me'}`,
     type: 'call',
     mediaType: 'call',
     text,
     senderId,
-    senderType: isOutgoing ? 'self' : 'other',
-    receiverId: isOutgoing ? peerId : (myId || null),
+    // Only when the ids actually resolve — see utils/messageDirection. A
+    // guessed side written here is permanent and outranks nothing at render.
+    senderType: computeSenderType(senderId, selfId) || (isOutgoing ? 'self' : null),
+    receiverId,
     status: 'sent',
     createdAt: nowIso,
     time: moment(nowIso).format('hh:mm A'),
