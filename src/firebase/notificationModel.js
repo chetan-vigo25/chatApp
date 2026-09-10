@@ -15,6 +15,8 @@
  * Pure JS — NO native modules, NO react-native imports beyond Platform-free
  * helpers — so it is safe to import from the headless FCM background handler.
  */
+// Pure JS (no react-native imports) — safe for the headless background handler.
+import { isFileNameCaption } from '../utils/mediaCaption';
 
 // Media preview labels. MUST stay byte-for-byte identical to the backend's
 // MEDIA_PREVIEW in chat-backend/src/services/messageNotify.service.js so a
@@ -30,11 +32,20 @@ export const MEDIA_PREVIEW = {
   contact: '👤 Contact',
   location: '📍 Location',
   sticker: 'Sticker',
+  // App-side addition (the backend map has no album entry yet): a bulk send is
+  // ONE message, and without a label here its preview fell through to the
+  // message text — which for media is the upload's file name.
+  album: '🖼️ Media',
 };
 
 export const previewFor = (messageType, text) => {
   if (!messageType || messageType === 'text') return text || '';
-  return MEDIA_PREVIEW[messageType] || text || 'New message';
+  const label = MEDIA_PREVIEW[messageType];
+  if (label) return label;
+  // An unlabelled media type falls back to the message text — which must never
+  // be the upload's file name ("Screenshot_20260910-101828.jpg" is not a
+  // preview). See utils/mediaCaption for the shared rule.
+  return (isFileNameCaption(text) ? '' : text) || 'New message';
 };
 
 export const normalizeId = (value) => {

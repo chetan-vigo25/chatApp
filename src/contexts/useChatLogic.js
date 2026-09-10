@@ -38,6 +38,7 @@ import {
   uploadMediaFile,
 } from "../utils/mediaService";
 import { abortChunkSession, CHUNKED_UPLOAD_THRESHOLD } from '../utils/chunkedUpload';
+import { captionOf } from '../utils/mediaCaption';
 import {
   pauseUpload as registryPauseUpload,
   resumeUpload as registryResumeUpload,
@@ -400,6 +401,15 @@ export default function useChatLogic({ navigation, route }) {
   const isMediaMessageType = (value) => {
     const type = String(value || '').toLowerCase();
     return MEDIA_MESSAGE_TYPES.has(type);
+  };
+
+  // Media the bubble RENDERS (a photo/video is its own content), as opposed to
+  // media the bubble has to NAME (a document/audio row shows the file name).
+  // Only the first kind ships with an empty caption — see
+  // createMediaMessagePayload.
+  const isVisualMediaType = (value) => {
+    const type = String(value || '').toLowerCase();
+    return type === 'image' || type === 'photo' || type === 'video';
   };
   
   const normalizeMessagePayloadWithDownloadFlag = (messageType, payload = {}) => {
@@ -832,6 +842,7 @@ export default function useChatLogic({ navigation, route }) {
     receiverId,
     chatId,
     messageId,
+    caption = '',
   }) => {
     const uploadData = uploadResponse?.data || uploadResponse || {};
     const normalizedMessageType = normalizeOutboundMessageType(
@@ -879,7 +890,16 @@ export default function useChatLogic({ navigation, route }) {
           : {}),
       },
       status: 'sent',
-      text: file?.name || '',
+      // `text` is the CAPTION, and a photo/video has none unless the user typed
+      // one — it must never be the file name. It used to be, and the server
+      // persists + echoes whatever it gets, so every image arrived at the
+      // recipient captioned "Screenshot_20260910-101828.jpg" (shown under the
+      // image, and used as the group chat-list preview). The name still travels
+      // in `mediaMeta.fileName` above, which is what the file bubble, the
+      // chat-list preview and every download/save/share path actually read.
+      // Documents/audio keep it: their name IS the content the row shows, and
+      // older rows without mediaMeta still fall back to it.
+      text: isVisualMediaType(normalizedMessageType) ? (caption || '') : (file?.name || ''),
       createdAt: uploadData?.createdAt || new Date().toISOString(),
     };
   }, [normalizeOutboundMessageType]);
@@ -2584,8 +2604,15 @@ export default function useChatLogic({ navigation, route }) {
       }
     );
 
-    // Preserve the original tempId if present — it's the link to the optimistic message
-    const originalTempId = normalizeId(apiMsg?.tempId || apiMsg?.payload?.tempId);
+    // Preserve the original tempId if present — it's the link to the optimistic
+    // message. clientMessageId/clientId are the same value under the names the
+    // wire contract actually uses (see sendMessageViaSocket's emitPayload), so a
+    // server that echoes only clientMessageId still links to the right bubble
+    // instead of looking like a brand-new message.
+    const originalTempId = normalizeId(
+      apiMsg?.tempId || apiMsg?.clientMessageId || apiMsg?.clientId
+      || apiMsg?.payload?.tempId || apiMsg?.payload?.clientMessageId
+    );
 
     // Extract reply object from multiple possible locations
     const replyObj = (apiMsg?.replyTo && typeof apiMsg.replyTo === 'object' ? apiMsg.replyTo : null)
@@ -7647,7 +7674,19 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     const messageId = normalizeId(msg.messageId || msg._id);
-    const incomingTempId = normalizeId(msg.tempId);
+    // The optimistic row's id, as echoed back by the server. `sendMessageViaSocket`
+    // emits it as clientMessageId (the documented idempotency key) AND as the
+    // legacy `tempId`/`clientId` aliases — so reading only `tempId` here missed
+    // the link whenever the server echoed just clientMessageId, and the send fell
+    // through to the content-matching fallback below. For MEDIA that fallback is
+    // text-only by design (see ChatDatabase.findTempRowByContent), so the echo was
+    // inserted as a SECOND row: the uploading bubble and the sent bubble side by
+    // side until the next reconcile removed one. This is the deterministic link;
+    // the fallbacks below cover a broadcast that carries none of these names.
+    const incomingTempId = normalizeId(
+      msg.tempId || msg.clientMessageId || msg.clientId
+      || msg?.payload?.tempId || msg?.payload?.clientMessageId
+    );
     const incomingSenderId = msg?.senderId;
     const isSelfMessage = incomingSenderId && sameId(incomingSenderId, currentUserIdRef.current);
 
@@ -7664,12 +7703,29 @@ export default function useChatLogic({ navigation, route }) {
     // Self-echo without tempId: check if we recently sent a message with matching tempId
     if (isSelfMessage && messageId && !incomingTempId) {
       // Check sentTempIdsRef — if any pending temp matches, do the ACK
+      const echoText = String(msg.text ?? msg.message ?? '');
+      const echoMediaId = normalizeId(msg?.mediaId || msg?.mediaMeta?.mediaId || msg?.payload?.mediaId);
+      const echoType = normalizeOutboundMessageType(msg?.messageType || msg?.type || 'text');
       for (const pendingTempId of sentTempIdsRef.current) {
         const tempExists = await ChatDatabase.messageExists(pendingTempId);
         if (tempExists) {
           const tempMsg = await ChatDatabase.getMessage(pendingTempId);
-          // Match by text + close timestamp (within 10s)
-          if (tempMsg && tempMsg.text === (msg.text || msg.message) &&
+          // Match by content + close timestamp (within 10s). Media is matched on
+          // its mediaId, never on text: a captionless photo has text='' (as does
+          // every other captionless photo in flight), so an empty-text match would
+          // acknowledge the WRONG upload. `?? ''` because the server echoes a
+          // missing caption as null/undefined while our row holds '' — comparing
+          // those with || made every captionless send miss its own echo.
+          const tempMediaId = normalizeId(tempMsg?.mediaId || tempMsg?.mediaMeta?.mediaId || tempMsg?.payload?.mediaId);
+          const tempType = normalizeOutboundMessageType(tempMsg?.type || tempMsg?.mediaType || 'text');
+          const contentMatches = echoMediaId || tempMediaId
+            // One of them is media → they must be the SAME media. This also stops
+            // a text echo from acknowledging a media upload and vice versa.
+            ? Boolean(echoMediaId && tempMediaId && sameId(echoMediaId, tempMediaId))
+            // Neither carries a mediaId (a text message, or a view-once send whose
+            // mediaId is null by contract) → same type AND same text.
+            : tempType === echoType && String(tempMsg?.text ?? '') === echoText;
+          if (tempMsg && contentMatches &&
               Math.abs((tempMsg.timestamp || 0) - new Date(msg.createdAt || msg.timestamp || 0).getTime()) < 10000) {
             await ChatDatabase.acknowledgeMessage(pendingTempId, messageId);
             const rd = await ChatDatabase.getReplyData(pendingTempId);
@@ -7680,13 +7736,22 @@ export default function useChatLogic({ navigation, route }) {
           }
         }
       }
-      // Fallback: search SQLite directly for a temp row matching this message's content
-      const matchingTemp = await ChatDatabase.findTempRowByContent(
-        chatIdRef.current,
-        currentUserIdRef.current,
-        msg.text || msg.message || '',
-        new Date(msg.createdAt || msg.timestamp || 0).getTime()
-      );
+      // Fallback: search SQLite directly for the pending row of this message.
+      // Media is matched on its mediaId (findTempRowByContent is text-only —
+      // a captionless photo has nothing to match on), which also covers the case
+      // sentTempIdsRef above cannot: that set is in-memory, so an app restart
+      // between the send and the echo leaves it empty.
+      const echoTs = new Date(msg.createdAt || msg.timestamp || 0).getTime();
+      const matchingTemp = echoMediaId
+        ? await ChatDatabase.findPendingRowByMediaId(
+            chatIdRef.current, currentUserIdRef.current, echoMediaId, echoTs, messageId,
+          )
+        : await ChatDatabase.findTempRowByContent(
+            chatIdRef.current,
+            currentUserIdRef.current,
+            msg.text || msg.message || '',
+            echoTs,
+          );
       if (matchingTemp) {
         await ChatDatabase.acknowledgeMessage(matchingTemp.id, messageId);
         const rd = await ChatDatabase.getReplyData(matchingTemp.id);
@@ -8659,6 +8724,13 @@ export default function useChatLogic({ navigation, route }) {
     // metadata-only — no local preview, no thumbnail, no caption.
     const isViewOnceSend = Boolean(mediaObj.viewOnce || options?.viewOnce)
       && ['image', 'video'].includes(normalizedType);
+    // A caption the user typed next to the staged photo/video. It used to be
+    // dropped here (the composer passed nothing and `text` was overwritten with
+    // the file name), so typing with a single image lost the text. View-once
+    // bubbles stay captionless by contract.
+    const caption = isViewOnceSend
+      ? ''
+      : String(options?.caption || mediaObj?.caption || '').trim();
     const tempId = options?.tempId || `temp_media_${Date.now()}_${Math.random()}`;
     const timestamp = options?.createdAt || new Date().toISOString();
     const localSourceUri = normalizeUri(file.uri);
@@ -8689,7 +8761,8 @@ export default function useChatLogic({ navigation, route }) {
       clientMessageId: tempId,
       type: normalizedType,
       mediaType: normalizedType,
-      text: isViewOnceSend ? '' : (file.name || ''),
+      // No file-name caption on a photo/video — see createMediaMessagePayload.
+      text: isViewOnceSend ? '' : (isVisualMediaType(normalizedType) ? caption : (file.name || '')),
       mediaUrl: '',
       mediaThumbnailUrl: isViewOnceSend ? null : (normalizedType === 'video' ? localVideoThumb : localSourceUri),
       previewUrl: isViewOnceSend ? null : (normalizedType === 'video' ? localVideoThumb : localSourceUri),
@@ -8809,7 +8882,9 @@ export default function useChatLogic({ navigation, route }) {
       const preTask = {
         tempId,
         chatId: chatIdRef.current,
-        mediaObj: { ...mediaObj, file: { ...file, uri: localSourceUri } },
+        // `caption` folded in: the flush calls sendMedia(row.mediaObj) with no
+        // options, so a caption passed by the composer would otherwise be lost.
+        mediaObj: { ...mediaObj, caption, file: { ...file, uri: localSourceUri } },
         createdAt: timestamp,
         retries: Number(preQueue[preIdx]?.retries || 0),
         chunkSession: preQueue[preIdx]?.chunkSession || null,
@@ -8829,6 +8904,7 @@ export default function useChatLogic({ navigation, route }) {
         chatId: chatIdRef.current,
         mediaObj: {
           ...mediaObj,
+          caption,
           file: { ...file, uri: localSourceUri },
         },
         createdAt: timestamp,
@@ -9011,6 +9087,7 @@ export default function useChatLogic({ navigation, route }) {
         senderDeviceId: deviceId,
         receiverId: chatData.peerUser?._id || null,
         chatId: chatIdRef.current,
+        caption,
         // NEVER pass responseData.messageId here — for a deduped upload it is
         // the FIRST message's id (shared media doc) and collides two sends.
       });
@@ -9060,7 +9137,11 @@ export default function useChatLogic({ navigation, route }) {
           clientMessageId: tempId,
           type: normalizedCategory,
           mediaType: normalizedCategory,
-          text: isViewOnceSend ? '' : (uploadFile.name || file.name || ''),
+          text: isViewOnceSend
+            ? ''
+            : (isVisualMediaType(normalizedCategory)
+                ? caption
+                : (uploadFile.name || file.name || '')),
           mediaUrl: isViewOnceSend ? '' : resolvedMediaUrl,
           mediaThumbnailUrl: isViewOnceSend ? null : resolvedPreviewUrl,
           previewUrl: isViewOnceSend ? null : resolvedPreviewUrl,
@@ -9200,6 +9281,7 @@ export default function useChatLogic({ navigation, route }) {
           chatId: chatIdRef.current,
           mediaObj: {
             ...mediaObj,
+            caption,
             file: { ...file, uri: localSourceUri },
           },
           createdAt: timestamp,
@@ -10320,14 +10402,15 @@ export default function useChatLogic({ navigation, route }) {
       result = await sendMediaGroup(
         row?.albumObj || {
           files: albumFiles,
-          caption: msg?.text || '',
+          // captionOf drops a legacy file-name "caption" instead of re-sending it.
+          caption: captionOf(msg),
           mediaGroupId: msg?.mediaGroupId || msg?.payload?.mediaGroupId,
         },
         common
       );
     } else if (singleFile?.uri) {
       result = await sendMedia(
-        row?.mediaObj || { file: singleFile, type: msg?.mediaType || msg?.type },
+        row?.mediaObj || { file: singleFile, type: msg?.mediaType || msg?.type, caption: captionOf(msg) },
         { ...common, chunkSession: row?.chunkSession || null }
       );
     } else {

@@ -32,6 +32,7 @@ import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
 import * as Location from "expo-location";
 import * as Contacts from "expo-contacts";
+import { isFileNameCaption } from "../../utils/mediaCaption";
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import useDelayedVisible from "../../hooks/useDelayedVisible";
@@ -4075,7 +4076,8 @@ export default function ChatScreen({ navigation, route }) {
         // Multi-select → ONE WhatsApp-style album message (grid bubble)
         await sendMediaGroup({ files: mediaToSend.files, caption });
       } else {
-        await sendMedia(mediaToSend);
+        // Pass the typed caption through — a single photo/video used to drop it.
+        await sendMedia(mediaToSend, { caption });
       }
       return;
     }
@@ -7252,7 +7254,10 @@ export default function ChatScreen({ navigation, route }) {
                     );
                   }}
                 />
-                {Boolean(msg.text) && (
+                {/* Album caption — same file-name filter as the single-media
+                    caption below, so a bulk send whose text is a file name
+                    renders as plain media. */}
+                {Boolean(msg.text) && !isFileNameCaption(msg.text, msg?.mediaMeta) && (
                   <Text style={{
                     fontSize: 15,
                     lineHeight: 20,
@@ -7274,8 +7279,13 @@ export default function ChatScreen({ navigation, route }) {
             {!isDeletedMessage && isVideo && renderVideoMessage(msg, isMyMessage, progress, messageKey, downloadState)}
             {/* Caption under a single image/video (album captions render in the
                 album branch) — e.g. broadcast-channel media with text. Skip when
-                the "caption" is just the upload's file name. */}
-            {!isDeletedMessage && (isImage || isVideo) && Boolean(msg.text) && msg.text !== msg?.mediaMeta?.fileName && (
+                the "caption" is just the upload's file name: comparing it to
+                mediaMeta.fileName alone was not enough, because the name arrives
+                as the message text from the server (and from older builds) on
+                rows whose mediaMeta carries a different/absent name — which is
+                why photos showed "Screenshot_20260910-101828.jpg" under them.
+                utils/mediaCaption holds the one rule, shared with the chat list. */}
+            {!isDeletedMessage && (isImage || isVideo) && Boolean(msg.text) && !isFileNameCaption(msg.text, msg?.mediaMeta) && (
               <Text style={{
                 fontSize: 15,
                 lineHeight: 20,

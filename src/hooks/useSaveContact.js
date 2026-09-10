@@ -224,7 +224,9 @@ const useSaveContact = (peerUser) => {
       try { socket?.emit?.('contact:sync:notify', { reason }); } catch {}
 
       try {
-        await refreshContacts({ fallbackToSync: true });
+        // Background resync — never alerts about a denied contacts permission
+        // (the save itself already succeeded); a user-pressed Refresh does.
+        await refreshContacts({ fallbackToSync: true, userInitiated: false });
       } catch (err) {
         console.warn('[useSaveContact] refreshContacts failed:', err?.message);
       }

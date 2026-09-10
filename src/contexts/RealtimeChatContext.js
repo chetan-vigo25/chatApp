@@ -10,6 +10,7 @@ import { getChatActivityValue, compareChatsByActivity } from '../utils/chatOrder
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
 import { shouldEmitReadAll } from '../utils/readAllThrottle';
+import { isFileNameCaption } from '../utils/mediaCaption';
 // Firebase/notifee message notifications disabled in Expo Go / dev builds.
 // import { clearMessageNotification } from '../firebase/messageNotification';
 import OutboxWorker from '../services/OutboxWorker';
@@ -310,22 +311,52 @@ const formatLastSeen = (value) => {
   return `Last seen on ${day}/${month}/${year}`;
 };
 
+// The row's label for one message. A media row NEVER shows the upload's file
+// name: the whole point of the preview is "Photo" / "Video" / "Media" next to
+// the type's icon (see MESSAGE_TYPE_ICON_MAP), the way the thread shows the
+// media itself rather than its name. A real caption, though, is what the user
+// wrote and wins over the label.
 const getMessageTypeDisplayText = (messageType, text, metadata = {}) => {
   const type = (messageType || 'text').toString().toLowerCase();
-  const normalizedText = (text || '').toString().trim();
+  const raw = (text || '').toString().trim();
+  // A "caption" that is only the file name counts as no caption at all.
+  const normalizedText = isFileNameCaption(raw, metadata) ? '' : raw;
 
   if (type === 'text') return normalizedText || 'No messages yet';
-  if (type === 'image') return 'Photo';
-  if (type === 'video') return 'Video';
+  // Visual media: the caption if there is one, else the label.
+  if (type === 'image') return normalizedText || 'Photo';
+  if (type === 'video') return normalizedText || 'Video';
+  // Bulk send (several files in one bubble) → "Media", not the first file name.
+  if (type === 'album') return normalizedText || 'Media';
   if (type === 'audio') return 'Audio';
-  if (type === 'file') return metadata?.fileName || metadata?.name || 'File';
+  // A document IS named by its file name — that is the row's content, not a
+  // caption, so mediaMeta wins and the legacy text is the last resort.
+  if (type === 'file') return metadata?.fileName || metadata?.name || raw || 'File';
   if (type === 'location') return 'Location';
   if (type === 'contact') return 'Contact';
   if (type === 'sticker') return 'Sticker';
   if (type === 'gif') return 'GIF';
-  if (type === 'album') return normalizedText || 'Album';
 
   return normalizedText || 'No messages yet';
+};
+
+// A group's stored `lastMessage.text` is "Name: <text>" (see the group
+// incoming-message reducer), so the label rule above cannot be applied to it
+// directly — it would treat the whole "Name: …" string as the caption. Split the
+// name off, re-label just the message part, and put the name back. Text
+// messages are returned untouched.
+const relabelGroupPreview = (storedText, messageType, metadata = {}) => {
+  const raw = String(storedText || '').trim();
+  if (!raw) return '';
+  const type = String(messageType || 'text').toLowerCase();
+  if (type === 'text') return raw;
+
+  // Same "first ': ' only" split the body/name separation below uses, so a
+  // message that itself contains a colon survives intact.
+  const match = /^([^:]{1,60}): ([\s\S]+)$/.exec(raw);
+  const namePrefix = match ? `${match[1]}: ` : '';
+  const rest = match ? match[2] : raw;
+  return `${namePrefix}${getMessageTypeDisplayText(type, rest, metadata)}`;
 };
 
 const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName }) => {
@@ -424,13 +455,23 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
 
   // For group chats, the lastMessage.text already contains the sender prefix (e.g. "John: Hello")
   // so we should not add another "You:" prefix. For private chats, add "You:" if the sender is current user.
+  const lastMeta = rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {};
+  // A group's stored preview is "Name: <text>", and for media that <text> used
+  // to be the upload's file name — so the row read
+  // "@ravina: Screenshot_20260910-101828.jpg" while the 1-1 row for the same
+  // message read "📷 Photo". Re-label the part AFTER the name through the same
+  // rule, so both agree.
   const baseText = isGroupChat
-    ? (messageText || getMessageTypeDisplayText(messageType, '', rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {}))
-    : getMessageTypeDisplayText(messageType, messageText, rawLastMessage?.mediaMeta || rawLastMessage?.metadata || {});
+    ? (relabelGroupPreview(messageText, messageType, lastMeta)
+        || getMessageTypeDisplayText(messageType, '', lastMeta))
+    : getMessageTypeDisplayText(messageType, messageText, lastMeta);
   const isOwn = Boolean(currentUserId && messageSender && String(currentUserId) === String(messageSender));
   const prefix = (!isGroupChat && isOwn) ? 'You: ' : '';
   const editedSuffix = isEdited ? ' (edited)' : '';
-  const iconPart = icon && !isGroupChat ? `${icon} ` : '';
+  // The type icon (📷 / 📹 / 🖼️ …) rides with the label in BOTH chat kinds; in a
+  // group it sits after the sender's name ("@ravina: 📷 Photo"), which is why it
+  // is applied where prefixText is assembled rather than here.
+  const iconPart = icon ? `${icon} ` : '';
 
   // ── Split the sender's NAME off the body ──────────────────────────────────
   //
@@ -454,7 +495,10 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
     }
   }
 
-  const prefixText = `${prefix}${iconPart}${namePrefix}`;
+  // Group: "<name>: <icon> <label>". 1-1: "You: <icon> <label>".
+  const prefixText = isGroupChat
+    ? `${namePrefix}${iconPart}`
+    : `${prefix}${iconPart}${namePrefix}`;
 
   return {
     text: baseText,
@@ -2955,7 +2999,10 @@ export function RealtimeChatProvider({ children }) {
       if (schedTime && Number.isFinite(schedTimeMs) && schedTimeMs > Date.now() + 5000) return;
 
       // Strip schedule flags for delivered scheduled messages so chat list shows them as normal
-      const isSelf = source?.senderId && currentUserIdRef.current && String(source.senderId) === String(currentUserIdRef.current);
+      // normalizeId both sides — a populated sender object stringifies to
+      // "[object Object]" and would make our own echo look incoming.
+      const isSelf = Boolean(source?.senderId) && Boolean(currentUserIdRef.current)
+        && normalizeId(source.senderId) === normalizeId(currentUserIdRef.current);
       if (!isSelf && (source?.isScheduled || source?.data?.isScheduled)) {
         if (source) { source.isScheduled = false; source.scheduleTime = null; source.scheduleTimeLabel = null; source.status = source.status === 'scheduled' ? 'sent' : source.status; }
         if (source?.data) { source.data.isScheduled = false; source.data.scheduleTime = null; source.data.scheduleTimeLabel = null; }
@@ -4157,7 +4204,13 @@ export function RealtimeChatProvider({ children }) {
       }
 
       // Block isScheduled on receiver side only if scheduleTime is still in the future
-      const isSelf = data?.senderId && currentUserIdRef.current && String(data.senderId) === String(currentUserIdRef.current);
+      // normalizeId on BOTH sides: the server sometimes sends senderId as a
+      // populated object, and String({...}) is "[object Object]" — which never
+      // equals our id, so our OWN echo looked like an incoming message and the
+      // `!isSelf` upsert below wrote it as a second row beside the optimistic
+      // one (two bubbles for one send until the next reconcile).
+      const isSelf = Boolean(data?.senderId) && Boolean(currentUserIdRef.current)
+        && normalizeId(data.senderId) === normalizeId(currentUserIdRef.current);
       if (!isSelf && data?.isScheduled) {
         const st = data?.scheduleTime || data?.schedule_time;
         const stMs = st ? new Date(st).getTime() : 0;

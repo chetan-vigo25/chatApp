@@ -1888,6 +1888,45 @@ const findTempRowByContent = async (chatId, senderId, text, timestamp) => {
   } catch { return null; }
 };
 
+/**
+ * The still-unacknowledged local row for a media send, found by its mediaId.
+ *
+ * Companion to findTempRowByContent for the case that helper deliberately cannot
+ * serve: a captionless photo/video has text='', so content matching can neither
+ * identify it nor tell it apart from another captionless upload. The mediaId is
+ * the server's own handle for the uploaded file and comes back on the echo, so it
+ * identifies the send exactly.
+ *
+ * Only rows that ORIGINATED as an optimistic send on this device are eligible
+ * (they carry a temp_id), and `excludeId` skips the echo's own row so an already
+ * acknowledged send never matches itself. The send path mints a client-side
+ * messageId while the ack is outstanding, so the row being looked for is often
+ * NOT under a temp_ id any more — which is why the temp_id column, not the id
+ * shape, is the test. Without this, a broadcast echo carrying no clientMessageId
+ * became a SECOND row next to the one already on screen: the uploading bubble and
+ * the sent bubble at once.
+ */
+const findPendingRowByMediaId = async (chatId, senderId, mediaId, timestamp, excludeId = null) => {
+  if (!chatId || !senderId || !mediaId) return null;
+  const db = await getDB();
+  try {
+    const row = await db.getFirstAsync(
+      `SELECT * FROM messages
+         WHERE chat_id = $cid AND sender_id = $sid AND media_id = $mid
+           AND (temp_id IS NOT NULL OR id LIKE 'temp_%')
+           AND id != $ex AND COALESCE(server_message_id, '') != $ex
+           AND ABS(timestamp - $ts) < 120000
+         ORDER BY ABS(timestamp - $ts) ASC
+         LIMIT 1`,
+      {
+        $cid: chatId, $sid: senderId, $mid: String(mediaId),
+        $ts: timestamp || 0, $ex: excludeId ? String(excludeId) : '\u0000',
+      }
+    );
+    return row ? rowToMsg(row) : null;
+  } catch { return null; }
+};
+
 const messageExists = async (messageId) => {
   if (!messageId) return false;
   const db = await getDB();
@@ -3638,7 +3677,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,

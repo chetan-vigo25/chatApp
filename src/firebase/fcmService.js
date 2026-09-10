@@ -951,6 +951,17 @@ export const initializeNotifications = () => {
       await displayMissedCallNotification(remoteMessage.data);
       return;
     }
+    // iOS + an ALERT push (it carries a `notification` payload): iOS has already
+    // run the Notification Service Extension and presented that notification
+    // itself — scheduling our own copy here would put a SECOND banner on screen
+    // for one message. Android never auto-presents a push in the foreground, so
+    // it still needs us to draw it.
+    //
+    // Deliberately NOT claimed in the dedupe store: the in-app banner
+    // (AppBannerHost, driven by the socket) stays free to show, because it is the
+    // better foreground surface and it must never be suppressed by a push the OS
+    // may or may not have had permission to display.
+    if (Platform.OS === 'ios' && remoteMessage?.notification) return;
     await showLocalNotification(remoteMessage);
   });
 

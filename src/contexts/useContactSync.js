@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Platform, PermissionsAndroid } from 'react-native';
+import { Alert, Platform, PermissionsAndroid } from 'react-native';
 import * as Contacts from 'expo-contacts';
 import { useContacts } from './ContactContext';
 import { useNetwork } from './NetworkContext';
@@ -9,6 +9,7 @@ import { useDeviceInfo } from './DeviceInfoContext';
 import contactHasher from '../Redux/Services/Contact/ContactHasher';
 import ContactDatabase from '../services/ContactDatabase';
 import { suspendAppLock, resumeAppLock } from '../services/appLockGuard';
+import permissionManager from '../features/permissions/data/PermissionManager';
 import { subscribeSessionReset } from '../services/sessionEvents';
 
 // Module-level warm cache of the last-applied contact list. It lives OUTSIDE the
@@ -35,6 +36,34 @@ const STORAGE_KEYS = {
 };
 
 const UPDATE_HIGHLIGHT_MS = 24 * 60 * 60 * 1000;
+
+// ─── CONTACTS PERMISSION STATE ───
+// READ_CONTACTS is device state, not screen state: several screens mount this hook
+// at once (Select Contact, New group, Add members), so the last status the OS gave
+// us lives at MODULE level and every instance mirrors it. Deliberately NOT cleared
+// on session reset — revoking a permission is not an account event.
+//
+//   'granted' → usable
+//   'denied'  → refused, but the OS will still show its dialog again (so the very
+//               next Refresh re-asks, which is the whole point of this flow)
+//   'blocked' → "Don't allow" twice / iOS second ask: no dialog can ever appear
+//               again, only app Settings can fix it
+const CONTACTS_PERMISSION = { GRANTED: 'granted', DENIED: 'denied', BLOCKED: 'blocked' };
+
+let _contactsPermission = null; // null = never checked in this app session
+const _contactsPermissionListeners = new Set();
+
+const publishContactsPermission = (status) => {
+  if (_contactsPermission === status) return status;
+  _contactsPermission = status;
+  _contactsPermissionListeners.forEach((fn) => { try { fn(status); } catch (_) {} });
+  return status;
+};
+
+// One explanatory alert at a time. Two mounted instances resolving the same denial
+// (or a double tap on Refresh) must not stack two identical dialogs.
+let _lastPermissionExplainAt = 0;
+const PERMISSION_EXPLAIN_DEBOUNCE_MS = 1200;
 
 // Contacts synced per socket frame. Devices with thousands of contacts can't be
 // sent in one payload (huge frame + a server-side validation/match loop that
@@ -167,10 +196,21 @@ export const useContactSync = () => {
   const [lastSyncSessionId, setLastSyncSessionId] = useState(null);
   const [syncMetadata, setSyncMetadata] = useState({});
   const [changes, setChanges] = useState({ added: [], updated: [], removed: [], statusChanged: [] });
+  // Mirrors the module-level READ_CONTACTS status so a screen can render an
+  // "Allow contacts access" state without asking the OS itself.
+  const [contactsPermission, setContactsPermissionState] = useState(_contactsPermission);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    const listener = (status) => { if (mountedRef.current) setContactsPermissionState(status); };
+    _contactsPermissionListeners.add(listener);
+    // Catch a status another instance learned before this one mounted.
+    if (_contactsPermission !== null) listener(_contactsPermission);
+    return () => { _contactsPermissionListeners.delete(listener); };
   }, []);
 
   // ─── HELPERS ───
@@ -369,10 +409,17 @@ export const useContactSync = () => {
   // ─── HASHING ───
 
   /**
-   * Read contacts FRESH from device every time. Don't rely on the stale
-   * deviceContacts closure — it won't reflect numbers added after mount.
+   * The ONE place READ_CONTACTS is asked for. Returns a CONTACTS_PERMISSION value.
+   *
+   * A denial is never final: the OS dialog is raised again on the next sync/Refresh
+   * (`prompt: true`, the default) exactly as if it had never been asked, so the user
+   * can recover from "Deny" without reinstalling. Only when the OS itself refuses to
+   * ask again ('blocked') does the flow switch to the Settings prompt.
+   *
+   * @param {Object}  [options]
+   * @param {boolean} [options.prompt] false = passive read, shows NO dialog
    */
-  const readFreshDeviceContacts = useCallback(async () => {
+  const requestContactsPermission = useCallback(async ({ prompt = true } = {}) => {
     // The permission dialog can background the app (OEM-dependent) — suspend
     // the app lock so a contact fetch never bounces to the lock screen.
     suspendAppLock();
@@ -384,34 +431,119 @@ export const useContactSync = () => {
       // backgrounds→foregrounds the app and made the Select Contact screen
       // visibly BLINK once each time. Only request when we don't already hold it.
       let status;
+      let canAskAgain = true;
       try {
-        ({ status } = await Contacts.getPermissionsAsync());
+        const current = await Contacts.getPermissionsAsync();
+        status = current?.status;
+        canAskAgain = current?.canAskAgain !== false;
       } catch {
         status = undefined;
       }
-      if (status !== 'granted') {
-        if (Platform.OS === 'android') {
-          // Request via RN core PermissionsAndroid, NOT Contacts.requestPermissionsAsync().
-          // expo's request can route through a separate transparent permission
-          // activity, which stops→restarts MainActivity on return — and because
-          // MainActivity's theme is the splash theme (windowBackground = splash
-          // drawable), that restart FLASHES the splash for a frame (the "blink on
-          // first contact fetch"). PermissionsAndroid shows the dialog on the
-          // CURRENT activity (plain onPause→onResume), so nothing restarts/flashes.
-          try {
-            const res = await PermissionsAndroid.request(
-              PermissionsAndroid.PERMISSIONS.READ_CONTACTS
-            );
-            status = res === PermissionsAndroid.RESULTS.GRANTED ? 'granted' : 'denied';
-          } catch {
-            // Fall back to expo's request if the core module is somehow unavailable.
-            ({ status } = await Contacts.requestPermissionsAsync());
-          }
-        } else {
-          ({ status } = await Contacts.requestPermissionsAsync());
-        }
+      if (status === 'granted') return publishContactsPermission(CONTACTS_PERMISSION.GRANTED);
+
+      if (!prompt) {
+        // Android only reports never-ask-again from a REAL request (a passive check
+        // can't tell "never asked" from "permanently denied"), so a passive read
+        // never upgrades a denial to 'blocked' there — it keeps whatever an earlier
+        // request taught us.
+        return publishContactsPermission(
+          Platform.OS === 'android'
+            ? (_contactsPermission === CONTACTS_PERMISSION.BLOCKED
+                ? CONTACTS_PERMISSION.BLOCKED
+                : CONTACTS_PERMISSION.DENIED)
+            : (canAskAgain ? CONTACTS_PERMISSION.DENIED : CONTACTS_PERMISSION.BLOCKED)
+        );
       }
-      if (status !== 'granted') return [];
+
+      if (Platform.OS === 'android') {
+        // Request via RN core PermissionsAndroid, NOT Contacts.requestPermissionsAsync().
+        // expo's request can route through a separate transparent permission
+        // activity, which stops→restarts MainActivity on return — and because
+        // MainActivity's theme is the splash theme (windowBackground = splash
+        // drawable), that restart FLASHES the splash for a frame (the "blink on
+        // first contact fetch"). PermissionsAndroid shows the dialog on the
+        // CURRENT activity (plain onPause→onResume), so nothing restarts/flashes.
+        try {
+          const res = await PermissionsAndroid.request(
+            PermissionsAndroid.PERMISSIONS.READ_CONTACTS
+          );
+          if (res === PermissionsAndroid.RESULTS.GRANTED) {
+            status = 'granted';
+          } else {
+            // NEVER_ASK_AGAIN is the only signal Android gives that no further
+            // dialog can appear — a plain DENIED still re-asks next time.
+            status = 'denied';
+            canAskAgain = res !== PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN;
+          }
+        } catch {
+          // Fall back to expo's request if the core module is somehow unavailable.
+          const res = await Contacts.requestPermissionsAsync();
+          status = res?.status;
+          canAskAgain = res?.canAskAgain !== false;
+        }
+      } else {
+        const res = await Contacts.requestPermissionsAsync();
+        status = res?.status;
+        canAskAgain = res?.canAskAgain !== false;
+      }
+
+      if (status === 'granted') return publishContactsPermission(CONTACTS_PERMISSION.GRANTED);
+      return publishContactsPermission(
+        canAskAgain ? CONTACTS_PERMISSION.DENIED : CONTACTS_PERMISSION.BLOCKED
+      );
+    } catch (err) {
+      console.warn('[useContactSync] requestContactsPermission error:', err?.message);
+      return publishContactsPermission(CONTACTS_PERMISSION.DENIED);
+    } finally {
+      resumeAppLock();
+    }
+  }, []);
+
+  /**
+   * Tell the user why the contact list stayed empty — ONLY for actions they took
+   * themselves (Refresh / Process contacts). Screen-open and background syncs stay
+   * silent: they still re-raise the OS dialog, but they never pop an alert the user
+   * didn't ask for.
+   */
+  const explainContactsPermission = useCallback((status, { userInitiated = false } = {}) => {
+    if (!userInitiated || status === CONTACTS_PERMISSION.GRANTED) return;
+    if (Date.now() - _lastPermissionExplainAt < PERMISSION_EXPLAIN_DEBOUNCE_MS) return;
+    _lastPermissionExplainAt = Date.now();
+
+    if (status === CONTACTS_PERMISSION.BLOCKED) {
+      Alert.alert(
+        'Contacts access is blocked',
+        'We match your phonebook to show which of your contacts are already here.\n\n'
+        + 'The permission dialog can no longer be shown, so please enable Contacts in Settings.',
+        [
+          { text: 'Not now', style: 'cancel' },
+          { text: 'Open Settings', onPress: () => { permissionManager.openSettings(); } },
+        ],
+      );
+      return;
+    }
+
+    Alert.alert(
+      'Contacts permission needed',
+      'Allow access to your contacts so we can show which of them are already here. '
+      + 'Pull to refresh to try again.',
+    );
+  }, []);
+
+  /**
+   * Read contacts FRESH from device every time. Don't rely on the stale
+   * deviceContacts closure — it won't reflect numbers added after mount.
+   *
+   * Returns [] when the permission isn't held. Callers MUST treat an empty result
+   * together with the permission status — "not allowed to read" and "no contacts on
+   * this device" are different states (see runFullSync / runDeltaSync).
+   */
+  const readFreshDeviceContacts = useCallback(async () => {
+    // Re-asks on every fetch/refresh while the permission is merely denied — a
+    // "Deny" during the first sync is recoverable by hitting Refresh.
+    const permission = await requestContactsPermission({ prompt: true });
+    if (permission !== CONTACTS_PERMISSION.GRANTED) return [];
+    try {
       const { data } = await Contacts.getContactsAsync({
         fields: [Contacts.Fields.PhoneNumbers],
       });
@@ -421,10 +553,8 @@ export const useContactSync = () => {
     } catch (err) {
       console.warn('[useContactSync] readFreshDeviceContacts error:', err?.message);
       return [];
-    } finally {
-      resumeAppLock();
     }
-  }, []);
+  }, [requestContactsPermission]);
 
   /**
    * Read device contacts fresh and normalize every number to plaintext E.164
@@ -556,7 +686,7 @@ export const useContactSync = () => {
 
   // ─── FULL SYNC (first time or expired) ───
 
-  const runFullSync = useCallback(async ({ reason = 'manual', silent = false, force = false } = {}) => {
+  const runFullSync = useCallback(async ({ reason = 'manual', silent = false, force = false, userInitiated = false } = {}) => {
     if (!socket?.emit) throw new Error('Socket not available for full sync');
 
     // A full sync is already running (e.g. the background one kicked off after the
@@ -566,9 +696,21 @@ export const useContactSync = () => {
 
     const e164Contacts = await getE164Contacts();
     if (!e164Contacts.length) {
-      await ContactDatabase.setSyncMetadata({ lastSyncStatus: 'empty_device_contacts' });
+      // An UNREADABLE phonebook also comes back empty, so the two cases must not be
+      // recorded (or explained) the same way: 'empty_device_contacts' means the
+      // device really has no numbers, 'permission_*' means we were never allowed to
+      // look. Either way nothing is uploaded and nothing local is touched — the
+      // cached list stays exactly as it was.
+      const permission = _contactsPermission;
+      const denied = permission && permission !== CONTACTS_PERMISSION.GRANTED;
+      // setSyncMetadata REPLACES the stored object, so the denied path merges the
+      // previous metadata back in — a refusal must not erase when we last synced.
+      await ContactDatabase.setSyncMetadata(denied
+        ? { ...((await ContactDatabase.getSyncMetadata()) || {}), lastSyncStatus: `permission_${permission}` }
+        : { lastSyncStatus: 'empty_device_contacts' });
       await applyFromDB();
       fullSyncInProgressRef.current = false;
+      if (denied) explainContactsPermission(permission, { userInitiated });
       return;
     }
 
@@ -708,17 +850,34 @@ export const useContactSync = () => {
         setIsExpiredUpdating(false);
       }
     }
-  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
+  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB, explainContactsPermission]);
 
   // ─── DELTA SYNC (only added / removed numbers) ───
   // After the first full sync, subsequent syncs send ONLY the numbers added since
   // last time (+ a removed list) — not the whole phonebook. Adding one contact
   // costs one small round-trip, not a full re-upload + re-match.
   const runDeltaSyncRef = useRef(null);
-  const runDeltaSync = useCallback(async ({ reason = 'delta', silent = true } = {}) => {
+  const runDeltaSync = useCallback(async ({ reason = 'delta', silent = true, userInitiated = false } = {}) => {
     if (!socket?.emit) throw new Error('Socket not available for delta sync');
 
     const e164Contacts = await getE164Contacts();
+
+    // A phonebook we were not ALLOWED to read comes back empty — and to the diff
+    // below an empty device set looks exactly like "the user deleted every contact",
+    // so it would send the whole synced list as `removedContacts` and then delete it
+    // locally too. Bail out before the diff: a denied permission must never wipe
+    // contacts. The OS dialog was already re-raised by getE164Contacts, so hitting
+    // Refresh again after allowing is all the recovery needed.
+    if (!e164Contacts.length && _contactsPermission && _contactsPermission !== CONTACTS_PERMISSION.GRANTED) {
+      await ContactDatabase.setSyncMetadata({
+        ...((await ContactDatabase.getSyncMetadata()) || {}),
+        lastSyncStatus: `permission_${_contactsPermission}`,
+      });
+      await applyFromDB();
+      explainContactsPermission(_contactsPermission, { userInitiated });
+      return;
+    }
+
     const numbers = e164Contacts.map((c) => c.phoneNumber);
     const contactsHash = contactHasher.computeContactListHash(numbers);
 
@@ -822,7 +981,7 @@ export const useContactSync = () => {
     } finally {
       if (mountedRef.current) setIsSyncing(false);
     }
-  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB]);
+  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB, explainContactsPermission]);
   runDeltaSyncRef.current = runDeltaSync;
 
   // ─── INCREMENTAL REFRESH ───
@@ -1022,7 +1181,12 @@ export const useContactSync = () => {
   // full sync. Contacts that JOINED since last sync flip live via the
   // `contact:registered` push, so a manual refresh doesn't need a full re-match.
 
-  const refreshContacts = useCallback(async ({ fallbackToSync = true } = {}) => {
+  // `userInitiated` defaults to true because pull-to-refresh is this function's
+  // main caller: a refusal the user can SEE the consequence of deserves an
+  // explanation (and the Settings prompt once the OS stops asking). Background
+  // callers (the reconnect flush, the post-save resync) pass false — they still
+  // re-raise the OS dialog, they just never pop an alert out of nowhere.
+  const refreshContacts = useCallback(async ({ fallbackToSync = true, userInitiated = true } = {}) => {
     if (!isConnected) {
       await AsyncStorage.setItem(STORAGE_KEYS.PENDING_REFRESH, 'true');
       throw new Error('Offline - refresh queued');
@@ -1035,9 +1199,12 @@ export const useContactSync = () => {
     // `deviceContacts` state — re-rendering every consumer of that context and
     // making the Select Contact screen visibly BLINK on each refresh. Removed.
 
+    // userInitiated: the OS dialog is re-raised on every path below, but only a
+    // refresh the USER asked for is allowed to follow a refusal with an alert (and,
+    // once the OS stops asking, the Settings prompt).
     const initialDone = await ContactDatabase.isInitialSyncDone();
-    if (!initialDone) return runFullSync({ reason: 'pull_to_refresh_first', silent: false });
-    return runDeltaSync({ reason: 'pull_to_refresh', silent: false });
+    if (!initialDone) return runFullSync({ reason: 'pull_to_refresh_first', silent: false, userInitiated });
+    return runDeltaSync({ reason: 'pull_to_refresh', silent: false, userInitiated });
   }, [isConnected, runFullSync, runDeltaSync]);
 
   // ─── PUBLIC: ensureContactsSynced (screen-open auto sync) ───
@@ -1084,7 +1251,7 @@ export const useContactSync = () => {
 
   const processContacts = useCallback(async () => {
     setIsProcessing(true);
-    try { return await runFullSync({ reason: 'process_contacts', silent: false }); }
+    try { return await runFullSync({ reason: 'process_contacts', silent: false, userInitiated: true }); }
     finally { if (mountedRef.current) setIsProcessing(false); }
   }, [runFullSync]);
 
@@ -1174,7 +1341,7 @@ export const useContactSync = () => {
     const reconcile = async () => {
       const pending = await AsyncStorage.getItem(STORAGE_KEYS.PENDING_REFRESH);
       if (pending === 'true') {
-        try { await refreshContacts({ fallbackToSync: true }); }
+        try { await refreshContacts({ fallbackToSync: true, userInitiated: false }); }
         catch (err) { console.warn('[useContactSync] pending refresh failed:', err?.message); }
       }
     };
@@ -1273,6 +1440,14 @@ export const useContactSync = () => {
     syncMetadata,
     changes,
     hasCachedContacts: matchedContacts.length > 0,
+    // Last status the OS reported for READ_CONTACTS ('granted' | 'denied' |
+    // 'blocked' | null when never checked yet) + the gate itself, so a screen can
+    // render its own "Allow contacts access" affordance. Pass { prompt: false } to
+    // read the status without raising a dialog.
+    contactsPermission,
+    contactsPermissionBlocked: contactsPermission === CONTACTS_PERMISSION.BLOCKED,
+    requestContactsPermission,
+    openContactsSettings: () => permissionManager.openSettings(),
     isCacheExpired: syncMetadata?.expiresAt ? Date.now() >= Number(syncMetadata.expiresAt) : false,
   };
 };
