@@ -4456,19 +4456,31 @@ export default function ChatScreen({ navigation, route }) {
   }, [isConnected, sendContactMessage]);
 
   /**
-   * Media picked inside AttachmentSheet's own gallery grid.
+   * Media sent from AttachmentSheet's gallery grid + caption bar.
    *
-   * Deliberately the SAME branch useChatLogic.handlePickMedia takes for a
-   * system-picker result, so the two sources cannot drift:
-   *   • one photo/video → staged into the composer's pending-media strip, which
-   *     is what carries the View Once "1" toggle; the user still taps send.
-   *   • several        → an album, uploaded immediately through sendMediaGroup.
+   * The sheet's caption bar IS the send (WhatsApp picker), so nothing is staged
+   * into the composer — it goes out over the same calls the composer's send
+   * makes:
+   *   • one photo/video → sendMedia, with the caption.
+   *   • several        → one album through sendMediaGroup, with the caption.
    * Nothing about the upload, the optimistic row, or the socket emit changes —
    * only where the file objects came from.
    */
   const handleSheetSendMedia = useCallback((files, options = {}) => {
     if (!files?.length) return;
+    // The composer's send refuses while I have this peer blocked. A single pick
+    // used to inherit that by being staged there; sending directly must repeat it.
+    if (!isGroupChat && iBlockedPeer) {
+      Alert.alert('You blocked this contact', 'Unblock them to send a message.', [
+        { text: 'Cancel', style: 'cancel' },
+        // Called lazily: it is declared further down this component, so it
+        // cannot sit in the deps array (TDZ during render).
+        { text: 'Unblock', onPress: () => handleUnblockFromChat() },
+      ]);
+      return;
+    }
     const typeOf = (file) => (String(file.type || '').startsWith('video') ? 'video' : 'image');
+    const caption = String(options.caption || '').trim();
 
     // View once goes out as ONE MESSAGE PER FILE, deliberately.
     //
@@ -4494,12 +4506,13 @@ export default function ChatScreen({ navigation, route }) {
 
     if (files.length === 1) {
       const file = files[0];
-      setPendingMedia({ file, type: typeOf(file) });
+      sendMedia({ file, type: typeOf(file) }, { caption })
+        .catch((err) => console.warn('[sendMedia] sheet-send error:', err?.message));
       return;
     }
-    sendMediaGroup({ files, caption: '' })
+    sendMediaGroup({ files, caption })
       .catch((err) => console.warn('[sendMediaGroup] sheet-send error:', err?.message));
-  }, [setPendingMedia, sendMedia, sendMediaGroup]);
+  }, [isGroupChat, iBlockedPeer, sendMedia, sendMediaGroup]);
 
   // The sheet's folder FAB — hands off to the OS picker for anything the
   // Recents grid does not surface (other apps' albums, cloud providers).

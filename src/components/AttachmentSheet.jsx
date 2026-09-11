@@ -47,6 +47,7 @@ import {
   Alert,
   BackHandler,
   Dimensions,
+  Keyboard,
   Platform,
   Pressable,
   ScrollView,
@@ -75,6 +76,7 @@ import useDeviceMediaLibrary from '../hooks/useDeviceMediaLibrary';
 import { createSelectionStore } from '../utils/mediaSelectionStore';
 import { normalizeLibraryAssets } from '../utils/deviceMedia';
 import MediaGridCell from './MediaGridCell';
+import MediaCaptionBar from './MediaCaptionBar';
 
 const SCREEN_W = Dimensions.get('window').width;
 
@@ -220,10 +222,18 @@ export default function AttachmentSheet({
 
   const [sending, setSending] = useState(false);
   const [albumOpen, setAlbumOpen] = useState(false);
-  // View once — the same "1" affordance the composer's pending-media strip
-  // carries, offered here so a multi-select can be sent view-once without
-  // going through the composer one item at a time.
+  // View once — the "1" inside the caption bar's pill (components/
+  // MediaCaptionBar), so a multi-select can be sent view-once without going
+  // through the composer one item at a time.
   const [viewOnce, setViewOnce] = useState(false);
+  const toggleViewOnce = useCallback(() => setViewOnce((on) => !on), []);
+
+  // The caption bar's thumbnail lookup. Rebuilt only on a real insert, like
+  // gridData — never on selection.
+  const assetsById = useMemo(
+    () => new Map(media.assets.map((asset) => [asset.id, asset])),
+    [media.assets],
+  );
 
   // Set true on SETUP, not just false on cleanup. A cleanup-only version leaks
   // across any remount that reuses the ref — Fast Refresh and StrictMode both
@@ -260,6 +270,8 @@ export default function AttachmentSheet({
       return;
     }
     if (!mounted) return;
+    // The caption bar may own the keyboard; it must not outlive the sheet.
+    Keyboard.dismiss();
     setExpanded(false);
     expandedSV.value = false;
     ty.value = withTiming(
@@ -340,12 +352,26 @@ export default function AttachmentSheet({
     try { listRef.current?.scrollToOffset?.({ offset: 0, animated: false }); } catch { /* list not mounted */ }
   }, [scrollY]);
 
+  // A caption keyboard left up over the half state would cover the attach grid
+  // and float ChatScreen's composer (which pads by the keyboard too) over it.
+  const dismissKeyboard = useCallback(() => { Keyboard.dismiss(); }, []);
+
   const collapseToHalf = useCallback(() => {
+    dismissKeyboard();
     setExpanded(false);
     expandedSV.value = false;
     resetGridScroll();
     ty.value = withSpring(HALF_Y, SPRING);
-  }, [HALF_Y, ty, expandedSV, resetGridScroll]);
+  }, [HALF_Y, ty, expandedSV, resetGridScroll, dismissKeyboard]);
+
+  // Focusing the caption opens the full picker, as WhatsApp's does — the
+  // keyboard is only ever up over the full state (see dismissKeyboard).
+  const expandToFull = useCallback(() => {
+    if (expandedSV.value) return;
+    expandedSV.value = true;
+    setExpanded(true);
+    ty.value = withSpring(0, SPRING);
+  }, [ty, expandedSV]);
 
   useEffect(() => {
     if (!expanded) resetGridScroll();
@@ -399,25 +425,28 @@ export default function AttachmentSheet({
    * ph:// identifier to a real file, which is why it is emphatically not
    * something to do per visible tile.
    */
-  const handleSend = useCallback(async () => {
+  const handleSend = useCallback(async (caption = '') => {
     const ids = selection.getIds();
     if (sending || ids.length === 0) return;
+    Keyboard.dismiss();
     setSending(true);
     try {
-      const byId = new Map(media.assets.map((asset) => [asset.id, asset]));
-      const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
+      const ordered = ids.map((id) => assetsById.get(id)).filter(Boolean);
       const files = await normalizeLibraryAssets(ordered);
       const once = viewOnce;
       selection.clear();
       setViewOnce(false);
       requestClose();
-      if (files.length) callbacks.current.onSendMedia?.(files, { viewOnce: once });
+      // View-once media is captionless by contract (useChatLogic.sendMedia).
+      if (files.length) {
+        callbacks.current.onSendMedia?.(files, { viewOnce: once, caption: once ? '' : caption });
+      }
     } catch (err) {
       console.warn('[AttachmentSheet] send failed', err?.message || err);
     } finally {
       if (aliveRef.current) setSending(false);
     }
-  }, [media.assets, requestClose, selection, sending, viewOnce]);
+  }, [assetsById, requestClose, selection, sending, viewOnce]);
 
   const handleOptionPress = useCallback((option) => {
     requestClose();
@@ -481,10 +510,11 @@ export default function AttachmentSheet({
         return;
       }
       const isFull = best === 0;
+      if (!isFull) runOnJS(dismissKeyboard)();
       expandedSV.value = isFull;
       runOnJS(setExpanded)(isFull);
       ty.value = withSpring(best, SPRING);
-    }), [listGesture, FULL_H, HALF_Y, ty, start, anchor, moved, expandedSV, scrollY, requestClose]);
+    }), [listGesture, FULL_H, HALF_Y, ty, start, anchor, moved, expandedSV, scrollY, requestClose, dismissKeyboard]);
 
   const onScroll = useAnimatedScrollHandler({
     onScroll: (e) => { scrollY.value = e.contentOffset.y; },
@@ -581,7 +611,7 @@ export default function AttachmentSheet({
 
   const isLimitedAccess = media.isLimited;
   const showFolderFab = expanded && selectedCount === 0 && media.permissionGranted;
-  const showSendFab = selectedCount > 0;
+  const showCaptionBar = selectedCount > 0;
 
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
@@ -875,50 +905,23 @@ export default function AttachmentSheet({
         </TouchableOpacity>
       )}
 
-      {/* View once — sits beside the send FAB so the choice is made at the same
-          moment as the send, exactly like the composer's pending-media strip.
-          Same "1" disc, filled when armed, so the two read as one control. */}
-      {showSendFab && (
-        <TouchableOpacity
-          style={[styles.viewOnceFab, {
-            backgroundColor: viewOnce ? accent : colors.surface,
-            borderColor: viewOnce ? accent : colors.divider,
-          }]}
-          onPress={() => setViewOnce((on) => !on)}
-          accessibilityRole="button"
-          accessibilityState={{ selected: viewOnce }}
-          accessibilityLabel={viewOnce ? 'View once on' : 'View once'}
-        >
-          <Text style={[styles.viewOnceText, {
-            color: viewOnce ? '#fff' : colors.primaryTextColor,
-            fontFamily: fonts.bold,
-          }]}>
-            1
-          </Text>
-        </TouchableOpacity>
-      )}
-
-      {showSendFab && (
-        <TouchableOpacity
-          style={[styles.fab, styles.sendFab, { backgroundColor: accent, borderColor: colors.divider }]}
-          onPress={handleSend}
-          disabled={sending}
-          accessibilityRole="button"
-          accessibilityLabel={`Send ${selectedCount} item${selectedCount === 1 ? '' : 's'}`}
-        >
-          {sending ? (
-            <ActivityIndicator size="small" color="#fff" />
-          ) : (
-            <>
-              <Ionicons name="send" size={20} color="#fff" />
-              <View style={[styles.sendCount, { backgroundColor: colors.cardBackground }]}>
-                <Text style={[styles.sendCountText, { color: accent, fontFamily: fonts.bold }]}>
-                  {selectedCount}
-                </Text>
-              </View>
-            </>
-          )}
-        </TouchableOpacity>
+      {/* WhatsApp-style send row: latest pick, caption pill with the view-once
+          "1" inside it, send with the count. A sibling of the sheet, anchored
+          to the screen bottom, so it is reachable in the half state too. */}
+      {showCaptionBar && (
+        <MediaCaptionBar
+          store={selection}
+          assetsById={assetsById}
+          viewOnce={viewOnce}
+          onToggleViewOnce={toggleViewOnce}
+          onSend={handleSend}
+          onFocus={expandToFull}
+          sending={sending}
+          colors={colors}
+          fonts={fonts}
+          accent={accent}
+          isDarkMode={isDarkMode}
+        />
       )}
     </View>
   );
@@ -1063,29 +1066,4 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: StyleSheet.hairlineWidth,
   },
-  sendFab: {},
-  viewOnceFab: {
-    position: 'absolute',
-    right: 80,
-    bottom: 31,
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1.5,
-  },
-  viewOnceText: { fontSize: 13 },
-  sendCount: {
-    position: 'absolute',
-    top: -2,
-    right: -2,
-    minWidth: 20,
-    height: 20,
-    borderRadius: 10,
-    paddingHorizontal: 5,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sendCountText: { fontSize: 11 },
 });
