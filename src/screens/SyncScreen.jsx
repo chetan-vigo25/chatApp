@@ -20,6 +20,7 @@ import { chatServices } from '../Redux/Services/Chat/Chat.Services';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { subscribeSessionReset } from '../services/sessionEvents';
 import { waitWhilePaused } from '../services/syncPriority';
+import { normalizeMentions } from '../utils/mentions';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -55,27 +56,57 @@ const MSG_WARM_LIMIT = 25;        // recent messages to pre-cache per chat
 const MSG_WARM_CONCURRENCY = 4;   // parallel chat fetches (was a batch of 3)
 const MSG_WARM_WRITE_GAP_MS = 60; // breathing room between writes so chat-open reads slip in
 
-const _normalizeMessage = (msg, chat, chatId) => ({
-  id: msg._id || msg.messageId,
-  serverMessageId: msg._id || msg.messageId,
-  chatId,
-  groupId: chat.groupId || (chat.chatType === 'group' ? chatId : null),
-  senderId: msg.senderId || null,
-  senderName: msg.senderName || null,
-  text: msg.text || '',
-  type: msg.messageType || msg.type || 'text',
-  status: msg.status || 'sent',
-  timestamp: msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now(),
-  createdAt: msg.createdAt || new Date().toISOString(),
-  synced: 1,
-  mediaUrl: msg.mediaUrl || null,
-  mediaType: msg.mediaType || null,
-  replyToMessageId: msg.replyToMessageId || (typeof msg.replyTo === 'string' ? msg.replyTo : msg.replyTo?._id) || null,
-  replyPreviewText: msg.replyPreviewText || msg.replyTo?.text || null,
-  replyPreviewType: msg.replyPreviewType || msg.replyTo?.messageType || null,
-  replySenderId: msg.replySenderId || msg.replyTo?.senderId || null,
-  replySenderName: msg.replySenderName || msg.replyTo?.senderName || null,
-});
+// Keyed by the UUID `messageId` FIRST — the id every realtime / sync / catch-up
+// normalizer keys rows by. Preferring the Mongo `_id` here stored each warmed
+// message a second time next to the copy chat-open sync later wrote under its
+// UUID: duplicate bubbles, and media shown once as "Unknown size" (this copy
+// carried no mediaMeta). `mongoId` lets the upsert retire a row stored under the
+// other form, and the media / forward / album / view-once fields match the live
+// path so a warmed row renders the same bubble. See utils/messageIdentity.
+const _normalizeMessage = (msg, chat, chatId) => {
+  const id = msg.messageId || msg._id;
+  const type = msg.messageType || msg.type || 'text';
+  const isViewOnce = Boolean(msg.isViewOnce);
+  return {
+    id,
+    serverMessageId: id,
+    mongoId: msg._id ? String(msg._id) : null,
+    clientMessageId: msg.clientMessageId || msg.clientId || null,
+    seq: (msg.seq != null && !Number.isNaN(Number(msg.seq))) ? Number(msg.seq) : null,
+    chatId,
+    groupId: chat.groupId || (chat.chatType === 'group' ? chatId : null),
+    senderId: msg.senderId || null,
+    senderName: msg.senderName || null,
+    receiverId: msg.receiverId || null,
+    text: msg.text || '',
+    type,
+    status: msg.status || 'sent',
+    timestamp: msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now(),
+    createdAt: msg.createdAt || new Date().toISOString(),
+    synced: 1,
+    // View-once rows are metadata-only — no url/preview/mediaId.
+    mediaUrl: isViewOnce ? null : (msg.mediaUrl || null),
+    mediaType: msg.mediaType || msg.fileCategory
+      || (['image', 'video', 'audio', 'file', 'album'].includes(type) ? type : null),
+    previewUrl: isViewOnce ? null : (msg.mediaThumbnailUrl || msg.previewUrl || null),
+    mediaThumbnailUrl: isViewOnce ? null : (msg.mediaThumbnailUrl || msg.thumbnailUrl || null),
+    mediaId: isViewOnce ? null : (msg.mediaId || null),
+    mediaMeta: msg.mediaMeta || null,
+    mediaGroupId: msg.mediaGroupId || null,
+    mediaItems: Array.isArray(msg.mediaItems) ? msg.mediaItems : null,
+    isViewOnce,
+    viewOnce: (msg.viewOnce && typeof msg.viewOnce === 'object') ? msg.viewOnce : null,
+    isForwarded: Boolean(msg.isForwarded || msg.forwardedFrom),
+    forwardedFrom: msg.forwardedFrom || null,
+    systemEvent: (msg.systemEvent && typeof msg.systemEvent === 'object') ? msg.systemEvent : null,
+    mentions: normalizeMentions(msg),
+    replyToMessageId: msg.replyToMessageId || (typeof msg.replyTo === 'string' ? msg.replyTo : msg.replyTo?._id) || null,
+    replyPreviewText: msg.replyPreviewText || msg.replyTo?.text || null,
+    replyPreviewType: msg.replyPreviewType || msg.replyTo?.messageType || null,
+    replySenderId: msg.replySenderId || msg.replyTo?.senderId || null,
+    replySenderName: msg.replySenderName || msg.replyTo?.senderName || null,
+  };
+};
 
 // Background, fire-and-forget warm of recent messages per chat. NOT awaited by
 // the restore — the user is already in the app. Uses a bounded worker pool

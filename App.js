@@ -119,6 +119,10 @@ export default function App() {
   // silently when the activity isn't task root — the native side re-launches
   // itself and returns WITHOUT notifying JS — and these logs are the only way to
   // see which stage swallowed it.
+  // Two render-crash boundaries (AppErrorBoundary needs no provider):
+  //  • inner — around the navigation root only, so a crashing screen shows the
+  //    fallback while CallProvider (a live call) and AppLockGate keep running;
+  //  • outer — around the whole tree, for a crash inside a provider itself.
   return (
     <ShareIntentProvider options={{ debug: __DEV__ }}>
      <SafeAreaProvider>
@@ -139,7 +143,7 @@ export default function App() {
                   <RealtimeChatProvider>
                     <CallProvider>
                       <CallContentInset>
-                        <AppContent />
+                          <AppContent />
                         <AppLockGate />
                       </CallContentInset>
                     </CallProvider>

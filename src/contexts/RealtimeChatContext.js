@@ -3931,6 +3931,9 @@ export function RealtimeChatProvider({ children }) {
                   mediaType: m.mediaType || null,
                   previewUrl: m.mediaThumbnailUrl || m.previewUrl || null,
                   mediaId: m.mediaId || null,
+                  // Dedupe bridge (cleanBeforeUpsert rule 0): a row the warm
+                  // restore stored under the Mongo _id is replaced, not doubled.
+                  mongoId: normalizeId(m._id) || null,
                   synced: 1,
                 };
               });
@@ -4358,6 +4361,11 @@ export function RealtimeChatProvider({ children }) {
         ChatDatabase.upsertMessage({
           id: resolvedMessageId,
           serverMessageId: resolvedMessageId,
+          // Dedupe bridges (cleanBeforeUpsert rule 0), same as the 1:1 path: a
+          // row stored under the Mongo _id or the send's idempotency key by
+          // another ingest path is replaced instead of duplicated.
+          mongoId: data?._id ? normalizeId(data._id) : null,
+          clientMessageId: data?.clientMessageId || data?.clientId || null,
           tempId: data?.tempId || null,
           chatId: chatId || groupId,
           groupId: groupId || chatId,

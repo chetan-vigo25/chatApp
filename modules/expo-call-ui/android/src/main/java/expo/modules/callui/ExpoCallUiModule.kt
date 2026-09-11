@@ -556,6 +556,11 @@ class ExpoCallUiModule : Module() {
         .setPriority(NotificationCompat.PRIORITY_MAX)
         .setOngoing(true)
         .setAutoCancel(false)
+        // Hard cap on ringing: a push delivered late (Doze / offline backlog) is
+        // accepted up to 10 min old to survive device clock skew, so without a
+        // timeout a call that already ended could ring until a call_cancel push
+        // arrives — or forever if none does. Longer than the 40s ring window.
+        .setTimeoutAfter(60_000L)
         .setContentIntent(fullScreenIntent)
         .setFullScreenIntent(fullScreenIntent, true)
         .setStyle(

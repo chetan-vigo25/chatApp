@@ -61,6 +61,7 @@ import {
   getCurrentUserId, setCurrentUser, primeCurrentUser, subscribeCurrentUser,
 } from "../services/currentUser";
 import { computeSenderType, isOutgoingMessage } from "../utils/messageDirection";
+import { dropAlternateIdTwins } from "../utils/messageIdentity";
 import { normalizeMentions } from "../utils/mentions";
 
 // Module-level cache of the logged-in user (id + display name). `initializeChat`
@@ -1656,7 +1657,10 @@ export default function useChatLogic({ navigation, route }) {
       return true;
     });
     const filteredScheduled = scheduledMessages.filter(matchesChat);
-    const combined = [...filteredScheduled, ...filteredChat];
+    // A message held under both its UUID and its Mongo _id shares no id — keep
+    // the UUID copy. The text fingerprint below never covers media, which is
+    // where the "Unknown size" twin showed up.
+    const combined = dropAlternateIdTwins([...filteredScheduled, ...filteredChat]);
     const sorted = combined.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
     // Dedup by ID, plus a content fingerprint that ONLY suppresses

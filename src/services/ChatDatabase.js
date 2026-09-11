@@ -1,6 +1,7 @@
 import * as SQLite from 'expo-sqlite';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
+import { isMongoObjectId, sqlIsObjectId, dropAlternateIdTwins } from '../utils/messageIdentity';
 
 const DB_NAME = 'TalksTry.db';
 const DB_VERSION = 15;
@@ -1007,11 +1008,50 @@ const cleanBeforeUpsert = async (db, msg) => {
   //    When the incoming msg carries the other form, delete any row stored
   //    under it — otherwise the two forms coexist as duplicate bubbles that
   //    no other rule can match (both have non-null, different ids).
-  if (msg.mongoId && msg.mongoId !== id) {
+  //    A raw server doc spread into the message (catch-up) carries the form as
+  //    `_id` rather than `mongoId`.
+  const altMongoId = msg.mongoId || msg._id;
+  if (altMongoId && isMongoObjectId(altMongoId) && String(altMongoId) !== String(id)) {
     await db.runAsync(
       `DELETE FROM messages WHERE (id = $alt OR server_message_id = $alt) AND id != $id`,
-      { $alt: String(msg.mongoId), $id: id }
+      { $alt: String(altMongoId), $id: id }
     );
+  }
+  //    Twin bridge — the same pair when the incoming copy names NEITHER form of
+  //    the other (see utils/messageIdentity): one sender + one type + one exact
+  //    server timestamp in one chat is one message. The UUID-keyed row always
+  //    survives; the ObjectId-keyed copy only hands over local state (downloaded
+  //    file, reactions, a further-along tick). Returns 'alternate' when the
+  //    INCOMING copy is the ObjectId form of a row already stored canonically —
+  //    the caller skips that write instead of re-creating the duplicate.
+  const twinTs = Number(msg.timestamp || new Date(msg.createdAt || 0).getTime() || 0);
+  if (twinTs > 0 && msg.chatId && msg.senderId && !String(id).startsWith('temp_')) {
+    const incomingIsObjectId = isMongoObjectId(id);
+    const twins = await db.getAllAsync(
+      `SELECT id, local_uri, reactions, status FROM messages WHERE chat_id = $cid AND sender_id = $sid AND timestamp = $ts AND type = $type AND id != $id AND id NOT LIKE 'temp_%'`,
+      { $cid: msg.chatId, $sid: String(msg.senderId), $ts: twinTs, $type: msg.type || 'text', $id: id }
+    );
+    for (const twin of twins) {
+      // Two ids of the same shape at the same instant are not proven one message.
+      if (isMongoObjectId(twin.id) === incomingIsObjectId) continue;
+      if (incomingIsObjectId) {
+        if (msg.localUri) {
+          await db.runAsync(
+            `UPDATE messages SET local_uri = COALESCE(local_uri, $lu) WHERE id = $t`,
+            { $lu: msg.localUri, $t: twin.id }
+          );
+        }
+        return 'alternate';
+      }
+      if (!msg.localUri && twin.local_uri) msg.localUri = twin.local_uri;
+      const hasReactions = msg.reactions && typeof msg.reactions === 'object' && Object.keys(msg.reactions).length > 0;
+      if (!hasReactions && twin.reactions) {
+        const r = parseJSON(twin.reactions);
+        if (r && typeof r === 'object' && Object.keys(r).length > 0) msg.reactions = r;
+      }
+      if ((STATUS_PRIORITY[twin.status] || 0) > (STATUS_PRIORITY[msg.status] || 0)) msg.status = twin.status;
+      await db.runAsync(`DELETE FROM messages WHERE id = $t`, { $t: twin.id });
+    }
   }
   //    Same idea for the cross-transport idempotency key: an optimistic /
   //    REST-created row may be keyed by the clientMessageId itself.
@@ -1349,7 +1389,9 @@ const _runUpsertBatch = async (db, messages) => {
               replySenderId: msg.replySenderId || replyData.replySenderId,
             }
           : msg;
-        await cleanBeforeUpsert(db, finalMsg);
+        // 'alternate': this is the Mongo-_id copy of a message already stored
+        // under its UUID — writing it would re-create the duplicate bubble.
+        if (await cleanBeforeUpsert(db, finalMsg) === 'alternate') continue;
         const merged = await _preserveLocalState(db, finalMsg);
         const writeMsg = merged || finalMsg;
         await _runInsert(db, writeMsg);
@@ -1873,10 +1915,13 @@ const loadMessages = async (chatId, opts = {}) => {
   }
 
   // ── STEP 5: Fast ID-based dedup (fingerprint only needed for temp rows) ──
+  // A message stored under both its UUID and its Mongo _id shares no id —
+  // dropAlternateIdTwins keeps the UUID row until deduplicateChat removes the
+  // other one from disk.
   const seenIds = new Set();
   const result = [];
 
-  for (const msg of allMsgs) {
+  for (const msg of dropAlternateIdTwins(allMsgs)) {
     const ids = [msg.serverMessageId, msg.id, msg.tempId].filter(Boolean);
     if (ids.some(id => seenIds.has(id))) continue;
 
@@ -2542,6 +2587,27 @@ const deduplicateChat = async (chatId) => {
   return _runCacheWrite('deduplicateChat', async (db) => {
       // 1. Remove exact primary key duplicates (shouldn't happen but safety net)
       await db.runAsync(`DELETE FROM messages WHERE rowid NOT IN (SELECT MIN(rowid) FROM messages WHERE chat_id = $c GROUP BY id) AND chat_id = $c`, { $c: chatId });
+      // 1b. One server message stored under BOTH of its ids — the UUID messageId
+      //    and the Mongo _id (see utils/messageIdentity): same chat + sender +
+      //    type + exact timestamp, exactly one ObjectId-keyed side. Runs before
+      //    the content rule #4, which keeps MAX(rowid) and would otherwise keep
+      //    whichever copy was written last (often the bare _id one). The
+      //    canonical row first takes the copy's downloaded file / reactions.
+      const twinOf = (outer) => `t.chat_id = ${outer}.chat_id AND t.sender_id = ${outer}.sender_id AND t.timestamp = ${outer}.timestamp AND t.type = ${outer}.type AND t.id != ${outer}.id AND t.id NOT LIKE 'temp_%'`;
+      const hasReactions = (col) => `(${col} IS NOT NULL AND ${col} NOT IN ('null', '{}'))`;
+      await db.runAsync(`
+        UPDATE messages SET
+          local_uri = COALESCE(local_uri, (SELECT t.local_uri FROM messages t WHERE ${twinOf('messages')} AND ${sqlIsObjectId('t.id')} AND t.local_uri IS NOT NULL LIMIT 1)),
+          reactions = CASE WHEN ${hasReactions('reactions')} THEN reactions
+            ELSE COALESCE((SELECT t.reactions FROM messages t WHERE ${twinOf('messages')} AND ${sqlIsObjectId('t.id')} AND ${hasReactions('t.reactions')} LIMIT 1), reactions) END
+        WHERE chat_id = $c AND timestamp > 0 AND messages.id NOT LIKE 'temp_%' AND NOT ${sqlIsObjectId('messages.id')}
+          AND EXISTS (SELECT 1 FROM messages t WHERE ${twinOf('messages')} AND ${sqlIsObjectId('t.id')}
+            AND (t.local_uri IS NOT NULL OR ${hasReactions('t.reactions')}))
+      `, { $c: chatId });
+      await db.runAsync(`
+        DELETE FROM messages WHERE chat_id = $c AND timestamp > 0 AND ${sqlIsObjectId('messages.id')}
+          AND EXISTS (SELECT 1 FROM messages t WHERE ${twinOf('messages')} AND NOT ${sqlIsObjectId('t.id')})
+      `, { $c: chatId });
       // 2. Remove temp rows that have a server-confirmed version (by temp_id link)
       await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND server_message_id IS NULL AND temp_id IS NOT NULL AND temp_id IN (SELECT temp_id FROM messages WHERE chat_id = $c AND server_message_id IS NOT NULL)`, { $c: chatId });
       // 3. Remove temp rows with a content-matching server row (30s window).

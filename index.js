@@ -19,6 +19,24 @@ import store from './src/Redux/Store';
 import { registerBackgroundHandler } from './src/firebase/fcmService';
 import { registerNotifeeBackground } from './src/firebase/callNotifee';
  
+// Global JS error hook: log every uncaught error (fatal or not) with its stack,
+// then CHAIN to the previous handler — React Native's own handler is what shows
+// the red box in dev and terminates on a fatal error in release. Swallowing it
+// here would leave the app running in a corrupt state.
+if (global.ErrorUtils && typeof global.ErrorUtils.setGlobalHandler === 'function') {
+  const previousGlobalHandler = typeof global.ErrorUtils.getGlobalHandler === 'function'
+    ? global.ErrorUtils.getGlobalHandler()
+    : null;
+  global.ErrorUtils.setGlobalHandler((error, isFatal) => {
+    try {
+      console.error(`[GlobalError]${isFatal ? '[fatal]' : ''}`, error?.message || error, error?.stack);
+    } catch (_) { /* logging must never throw */ }
+    if (typeof previousGlobalHandler === 'function') {
+      previousGlobalHandler(error, isFatal);
+    }
+  });
+}
+
 // Must run at module top-level (before the app renders) so FCM can deliver
 // data/background messages — including incoming-call wake pushes — when the app
 // is backgrounded or killed.
