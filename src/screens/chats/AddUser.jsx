@@ -171,13 +171,6 @@ export default function AddUser({ navigation }) {
     }, [])
   );
 
-  // Auto-sync on focus: never-synced / empty / stale contacts get fetched
-  // without the user having to press Refresh (see ensureContactsSynced).
-  useFocusEffect(
-    useCallback(() => {
-      ensureContactsSynced?.({ reason: 'contact_list_focus' });
-    }, [ensureContactsSynced])
-  );
 
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedChatItem, setSelectedChatItem] = useState(null);
@@ -214,8 +207,52 @@ export default function AddUser({ navigation }) {
     clearInviteResponse,
     refreshContacts,
     ensureContactsSynced,
+    isAutoSyncing,
+    contactsPermission,
+    requestContactsPermission,
     loadContacts
   } = useContactSync();
+
+  // Contacts permission is asked on the CHAT LIST (add-user FAB / "Contact
+  // list" menu), never here on open. On focus this screen only READS the
+  // status — `prompt: false` raises no dialog:
+  //   granted          → auto-sync (never-synced / empty / stale) and show them
+  //   denied / blocked → show what is stored; the empty state's Refresh
+  //                      Contacts button and the header refresh icon ask again.
+  // Declared below useContactSync so ensureContactsSynced is initialized here;
+  // it rides a ref so an identity change mid-focus doesn't re-run the check.
+  const ensureSyncedRef = useRef(ensureContactsSynced);
+  ensureSyncedRef.current = ensureContactsSynced;
+
+  // Covers the gap between opening and the hook raising isAutoSyncing (the
+  // permission read + isInitialSyncDone query). Seeded from the status the chat
+  // list just published, so the very first frame after "Allow" is already the
+  // syncing state — never a flash of "No contacts found" + Refresh Contacts.
+  const [checkingOnOpen, setCheckingOnOpen] = useState(contactsPermission === 'granted');
+  const openRunRef = useRef(0);
+  useFocusEffect(
+    useCallback(() => {
+      // Not cancelled on blur: the run clears its own flag when the sync ends.
+      // A newer focus supersedes it (and joins the same in-flight sync).
+      const runId = ++openRunRef.current;
+      requestContactsPermission({ prompt: false })
+        .then((status) => (status === 'granted'
+          ? ensureSyncedRef.current?.({ reason: 'contact_list_focus' })
+          : undefined))
+        .finally(() => {
+          if (openRunRef.current === runId) setCheckingOnOpen(false);
+        });
+      return undefined;
+    }, [requestContactsPermission])
+  );
+
+  const contactsEmpty = matchedContacts.length === 0;
+  // Header spinner + "Syncing contacts..." subtitle. The open-time check only
+  // counts while the list is empty — with contacts already showing, a no-op
+  // check on focus must stay invisible.
+  const syncBusy = isSyncing || refreshing || isAutoSyncing || (checkingOnOpen && contactsEmpty);
+  // Empty list + a sync running → the syncing placeholder, not the empty state.
+  const showSyncingPlaceholder = contactsEmpty && syncBusy;
 
   // ─── ALL EXISTING LOGIC (UNCHANGED) ───
 
@@ -315,7 +352,7 @@ export default function AddUser({ navigation }) {
   }, [openUserChat, discoverContact, navigation]);
 
   const handleRefresh = useCallback(async () => {
-    if (refreshing || isSyncing) return;
+    if (refreshing || isSyncing || isAutoSyncing) return;
     refreshCancelledRef.current = false;
     setRefreshing(true);
     try {
@@ -326,7 +363,7 @@ export default function AddUser({ navigation }) {
       console.warn('Refresh failed:', err);
       try { await syncContacts(); } catch (_) { showMessage('Failed to refresh contacts'); }
     } finally { setRefreshing(false); }
-  }, [refreshContacts, syncContacts, refreshing, isSyncing]);
+  }, [refreshContacts, syncContacts, refreshing, isSyncing, isAutoSyncing]);
 
   const getDisplayPhone = useCallback((contact) => {
     if (!contact) return '';
@@ -642,7 +679,7 @@ export default function AddUser({ navigation }) {
       && (directoryPending || directoryContacts.length > 0);
 
     if (registeredContacts.length === 0 && unregisteredContacts.length === 0 && !showDirectory) {
-      data.push({ type: 'empty' });
+      data.push({ type: showSyncingPlaceholder && !searching ? 'syncing' : 'empty' });
       return data;
     }
 
@@ -692,7 +729,7 @@ export default function AddUser({ navigation }) {
   }, [
     registeredContacts, unregisteredContacts, lastSyncTime,
     parsedQuery, directoryContacts, directoryLoading, directorySearchable,
-    directoryEnabled, directorySettled,
+    directoryEnabled, directorySettled, showSyncingPlaceholder,
   ]);
 
   // ─── RENDER FUNCTIONS ───
@@ -713,7 +750,7 @@ export default function AddUser({ navigation }) {
             Select Contact
           </Text>
           <Text style={[styles.headerSubtitle, { color: theme.colors.placeHolderTextColor }]}>
-            {isSyncing ? 'Syncing...' : `${matchedCount} contacts`}
+            {syncBusy ? 'Syncing contacts...' : `${matchedCount} contacts`}
           </Text>
         </View>
         <View style={styles.headerActions}>
@@ -730,11 +767,11 @@ export default function AddUser({ navigation }) {
           )}
           <TouchableOpacity
             onPress={handleRefresh}
-            disabled={isSyncing || refreshing}
+            disabled={syncBusy}
             activeOpacity={0.6}
             style={styles.headerActionBtn}
           >
-            {isSyncing || refreshing ? (
+            {syncBusy ? (
               <ActivityIndicator size="small" color={theme.colors.themeColor} />
             ) : (
               <Ionicons name="sync-outline" size={22} color={theme.colors.primaryTextColor} />
@@ -985,6 +1022,18 @@ export default function AddUser({ navigation }) {
           />
         );
       }
+      case 'syncing':
+        return (
+          <View style={styles.emptyWrap}>
+            <ActivityIndicator size="large" color={themeColor} />
+            <Text style={[styles.emptyTitle, { color: textColor, marginTop: 16 }]}>
+              Syncing contacts...
+            </Text>
+            <Text style={[styles.emptySubtitle, { color: subTextColor }]}>
+              {`Finding which of your contacts are on ${APP_TAG_NAME}`}
+            </Text>
+          </View>
+        );
       case 'spacer':
         return SpacerItem;
       case 'empty':
@@ -997,7 +1046,11 @@ export default function AddUser({ navigation }) {
               {searchQuery ? 'No matching contacts' : 'No contacts found'}
             </Text>
             <Text style={[styles.emptySubtitle, { color: subTextColor }]}>
-              {searchQuery ? 'Try a different search term' : 'Pull down to refresh or sync your contacts'}
+              {searchQuery
+                ? 'Try a different search term'
+                : (contactsPermission === 'granted'
+                  ? 'Tap refresh to sync your contacts'
+                  : 'Allow contacts access to see your contacts')}
             </Text>
             {error && (
               <Text style={styles.emptyError}>{error}</Text>
@@ -1020,7 +1073,7 @@ export default function AddUser({ navigation }) {
       default:
         return null;
     }
-  }, [bgColor, textColor, subTextColor, themeColor, inviteBgColor, menuBgColor, badgeBgColor, textWhite, invitingContactId, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, SpacerItem]);
+  }, [bgColor, textColor, subTextColor, themeColor, inviteBgColor, menuBgColor, badgeBgColor, textWhite, invitingContactId, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, SpacerItem, contactsPermission]);
 
   const keyExtractor = useCallback((item, index) => {
     if (item.type === 'contact') {

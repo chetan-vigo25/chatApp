@@ -43,6 +43,7 @@ import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chat
 import { orderChatsForDisplay } from '../../utils/chatOrder';
 import { buildQuery, contactMatchScore } from '../../utils/contactSearch';
 import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
+import { requestContactsPermission } from '../../contexts/useContactSync';
 import useOpenUserChat from '../../hooks/useOpenUserChat';
 import UserSearchRow from '../../components/UserSearchRow';
 import { getUserSettings } from '../../Redux/Services/Profile/Settings.Services';
@@ -370,6 +371,23 @@ const ChatListRow = memo(function ChatListRow({
 });
 
 export default function ChatList({ navigation }) {
+  // Contacts permission is asked HERE, on the chat list, before the Select
+  // Contact screen opens — that screen only reads the status on focus and never
+  // prompts. It opens whatever the answer: granted → it syncs and shows the
+  // contacts; denied / blocked → it shows its Refresh Contacts button, which
+  // asks again. Resolves at once, with no dialog, when access is already held.
+  const openingContactsRef = useRef(false);
+  const openContacts = useCallback(async () => {
+    if (openingContactsRef.current) return; // a second tap while the dialog is up
+    openingContactsRef.current = true;
+    try {
+      await requestContactsPermission({ prompt: true });
+    } finally {
+      openingContactsRef.current = false;
+    }
+    navigation.navigate('ContactsTab');
+  }, [navigation]);
+
   const { theme, isDarkMode } = useTheme();
   const fadeAnim = useRef(new Animated.Value(0)).current;
   const openSwipeableRef = useRef(null);
@@ -2146,7 +2164,7 @@ export default function ChatList({ navigation }) {
 
       {/* ─── FAB ─── */}
       <TouchableOpacity
-        onPress={() => navigation.navigate('ContactsTab')}
+        onPress={openContacts}
         activeOpacity={0.85}
         style={[styles.fab, { backgroundColor: theme.colors.themeColor }]}
       >
@@ -2194,7 +2212,12 @@ export default function ChatList({ navigation }) {
               <TouchableOpacity
                 key={it.route}
                 activeOpacity={0.65}
-                onPress={() => { setVisible(false); navigation.navigate(it.route); }}
+                onPress={() => {
+                  setVisible(false);
+                  // "Contact list" asks for contacts permission first, same as the FAB.
+                  if (it.route === 'ContactsTab') openContacts();
+                  else navigation.navigate(it.route);
+                }}
                 style={styles.headerMenuItem}
               >
                 <View style={[

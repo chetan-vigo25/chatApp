@@ -48,7 +48,7 @@ const UPDATE_HIGHLIGHT_MS = 24 * 60 * 60 * 1000;
 //               next Refresh re-asks, which is the whole point of this flow)
 //   'blocked' → "Don't allow" twice / iOS second ask: no dialog can ever appear
 //               again, only app Settings can fix it
-const CONTACTS_PERMISSION = { GRANTED: 'granted', DENIED: 'denied', BLOCKED: 'blocked' };
+export const CONTACTS_PERMISSION = { GRANTED: 'granted', DENIED: 'denied', BLOCKED: 'blocked' };
 
 let _contactsPermission = null; // null = never checked in this app session
 const _contactsPermissionListeners = new Set();
@@ -157,6 +157,117 @@ const contactsSignatureOf = (list = []) => {
   return sig;
 };
 
+/**
+ * The ONE place READ_CONTACTS is asked for. Returns a CONTACTS_PERMISSION value.
+ *
+ * Module-level, not a hook callback, so a screen that does not mount
+ * useContactSync can ask too — the chat list asks here before it opens the
+ * Select Contact screen. It touches only module state, so every mounted hook
+ * instance still mirrors the answer through publishContactsPermission.
+ *
+ * A denial is never final: the OS dialog is raised again on the next sync/Refresh
+ * (`prompt: true`, the default) exactly as if it had never been asked, so the user
+ * can recover from "Deny" without reinstalling. Only when the OS itself refuses to
+ * ask again ('blocked') does the flow switch to the Settings prompt.
+ *
+ * Never throws.
+ *
+ * @param {Object}  [options]
+ * @param {boolean} [options.prompt] false = passive read, shows NO dialog
+ */
+export const requestContactsPermission = async ({ prompt = true } = {}) => {
+  // The permission dialog can background the app (OEM-dependent) — suspend
+  // the app lock so a contact fetch never bounces to the lock screen.
+  suspendAppLock();
+  try {
+    // Check the CURRENT permission first with a pure query that launches
+    // NOTHING. Requesting unconditionally (the old behaviour) re-launched the
+    // system permission activity on EVERY fetch/refresh — even when already
+    // granted — which backgrounds→foregrounds the app and made the Select
+    // Contact screen visibly BLINK once each time. Only request when we don't
+    // already hold it.
+    //
+    // Android checks READ_CONTACTS ALONE, through PermissionsAndroid — the one
+    // permission the request below asks for, and the only one reading contacts
+    // needs. expo-contacts' getPermissionsAsync() folds WRITE_CONTACTS in
+    // whenever the manifest declares it (this app's does, for saving contacts),
+    // so right after the chat list granted READ it still said "not granted":
+    // the Select Contact screen's focus check took that as a denial and never
+    // synced until Refresh was tapped.
+    let status;
+    let canAskAgain = true;
+    try {
+      if (Platform.OS === 'android') {
+        const hasRead = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
+        status = hasRead ? 'granted' : undefined;
+      } else {
+        const current = await Contacts.getPermissionsAsync();
+        status = current?.status;
+        canAskAgain = current?.canAskAgain !== false;
+      }
+    } catch {
+      status = undefined;
+    }
+    if (status === 'granted') return publishContactsPermission(CONTACTS_PERMISSION.GRANTED);
+
+    if (!prompt) {
+      // Android only reports never-ask-again from a REAL request (a passive check
+      // can't tell "never asked" from "permanently denied"), so a passive read
+      // never upgrades a denial to 'blocked' there — it keeps whatever an earlier
+      // request taught us.
+      return publishContactsPermission(
+        Platform.OS === 'android'
+          ? (_contactsPermission === CONTACTS_PERMISSION.BLOCKED
+              ? CONTACTS_PERMISSION.BLOCKED
+              : CONTACTS_PERMISSION.DENIED)
+          : (canAskAgain ? CONTACTS_PERMISSION.DENIED : CONTACTS_PERMISSION.BLOCKED)
+      );
+    }
+
+    if (Platform.OS === 'android') {
+      // Request via RN core PermissionsAndroid, NOT Contacts.requestPermissionsAsync().
+      // expo's request can route through a separate transparent permission
+      // activity, which stops→restarts MainActivity on return — and because
+      // MainActivity's theme is the splash theme (windowBackground = splash
+      // drawable), that restart FLASHES the splash for a frame (the "blink on
+      // first contact fetch"). PermissionsAndroid shows the dialog on the
+      // CURRENT activity (plain onPause→onResume), so nothing restarts/flashes.
+      try {
+        const res = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.READ_CONTACTS
+        );
+        if (res === PermissionsAndroid.RESULTS.GRANTED) {
+          status = 'granted';
+        } else {
+          // NEVER_ASK_AGAIN is the only signal Android gives that no further
+          // dialog can appear — a plain DENIED still re-asks next time.
+          status = 'denied';
+          canAskAgain = res !== PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN;
+        }
+      } catch {
+        // Fall back to expo's request if the core module is somehow unavailable.
+        const res = await Contacts.requestPermissionsAsync();
+        status = res?.status;
+        canAskAgain = res?.canAskAgain !== false;
+      }
+    } else {
+      const res = await Contacts.requestPermissionsAsync();
+      status = res?.status;
+      canAskAgain = res?.canAskAgain !== false;
+    }
+
+    if (status === 'granted') return publishContactsPermission(CONTACTS_PERMISSION.GRANTED);
+    return publishContactsPermission(
+      canAskAgain ? CONTACTS_PERMISSION.DENIED : CONTACTS_PERMISSION.BLOCKED
+    );
+  } catch (err) {
+    console.warn('[useContactSync] requestContactsPermission error:', err?.message);
+    return publishContactsPermission(CONTACTS_PERMISSION.DENIED);
+  } finally {
+    resumeAppLock();
+  }
+};
+
 export const useContactSync = () => {
   const { contacts: deviceContacts = [], askPermissionAndLoadContacts } = useContacts();
   const { isConnected } = useNetwork();
@@ -189,6 +300,11 @@ export const useContactSync = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isBackgroundRefreshing, setIsBackgroundRefreshing] = useState(false);
   const [isExpiredUpdating, setIsExpiredUpdating] = useState(false);
+  // True while ensureContactsSynced is building a list the user can't see yet
+  // (first-time sync, or synced-but-empty). isSyncing misses most of that: the
+  // first-time preview and background full sync run silent, and a loud sync
+  // only raises it after the phonebook has been read.
+  const [isAutoSyncing, setIsAutoSyncing] = useState(false);
   const [error, setError] = useState(null);
   const [lastSyncTime, setLastSyncTime] = useState(_contactsWarmMeta.lastSyncTime);
   const [discoverResponse, setDiscoverResponse] = useState(null);
@@ -408,96 +524,9 @@ export const useContactSync = () => {
 
   // ─── HASHING ───
 
-  /**
-   * The ONE place READ_CONTACTS is asked for. Returns a CONTACTS_PERMISSION value.
-   *
-   * A denial is never final: the OS dialog is raised again on the next sync/Refresh
-   * (`prompt: true`, the default) exactly as if it had never been asked, so the user
-   * can recover from "Deny" without reinstalling. Only when the OS itself refuses to
-   * ask again ('blocked') does the flow switch to the Settings prompt.
-   *
-   * @param {Object}  [options]
-   * @param {boolean} [options.prompt] false = passive read, shows NO dialog
-   */
-  const requestContactsPermission = useCallback(async ({ prompt = true } = {}) => {
-    // The permission dialog can background the app (OEM-dependent) — suspend
-    // the app lock so a contact fetch never bounces to the lock screen.
-    suspendAppLock();
-    try {
-      // Check the CURRENT permission first with getPermissionsAsync(), which is a
-      // pure query and launches NOTHING. Calling requestPermissionsAsync()
-      // unconditionally (the old behaviour) re-launched the system permission
-      // activity on EVERY fetch/refresh — even when already granted — which
-      // backgrounds→foregrounds the app and made the Select Contact screen
-      // visibly BLINK once each time. Only request when we don't already hold it.
-      let status;
-      let canAskAgain = true;
-      try {
-        const current = await Contacts.getPermissionsAsync();
-        status = current?.status;
-        canAskAgain = current?.canAskAgain !== false;
-      } catch {
-        status = undefined;
-      }
-      if (status === 'granted') return publishContactsPermission(CONTACTS_PERMISSION.GRANTED);
-
-      if (!prompt) {
-        // Android only reports never-ask-again from a REAL request (a passive check
-        // can't tell "never asked" from "permanently denied"), so a passive read
-        // never upgrades a denial to 'blocked' there — it keeps whatever an earlier
-        // request taught us.
-        return publishContactsPermission(
-          Platform.OS === 'android'
-            ? (_contactsPermission === CONTACTS_PERMISSION.BLOCKED
-                ? CONTACTS_PERMISSION.BLOCKED
-                : CONTACTS_PERMISSION.DENIED)
-            : (canAskAgain ? CONTACTS_PERMISSION.DENIED : CONTACTS_PERMISSION.BLOCKED)
-        );
-      }
-
-      if (Platform.OS === 'android') {
-        // Request via RN core PermissionsAndroid, NOT Contacts.requestPermissionsAsync().
-        // expo's request can route through a separate transparent permission
-        // activity, which stops→restarts MainActivity on return — and because
-        // MainActivity's theme is the splash theme (windowBackground = splash
-        // drawable), that restart FLASHES the splash for a frame (the "blink on
-        // first contact fetch"). PermissionsAndroid shows the dialog on the
-        // CURRENT activity (plain onPause→onResume), so nothing restarts/flashes.
-        try {
-          const res = await PermissionsAndroid.request(
-            PermissionsAndroid.PERMISSIONS.READ_CONTACTS
-          );
-          if (res === PermissionsAndroid.RESULTS.GRANTED) {
-            status = 'granted';
-          } else {
-            // NEVER_ASK_AGAIN is the only signal Android gives that no further
-            // dialog can appear — a plain DENIED still re-asks next time.
-            status = 'denied';
-            canAskAgain = res !== PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN;
-          }
-        } catch {
-          // Fall back to expo's request if the core module is somehow unavailable.
-          const res = await Contacts.requestPermissionsAsync();
-          status = res?.status;
-          canAskAgain = res?.canAskAgain !== false;
-        }
-      } else {
-        const res = await Contacts.requestPermissionsAsync();
-        status = res?.status;
-        canAskAgain = res?.canAskAgain !== false;
-      }
-
-      if (status === 'granted') return publishContactsPermission(CONTACTS_PERMISSION.GRANTED);
-      return publishContactsPermission(
-        canAskAgain ? CONTACTS_PERMISSION.DENIED : CONTACTS_PERMISSION.BLOCKED
-      );
-    } catch (err) {
-      console.warn('[useContactSync] requestContactsPermission error:', err?.message);
-      return publishContactsPermission(CONTACTS_PERMISSION.DENIED);
-    } finally {
-      resumeAppLock();
-    }
-  }, []);
+  // requestContactsPermission is module-level (above the hook) so the chat list
+  // can ask before the Select Contact screen opens; the hook returns the same
+  // function.
 
   /**
    * Tell the user why the contact list stayed empty — ONLY for actions they took
@@ -554,7 +583,7 @@ export const useContactSync = () => {
       console.warn('[useContactSync] readFreshDeviceContacts error:', err?.message);
       return [];
     }
-  }, [requestContactsPermission]);
+  }, []);
 
   /**
    * Read device contacts fresh and normalize every number to plaintext E.164
@@ -1161,7 +1190,10 @@ export const useContactSync = () => {
         // Nothing on screen yet → wait for the full sync; otherwise let it run in
         // the background while the previewed contacts are already visible.
         if (previewCount === 0) await fullSyncPromise;
-        return;
+        // Handed back WRAPPED (a plain object is not a thenable), so awaiting
+        // syncContacts still returns right after the preview; ensureContactsSynced
+        // awaits this to know when the whole first sync has really finished.
+        return { backgroundSync: fullSyncPromise };
       }
 
       // Step 3: Already synced once → DELTA sync. Sends only numbers added/removed
@@ -1216,35 +1248,48 @@ export const useContactSync = () => {
   //   • synced but stale (> max) → silent delta sync
   //   • fresh                    → nothing (zero network)
   // Offline → queues a pending refresh, flushed on reconnect.
-  const ensureSyncInProgressRef = useRef(false);
-  const ensureContactsSynced = useCallback(async ({ maxAgeMs = 6 * 60 * 60 * 1000, reason = 'screen_focus' } = {}) => {
-    if (ensureSyncInProgressRef.current) return;
-    ensureSyncInProgressRef.current = true;
-    try {
-      if (!isConnected) {
-        await AsyncStorage.setItem(STORAGE_KEYS.PENDING_REFRESH, 'true');
-        return;
+  //
+  // Never rejects. Resolves only when the work is really done — including a
+  // first-time background full sync — and a call made while one is running
+  // JOINS it (same promise) instead of returning early, so a caller awaiting it
+  // to drive a "syncing" indicator never stops that indicator too soon.
+  const ensureInFlightRef = useRef(null);
+  const ensureContactsSynced = useCallback(({ maxAgeMs = 6 * 60 * 60 * 1000, reason = 'screen_focus' } = {}) => {
+    if (ensureInFlightRef.current) return ensureInFlightRef.current;
+    const run = (async () => {
+      try {
+        if (!isConnected) {
+          await AsyncStorage.setItem(STORAGE_KEYS.PENDING_REFRESH, 'true');
+          return;
+        }
+        const initialDone = await ContactDatabase.isInitialSyncDone();
+        if (!initialDone) {
+          if (mountedRef.current) setIsAutoSyncing(true);
+          const started = await syncContacts({ reason: `${reason}_first_time` });
+          await started?.backgroundSync;
+          return;
+        }
+        const cached = await applyFromDB();
+        if (!cached || cached.length === 0) {
+          if (mountedRef.current) setIsAutoSyncing(true);
+          await runFullSync({ reason: `${reason}_empty_local`, silent: false, force: true });
+          return;
+        }
+        // Contacts are already on screen here, so a stale delta stays invisible.
+        const meta = await ContactDatabase.getSyncMetadata().catch(() => null);
+        const syncedAt = meta?.syncedAt ? new Date(meta.syncedAt).getTime() : 0;
+        if (!syncedAt || Date.now() - syncedAt > maxAgeMs) {
+          await runDeltaSync({ reason: `${reason}_stale`, silent: true });
+        }
+      } catch (err) {
+        console.warn('[useContactSync] ensureContactsSynced failed:', err?.message);
+      } finally {
+        ensureInFlightRef.current = null;
+        if (mountedRef.current) setIsAutoSyncing(false);
       }
-      const initialDone = await ContactDatabase.isInitialSyncDone();
-      if (!initialDone) {
-        await syncContacts({ reason: `${reason}_first_time` });
-        return;
-      }
-      const cached = await applyFromDB();
-      if (!cached || cached.length === 0) {
-        await runFullSync({ reason: `${reason}_empty_local`, silent: false, force: true });
-        return;
-      }
-      const meta = await ContactDatabase.getSyncMetadata().catch(() => null);
-      const syncedAt = meta?.syncedAt ? new Date(meta.syncedAt).getTime() : 0;
-      if (!syncedAt || Date.now() - syncedAt > maxAgeMs) {
-        await runDeltaSync({ reason: `${reason}_stale`, silent: true });
-      }
-    } catch (err) {
-      console.warn('[useContactSync] ensureContactsSynced failed:', err?.message);
-    } finally {
-      ensureSyncInProgressRef.current = false;
-    }
+    })();
+    ensureInFlightRef.current = run;
+    return run;
   }, [isConnected, syncContacts, applyFromDB, runFullSync, runDeltaSync]);
 
   // ─── PUBLIC: processContacts ───
@@ -1421,6 +1466,7 @@ export const useContactSync = () => {
     isRefreshing,
     isBackgroundRefreshing,
     isExpiredUpdating,
+    isAutoSyncing,
     error,
     lastSyncTime,
     discoverResponse,
