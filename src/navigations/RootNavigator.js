@@ -18,6 +18,7 @@ import Term from "../screens/Term";
 import Privacy from "../screens/Privacy";
 import NoInternet from "../screens/NoInternet";
 import { LinkedDevicesScreen, QRScannerScreen } from "../features/device-linking";
+import { ContactQRScreen } from "../features/contact-qr";
 import DeviceLinkSuccess from "../screens/ActiveDevice/SuccessScreen";
 import LinkDevice from "../screens/ActiveDevice/LinkDevice";
 import EditProfile from "../screens/profiles/EditProfile";
@@ -133,6 +134,10 @@ export default function RootNavigator() {
           <Stack.Screen name="NoInternet" component={NoInternet} />
           <Stack.Screen name="LinkDevice" component={LinkedDevicesScreen} />
           <Stack.Screen name="QRScanner" component={QRScannerScreen} />
+          {/* One two-tab "QR code" screen (My code | Scan code). MyQR opens on
+              My code (chat-list + Settings); ContactQRScanner opens on Scan. */}
+          <Stack.Screen name="MyQR" component={ContactQRScreen} />
+          <Stack.Screen name="ContactQRScanner" component={ContactQRScreen} initialParams={{ initialTab: 'scan' }} />
           <Stack.Screen name="DeviceLinkSuccess" component={DeviceLinkSuccess} />
           <Stack.Screen name="Test" component={Test} />
           <Stack.Screen name="Privacy" component={Privacy} />

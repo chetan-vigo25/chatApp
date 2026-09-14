@@ -1,5 +1,7 @@
 import * as Contacts from 'expo-contacts';
 import { Platform } from 'react-native';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as ImageManipulator from 'expo-image-manipulator';
 import contactHasher from '../Redux/Services/Contact/ContactHasher';
 import ContactDatabase from './ContactDatabase';
 import { suspendAppLock, resumeAppLock } from './appLockGuard';
@@ -176,6 +178,48 @@ export const verifySavedToDevice = async (normalizedPhone, { attempts = 5, delay
   return null;
 };
 
+const NO_PHOTO = { uri: null, cleanup: () => {} };
+
+/**
+ * A contact photo the iOS Contacts framework will accept.
+ *
+ * expo-contacts only reads `file://` URIs for `image`. Handing it the profile
+ * photo URL from the server made addContactAsync AND presentFormAsync throw
+ * ("Only file:// URIs are supported for contact images"), so Save contact failed
+ * outright on iOS. Download it to the cache and re-encode as JPEG (server avatars
+ * are .webp). Any failure returns no photo: a contact without a photo beats no
+ * contact. Returns { uri, cleanup } — call cleanup once the save is done.
+ */
+const prepareContactPhoto = async (imageUri) => {
+  const src = String(imageUri || '').trim();
+  if (!src) return NO_PHOTO;
+  if (src.startsWith('file://')) return { uri: src, cleanup: () => {} };
+  if (!/^https?:\/\//i.test(src) || !FileSystem.cacheDirectory) return NO_PHOTO;
+
+  const temps = [];
+  const cleanup = () => {
+    temps.forEach((u) => FileSystem.deleteAsync(u, { idempotent: true }).catch(() => {}));
+  };
+  try {
+    const downloaded = await FileSystem.downloadAsync(src, `${FileSystem.cacheDirectory}contact_photo_${Date.now()}`);
+    temps.push(downloaded.uri);
+    if (downloaded.status && (downloaded.status < 200 || downloaded.status >= 300)) {
+      cleanup();
+      return NO_PHOTO;
+    }
+    const jpeg = await ImageManipulator.manipulateAsync(downloaded.uri, [], {
+      compress: 0.9,
+      format: ImageManipulator.SaveFormat.JPEG,
+    });
+    temps.push(jpeg.uri);
+    return { uri: jpeg.uri, cleanup };
+  } catch (err) {
+    console.warn('[SaveContact] contact photo skipped:', err?.message);
+    cleanup();
+    return NO_PHOTO;
+  }
+};
+
 /**
  * Save a contact to the device phone book.
  *
@@ -195,6 +239,7 @@ export const saveToDeviceContacts = async ({ firstName, lastName, phone, imageUr
   // the app — suspend the app lock for the round trip so the user isn't
   // dumped on the lock screen after saving a contact.
   suspendAppLock();
+  let photo = NO_PHOTO;
   try {
   const granted = await requestContactsPermission();
   if (!granted) {
@@ -218,29 +263,41 @@ export const saveToDeviceContacts = async ({ firstName, lastName, phone, imageUr
     ],
   };
 
+  // Photo on iOS only, and only as a local file — see prepareContactPhoto.
   if (imageUri && Platform.OS === 'ios') {
-    contactData.image = { uri: imageUri };
+    photo = await prepareContactPhoto(imageUri);
+    if (photo.uri) contactData.image = { uri: photo.uri };
   }
+  const { image: _photo, ...contactDataWithoutPhoto } = contactData;
+
+  // A photo the framework still rejects must never cost the user the contact:
+  // retry the same call without it.
+  const withPhotoFallback = (call) => async () => {
+    const first = await call(contactData);
+    if (first.ok || !contactData.image) return first;
+    console.warn('[SaveContact] retrying without photo:', first.error?.message);
+    return call(contactDataWithoutPhoto);
+  };
 
   // Try a silent insert first — on devices with a writable account this saves
   // the contact outright, which is what the user asked for ("contact saved bhi
   // hone chahiye"). Only when that is not possible do we fall back to the
   // native form, which requires the extra tap.
-  const trySilentInsert = async () => {
+  const trySilentInsert = withPhotoFallback(async (data) => {
     try {
-      const contactId = await Contacts.addContactAsync(contactData);
+      const contactId = await Contacts.addContactAsync(data);
       return { ok: true, contactId };
     } catch (err) {
       return { ok: false, error: err };
     }
-  };
+  });
 
-  const tryForm = async () => {
+  const tryForm = withPhotoFallback(async (data) => {
     try {
       // presentFormAsync opens the system "Create contact" UI pre-filled.
       // Resolves when the user closes the form (saved OR cancelled) — the
       // caller must verify against the phone book before claiming success.
-      await Contacts.presentFormAsync(null, contactData, {
+      await Contacts.presentFormAsync(null, data, {
         allowsEditing: true,
         cancelButtonTitle: 'Cancel',
       });
@@ -248,7 +305,7 @@ export const saveToDeviceContacts = async ({ firstName, lastName, phone, imageUr
     } catch (err) {
       return { ok: false, error: err };
     }
-  };
+  });
 
   const silent = await trySilentInsert();
   if (silent.ok) {
@@ -278,6 +335,8 @@ export const saveToDeviceContacts = async ({ firstName, lastName, phone, imageUr
   }
   return { success: false, verified: false, error: 'not_saved' };
   } finally {
+    // Contacts copied the image bytes — the cached download is no longer needed.
+    photo.cleanup();
     resumeAppLock();
   }
 };

@@ -21,7 +21,7 @@ import { useFocusEffect } from "@react-navigation/native";
 import { profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { resetToLogin } from "../../Redux/Services/navigationService";
 import { useAuth } from "../../contexts/AuthContext";
-import { Ionicons, FontAwesome6, AntDesign } from '@expo/vector-icons';
+import { Ionicons, FontAwesome6 } from '@expo/vector-icons';
 import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
 import VerifiedBadge from '../../components/VerifiedBadge';
@@ -238,9 +238,16 @@ export default function Setting({ navigation }) {
         </Text>
       </View>
 
-      <View style={[styles.qrBtn, { backgroundColor: accent + '14' }]}>
-        <AntDesign name="edit" size={20} color={accent} />
-      </View>
+      {/* My QR code — its own touch target inside the card, so tapping the
+          QR opens the code while the rest of the card still opens the profile. */}
+      <TouchableOpacity
+        onPress={() => navigation.navigate('MyQR')}
+        activeOpacity={0.6}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        style={[styles.qrBtn, { backgroundColor: accent + '14' }]}
+      >
+        <Ionicons name="qr-code-outline" size={20} color={accent} />
+      </TouchableOpacity>
     </TouchableOpacity>
   );
 

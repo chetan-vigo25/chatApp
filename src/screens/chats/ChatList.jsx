@@ -2107,6 +2107,16 @@ export default function ChatList({ navigation }) {
         </View>
 
         <View style={styles.headerRight}>
+          {/* Contact QR — opens the two-tab QR screen (My code | Scan code), the
+              same screen as the Settings profile-card QR button. */}
+          <TouchableOpacity
+            onPress={() => navigation.navigate('MyQR')}
+            activeOpacity={0.6}
+            hitSlop={{ top: 10, bottom: 10, left: 6, right: 6 }}
+            style={styles.headerBtn}
+          >
+            <Ionicons name="qr-code-outline" size={22} color={theme.colors.iconColor} />
+          </TouchableOpacity>
           {/* Custom overflow menu — a Modal dropdown, NOT react-native-paper's
               Menu, which got stuck on rapid taps and stopped opening. This
               anchor just measures + opens; the dropdown lives in a Modal below. */}
