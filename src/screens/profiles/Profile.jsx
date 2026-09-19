@@ -6,7 +6,6 @@ import {
 } from "react-native";
 import * as ImagePicker from 'expo-image-picker';
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
@@ -16,6 +15,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
 import CopyFieldButton from '../../components/CopyFieldButton';
+import { getAccessToken } from '../../services/secureTokenStore';
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -73,7 +73,7 @@ export default function Profile({ navigation }) {
     if (!uri) return;
     setLoader(true);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
+      const token = await getAccessToken();
       const ext = uri.split('.').pop();
       const mime = (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg' : 'image/png';
       const formData = new FormData();
@@ -102,7 +102,7 @@ export default function Profile({ navigation }) {
   const removeDp = async () => {
     setLoader(true);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
+      const token = await getAccessToken();
       const response = await fetch(`${BACKEND_URL}user/profile/picture/remove`, {
         method: "POST",
         headers: { Authorization: "Bearer " + token },

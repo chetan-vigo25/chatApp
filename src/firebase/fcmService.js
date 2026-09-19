@@ -19,6 +19,7 @@ import { ensureFirebaseApp } from './config';
 import { isNotificationPromptHeld } from '../features/permissions/notificationPromptGate';
 import { translateNotificationBody } from '../components/Translate';
 import { loadContactNames, resolveDisplayName as resolveCallerName, handleFromRedactedName } from '../services/contactNameStore';
+import { hasAccessToken } from '../services/secureTokenStore';
 
 // Cross-module events the call layer (CallProvider) listens to. Defined in
 // ./callEvents and re-exported here for back-compat with existing importers.
@@ -828,12 +829,17 @@ export const clearChatNotifications = async (chatId) => {
 // logged-out device never rings for a call or shows a chat notification.
 const hasActiveSession = async () => {
   try {
-    // accessToken is the single source of truth for "logged in" (logout's
-    // AsyncStorage.clear() removes it). Do NOT also require deviceId — the backend
+    // accessToken is the single source of truth for "logged in" (logout calls
+    // secureTokenStore.clearTokens()). Do NOT also require deviceId — the backend
     // login response doesn't always store one, so requiring it would wrongly drop
     // real calls/messages while logged in (screen wakes but no call UI shows).
-    const accessToken = await AsyncStorage.getItem('accessToken');
-    return !!accessToken;
+    //
+    // `hasAccessToken` fails OPEN: this runs in the HEADLESS background handler
+    // on a LOCKED device, and a keystore that refuses to answer must not be
+    // read as "logged out" — that would silently stop the phone ringing. The
+    // token itself is stored with AFTER_FIRST_UNLOCK precisely so this read
+    // succeeds while locked.
+    return await hasAccessToken();
   } catch (_) {
     // Fail OPEN for calls/messages — better to show a call than to miss one.
     return true;

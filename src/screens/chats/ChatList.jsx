@@ -29,7 +29,8 @@ import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import useStatusIndicators from '../../hooks/useStatusIndicators';
 import useContactDirectory, { peerPrivacyOf } from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
-import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
+import { resolveDisplayName as resolveCanonicalName, isSavedContact } from '../../services/contactNameStore';
+import { getAvatarColor, getAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
 import { useCall } from '../../calls/useCall';
 import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Services';
 import ChatCache from '../../services/ChatCache';
@@ -100,17 +101,6 @@ const MUTE_OPTIONS = [
 ];
 
 const name = APP_TAG_NAME
-
-const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#D63031', '#A29BFE'];
-
-const getAvatarColor = (name) => {
-  if (!name) return AVATAR_COLORS[0];
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-};
 
 // Resolve the peer's registered user id for a private chat. Prefer the explicit
 // peerUser id, then peerUserId, and finally fall back to parsing it out of a
@@ -1822,7 +1812,23 @@ export default function ChatList({ navigation }) {
   const previewImage = (isPreviewGroup || isPreviewBroadcast)
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;
-  const previewAvatarColor = getAvatarColor(previewName);
+  // Same avatar identity as the row (ChatCard): colour keyed by the peer's user
+  // id, letter only for a saved contact, person icon for an unsaved number.
+  const previewPeerId = selectedChatItem?.peerUser?._id || selectedChatItem?.peerUser?.userId || selectedChatItem?.peerUserId;
+  const previewShowInitial = Boolean(
+    selectedChatItem && !isPreviewGroup && !isPreviewBroadcast && !isSelfChat(selectedChatItem)
+    && isSavedContact({
+      userId: previewPeerId,
+      phone: selectedChatItem?.mobileNumber
+        || selectedChatItem?.peerUser?.mobileNumber
+        || (selectedChatItem?.peerUser?.mobile?.number
+          ? `${selectedChatItem.peerUser.mobile.code || ''}${selectedChatItem.peerUser.mobile.number}`
+          : (typeof selectedChatItem?.peerUser?.mobile === 'string' ? selectedChatItem.peerUser.mobile : '')),
+    }),
+  );
+  const previewAvatarColor = (isPreviewGroup || isPreviewBroadcast)
+    ? getAvatarColor(previewName)
+    : previewShowInitial ? getAvatarColor(previewPeerId || previewName) : UNSAVED_AVATAR_BG;
   // WhatsApp's profile-popup action icons are a bright green (dark mode) /
   // teal-green (light mode) — distinct from the app's own brand teal.
   const previewActionGreen = isDarkMode ? theme.colors.themeColor : '#028578';
@@ -2261,13 +2267,15 @@ export default function ChatList({ navigation }) {
                 {previewImage ? (
                   <Image source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
                 ) : (
-                  <View style={[styles.sheetUserAvatar, { backgroundColor: previewAvatarColor || getUserColor(previewName) }]}>
+                  <View style={[styles.sheetUserAvatar, { backgroundColor: previewAvatarColor }]}>
                     {isPreviewGroup ? (
                       <Ionicons name="people" size={20} color="#fff" />
-                    ) : (
+                    ) : previewShowInitial ? (
                       <Text style={styles.sheetUserInitial}>
-                        {(previewName || '?').charAt(0).toUpperCase()}
+                        {getAvatarInitial(previewName)}
                       </Text>
+                    ) : (
+                      <Ionicons name="person" size={20} color="#fff" />
                     )}
                   </View>
                 )}
@@ -2466,6 +2474,7 @@ export default function ChatList({ navigation }) {
         name={previewName}
         image={previewImage}
         avatarColor={previewAvatarColor}
+        showInitial={previewShowInitial}
         isGroup={isPreviewGroup || isPreviewBroadcast}
         isBroadcast={isPreviewBroadcast}
         isVerified={Boolean(selectedChatItem?.isVerified || selectedChatItem?.peerUser?.isVerified)}
@@ -2518,10 +2527,12 @@ export default function ChatList({ navigation }) {
               <View style={[styles.imageViewerFallbackCircle, { backgroundColor: previewAvatarColor }]}>
                 {isPreviewGroup ? (
                   <Ionicons name="people" size={64} color="#fff" />
-                ) : (
+                ) : previewShowInitial ? (
                   <Text style={styles.imageViewerFallbackLetter}>
-                    {(previewName || '?').charAt(0).toUpperCase()}
+                    {getAvatarInitial(previewName)}
                   </Text>
+                ) : (
+                  <Ionicons name="person" size={64} color="#fff" />
                 )}
               </View>
               <Text style={styles.imageViewerNoPhotoText}>{isPreviewGroup ? 'No group photo' : 'No profile photo'}</Text>

@@ -6,6 +6,7 @@ import SegmentedRing from './SegmentedRing';
 import { useTranslatedText, needsSystemFont } from './Translate';
 import useDisplayName from '../hooks/useDisplayName';
 import { isSelfChat, selfChatLabel, selfIdentityOf } from '../utils/selfChat';
+import { getAvatarColor, getAvatarInitial } from '../utils/avatarIdentity';
 
 const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
 const RING_SIZE   = 53; // outer ring diameter — leaves a small gap around the avatar
@@ -24,7 +25,6 @@ const ChatCard = ({
   onPress,
   onLongPress,
   onAvatarPress,
-  getUserColor,
   getPreviewText,
   getRelativeTime,
   getLastMessageText,
@@ -35,7 +35,7 @@ const ChatCard = ({
   const scale = useRef(new Animated.Value(1)).current;
   // Canonical name resolution — the row re-renders by itself when the address
   // book changes (contact synced / saved / deleted).
-  const { resolveName } = useDisplayName();
+  const { resolveName, isSaved } = useDisplayName();
   // Only the self-chat row reads this — my own handle/privacy toggle, which no
   // chat row carries. Selecting the slice object keeps the subscription cheap
   // (stable reference until the profile itself changes).
@@ -96,6 +96,7 @@ const ChatCard = ({
     || (item?.peerUser?.mobile?.number
       ? `${item.peerUser.mobile.code || ''}${item.peerUser.mobile.number}`
       : (typeof item?.peerUser?.mobile === 'string' ? item.peerUser.mobile : ''));
+  const peerUserId = item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId;
   // 1-1 rows follow the ONE display rule: my saved contact name → the peer's
   // phone number → (only when no number exists at all) whatever name the server
   // shipped. `peerUser.fullName` is the peer's SELF-SET profile name — a push
@@ -113,7 +114,7 @@ const ChatCard = ({
     : isGroup
       ? (item?.chatName || item?.group?.name || item?.groupName || 'Group')
       : resolveName({
-          userId: item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId,
+          userId: peerUserId,
           phone: peerMobile,
           pushName: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
           // Contact privacy — chat-list row is surface #1.
@@ -132,6 +133,11 @@ const ChatCard = ({
   const peerAvatarUri = !isGroup && !isBroadcast
     ? (item?.peerUser?.profileImage || item?.chatAvatar || null)
     : null;
+  // No photo: a saved contact gets its first letter on a per-user colour (the
+  // same one the profile popup and UserB show); an unsaved number keeps the
+  // person icon. See utils/avatarIdentity.
+  const showPeerInitial = !isGroup && !isBroadcast && !isSelf && !peerAvatarUri
+    && isSaved({ userId: peerUserId, phone: peerMobile });
   // WhatsApp-style status ring: only for 1-1 chats whose peer has live statuses.
   const hasStatusRing = !isGroup && statusInfo && statusInfo.count > 0;
 
@@ -170,7 +176,7 @@ const ChatCard = ({
                 groupAvatarUri ? (
                   <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={[styles.avatarImage, { borderColor: theme.colors.border }]} />
                 ) : (
-                  <View style={[styles.avatarFallback, { backgroundColor: getUserColor(peerName), borderColor: theme.colors.border }]}>
+                  <View style={[styles.avatarFallback, { backgroundColor: getAvatarColor(peerName), borderColor: theme.colors.border }]}>
                     <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={18} color="#fff" />
                   </View>
                 )
@@ -180,6 +186,10 @@ const ChatCard = ({
                   source={{ uri: peerAvatarUri }}
                   style={[styles.avatarImage, { borderColor: theme.colors.border }]}
                 />
+              ) : showPeerInitial ? (
+                <View style={[styles.avatarFallback, { backgroundColor: getAvatarColor(peerUserId || peerName), borderColor: theme.colors.border }]}>
+                  <Text style={styles.avatarInitial}>{getAvatarInitial(peerName)}</Text>
+                </View>
               ) : (
                 // No profile picture → default person avatar with a subtle theme border.
                 <View

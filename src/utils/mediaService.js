@@ -1,12 +1,12 @@
 // utils/mediaService.js
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform, Alert, Linking } from 'react-native';
 import { apiCall } from '../Config/Https';
 import { BACKEND_URL } from '@env';
 import { uploadFileInChunks, CHUNKED_UPLOAD_THRESHOLD } from './chunkedUpload';
 import { ensurePermission, PERMISSION_IDS } from '../features/permissions/ensurePermission';
+import { getAccessToken } from '../services/secureTokenStore';
 
 // Define all directories - using FileSystem.documentDirectory for compatibility
 export const APP_FOLDER = 'TalksTry';
@@ -31,7 +31,7 @@ const authHeadersForUrl = async (url) => {
   const isPresigned = /[?&](X-Amz-Signature|X-Amz-Credential)=/i.test(String(url || ''));
   if (isPresigned) return {};
   let token = null;
-  try { token = await AsyncStorage.getItem('accessToken'); } catch { /* best-effort */ }
+  try { token = await getAccessToken(); } catch { /* best-effort */ }
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
 

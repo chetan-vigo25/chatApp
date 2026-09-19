@@ -10,6 +10,7 @@ import {
 import { isAppLockSuspended } from '../services/appLockGuard';
 import { clearDirectoryCache } from '../Redux/Services/Contact/Directory.Services';
 import { setCurrentUser, setCurrentUserId } from '../services/currentUser';
+import { getAccessToken, setAccessToken, setRefreshToken } from '../services/secureTokenStore';
 
 const AuthContext = createContext({});
 export const useAuth = () => useContext(AuthContext);
@@ -52,7 +53,7 @@ export const AuthProvider = ({ children }) => {
       const [userData, userInfo, accessToken, deviceId] = await Promise.all([
         AsyncStorage.getItem('userData'),
         AsyncStorage.getItem('userInfo'),
-        AsyncStorage.getItem('accessToken'),
+        getAccessToken(),
         AsyncStorage.getItem('deviceId'),
       ]);
 
@@ -87,8 +88,12 @@ export const AuthProvider = ({ children }) => {
     try {
       await AsyncStorage.setItem('userData', JSON.stringify(userData));
       await AsyncStorage.setItem('userInfo', JSON.stringify(userData));
-      if (tokens.accessToken) await AsyncStorage.setItem('accessToken', tokens.accessToken);
-      if (tokens.refreshToken) await AsyncStorage.setItem('refreshToken', tokens.refreshToken);
+      // Secrets go to the encrypted store. setRefreshToken writes both
+      // `refreshToken` and `refreshTokenHash`; the old code here wrote only the
+      // former, which left getStoredSession (it prefers the *Hash name) reading
+      // a stale value from a previous session after a login through this path.
+      if (tokens.accessToken) await setAccessToken(tokens.accessToken);
+      if (tokens.refreshToken) await setRefreshToken(tokens.refreshToken);
       if (tokens.deviceId) await AsyncStorage.setItem('deviceId', tokens.deviceId);
 
       setCurrentUser(userData);
@@ -167,7 +172,7 @@ export const AuthProvider = ({ children }) => {
         if (isAppLockSuspended()) return;
 
         console.log('App returned to foreground');
-        const accessToken = await AsyncStorage.getItem('accessToken');
+        const accessToken = await getAccessToken();
         if (accessToken) {
           await checkLoginStatus(); // will also re-init socket if needed
         }

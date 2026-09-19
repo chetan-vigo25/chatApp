@@ -11,9 +11,9 @@ import { updateGroup, viewGroup } from '../../Redux/Reducer/Group/Group.reducer'
 import * as ImagePicker from 'expo-image-picker';
 import { suspendAppLock, resumeAppLock } from '../../services/appLockGuard';
 import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../../Config/Https';
+import { getAccessToken } from '../../services/secureTokenStore';
 
 function showToast(msg) {
   if (Platform.OS === 'android') ToastAndroid.show(msg, ToastAndroid.SHORT);
@@ -79,7 +79,7 @@ export default function EditGroup({ navigation, route }) {
   // Upload avatar using the same pattern as user profile picture (fetch + FormData)
   const uploadAvatar = async (uri) => {
     try {
-      const token = await AsyncStorage.getItem('accessToken');
+      const token = await getAccessToken();
       const myHeaders = new Headers();
       myHeaders.append('Authorization', 'Bearer ' + token);
 

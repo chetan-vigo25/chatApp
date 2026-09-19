@@ -32,6 +32,7 @@ import { formatLastSeen } from "../../presence/services/lastSeenFormatter.servic
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getCommonGroups } from "../../Redux/Services/Group/Group.Services";
 import useDisplayName from "../../hooks/useDisplayName";
+import { getAvatarColor, getAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
 
 const { width } = Dimensions.get('window');
 const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
@@ -123,7 +124,7 @@ export default function UserB({ navigation, route }) {
   const [commonGroups, setCommonGroups] = useState([]);
   const [commonGroupsLoading, setCommonGroupsLoading] = useState(false);
   const [selfUserId, setSelfUserId] = useState(null);
-  const { resolveName: resolveMemberName } = useDisplayName();
+  const { resolveName: resolveMemberName, isSaved } = useDisplayName();
   const [reloadVersion, setReloadVersion] = useState(0);
 
   // Force the system status bar visible whenever this screen is focused. Some
@@ -260,7 +261,14 @@ export default function UserB({ navigation, route }) {
     peer?.name ||
     peerHandle ||
     "User";
-  const initial = displayName ? displayName.charAt(0).toUpperCase() : '?';
+  const initial = getAvatarInitial(displayName);
+  // Same avatar rule as the chat list row and profile popup: a saved contact
+  // shows its letter on a per-user colour, an unsaved number a person icon.
+  const isSavedPeer = Boolean(
+    localContact?.fullName
+      || serverDisplayName
+      || isSaved({ userId: peerId, phone: countryCode ? `${countryCode}${phoneNumber}` : phoneNumber }),
+  );
   const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
   const about = peerProfile?.about || peer?.about || '';
   // Admin-granted verified badge (from the profile view endpoint / chat item).
@@ -321,15 +329,7 @@ export default function UserB({ navigation, route }) {
     return () => clearTimeout(t);
   }, [contactJustSaved]);
 
-  const pastelColors = ["#6C5CE7", "#00B894", "#E17055", "#0984E3", "#D63031", "#E84393", "#00CEC9"];
-  function getUserColor(str) {
-    if (!str) return pastelColors[0];
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-    return pastelColors[Math.abs(hash) % pastelColors.length];
-  }
-
-  const avatarBgColor = getUserColor(peerId || displayName);
+  const avatarBgColor = isSavedPeer ? getAvatarColor(peerId || displayName) : UNSAVED_AVATAR_BG;
 
   useEffect(() => {
     let alive = true;
@@ -613,7 +613,11 @@ export default function UserB({ navigation, route }) {
             <Image source={imageSource} style={styles.heroImage} resizeMode="cover" />
           ) : (
             <View style={styles.heroFallback}>
-              <Text style={styles.heroInitial}>{initial}</Text>
+              {isSavedPeer ? (
+                <Text style={styles.heroInitial}>{initial}</Text>
+              ) : (
+                <Ionicons name="person" size={140} color="rgba(255,255,255,0.95)" />
+              )}
             </View>
           )}
           <HeroGradient />

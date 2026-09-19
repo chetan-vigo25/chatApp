@@ -16,10 +16,10 @@
 // there instead of restarting. `onSession` fires whenever {sessionId, offset}
 // changes so callers can persist resume state across app restarts.
 import * as FileSystem from 'expo-file-system/legacy';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../Config/Https';
 import { refreshAccessToken } from '../services/sessionManager';
+import { getAccessToken } from '../services/secureTokenStore';
 
 // 12MB (was 48MB). A single multipart POST cannot survive a connection drop —
 // a 35MB video on a flaky production uplink restarted from byte 0 on every
@@ -50,7 +50,7 @@ const buildAbsoluteUrl = (endpoint) => {
 
 const getAuthToken = async () => {
   try {
-    return await AsyncStorage.getItem('accessToken');
+    return await getAccessToken();
   } catch {
     return null;
   }

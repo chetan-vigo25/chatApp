@@ -7,6 +7,7 @@ import { apiCall } from '../Config/Https';
 import localStorageService from './LocalStorageService';
 import { toSecureMediaUri, mediaResolve, saveAssetToAlbum } from '../utils/mediaService';
 import { computeFileSha256 } from '../utils/fileHash';
+import { getAccessToken } from './secureTokenStore';
 
 const API_PREFIX = 'user/media';
 
@@ -150,7 +151,7 @@ class MediaService {
   async uploadMedia({ file, chatId, messageType, onProgress }) {
     if (!file?.uri) throw new Error('Invalid file payload');
 
-    const token = await AsyncStorage.getItem('accessToken');
+    const token = await getAccessToken();
     const uploadId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const endpoint = buildAbsoluteUrl(`${API_PREFIX}/upload`);
 
@@ -342,7 +343,7 @@ class MediaService {
     // the app (Bearer header). Send the header ONLY to non-presigned (own-origin)
     // URLs.
     let authToken = null;
-    try { authToken = await AsyncStorage.getItem('accessToken'); } catch {}
+    try { authToken = await getAccessToken(); } catch {}
     const headersForUrl = (url) => {
       const isPresigned = /[?&](X-Amz-Signature|X-Amz-Credential)=/i.test(String(url || ''));
       return authToken && !isPresigned ? { Authorization: `Bearer ${authToken}` } : {};

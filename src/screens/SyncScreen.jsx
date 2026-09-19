@@ -21,6 +21,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { subscribeSessionReset } from '../services/sessionEvents';
 import { waitWhilePaused } from '../services/syncPriority';
 import { normalizeMentions } from '../utils/mentions';
+import { getAccessToken } from '../services/secureTokenStore';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -121,7 +122,7 @@ const _warmRecentMessages = (chats) => {
       if (_warmAbort) return;
       // Never fire authenticated message fetches without a token (e.g. mid
       // logout/session reset) — that just spams 401 "No token provided".
-      const token = await AsyncStorage.getItem('accessToken');
+      const token = await getAccessToken();
       if (!token) { _warmAbort = true; return; }
       const chat = queue.shift();
       const chatId = chat.chatId || chat._id;
@@ -167,7 +168,7 @@ const _warmRecentMessages = (chats) => {
 const _performInitialRestore = async (userId, onProgress) => {
   // Don't attempt an authenticated restore without a token (session not fully
   // saved yet / mid-reset) — it would 401 with "No token provided".
-  const token = await AsyncStorage.getItem('accessToken');
+  const token = await getAccessToken();
   if (!token) {
     console.warn('[Sync] no access token yet — skipping restore');
     return false;

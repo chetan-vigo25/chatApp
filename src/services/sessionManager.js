@@ -4,7 +4,19 @@ import { BACKEND_URL } from '@env';
 import { resetToLogin } from '../Redux/Services/navigationService';
 import { emitSessionReset, emitUserChanged } from './sessionEvents';
 import ChatDatabase from './ChatDatabase';
+import secureTokenStore, { SECURE_TOKEN_KEYS } from './secureTokenStore';
+import { INSTALL_MARKER_KEY } from '../utils/freshInstallSweep';
 
+// NOTE ON STORAGE BACKENDS
+// ------------------------
+// The three TOKEN keys (accessToken / refreshToken / refreshTokenHash) no
+// longer live in AsyncStorage — they are held by `secureTokenStore`
+// (Keychain / AndroidKeyStore). They stay listed here because
+// `clearAllSessionData`'s non-destructive branch and other callers still
+// enumerate AUTH_KEYS to sweep up any legacy plaintext copy left by an install
+// that predates the migration. The remaining keys (userInfo, deviceId,
+// sessionId, loginMethod) are identifiers, not secrets, and stay in
+// AsyncStorage.
 export const AUTH_KEYS = {
   accessToken: 'accessToken',
   refreshTokenHash: 'refreshTokenHash',
@@ -150,10 +162,10 @@ export const extractLoginSession = (responseData = {}) => {
 };
 
 export const getStoredSession = async () => {
-  const [accessToken, refreshTokenHash, refreshTokenLegacy, userRaw, deviceId, sessionId, loginMethod] = await Promise.all([
-    AsyncStorage.getItem(AUTH_KEYS.accessToken),
-    AsyncStorage.getItem(AUTH_KEYS.refreshTokenHash),
-    AsyncStorage.getItem(AUTH_KEYS.refreshToken),
+  // Tokens come from the encrypted store (which also migrates any legacy
+  // plaintext copy on first read); everything else is plain AsyncStorage.
+  const [tokens, userRaw, deviceId, sessionId, loginMethod] = await Promise.all([
+    secureTokenStore.getTokens(),
     AsyncStorage.getItem(AUTH_KEYS.userInfo),
     AsyncStorage.getItem(AUTH_KEYS.deviceId),
     AsyncStorage.getItem(AUTH_KEYS.sessionId),
@@ -164,9 +176,9 @@ export const getStoredSession = async () => {
   const userId = userInfo?._id || userInfo?.id || null;
 
   return {
-    accessToken,
-    refreshToken: refreshTokenHash || refreshTokenLegacy,
-    refreshTokenHash: refreshTokenHash || refreshTokenLegacy,
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    refreshTokenHash: tokens.refreshTokenHash,
     userInfo,
     userId: userId ? String(userId) : null,
     deviceId,
@@ -187,10 +199,11 @@ export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, ref
   const resolvedRefreshToken = refreshTokenHash || refreshToken;
 
   if (userInfo) writes.push(AsyncStorage.setItem(AUTH_KEYS.userInfo, JSON.stringify(userInfo)));
-  if (accessToken) writes.push(AsyncStorage.setItem(AUTH_KEYS.accessToken, String(accessToken)));
+  // Secrets → encrypted store. setRefreshToken writes BOTH names, exactly as
+  // the two AsyncStorage writes it replaces did.
+  if (accessToken) writes.push(secureTokenStore.setAccessToken(String(accessToken)));
   if (resolvedRefreshToken) {
-    writes.push(AsyncStorage.setItem(AUTH_KEYS.refreshToken, String(resolvedRefreshToken)));
-    writes.push(AsyncStorage.setItem(AUTH_KEYS.refreshTokenHash, String(resolvedRefreshToken)));
+    writes.push(secureTokenStore.setRefreshToken(String(resolvedRefreshToken)));
   }
   if (deviceId) writes.push(AsyncStorage.setItem(AUTH_KEYS.deviceId, String(deviceId)));
   if (sessionId) writes.push(AsyncStorage.setItem(AUTH_KEYS.sessionId, String(sessionId)));
@@ -243,7 +256,15 @@ const stampCacheOwnerForBootstrap = async (userId) => {
 // app language to English and threw away every cached translation — the user
 // picked Hindi once and found the app back in English after a reload. These
 // keys are read before the wipe and written back after it.
-const DEVICE_PREFERENCE_KEYS = ['app.language', 'translation.cache.v3'];
+//
+// INSTALL_MARKER_KEY belongs here for a different reason, and it is not
+// optional. freshInstallSweep deletes every SecureStore key (now including the
+// auth tokens) when that marker is ABSENT, which is its test for "the sandbox
+// was wiped but the iOS keychain survived, i.e. a reinstall". A logout is not a
+// reinstall — but the wipe below would erase the marker, so the NEXT cold boot
+// after a logout→login would look like a fresh install and delete the freshly
+// stored tokens, signing the user straight back out.
+const DEVICE_PREFERENCE_KEYS = ['app.language', 'translation.cache.v3', INSTALL_MARKER_KEY];
 
 const preserveDevicePreferences = async (wipe) => {
   let saved = [];
@@ -263,10 +284,20 @@ const preserveDevicePreferences = async (wipe) => {
 };
 
 export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
+  // MUST come first and MUST be explicit: AsyncStorage.clear() below does not
+  // reach the Keychain / AndroidKeyStore, so without this the auth tokens would
+  // survive logout — the device would stay able to call the API as the
+  // signed-out user. This also drops the in-memory token cache, so nothing
+  // reads the old session's token after this point.
+  await secureTokenStore.clearTokens();
+
   if (clearAllStorage) {
     await preserveDevicePreferences(() => AsyncStorage.clear());
   } else {
-    await AsyncStorage.multiRemove(Object.values(AUTH_KEYS));
+    // SECURE_TOKEN_KEYS overlaps AUTH_KEYS here on purpose — clearTokens()
+    // already handled the encrypted copies; this sweeps any legacy plaintext
+    // leftover on an install that has not been fully migrated yet.
+    await AsyncStorage.multiRemove([...new Set([...Object.values(AUTH_KEYS), ...SECURE_TOKEN_KEYS])]);
 
     const keys = await AsyncStorage.getAllKeys();
     const chatKeys = keys.filter((key) =>
@@ -401,10 +432,9 @@ const refreshAccessTokenInternal = async ({ refreshToken, deviceId }) => {
       const tokens = extractTokens(payload);
 
       if (tokens.accessToken) {
-        await AsyncStorage.setItem(AUTH_KEYS.accessToken, tokens.accessToken);
+        await secureTokenStore.setAccessToken(tokens.accessToken);
         if (tokens.refreshToken) {
-          await AsyncStorage.setItem(AUTH_KEYS.refreshToken, tokens.refreshToken);
-          await AsyncStorage.setItem(AUTH_KEYS.refreshTokenHash, tokens.refreshToken);
+          await secureTokenStore.setRefreshToken(tokens.refreshToken);
         }
 
         return {

@@ -19,6 +19,8 @@
  *   image         uri|null  — avatar URL (falls back to a colored initial)
  *   avatarColor   string    — fallback circle background
  *   isGroup       bool      — group → people fallback icon
+ *   showInitial   bool      — 1-1 with no photo: letter (saved contact) vs
+ *                             person icon (unsaved number). Default true.
  *   onMessage     fn?       — show Message button when provided
  *   onCall        fn?       — show Call button when provided (1-1 + group)
  *   onVideo       fn?       — show Video button when provided (1-1 + group)
@@ -40,6 +42,7 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useSelector } from 'react-redux';
 import { useTheme } from '../contexts/ThemeContext';
 import { useCall } from '../calls/useCall';
+import { getAvatarInitial } from '../utils/avatarIdentity';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -50,6 +53,7 @@ export default function ProfilePreviewModal({
   image = null,
   avatarColor = '#6C5CE7',
   isGroup = false,
+  showInitial = true,
   isBroadcast = false,
   isVerified = false,
   subtitle = null,
@@ -99,7 +103,7 @@ export default function ProfilePreviewModal({
 
   // WhatsApp's popup action icons are bright green (dark) / teal-green (light).
   const actionGreen = isDarkMode ? theme.colors.themeColor : '#028578';
-  const initial = (name || '?').charAt(0).toUpperCase();
+  const initial = getAvatarInitial(name);
 
   const showMessage = typeof onMessage === 'function';
   // Call/video appear whenever the PARENT supplied a handler — for a group that
@@ -141,8 +145,10 @@ export default function ProfilePreviewModal({
                     <Ionicons name="megaphone" size={88} color="rgba(255,255,255,0.95)" />
                   ) : isGroup ? (
                     <Ionicons name="people" size={92} color="rgba(255,255,255,0.95)" />
-                  ) : (
+                  ) : showInitial ? (
                     <Text style={styles.fallbackText}>{initial}</Text>
+                  ) : (
+                    <Ionicons name="person" size={96} color="rgba(255,255,255,0.95)" />
                   )}
                 </View>
               )}

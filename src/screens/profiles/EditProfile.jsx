@@ -4,7 +4,6 @@ import {
   Alert, Platform, ToastAndroid, ActivityIndicator, TextInput,
   StatusBar, StyleSheet, KeyboardAvoidingView,
 } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useTheme } from "../../contexts/ThemeContext";
 import { useDispatch, useSelector } from "react-redux";
@@ -14,6 +13,7 @@ import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ens
 import { editProfile, profileDetail } from "../../Redux/Reducer/Profile/Profile.reducer";
 import { BACKEND_URL } from '@env';
 import { Feather, Ionicons } from '@expo/vector-icons';
+import { getAccessToken } from '../../services/secureTokenStore';
 
 const NAME_MAX = 25;
 const ABOUT_MAX = 139;
@@ -155,7 +155,7 @@ export default function EditProfile({ navigation, route }) {
     }
     setImageUploadLoader(true);
     try {
-      const token = await AsyncStorage.getItem("accessToken");
+      const token = await getAccessToken();
       const ext = selectedImage.split('.').pop();
       const mime = (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg' : 'image/png';
       const formData = new FormData();

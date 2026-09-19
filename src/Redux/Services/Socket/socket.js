@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SOCKET_URL } from '@env';
 import { Alert, AppState, Platform } from 'react-native';
 import { performSessionReset, saveAuthSession } from '../../../services/sessionManager';
+import secureTokenStore from '../../../services/secureTokenStore';
 import { resetToLogin, resetToAccountStatus } from '../navigationService';
 import ChatDatabase from '../../../services/ChatDatabase';
 
@@ -46,6 +47,9 @@ const persistPresenceEvent = (raw) => {
   }
 };
 
+// ACCESS_TOKEN / REFRESH_TOKEN_* are handled by `secureTokenStore` (Keychain /
+// AndroidKeyStore) — they are named here only for reference. DEVICE_ID and
+// SESSION_ID are plain identifiers and remain in AsyncStorage.
 const STORAGE_KEYS = {
   ACCESS_TOKEN: 'accessToken',
   REFRESH_TOKEN_HASH: 'refreshTokenHash',
@@ -188,19 +192,17 @@ const createAuthRejectedError = (message = 'Reauthentication rejected by server'
 
 const getAuthStorage = async () => {
   try {
-    const values = await AsyncStorage.multiGet([
-      STORAGE_KEYS.ACCESS_TOKEN,
-      STORAGE_KEYS.REFRESH_TOKEN_HASH,
-      STORAGE_KEYS.REFRESH_TOKEN_LEGACY,
-      STORAGE_KEYS.DEVICE_ID,
-      STORAGE_KEYS.SESSION_ID,
+    // Tokens come from the encrypted store; deviceId/sessionId are plain
+    // identifiers and stay in AsyncStorage.
+    const [tokens, values] = await Promise.all([
+      secureTokenStore.getTokens(),
+      AsyncStorage.multiGet([STORAGE_KEYS.DEVICE_ID, STORAGE_KEYS.SESSION_ID]),
     ]);
 
     const map = Object.fromEntries(values);
     return {
-      accessToken: map[STORAGE_KEYS.ACCESS_TOKEN] || null,
-      refreshTokenHash:
-        map[STORAGE_KEYS.REFRESH_TOKEN_HASH] || map[STORAGE_KEYS.REFRESH_TOKEN_LEGACY] || null,
+      accessToken: tokens.accessToken || null,
+      refreshTokenHash: tokens.refreshTokenHash || null,
       deviceId: map[STORAGE_KEYS.DEVICE_ID] || null,
       sessionId: map[STORAGE_KEYS.SESSION_ID] || null,
     };
@@ -221,10 +223,10 @@ const persistAuthStorage = async ({ accessToken, refreshTokenHash, deviceId, ses
     });
   }
 
-  if (refreshTokenHash) {
-    writes.push([STORAGE_KEYS.REFRESH_TOKEN_HASH, String(refreshTokenHash)]);
-    writes.push([STORAGE_KEYS.REFRESH_TOKEN_LEGACY, String(refreshTokenHash)]);
-  }
+  // The refresh token is NOT written here any more: saveAuthSession above
+  // already persists it under both names through the encrypted store, and
+  // re-writing it via AsyncStorage.multiSet would put a plaintext copy back on
+  // disk — the exact thing this migration removes.
 
   if (sessionId) {
     writes.push([STORAGE_KEYS.SESSION_ID, String(sessionId)]);
@@ -709,8 +711,10 @@ const attachCoreSocketListeners = (navigation) => {
     });
 
     // Read the token fresh from storage: the HTTP layer's silent refresh writes
-    // AsyncStorage only, so the module-level accessTokenCache can be stale here
-    // — handshaking with it costs a guaranteed failed auth + reauth round-trip.
+    // it through secureTokenStore, so the module-level accessTokenCache here can
+    // be stale — handshaking with it costs a guaranteed failed auth + reauth
+    // round-trip. (The read itself is cheap: secureTokenStore serves it from
+    // memory once warm, so this is not a Keychain hit per reconnect.)
     let authToken = accessTokenCache;
     try {
       const stored = await getAuthStorage();

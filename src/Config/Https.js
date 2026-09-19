@@ -1,8 +1,8 @@
 import axios from "axios";
 import { ToastAndroid, Alert, Platform } from "react-native";
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { BACKEND_URL } from "@env";
 import { performSessionReset, refreshAccessToken } from "../services/sessionManager";
+import { getAccessToken } from "../services/secureTokenStore";
 
 // In-memory throttle so we never spam multiple alerts in a row.
 // Apple flags blocking modals from background fetches under 2.1.0
@@ -71,7 +71,10 @@ const isFormData = (data) => {
 api.interceptors.request.use(
   async (config) => {
     try {
-      const token = await AsyncStorage.getItem("accessToken");
+      // Served from secureTokenStore's in-memory cache after the first read —
+      // this runs on EVERY request, so it must not be a Keychain round-trip
+      // each time.
+      const token = await getAccessToken();
       if (token) {
         config.headers = config.headers || {};
         config.headers.Authorization = `Bearer ${token}`;
@@ -136,7 +139,7 @@ api.interceptors.response.use(
     // also can't be a token-expiry case — don't attempt a refresh that would
     // throw a confusing "missing refresh token" error and wipe navigation.
     try {
-      const hasSession = await AsyncStorage.getItem('accessToken');
+      const hasSession = await getAccessToken();
       if (!hasSession) {
         return Promise.reject(error);
       }
@@ -304,7 +307,7 @@ export const apiCallForm = async (method, endpoint, formData, config = {}) => {
     }
 
     // Prepare headers and token
-    let token = await AsyncStorage.getItem('accessToken');
+    let token = await getAccessToken();
     const headers = { ...(config.headers || {}) };
     if (token) headers.Authorization = `Bearer ${token}`;
     // Do NOT set Content-Type for FormData; fetch will handle it.
