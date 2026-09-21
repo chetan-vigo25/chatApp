@@ -92,6 +92,15 @@ export const EVT = {
   // mid-call media-layer connection state (network resilience)
   MEDIA_DOWN: 'mediaDown',
   MEDIA_UP: 'mediaUp',
+  // ENGINE-level (not media-level) lobby membership. The engine socket can drop
+  // while NO call is up — the device silently leaves the media server's lobby and
+  // every dial to it comes back "callee offline" even though the app is wide open
+  // and the chat socket is fine. Nothing used to report that edge, so the app's
+  // `engineReady` stayed true forever and its foreground re-warm no-opped. Both
+  // edges are now reported so the app layer can rebuild proactively instead of
+  // discovering the dead socket at ring time.
+  ENGINE_DOWN: 'engineDown',
+  ENGINE_UP: 'engineUp',
   // command results
   START_CALL_RESULT: 'startCallResult',
   START_CALL_ERROR: 'startCallError',

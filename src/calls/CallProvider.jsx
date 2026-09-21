@@ -201,6 +201,26 @@ const MEDIA_RING_TIMEOUT_MS = 12000;
 // the false kill; the connect watchdog (30s) still ends a truly dead call.
 const MEDIA_WATCHDOG_MS = 20000;
 
+// How often a FOREGROUND app re-verifies that its engine socket is still
+// registered on the media server. Registration is what makes this device
+// callable at all — a caller dialing an unregistered device gets `offline` back
+// and the call dies — and the socket can leave the lobby with no lifecycle event
+// to hang a repair off. socket.io only notices a HALF-OPEN socket at its own ping
+// timeout (media server: 25s interval + 20s timeout ≈ 45s), and the server then
+// holds the dead session ~5s more — so without this a dead socket can look alive
+// for ~50s. 45s keeps the check on that same cadence for one tiny round trip a
+// minute; it mostly exists for the case socket.io cannot fix on its own (a
+// stale engineReady over an SDK that is gone). Background/suspended time is not covered on purpose:
+// timers are throttled there anyway, and the foreground pass + the ring-time
+// ensureConnected cover the wake-up.
+const ENGINE_HEALTH_MS = 45000;
+
+// Backoff for rebuilding an engine whose connect FAILED (bad network at boot, a
+// token mint that couldn't reach the backend). Without this the next attempt was
+// whatever came first — a foreground switch or an actual call — so a single blip
+// at startup could leave the device uncallable indefinitely.
+const ENGINE_RETRY_MS = 8000;
+
 // Same-peer redial guard: after we decline/miss a 1:1 UN-answered, auto-decline
 // a re-ring from the SAME peer for this long (the caller's redial loop mints a
 // fresh callId the ids-guard can't know, and re-rings within ~1-2s). Kept SHORT
@@ -341,6 +361,7 @@ export const CallProvider = ({ children }) => {
   const mediaWatchdogRef = useRef(null); // detect a hung getUserMedia (no localstream)
   const connectWatchdogRef = useRef(null); // detect an answered call that never reaches ACTIVE (no remote media)
   const mediaRingWatchdogRef = useRef(null); // answered, but the media server's ring (WebRTC callId) never arrived
+  const mediaRingExtendedRef = useRef(false); // that watchdog already granted its one extension for this call
   const acceptingRef = useRef(false);      // synchronous accept lock (double-tap / re-render re-entry)
   // Was the full-screen ring opened AUTOMATICALLY (the app happened to be
   // backgrounded when the call arrived), or did the USER ask for it (banner tap /
@@ -350,6 +371,9 @@ export const CallProvider = ({ children }) => {
   // AFTER the foreground event it caused.
   const autoExpandedRef = useRef(false);
   const reconnectWatchdogRef = useRef(null); // mid-call media-drop recovery watchdog (APP-6)
+  const engineRetryRef = useRef(null);       // re-arm a FAILED engine connect (keeps this device callable)
+  const authedRef = useRef(false);           // isAuthenticated, readable from timers without re-arming them
+  const healEngineRef = useRef(() => {});     // latest healEngine, so the heartbeat never re-arms on identity churn
   const audioRouteAppliedRef = useRef(false); // did the user toggle Speaker this call? (so we reset routing on end)
   const initialRouteAppliedRef = useRef(false); // initial earpiece/speaker route applied for THIS call (once, at connect)
   const presenceWaiters = useRef({}); // ref -> resolve
@@ -445,6 +469,7 @@ export const CallProvider = ({ children }) => {
   // a call swiped out of Recents is restored from when the user re-opens the app.
   useEffect(() => { callSession.publish(state); }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
+  useEffect(() => { authedRef.current = !!isAuthenticated; }, [isAuthenticated]);
 
   // This device's id — used to ignore a `call:cancelled-elsewhere` whose
   // `winnerDeviceId` is US (a stale duplicate socket of the winning device can
@@ -966,9 +991,19 @@ export const CallProvider = ({ children }) => {
   // registers after the dial, within the ring window (see signaling.js connection
   // handler). If a connect is attempted before the engine HTML is ready it is
   // queued in pendingConnectRef and flushed the instant the HTML signals ready.
-  const doConnect = useCallback(async () => {
+  // `force` bypasses the engineReady short-circuit. That guard exists so repeated
+  // warm-ups are free, but it ALSO defeated the one path that was supposed to
+  // repair a dead engine: the foreground re-warm below calls doConnect() to
+  // rebuild a socket that dropped while backgrounded, and a STALE engineReady
+  // (socket dead, flag still true — nothing reported the idle drop) made that
+  // call a no-op. The device then stayed out of the media server's lobby with the
+  // app wide open and every incoming call died "callee offline on media server".
+  // Callers that have REASON to doubt the socket pass force:true.
+  const doConnect = useCallback(async ({ force = false } = {}) => {
     if (IS_EXPO_GO) return;
-    if (connectingRef.current || engineReadyRef.current) return;
+    if (connectingRef.current) return;
+    if (!force && engineReadyRef.current) return;
+    if (force) { engineReadyRef.current = false; setEngineReady(false); }
     // NEVER rebuild the engine underneath a call whose media is already up. A
     // CONNECT re-registers (and, when the idle socket fails the liveness probe,
     // REBUILDS) the SDK socket — and the media server drops the peer that socket
@@ -1050,6 +1085,61 @@ export const CallProvider = ({ children }) => {
     });
   }, [doConnect, pingEngine]);
 
+  // ---- engine self-heal (keeps this device IN the media server's lobby) ----
+  // Being registered on the media server is what makes us CALLABLE: a caller's
+  // dial to an unregistered device comes straight back `offline` and their engine
+  // drops into a redial loop the callee's own watchdogs usually outlive — the call
+  // simply dies. The engine socket can leave the lobby silently (OS suspend,
+  // network change, a half-open TCP that still reads `connected`), and until now
+  // nothing checked between calls, so the app could sit unreachable for hours.
+  //
+  // This is the repair: probe the engine for real (a `register` round trip, which
+  // doubles as a registration REFRESH) and rebuild only when the probe fails.
+  // Never runs against a live call — `doConnect` refuses to rebuild under one, and
+  // a call in progress is its own proof of liveness.
+  const healEngine = useCallback(async (why) => {
+    if (IS_EXPO_GO || !isAuthenticated) return;
+    // ONLY when nothing is in flight. A rebuild tears the SDK down, and during a
+    // RINGING/DIALING call that teardown hangs up the very call in progress
+    // (_connectFresh declines a pending ring / cancels a warm-up room). The
+    // call-time paths own repair while a call exists — this is the idle keeper.
+    const st = stateRef.current?.status;
+    if (st !== CALL_STATUS.IDLE && st !== CALL_STATUS.ENDED) return;
+    if (connectingRef.current) return;
+    if (!engineReadyRef.current) { doConnect(); return; }
+    const pong = await pingEngine();
+    if (pong && pong.hasCall && pong.connected) return;
+    if (__DEV__) console.log('[CALL][APP] engine liveness FAILED → rebuilding', { why, pong });
+    doConnect({ force: true });
+  }, [isAuthenticated, doConnect, pingEngine]);
+  // healEngine's identity changes whenever `user` does (doConnect closes over it).
+  // The heartbeat below must NOT be re-armed by that churn — a profile update
+  // landing more often than ENGINE_HEALTH_MS would reset the interval forever and
+  // the health check would never actually run. Read it through a ref instead.
+  healEngineRef.current = healEngine;
+
+  const clearEngineRetry = useCallback(() => {
+    if (engineRetryRef.current) { clearTimeout(engineRetryRef.current); engineRetryRef.current = null; }
+  }, []);
+
+  // Re-arm a connect that FAILED or a socket that DROPPED, so the device gets
+  // back into the media server's lobby on its own. Single-shot and idempotent:
+  // the first failure arms it, later ones ride the armed timer, and any recovery
+  // (engineReady / engineUp) clears it. Reads auth + call state from refs so the
+  // timer never needs re-arming when those change.
+  const scheduleEngineRetry = useCallback((why) => {
+    if (IS_EXPO_GO) return;
+    if (engineRetryRef.current) return;
+    engineRetryRef.current = setTimeout(() => {
+      engineRetryRef.current = null;
+      if (!authedRef.current) return;                                   // logged out — nothing to register
+      if (engineReadyRef.current) return;                               // recovered on its own
+      if (stateRef.current?.status === CALL_STATUS.ACTIVE) return;      // never rebuild under a live call
+      if (__DEV__) console.log('[CALL][APP] engine retry →', why);
+      doConnect({ force: true });
+    }, ENGINE_RETRY_MS);
+  }, [doConnect]);
+
   // ---- pre-warm the WebRTC engine connection (first-call reliability) ----
   // The engine connect (WebView SDK load + socket.io handshake to whatsapp-call +
   // token mint) takes several seconds when COLD. Connecting it lazily only when the
@@ -1070,12 +1160,22 @@ export const CallProvider = ({ children }) => {
     if (IS_EXPO_GO || !isAuthenticated) return undefined;
     // Small delay so the warm-up doesn't compete with app-startup work (chat sync).
     const t = setTimeout(() => { doConnect(); }, 3000);
-    // Re-warm on foreground: the engine socket may have dropped while backgrounded,
-    // and a cold reconnect would re-introduce the first-call delay.
+    // Foreground: VERIFY rather than assume. This used to call doConnect(), whose
+    // own engineReady guard turned it into a no-op in exactly the case it was
+    // written for — a socket that died while the app was backgrounded, with the
+    // ready flag left standing behind it.
     const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') doConnect();
+      if (next === 'active') healEngineRef.current('foreground');
     });
-    return () => { clearTimeout(t); sub.remove(); };
+    // Heartbeat. The foreground pass alone only covers a visible app-switch; an
+    // app left open and untouched (or one whose socket dies without a lifecycle
+    // event) still silently fell out of the lobby and stayed out — which is how a
+    // device that had not been used for hours became uncallable.
+    const hb = setInterval(() => {
+      if (AppState.currentState !== 'active') return; // suspended timers are useless
+      healEngineRef.current('heartbeat');
+    }, ENGINE_HEALTH_MS);
+    return () => { clearTimeout(t); clearInterval(hb); sub.remove(); };
   }, [isAuthenticated, doConnect]);
 
   // ---- iOS video-call camera recovery (native engine) ----
@@ -1132,8 +1232,18 @@ export const CallProvider = ({ children }) => {
       if (__DEV__) console.log('[CALL][APP][perm] mic stored status', { granted: mic.granted, canAskAgain: mic.canAskAgain });
       if (mic.granted) {
         if (__DEV__) console.log('[CALL][APP][perm] mic already granted → reusing stored permission');
-      } else if (mic.canAskAgain) {
-        if (__DEV__) console.log('[CALL][APP][perm] → FIRST TIME: requesting MICROPHONE');
+      } else {
+        // ALWAYS ask when not granted — never pre-judge from the stored
+        // `canAskAgain`. On Android that flag is unreliable: after an "Only this
+        // time" grant expires (Android revokes it soon after the app is
+        // backgrounded) expo reports {granted:false, canAskAgain:false} although
+        // the OS WILL show the dialog again. Trusting it skipped the prompt and
+        // the caller of this function REJECTED the call — tapping Answer on the
+        // notification declined the call instead of answering it (reproduced on
+        // device: RECORD_AUDIO granted=false flags=ONE_TIME). A genuinely
+        // blocked permission costs nothing here: the request resolves at once
+        // with no dialog, and the result below still routes to Settings.
+        if (__DEV__) console.log('[CALL][APP][perm] → requesting MICROPHONE', { storedCanAskAgain: mic.canAskAgain });
         mic = await Audio.requestPermissionsAsync();
         if (__DEV__) console.log('[CALL][APP][perm] mic after ask', { granted: mic.granted, canAskAgain: mic.canAskAgain });
       }
@@ -1650,8 +1760,9 @@ export const CallProvider = ({ children }) => {
   // `pendingAccept` with no callId; it self-checks at fire time, so the callId
   // landing late needs no explicit clear — the connect watchdog owns the call
   // from that point on.
-  const armMediaRingWatchdog = useCallback(() => {
+  const armMediaRingWatchdog = useCallback((extension = false) => {
     clearMediaRingWatchdog();
+    if (!extension) mediaRingExtendedRef.current = false;
     mediaRingWatchdogRef.current = setTimeout(() => {
       mediaRingWatchdogRef.current = null;
       const snap = stateRef.current;
@@ -1660,6 +1771,26 @@ export const CallProvider = ({ children }) => {
         || snap.status === CALL_STATUS.ENDED) return;
       if (snap.callId) return;        // the media ring landed — connect watchdog takes over
       if (!snap.pendingAccept) return; // not waiting on the engine any more
+      // ONE extension for a 1:1 whose engine has since come up. The caller's
+      // dial loop re-rings every ~2.5s for the whole ring window, so the instant
+      // our engine registers their next tick reaches us — killing the call here
+      // throws away an answer the other side is still actively trying to
+      // connect. That is the "callee answers from a cold start / killed app and
+      // gets Could not join the call" case: the engine needed ~15-20s to
+      // register, the original 12s cut it at 12. Bounded and conditional on
+      // purpose: a GROUP/CONFERENCE ring has no equivalent caller-side retry, so
+      // it still fails fast, and an engine that never came up is not extended
+      // either — there is genuinely nothing in flight to wait for.
+      if (!snap.isGroup && engineReadyRef.current && !mediaRingExtendedRef.current) {
+        mediaRingExtendedRef.current = true;
+        if (__DEV__) {
+          console.log('[CALL] media-ring watchdog — engine is up but the ring has not landed yet, extending once', {
+            signalId: snap.signalId, extraMs: MEDIA_RING_TIMEOUT_MS,
+          });
+        }
+        armMediaRingWatchdog(true);
+        return;
+      }
       if (__DEV__) {
         console.log('[CALL] media-ring watchdog — answered but the media server never rang this device', {
           signalId: snap.signalId, isConference: snap.isConference, isGroup: snap.isGroup,
@@ -1788,7 +1919,9 @@ export const CallProvider = ({ children }) => {
       }
       case 'engineReady': {
         if (__DEV__) console.log('[CALL] engineReady ✓ (SDK connected to calling service)');
+        clearEngineRetry();
         connectingRef.current = false;
+        engineReadyRef.current = true;
         setEngineReady(true);
         const waiters = readyWaiters.current; readyWaiters.current = [];
         waiters.forEach((fn) => { try { fn(); } catch (_) {} });
@@ -1797,8 +1930,37 @@ export const CallProvider = ({ children }) => {
       case 'connectError': {
         if (__DEV__) console.log('[CALL] connectError ✗', payload?.message || '');
         connectingRef.current = false;
+        engineReadyRef.current = false;
         setEngineReady(false);
         clearCachedCallToken();
+        // RETRY. Nothing used to re-arm this: a connect that failed at boot (no
+        // network yet, backend unreachable for one request) left the device out
+        // of the media server's lobby until the user happened to switch apps or
+        // place a call — i.e. uncallable, with the app apparently running fine.
+        scheduleEngineRetry('connectError');
+        break;
+      }
+      // ---- engine lobby membership (no call involved) ----
+      // The engine socket dropped while idle. We are no longer registered on the
+      // media server, so a caller dialing us right now gets `offline` back. Drop
+      // the ready flag (so nothing trusts the dead socket) and rebuild.
+      case 'engineDown': {
+        if (__DEV__) console.log('[CALL] engineDown ✗ — left the media server lobby', payload?.reason || '');
+        engineReadyRef.current = false;
+        setEngineReady(false);
+        scheduleEngineRetry('engineDown');
+        break;
+      }
+      // socket.io reconnected and re-registered on its own — the cheapest possible
+      // recovery. Restore the flag instead of tearing a healthy socket down.
+      case 'engineUp': {
+        if (__DEV__) console.log('[CALL] engineUp ✓ — re-registered on the media server');
+        clearEngineRetry();
+        connectingRef.current = false;
+        engineReadyRef.current = true;
+        setEngineReady(true);
+        const upWaiters = readyWaiters.current; readyWaiters.current = [];
+        upWaiters.forEach((fn) => { try { fn(); } catch (_) {} });
         break;
       }
       case 'incoming': {
@@ -2429,7 +2591,7 @@ export const CallProvider = ({ children }) => {
       }
       default: break;
     }
-  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording, upgradeUiToVideo, applyInitialCallRoute, removeGroupParticipant]);
+  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording, upgradeUiToVideo, applyInitialCallRoute, removeGroupParticipant, scheduleEngineRetry, clearEngineRetry]);
 
   // ---- public actions ----
   // `peerOrPeers` is a single peer object OR an array (group, up to
@@ -4371,7 +4533,10 @@ export const CallProvider = ({ children }) => {
   // Accept tapped on the notification (or a plain tap): make sure the ringing
   // state exists (cold start from a killed app), then answer once it commits.
   const onPushAccept = useCallback((data) => {
-    if (!data?.callerId) return;
+    if (!data?.callerId) {
+      if (__DEV__) console.log('[CALL][APP][push] ACCEPT dropped — payload has no callerId', { callId: data?.callId || null });
+      return;
+    }
     // An Accept belonging to an already-finished call must never answer (or worse,
     // re-ring) the call that is live now — see isForeignCallAction.
     if (isForeignCallAction(data)) return;
@@ -4877,7 +5042,11 @@ export const CallProvider = ({ children }) => {
     if (authRestoring) return undefined;
     if (!isAuthenticated) {
       setEngineReady(false);
+      engineReadyRef.current = false;
       connectingRef.current = false;
+      // A logout must not leave the self-heal retry armed — it would rebuild an
+      // engine for an account that is no longer signed in.
+      clearEngineRetry();
       // The engine WebView unmounts on logout and reloads on re-login, so the
       // loaded-HTML guard + any queued connect must reset (a stale `true` would
       // make doConnect inject CONNECT into a not-yet-loaded WebView).
@@ -4897,8 +5066,9 @@ export const CallProvider = ({ children }) => {
     return () => {
       if (resetTimerRef.current) clearTimeout(resetTimerRef.current);
       clearRingTimeout();
+      clearEngineRetry();
     };
-  }, [isAuthenticated, authRestoring, clearRingTimeout, stopRinging]);
+  }, [isAuthenticated, authRestoring, clearRingTimeout, stopRinging, clearEngineRetry]);
 
   // Native call UI (CallKit / ConnectionService) — inert no-op unless
   // react-native-callkeep is installed and the app rebuilt. Maps OS actions

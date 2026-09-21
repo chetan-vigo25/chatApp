@@ -11,6 +11,7 @@ import { isAppLockSuspended } from '../services/appLockGuard';
 import { clearDirectoryCache } from '../Redux/Services/Contact/Directory.Services';
 import { setCurrentUser, setCurrentUserId } from '../services/currentUser';
 import { getAccessToken, setAccessToken, setRefreshToken } from '../services/secureTokenStore';
+import { subscribeUserChanged } from '../services/sessionEvents';
 
 const AuthContext = createContext({});
 export const useAuth = () => useContext(AuthContext);
@@ -31,6 +32,11 @@ export const AuthProvider = ({ children }) => {
   // exactly once (previously discarded → leaked/duplicate listeners reconnecting
   // the socket after logout).
   const appStateCleanupRef = useRef(null);
+  // Latest auth state for the user-changed subscription below (registered once).
+  const userRef = useRef(null);
+  const authedRef = useRef(false);
+  useEffect(() => { userRef.current = user; }, [user]);
+  useEffect(() => { authedRef.current = isAuthenticated; }, [isAuthenticated]);
 
   const getDeviceInfo = async () => {
     try {
@@ -142,6 +148,40 @@ export const AuthProvider = ({ children }) => {
   useEffect(() => {
     checkLoginStatus();
   }, []);
+
+  // A FRESH sign-in (OTP / email) never calls login() above — those screens
+  // persist the session through sessionManager.saveAuthSession and navigate on.
+  // So isAuthenticated stayed FALSE for the whole first session after logging
+  // in, and everything gated on it stayed off. Worst hit: CallProvider never
+  // connected its engine to the media server (and its logout-teardown kept it
+  // shut down), so the device was UNCALLABLE until the app was restarted —
+  // callers got "callee offline on media server" and the call ended. Verified
+  // live on both phones: login succeeded, chat worked, AuthContext read
+  // isAuthenticated:false / user:null and the engine had no SDK at all.
+  //
+  // saveAuthSession announces the new user AFTER every token is written, so
+  // adopting it here is safe (no tokenless request can race ahead of it).
+  // The SAME user is ignored: sessionManager re-announces on every boot and on
+  // token refresh, and re-setting `user` would churn every consumer for nothing.
+  // A null userId (performSessionReset) is left to logout(), which owns teardown.
+  useEffect(() => subscribeUserChanged(({ userId, userInfo } = {}) => {
+    if (!userId || !userInfo) return;
+    const cur = userRef.current;
+    const curId = cur ? String(cur._id || cur.id || '') : '';
+    if (authedRef.current && curId === String(userId)) return;
+    userRef.current = userInfo;
+    authedRef.current = true;
+    setCurrentUser(userInfo);
+    setUser(userInfo);
+    setIsAuthenticated(true);
+    setIsLoading(false);
+    // Same foreground socket-recovery listener a restored session gets in
+    // checkLoginStatus — without it the chat socket isn't re-established on
+    // return from background until the next app launch.
+    if (!appStateCleanupRef.current) {
+      appStateCleanupRef.current = setupAppStateListener(navigationRef.current);
+    }
+  }), []);
 
   // Foreground → quick re-check & socket recovery.
   //

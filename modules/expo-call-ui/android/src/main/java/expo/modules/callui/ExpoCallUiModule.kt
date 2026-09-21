@@ -58,7 +58,12 @@ object CallUiBus {
 
   fun dispatch(payload: Map<String, Any?>) {
     val m = module
-    if (m != null) m.emit(payload) else pending = payload
+    // Emit only when JS is actually LISTENING. A module instance exists long
+    // before the JS subscribes (App.js registers after an async FCM setup), and
+    // an event sent into that gap is silently dropped — park it instead; the JS
+    // side collects it on subscribe (OnStartObserving) or via
+    // getInitialCallAction, whichever comes first.
+    if (m != null && m.isObservingActions) m.emit(payload) else pending = payload
   }
 }
 
@@ -73,6 +78,11 @@ class ExpoCallUiModule : Module() {
   // (OnActivityEntersForeground) so app content is bounced behind the lock screen
   // when no call justifies showing over it.
   @Volatile private var callActive: Boolean = false
+
+  // True while JS has a listener on EVENT_NAME. Anything emitted while this is
+  // false is lost, so call actions are parked in CallUiBus.pending instead.
+  @Volatile var isObservingActions: Boolean = false
+    private set
 
   override fun definition() = ModuleDefinition {
     Name("ExpoCallUi")
@@ -259,7 +269,21 @@ class ExpoCallUiModule : Module() {
     // Alive app (e.g. backgrounded) re-launched by an Answer / body / full-screen
     // tap → the new intent is delivered here; route it straight into JS.
     OnNewIntent { intent ->
-      readCallIntent(intent)?.let { emit(it) }
+      // readCallIntent CONSUMES the action (strips it from the intent), so if JS
+      // is not listening yet — the app is still booting after the full-screen
+      // intent opened it, and the user taps Answer — emitting here drops the
+      // Answer for good and getInitialCallAction later finds nothing: the call
+      // rang out although the user answered it (reproduced on device). Park it.
+      readCallIntent(intent)?.let { CallUiBus.dispatch(it) }
+    }
+
+    // JS subscribed to call actions → deliver anything parked while it wasn't.
+    OnStartObserving(EVENT_NAME) {
+      isObservingActions = true
+      CallUiBus.pending?.let { CallUiBus.pending = null; emit(it) }
+    }
+    OnStopObserving(EVENT_NAME) {
+      isObservingActions = false
     }
 
     // Keyguard backstop (APP-3): if the activity comes to the foreground OVER the

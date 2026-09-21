@@ -643,6 +643,7 @@ export const consumeInitialNotifeeCall = async () => {
   if (isCallUi()) {
     try {
       const action = getCallUi().getInitialCallAction();
+      if (__DEV__) console.log('[callNotif] cold-start launch action', action ? { action: action.action, callId: action.callId, hasCaller: !!action.callerId } : null);
       if (action?.action) {
         // Fire on the next tick (not +800ms). CallProvider only calls this once
         // its listeners are attached and auth is restored, so the long defer just

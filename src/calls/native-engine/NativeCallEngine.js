@@ -423,6 +423,21 @@ class NativeCallEngine {
 
   /** Port of the WebView glue's wireEvents() — SDK events → EVT posts. */
   _wireEvents(sdk) {
+    // Engine LOBBY membership (no call involved). A dropped engine socket means
+    // the media server no longer knows this device exists, so callers get
+    // "offline" — report both edges so the app layer can heal it proactively.
+    // Both guard on the SDK still being the CURRENT one: a superseded instance
+    // must never post lobby state for the engine that replaced it.
+    sdk.on('enginedown', (p = {}) => {
+      if (this._sdk !== sdk) return;
+      this._log(`engine socket DOWN (${p.reason || '?'}) — no longer registered on the media server`);
+      this._post(EVT.ENGINE_DOWN, { reason: p.reason || '' });
+    });
+    sdk.on('engineup', () => {
+      if (this._sdk !== sdk) return;
+      this._log('engine socket back UP — re-registered on the media server');
+      this._post(EVT.ENGINE_UP, { screenShare: this._screenShareSupported() });
+    });
     // System-initiated share stop (status-bar chip / OS notification) — the
     // SDK mirrors the ended track as a clean stop; reflect it in the UI flag.
     sdk.on('screenshare', (p) => {

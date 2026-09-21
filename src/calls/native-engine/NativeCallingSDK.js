@@ -296,6 +296,11 @@ export default class NativeCallingSDK {
         this._registered = true;
         this._log(`registered on ${url} as ${this.userId}`);
         if (done) { const d = done; done = null; d(null); }
+        // Back in the lobby. socket.io's own reconnect re-runs this handler, so
+        // this is also how a drop that self-healed tells the app layer to put
+        // `engineReady` back up — without it the app would rebuild the whole
+        // engine on a socket that had already recovered.
+        else this._emit('engineup', {});
         // Socket came back while in a call → resume the room media. Only a
         // FULLY-JOINED room resumes: a half-joined one still has its fresh
         // joinRoom in flight, and firing _resume() beside it ran TWO joins
@@ -314,7 +319,18 @@ export default class NativeCallingSDK {
     });
     s.on('disconnect', (reason) => {
       this._log(`socket disconnected: ${reason}`);
-      if (this._room && this._room.joined) this._emitDown(`signal:${reason}`);
+      // We have LEFT the media server's lobby. Until socket.io reconnects AND
+      // re-registers, every dial to this device answers "callee offline" — so
+      // the reuse path must not hand this socket back as registered.
+      this._registered = false;
+      if (this._room && this._room.joined) { this._emitDown(`signal:${reason}`); return; }
+      // IDLE drop (no call up). This edge was previously SILENT: the app layer's
+      // engineReady stayed true, its foreground re-warm no-opped on that stale
+      // flag, and the device sat UNREGISTERED with the app wide open — every
+      // incoming call then died with "callee offline on media server" (observed
+      // live: iOS app running, absent from the lobby while 8 other users were
+      // present). Report it so the app can rebuild before the next ring.
+      this._emit('enginedown', { reason: String(reason || '') });
     });
     this._wire(s);
   }
