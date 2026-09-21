@@ -986,7 +986,7 @@ const attachCoreSocketListeners = (navigation) => {
         const ChatDatabase = require('../../../services/ChatDatabase').default
           || require('../../../services/ChatDatabase');
         ChatDatabase.updateMessageStatus(failedClientId, 'failed').catch(() => {});
-        ChatDatabase.outboxRemove(failedClientId).catch(() => {});
+        ChatDatabase.outboxRemove(failedClientId, { acked: false }).catch(() => {});
       } catch (e) {}
       try {
         const { DeviceEventEmitter } = require('react-native');

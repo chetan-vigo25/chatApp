@@ -73,4 +73,30 @@ export function gridLayout(count, max = MAX_VIDEO_TILES) {
   };
 }
 
+/**
+ * Size of the SMALLEST tile a layout produces inside a measured grid box.
+ * Stretched last-row tiles are only ever wider, so sizing content to this box
+ * guarantees it fits every tile. `gutter` is the cell padding on both sides.
+ */
+export function tileBox(layout, gridW, gridH, gutter = 0) {
+  if (!layout || !gridW || !gridH) return null;
+  return {
+    width: Math.max(0, gridW / layout.cols - gutter),
+    height: Math.max(0, gridH / layout.rows - gutter),
+  };
+}
+
+/**
+ * Largest avatar that fits a tile once `reserve` points of vertical space are
+ * kept for the text around it (name / status). The avatar is sized from the
+ * tile, never from the participant count alone — a fixed size overflowed short
+ * tiles and clipped the avatar and name.
+ */
+export function fitAvatar(box, reserve, max, min = 28) {
+  if (!box) return null;
+  const byWidth = box.width * 0.72;
+  const byHeight = box.height - reserve;
+  return Math.round(Math.max(min, Math.min(max, byWidth, byHeight)));
+}
+
 export default gridLayout;

@@ -109,7 +109,7 @@ const tick = async () => {
       const { exhausted } = await ChatDatabase.outboxRecordFailure(cid, err?.message);
       if (exhausted) {
         // Final failure — drop and surface to UI via listener.
-        await ChatDatabase.outboxRemove(cid);
+        await ChatDatabase.outboxRemove(cid, { acked: false });
         try { _onFailureListeners.forEach((cb) => cb({ clientMessageId: cid, error: err?.message })); } catch {}
       }
     }

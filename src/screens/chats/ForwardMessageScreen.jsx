@@ -106,6 +106,9 @@ const showToast = (msg) => {
   else Alert.alert('', msg);
 };
 
+// Per-message ack wait in the ordered forward send; past it the outbox resends.
+const FORWARD_ACK_TIMEOUT_MS = 3000;
+
 export default function ForwardMessageScreen({ navigation, route }) {
   const { messageIds = [], messages = [] } = route.params || {};
   const { theme, isDarkMode } = useTheme();
@@ -205,6 +208,24 @@ export default function ForwardMessageScreen({ navigation, route }) {
       // Mark forward timestamp
       setForwardTimestamp();
 
+      // Chronological order (WhatsApp): selection order is tap order, but the
+      // forwarded copies must read top-to-bottom like the source chat.
+      const msgTime = (m) => {
+        const t = m?.timestamp ?? m?.createdAt;
+        const n = typeof t === 'number' ? t : Date.parse(t);
+        return Number.isFinite(n) ? n : 0;
+      };
+      const orderedMessages = [...messages].sort((a, b) => msgTime(a) - msgTime(b));
+
+      // Strictly increasing clock per forwarded copy: same-millisecond
+      // timestamps made the batch sort unstably and look like twins to the
+      // exact-timestamp dedup.
+      const baseTs = Date.now();
+      let seqOffset = 0;
+      const localRows = [];
+      // Per destination chat, the ordered emits (sent after navigation).
+      const sendQueues = [];
+
       // Send each message to each selected chat as a NEW message
       let sentCount = 0;
       for (const chatId of selectedReceivers) {
@@ -222,9 +243,11 @@ export default function ForwardMessageScreen({ navigation, route }) {
           ? (chat.groupId || chat.group?._id || chat._id || chat.chatId)
           : `u_${[String(currentUserId), String(chat?.peerUser?._id || 'unknown')].sort().join('_')}`;
 
-        for (const msg of messages) {
+        const queue = [];
+        sendQueues.push(queue);
+        for (const msg of orderedMessages) {
           const tempId = `temp_fwd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          const timestamp = new Date().toISOString();
+          const timestamp = new Date(baseTs + seqOffset++).toISOString();
 
           const sendEvent = isGroup ? 'group:message:send' : 'message:send';
 
@@ -277,11 +300,6 @@ export default function ForwardMessageScreen({ navigation, route }) {
                 createdAt: timestamp,
               };
 
-          // Fire and don't wait — the existing message:new handler will pick it up
-          socket.emit(sendEvent, sendPayload, (ack) => {
-            if (ack?.error) console.warn('[Forward] send ack error:', ack.error);
-          });
-
           // Optimistically add to cache for instant UI update
           const optimisticMessage = {
             id: tempId,
@@ -310,22 +328,50 @@ export default function ForwardMessageScreen({ navigation, route }) {
           // Local-first durability: the row used to live ONLY in the in-memory
           // cache — opening the destination chat re-read SQLite (which had
           // nothing) and the forward vanished until the next sync round, and
-          // an app kill lost it entirely. Persist it, and enqueue a durable
-          // outbox row so a dropped emit auto-resends (server dedupes on
-          // clientMessageId, so the socket/outbox race can't duplicate).
-          ChatDatabase.upsertMessage({ ...optimisticMessage, synced: false }).catch(() => {});
-          ChatDatabase.outboxEnqueue({
-            clientMessageId: tempId,
-            chatId: chatIdForCache,
+          // an app kill lost it entirely. Rows are persisted below in ONE
+          // transaction, plus a durable outbox row each so a dropped emit
+          // auto-resends (server dedupes on clientMessageId, so the
+          // socket/outbox race can't duplicate).
+          localRows.push({ ...optimisticMessage, synced: false });
+          queue.push({
+            event: sendEvent,
             payload: sendPayload,
-            notBefore: Date.now() + 4000,
-          }).then(() => OutboxWorker.wake()).catch(() => {});
+            outbox: { clientMessageId: tempId, chatId: chatIdForCache, payload: sendPayload },
+          });
 
           sentCount++;
-          // Small delay between messages to avoid flooding
-          if (messages.length > 1) await new Promise(r => setTimeout(r, 100));
         }
       }
+
+      // Everything below runs OFF the navigation path (WhatsApp closes the
+      // picker instantly). The destination chat paints these rows from
+      // ChatCache and its SQLite refresh keeps tempId rows the DB doesn't have
+      // yet, so nothing blinks.
+      //
+      // Emits go one at a time per chat, each waiting for its ack: the server
+      // stamps order on arrival and processes concurrent sends in parallel, so
+      // a burst reached receivers shuffled. Chats run in parallel. A timed-out
+      // ack just moves on — the outbox row (enqueued right after each emit, as
+      // before) resends it.
+      (async () => {
+        try { await ChatDatabase.upsertMessages(localRows); } catch (_) {}
+      })();
+      const emitInOrder = async (queue) => {
+        for (const item of queue) {
+          await new Promise((resolve) => {
+            const timer = setTimeout(resolve, FORWARD_ACK_TIMEOUT_MS);
+            socket.emit(item.event, item.payload, (ack) => {
+              clearTimeout(timer);
+              if (ack?.error) console.warn('[Forward] send ack error:', ack.error);
+              resolve();
+            });
+            ChatDatabase.outboxEnqueue({ ...item.outbox, notBefore: Date.now() + 4000 })
+              .then(() => OutboxWorker.wake())
+              .catch(() => {});
+          });
+        }
+      };
+      sendQueues.forEach((queue) => { emitInOrder(queue).catch(() => {}); });
 
       const msgCount = messages.length;
       const chatCount = selectedReceivers.length;

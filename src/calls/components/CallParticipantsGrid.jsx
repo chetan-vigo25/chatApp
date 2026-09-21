@@ -1,9 +1,11 @@
-import React from 'react';
+import React, { useState, useCallback } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import CallAvatar from './CallAvatar';
-import { gridLayout, MAX_VOICE_TILES } from '../callGridLayout';
+import {
+  gridLayout, tileBox, fitAvatar, MAX_VOICE_TILES,
+} from '../callGridLayout';
 
 /**
  * Roster grid for a GROUP / CONFERENCE call (and the ringing/ended states of a
@@ -35,8 +37,20 @@ const statusLabel = (p, ringing) => {
   return ringing ? 'Ringing…' : 'Connecting…';
 };
 
-// Avatars shrink as the grid densifies so a 9-person conference still fits.
-const avatarFor = (n) => (n <= 2 ? 104 : n <= 4 ? 78 : n <= 6 ? 62 : 50);
+// Upper bound per density, and the first-frame fallback before the grid box is
+// measured. The real size comes from the measured tile (fitAvatar) so the
+// avatar + name + status always fit — a fixed 104dp avatar clipped short tiles.
+const avatarCapFor = (n) => (n <= 2 ? 104 : n <= 4 ? 84 : n <= 6 ? 68 : 56);
+
+// Cell padding (3 per side) + tile border (2 per side).
+const TILE_GUTTER = 10;
+// Vertical text space under the avatar: name (marginTop + line), status line,
+// the optional @handle line, plus breathing room top/bottom.
+const NAME_H = 10 + 20;
+const NAME_H_COMPACT = 4 + 18;
+const HANDLE_H = 1 + 16;
+const STATUS_H = 2 + 16;
+const BREATHING = 16;
 
 // `onParticipantLongPress(p)` — optional; the conference HOST long-presses a
 // tile to get the Remove option (CallOverlay only passes it for the host).
@@ -52,6 +66,12 @@ export default function CallParticipantsGrid({
   showSelf = true,
 }) {
   const { theme, isDarkMode } = useTheme();
+  const [gridSize, setGridSize] = useState(null);
+  const onGridLayout = useCallback((e) => {
+    const { width, height } = e.nativeEvent.layout;
+    setGridSize((prev) => (prev && prev.width === width && prev.height === height
+      ? prev : { width, height }));
+  }, []);
   const c = theme.colors;
   const onBg = isDarkMode ? '#FFFFFF' : c.primaryTextColor;
   const onBgSoft = isDarkMode ? 'rgba(255,255,255,0.65)' : c.secondaryTextColor;
@@ -73,10 +93,21 @@ export default function CallParticipantsGrid({
 
   const layout = gridLayout(list.length, MAX_VOICE_TILES);
   const shown = list.slice(0, layout.count);
-  const size = avatarFor(layout.count);
+  const box = tileBox(layout, gridSize?.width, gridSize?.height, TILE_GUTTER);
+  // Short tiles (5+ people on a small phone) drop the @handle line and tighten
+  // the name; very short ones drop the status line too — never overflow.
+  const compact = !!box && box.height < 170;
+  const tiny = !!box && box.height < 96;
+  const showHandle = !compact && shown.some((p) => p.handle);
+  const reserve = (compact ? NAME_H_COMPACT : NAME_H)
+    + (tiny ? 0 : STATUS_H)
+    + (showHandle ? HANDLE_H : 0)
+    + (compact ? 8 : BREATHING);
+  const size = fitAvatar(box, reserve, avatarCapFor(layout.count))
+    || avatarCapFor(layout.count);
 
   return (
-    <View style={styles.grid}>
+    <View style={styles.grid} onLayout={onGridLayout}>
       {shown.map((p, i) => {
         // Only a LIVE participant can be the speaker — a stale relay for someone
         // who already left must not light their tile up.
@@ -99,23 +130,32 @@ export default function CallParticipantsGrid({
               delayLongPress={350}
             >
               <CallAvatar uri={p.avatar} name={p.name} id={p.id} size={size} />
-              <Text style={[styles.name, { color: onBg }]} numberOfLines={1}>
+              <Text style={[styles.name, compact && styles.nameCompact, { color: onBg }]} numberOfLines={1}>
                 {p.name || 'Unknown'}
               </Text>
               {/* Public "@handle" under the name. useCallRoster nulls it out
                   when it would only repeat the name above, so this line never
                   shows the same identity twice. */}
-              {p.handle ? (
+              {showHandle && p.handle ? (
                 <Text style={[styles.handle, { color: onBgSoft }]} numberOfLines={1}>
                   {p.handle}
                 </Text>
               ) : null}
-              <Text
-                style={[styles.status, { color: onBgSoft }, p.joined && !p.isSelf && styles.statusActive]}
-                numberOfLines={1}
-              >
-                {statusLabel(p, ringing)}
-              </Text>
+              {/* Your own tile is already named "You" — a second "You" status
+                  line under it is noise. */}
+              {tiny || p.isSelf ? null : (
+                <Text
+                  style={[
+                    styles.status,
+                    compact && styles.statusCompact,
+                    { color: onBgSoft },
+                    p.joined && !p.isSelf && styles.statusActive,
+                  ]}
+                  numberOfLines={1}
+                >
+                  {statusLabel(p, ringing)}
+                </Text>
+              )}
 
               {/* Muted. Your own state comes from the local toggle; a remote
                   member's comes from the server roster (`audioEnabled`), which
@@ -148,6 +188,7 @@ const styles = StyleSheet.create({
     flex: 1,
     flexDirection: 'row',
     flexWrap: 'wrap',
+    overflow: 'hidden',
   },
   // 3pt of padding per cell = a 6pt visual gutter between neighbouring tiles.
   cell: { padding: 3 },
@@ -168,6 +209,7 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
     textAlign: 'center',
   },
+  nameCompact: { fontSize: 14, marginTop: 4 },
   handle: {
     fontFamily: 'Roboto-Regular',
     fontSize: 12,
@@ -182,6 +224,7 @@ const styles = StyleSheet.create({
     maxWidth: '100%',
     textAlign: 'center',
   },
+  statusCompact: { fontSize: 11, marginTop: 1 },
   statusActive: { color: '#00D26A' },
   micBadge: {
     position: 'absolute',

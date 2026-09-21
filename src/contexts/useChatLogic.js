@@ -57,6 +57,7 @@ import { computeFileSha256, MAX_HASH_BYTES } from '../utils/fileHash';
 import SqliteWriter from "../services/SqliteWriter";
 import { pauseBackgroundSyncFor } from "../services/syncPriority";
 import { subscribeSessionReset, subscribeUserChanged } from "../services/sessionEvents";
+import { claimDeliveryReceipt } from '../utils/deliveryReceiptGuard';
 import {
   getCurrentUserId, setCurrentUser, primeCurrentUser, subscribeCurrentUser,
 } from "../services/currentUser";
@@ -368,6 +369,25 @@ const resolveUploadMediaId = (uploadData = {}) => {
   if (uploadData?._id) return String(uploadData._id);
   if (uploadData?.id) return String(uploadData.id);
   return null;
+};
+
+// Same rendered content? A DB re-read produces a fresh object for every row;
+// reusing the previous object when nothing it carries changed lets memoized
+// rows skip re-rendering. Keys the fresh copy leaves undefined are ignored
+// (in-memory-only fields survive, as before); objects compare by value.
+const isSameRowContent = (prev, next) => {
+  if (!prev || !next || prev === next) return prev === next;
+  for (const k of Object.keys(next)) {
+    const b = next[k];
+    if (b === undefined) continue;
+    const a = prev[k];
+    if (a === b) continue;
+    if (a && b && typeof a === 'object' && typeof b === 'object') {
+      try { if (JSON.stringify(a) === JSON.stringify(b)) continue; } catch { /* fall through */ }
+    }
+    return false;
+  }
+  return true;
 };
 
 export default function useChatLogic({ navigation, route }) {
@@ -1675,7 +1695,11 @@ export default function useChatLogic({ navigation, route }) {
     const isTempish = (m) => !m.serverMessageId
       && (Boolean(m.tempId) || String(m.id || '').startsWith('temp_'));
     const deduped = sorted.filter(msg => {
-      const ids = [normalizeId(msg.serverMessageId), normalizeId(msg.id), normalizeId(msg.tempId)].filter(Boolean);
+      // clientMessageId is the exact idempotency key the server now echoes on
+      // every copy (ack, fan-out, fetch) — including it here links an optimistic
+      // row to its confirmed twin by identity, so the text fingerprint below no
+      // longer has to guess.
+      const ids = [normalizeId(msg.serverMessageId), normalizeId(msg.id), normalizeId(msg.tempId), normalizeId(msg.clientMessageId)].filter(Boolean);
       if (ids.some(id => seenIds.has(id))) return false;
       // Content fingerprint is TEXT-ONLY (same policy as deduplicateMessages
       // and the SQLite dedupe rules). Media/album/view-once rows all share
@@ -1693,7 +1717,13 @@ export default function useChatLogic({ navigation, route }) {
         const fpNext = `${normalizeId(msg.senderId)}|${msg.text}|${roundedTs + 1}`;
         const clash = fpMap.get(fp) || fpMap.get(fpPrev) || fpMap.get(fpNext);
         const tempish = isTempish(msg);
-        if (clash && (tempish || clash.tempish || clash.ts === Number(msg.timestamp || 0))) return false;
+        // Only the SAME message stored twice (identical server timestamp) is a
+        // content twin. "One side is optimistic" is NOT proof: a second genuine
+        // "ok" typed while the first is already confirmed is optimistic too, and
+        // hiding it made the new message vanish until its ack (verified: repeat
+        // sends). Optimistic↔confirmed twins are now linked by clientMessageId
+        // in `ids` above.
+        if (clash && clash.ts === Number(msg.timestamp || 0) && clash.ts > 0) return false;
         if (!fpMap.has(fp)) fpMap.set(fp, { tempish, ts: Number(msg.timestamp || 0) });
       }
       for (const id of ids) seenIds.add(id);
@@ -2933,17 +2963,16 @@ export default function useChatLogic({ navigation, route }) {
             readAt: new Date().toISOString(),
           });
         } else {
-          // Emit individual read + seen for each message, plus bulk
+          // One read receipt per message. `message:seen` used to be emitted
+          // alongside `message:read`; the backend now treats both as a read and
+          // relayed each one, so the sender got every read TWICE (verified on
+          // device). `message:read` is the canonical receipt (backend spec B6).
           unreadVisibleIds.forEach(msgId => {
             socket.emit('message:read', {
               messageId: msgId,
               chatId: chatIdRef.current,
               senderId: currentUserIdRef.current,
               timestamp: Date.now(),
-            });
-            socket.emit('message:seen', {
-              messageId: msgId,
-              chatId: chatIdRef.current,
             });
           });
         }
@@ -3382,6 +3411,20 @@ export default function useChatLogic({ navigation, route }) {
             if (!m.senderName && prevMsg.senderName) {
               patch = { ...(patch || {}), senderName: prevMsg.senderName };
             }
+            // Ticks are MONOTONIC across a refresh too. updateMessageStatus already
+            // refuses a downgrade, but this merge replaced the live row with the
+            // SQLite snapshot wholesale — when the 'seen' write hadn't landed yet
+            // the snapshot still said 'delivered', and the sender's blue tick went
+            // back to grey and STAYED grey until the chat was reopened (verified
+            // on device: screen 'delivered', SQLite 'seen'). Keep whichever side is
+            // further along; handler-owned states and a real 'failed' are left to
+            // their own paths.
+            if (prevMsg.status && m.status && prevMsg.status !== m.status
+              && !['scheduled', 'processing', 'cancelled', 'failed'].includes(m.status)
+              && !['scheduled', 'processing', 'cancelled', 'failed'].includes(prevMsg.status)
+              && getMessageStatusPriority(prevMsg.status) > getMessageStatusPriority(m.status)) {
+              patch = { ...(patch || {}), status: prevMsg.status };
+            }
             // Always prefer in-memory reactions over SQLite — optimistic updates are more recent
             if (prevMsg.reactions && typeof prevMsg.reactions === 'object' && Object.keys(prevMsg.reactions).length > 0) {
               if (!m.reactions || typeof m.reactions !== 'object' || Object.keys(m.reactions).length === 0) {
@@ -3418,7 +3461,14 @@ export default function useChatLogic({ navigation, route }) {
                 patch = { ...(patch || {}), mediaItems: prevMsg.mediaItems };
               }
             }
-            return patch ? { ...m, ...patch } : m;
+            const next = patch ? { ...m, ...patch } : m;
+            // Keep the in-memory OBJECT when SQLite returned the same content.
+            // This refresh runs on every status/ack event and rebuilt all ~78
+            // rows as new objects each time, so the memoized MessageRow saw
+            // every row as changed and re-rendered the whole list (measured:
+            // 76 of 78 identities replaced per send). Identity now changes only
+            // for a row whose content actually changed.
+            return isSameRowContent(prevMsg, next) ? prevMsg : next;
           });
 
           // Build a set of ALL IDs from DB messages
@@ -4088,6 +4138,7 @@ export default function useChatLogic({ navigation, route }) {
   // Returns true when a sync/fetch request was actually emitted, false when it
   // bailed (socket down). Callers use this to avoid arming throttles/cursors on
   // a request that never left the device.
+  const syncBurstRef = useRef(null); // last non-forced socket sync, to coalesce open-time bursts
   const fetchAndSyncMessagesViaSocket = useCallback((chatIdParam, options = {}) => {
     const socket = socketRef.current || getSocket();
     if (!socket || !isSocketConnected() || !chatIdParam) {
@@ -4097,6 +4148,21 @@ export default function useChatLogic({ navigation, route }) {
     const { before = null, limit = SOCKET_FETCH_LIMIT } = options;
     const force = options?.force === true;
     const syncOnly = options?.syncOnly === true;
+
+    // Coalesce the burst: opening a chat reaches this from mount, focus and the
+    // reconnect/foreground paths within the same second, and each one emitted a
+    // full sync (verified: group:message:sync ×3 on one group open). The server
+    // answer is the same, so collapse identical non-forced, non-paged requests
+    // for one chat inside a short window. `force` and older-page loads
+    // (`before`) always go through.
+    if (!force && !before) {
+      const nowMs = Date.now();
+      const last = syncBurstRef.current;
+      if (last && last.chatId === String(chatIdParam) && last.syncOnly === syncOnly && nowMs - last.at < 1500) {
+        return true;
+      }
+      syncBurstRef.current = { chatId: String(chatIdParam), syncOnly, at: nowMs };
+    }
 
     const isGrpSync = chatData?.chatType === 'group' || chatData?.isGroup;
 
@@ -5517,6 +5583,11 @@ export default function useChatLogic({ navigation, route }) {
     registerSocketHandler('message:edit:response', onEditResponse);
     // Receiver gets: message:edited (broadcast from server)
     registerSocketHandler('message:edited', onEditResponse);
+    // ...and the current backend broadcasts the edit to the receiver as
+    // `message:edit` (same name as the request). Without this the receiver
+    // ignored every edit: the sender saw the new text (optimistic update), the
+    // peer kept the old one until a reopen (verified on device).
+    registerSocketHandler('message:edit', onEditResponse);
 
     const handleMediaDownloadedUpdate = (data) => {
       const source = data?.data || data || {};
@@ -5885,6 +5956,8 @@ export default function useChatLogic({ navigation, route }) {
       refreshMessagesFromDB();
     };
     registerSocketHandler('group:message:edited', onGroupMessageEdited);
+    // Same backend naming as 1:1 — accept the request-named broadcast too.
+    registerSocketHandler('group:message:edit', onGroupMessageEdited);
 
     // ─── GROUP MESSAGE DELETE HANDLERS ───
 
@@ -6683,6 +6756,10 @@ export default function useChatLogic({ navigation, route }) {
   const updateMessageStatus = useCallback(async (tempId, status, serverData = null) => {
     const normalizedStatus = normalizeMessageStatus(status) || status;
     const serverMessageId = serverData?.messageId || serverData?._id;
+    // Server-allocated per-chat seq from the send ack — kept on the row so this
+    // device's own messages are never seq-less (see acknowledgeMessage).
+    const serverSeq = Number(serverData?.seq ?? serverData?.data?.seq);
+    const hasServerSeq = Number.isFinite(serverSeq) && serverSeq > 0;
 
     // Do NOT update status for messages that are scheduled/processing/cancelled/failed
     // These statuses are managed by their own dedicated handlers
@@ -6727,13 +6804,15 @@ export default function useChatLogic({ navigation, route }) {
 
         const needsIdSync = !!serverMessageId &&
           (m.serverMessageId !== serverMessageId || m.id !== serverMessageId || !m.synced);
-        if (nextStatus === m.status && !needsIdSync) return m;
+        const needsSeq = hasServerSeq && !(Number(m.seq) > 0);
+        if (nextStatus === m.status && !needsIdSync && !needsSeq) return m;
 
         changed = true;
         return {
           ...m,
           status: nextStatus,
           ...(serverMessageId ? { serverMessageId, id: serverMessageId, synced: true } : {}),
+          ...(needsSeq ? { seq: serverSeq } : {}),
         };
       });
       return changed ? updated : prev;
@@ -6741,7 +6820,7 @@ export default function useChatLogic({ navigation, route }) {
 
     // Background: persist to SQLite
     if (serverMessageId && tempId && serverMessageId !== tempId) {
-      ChatDatabase.acknowledgeMessage(tempId, serverMessageId).catch(() => {});
+      ChatDatabase.acknowledgeMessage(tempId, serverMessageId, hasServerSeq ? serverSeq : null).catch(() => {});
       const tempReply = await ChatDatabase.getReplyData(tempId);
       if (tempReply) {
         ChatDatabase.saveReplyData(serverMessageId, tempReply).catch(() => {});
@@ -6753,8 +6832,15 @@ export default function useChatLogic({ navigation, route }) {
       SqliteWriter.enqueue('updateMessageStatus', { id: targetId, status: normalizedStatus }).catch(() => {});
     }
 
-    // Debounced DB refresh (merge strategy preserves optimistic messages)
-    refreshMessagesFromDB();
+    // Re-read SQLite only when the row's IDENTITY changed (the ack swapped the
+    // temp id for the server id — the DB is where the two rows reconcile). A
+    // plain tick change (sent → delivered → seen) is already applied to state
+    // above and persisted through SqliteWriter; re-reading and re-enriching the
+    // whole window on each of those was the largest remaining JS-thread cost
+    // after a send (SQLite round trips on every receipt, measured on device).
+    if (serverMessageId && tempId && serverMessageId !== tempId) {
+      refreshMessagesFromDB();
+    }
 
     // Update chat list preview
     const currentMsgs = allMessagesRef.current || [];
@@ -6823,7 +6909,7 @@ export default function useChatLogic({ navigation, route }) {
           // SQLite — swap `id = temp_xxx` for the canonical `server_message_id`
           // so all future actions (reply / react / read / edit / delete) use
           // the server-recognized id, not the temp one.
-          ChatDatabase.acknowledgeMessage(targetTempId, serverMessageId).catch(() => {});
+          ChatDatabase.acknowledgeMessage(targetTempId, serverMessageId, ackData?.seq ?? null).catch(() => {});
           // Socket delivered it — drop the durable outbox row so the REST drain
           // worker never re-sends. (Server dedupes on (chatId, clientMessageId)
           // anyway, but removing it keeps the happy path socket-only.)
@@ -7991,7 +8077,9 @@ export default function useChatLogic({ navigation, route }) {
     const senderId = msg?.senderId;
     if (senderId && !sameId(senderId, currentUserIdRef.current) && messageId && !isProtectedStatus) {
       const socket = socketRef.current || getSocket();
-      if (socket && isSocketConnected() && chatIdRef.current) {
+      // claimDeliveryReceipt: the same message arrives as message:received AND
+      // message:new, and RealtimeChatContext acks it app-wide — one receipt only.
+      if (socket && isSocketConnected() && chatIdRef.current && claimDeliveryReceipt(messageId)) {
         const isGrpDel = chatData?.chatType === 'group' || chatData?.isGroup;
         if (isGrpDel) {
           socket.emit('group:message:delivered', {

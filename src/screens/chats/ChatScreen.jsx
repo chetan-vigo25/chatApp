@@ -1453,6 +1453,22 @@ const chatMenuStyles = StyleSheet.create({
   confirmDangerText: { fontFamily: 'Roboto-SemiBold', fontSize: 14, color: '#fff', letterSpacing: 0.2 },
 });
 
+// One message row, memoized. See renderChatsItem for why this exists.
+const MessageRow = React.memo(
+  function MessageRow({ renderBody, msg, index }) {
+    return renderBody({ item: msg, index });
+  },
+  // `index` is deliberately NOT compared. Inserting a message shifts every
+  // row's index by one, which re-rendered all ~78 rows on each send (the
+  // single largest stall). The body only uses index to find the neighbour
+  // above it (grouping + date badge) — that neighbour is compared as `older`.
+  (a, b) => a.renderBody === b.renderBody
+    && a.msg === b.msg
+    && a.older === b.older
+    && a.extra === b.extra
+    && a.lineCount === b.lineCount,
+);
+
 export default function ChatScreen({ navigation, route }) {
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
@@ -1646,6 +1662,13 @@ export default function ChatScreen({ navigation, route }) {
   const [recentEmojis, setRecentEmojis] = useState(['😀', '😂', '❤️', '👍', '🔥', '🙏']);
   const [expandedRichMessages, setExpandedRichMessages] = useState({});
   const [richMessageLineCounts, setRichMessageLineCounts] = useState({});
+  // Read through a ref by the row renderer so a freshly measured line count
+  // doesn't rebuild renderChatsItem (which re-rendered EVERY row, twice per
+  // sent message). Each row gets its own count as a MessageRow prop instead.
+  const richMessageLineCountsRef = useRef(richMessageLineCounts);
+  richMessageLineCountsRef.current = richMessageLineCounts;
+  // Every measured count, including the ones that never reach state (below).
+  const measuredLineCountsRef = useRef({});
 
   /* ── Chat message translation ──────────────────────────────────────────────
      Translations live HERE, above the bubble, on purpose.
@@ -1718,7 +1741,7 @@ export default function ChatScreen({ navigation, route }) {
   const chatInputRef = useRef(null);
   const emojiPanelAnim = useRef(new Animated.Value(0)).current;
   const richParseCacheRef = useRef(new Map());
-  const [visibleMessageKeys, setVisibleMessageKeys] = useState({});
+  const primeVisibleThumbnailsRef = useRef(null); // was visibleMessageKeys state (effect-only)
   const thumbnailCacheRef = useRef({});
   const thumbnailLoadInFlightRef = useRef(new Set());
   // mediaIds already asked of user/media/resolve for a missing video poster —
@@ -1734,7 +1757,7 @@ export default function ChatScreen({ navigation, route }) {
   const lastScrollStateRef = useRef({ isAtLatest: true, isAtTop: false, showScrollButton: false });
   const visibleMapRef = useRef({});
   const [stickyDateLabel, setStickyDateLabel] = useState('');
-  const [pendingVisibleReadIds, setPendingVisibleReadIds] = useState([]);
+  const markVisibleIncomingAsReadRef = useRef(null); // was pendingVisibleReadIds state (effect-only)
   const pendingVisibleReadSignatureRef = useRef('');
   const stickyDateOpacity = useRef(new Animated.Value(0)).current;
   const stickyDateScale = useRef(new Animated.Value(0.96)).current;
@@ -3801,16 +3824,20 @@ export default function ChatScreen({ navigation, route }) {
     const prevKeys = Object.keys(prevMap);
     const nextKeys = Object.keys(nextVisibleMap);
     const mapChanged = prevKeys.length !== nextKeys.length || nextKeys.some((key) => !prevMap[key]);
+    // These two used to be React STATE read only by effects — every
+    // viewability change (each new message, each temp→server id swap) re-rendered
+    // the whole ChatScreen twice for nothing on screen. They are side effects,
+    // so they run directly (deferred out of the list callback) via refs.
     if (mapChanged) {
       visibleMapRef.current = nextVisibleMap;
-      setVisibleMessageKeys(nextVisibleMap);
+      setTimeout(() => { try { primeVisibleThumbnailsRef.current?.(); } catch {} }, 0);
     }
 
     if (visibleIds.length > 0) {
       const nextSignature = visibleIds.join('|');
       if (pendingVisibleReadSignatureRef.current !== nextSignature) {
         pendingVisibleReadSignatureRef.current = nextSignature;
-        setPendingVisibleReadIds(visibleIds);
+        setTimeout(() => { try { markVisibleIncomingAsReadRef.current?.(visibleIds); } catch {} }, 0);
       }
     }
 
@@ -3834,21 +3861,22 @@ export default function ChatScreen({ navigation, route }) {
     }
   }).current;
 
-  useEffect(() => {
-    if (!Array.isArray(pendingVisibleReadIds) || pendingVisibleReadIds.length === 0) return;
-    // Defer read sync to an effect so provider updates never run during render.
-    markVisibleIncomingAsRead(pendingVisibleReadIds);
-  }, [pendingVisibleReadIds, markVisibleIncomingAsRead]);
-
-  useEffect(() => {
-    const visibleMessages = messages.filter((msg) => visibleMessageKeys[getMessageKey(msg)]);
-    if (visibleMessages.length === 0) return;
-    visibleMessages.forEach((msg) => {
-      if (isMediaType(msg)) {
+  // Latest callbacks for the (stable, ref-held) viewability handler above.
+  markVisibleIncomingAsReadRef.current = markVisibleIncomingAsRead;
+  primeVisibleThumbnailsRef.current = () => {
+    const visibleMap = visibleMapRef.current || {};
+    (messagesRef.current || []).forEach((msg) => {
+      if (visibleMap[getMessageKey(msg)] && isMediaType(msg)) {
         primeThumbnailCacheForMessage(msg).catch(() => {});
       }
     });
-  }, [messages, visibleMessageKeys, primeThumbnailCacheForMessage]);
+  };
+
+  // A visible media row whose URL arrives later still gets its thumbnail primed
+  // (this ran on every messages change before, too) — an effect, not a render.
+  useEffect(() => {
+    primeVisibleThumbnailsRef.current?.();
+  }, [messages]);
 
   // Populate text input when entering edit mode
   useEffect(() => {
@@ -5280,7 +5308,7 @@ export default function ChatScreen({ navigation, route }) {
       : (msg?.text || '');
     const parsed = getParsedRichMessage(displayText);
     const isExpanded = Boolean(expandedRichMessages[messageKey]);
-    const measuredLineCount = Number(richMessageLineCounts[messageKey] || 0);
+    const measuredLineCount = Number(measuredLineCountsRef.current[messageKey] ?? (richMessageLineCountsRef.current || {})[messageKey] ?? 0);
     const showReadMore = measuredLineCount > RICH_TEXT_COLLAPSED_LINES;
     // Roboto has no Devanagari/Bengali/Tamil/Arabic/Thai/CJK glyphs, so a
     // translated bubble must hand those scripts to the platform font instead of
@@ -5299,6 +5327,17 @@ export default function ChatScreen({ navigation, route }) {
 
     const handleMeasureLayout = (event) => {
       const lineCount = event?.nativeEvent?.lines?.length || 0;
+      const prevCount = measuredLineCountsRef.current[messageKey];
+      if (prevCount === lineCount) return;
+      measuredLineCountsRef.current[messageKey] = lineCount;
+      // Only crossing the "Read more" threshold changes what the row shows.
+      // Committing every measurement to state re-rendered the whole ChatScreen
+      // twice per sent message (once under the temp id, again after the server
+      // id swap) for a short text that never shows "Read more".
+      const wasLong = Number(prevCount || 0) > RICH_TEXT_COLLAPSED_LINES;
+      const isLong = lineCount > RICH_TEXT_COLLAPSED_LINES;
+      if (wasLong === isLong && prevCount !== undefined) return;
+      if (!isLong && prevCount === undefined) return;
       setRichMessageLineCounts((prev) => {
         if (prev[messageKey] === lineCount) return prev;
         return { ...prev, [messageKey]: lineCount };
@@ -6580,11 +6619,16 @@ export default function ChatScreen({ navigation, route }) {
   // the FlatList renders every message and the date-badge lookups below read
   // the very same array.
   const renderableMessages = messages;
+  // Latest list for the row renderer (neighbour grouping, reply-quote lookup):
+  // rows are memoized now, so they must not read a list captured by an older
+  // render of renderChatsItemBody.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
 
   // Written every render so renderChatsItem never reads a stale array.
   renderableMessagesRef.current = Array.isArray(renderableMessages) ? renderableMessages : [];
 
-  const renderChatsItem = useCallback(({ item: msg, index }) => {
+  const renderChatsItemBody = useCallback(({ item: msg, index }) => {
     const messageKey = getMessageKey(msg);
     const isSelected = selectedMessage.some(sel => sameId(sel, messageKey));
     // Which side this row renders on. Resolved from the row's OWN participant
@@ -6803,7 +6847,8 @@ export default function ChatScreen({ navigation, route }) {
     // A run restarts when the sender changes, a date divider splits the two, or
     // a significant time gap passes between them.
     const CONSECUTIVE_GROUP_GAP_MS = 5 * 60 * 1000; // 5 min restarts the run
-    const olderMsg = index < messages.length - 1 ? messages[index + 1] : null;
+    const _rowList = messagesRef.current || [];
+    const olderMsg = index < _rowList.length - 1 ? _rowList[index + 1] : null;
     const olderIsSystemLike = !!olderMsg && (
       olderMsg?.type === 'system' || olderMsg?.messageType === 'system' ||
       olderMsg?.type === 'call' || olderMsg?.messageType === 'call'
@@ -7085,7 +7130,7 @@ export default function ChatScreen({ navigation, route }) {
               // original message (preview data alone doesn't carry the URL).
               // Match EVERY id form the app stores — replies created on other
               // devices carry the server uuid, local ones the temp/client id.
-              const quotedOriginal = messages.find(m =>
+              const quotedOriginal = (messagesRef.current || []).find(m =>
                 sameId(m.serverMessageId, msg.replyToMessageId) ||
                 sameId(m.id, msg.replyToMessageId) ||
                 sameId(m.tempId, msg.replyToMessageId) ||
@@ -7349,7 +7394,7 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, richMessageLineCounts, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys]);
 
 
   // FlatList extraData for media rows. Its identity changes only when one of
@@ -7370,6 +7415,28 @@ export default function ChatScreen({ navigation, route }) {
     () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId }),
     [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId]
   );
+
+  // The list cell renderer. VirtualizedList (RN 0.81 / React 19) hands every
+  // cell a fresh inline `ref`, so its PureComponent cells re-render on EVERY
+  // list render and call renderItem for every mounted row — one sent message
+  // cost ~630 full row renders (8 screen renders × ~78 rows, measured on
+  // device) and froze the JS thread for 350–660ms. MessageRow memoizes the
+  // expensive body per row: it re-renders only when THIS row's inputs change —
+  // its message, position, the neighbour its grouping depends on, its measured
+  // line count, the media/translation state (extra) or the body itself.
+  const renderChatsItem = useCallback(({ item, index }) => {
+    const list = messagesRef.current || [];
+    return (
+      <MessageRow
+        renderBody={renderChatsItemBody}
+        msg={item}
+        index={index}
+        older={index < list.length - 1 ? list[index + 1] : null}
+        extra={mediaRenderExtra}
+        lineCount={richMessageLineCounts[getMessageKey(item)] || 0}
+      />
+    );
+  }, [renderChatsItemBody, mediaRenderExtra, richMessageLineCounts]);
 
   // Typing indicator
   const renderTypingIndicator = () => {

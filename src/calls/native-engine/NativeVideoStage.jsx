@@ -10,7 +10,9 @@ import * as registry from './streamRegistry';
 import CallAvatar from '../components/CallAvatar';
 import useDraggablePip from '../components/useDraggablePip';
 import useCallRoster from '../useCallRoster';
-import { gridLayout, MAX_VIDEO_TILES } from '../callGridLayout';
+import {
+  gridLayout, tileBox, fitAvatar, MAX_VIDEO_TILES,
+} from '../callGridLayout';
 
 /**
  * Video surface for the NATIVE call engine — replaces the WebView (which WAS
@@ -89,8 +91,15 @@ const tileStatus = (p) => {
   return 'Connecting…';
 };
 
-// Avatars shrink as the grid densifies so a 6-way call still reads.
-const groupAvatarFor = (n) => (n <= 2 ? 110 : n <= 4 ? 80 : 62);
+// Upper bound per density, and the first-frame fallback before the grid is
+// measured — the real size is fitted to the measured tile (fitAvatar).
+const groupAvatarFor = (n) => (n <= 2 ? 110 : n <= 4 ? 84 : 68);
+// Cell padding (2 per side) + tile border (2 per side).
+const G_TILE_GUTTER = 8;
+// The avatar area stops above the bottom name chip (see gPlaceholder), so the
+// reserve is that chip, the status line under the avatar, and breathing room.
+const G_CHIP_H = 34;
+const G_STATUS_H = 10 + 16;
 
 // CallOverlay floats its top bar and its control row OVER this stage. In a 1:1
 // call that is the point (full-bleed video under the chrome), but a grid tile's
@@ -126,6 +135,12 @@ function CallGroupGrid({
 }) {
   const roster = useCallRoster(participants, { connectedOnly: rosterConnectedOnly });
   const insets = useSafeAreaInsets();
+  const [gridSize, setGridSize] = useState(null);
+  const onGridLayout = (e) => {
+    const { width, height } = e.nativeEvent.layout;
+    setGridSize((prev) => (prev && prev.width === width && prev.height === height
+      ? prev : { width, height }));
+  };
 
   const local = snap.local;
   const localOff = cameraOn === false;
@@ -213,16 +228,21 @@ function CallGroupGrid({
 
   const layout = gridLayout(tiles.length, MAX_VIDEO_TILES);
   const shown = tiles.slice(0, layout.count);
-  const avatarSize = groupAvatarFor(layout.count);
+  const padTop = insets.top + TOP_BAR_H;
+  const padBottom = insets.bottom + CONTROLS_H;
+  const box = gridSize
+    ? tileBox(layout, gridSize.width, gridSize.height - padTop - padBottom, G_TILE_GUTTER)
+    : null;
+  const anyStatus = shown.some((t) => !t.stream && t.status);
+  const avatarSize = fitAvatar(box, G_CHIP_H + (anyStatus ? G_STATUS_H : 0) + 12, groupAvatarFor(layout.count))
+    || groupAvatarFor(layout.count);
 
   return (
     <View style={styles.stage} pointerEvents="box-none">
       <View
-        style={[styles.gGrid, {
-          paddingTop: insets.top + TOP_BAR_H,
-          paddingBottom: insets.bottom + CONTROLS_H,
-        }]}
+        style={[styles.gGrid, { paddingTop: padTop, paddingBottom: padBottom }]}
         pointerEvents="none"
+        onLayout={onGridLayout}
       >
         {shown.map((t, i) => (
           <View key={t.key} style={[styles.gCell, layout.tileStyle(i)]}>
@@ -529,6 +549,7 @@ const styles = StyleSheet.create({
     flex: 1,
     flexDirection: 'row',
     flexWrap: 'wrap',
+    overflow: 'hidden',
   },
   // 2pt per cell = a 4pt visual gutter between neighbouring tiles.
   gCell: { padding: 2 },
@@ -542,11 +563,15 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   gFill: { flex: 1 },
+  // Content centres in the space ABOVE the bottom name chip, so the avatar and
+  // status never slide under it on a short tile.
   gPlaceholder: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
+    paddingTop: 6,
+    paddingBottom: 34,
   },
   gStatus: {
     color: 'rgba(255,255,255,0.7)',

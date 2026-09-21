@@ -134,6 +134,9 @@ export default function CallOverlay() {
     call?.participants,
     { connectedOnly: receiverConnectedOnly },
   );
+  // The grid only renders once someone else is on the roster (see
+  // CallParticipantsGrid) — only then does the header compact to make room.
+  const hasGrid = Object.values(gridParticipants || {}).some((p) => p && p.id);
 
   // "Add participant" is available on a LIVE group call (host ringing included —
   // the host is already in the room while others ring) — AND on a live 1:1
@@ -460,13 +463,13 @@ export default function CallOverlay() {
       ) : isGroup ? (
         // ----- GROUP (audio, or pre-video ringing/ended) -----
         <>
-          <View style={styles.identity}>
-            <Text style={[styles.subtitle, { color: onBgSoft }]}>{subtitle}</Text>
-            <Text style={[styles.groupName, { color: onBg }]} numberOfLines={1}>{groupTitle}</Text>
+          <View style={[styles.identity, hasGrid && styles.identityGrid]}>
+            <Text style={[styles.subtitle, hasGrid && styles.subtitleGrid, { color: onBgSoft }]}>{subtitle}</Text>
+            <Text style={[styles.groupName, hasGrid && styles.groupNameGrid, { color: onBg }]} numberOfLines={1}>{groupTitle}</Text>
             {/* The grid only claims the flexible space once there is actually
                 someone to show — before anyone joins, the title/status stays
                 vertically centred instead of being pushed up by an empty box. */}
-            <View style={Object.keys(gridParticipants).length ? styles.gridWrap : null}>
+            <View style={hasGrid ? styles.gridWrap : null}>
               <CallParticipantsGrid
                 participants={gridParticipants}
                 ringing={ringing}
@@ -491,7 +494,7 @@ export default function CallOverlay() {
               />
             </View>
             {timerRunning ? (
-              <CallTimer startMs={call?.connectedAt || call?.answeredAt} style={[styles.activeTimer, { color: onBg }]} />
+              <CallTimer startMs={call?.connectedAt || call?.answeredAt} style={[styles.activeTimer, hasGrid && styles.activeTimerGrid, { color: onBg }]} />
             ) : null}
           </View>
 
@@ -502,7 +505,7 @@ export default function CallOverlay() {
             </TouchableOpacity>
           ) : null}
 
-          <View style={styles.bottom}>
+          <View style={[styles.bottom, hasGrid && styles.bottomGrid]}>
             {(status === CALL_STATUS.ACTIVE || accepted || status === CALL_STATUS.OUTGOING) ? (
               <CallControls
                 isVideo={isVideo}
@@ -618,6 +621,12 @@ const styles = StyleSheet.create({
     elevation: 999,
   },
   identity: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 40 },
+  // Once the roster grid is up, the header hugs the top (level with the
+  // minimize / add buttons) so every pixel below goes to the tiles.
+  identityGrid: { justifyContent: 'flex-start', paddingTop: 12 },
+  subtitleGrid: { marginBottom: 4, paddingHorizontal: 64 },
+  groupNameGrid: { fontSize: 20, marginBottom: 10, maxWidth: '70%' },
+  activeTimerGrid: { marginTop: 8, marginBottom: 2 },
   // WhatsApp-style 1:1 active-call header: name centered at the top (between
   // the floating minimize / add-participant corner buttons), status/timer under.
   header: { alignItems: 'center', paddingTop: 14, paddingHorizontal: 64 },
@@ -674,11 +683,12 @@ const styles = StyleSheet.create({
   // The tiled grid sizes its rows as a PERCENTAGE of this box, so it needs a
   // real height — flex:1 gives it everything left between the title and the
   // controls. Without it every tile would collapse to zero.
-  gridWrap: { width: '100%', flex: 1, paddingHorizontal: 8 },
+  gridWrap: { width: '100%', flex: 1, paddingHorizontal: 8, overflow: 'hidden' },
   mediaRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10 },
   mediaText: { color: 'rgba(255,255,255,0.8)', fontFamily: 'Roboto-Regular', fontSize: 13 },
   activeTimer: { marginTop: 18, fontSize: 16 },
   bottom: { paddingBottom: 30, paddingTop: 10 },
+  bottomGrid: { paddingBottom: 16, paddingTop: 6 },
   singleEndWrap: { alignItems: 'center' },
   endBtn: {
     width: 64, height: 64, borderRadius: 32,

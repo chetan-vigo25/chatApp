@@ -1097,12 +1097,25 @@ const cleanBeforeUpsert = async (db, msg) => {
   const isMediaMsg = ['image', 'video', 'audio', 'file', 'album'].includes(
     String(msg.type || msg.mediaType || '')
   );
-  if (!isMediaMsg && msg.senderId && msg.timestamp) {
+  //    LAST-RESORT and ONE-TO-ONE. The old rule deleted every same-sender,
+  //    same-text row within 30s that lacked server_message_id — which is how a
+  //    normally-received message is stored — so a second genuine "ok" deleted
+  //    the first one from SQLite (reproduced on device: the row vanished, came
+  //    back only when the server page was re-fetched, and would have been lost
+  //    for good beyond that page). Now it may remove AT MOST ONE row, only an
+  //    optimistic `temp_%` row, and only when the incoming copy carries no
+  //    link key (a link-keyed copy is fully handled by the exact rules above).
+  const hasLinkKey = !!(msg.clientMessageId || (tempId && tempId !== id));
+  if (!isMediaMsg && !hasLinkKey && msg.senderId && msg.timestamp && !String(id).startsWith('temp_')) {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       await db.runAsync(
-        `DELETE FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id != $id AND text = $text AND ABS(timestamp - $ts) < 30000 AND (id LIKE 'temp_%' OR server_message_id IS NULL${serverId ? ' OR server_message_id = $serverId' : ''})`,
-        { $cid: msg.chatId, $sid: msg.senderId, $id: id, $text: msg.text || '', $ts: ts, ...(serverId ? { $serverId: serverId } : {}) }
+        `DELETE FROM messages WHERE rowid = (
+           SELECT rowid FROM messages
+            WHERE chat_id = $cid AND sender_id = $sid AND id != $id AND id LIKE 'temp_%'
+              AND type = 'text' AND text = $text AND ABS(timestamp - $ts) < 30000
+            ORDER BY ABS(timestamp - $ts) LIMIT 1)`,
+        { $cid: msg.chatId, $sid: msg.senderId, $id: id, $text: msg.text || '', $ts: ts }
       );
     }
   }
@@ -1438,9 +1451,13 @@ const _runInsert = async (db, msg, _retried = false) => {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       try {
+        // EXACT link only (the confirmed copy that names this temp id as its
+        // clientMessageId / temp_id). The old content match redirected a NEW
+        // "ok" into the PREVIOUS confirmed "ok" within 30s, so the new message
+        // was never stored as its own row.
         const serverRow = await db.getFirstAsync(
-          `SELECT id FROM messages WHERE chat_id = $cid AND sender_id = $sid AND text = $text AND ABS(timestamp - $ts) < 30000 AND server_message_id IS NOT NULL AND id NOT LIKE 'temp_%' AND type = 'text' LIMIT 1`,
-          { $cid: msg.chatId, $sid: msg.senderId, $text: msg.text || '', $ts: ts }
+          `SELECT id FROM messages WHERE chat_id = $cid AND id NOT LIKE 'temp_%' AND (client_message_id = $tid OR temp_id = $tid) LIMIT 1`,
+          { $cid: msg.chatId, $tid: id }
         );
         if (serverRow) {
           // Server version exists — update it instead of creating a temp duplicate
@@ -1754,13 +1771,17 @@ const _preserveLocalState = async (db, msg) => {
   // the incoming message is itself media (it links by id/tempId, above).
   const incomingType = String(msg.type || msg.mediaType || 'text');
   const isIncomingMedia = ['image', 'video', 'audio', 'file', 'album'].includes(incomingType);
-  if (!existing && !isIncomingMedia && msg.senderId && msg.timestamp) {
+  // Also requires the SAME text and an incoming copy with no link key: the
+  // content-agnostic version deleted "hi" (still sending) the moment the
+  // confirmed "how are you" from the same sender arrived within 5s. A copy that
+  // carries clientMessageId is linked exactly above and never reaches here.
+  if (!existing && !isIncomingMedia && !msg.clientMessageId && msg.senderId && msg.timestamp) {
     const ts = Number(msg.timestamp || 0);
     if (ts > 0) {
       try {
         existing = await db.getFirstAsync(
-          `SELECT * FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND type = 'text' AND ABS(timestamp - $ts) < 5000 ORDER BY is_edited DESC LIMIT 1`,
-          { $cid: msg.chatId, $sid: msg.senderId, $ts: ts }
+          `SELECT * FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND type = 'text' AND text = $text AND ABS(timestamp - $ts) < 5000 ORDER BY ABS(timestamp - $ts) ASC, is_edited DESC LIMIT 1`,
+          { $cid: msg.chatId, $sid: msg.senderId, $text: msg.text || '', $ts: ts }
         );
         if (existing?.id) await db.runAsync(`DELETE FROM messages WHERE id = $id`, { $id: existing.id });
       } catch {}
@@ -1922,16 +1943,11 @@ const loadMessages = async (chatId, opts = {}) => {
   const result = [];
 
   for (const msg of dropAlternateIdTwins(allMsgs)) {
-    const ids = [msg.serverMessageId, msg.id, msg.tempId].filter(Boolean);
+    // Identity only. clientMessageId links an optimistic temp row to its
+    // confirmed copy exactly; the old text fingerprint also dropped a genuine
+    // second "ok" that was still sending when a confirmed "ok" sat within 30s.
+    const ids = [msg.serverMessageId, msg.id, msg.tempId, msg.clientMessageId].filter(Boolean);
     if (ids.some(id => seenIds.has(id))) continue;
-
-    // Only fingerprint-check temp rows — server-confirmed rows are unique by ID
-    if (msg.id && String(msg.id).startsWith('temp_') && msg.senderId && msg.text != null) {
-      const roundedTs = Math.round((msg.timestamp || 0) / 30000);
-      const fp = `${msg.senderId}|${msg.text}|${roundedTs}`;
-      if (seenIds.has(fp) || seenIds.has(`${msg.senderId}|${msg.text}|${roundedTs - 1}`) || seenIds.has(`${msg.senderId}|${msg.text}|${roundedTs + 1}`)) continue;
-      seenIds.add(fp);
-    }
 
     for (const id of ids) seenIds.add(id);
     result.push(msg);
@@ -2009,7 +2025,7 @@ const messageExists = async (messageId) => {
   return Boolean(r);
 };
 
-const acknowledgeMessage = async (tempId, serverMessageId) => {
+const acknowledgeMessage = async (tempId, serverMessageId, seq = null) => {
   if (!tempId || !serverMessageId) return;
   return runExclusive(async () => {
   const db = await getDB();
@@ -2083,6 +2099,20 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
     try { await saveReplyData(serverMessageId, rd, db); } catch {}
   }
 
+  // The ack carries the server-allocated per-chat `seq`. It was dropped here,
+  // so every message THIS device sent stayed seq-less locally (verified: own
+  // rows seq=null while the receiver's copy had it) — the seq cursor that the
+  // reconnect catch-up and read watermarks depend on then had holes exactly at
+  // our own messages. Write it once; never overwrite a known seq.
+  const _ackSeq = Number(seq);
+  if (Number.isFinite(_ackSeq) && _ackSeq > 0) {
+    try {
+      await db.runAsync(
+        `UPDATE messages SET seq = $q WHERE (id = $s OR server_message_id = $s) AND (seq IS NULL OR seq = 0)`,
+        { $q: _ackSeq, $s: serverMessageId }
+      );
+    } catch {}
+  }
   // NUCLEAR CLEANUP: after acknowledge, delete ALL remaining temp rows that could
   // be orphans of this same message (matched by sender + text + timestamp).
   // This catches stale temp rows re-created by saveMessagesToLocal race conditions.
@@ -2093,9 +2123,12 @@ const acknowledgeMessage = async (tempId, serverMessageId) => {
       // wipe a sibling captionless media still uploading (same empty text, within
       // 30s). Media temp rows are removed via their exact tempId link above, never
       // by this content-based sweep.
+      // Orphans of THIS send only — matched by its exact key. The old
+      // content sweep deleted EVERY temp "ok" within 30s, including a second
+      // genuine "ok" still being sent.
       await db.runAsync(
-        `DELETE FROM messages WHERE chat_id = $cid AND sender_id = $sid AND id LIKE 'temp_%' AND type = 'text' AND text = $text AND ABS(timestamp - $ts) < 30000`,
-        { $cid: finalRow.chat_id, $sid: finalRow.sender_id, $text: finalRow.text || '', $ts: finalRow.timestamp }
+        `DELETE FROM messages WHERE chat_id = $cid AND id LIKE 'temp_%' AND (id = $t OR temp_id = $t OR client_message_id = $t)`,
+        { $cid: finalRow.chat_id, $t: String(tempId) }
       );
     }
   } catch {}
@@ -2615,16 +2648,22 @@ const deduplicateChat = async (chatId) => {
       //    content match would wrongly delete a DIFFERENT in-flight upload's bubble —
       //    the "sending media disappears on chat reopen" bug. Media is deduped
       //    reliably by the temp_id↔server_message_id link in #2 above, never by text.
-      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND id LIKE 'temp_%' AND type = 'text' AND EXISTS (SELECT 1 FROM messages s WHERE s.chat_id = $c AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000)`, { $c: chatId });
-      // 4. Remove any remaining content duplicates (same sender + text within 30s),
-      //    keep newest — TEXT ONLY, for the same reason as #3 (both the DELETE and the
-      //    keep-set are scoped to type='text' so no media row can ever be collapsed).
-      await db.runAsync(`
-        DELETE FROM messages WHERE chat_id = $c AND type = 'text' AND rowid NOT IN (
-          SELECT MAX(rowid) FROM messages WHERE chat_id = $c AND type = 'text'
-          GROUP BY sender_id, text, CAST(timestamp / 30000 AS INTEGER)
-        )
-      `, { $c: chatId });
+      //    ONE-TO-ONE and never in flight: a temp row the outbox still owns
+      //    (sending/queued/pending/failed) is left alone — the outbox resolves it
+      //    by its exact key — and a server row already linked to a DIFFERENT send
+      //    (client_message_id set) never absorbs this temp row. Previously any
+      //    confirmed "ok" deleted a second "ok" that was still sending.
+      await db.runAsync(`DELETE FROM messages WHERE chat_id = $c AND id LIKE 'temp_%' AND type = 'text'
+        AND COALESCE(status, '') NOT IN ('sending', 'queued', 'pending', 'failed', 'uploading')
+        AND EXISTS (SELECT 1 FROM messages s WHERE s.chat_id = $c AND s.id NOT LIKE 'temp_%' AND s.sender_id = messages.sender_id AND s.text = messages.text AND ABS(s.timestamp - messages.timestamp) < 30000
+          AND (s.client_message_id IS NULL OR s.client_message_id = messages.id OR s.client_message_id = messages.temp_id))`, { $c: chatId });
+      // 4. (REMOVED) "Same sender + same text within a 30s bucket → keep one."
+      //    It ran on EVERY chat open and permanently deleted genuine repeats —
+      //    two "ok"s 8s apart lost one from SQLite (verified on device); the
+      //    server copy only came back if that page happened to be re-fetched.
+      //    True duplicates are removed by exact keys: #1 (same id), #1b (the
+      //    UUID/_id twin), #2 (temp_id link) and #5 (client_message_id bridge).
+      //    Repeating short text is normal conversation — never collapse it.
       // 5. clientMessageId bridge: a stale local row (optimistic/acked under an
       //    old id) whose id/temp_id equals a CONFIRMED row's client_message_id
       //    is the SAME logical message — the server row wins. This is the exact
@@ -3326,9 +3365,25 @@ const getChatCount = async () => {
 // worker for a grace window. The send path uses this so the socket fast-path
 // can settle (and outboxRemove the row) before the worker REST-resends —
 // keeping the online happy-path socket-only while still surviving an app kill.
+// Sends already settled (acked by the server, or finally failed) — in memory.
+// outboxEnqueue and outboxRemove both queue behind the SQLite write mutex, and
+// under load the enqueue for a send could land AFTER the ack had already run
+// its outboxRemove: the remove found nothing, the late insert created an orphan
+// row, and the worker re-sent an already-delivered message 4s later (verified
+// on device: the row appeared 3.4s after the emit, then the resend came back
+// `duplicate: true`). Recording the settlement makes the order irrelevant.
+const _settledSends = new Set();
+const _markSendSettled = (clientMessageId) => {
+  if (!clientMessageId) return;
+  _settledSends.add(String(clientMessageId));
+  if (_settledSends.size > 2000) _settledSends.delete(_settledSends.values().next().value);
+};
+
 const outboxEnqueue = async ({ clientMessageId, chatId, payload, notBefore = 0 }) => {
   if (!clientMessageId || !chatId) return;
+  if (_settledSends.has(String(clientMessageId))) return; // acked before this insert landed
   await runExclusive(async () => {
+    if (_settledSends.has(String(clientMessageId))) return;
     const db = await getDB();
     const now = Date.now();
     await db.runAsync(
@@ -3340,8 +3395,11 @@ const outboxEnqueue = async ({ clientMessageId, chatId, payload, notBefore = 0 }
   });
 };
 
-const outboxRemove = async (clientMessageId) => {
+// `acked: false` for removals on a FINAL FAILURE — a failed send may be retried
+// by the user with the same clientMessageId, so it must not be marked settled.
+const outboxRemove = async (clientMessageId, { acked = true } = {}) => {
   if (!clientMessageId) return;
+  if (acked) _markSendSettled(clientMessageId);
   await runExclusive(async () => {
     const db = await getDB();
     await db.runAsync(`DELETE FROM outbox WHERE client_message_id = $c`, { $c: clientMessageId });
@@ -3380,10 +3438,19 @@ const outboxRecordFailure = async (clientMessageId, errMessage) => {
 
 const outboxDrainDue = async (limit = 20) => {
   const db = await getDB();
-  const rows = await db.getAllAsync(
+  const allRows = await db.getAllAsync(
     `SELECT * FROM outbox WHERE next_retry_at <= $now ORDER BY created_at ASC LIMIT $l`,
     { $now: Date.now(), $l: limit }
   );
+  // Never re-send a settled message; clear any orphan row left by the race above.
+  const rows = allRows.filter((r) => {
+    if (!_settledSends.has(String(r.client_message_id))) return true;
+    runExclusive(async () => {
+      const d = await getDB();
+      await d.runAsync(`DELETE FROM outbox WHERE client_message_id = $c`, { $c: r.client_message_id });
+    }).catch(() => {});
+    return false;
+  });
   return rows.map((r) => ({
     ...r,
     payload: r.payload ? safeParse(r.payload) : null,

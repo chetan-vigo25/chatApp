@@ -4,6 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { getSocket, isSocketConnected, isSocketAuthed, subscribeSocketState } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
+import { claimDeliveryReceipt } from '../utils/deliveryReceiptGuard';
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { getChatActivityValue, compareChatsByActivity } from '../utils/chatOrder';
@@ -1353,7 +1354,10 @@ const reducer = (state, action) => {
       const isNonBadgingCall = incomingType === 'call' && !['missed', 'cancelled'].includes(incomingCallOutcome);
 
       const unreadByChat = { ...state.unreadByChat };
-      if (isIncoming && state.activeChatId !== chatId && !isNonBadgingCall) {
+      // Count each message once. When the server's chat:list:update for this
+      // message lands FIRST it already set the authoritative unread (and made
+      // this message the row's lastMessage) — bumping again here double-counts.
+      if (isIncoming && state.activeChatId !== chatId && !isNonBadgingCall && !isSameLastMessage) {
         unreadByChat[chatId] = Number(unreadByChat[chatId] || existing.unreadCount || 0) + 1;
       }
 
@@ -1803,9 +1807,45 @@ const reducer = (state, action) => {
           };
         }
 
+        // Never let a STALE server summary replace a NEWER local lastMessage.
+        // The server emits ~4 chat:list:update per message and its summary can
+        // lag its own write — one of those carried the PREVIOUS message with
+        // the NEW unread count, so the row showed "1 unread" under the old
+        // preview until the chat was opened (verified on device). Compare by
+        // seq when both have it (authoritative), else by timestamp; the unread
+        // count is still taken from the server.
+        const lmSeq = (lm) => Number(lm?.seq);
+        const lmTs = (lm, fallback) => {
+          const v = lm?.createdAt || lm?.timestamp || fallback;
+          const n = typeof v === 'number' ? v : Date.parse(v || '');
+          return Number.isFinite(n) ? n : 0;
+        };
+        const existingLmObj = existingLastMsg && typeof existingLastMsg === 'object' ? existingLastMsg : null;
+        const incomingLmObj = item?.lastMessage && typeof item.lastMessage === 'object' ? item.lastMessage : null;
+        let keepNewerLocal = false;
+        if (existingLmObj && incomingLmObj) {
+          const exId = normalizeId(existingLmObj.serverMessageId || existingLmObj.messageId || existingLmObj.id);
+          const inId = normalizeId(incomingLmObj.serverMessageId || incomingLmObj.messageId || incomingLmObj._id || incomingLmObj.id);
+          if (!(exId && inId && String(exId) === String(inId))) {
+            if (lmSeq(existingLmObj) > 0 && lmSeq(incomingLmObj) > 0) {
+              keepNewerLocal = lmSeq(existingLmObj) > lmSeq(incomingLmObj);
+            } else {
+              const exTs = lmTs(existingLmObj, existing?.lastMessageAt);
+              const inTs = lmTs(incomingLmObj, item?.lastMessageAt || item?.updatedAt);
+              keepNewerLocal = exTs > 0 && inTs > 0 && exTs > inTs;
+            }
+          }
+        }
+
         const mergedBase = {
           ...existing,
           ...item,
+          ...(keepNewerLocal ? {
+            lastMessage: existingLastMsg,
+            lastMessageAt: existing?.lastMessageAt,
+            timestamp: existing?.timestamp || existing?.lastMessageAt,
+            lastMessageType: existing?.lastMessageType,
+          } : {}),
           _id: normalizeId(item?._id) || normalizeId(existing?._id) || chatId,
           chatId,
           peerUser: mergedPeerUser,
@@ -1840,7 +1880,8 @@ const reducer = (state, action) => {
             if (schedTime && new Date(schedTime).getTime() > Date.now() + 5000) {
               break;
             }
-            const lastMessage = buildLastMessageFromItem(existing, item, timestamp);
+            // A stale server summary must not replace a newer local preview (see keepNewerLocal).
+            const lastMessage = keepNewerLocal ? existingLastMsg : buildLastMessageFromItem(existing, item, timestamp);
             const isActiveChat = state.activeChatId && String(state.activeChatId) === String(chatId);
             // Use the higher of local count and server count as base, then increment by 1
             const localUnread = Number(unreadByChat[chatId] || existing?.unreadCount || 0);
@@ -1849,7 +1890,19 @@ const reducer = (state, action) => {
             // Answered/declined call entries don't badge the chat (only missed do).
             const nmCallOutcome = lastMessage?.call?.outcome || lastMessage?.call?.callDetails?.outcome || null;
             const nmNonBadgingCall = lastMessage?.type === 'call' && !['missed', 'cancelled'].includes(nmCallOutcome);
-            unreadByChat[chatId] = isActiveChat ? 0 : (nmNonBadgingCall ? baseUnread : baseUnread + 1);
+            // The server's unreadCount is AUTHORITATIVE and already includes this
+            // message (the backend builds chat:list:update after persisting it).
+            // Adding +1 on top double-counted every message: the realtime
+            // message:new had already bumped the local count to 1, then this
+            // update took max(1, 1) + 1 = 2 for a single message (verified on
+            // device once the backend stopped sending message:received). Only
+            // when the server sends no number do we fall back to local + 1.
+            const hasServerUnread = typeof item?.unreadCount === 'number';
+            unreadByChat[chatId] = isActiveChat
+              ? 0
+              : (hasServerUnread
+                ? serverUnread
+                : (nmNonBadgingCall ? baseUnread : baseUnread + 1));
 
             const nextLastMessageAt = isActiveChat
               ? (existing?.lastMessageAt || item?.lastMessageAt || lastMessage?.createdAt || timestamp)
@@ -2006,7 +2059,8 @@ const reducer = (state, action) => {
           }
 
           case 'chat_created': {
-            const lastMessage = buildLastMessageFromItem(existing, item, timestamp);
+            // A stale server summary must not replace a newer local preview (see keepNewerLocal).
+            const lastMessage = keepNewerLocal ? existingLastMsg : buildLastMessageFromItem(existing, item, timestamp);
             nextMap[chatId] = {
               ...mergedBase,
               chatType: mergedBase?.chatType || 'private',
@@ -2864,6 +2918,8 @@ export function RealtimeChatProvider({ children }) {
       if (deliveredEmittedRef.current.has(key)) return;
       const socket = getSocket();
       if (!socket || !isSocketConnected()) return;
+      // App-wide guard: the open chat screen and ChatSocketProvider emit too.
+      if (!claimDeliveryReceipt(key)) { deliveredEmittedRef.current.add(key); return; }
       deliveredEmittedRef.current.add(key);
       if (deliveredEmittedRef.current.size > 2000) {
         const first = deliveredEmittedRef.current.values().next().value;
@@ -2878,6 +2934,33 @@ export function RealtimeChatProvider({ children }) {
         });
       } else {
         socket.emit('message:delivered', { messageId, chatId, senderId });
+      }
+    };
+
+    // Delivery receipts for messages that reached this device WITHOUT a live
+    // message:new — the reconnect catch-up (the offline-then-online case) and
+    // a brand-new chat's latest message from the chat-list reconcile. Those
+    // paths stored and rendered the message but never told the server, so the
+    // SENDER sat on a single grey tick forever (verified on device: receiver had
+    // the row in SQLite + unread 1, sender still 'sent'). Only a peer's message
+    // the server still reports as undelivered is acknowledged; emitDeliveryReceipt
+    // dedupes per id, so overlap with the live path is harmless.
+    const emitReceiptsForFetched = (msgs, fallbackChatId) => {
+      if (!Array.isArray(msgs) || msgs.length === 0) return;
+      const me = String(currentUserIdRef.current || '');
+      for (const m of msgs) {
+        if (!m || typeof m !== 'object') continue;
+        const senderId = normalizeId(m.senderId || m.sender?._id || m.sender);
+        if (!senderId || (me && String(senderId) === me)) continue;
+        const status = String(m.status || '').toLowerCase();
+        if (status && status !== 'sent' && status !== 'pending') continue; // already delivered/seen
+        const type = String(m.messageType || m.type || '');
+        if (type === 'system' || type === 'call') continue;
+        const chatId = m.chatId || fallbackChatId || null;
+        const groupId = normalizeId(m.groupId) || null;
+        const isGroup = !!groupId || m.chatType === 'group' || (chatId && !String(chatId).startsWith('u_') && !String(chatId).includes('_'));
+        const messageId = m.messageId || m.serverMessageId || m.id || normalizeId(m._id);
+        emitDeliveryReceipt({ isGroup, messageId, chatId, groupId: groupId || (isGroup ? chatId : null), senderId });
       }
     };
 
@@ -3718,6 +3801,29 @@ export function RealtimeChatProvider({ children }) {
       const resolvedId = chatId || groupId;
       if (!resolvedId) return;
 
+      // Settle the SEND first, unconditionally. The dedup below only guards the
+      // chat-list preview dispatch — but it used to return BEFORE this, and the
+      // server's own echo of a group message (group:message:received) routinely
+      // lands a millisecond ahead of the ack and marks the id handled. The ack
+      // then skipped acknowledgeMessage + outboxRemove, the outbox row survived,
+      // and the worker RE-SENT the already-delivered message 4s later (verified
+      // on device: resend answered `duplicate: true`). All three calls are
+      // idempotent, so running them for every ack copy is safe.
+      {
+        const earlyClientId = normalizeId(
+          source?.clientMessageId || source?.tempId
+          || source?.data?.clientMessageId || source?.data?.tempId,
+        );
+        const earlyMsgId = normalizeId(source?.messageId || source?._id || source?.data?.messageId);
+        if (earlyClientId) {
+          if (earlyMsgId && earlyMsgId !== earlyClientId) {
+            ChatDatabase.acknowledgeMessage(earlyClientId, earlyMsgId, source?.seq ?? source?.data?.seq).catch(() => {});
+          }
+          ChatDatabase.updateMessageStatus(earlyMsgId || earlyClientId, 'sent').catch(() => {});
+          ChatDatabase.outboxRemove(earlyClientId).catch(() => {});
+        }
+      }
+
       // Dedup: if this message was already processed by onGroupMessageNew, skip
       const dedupId = normalizeId(source?.messageId || source?._id || source?.data?.messageId);
       if (dedupId && handledGroupMsgIdsRef.current.has(dedupId)) return;
@@ -3828,6 +3934,16 @@ export function RealtimeChatProvider({ children }) {
           const chats = Array.isArray(payload?.chats) ? payload.chats : null;
           if (chats && chats.length > 0) {
             try { hydrateChatsRef.current?.(chats); } catch {}
+            // A chat the catch-up doesn't know yet (first message from someone
+            // new while we were offline) only arrives here — acknowledge its
+            // latest message so that sender gets their delivered tick too.
+            try {
+              emitReceiptsForFetched(
+                chats.map((c) => (c && c.lastMessage && typeof c.lastMessage === 'object'
+                  ? { ...c.lastMessage, chatId: c.lastMessage.chatId || c.chatId || c._id, groupId: c.lastMessage.groupId || (c.chatType === 'group' ? (c.groupId || c.chatId) : null) }
+                  : null)).filter(Boolean),
+              );
+            } catch {}
           }
           resolveDone(true);
         };
@@ -3946,6 +4062,9 @@ export function RealtimeChatProvider({ children }) {
               normalizedNew.forEach((m) => {
                 dispatch({ type: 'INCOMING_MESSAGE', payload: m });
               });
+              // Tell the server these reached us — the catch-up is how an
+              // offline device receives, and it used to skip the receipt.
+              emitReceiptsForFetched(newMessages, entry.chatId);
             }
 
             // Mutation delta — edits/deletes applied to already-stored messages
@@ -5845,76 +5964,74 @@ export function RealtimeChatProvider({ children }) {
     emitChatAction('group:activity', { groupId: id, limit, offset });
   }, [emitChatAction]);
 
-  const chatList = useMemo(() => {
-    return state.sortedChatIds.map((chatId) => {
-      const item = state.chatMap[chatId];
-      const peerId = item?.peerUser?._id;
-      const presence = peerId
-        ? (state.presenceByUser[peerId] || {
-            status: normalizeStatus(item?.participantPresence),
-            lastSeen: item?.participantLastSeen || null,
-            lastSeenDisplay: formatLastSeen(item?.participantLastSeen || null),
-          })
-        : null;
-      const typing = state.typingStates[chatId] || null;
-      const unreadCount = Number(state.unreadByChat[chatId] || item?.unreadCount || 0);
-      const lastMessageDisplay = buildLastMessageDisplay({
-        chat: item,
-        currentUserId: state.currentUserId,
-        isTyping: Boolean(typing?.isTyping),
-        typingUserName: typing?.userName || null,
-      });
-
-      return {
-        ...item,
-        otherUser: item?.otherUser || item?.peerUser || {},
-        unreadCount,
-        timestampDisplay: formatRelativeTime(item?.lastMessageAt),
-        lastSeenDisplay: presence?.status === 'offline'
-          ? (presence?.lastSeenDisplay || formatLastSeen(presence?.lastSeen || item?.participantLastSeen))
-          : '',
-        lastMessageDisplay,
-        realtime: {
-          presence,
-          typing,
-          isHighlighted: Boolean(state.highlightByChat[chatId]),
-          highlightedAt: state.highlightByChat[chatId] || null,
-        },
-      };
+  // Per-chat view-model cache. Both lists below used to rebuild EVERY row object
+  // whenever ANY chat, presence entry, typing flag or unread count changed, so
+  // the memoized ChatListRow/ChatCard saw every row as changed and the whole list
+  // re-rendered on each message event (80–160 row renders per sent message,
+  // measured on device — even while hidden under an open chat). A row is now
+  // rebuilt only when ITS inputs change; the minute bucket keeps "2m ago"-style
+  // relative times fresh.
+  const chatRowCacheRef = useRef(new Map());
+  const buildChatRow = (chatId, { withPresenceFallback }) => {
+    const item = state.chatMap[chatId];
+    const peerId = item?.peerUser?._id;
+    const rawPresence = peerId ? state.presenceByUser[peerId] : undefined;
+    const typing = state.typingStates[chatId] || null;
+    const unreadRaw = state.unreadByChat[chatId];
+    const highlight = state.highlightByChat[chatId] || null;
+    const minute = Math.floor(Date.now() / 60000);
+    const cacheKey = `${withPresenceFallback ? 'a' : 'b'}:${chatId}`;
+    const cached = chatRowCacheRef.current.get(cacheKey);
+    if (cached
+      && cached.item === item && cached.rawPresence === rawPresence && cached.typing === typing
+      && cached.unreadRaw === unreadRaw && cached.highlight === highlight
+      && cached.userId === state.currentUserId && cached.minute === minute) {
+      return cached.out;
+    }
+    const presence = peerId
+      ? (rawPresence || (withPresenceFallback ? {
+          status: normalizeStatus(item?.participantPresence),
+          lastSeen: item?.participantLastSeen || null,
+          lastSeenDisplay: formatLastSeen(item?.participantLastSeen || null),
+        } : null))
+      : null;
+    const unreadCount = Number(unreadRaw || item?.unreadCount || 0);
+    const lastMessageDisplay = buildLastMessageDisplay({
+      chat: item,
+      currentUserId: state.currentUserId,
+      isTyping: Boolean(typing?.isTyping),
+      typingUserName: typing?.userName || null,
     });
+    const out = {
+      ...item,
+      otherUser: item?.otherUser || item?.peerUser || {},
+      unreadCount,
+      timestampDisplay: formatRelativeTime(item?.lastMessageAt),
+      lastSeenDisplay: presence?.status === 'offline'
+        ? (presence?.lastSeenDisplay || formatLastSeen(presence?.lastSeen || item?.participantLastSeen))
+        : '',
+      lastMessageDisplay,
+      realtime: {
+        presence,
+        typing,
+        isHighlighted: Boolean(highlight),
+        highlightedAt: highlight,
+      },
+    };
+    chatRowCacheRef.current.set(cacheKey, {
+      item, rawPresence, typing, unreadRaw, highlight, userId: state.currentUserId, minute, out,
+    });
+    return out;
+  };
+
+  const chatList = useMemo(() => {
+    return state.sortedChatIds.map((chatId) => buildChatRow(chatId, { withPresenceFallback: true }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.sortedChatIds, state.chatMap, state.presenceByUser, state.typingStates, state.unreadByChat, state.highlightByChat, state.currentUserId]);
 
   const archivedChatList = useMemo(() => {
-    return state.archivedChatIds.map((chatId) => {
-      const item = state.chatMap[chatId];
-      const peerId = item?.peerUser?._id;
-      const presence = peerId ? state.presenceByUser[peerId] : null;
-      const typing = state.typingStates[chatId] || null;
-      const unreadCount = Number(state.unreadByChat[chatId] || item?.unreadCount || 0);
-      const lastMessageDisplay = buildLastMessageDisplay({
-        chat: item,
-        currentUserId: state.currentUserId,
-        isTyping: Boolean(typing?.isTyping),
-        typingUserName: typing?.userName || null,
-      });
-
-      return {
-        ...item,
-        otherUser: item?.otherUser || item?.peerUser || {},
-        unreadCount,
-        timestampDisplay: formatRelativeTime(item?.lastMessageAt),
-        lastSeenDisplay: presence?.status === 'offline'
-          ? (presence?.lastSeenDisplay || formatLastSeen(presence?.lastSeen || item?.participantLastSeen))
-          : '',
-        lastMessageDisplay,
-        realtime: {
-          presence,
-          typing,
-          isHighlighted: Boolean(state.highlightByChat[chatId]),
-          highlightedAt: state.highlightByChat[chatId] || null,
-        },
-      };
-    });
+    return state.archivedChatIds.map((chatId) => buildChatRow(chatId, { withPresenceFallback: false }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.archivedChatIds, state.chatMap, state.presenceByUser, state.typingStates, state.unreadByChat, state.highlightByChat, state.currentUserId]);
 
   // Actions only — every entry is useCallback-stable, so this value's identity

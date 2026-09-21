@@ -3,6 +3,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
 import ChatDB from '../services/ChatDatabase';
 import moment from 'moment';
+import { claimDeliveryReceipt } from '../utils/deliveryReceiptGuard';
 import {
   clearChatLocalArtifacts,
   getChatMessagesKey,
@@ -39,6 +40,8 @@ const flushDeliveredBatch = (key) => {
 const emitDelivered = (socket, { messageId, chatId, senderId }) => {
   if (!socket || !messageId || !chatId || !senderId) return;
   if (deliveredAckSet.has(messageId)) return;
+  // App-wide guard shared with RealtimeChatContext and the open chat screen.
+  if (!claimDeliveryReceipt(messageId)) { deliveredAckSet.add(messageId); return; }
 
   deliveredAckSet.add(messageId);
   // Prevent unbounded growth
