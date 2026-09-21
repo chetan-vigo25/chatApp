@@ -171,6 +171,19 @@ const MESSAGE_TYPE_ICON_MAP = {
   album: '🖼️',
 };
 
+// Mirror unreadByChat onto each row's unreadCount, cloning ONLY rows whose
+// count actually differs. Re-spreading every row made all chat objects new on
+// each message event, which defeated the per-row cache in buildChatRow and
+// re-rendered the whole (hidden) chat list on every send.
+const syncRowUnreadCounts = (nextMap, unreadByChat) => {
+  Object.keys(nextMap).forEach((id) => {
+    const unreadCount = Number(unreadByChat[id] || 0);
+    if (nextMap[id]?.unreadCount !== unreadCount) {
+      nextMap[id] = { ...nextMap[id], unreadCount };
+    }
+  });
+};
+
 const initialState = {
   currentUserId: null,
   activeChatId: null,
@@ -1010,12 +1023,7 @@ const reducer = (state, action) => {
         }
       });
 
-      Object.keys(nextMap).forEach((id) => {
-        nextMap[id] = {
-          ...nextMap[id],
-          unreadCount: Number(unreadByChat[id] || 0),
-        };
-      });
+      syncRowUnreadCounts(nextMap, unreadByChat);
 
       return {
         ...state,
@@ -1428,12 +1436,7 @@ const reducer = (state, action) => {
         });
       }
 
-      Object.keys(nextMap).forEach((id) => {
-        nextMap[id] = {
-          ...nextMap[id],
-          unreadCount: Number(unreadByChat[id] || 0),
-        };
-      });
+      syncRowUnreadCounts(nextMap, unreadByChat);
 
       // If this chat was previously removed (user "deleted chat for me"), a fresh
       // incoming message is the explicit "the chat is back" signal — clear the
@@ -2220,12 +2223,8 @@ const reducer = (state, action) => {
         if (typeof unreadByChat[id] !== 'number') {
           unreadByChat[id] = Number(nextMap[id]?.unreadCount || 0);
         }
-
-        nextMap[id] = {
-          ...nextMap[id],
-          unreadCount: Number(unreadByChat[id] || 0),
-        };
       });
+      syncRowUnreadCounts(nextMap, unreadByChat);
 
       const sections = buildOrderedSections(nextMap);
 
