@@ -63,8 +63,23 @@ class CallForegroundService : Service() {
     // screen). "ongoing" = media connected → live duration chronometer.
     val state = intent.getStringExtra(EXTRA_STATE) ?: "ongoing"
 
-    val notification = buildNotification(callId, name, image, isVideo, startedAtMs, state)
-    val promoted = startForegroundWithType(notification, isVideo)
+    // RINGING (incoming): the CallStyle banner the module already posted is handed
+    // to this service so the SERVICE owns it. Without that, Android drops the
+    // ring notification the moment the app leaves the foreground — the user
+    // pressed Home over the lock screen and the call rang on with nothing in the
+    // tray to answer from (it then landed as "Missed"). Same notification, same
+    // id: taking ownership never shows a second one.
+    val incoming = state == "incoming"
+    val notification = if (incoming) {
+      ExpoCallUiModule.buildIncomingNotification(
+        this, callId, intent.getStringExtra(EXTRA_CALLER_ID), name, image, type
+      )
+    } else {
+      buildNotification(callId, name, image, isVideo, startedAtMs, state)
+    }
+    val notifId = if (incoming) callId.hashCode() else ONGOING_NOTIF_ID
+    val promoted = if (incoming) startForegroundForRing(notification, notifId)
+      else startForegroundWithType(notification, isVideo, notifId)
     if (!promoted) {
       // Could not become a foreground service (e.g. a microphone-type FGS start
       // rejected on Android 12+). We MUST NOT keep a started-but-not-foreground
@@ -157,15 +172,34 @@ class CallForegroundService : Service() {
   // bare notification as a "fallback" — a started service that never calls
   // startForeground() is killed by the OS watchdog (and takes the app + live call
   // down with it), so on failure we report false and the caller stops the service.
-  private fun startForegroundWithType(notification: Notification, isVideo: Boolean): Boolean {
+  // The RING service. phoneCall type, never microphone: this one is routinely
+  // started while the app sits in the background (the push arrives with the
+  // screen off), and Android refuses mic/camera access to a background-started
+  // FGS — the service was then torn down and the ring notification went with it.
+  private fun startForegroundForRing(notification: Notification, notifId: Int): Boolean {
+    return try {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        startForeground(notifId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
+      } else {
+        startForeground(notifId, notification)
+      }
+      true
+    } catch (e: Exception) {
+      false
+    }
+  }
+
+  private fun startForegroundWithType(
+    notification: Notification, isVideo: Boolean, notifId: Int = ONGOING_NOTIF_ID
+  ): Boolean {
     // Try the typed foreground service first.
     try {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         if (isVideo) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-        startForeground(ONGOING_NOTIF_ID, notification, type)
+        startForeground(notifId, notification, type)
       } else {
-        startForeground(ONGOING_NOTIF_ID, notification)
+        startForeground(notifId, notification)
       }
       return true
     } catch (_: Exception) {
@@ -174,7 +208,7 @@ class CallForegroundService : Service() {
       // an explicit type before giving up.
     }
     return try {
-      startForeground(ONGOING_NOTIF_ID, notification)
+      startForeground(notifId, notification)
       true
     } catch (_: Exception) {
       false
@@ -229,6 +263,7 @@ class CallForegroundService : Service() {
 
   companion object {
     const val ACTION_STOP = "expo.modules.callui.STOP_ONGOING"
+    const val EXTRA_CALLER_ID = "callerId"
     const val ONGOING_CHANNEL_ID = "calls_ongoing"
     const val ONGOING_NOTIF_ID = 424242
 
@@ -261,6 +296,23 @@ class CallForegroundService : Service() {
         putExtra(EXTRA_CALL_TYPE, type ?: "audio")
         putExtra(EXTRA_STARTED_AT, startedAtMs)
         putExtra(EXTRA_STATE, state ?: "ongoing")
+      }
+      try { ContextCompat.startForegroundService(ctx, i) } catch (_: Exception) { /* */ }
+    }
+
+    // Hand an incoming ring to the service so the OS keeps its notification alive
+    // while the app is backgrounded. Best-effort: if the FGS start is refused the
+    // service stops itself and the plain notification the module posted stays.
+    fun startForIncoming(
+      ctx: Context, callId: String, callerId: String?, name: String?, image: String?, type: String?
+    ) {
+      val i = Intent(ctx, CallForegroundService::class.java).apply {
+        putExtra(EXTRA_CALL_ID, callId)
+        putExtra(EXTRA_CALLER_ID, callerId)
+        putExtra(EXTRA_CALLER_NAME, name)
+        putExtra(EXTRA_CALLER_IMAGE, image)
+        putExtra(EXTRA_CALL_TYPE, type ?: "audio")
+        putExtra(EXTRA_STATE, "incoming")
       }
       try { ContextCompat.startForegroundService(ctx, i) } catch (_: Exception) { /* */ }
     }

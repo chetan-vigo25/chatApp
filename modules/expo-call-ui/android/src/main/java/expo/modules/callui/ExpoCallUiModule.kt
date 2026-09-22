@@ -126,6 +126,7 @@ class ExpoCallUiModule : Module() {
 
     Function("cancelIncomingCall") { callId: String ->
       appContext.reactContext?.let {
+        CallForegroundService.stop(it)
         NotificationManagerCompat.from(it).cancel(callId.hashCode())
       }
       postedIncomingIds.remove(callId.hashCode())
@@ -498,6 +499,9 @@ class ExpoCallUiModule : Module() {
 
     // Dismiss every posted incoming-call notification and clear the tracking set.
     fun cancelAllIncoming(ctx: Context) {
+      // The ring is now held up by the call foreground service (see render) —
+      // dropping only the notification would leave that service running.
+      CallForegroundService.stop(ctx)
       val nm = NotificationManagerCompat.from(ctx)
       val ids = synchronized(postedIncomingIds) { postedIncomingIds.toList() }
       ids.forEach { try { nm.cancel(it) } catch (_: Exception) {} }
@@ -542,6 +546,30 @@ class ExpoCallUiModule : Module() {
       ctx: Context, callId: String, callerId: String?, callerName: String,
       callerImage: String?, callType: String
     ) {
+      val notification = buildIncomingNotification(ctx, callId, callerId, callerName, callerImage, callType)
+      try {
+        NotificationManagerCompat.from(ctx).notify(callId.hashCode(), notification)
+        postedIncomingIds.add(callId.hashCode())
+      } catch (_: SecurityException) {
+        // POST_NOTIFICATIONS not granted — nothing we can do; ignore.
+      }
+      // Hand the SAME notification to the call foreground service. A notification
+      // nothing keeps alive is dropped by the OS as soon as the app leaves the
+      // foreground: the user pressed Home over the lock screen and the ring
+      // vanished from the tray while the call was still ringing (it then landed
+      // as a missed call). The service re-posts it under the same id, so this
+      // never shows a second banner; if the FGS start is refused, the plain
+      // notification above still stands.
+      CallForegroundService.startForIncoming(ctx, callId, callerId, callerName, callerImage, callType)
+    }
+
+    // The CallStyle (green Answer / red Decline) notification + full-screen intent.
+    // Built here so BOTH the plain post above and the foreground service show the
+    // exact same banner.
+    fun buildIncomingNotification(
+      ctx: Context, callId: String, callerId: String?, callerName: String,
+      callerImage: String?, callType: String
+    ): android.app.Notification {
       val isVideo = callType == "video"
       ensureChannel(ctx)
 
@@ -592,12 +620,7 @@ class ExpoCallUiModule : Module() {
             .setIsVideo(isVideo)
         )
 
-      try {
-        NotificationManagerCompat.from(ctx).notify(callId.hashCode(), builder.build())
-        postedIncomingIds.add(callId.hashCode())
-      } catch (_: SecurityException) {
-        // POST_NOTIFICATIONS not granted — nothing we can do; ignore.
-      }
+      return builder.build()
     }
 
     private fun ensureChannel(ctx: Context) {

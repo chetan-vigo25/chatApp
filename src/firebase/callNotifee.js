@@ -411,6 +411,58 @@ export const displayIncomingCallNotifee = async (data) => {
   }
 };
 
+// ===== ring REMINDER (the ring screen was dismissed, the call is still ringing) =====
+//
+// The CallStyle banner the native backend posts carries a FULL-SCREEN intent —
+// that is what makes a call take over a locked screen. Re-posting THAT one after
+// the user pressed Home/Back re-launched the call screen they had just left (the
+// app "flickering" back), and in that fight the tray ended up with nothing at
+// all: the call kept ringing invisibly and landed as a missed call.
+//
+// So the reminder is a plain notification: same Answer / Decline actions, same
+// ring channel, ongoing so it can't be swiped away — but NO full-screen intent,
+// so it waits in the shade instead of grabbing the screen. `_reminder` marks it
+// for the event router, which otherwise leaves call actions to the native
+// CallStyle backend.
+export const displayRingReminderNotification = async (data = {}) => {
+  const notifee = getNotifee();
+  if (__DEV__) console.log('[DIAG][ring] reminder post', { callId: data?.callId, hasNotifee: !!notifee });
+  if (!notifee || !data?.callId) return false;
+  try {
+    const channelId = await ensureCallChannel();
+    const { AndroidImportance, AndroidVisibility, AndroidCategory } = _consts;
+    const isVideo = (data.callType || data.media) === 'video';
+    const id = String(data.callId);
+    shownCallIds.add(id);
+    await notifee.displayNotification({
+      id,
+      title: data.callerDisplayName || data.callerName || 'Incoming call',
+      body: isVideo ? '📹 Incoming video call' : '📞 Incoming voice call',
+      data: strData({ ...data, type: 'call', _reminder: 'true' }),
+      android: {
+        channelId,
+        smallIcon: 'notification_icon',
+        color: '#03b0a2',
+        ...(data.callerImage ? { largeIcon: data.callerImage, circularLargeIcon: true } : {}),
+        category: AndroidCategory.CALL,
+        importance: AndroidImportance.HIGH,
+        visibility: AndroidVisibility.PUBLIC,
+        ongoing: true,
+        autoCancel: false,
+        pressAction: { id: 'default', launchActivity: 'default' },
+        actions: [
+          { title: '❌ Decline', pressAction: { id: 'decline' } },
+          { title: '📞 Accept', pressAction: { id: 'accept', launchActivity: 'default' } },
+        ],
+      },
+    });
+    return true;
+  } catch (err) {
+    console.warn('[callNotif] ring reminder failed:', err?.message);
+    return false;
+  }
+};
+
 export const cancelIncomingCallNotifee = async (callId) => {
   if (!callId) return; // never cancel-all — would clear chat notifications too
   shownCallIds.delete(String(callId));
@@ -431,6 +483,7 @@ export const cancelIncomingCallNotifee = async (callId) => {
  * notifications are untouched.
  */
 export const cancelAllIncomingCallNotifee = async () => {
+  if (__DEV__) console.log('[DIAG][ring] cancelAll');
   if (isCallUi()) {
     try { getCallUi().cancelAllIncomingCalls?.(); } catch (_) { /* */ }
   }
@@ -625,8 +678,9 @@ export const registerNotifeeBackground = () => {
         return;
       }
       // CallStyle handles its own Answer/Decline natively; only route call
-      // actions here when notifee is the active call backend.
-      if (isCallUi()) return;
+      // actions here when notifee is the active call backend — or when the
+      // notification is OUR ring reminder, which notifee posted itself.
+      if (isCallUi() && data?._reminder !== 'true') return;
       const action = routeNotifeeEvent(type, detail);
       if (action === 'decline' || action === 'accept') {
         await cancelIncomingCallNotifee(detail?.notification?.data?.callId);

@@ -14,6 +14,17 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <!--
+       RINGING uses the phoneCall FGS type, not microphone: a service started
+       while the app is in the background is stripped of mic/camera access ("can
+       not have location/camera/microphone access" in logcat), so the ring
+       service died and Android dropped the incoming-call notification with it —
+       the call rang on with nothing in the tray to answer from. phoneCall is the
+       type meant for this and needs only MANAGE_OWN_CALLS (a normal permission,
+       no runtime prompt). The ANSWERED call keeps the microphone/camera types.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
 
     <!--
        Lets the app open the system dialog to exempt itself from Doze battery
@@ -47,7 +58,7 @@
         <service
             android:name="expo.modules.callui.CallForegroundService"
             android:exported="false"
-            android:foregroundServiceType="microphone|camera"
+            android:foregroundServiceType="microphone|camera|phoneCall"
             android:stopWithTask="false" />
     </application>
 

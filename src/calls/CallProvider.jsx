@@ -68,6 +68,7 @@ import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall, displayIncomingCallNotifee,
   startOngoingCallNotification, stopOngoingCallNotification,
   isDeviceLockedNow, returnToLockScreen, addDeviceLockListener,
+  displayRingReminderNotification,
   setShowWhenLockedNative, displayMissedCallNotification, setCallActiveNative,
   peekInitialCallLaunch, hideCallLaunchCover,
 } from '../firebase/callNotifee';
@@ -2850,6 +2851,26 @@ export const CallProvider = ({ children }) => {
     // (re-called below is harmless).
     clearRingTimeout();
     stopRinging();
+    // START THE CALL FOREGROUND SERVICE HERE — at the tap, not at connect.
+    // Android only lets an app start a microphone foreground service while it
+    // is allowed to (visible, or inside the grace window the OS grants when the
+    // user acts on a call notification). The old code started it from the
+    // `answeredAt` effect, which runs a second or two LATER, by which time a
+    // call answered from the lock screen / notification (app still in the
+    // background) was outside that window: Android refused the service, refused
+    // the mic with it, and the caller heard NOTHING — measured on device, the
+    // callee sent ~250 bytes/s of silence until the app was opened by hand.
+    // Answering is the user action that earns the exemption, so claim it now.
+    try {
+      startOngoingCallNotification({
+        callId: String(snap.signalId || snap.callId || ''),
+        callerName: snap.peer?.name || 'Ongoing call',
+        callerImage: snap.peer?.avatar || null,
+        callType: snap.media === 'video' ? 'video' : 'audio',
+        startedAt: Date.now(),
+        state: 'connecting',
+      });
+    } catch (_) { /* best-effort — the answeredAt effect refreshes it anyway */ }
     // Mic/camera must be granted before the SDK's accept runs getUserMedia, else
     // the answer hangs with no media. If denied, decline the call cleanly.
     // CONFERENCE joins are camera-OFF by design (WhatsApp-style opt-in), so a
@@ -3139,20 +3160,38 @@ export const CallProvider = ({ children }) => {
     } catch (_) { /* offline — roster broadcast reconciles on reconnect */ }
   }, []);
 
-  const toggleMic = useCallback(() => {
+  // Mic state is owned by ONE function so the app and the OS call UI can never
+  // fight over it. The OS (CallKit on iOS, the call notification on Android)
+  // echoes every mute we push back to us as an onToggleMute event; feeding that
+  // echo back into a TOGGLE made the two flip each other in a loop — observed
+  // live on a video call: mic on→off→on→off within a second, ending muted, so
+  // neither side could be heard even though every permission was granted.
+  // `fromOS` marks the echo path: it never pushes the value back to the OS.
+  const micSyncRef = useRef({ pushedMuted: null, at: 0 });
+  const handBackRef = useRef({ id: null, at: 0 });
+  const applyMic = useCallback((on, { fromOS = false } = {}) => {
     const snap = stateRef.current;
-    const next = !snap.micOn;
-    dispatch({ type: ACT.SET_FLAG, key: 'micOn', value: next });
-    sendCmd({ cmd: CMD.TOGGLE_MIC, on: next });
-    // Keep the CallKit screen's mute button in sync with the in-app toggle
-    // (the reverse direction — OS mute → app — is handled by onToggleMute).
-    const ckId = snap.signalId || snap.callId;
-    if (ckId) nativeCall.setMuted(ckId, !next);
+    if (snap.micOn === on) return;           // already there — never re-push
+    dispatch({ type: ACT.SET_FLAG, key: 'micOn', value: on });
+    sendCmd({ cmd: CMD.TOGGLE_MIC, on });
+    if (!fromOS) {
+      // Keep the OS call UI's mute button in sync with the in-app toggle, and
+      // remember what we pushed so its echo is recognised and dropped.
+      const ckId = snap.signalId || snap.callId;
+      if (ckId) {
+        micSyncRef.current = { pushedMuted: !on, at: Date.now() };
+        nativeCall.setMuted(ckId, !on);
+      }
+    }
     // Conference: mirror the mute into the backend roster so every tile shows it.
     if (isMultiParty(snap) && snap.signalId) {
-      conferenceMedia({ callId: snap.signalId, audioEnabled: next }).catch(() => {});
+      conferenceMedia({ callId: snap.signalId, audioEnabled: on }).catch(() => {});
     }
   }, [sendCmd]);
+
+  const toggleMic = useCallback(() => {
+    applyMic(!stateRef.current.micOn);
+  }, [applyMic]);
 
   const toggleCamera = useCallback(async () => {
     const snap = stateRef.current;
@@ -3886,7 +3925,13 @@ export const CallProvider = ({ children }) => {
     // (its channel ringtone + full-screen intent) — cancelling it here killed
     // the only thing that could open the full-screen call UI. The
     // dismiss-on-foreground effect clears it the moment the app comes up.
-    if (Platform.OS !== 'android' || appVisible) cancelAllIncomingCallNotifee();
+    // ...and NOT when the device is LOCKED. An incoming call shows our activity
+    // over the keyguard, so `appVisible` reads true while the user is still
+    // looking at the lock screen. Cancelling here then left the ring with no OS
+    // surface at all: pressing Home/Back took the call screen away and the call
+    // went on ringing invisibly until it landed as "Missed" — reproduced on
+    // device, the ring notification was gone in 2 of 3 locked rings.
+    if (Platform.OS !== 'android' || (appVisible && !isDeviceLockedNow())) cancelAllIncomingCallNotifee();
     // CRITICAL de-dup: converge on the SAME CallKit UUID the native iOS VoIP push
     // uses. The backend mints one RFC4122 `uuid` per call; the AppDelegate reports
     // CallKit with THAT uuid, while this JS socket path would otherwise mint its
@@ -4719,9 +4764,23 @@ export const CallProvider = ({ children }) => {
       if (snap.status !== CALL_STATUS.INCOMING || snap.accepted || snap.answeredAt) return;
       const id = snap.signalId || snap.callId;
       if (!id) return;
+      // THROTTLE. The lock screen makes AppState and the keyguard flap (our
+      // activity lives over the keyguard), and every flap re-ran this — the
+      // notification API was hammered dozens of times a second and the JS thread
+      // wedged. One hand-back per call id per 3s is all the user can perceive.
+      const lastBack = handBackRef.current;
+      if (lastBack.id === id && Date.now() - lastBack.at < 3000) return;
+      handBackRef.current = { id, at: Date.now() };
       stopRinging();
       if (__DEV__) console.log('[CALL][APP] app backgrounded mid-ring → handing the ring back to the OS notification', { callId: id });
-      displayIncomingCallNotifee({
+      // Reminder, NOT the full-screen banner: re-posting the full-screen one
+      // re-launched the very call screen the user had just left (the app
+      // "flickered" back on every Home press) and the tray ended up empty, so
+      // the call rang on invisibly. See displayRingReminderNotification.
+      const ringNotification = Platform.OS === 'android'
+        ? displayRingReminderNotification
+        : displayIncomingCallNotifee;
+      ringNotification({
         _src: 'handBack',
         callId: id,
         callerId: snap.peer?.id,
@@ -4754,7 +4813,14 @@ export const CallProvider = ({ children }) => {
       if (next === 'active') takeOver();
       else handBack();
     });
-    return () => { try { sub.remove(); } catch (_) { /* */ } };
+    // The keyguard is the OTHER way the ring screen can leave the user's sight,
+    // and it fires NO AppState change: our activity runs over the lock screen,
+    // so Home/Back/lock keep AppState 'active' while the user sees the lock
+    // screen. Watch the lock state too, and put the notification back whenever
+    // the device is (or goes) locked while the call is still ringing.
+    const unlisten = addDeviceLockListener((locked) => { if (locked) handBack(); });
+    if (Platform.OS === 'android' && isDeviceLockedNow()) handBack();
+    return () => { try { sub.remove(); } catch (_) { /* */ } try { unlisten(); } catch (_) { /* */ } };
   }, [state.status, state.notificationOnly, startRinging, stopRinging]);
 
   // ── Keep the OS call POP-UP coming back, app open or closed (Android) ──────
@@ -5004,7 +5070,7 @@ export const CallProvider = ({ children }) => {
 
   // Keep the latest action handles available to the native OS-call listeners.
   actionsRef.current = {
-    accept, reject, hangup, toggleMic, reassertCallAudio, restartEngineAudio, pullStillRingingInvites,
+    accept, reject, hangup, toggleMic, applyMic, reassertCallAudio, restartEngineAudio, pullStillRingingInvites,
     reassertSpeakerRoute, scheduleOutgoingAudioRecovery,
   };
   onEngineEventRef.current = onEngineEvent;
@@ -5183,9 +5249,14 @@ export const CallProvider = ({ children }) => {
         actionsRef.current.hangup && actionsRef.current.hangup();
       },
       onToggleMute: (callId, muted) => {
-        const snap = stateRef.current;
-        // Sync our mic flag with the OS toggle if they diverge.
-        if (snap.micOn === muted) actionsRef.current.toggleMic && actionsRef.current.toggleMic();
+        // Drop our OWN mute echo: setMuted() above makes the OS re-announce the
+        // same state, and treating that as a user action flipped it straight
+        // back (mute ping-pong → the call ends up silent).
+        const pushed = micSyncRef.current;
+        if (pushed.pushedMuted === muted && Date.now() - pushed.at < 3000) return;
+        // A genuine OS-side toggle: adopt it as-is (never a blind toggle, which
+        // inverts whenever the two sides are already out of step).
+        actionsRef.current.applyMic && actionsRef.current.applyMic(!muted, { fromOS: true });
       },
       // CallKit activated its own AVAudioSession (call answered from killed/locked,
       // or an interruption ended). This is the moment WebRTC audio can start in the

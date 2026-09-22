@@ -20,52 +20,67 @@
 16    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:3-82
 16-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:10:20-79
-17
-18    <!--
-19       Lets the app open the system dialog to exempt itself from Doze battery
-20       optimization (requestDisableBatteryOptimization). Without this exemption a
-21       killed/rebooted app on OEM skins is blocked from waking on the incoming-call
-22       FCM push, so calls never ring until the app is opened. Declared here so it
-23       merges into the app manifest with the module that uses it.
-24    -->
-25    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:3-93
-25-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:17:20-90
-26
-27    <application>
-27-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:3-39:17
+17    <!--
+18       RINGING uses the phoneCall FGS type, not microphone: a service started
+19       while the app is in the background is stripped of mic/camera access ("can
+20       not have location/camera/microphone access" in logcat), so the ring
+21       service died and Android dropped the incoming-call notification with it —
+22       the call rang on with nothing in the tray to answer from. phoneCall is the
+23       type meant for this and needs only MANAGE_OWN_CALLS (a normal permission,
+24       no runtime prompt). The ANSWERED call keeps the microphone/camera types.
+25    -->
+26    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+26-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:18:3-86
+26-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:18:20-83
+27    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+27-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:3-73
+27-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:19:20-70
 28
-29        <!--
-30         Receives the Decline / Hang-up taps from the CallStyle notifications.
-31         Runs natively even when the JS app is killed.
-32        -->
-33        <receiver
-33-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:22:5-24:34
-34            android:name="expo.modules.callui.CallActionReceiver"
-34-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:23:7-41
-35            android:exported="false" />
-35-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:24:7-31
-36
-37        <!--
-38         Persistent active-call notification (duration timer + Hang up).
-39         stopWithTask="false" is what lets a call outlive the app's UI: when the
-40         user swipes the app out of Recents mid-call the Activity is destroyed,
-41         but this service (and with it the process, the JS runtime and the WebRTC
-42         engine) keeps running, so the call continues and stays controllable from
-43         its notification. With the default (true) the OS would tear the service
-44         down with the task and kill the call. See CallForegroundService
-45         .onTaskRemoved and src/calls/callSessionKeeper.js.
-46        -->
-47        <service
-47-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:34:5-38:59
-48            android:name="expo.modules.callui.CallForegroundService"
-48-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:35:7-44
-49            android:exported="false"
-49-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:36:7-31
-50            android:foregroundServiceType="microphone|camera"
-50-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:38:7-56
-51            android:stopWithTask="false" />
-51-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:37:7-35
-52    </application>
-53
-54</manifest>
+29    <!--
+30       Lets the app open the system dialog to exempt itself from Doze battery
+31       optimization (requestDisableBatteryOptimization). Without this exemption a
+32       killed/rebooted app on OEM skins is blocked from waking on the incoming-call
+33       FCM push, so calls never ring until the app is opened. Declared here so it
+34       merges into the app manifest with the module that uses it.
+35    -->
+36    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+36-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:26:3-93
+36-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:26:20-90
+37
+38    <application>
+38-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:28:3-48:17
+39
+40        <!--
+41         Receives the Decline / Hang-up taps from the CallStyle notifications.
+42         Runs natively even when the JS app is killed.
+43        -->
+44        <receiver
+44-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:31:5-33:34
+45            android:name="expo.modules.callui.CallActionReceiver"
+45-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:32:7-41
+46            android:exported="false" />
+46-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:33:7-31
+47
+48        <!--
+49         Persistent active-call notification (duration timer + Hang up).
+50         stopWithTask="false" is what lets a call outlive the app's UI: when the
+51         user swipes the app out of Recents mid-call the Activity is destroyed,
+52         but this service (and with it the process, the JS runtime and the WebRTC
+53         engine) keeps running, so the call continues and stays controllable from
+54         its notification. With the default (true) the OS would tear the service
+55         down with the task and kill the call. See CallForegroundService
+56         .onTaskRemoved and src/calls/callSessionKeeper.js.
+57        -->
+58        <service
+58-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:43:5-47:69
+59            android:name="expo.modules.callui.CallForegroundService"
+59-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:44:7-44
+60            android:exported="false"
+60-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:45:7-31
+61            android:foregroundServiceType="microphone|camera|phoneCall"
+61-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:47:7-66
+62            android:stopWithTask="false" />
+62-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:46:7-35
+63    </application>
+64
+65</manifest>
