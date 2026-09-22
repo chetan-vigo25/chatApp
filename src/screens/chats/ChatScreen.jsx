@@ -2652,6 +2652,26 @@ export default function ChatScreen({ navigation, route }) {
       try {
         for (const item of share.files || []) {
           if (!item?.file?.uri) continue;
+          // An EMPTY file must never be sent. A share can hand us a 0-byte file
+          // (a snapshot that failed to write, a provider that gave us nothing),
+          // and uploading it produced a message with a blank picture on BOTH
+          // sides — the receiver had no way to tell it wasn't a real photo.
+          // eslint-disable-next-line no-await-in-loop
+          let emptyFile = false;
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            const info = await FileSystem.getInfoAsync(item.file.uri, { size: true });
+            emptyFile = info?.exists && (info.size ?? 0) === 0;
+          } catch (_) { /* unreadable → let the upload decide */ }
+          if (emptyFile) {
+            console.warn('[SHARE] skipped empty file', item.file?.name || item.file?.uri);
+            try {
+              const { ToastAndroid: T, Platform: P, Alert: A } = require('react-native');
+              const msg = "Couldn't share that file — it was empty";
+              if (P.OS === 'android') T.show(msg, T.SHORT); else A.alert('', msg);
+            } catch (_) { /* */ }
+            continue;
+          }
           // eslint-disable-next-line no-await-in-loop
           await sendMedia({ file: item.file, type: item.type }).catch(() => {});
         }

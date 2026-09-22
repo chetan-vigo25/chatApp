@@ -110,6 +110,50 @@ class ExpoCallUiModule : Module() {
     // dropped and the call then rings invisibly). `fullScreen: false` posts the
     // quiet card — same Answer / Decline, no full-screen takeover — which is what
     // the app wants once the user has left the ring screen.
+    // Fire the system share chooser for a file. Lives here because this module is
+    // the app's own native surface; it is NOT call-specific.
+    //
+    // expo-sharing can't be used on Android: `shareAsync` keeps a pendingPromise
+    // that is only cleared by an activity RESULT, and the share chooser routinely
+    // returns none (the user taps WhatsApp and comes back through Recents). After
+    // ONE share every later attempt failed with "Another share request is being
+    // processed now" and no sheet opened at all. This keeps no state.
+    Function("shareFile") { fileUri: String, mimeType: String?, title: String? ->
+      val ctx = appContext.reactContext ?: return@Function false
+      val activity = appContext.currentActivity
+      val path = fileUri.removePrefix("file://")
+      val file = java.io.File(path)
+      if (!file.exists() || file.length() == 0L) return@Function false
+      val uri = try {
+        androidx.core.content.FileProvider.getUriForFile(
+          ctx, "${ctx.packageName}.FileSystemFileProvider", file
+        )
+      } catch (e: Exception) {
+        android.util.Log.w("ShareFile", "provider uri failed: ${e.message}")
+        return@Function false
+      }
+      val send = Intent(Intent.ACTION_SEND).apply {
+        type = mimeType ?: "*/*"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        // ClipData is what makes the Android share sheet show the picture
+        // PREVIEW (and it carries the read grant to every target in the list).
+        // Without it the sheet lists apps with no thumbnail at all.
+        clipData = android.content.ClipData.newUri(ctx.contentResolver, title ?: "Share", uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+      }
+      val chooser = Intent.createChooser(send, title ?: "Share").apply {
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (activity == null) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+      try {
+        (activity ?: ctx).startActivity(chooser)
+        true
+      } catch (e: Exception) {
+        android.util.Log.w("ShareFile", "chooser failed: ${e.message}")
+        false
+      }
+    }
+
     Function("startRingService") { options: Map<String, Any?> ->
       val ctx = appContext.reactContext
       val callId = options["callId"] as? String
