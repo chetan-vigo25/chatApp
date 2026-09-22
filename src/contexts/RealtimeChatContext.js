@@ -2,7 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { AppState, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
-import { getSocket, isSocketConnected, isSocketAuthed, subscribeSocketState } from '../Redux/Services/Socket/socket';
+import { getSocket, isSocketConnected, isSocketAuthed, subscribeSocketState, emitSocketEvent } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import { claimDeliveryReceipt } from '../utils/deliveryReceiptGuard';
 import ChatDatabase from '../services/ChatDatabase';
@@ -5549,7 +5549,14 @@ export function RealtimeChatProvider({ children }) {
       // context's import graph at module-eval time.
       try { require('../firebase/fcmService').clearChatNotifications(chatId); } catch (_) { /* */ }
       const socket = getSocket();
-      if (socket && isSocketConnected()) {
+      {
+        // Offline (or mid-reconnect, the usual state right after tapping a
+        // notification) these receipts used to be skipped entirely and nothing
+        // retried them — the chat read locally while the SENDER's ticks never
+        // turned blue. emitSocketEvent buffers them instead and sends them once
+        // the server confirms `authenticated` (a pre-auth emit is rejected, so
+        // firing them on plain 'connect' would drop them just as silently).
+        const sendOrQueue = (event, payload) => { emitSocketEvent(event, payload); };
         // Group chat IDs are raw ObjectIds; private chat IDs are `u_<a>_<b>`.
         // The private `message:read:all` / `message:read` handlers validate
         // membership by parsing `u_a_b`, so sending a group id there fails with
@@ -5560,19 +5567,19 @@ export function RealtimeChatProvider({ children }) {
         if (shouldEmitReadAll(chatId)) {
           try {
             if (isGroupChat) {
-              socket.emit('group:message:read:all', { groupId: chatId });
+              sendOrQueue('group:message:read:all', { groupId: chatId });
             } else {
               const raw = await AsyncStorage.getItem('userInfo');
               const user = raw ? JSON.parse(raw) : null;
               const senderId = user?._id || user?.id;
               if (senderId) {
                 // Use message:read:all to mark all messages in this chat as read
-                socket.emit('message:read:all', { chatId, senderId });
+                sendOrQueue('message:read:all', { chatId, senderId });
               }
             }
           } catch (e) {
             // Fallback without senderId (private chats only)
-            if (!isGroupChat) socket.emit('message:read', { chatId });
+            if (!isGroupChat) sendOrQueue('message:read', { chatId });
           }
         }
 
@@ -5584,7 +5591,7 @@ export function RealtimeChatProvider({ children }) {
         try {
           const lastSeq = await ChatDatabase.getLatestSeq(chatId);
           if (lastSeq > 0) {
-            socket.emit('message:read:upto', {
+            sendOrQueue('message:read:upto', {
               chatId,
               readUpToSeq: lastSeq,
               deliveredUpToSeq: lastSeq,

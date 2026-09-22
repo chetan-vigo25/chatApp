@@ -103,6 +103,23 @@ const PRE_MAIN_ROUTES = new Set([
   'AccountStatus', 'NoInternet',
 ]);
 
+// The avatar arrives under a different key on every producer: the socket
+// message payload calls it senderProfileImage, notifee/FCM data senderImage or
+// avatarUrl, the REST/chat-list shape profileImage. Reading only `profileImage`
+// left the header with a letter placeholder on a chat opened from a
+// notification, while re-opening it from the chat list showed the real picture.
+const pushAvatar = (data = {}) => (
+  data?.profileImage
+  || data?.senderProfileImage
+  || data?.senderImage
+  || data?.avatarUrl
+  || data?.avatar
+  || data?.chatAvatar
+  || data?.groupAvatar
+  || data?.sender?.profileImage
+  || ''
+);
+
 // Navigate to a chat from a tapped push notification. The push `data` carries
 // { chatId, chatType, groupId, senderId, senderName, profileImage, senderMobile,
 // groupName }. On a COLD launch the nav container isn't mounted yet, so retry
@@ -145,8 +162,13 @@ export function navigateToChat(data = {}, attempt = 0) {
         chatType: 'group',
         isGroup: true,
         groupId: normalizeId(data?.groupId || chatId),
-        chatName: data?.groupName || '',
-        group: { _id: normalizeId(data?.groupId || chatId), name: data?.groupName || '', avatar: '' },
+        chatName: data?.groupName || data?.chatName || '',
+        chatAvatar: pushAvatar(data),
+        group: {
+          _id: normalizeId(data?.groupId || chatId),
+          name: data?.groupName || data?.chatName || '',
+          avatar: pushAvatar(data),
+        },
       }
     : {
         chatId,
@@ -155,9 +177,9 @@ export function navigateToChat(data = {}, attempt = 0) {
         // so the chat header resolves a real name instead of "Unknown User".
         peerUser: {
           _id: normalizeId(data?.senderId),
-          fullName: data?.senderName || '',
-          profileImage: data?.profileImage || '',
-          mobileNumber: data?.senderMobile || '',
+          fullName: data?.senderName || data?.sender?.fullName || data?.chatName || '',
+          profileImage: pushAvatar(data),
+          mobileNumber: data?.senderMobile || data?.sender?.mobileNumber || '',
         },
       };
 

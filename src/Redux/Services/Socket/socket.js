@@ -15,10 +15,36 @@ import ChatDatabase from '../../../services/ChatDatabase';
 const PRESENCE_HEARTBEAT_MS = 4000;
 let presenceHeartbeatTimer = null;
 
+// Half-open ("zombie") connection watchdog.
+//
+// socket.connected can stay TRUE on a link that carries nothing — seen on
+// device after the network dropped and came back on a different AP, with the
+// transport stuck on long-polling: the app looked online, but no message, no
+// receipt and no heartbeat response ever arrived again, and only an app restart
+// fixed it. engine.io's own ping timeout did NOT catch it.
+//
+// The server answers every heartbeat with `presence:heartbeat:response`, so
+// while the app is foregrounded SOMETHING must arrive at least every few
+// seconds. If nothing has, the link is dead — drop it and reconnect.
+const DEAD_LINK_MS = 20000;
+let lastInboundAt = Date.now();
+const noteInboundTraffic = () => { lastInboundAt = Date.now(); };
+
 const startPresenceHeartbeat = () => {
   if (presenceHeartbeatTimer) return;
+  // Fresh window: the heartbeat stops in background, so the last inbound packet
+  // can be minutes old on foreground without the link being dead.
+  lastInboundAt = Date.now();
   const tick = () => {
-    if (socket && socket.connected) socket.emit('presence:heartbeat');
+    if (!socket || !socket.connected) return;
+    if (Date.now() - lastInboundAt > DEAD_LINK_MS) {
+      console.warn('💀 socket looks connected but nothing inbound — forcing reconnect');
+      lastInboundAt = Date.now(); // don't retrigger while the reconnect runs
+      try { socket.disconnect(); } catch (_) { /* */ }
+      try { socket.connect(); } catch (_) { /* */ }
+      return;
+    }
+    socket.emit('presence:heartbeat');
   };
   tick();
   presenceHeartbeatTimer = setInterval(tick, PRESENCE_HEARTBEAT_MS);
@@ -699,9 +725,13 @@ const attachCoreSocketListeners = (navigation) => {
   if (!socket || socketListenersBound) return;
   socketListenersBound = true;
 
+  // Any inbound packet counts as proof the link is alive (see DEAD_LINK_MS).
+  try { socket.onAny(noteInboundTraffic); } catch (_) { /* */ }
+
   socket.on('connect', async () => {
     console.log('✅ socket connected', { socketId: socket?.id });
     isSocketAuthenticated = false;
+    noteInboundTraffic();
     updateSocketState({
       status: 'connected',
       connected: true,

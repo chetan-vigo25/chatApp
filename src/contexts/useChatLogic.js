@@ -487,6 +487,15 @@ export default function useChatLogic({ navigation, route }) {
         _id: routePeerUser._id || routePeerUser.userId || routePeerUser.id || null,
       }
     : null;
+  // A chat opened from a notification/banner carries only what that payload
+  // held — often no avatar (and the sender's @handle instead of the saved
+  // name), so the header showed a letter placeholder until the user went back
+  // and re-opened the chat from the list. The row we already hold locally is
+  // the richer source: fill the GAPS from it, route params still win.
+  const lookupChatId = item?.chatId || item?._id || routeChatId || null;
+  const knownChatRow = useRealtimeChatSlice(
+    useCallback((st) => (lookupChatId ? (st?.chatMap?.[lookupChatId] || null) : null), [lookupChatId])
+  );
   // Preserve chatType + group fields from the route item
   const isGroupChat = item?.chatType === 'group' || item?.isGroup || Boolean(item?.group);
   // Broadcast channel: a one-way, read-only chat. It has no peer and no group —
@@ -521,10 +530,10 @@ export default function useChatLogic({ navigation, route }) {
       ...(_liveAvatar != null ? { avatar: _liveAvatar } : {}),
       ...(_meta?.description != null ? { description: _meta.description } : {}),
     },
-    chatName: _liveName || item.chatName || item.group?.name,
-    chatAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar,
-    groupName: _liveName || item.chatName || item.group?.name,
-    groupAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar,
+    chatName: _liveName || item.chatName || item.group?.name || knownChatRow?.chatName,
+    chatAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar || knownChatRow?.chatAvatar,
+    groupName: _liveName || item.chatName || item.group?.name || knownChatRow?.chatName,
+    groupAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar || knownChatRow?.chatAvatar,
     members: item.members,
     memberCount: item.members?.length || item.memberCount,
   } : {};
@@ -535,15 +544,29 @@ export default function useChatLogic({ navigation, route }) {
   // unstable reference here forces the whole message list to re-render every
   // render — which shows up as old messages "blinking"/refreshing repeatedly.
   // All inputs below are pure functions of [item, user, routeChatId, liveGroupMeta].
-  const chatData = useMemo(() => (
+  const chatData = useMemo(() => {
+    // Gap-fill the peer from the locally known chat row (see knownChatRow).
+    const rowPeer = knownChatRow?.peerUser || null;
+    const peerUser = (normalizedPeerUser || rowPeer)
+      ? {
+          ...(rowPeer || {}),
+          ...(normalizedPeerUser || {}),
+          _id: normalizedPeerUser?._id || rowPeer?._id || null,
+          fullName: normalizedPeerUser?.fullName || rowPeer?.fullName || knownChatRow?.chatName || '',
+          profileImage: normalizedPeerUser?.profileImage || rowPeer?.profileImage || knownChatRow?.chatAvatar || '',
+          mobileNumber: normalizedPeerUser?.mobileNumber || rowPeer?.mobileNumber || '',
+        }
+      : null;
+    return (
     isBroadcastChat
       ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'broadcast', ...broadcastFields }
       : isGroupChat
         ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
-        : (item && normalizedPeerUser)
-          ? { peerUser: normalizedPeerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
-          : (normalizedPeerUser ? { peerUser: normalizedPeerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' })
-  ), [item, user, routeChatId, liveGroupMeta]);
+        : (item && peerUser)
+          ? { peerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
+          : (peerUser ? { peerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' })
+    );
+  }, [item, user, routeChatId, liveGroupMeta, knownChatRow]);
 
   // True when this is a group chat the current user has left or been removed
   // from — used to disable the message input (you can no longer send messages).
@@ -2954,9 +2977,15 @@ export default function useChatLogic({ navigation, route }) {
 
       const socket = socketRef.current || getSocket();
       const isGrpRead = chatData?.chatType === 'group' || chatData?.isGroup;
-      if (socket && isSocketConnected() && chatIdRef.current && currentUserIdRef.current) {
+      if (chatIdRef.current && currentUserIdRef.current) {
+        // Rows below flip to 'seen' either way, so a receipt that cannot go out
+        // right now must NOT be dropped — that is how a chat opened while the
+        // socket was down (the usual state right after a notification tap) left
+        // the SENDER on double-grey forever. emitSocketEvent buffers it and
+        // flushes once the server confirms `authenticated`.
+        const sendOrQueue = (event, payload) => { emitSocketEvent(event, payload); };
         if (isGrpRead) {
-          socket.emit('group:message:read', {
+          sendOrQueue('group:message:read', {
             groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
             messageIds: unreadVisibleIds,
             userId: currentUserIdRef.current,
@@ -2968,7 +2997,7 @@ export default function useChatLogic({ navigation, route }) {
           // relayed each one, so the sender got every read TWICE (verified on
           // device). `message:read` is the canonical receipt (backend spec B6).
           unreadVisibleIds.forEach(msgId => {
-            socket.emit('message:read', {
+            sendOrQueue('message:read', {
               messageId: msgId,
               chatId: chatIdRef.current,
               senderId: currentUserIdRef.current,
@@ -3023,20 +3052,38 @@ export default function useChatLogic({ navigation, route }) {
       // Emit read events to server
       const socket = socketRef.current || getSocket();
       const isGrp = chatData?.chatType === 'group' || chatData?.isGroup;
-      if (socket && isSocketConnected() && chatIdRef.current && currentUserIdRef.current) {
+      if (chatIdRef.current && currentUserIdRef.current) {
+        // Queued, not dropped, when the socket is down — same reason as in
+        // markVisibleIncomingAsRead above.
+        const online = Boolean(socket) && isSocketConnected();
+        const sendOrQueue = (event, payload) => { emitSocketEvent(event, payload); };
         if (isGrp) {
-          socket.emit('group:message:read', {
+          sendOrQueue('group:message:read', {
             groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
             messageIds: unreadIds,
             userId: currentUserIdRef.current,
             readAt: new Date().toISOString(),
           });
-        } else {
+        } else if (online) {
           socket.emit('message:read:bulk', {
             chatId: chatIdRef.current,
             messageIds: unreadIds,
             senderId: currentUserIdRef.current,
             timestamp: Date.now(),
+          });
+        } else {
+          // Offline: send the PER-MESSAGE receipts, not the bulk one. Only
+          // `message:read` makes the server relay a read to the sender —
+          // `message:read:bulk` / `message:read:all` mark the messages read in
+          // the database but notify nobody (measured on device), so a bulk
+          // receipt delivered late left the sender's ticks grey.
+          unreadIds.forEach((msgId) => {
+            emitSocketEvent('message:read', {
+              messageId: msgId,
+              chatId: chatIdRef.current,
+              senderId: currentUserIdRef.current,
+              timestamp: Date.now(),
+            });
           });
         }
       }

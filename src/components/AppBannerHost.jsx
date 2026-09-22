@@ -19,6 +19,7 @@ import { previewFor, buildNotificationModel } from '../firebase/notificationMode
 import { onlyDigits } from '../utils/savedContactName';
 import { formatPhoneNumber } from '../services/contactNameStore';
 import { claimNotification } from '../firebase/notificationDedupe';
+import { displayGroupedMessage, isMessageGroupingAvailable } from '../firebase/messageNotification';
 import { translateNotificationBody } from './Translate';
 
 // Preload the notification sound once at module level
@@ -403,7 +404,13 @@ export default function WhatsAppBannerHost() {
   }, []);
 
   const enqueueBanner = useCallback(async (rawPayload) => {
-    if (appStateRef.current !== 'active') return;
+    // Backgrounded (but still connected): the in-app banner has nowhere to
+    // show, and the server sends NO push while this device holds a live socket
+    // — so the message used to arrive completely silently and the user only
+    // found it on the next app open. Raise the same WhatsApp-style tray
+    // notification the push path builds; it shares the dedupe claim below, so a
+    // push for the same message can't double it.
+    const inBackground = appStateRef.current !== 'active';
 
     // Call-log entries (the in-thread "call" message the backend writes when a
     // call ends) still fan out as a normal message:new so the call bubble renders
@@ -432,7 +439,9 @@ export default function WhatsAppBannerHost() {
     // messageId fall back to the in-session seenRef guard above.
     if (item.messageId && !claimNotification(item.messageId)) return;
 
-    if (shouldSuppressForActiveRoute(item)) {
+    // Only when the app is ON SCREEN: in the background the route snapshot is
+    // whatever chat was last open, which must not silence its notifications.
+    if (!inBackground && shouldSuppressForActiveRoute(item)) {
       return;
     }
 
@@ -523,6 +532,13 @@ export default function WhatsAppBannerHost() {
       }
     } catch {
       // keep the original text
+    }
+
+    if (inBackground) {
+      // Tray notification instead of the (invisible) banner. notifee owns the
+      // sound here, so don't play our own on top of it.
+      try { await displayGroupedMessage(item); } catch (_) { /* best effort */ }
+      return;
     }
 
     // Play notification sound for every new banner

@@ -135,7 +135,21 @@ export const displayGroupedMessage = async (data) => {
     });
   } catch (_) { /* channel may already exist (created by expo) */ }
 
-  const convoTitle = isGroup ? (data?.groupName || senderName) : senderName;
+  // A push for a GROUP message often carries no group name (the server only
+  // sends the sender), and the notification then read like a 1-1 chat from
+  // that person — the same message showing twice, once as the group and once
+  // as "@sender". The local chat row already knows the group's name, so use it
+  // whenever the payload leaves it out. Headless-safe: SQLite is available in
+  // the background handler.
+  let groupTitle = data?.groupName || data?.chatName || '';
+  if (isGroup && !groupTitle) {
+    try {
+      const ChatDatabase = require('../services/ChatDatabase').default || require('../services/ChatDatabase');
+      const row = await ChatDatabase.getChatById(String(data?.groupId || chatId));
+      groupTitle = row?.chatName || row?.group?.name || row?.groupName || '';
+    } catch (_) { /* fall back to the sender's name below */ }
+  }
+  const convoTitle = isGroup ? (groupTitle || senderName) : senderName;
 
   try {
     await notifee.displayNotification({
@@ -167,11 +181,37 @@ export const displayGroupedMessage = async (data) => {
       },
     });
     await ensureGroupSummary(notifee, AndroidImportance, AndroidVisibility);
+    await cancelForeignChatNotifications(notifee);
     return true;
   } catch (err) {
     console.warn('[msgNotif] MessagingStyle display failed:', err?.message);
     return false;
   }
+};
+
+// Drop the tray copy Android rendered ITSELF from a push that carried a
+// `notification` block. That copy is ungrouped, says whatever generic text the
+// server put in it ("New media message"), and shows a 1-1 style row even for a
+// group — so the user saw the same message twice, once right and once wrong.
+// We cannot stop the OS from drawing it, but we can take it away right after
+// our own MessagingStyle notification lands.
+//
+// Everything this app posts itself carries a known id ('msg-…' here, 'call-…' /
+// 'missed-…' / 'ongoing-call' for calls), so anything else in our tray came
+// from the OS push path. Call alerts are never touched, by id and by wording.
+const cancelForeignChatNotifications = async (notifee) => {
+  try {
+    const displayed = await notifee.getDisplayedNotifications();
+    for (const entry of displayed || []) {
+      const id = entry?.id == null ? '' : String(entry.id);
+      if (!id) continue;
+      if (id.startsWith('msg-') || id.startsWith('call-') || id.startsWith('missed-') || id === 'ongoing-call') continue;
+      const text = `${entry?.notification?.title || ''} ${entry?.notification?.body || ''}`.toLowerCase();
+      if (text.includes('call')) continue;
+      const tag = entry?.notification?.android?.tag;
+      try { await notifee.cancelDisplayedNotification(id, tag); } catch (_) { /* */ }
+    }
+  } catch (_) { /* best-effort */ }
 };
 
 // Post (or refresh) the group summary that anchors the per-chat notifications.
