@@ -44,6 +44,6 @@
       android:name=".CallForegroundService"
       android:exported="false"
       android:stopWithTask="false"
-      android:foregroundServiceType="microphone|camera|phoneCall" />
+      android:foregroundServiceType="microphone|camera|phoneCall|shortService" />
   </application>
 </manifest>

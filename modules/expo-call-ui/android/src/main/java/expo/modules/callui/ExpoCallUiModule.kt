@@ -95,7 +95,35 @@ class ExpoCallUiModule : Module() {
     Function("isDeviceLocked") {
       val ctx = appContext.reactContext ?: return@Function false
       val km = ctx.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-      km?.isKeyguardLocked ?: false
+      // A phone with no PIN/pattern reports NO keyguard even with the screen off,
+      // so callers asking "is the user away from the app?" got `false` and, on an
+      // incoming call, cancelled the ring notification the user was about to need.
+      // Screen off counts as locked here — same rule the lock receiver already
+      // uses (ACTION_SCREEN_OFF → locked).
+      val pm = ctx.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+      val screenOff = pm?.isInteractive == false
+      (km?.isKeyguardLocked == true) || screenOff
+    }
+
+    // Put the RING notification under the call foreground service, so Android
+    // keeps it alive while the app is backgrounded (a plain notification is
+    // dropped and the call then rings invisibly). `fullScreen: false` posts the
+    // quiet card — same Answer / Decline, no full-screen takeover — which is what
+    // the app wants once the user has left the ring screen.
+    Function("startRingService") { options: Map<String, Any?> ->
+      val ctx = appContext.reactContext
+      val callId = options["callId"] as? String
+      if (ctx != null && !callId.isNullOrBlank()) {
+        CallForegroundService.startForIncoming(
+          ctx,
+          callId,
+          options["callerId"] as? String,
+          (options["callerName"] as? String)?.takeIf { it.isNotBlank() } ?: "Incoming call",
+          options["callerImage"] as? String,
+          options["callType"] as? String ?: "audio",
+          options["fullScreen"] as? Boolean ?: false
+        )
+      }
     }
 
     // Turn the activity's show-over-the-keyguard ability on/off at runtime. The
@@ -546,7 +574,7 @@ class ExpoCallUiModule : Module() {
       ctx: Context, callId: String, callerId: String?, callerName: String,
       callerImage: String?, callType: String
     ) {
-      val notification = buildIncomingNotification(ctx, callId, callerId, callerName, callerImage, callType)
+      val notification = buildIncomingNotification(ctx, callId, callerId, callerName, callerImage, callType, true)
       try {
         NotificationManagerCompat.from(ctx).notify(callId.hashCode(), notification)
         postedIncomingIds.add(callId.hashCode())
@@ -560,7 +588,7 @@ class ExpoCallUiModule : Module() {
       // as a missed call). The service re-posts it under the same id, so this
       // never shows a second banner; if the FGS start is refused, the plain
       // notification above still stands.
-      CallForegroundService.startForIncoming(ctx, callId, callerId, callerName, callerImage, callType)
+      CallForegroundService.startForIncoming(ctx, callId, callerId, callerName, callerImage, callType, true)
     }
 
     // The CallStyle (green Answer / red Decline) notification + full-screen intent.
@@ -568,7 +596,7 @@ class ExpoCallUiModule : Module() {
     // exact same banner.
     fun buildIncomingNotification(
       ctx: Context, callId: String, callerId: String?, callerName: String,
-      callerImage: String?, callType: String
+      callerImage: String?, callType: String, withFullScreen: Boolean = true
     ): android.app.Notification {
       val isVideo = callType == "video"
       ensureChannel(ctx)
@@ -614,7 +642,12 @@ class ExpoCallUiModule : Module() {
         // arrives — or forever if none does. Longer than the 40s ring window.
         .setTimeoutAfter(60_000L)
         .setContentIntent(fullScreenIntent)
-        .setFullScreenIntent(fullScreenIntent, true)
+        .apply {
+          // The card variant keeps the same body tap (opens the call screen) but
+          // no full-screen intent: re-posting one after the user left the ring
+          // screen dragged them straight back into it.
+          if (withFullScreen) setFullScreenIntent(fullScreenIntent, true)
+        }
         .setStyle(
           NotificationCompat.CallStyle.forIncomingCall(person, declineIntent, answerIntent)
             .setIsVideo(isVideo)

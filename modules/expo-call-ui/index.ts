@@ -48,6 +48,17 @@ export const cancelIncomingCall = (callId: string): void => {
 
 // Start/stop the persistent active-call foreground service (Android only;
 // no-op when the native module is absent).
+export const startRingService = (data: {
+  callId: string;
+  callerId?: string | null;
+  callerName?: string | null;
+  callerImage?: string | null;
+  callType?: string | null;
+  fullScreen?: boolean;
+}): void => {
+  Native?.startRingService?.(data);
+};
+
 export const startOngoingCall = (data: OngoingCallData): void => {
   Native?.startOngoingCall(data);
 };

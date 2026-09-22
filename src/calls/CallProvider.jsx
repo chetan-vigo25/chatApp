@@ -3168,7 +3168,7 @@ export const CallProvider = ({ children }) => {
   // neither side could be heard even though every permission was granted.
   // `fromOS` marks the echo path: it never pushes the value back to the OS.
   const micSyncRef = useRef({ pushedMuted: null, at: 0 });
-  const handBackRef = useRef({ id: null, at: 0 });
+  const handBackRef = useRef({ key: null, at: 0 });
   const applyMic = useCallback((on, { fromOS = false } = {}) => {
     const snap = stateRef.current;
     if (snap.micOn === on) return;           // already there — never re-push
@@ -4754,7 +4754,7 @@ export const CallProvider = ({ children }) => {
     // notification back as the app leaves the foreground (Android; iOS rings via
     // CallKit, which we neither cancelled nor need to restore) and stop the
     // in-app ringtone so the notification channel is the only thing ringing.
-    const handBack = () => {
+    const handBack = ({ locked = false } = {}) => {
       if (Platform.OS !== 'android') return;
       // Same accept-in-flight guard as the pop-up effect: backgrounding the app
       // in the instant between `accept()` and the `accepted` commit must not
@@ -4768,15 +4768,25 @@ export const CallProvider = ({ children }) => {
       // activity lives over the keyguard), and every flap re-ran this — the
       // notification API was hammered dozens of times a second and the JS thread
       // wedged. One hand-back per call id per 3s is all the user can perceive.
+      // Keyed on the SURFACE too: locking the phone right after a Home press
+      // must still swap the quiet reminder for the full-screen banner.
+      const key = `${id}:${locked ? 'fs' : 'quiet'}`;
       const lastBack = handBackRef.current;
-      if (lastBack.id === id && Date.now() - lastBack.at < 3000) return;
-      handBackRef.current = { id, at: Date.now() };
+      if (lastBack.key === key && Date.now() - lastBack.at < 3000) return;
+      handBackRef.current = { key, at: Date.now() };
       stopRinging();
       if (__DEV__) console.log('[CALL][APP] app backgrounded mid-ring → handing the ring back to the OS notification', { callId: id });
       // Reminder, NOT the full-screen banner: re-posting the full-screen one
       // re-launched the very call screen the user had just left (the app
       // "flickered" back on every Home press) and the tray ended up empty, so
       // the call rang on invisibly. See displayRingReminderNotification.
+      // Android always gets the quiet reminder card — the same thing WhatsApp
+      // leaves on a lock screen once its full-screen ring has been dismissed:
+      // it sits in the shade with Answer / Decline, and tapping it opens the
+      // full-screen call UI. Re-posting the full-screen banner instead would
+      // yank the user back into the ring screen they just left (the app
+      // "flickering" back on every Home press). The FIRST ring still takes over
+      // a locked screen — that banner is posted natively when the push lands.
       const ringNotification = Platform.OS === 'android'
         ? displayRingReminderNotification
         : displayIncomingCallNotifee;
@@ -4811,15 +4821,15 @@ export const CallProvider = ({ children }) => {
     if (AppState.currentState === 'active') takeOver();
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') takeOver();
-      else handBack();
+      else handBack({ locked: isDeviceLockedNow() });
     });
     // The keyguard is the OTHER way the ring screen can leave the user's sight,
     // and it fires NO AppState change: our activity runs over the lock screen,
     // so Home/Back/lock keep AppState 'active' while the user sees the lock
     // screen. Watch the lock state too, and put the notification back whenever
     // the device is (or goes) locked while the call is still ringing.
-    const unlisten = addDeviceLockListener((locked) => { if (locked) handBack(); });
-    if (Platform.OS === 'android' && isDeviceLockedNow()) handBack();
+    const unlisten = addDeviceLockListener((locked) => { if (locked) handBack({ locked: true }); });
+    if (Platform.OS === 'android' && isDeviceLockedNow()) handBack({ locked: true });
     return () => { try { sub.remove(); } catch (_) { /* */ } try { unlisten(); } catch (_) { /* */ } };
   }, [state.status, state.notificationOnly, startRinging, stopRinging]);
 

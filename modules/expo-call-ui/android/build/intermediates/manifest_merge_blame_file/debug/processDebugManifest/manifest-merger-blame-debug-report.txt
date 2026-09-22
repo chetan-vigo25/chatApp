@@ -72,13 +72,13 @@
 56         .onTaskRemoved and src/calls/callSessionKeeper.js.
 57        -->
 58        <service
-58-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:43:5-47:69
+58-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:43:5-47:82
 59            android:name="expo.modules.callui.CallForegroundService"
 59-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:44:7-44
 60            android:exported="false"
 60-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:45:7-31
-61            android:foregroundServiceType="microphone|camera|phoneCall"
-61-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:47:7-66
+61            android:foregroundServiceType="microphone|camera|phoneCall|shortService"
+61-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:47:7-79
 62            android:stopWithTask="false" />
 62-->/Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:46:7-35
 63    </application>

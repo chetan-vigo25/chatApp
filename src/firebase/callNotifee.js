@@ -425,8 +425,27 @@ export const displayIncomingCallNotifee = async (data) => {
 // for the event router, which otherwise leaves call actions to the native
 // CallStyle backend.
 export const displayRingReminderNotification = async (data = {}) => {
+  // Native backend: post the card THROUGH the call foreground service. A plain
+  // notification posted while the app is backgrounded is dropped by Android —
+  // which is exactly when this card matters (the user pressed Home, or locked
+  // the phone, while the call was still ringing).
+  if (isCallUi() && data?.callId) {
+    try {
+      getCallUi().startRingService({
+        callId: String(data.callId),
+        callerId: data.callerId || null,
+        callerName: data.callerDisplayName || data.callerName || 'Incoming call',
+        callerImage: data.callerImage || null,
+        callType: (data.callType || data.media) === 'video' ? 'video' : 'audio',
+        fullScreen: false,
+      });
+      shownCallIds.add(String(data.callId));
+      return true;
+    } catch (err) {
+      console.warn('[callNotif] ring card via service failed:', err?.message);
+    }
+  }
   const notifee = getNotifee();
-  if (__DEV__) console.log('[DIAG][ring] reminder post', { callId: data?.callId, hasNotifee: !!notifee });
   if (!notifee || !data?.callId) return false;
   try {
     const channelId = await ensureCallChannel();

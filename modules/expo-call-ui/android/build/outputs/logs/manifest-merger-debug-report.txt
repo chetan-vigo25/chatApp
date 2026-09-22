@@ -39,13 +39,13 @@ ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/sr
 	android:name
 		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:32:7-41
 service#expo.modules.callui.CallForegroundService
-ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:43:5-47:69
+ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:43:5-47:82
 	android:exported
 		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:45:7-31
 	android:stopWithTask
 		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:46:7-35
 	android:foregroundServiceType
-		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:47:7-66
+		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:47:7-79
 	android:name
 		ADDED from /Volumes/PortableSSD/projects/chatApp/modules/expo-call-ui/android/src/main/AndroidManifest.xml:44:7-44
 uses-sdk

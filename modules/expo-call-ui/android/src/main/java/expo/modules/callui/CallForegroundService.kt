@@ -72,7 +72,8 @@ class CallForegroundService : Service() {
     val incoming = state == "incoming"
     val notification = if (incoming) {
       ExpoCallUiModule.buildIncomingNotification(
-        this, callId, intent.getStringExtra(EXTRA_CALLER_ID), name, image, type
+        this, callId, intent.getStringExtra(EXTRA_CALLER_ID), name, image, type,
+        intent.getBooleanExtra(EXTRA_FULL_SCREEN, true)
       )
     } else {
       buildNotification(callId, name, image, isVideo, startedAtMs, state)
@@ -177,14 +178,39 @@ class CallForegroundService : Service() {
   // screen off), and Android refuses mic/camera access to a background-started
   // FGS — the service was then torn down and the ring notification went with it.
   private fun startForegroundForRing(notification: Notification, notifId: Int): Boolean {
-    return try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        startForeground(notifId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
-      } else {
-        startForeground(notifId, notification)
+    // shortService (Android 14+) is the one type a BACKGROUND start may use with
+    // no special role: phoneCall needs the app to be the default dialer / a
+    // self-managed ConnectionService (it was refused here and the service died
+    // silently), and mic/camera are stripped from a background-started service.
+    // Its ~3 minute budget is far longer than a 40s ring, and answering swaps it
+    // for the ongoing microphone service from the foreground, where that is allowed.
+    val types = if (Build.VERSION.SDK_INT >= 34) {
+      intArrayOf(
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE,
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL,
+      )
+    } else {
+      intArrayOf(ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL)
+    }
+    for (type in types) {
+      try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+          startForeground(notifId, notification, type)
+        } else {
+          startForeground(notifId, notification)
+        }
+        android.util.Log.i(TAG, "ring FGS started (type=$type)")
+        return true
+      } catch (e: Exception) {
+        android.util.Log.w(TAG, "ring FGS type=$type refused: ${e.message}")
       }
+    }
+    return try {
+      startForeground(notifId, notification)
+      android.util.Log.i(TAG, "ring FGS started (legacy, no type)")
       true
     } catch (e: Exception) {
+      android.util.Log.w(TAG, "ring FGS failed: ${e.message}")
       false
     }
   }
@@ -262,8 +288,10 @@ class CallForegroundService : Service() {
   }
 
   companion object {
+    const val TAG = "CallFgService"
     const val ACTION_STOP = "expo.modules.callui.STOP_ONGOING"
     const val EXTRA_CALLER_ID = "callerId"
+    const val EXTRA_FULL_SCREEN = "fullScreen"
     const val ONGOING_CHANNEL_ID = "calls_ongoing"
     const val ONGOING_NOTIF_ID = 424242
 
@@ -304,7 +332,8 @@ class CallForegroundService : Service() {
     // while the app is backgrounded. Best-effort: if the FGS start is refused the
     // service stops itself and the plain notification the module posted stays.
     fun startForIncoming(
-      ctx: Context, callId: String, callerId: String?, name: String?, image: String?, type: String?
+      ctx: Context, callId: String, callerId: String?, name: String?, image: String?, type: String?,
+      fullScreen: Boolean = true
     ) {
       val i = Intent(ctx, CallForegroundService::class.java).apply {
         putExtra(EXTRA_CALL_ID, callId)
@@ -313,6 +342,7 @@ class CallForegroundService : Service() {
         putExtra(EXTRA_CALLER_IMAGE, image)
         putExtra(EXTRA_CALL_TYPE, type ?: "audio")
         putExtra(EXTRA_STATE, "incoming")
+        putExtra(EXTRA_FULL_SCREEN, fullScreen)
       }
       try { ContextCompat.startForegroundService(ctx, i) } catch (_: Exception) { /* */ }
     }

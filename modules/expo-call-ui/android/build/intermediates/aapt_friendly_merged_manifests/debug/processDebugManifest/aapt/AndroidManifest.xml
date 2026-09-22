@@ -58,7 +58,7 @@
         <service
             android:name="expo.modules.callui.CallForegroundService"
             android:exported="false"
-            android:foregroundServiceType="microphone|camera|phoneCall"
+            android:foregroundServiceType="microphone|camera|phoneCall|shortService"
             android:stopWithTask="false" />
     </application>
 
