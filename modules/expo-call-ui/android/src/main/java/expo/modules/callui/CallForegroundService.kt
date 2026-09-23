@@ -53,6 +53,7 @@ class CallForegroundService : Service() {
 
     val callId = intent?.getStringExtra(EXTRA_CALL_ID)
     if (callId.isNullOrBlank()) {
+      startHandled()
       stopSelf()
       return START_NOT_STICKY
     }
@@ -86,6 +87,14 @@ class CallForegroundService : Service() {
     val notifId = if (incoming) callId.hashCode() else ONGOING_NOTIF_ID
     val promoted = if (incoming) startForegroundForRing(notification, notifId)
       else startForegroundWithType(notification, isVideo, notifId)
+    // startForeground() has now run for this start — a stop() that arrived while
+    // it was queued can be honoured safely (see deferredStopPending).
+    if (startHandled()) {
+      android.util.Log.i(TAG, "applying stop() that arrived while this start was pending")
+      stopForegroundCompat()
+      stopSelf()
+      return START_NOT_STICKY
+    }
     if (!promoted) {
       // Could not become a foreground service (e.g. a microphone-type FGS start
       // rejected on Android 12+). We MUST NOT keep a started-but-not-foreground
@@ -375,7 +384,7 @@ class CallForegroundService : Service() {
         putExtra(EXTRA_STARTED_AT, startedAtMs)
         putExtra(EXTRA_STATE, state ?: "ongoing")
       }
-      try { ContextCompat.startForegroundService(ctx, i) } catch (_: Exception) { /* */ }
+      startRequested(ctx, i)
     }
 
     // Hand an incoming ring to the service so the OS keeps its notification alive
@@ -394,10 +403,52 @@ class CallForegroundService : Service() {
         putExtra(EXTRA_STATE, "incoming")
         putExtra(EXTRA_FULL_SCREEN, fullScreen)
       }
-      try { ContextCompat.startForegroundService(ctx, i) } catch (_: Exception) { /* */ }
+      startRequested(ctx, i)
+    }
+
+    // ---- start/stop race guard ----
+    // startForegroundService() obliges the service to call startForeground() once
+    // its onStartCommand runs. Stopping it BEFORE that (stopService while the start
+    // is still queued) is fatal on Android 12+: "Bringing down service while still
+    // waiting for start foreground" → ForegroundServiceDidNotStartInTimeException,
+    // and the whole app — call included — is killed. That is exactly the accept
+    // path on a busy main thread: the tap starts the ongoing (mic) service, and
+    // ~250ms later the ring cancel stops the same service before onStartCommand
+    // ran (reproduced 2026-09-23 on a cold-started, just-woken app).
+    // So a stop() that lands while a start is pending is DEFERRED: the service
+    // promotes itself first, then stops. A start() issued after the stop()
+    // cancels the deferred stop — the latest request wins, as before.
+    private val pendingStarts = java.util.concurrent.atomic.AtomicInteger(0)
+    @Volatile private var deferredStopPending = false
+
+    private fun startRequested(ctx: Context, i: Intent) {
+      deferredStopPending = false
+      pendingStarts.incrementAndGet()
+      try {
+        ContextCompat.startForegroundService(ctx, i)
+      } catch (_: Exception) {
+        // Never delivered — don't let it block future stops.
+        pendingStarts.decrementAndGet()
+      }
+    }
+
+    /** Called once per delivered start; true when a deferred stop should run now. */
+    private fun startHandled(): Boolean {
+      val left = pendingStarts.decrementAndGet()
+      if (left < 0) pendingStarts.set(0)
+      if (left <= 0 && deferredStopPending) {
+        deferredStopPending = false
+        return true
+      }
+      return false
     }
 
     fun stop(ctx: Context) {
+      if (pendingStarts.get() > 0) {
+        android.util.Log.i(TAG, "stop() while a start is pending — deferring until startForeground ran")
+        deferredStopPending = true
+        return
+      }
       try { ctx.stopService(Intent(ctx, CallForegroundService::class.java)) } catch (_: Exception) { /* */ }
     }
 

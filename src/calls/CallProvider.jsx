@@ -19,6 +19,7 @@ import { CallContext } from './CallContext';
 import CallEngineWebView from './engine/CallEngineWebView';
 import { isNativeCallEngine } from './engineSelector';
 import nativeEngine from './native-engine/NativeCallEngine';
+import { markCallEvent, recordCallFailure, readCallFailures } from './diagnostics/callDiagnostics';
 import { audioSessionDidActivate, audioSessionDidDeactivate } from './native-engine/webrtcGlobals';
 // AudioRoute wraps react-native-incall-manager. It lives under native-engine/ for
 // historical reasons but is NOT native-engine-only: on Android the WebView engine
@@ -155,6 +156,9 @@ const buildIncomingPeer = (from = {}, prevPeer = null) => {
     hideContact,
   };
 };
+
+// Dev: read saved call-failure reports from the Metro/CDP console.
+if (__DEV__) globalThis.__readCallFailures = readCallFailures;
 
 const IS_EXPO_GO = false
 //  Constants.appOwnership === 'expo'
@@ -1739,6 +1743,34 @@ export const CallProvider = ({ children }) => {
     }, getRingTimeoutMs());
   }, [clearRingTimeout, finalizeEnd, removeGroupParticipant]);
 
+  // Save a call-failure report (src/calls/diagnostics) before a watchdog ends
+  // the call — the only durable record of WHY an answered call never connected.
+  const reportCallFailure = useCallback((reason) => {
+    try {
+      const snap = stateRef.current || {};
+      recordCallFailure(reason, {
+        context: {
+          status: snap.status,
+          direction: snap.direction,
+          callId: snap.callId,
+          signalId: snap.signalId,
+          pendingAccept: snap.pendingAccept,
+          accepted: snap.accepted,
+          answeredAt: snap.answeredAt,
+          connectedAt: snap.connectedAt,
+          isGroup: snap.isGroup,
+          isConference: snap.isConference,
+          media: snap.media,
+          peerId: snap.peer?.id || null,
+          engineReady: engineReadyRef.current,
+          engineConnecting: connectingRef.current,
+          mediaRingExtended: mediaRingExtendedRef.current,
+        },
+        engine: isNativeCallEngine() ? nativeEngine.diagSnapshot() : null,
+      });
+    } catch (_) { /* diagnostics must never break the call flow */ }
+  }, []);
+
   const armMediaWatchdog = useCallback(() => {
     clearMediaWatchdog();
     mediaWatchdogRef.current = setTimeout(() => {
@@ -1752,10 +1784,11 @@ export const CallProvider = ({ children }) => {
       // accept/dial. 20s keeps the safety net without the false kill; the 30s
       // connect watchdog still backstops a truly dead call.
       if (__DEV__) console.log('[CALL] media watchdog — no localstream in 20s (getUserMedia/mic blocked or call service unreachable)');
+      reportCallFailure('media-watchdog: no localstream in 20s');
       Alert.alert('Call problem', 'Could not access the microphone. Check the app’s microphone permission and try again.');
       finalizeEnd('failed', 'Microphone unavailable');
     }, MEDIA_WATCHDOG_MS);
-  }, [clearMediaWatchdog, finalizeEnd]);
+  }, [clearMediaWatchdog, finalizeEnd, reportCallFailure]);
 
   // Arm the post-answer connect watchdog. Fires once if an ANSWERED call hasn't
   // reached ACTIVE (remote media flowing) within CONNECT_TIMEOUT_MS — turning an
@@ -1773,9 +1806,10 @@ export const CallProvider = ({ children }) => {
           callId: snap.callId, signalId: snap.signalId, pendingAccept: snap.pendingAccept,
         });
       }
+      reportCallFailure('connect-watchdog: answered but never reached ACTIVE');
       finalizeEnd('failed', 'Could not connect the call');
     }, CONNECT_TIMEOUT_MS);
-  }, [clearConnectWatchdog, finalizeEnd]);
+  }, [clearConnectWatchdog, finalizeEnd, reportCallFailure]);
 
   // Arm the media-ring watchdog. Only meaningful while the accept is parked on
   // `pendingAccept` with no callId; it self-checks at fire time, so the callId
@@ -1809,6 +1843,9 @@ export const CallProvider = ({ children }) => {
             signalId: snap.signalId, extraMs: MEDIA_RING_TIMEOUT_MS,
           });
         }
+        markCallEvent('media-ring-watchdog:extend', { signalId: snap.signalId });
+        // Same repair as at accept, in case a ring landed in the engine since.
+        if (snap.peer?.id) sendCmd({ cmd: CMD.RELEASE_PEER_RING, peerId: String(snap.peer.id) });
         armMediaRingWatchdog(true);
         return;
       }
@@ -1817,9 +1854,10 @@ export const CallProvider = ({ children }) => {
           signalId: snap.signalId, isConference: snap.isConference, isGroup: snap.isGroup,
         });
       }
+      reportCallFailure('media-ring-watchdog: answered but the media server never rang this device');
       finalizeEnd('failed', 'Could not join the call');
     }, MEDIA_RING_TIMEOUT_MS);
-  }, [clearMediaRingWatchdog, finalizeEnd]);
+  }, [clearMediaRingWatchdog, finalizeEnd, reportCallFailure, sendCmd]);
 
   // Arm the mid-call reconnect watchdog (APP-6). Fires once if the dropped media
   // layer hasn't recovered within RECONNECT_TIMEOUT_MS — ending the call as
@@ -1882,6 +1920,10 @@ export const CallProvider = ({ children }) => {
     // Trace every engine→RN event with its payload. 'log' is forwarded below
     // under its own [CALL][engine] tag, so skip it here to avoid double lines.
     if (__DEV__ && type !== 'log') console.log('[CALL][APP][engine→RN]', type, payload);
+    // Feed the failure black box in every build (engine log lines included —
+    // they are the only record of what the media-server socket did).
+    if (type === 'log') markCallEvent('engine', payload?.message);
+    else if (type !== 'activeSpeaker' && type !== 'presence' && type !== 'presenceResult') markCallEvent(`engine:${type}`, payload);
     switch (type) {
       case 'log': {
         // Surface engine-side diagnostics in Metro (dev only) so the whole call
@@ -2840,6 +2882,7 @@ export const CallProvider = ({ children }) => {
   const accept = useCallback(async () => {
     const snap = stateRef.current;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 1 accept tapped ═════', { status: snap.status, callId: snap.callId, signalId: snap.signalId, media: snap.media, isGroup: snap.isGroup, peer: snap.peer, awaitingEngine: snap.awaitingEngine });
+    markCallEvent('accept:tapped', { status: snap.status, callId: snap.callId, signalId: snap.signalId, engineReady: engineReadyRef.current });
     if (snap.status !== CALL_STATUS.INCOMING) return;
     // SYNCHRONOUS staleness check. `stateRef` is committed by an EFFECT, so it
     // trails the ENDED dispatch by a full render — and under load (SQLite writes,
@@ -3051,6 +3094,7 @@ export const CallProvider = ({ children }) => {
     // answer. This is what makes "accept" reliably connect rather than hang.
     let ready = await ensureConnected();
     if (__DEV__) console.log('[CALL][APP][accept] STEP 4 ensureConnected (engine ready?)', { ready });
+    markCallEvent('accept:ensureConnected', { ready });
     if (!ready) {
       // A CallKit/banner answer often runs with the app still BACKGROUNDED — the
       // engine socket can be cold/half-open and the first connect attempt can
@@ -3086,6 +3130,13 @@ export const CallProvider = ({ children }) => {
       // this same media/speaker — the moment the id lands.
       if (__DEV__) console.log('[CALL][APP][accept] STEP 5b callId NOT yet known → set pendingAccept, waiting for WebRTC incoming to reconcile (media-ring + connect watchdogs armed)');
       dispatch({ type: ACT.SET_FLAG, key: 'pendingAccept', value: true });
+      // A 1:1 answer with no media callId: make sure the engine isn't holding a
+      // ring for this peer that we never got — its dedupe would swallow every
+      // fresh ring from the caller and the accept could never reconcile.
+      if (!cur.isGroup && cur.peer?.id) {
+        markCallEvent('accept:releasePeerRing', { peerId: cur.peer.id });
+        sendCmd({ cmd: CMD.RELEASE_PEER_RING, peerId: String(cur.peer.id) });
+      }
       // Nothing is in flight on the media plane: if the media server's ring
       // never arrives there is no callId to accept with, so don't make the user
       // wait out the full connect watchdog on a call that cannot connect.
@@ -3640,6 +3691,7 @@ export const CallProvider = ({ children }) => {
     const snap = stateRef.current;
     const callerId = payload?.from?.id ? String(payload.from.id) : null;
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 0 call:incoming signal (app socket) ═════', { callerId, currentStatus: snap.status, payload });
+    markCallEvent('signal:incoming', { callerId, status: snap.status, callId: payload?.callId, via: payload?.uuid ? 'socket' : 'push' });
     if (!callerId) return;
     // A ring for a call we JUST ended/declined — a late VoIP push (APNs queued
     // it while the device was unreachable), a socket re-ring, or the caller's

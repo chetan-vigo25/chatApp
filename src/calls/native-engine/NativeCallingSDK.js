@@ -286,6 +286,16 @@ export default class NativeCallingSDK {
     });
     this._socket = s;
     this._serverUrl = url;
+    // Diagnostics: when did the media server last send us ANYTHING? A half-open
+    // socket still reads `connected`; this is what tells it apart in a failure
+    // report. The Manager is shared per URL across rebuilds, so re-bind one
+    // handler instead of stacking listeners.
+    try {
+      s.onAny(() => { this._lastInboundAt = Date.now(); });
+      if (!this._onMgrPing) this._onMgrPing = () => { this._lastInboundAt = Date.now(); };
+      s.io.off('ping', this._onMgrPing);
+      s.io.on('ping', this._onMgrPing);
+    } catch (_) { /* diagnostics only */ }
     s.on('connect', () => {
       // Cancels sent while we were offline are gone for good — drop any ring
       // entry old enough that its server-side call can no longer exist, so the
@@ -333,6 +343,57 @@ export default class NativeCallingSDK {
       this._emit('enginedown', { reason: String(reason || '') });
     });
     this._wire(s);
+  }
+
+  // The app answered a 1:1 from `peerId` but never received this engine's ring
+  // for it (no media callId). Any pending ring we still hold for that peer is
+  // therefore one the app doesn't know about — and it makes the reassert dedupe
+  // in 'incomingCall' swallow every FRESH ring from the caller as a duplicate,
+  // so the answer can never reconcile and the call dies on "Connecting…"
+  // (reproduced 2026-09-23). Drop those entries; the caller's next reassert
+  // (every REASSERT_MS) then reaches the app. accept() handles a 1:1 without a
+  // pending entry, so nothing depends on the dropped ones.
+  releasePendingFrom(peerId) {
+    const id = String(peerId);
+    if (this._room || this._acceptedId) return 0; // a call is already being set up
+    let n = 0;
+    Object.keys(this._pendingIn).forEach((k) => {
+      const q = this._pendingIn[k];
+      if (q && !q.group && q.from && String(q.from.id) === id) {
+        delete this._pendingIn[k];
+        n += 1;
+      }
+    });
+    this._log(`release pending rings from ${id}: ${n} dropped`);
+    return n;
+  }
+
+  // Read-only snapshot for call-failure reports (src/calls/diagnostics). Never
+  // mutates state; every field is best-effort.
+  diagSnapshot() {
+    const now = Date.now();
+    const s = this._socket;
+    const ageOf = (ts) => (ts ? now - ts : null);
+    return {
+      url: this._serverUrl || this.url || null,
+      socketId: (s && s.id) || null,
+      socketConnected: !!(s && s.connected),
+      registered: !!this._registered,
+      lastInboundAgoMs: ageOf(this._lastInboundAt),
+      pendingIn: Object.keys(this._pendingIn || {}).map((k) => {
+        const q = this._pendingIn[k] || {};
+        return { callId: k, from: q.from && q.from.id != null ? String(q.from.id) : null, group: !!q.group, ageMs: ageOf(q.ts) };
+      }),
+      acceptedFrom: this._acceptedFrom || null,
+      acceptedId: this._acceptedId || null,
+      room: this._room
+        ? { roomId: this._room.roomId || null, joined: !!this._room.joined, preAnswer: !!this._room.preAnswer }
+        : null,
+      declinedPeerAgeMs: Object.fromEntries(Object.entries(this._declinedPeer || {}).map(([k, v]) => [k, ageOf(v)])),
+      outgoing: this._out ? { callId: this._out.callId || null, to: this._out.to || null } : null,
+      dialRetryActive: !!this._retryTimer,
+      lastDialAgoMs: ageOf(this._lastDialAt),
+    };
   }
 
   // Round-trip liveness probe for the CONNECT-reuse path. A backgrounded app's
@@ -388,7 +449,7 @@ export default class NativeCallingSDK {
     s.on('incomingCall', (p = {}) => {
       this._prunePendingIn();
       const key = String(p.callId);
-      if (this._pendingIn[key]) return;
+      if (this._pendingIn[key]) { this._log(`ring ${key} already pending — ignored`); return; }
       const fromId = p.from && p.from.id != null ? String(p.from.id) : null;
       if (fromId) {
         // Ring-REASSERT dedupe: the caller re-emits callUser every few seconds
@@ -419,6 +480,7 @@ export default class NativeCallingSDK {
         // of ghost-re-ringing (parity with the group _declined window).
         const dec = this._declinedPeer[fromId];
         if (dec && (Date.now() - dec) < DECLINED_PEER_GUARD_MS) {
+          this._log(`ring ${key} from just-declined peer ${fromId} — auto-declined`);
           try { s.emit('declineCall', { callId: key }); } catch (_) {}
           return;
         }

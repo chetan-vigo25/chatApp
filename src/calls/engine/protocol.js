@@ -63,6 +63,11 @@ export const CMD = {
   // ensureConnected to catch a reloaded WebView page / dropped engine socket
   // BEFORE dialing (a stale "ready" otherwise fails the call with 'not connected').
   PING: 'ping',
+  // 1:1 accept is parked (no media callId) → drop any pending ring this engine
+  // holds for that peer. Such an entry makes the ring-reassert dedupe swallow
+  // every fresh ring from the caller as a "duplicate", so the accept can never
+  // reconcile ({ peerId }). Native engine only; the WebView engine ignores it.
+  RELEASE_PEER_RING: 'releasePeerRing',
 };
 
 // Engine → RN events (SDK passthroughs + engine/control results)

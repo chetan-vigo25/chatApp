@@ -55,6 +55,13 @@ class NativeCallEngine {
     this._post(EVT.LOG, { message: `[native-engine] ${message}` });
   }
 
+  /** Read-only snapshot for call-failure reports (src/calls/diagnostics). */
+  diagSnapshot() {
+    let sdk = null;
+    try { sdk = this._sdk ? this._sdk.diagSnapshot() : null; } catch (e) { sdk = { error: String(e && e.message) }; }
+    return { hasSdk: !!this._sdk, media: this._currentMedia || null, sdk };
+  }
+
   // Track-level mic enable (glue's enableLocalMic): reliable mute/unmute
   // regardless of producer state; returns the audio-track count for logs.
   _enableLocalMic(on) {
@@ -105,6 +112,11 @@ class NativeCallEngine {
           sdk.verifyAlive(1500).then((ok) => {
             this._post(EVT.PONG, { ref: msg.ref, hasCall: true, connected: !!ok });
           });
+          return;
+        }
+
+        case CMD.RELEASE_PEER_RING: {
+          if (this._sdk && msg.peerId) this._sdk.releasePendingFrom(msg.peerId);
           return;
         }
 
