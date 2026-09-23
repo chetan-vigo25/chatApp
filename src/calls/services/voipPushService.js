@@ -61,6 +61,14 @@ const toCallData = (payload = {}) => ({
   // name → number → account name) instead of trusting a server-composed name.
   callerPushName: payload.callerPushName || null,
   callerMobile: payload.callerMobile || null,
+  // Privacy bits — the backend adds them to the VoIP payload as of 2026-09-23.
+  // Without them a killed-app iOS ring re-resolved a hidden caller to my saved
+  // contact name / their number instead of the "@handle". The flag stays
+  // undefined when absent so an older server never reads as "not hidden".
+  callerUserName: payload.callerUserName || null,
+  callerHideContact: payload.callerHideContact != null && payload.callerHideContact !== ''
+    ? String(payload.callerHideContact)
+    : undefined,
   callerImage: payload.callerImage || null,
   callType: payload.callType || payload.media || 'audio',
   uuid: payload.uuid || null, // the CallKit UUID the AppDelegate reported with

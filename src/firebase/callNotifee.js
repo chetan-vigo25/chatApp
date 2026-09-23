@@ -42,6 +42,49 @@ const missedShownIds = new Set();
 // at a time, so clearing the whole set is safe.
 const shownCallIds = new Set();
 
+// IDENTICAL-REPOST SUPPRESSION.
+//
+// One incoming call legitimately reaches this function from several places: the
+// FCM push handler, CallProvider's in-app re-post (which corrects the caller's
+// name once the socket payload is known), and the ring hand-back that re-owns
+// the notification when the app leaves the foreground. Each of those calls
+// `displayIncomingCall`, which re-posts the notification AND re-starts the ring
+// foreground service.
+//
+// Android punishes that: a notification re-posted repeatedly is treated as spam
+// and the system SILENCES it — logcat shows
+// `NotifAttentionHelper: Muting recently noisy <our notification>` — so the
+// phone stops ringing while the banner is still on screen. Measured on device:
+// a single incoming call posted the ring FOUR times (two of them 133ms apart)
+// and the ringtone was muted every time.
+//
+// A re-post that CHANGES something (the corrected name, the card-vs-fullscreen
+// hand-back) still has to go through — that is the whole point of those paths.
+// So the guard is on the CONTENT, not the call id: identical content within the
+// window is dropped, anything different posts as before.
+const RING_REPOST_WINDOW_MS = 6000;
+const _lastRingPost = new Map(); // callId → { key, at }
+const shouldSkipIdenticalRing = (callId, key) => {
+  const id = String(callId || '');
+  if (!id) return false;
+  const prev = _lastRingPost.get(id);
+  const now = Date.now();
+  if (prev && prev.key === key && now - prev.at < RING_REPOST_WINDOW_MS) return true;
+  _lastRingPost.set(id, { key, at: now });
+  // The map only ever holds live calls; clearRingPostMemory() wipes it when the
+  // call ends, and this bound stops a long session from growing it unbounded.
+  if (_lastRingPost.size > 20) {
+    const oldest = _lastRingPost.keys().next().value;
+    _lastRingPost.delete(oldest);
+  }
+  return false;
+};
+/** Forget a call's re-post memory so a LATER call from the same peer rings. */
+const clearRingPostMemory = (callId) => {
+  if (callId) _lastRingPost.delete(String(callId));
+  else _lastRingPost.clear();
+};
+
 // ---- backend 1: ExpoCallUi (native CallStyle) ----
 let _callUi;
 let _callUiResolved = false;
@@ -138,6 +181,9 @@ const ONGOING_NOTIF_ID = 'ongoing-call';
 let _ongoingChannelReady = false;
 
 export const startOngoingCallNotification = (call) => {
+  if (__DEV__) console.log('[CALL][notif] startOngoingCall requested', {
+    callId: call?.callId || null, state: call?.state, nativeBackend: isCallUi(),
+  });
   if (!call?.callId) return;
   if (isCallUi()) {
     try {
@@ -354,6 +400,16 @@ export const displayIncomingCallNotifee = async (data) => {
     callType: (data?.callType || data?.media) === 'video' ? 'video' : 'audio',
   };
   if (!call.callId) return false;
+  // Same call, same caller, same type, same surface → the OS already shows it.
+  // Re-posting only makes Android mute the ringtone (see the note above).
+  const ringKey = [
+    call.callerName, call.callType, call.callerImage || '',
+    String(data?._reminder ?? ''), String(data?.fullScreen ?? ''),
+  ].join('|');
+  if (shouldSkipIdenticalRing(call.callId, ringKey)) {
+    if (__DEV__) console.log('[CALL][notif] identical ring re-post skipped', { callId: call.callId });
+    return true;
+  }
   shownCallIds.add(String(call.callId));
 
   // Preferred: native CallStyle (green Answer / red Decline).
@@ -485,6 +541,8 @@ export const displayRingReminderNotification = async (data = {}) => {
 export const cancelIncomingCallNotifee = async (callId) => {
   if (!callId) return; // never cancel-all — would clear chat notifications too
   shownCallIds.delete(String(callId));
+  // The call is over: a LATER call must be able to ring again immediately.
+  clearRingPostMemory(callId);
   if (isCallUi()) {
     try { getCallUi().cancelIncomingCall(String(callId)); } catch (_) { /* */ }
   }
@@ -508,6 +566,7 @@ export const cancelAllIncomingCallNotifee = async () => {
   }
   const ids = Array.from(shownCallIds);
   shownCallIds.clear();
+  clearRingPostMemory();
   const notifee = getNotifee();
   for (const id of ids) {
     if (isCallUi()) {

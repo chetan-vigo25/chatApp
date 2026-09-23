@@ -39,6 +39,11 @@ import androidx.core.content.ContextCompat
 class CallForegroundService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
 
+  // The FGS type this instance is CURRENTLY promoted as, or 0 when not foreground.
+  // Needed because Android 14+ refuses to convert a SHORT_SERVICE into any other
+  // type by calling startForeground() again — see demoteShortServiceIfNeeded().
+  private var currentFgsType: Int = 0
+
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP) {
       stopForegroundCompat()
@@ -199,6 +204,7 @@ class CallForegroundService : Service() {
         } else {
           startForeground(notifId, notification)
         }
+        currentFgsType = type
         android.util.Log.i(TAG, "ring FGS started (type=$type)")
         return true
       } catch (e: Exception) {
@@ -207,6 +213,7 @@ class CallForegroundService : Service() {
     }
     return try {
       startForeground(notifId, notification)
+      currentFgsType = 0
       android.util.Log.i(TAG, "ring FGS started (legacy, no type)")
       true
     } catch (e: Exception) {
@@ -215,28 +222,71 @@ class CallForegroundService : Service() {
     }
   }
 
+  /**
+   * Android 14+ will NOT convert a SHORT_SERVICE foreground service into another
+   * type: calling startForeground() again with FOREGROUND_SERVICE_TYPE_MICROPHONE
+   * throws, and the service quietly stays a shortService.
+   *
+   * That is exactly what happened to every answered call. The ring is promoted as
+   * SHORT_SERVICE (the only type a BACKGROUND start may use — see
+   * startForegroundForRing), and when the user answered, the ongoing service ran
+   * on the SAME instance and could never claim the microphone. Measured on device
+   * during a live, connected call:
+   *
+   *     isForeground=true  types=0x00000800   ← 0x800 = SHORT_SERVICE
+   *     W/ActivityManager: Foreground service started from background
+   *                        can not have location/camera/microphone access
+   *
+   * Android refuses mic/camera to that service for its whole life, so the call
+   * connected and ran silent — the "awaaz nahi aati" report. (SHORT_SERVICE also
+   * carries a ~3 minute budget, so a longer call would be stopped outright.)
+   *
+   * Dropping the foreground promotion first lets the very next startForeground()
+   * be a FRESH one, which may claim microphone/camera — the app is TOP at that
+   * moment, because answering is a user action, so the OS allows it.
+   */
+  private fun demoteShortServiceIfNeeded() {
+    if (Build.VERSION.SDK_INT < 34) return
+    if (currentFgsType != ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE) return
+    try {
+      stopForeground(STOP_FOREGROUND_REMOVE)
+      currentFgsType = 0
+      android.util.Log.i(TAG, "dropped shortService promotion before claiming microphone")
+    } catch (e: Exception) {
+      android.util.Log.w(TAG, "could not drop shortService promotion: ${e.message}")
+    }
+  }
+
   private fun startForegroundWithType(
     notification: Notification, isVideo: Boolean, notifId: Int = ONGOING_NOTIF_ID
   ): Boolean {
+    demoteShortServiceIfNeeded()
     // Try the typed foreground service first.
     try {
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
         if (isVideo) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
         startForeground(notifId, notification, type)
+        currentFgsType = type
+        android.util.Log.i(TAG, "ongoing FGS started (type=$type)")
       } else {
         startForeground(notifId, notification)
+        currentFgsType = 0
       }
       return true
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+      android.util.Log.w(TAG, "ongoing FGS microphone type refused: ${e.message}")
       // e.g. ForegroundServiceStartNotAllowedException (started while the app was
       // in the background) or a missing FGS-type permission. Try once more without
       // an explicit type before giving up.
     }
     return try {
       startForeground(notifId, notification)
+      currentFgsType = 0
+      android.util.Log.i(TAG, "ongoing FGS started (legacy, no type)")
       true
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+      android.util.Log.w(TAG, "ongoing FGS failed: ${e.message}")
       false
     }
   }

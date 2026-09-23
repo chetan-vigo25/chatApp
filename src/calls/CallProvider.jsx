@@ -570,8 +570,28 @@ export const CallProvider = ({ children }) => {
       // Re-fires on the ringing→connected transition (answeredAt flips), refreshing
       // the notification from "Calling…" to the live duration timer.
       startOngoingCallNotification(buildOngoingPayload());
-    } else {
-      // INCOMING-ringing (callee) / ENDED / IDLE → no ongoing notification.
+    } else if (state.status !== CALL_STATUS.INCOMING) {
+      // ENDED / IDLE → no ongoing notification.
+      //
+      // NEVER while an incoming call is RINGING. On Android the ongoing-call
+      // notification and the incoming ring are the SAME foreground service
+      // (CallForegroundService): the ring is handed to it so the OS cannot drop
+      // it when the app leaves the foreground. `stopOngoingCall()` stops that
+      // service — and a stopped foreground service takes its notification with
+      // it, which is the RING.
+      //
+      // The callee is exactly the case where `showOngoingNotif` is false while a
+      // call is ringing, so this branch fired on every incoming call and killed
+      // the ring ~700ms after it was posted. Measured on device:
+      //
+      //     16:36:16.455  playVibration … channel=calls_fullscreen_v2   (ring posted)
+      //     16:36:16.465  CallFgService: ring FGS started (type=2048)
+      //     16:36:17.156  No vibration for canceled notification        (ring gone)
+      //
+      // The phone vibrated and then showed NOTHING — no banner, nothing in the
+      // notification shade — and the call landed as "missed". It also made the
+      // module re-post the ring again and again, which is what Android answers
+      // with "Muting recently noisy" (the ringtone stops playing).
       stopOngoingCallNotification();
     }
   }, [
@@ -2263,12 +2283,13 @@ export const CallProvider = ({ children }) => {
           setTimeout(() => {
             actionsRef.current.restartEngineAudio && actionsRef.current.restartEngineAudio();
           }, 800);
-          // OUTGOING caller: the single pass above and the activation handler
-          // both race reportOutgoingConnected's LATE CallKit session activation
-          // and can miss — dead audio units until a manual Speaker toggle.
-          // Arm the bounded, self-gated recovery loop that keeps re-running the
-          // toggle's effective repair until audio is confirmed or attempts run
-          // out. No-op for incoming calls and the WebView engine.
+          // The single pass above and the activation handler both race CallKit's
+          // LATE session activation and can miss — dead audio units until a
+          // manual Speaker toggle. Arm the bounded, self-gated recovery loop
+          // that keeps re-running the toggle's effective repair until audio is
+          // confirmed or the 3 attempts run out. Armed for BOTH directions: the
+          // callee races CallKit's post-answer activation just as the caller
+          // races reportOutgoingConnected's. No-op on Android / WebView engine.
           actionsRef.current.scheduleOutgoingAudioRecovery
             && actionsRef.current.scheduleOutgoingAudioRecovery();
         }
@@ -3443,10 +3464,21 @@ export const CallProvider = ({ children }) => {
     if (oar.confirmed) return;
     const s = stateRef.current;
     if (Platform.OS !== 'ios' || !isNativeCallEngine()) return;
-    if (s.direction !== 'outgoing') return;
+    // BOTH directions. This ladder was originally armed for the caller only,
+    // because that is where the CallKit activation race was first seen. The
+    // RECEIVER loses the same race — and loses it more often: CallKit activates
+    // its audio session asynchronously after the answer, so the single 800ms
+    // `restartEngineAudio` on connect and the `onAudioSessionActivated` handler
+    // can BOTH land before the session is live. Everything then looks healthy
+    // (tracks 'live', call 'connected') and the call is silent both ways until
+    // the user toggles Speaker by hand — exactly the reported "iOS pe kabhi
+    // awaaz nahi aati", and exactly what this ladder already repairs for the
+    // caller. Every pass is idempotent and the loop stops the moment audio is
+    // confirmed, so running it for an incoming call adds no new behaviour, only
+    // the retries the receiver never had.
     if (s.status !== CALL_STATUS.ACTIVE || s.reconnecting) return;
     oar.attempts += 1;
-    if (__DEV__) console.log('[CALL][APP][audio] outgoing audio recovery pass', oar.attempts, '/ 3');
+    if (__DEV__) console.log('[CALL][APP][audio] call audio recovery pass', oar.attempts, '/ 3', { dir: s.direction });
     try { audioSessionDidActivate(); } catch (_) { /* best-effort */ }
     restartEngineAudio();
     reassertSpeakerRoute();
@@ -3470,7 +3502,6 @@ export const CallProvider = ({ children }) => {
 
   const scheduleOutgoingAudioRecovery = useCallback(() => {
     if (Platform.OS !== 'ios' || !isNativeCallEngine()) return;
-    if (stateRef.current.direction !== 'outgoing') return;
     const oar = outgoingAudioRecoveryRef.current;
     if (oar.timer) clearTimeout(oar.timer);
     oar.attempts = 0;
@@ -3648,7 +3679,24 @@ export const CallProvider = ({ children }) => {
       // 1:1-ONLY guard. A conference invite must never be suppressed by it: the
       // "peer" on a conference ring is the HOST, so a 1:1 with that same host that
       // ended seconds earlier would otherwise swallow a genuine conference invite.
+      //
+      // FRESH-RING EXCEPTION — the same `ts` test the conference branch above
+      // already uses, for the same reason.
+      //
+      // This guard exists to swallow a STALE re-delivery of the ring we just
+      // ended (a queued VoIP push, a socket replay). Those carry the ORIGINAL
+      // ring's `ts`, minted BEFORE our end. A ring the backend minted AFTER our
+      // end is a real, new call — someone dialling us again — and swallowing it
+      // loses the call completely: no banner, nothing in the notification shade,
+      // nothing in the app when it is opened. Observed on device: a callback
+      // placed a couple of seconds after a missed call vanished with only
+      // "incoming for a just-ended call — dismissing, not re-ringing" in the log.
+      //
+      // A lost call is far worse than a redundant re-ring, so a fresh ring always
+      // wins. The peer guard now only blocks a ring that is genuinely stale.
+      const ringMintedAfterOurEnd = Number(payload?.ts || 0) > (re.ts || 0);
       const peerHit = !payload?.isGroup && !payload?.isConference
+        && !ringMintedAfterOurEnd
         && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
         && re.peerId === callerId && Date.now() - re.ts < PEER_REDIAL_GUARD_MS;
       if ((idHit && !conferenceReinvite) || peerHit) {
@@ -4448,6 +4496,15 @@ export const CallProvider = ({ children }) => {
         pushName: data?.callerPushName || data?.callerName || null,
         mobile: data?.callerMobile || null,
         avatar: data?.callerImage || null,
+        // Privacy bits — every call push now carries them (backend 2026-09-23).
+        // Dropping them here made a push-first ring resolve a hidden caller to my
+        // saved contact name until the socket ring arrived. hideContact stays
+        // undefined when the push has no flag, so buildIncomingPeer keeps what it
+        // already knows instead of reading "not hidden".
+        userName: data?.callerUserName || null,
+        hideContact: data?.callerHideContact != null && data?.callerHideContact !== ''
+          ? flag(data.callerHideContact)
+          : undefined,
       },
       callId: data?.callId || null, // signaling id → onSignalIncoming stores as signalId
       media: data?.callType || data?.media || 'audio',

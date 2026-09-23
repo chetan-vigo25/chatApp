@@ -160,6 +160,7 @@
       "./plugins/withNotificationServiceExtension",
       "./plugins/withIosVoip",
       "./plugins/withIosPrivacyScreen",
+      "./plugins/withCallKeepAndroidInteropFix",
       [
         "@config-plugins/react-native-webrtc",
         {
