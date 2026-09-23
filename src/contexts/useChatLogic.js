@@ -193,6 +193,22 @@ export const buildPrivateChatId = (a, b) => {
   return `u_${[left, right].sort().join('_')}`;
 };
 
+// The inverse of buildPrivateChatId: recover the OTHER participant from the id.
+// A private thread id already names both sides, so even a route that carried
+// nothing but a chatId can still resolve who the chat is with — which is what
+// keeps ChatScreen off its "User information is missing" dead end.
+// A self-chat (`u_X_X`) correctly resolves the peer to yourself.
+export const peerIdFromPrivateChatId = (chatId, myUserId) => {
+  const id = chatId == null ? '' : String(chatId);
+  const me = myUserId == null ? '' : String(myUserId);
+  if (!id.startsWith('u_') || !me) return null;
+  const parts = id.slice(2).split('_').filter(Boolean);
+  if (parts.length !== 2) return null;
+  if (parts[0] === me) return parts[1];
+  if (parts[1] === me) return parts[0];
+  return null;
+};
+
 // Private chat ids are minted as `u_<userA>_<userB>` and the two participants may
 // have opposite orderings locally. Compare by the participant set so a message
 // arriving as `u_A_B` is not dropped on a receiver whose local id is `u_B_A`.
@@ -496,28 +512,38 @@ export default function useChatLogic({ navigation, route }) {
   const knownChatRow = useRealtimeChatSlice(
     useCallback((st) => (lookupChatId ? (st?.chatMap?.[lookupChatId] || null) : null), [lookupChatId])
   );
-  // Preserve chatType + group fields from the route item
-  const isGroupChat = item?.chatType === 'group' || item?.isGroup || Boolean(item?.group);
+  // Preserve chatType + group fields from the route item. The locally known row
+  // is consulted too: a route that carried nothing but a chatId (a stale push, a
+  // deep link) would otherwise be treated as a PRIVATE chat, find no peer, and
+  // land on the "User information is missing" screen even for a group we know.
+  const isGroupChat = item?.chatType === 'group' || item?.isGroup || Boolean(item?.group)
+    || (!item?.chatType && (knownChatRow?.chatType === 'group' || Boolean(knownChatRow?.isGroup)));
   // Broadcast channel: a one-way, read-only chat. It has no peer and no group —
   // its branding (name/logo/verified) rides on the chat-list item, so carry it
   // onto chatData explicitly (otherwise the header falls back to "Group").
-  const isBroadcastChat = item?.chatType === 'broadcast' || Boolean(item?.isBroadcast);
+  const isBroadcastChat = item?.chatType === 'broadcast' || Boolean(item?.isBroadcast)
+    || (!item?.chatType && (knownChatRow?.chatType === 'broadcast' || Boolean(knownChatRow?.isBroadcast)));
   const chatTypeField = item?.chatType || (isGroupChat ? 'group' : (isBroadcastChat ? 'broadcast' : 'private'));
+  // `item` is optional throughout: a chat can be opened with nothing but a
+  // chatId, in which case the locally known row supplies the branding.
   const broadcastFields = isBroadcastChat ? {
     isBroadcast: true,
     readOnly: true,
-    broadcastChannelId: item.broadcastChannelId || item.chatId || item._id || null,
-    chatName: item.chatName || item.broadcastChannel?.name || null,
-    chatAvatar: item.chatAvatar || item.broadcastChannel?.avatarUrl || null,
-    groupName: item.chatName || null,
-    groupAvatar: item.chatAvatar || null,
-    isVerified: item.isVerified ?? item.broadcastChannel?.isVerified ?? false,
+    broadcastChannelId: item?.broadcastChannelId || item?.chatId || item?._id
+      || knownChatRow?.broadcastChannelId || lookupChatId || null,
+    chatName: item?.chatName || item?.broadcastChannel?.name || knownChatRow?.chatName || null,
+    chatAvatar: item?.chatAvatar || item?.broadcastChannel?.avatarUrl || knownChatRow?.chatAvatar || null,
+    groupName: item?.chatName || knownChatRow?.chatName || null,
+    groupAvatar: item?.chatAvatar || knownChatRow?.chatAvatar || null,
+    isVerified: item?.isVerified ?? item?.broadcastChannel?.isVerified ?? knownChatRow?.isVerified ?? false,
   } : {};
   // Live group metadata overlay — updated in realtime when an admin/owner
   // changes the group name/avatar/description while this chat is open, so the
   // header reflects it instantly. Keyed by groupId so it never leaks to another chat.
   const [liveGroupMeta, setLiveGroupMeta] = useState(null);
-  const _gid = isGroupChat ? (item.groupId || item.group?._id) : null;
+  const _gid = isGroupChat
+    ? (item?.groupId || item?.group?._id || knownChatRow?.groupId || knownChatRow?.group?._id || lookupChatId)
+    : null;
   const _meta = (liveGroupMeta && _gid && String(liveGroupMeta.groupId) === String(_gid)) ? liveGroupMeta : null;
   const _liveName = _meta?.name;
   const _liveAvatar = _meta?.avatar;
@@ -525,17 +551,18 @@ export default function useChatLogic({ navigation, route }) {
     isGroup: true,
     groupId: _gid,
     group: {
-      ...(item.group || {}),
+      ...(knownChatRow?.group || {}),
+      ...(item?.group || {}),
       ...(_liveName != null ? { name: _liveName } : {}),
       ...(_liveAvatar != null ? { avatar: _liveAvatar } : {}),
       ...(_meta?.description != null ? { description: _meta.description } : {}),
     },
-    chatName: _liveName || item.chatName || item.group?.name || knownChatRow?.chatName,
-    chatAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar || knownChatRow?.chatAvatar,
-    groupName: _liveName || item.chatName || item.group?.name || knownChatRow?.chatName,
-    groupAvatar: _liveAvatar || item.chatAvatar || item.group?.avatar || knownChatRow?.chatAvatar,
-    members: item.members,
-    memberCount: item.members?.length || item.memberCount,
+    chatName: _liveName || item?.chatName || item?.group?.name || knownChatRow?.chatName,
+    chatAvatar: _liveAvatar || item?.chatAvatar || item?.group?.avatar || knownChatRow?.chatAvatar,
+    groupName: _liveName || item?.chatName || item?.group?.name || knownChatRow?.chatName,
+    groupAvatar: _liveAvatar || item?.chatAvatar || item?.group?.avatar || knownChatRow?.chatAvatar,
+    members: item?.members || knownChatRow?.members,
+    memberCount: item?.members?.length || item?.memberCount || knownChatRow?.memberCount,
   } : {};
 
   // Group chats take priority — even if peerUser exists on the item, treat as group.
@@ -547,14 +574,51 @@ export default function useChatLogic({ navigation, route }) {
   const chatData = useMemo(() => {
     // Gap-fill the peer from the locally known chat row (see knownChatRow).
     const rowPeer = knownChatRow?.peerUser || null;
-    const peerUser = (normalizedPeerUser || rowPeer)
+
+    // LAST-RESORT peer, rebuilt from whatever flat fields the route carried.
+    //
+    // The REST chat list (Redux `chat.chatsData`) has NO `peerUser` object at
+    // all — it ships `peerUserId` + `chatName` + `chatAvatar` and nothing else.
+    // RealtimeChatContext rebuilds a peer when it ingests that payload; this
+    // hook never did. So any screen that hands us a row straight off the REST
+    // list (the share picker and the forward picker each merge both sources)
+    // arrived with no peer, and the chat dead-ended on "Unable to load chat.
+    // User information is missing." whenever `knownChatRow` couldn't cover for
+    // it — on a cold start, or for a chat only the REST list knows about.
+    // Reproduced on device 2026-09-23 with exactly that row shape.
+    //
+    // And when even the id is absent, the chat id itself names both sides
+    // (`u_<a>_<b>`), so the peer is still recoverable from a bare chatId.
+    const cachedMe = getCachedUserInfoSync();
+    const flatSource = item || knownChatRow || null;
+    const flatPeerId = (!isGroupChat && !isBroadcastChat)
+      ? (normalizeId(flatSource?.peerUserId)
+        || normalizeId(flatSource?.otherUser)
+        || normalizeId(knownChatRow?.peerUserId)
+        || peerIdFromPrivateChatId(lookupChatId, cachedMe?._id || cachedMe?.id))
+      : null;
+    const flatPeer = flatPeerId
       ? {
+          ...(flatSource?.otherUser || {}),
+          _id: flatPeerId,
+          fullName: flatSource?.otherUser?.fullName || flatSource?.chatName || '',
+          profileImage: flatSource?.otherUser?.profileImage || flatSource?.chatAvatar || '',
+          mobileNumber: flatSource?.otherUser?.mobileNumber || flatSource?.mobileNumber || '',
+        }
+      : null;
+
+    const peerUser = (normalizedPeerUser || rowPeer || flatPeer)
+      ? {
+          ...(flatPeer || {}),
           ...(rowPeer || {}),
           ...(normalizedPeerUser || {}),
-          _id: normalizedPeerUser?._id || rowPeer?._id || null,
-          fullName: normalizedPeerUser?.fullName || rowPeer?.fullName || knownChatRow?.chatName || '',
-          profileImage: normalizedPeerUser?.profileImage || rowPeer?.profileImage || knownChatRow?.chatAvatar || '',
-          mobileNumber: normalizedPeerUser?.mobileNumber || rowPeer?.mobileNumber || '',
+          _id: normalizedPeerUser?._id || rowPeer?._id || flatPeer?._id || null,
+          fullName: normalizedPeerUser?.fullName || rowPeer?.fullName || knownChatRow?.chatName
+            || flatPeer?.fullName || '',
+          profileImage: normalizedPeerUser?.profileImage || rowPeer?.profileImage
+            || knownChatRow?.chatAvatar || flatPeer?.profileImage || '',
+          mobileNumber: normalizedPeerUser?.mobileNumber || rowPeer?.mobileNumber
+            || flatPeer?.mobileNumber || '',
         }
       : null;
     return (
@@ -564,9 +628,13 @@ export default function useChatLogic({ navigation, route }) {
         ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
         : (item && peerUser)
           ? { peerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
-          : (peerUser ? { peerUser, chatId: routeChatId || null, chatType: chatTypeField } : { peerUser: null, chatId: null, chatType: 'private' })
+          // Keep the thread id even with no peer at all: messages can still load,
+          // and the id is what lets a later hydration fill the header in.
+          : (peerUser
+            ? { peerUser, chatId: routeChatId || null, chatType: chatTypeField }
+            : { peerUser: null, chatId: lookupChatId || null, chatType: 'private' })
     );
-  }, [item, user, routeChatId, liveGroupMeta, knownChatRow]);
+  }, [item, user, routeChatId, liveGroupMeta, knownChatRow, lookupChatId, isGroupChat, isBroadcastChat]);
 
   // True when this is a group chat the current user has left or been removed
   // from — used to disable the message input (you can no longer send messages).
@@ -830,6 +898,32 @@ export default function useChatLogic({ navigation, route }) {
       ChatCache.updateMessage(chatIdRef.current, tempId, { status: 'failed' });
     } catch { /* cache is best-effort */ }
     SqliteWriter.enqueue('updateMessageStatus', { id: tempId, status: 'failed' }).catch(() => {});
+  }, []);
+
+  // Kick the upload queue again shortly after a TRANSIENT failure.
+  //
+  // The queue flush otherwise only runs on a socket reconnect or when the chat
+  // is reopened. A plain network blip on an otherwise healthy connection is
+  // neither, so the re-send waited for the user to navigate away and back —
+  // which is exactly what made a shared photo sit there looking broken and
+  // then "fix itself" when they returned to the chat.
+  const mediaRetryTimersRef = useRef(new Map());
+  const scheduleMediaRetry = useCallback((tempId, attempt = 0) => {
+    if (!tempId) return;
+    const timers = mediaRetryTimersRef.current;
+    if (timers.has(tempId)) clearTimeout(timers.get(tempId));
+    // 3s, 6s, 12s, 24s — long enough for a flapping link to settle, short
+    // enough that the bubble never looks stuck.
+    const delay = Math.min(3000 * (2 ** Math.max(0, attempt)), 24000);
+    const timer = setTimeout(() => {
+      timers.delete(tempId);
+      try { flushQueuedMediaUploadsRef.current?.().catch(() => {}); } catch { /* best effort */ }
+    }, delay);
+    timers.set(tempId, timer);
+  }, []);
+  useEffect(() => () => {
+    mediaRetryTimersRef.current.forEach((t) => clearTimeout(t));
+    mediaRetryTimersRef.current.clear();
   }, []);
 
   // tempId -> true for uploads the user paused (mirrors the durable
@@ -9215,8 +9309,29 @@ export default function useChatLogic({ navigation, route }) {
           }
           return { success: false, paused: true };
         }
-        markMediaFailed(tempId);
-        return { success: false, error: payloadData?.message || 'upload failed' };
+        // THROW instead of failing the bubble here.
+        //
+        // The upload is dispatched as a Redux `createAsyncThunk`, and a thunk
+        // that calls rejectWithValue RESOLVES with a rejected action — it never
+        // throws. So a plain network failure landed on this branch, not in the
+        // catch below, and skipped every bit of the retry machinery: the bubble
+        // went straight to "Failed — tap to retry" while the kill-safe queue row
+        // (persisted before the upload) quietly re-sent it on the next flush.
+        // That is the "Retry dikhta hai, phir back aane par sent" report.
+        // Routing it through the catch gives it the same classification,
+        // re-queue and backoff every other failure gets.
+        const uploadFailure = new Error(
+          (typeof payloadData === 'string'
+            ? payloadData
+            : (payloadData?.message || payloadData?.error)) || 'upload failed',
+        );
+        // Keep the HTTP status so a genuine 4xx is still treated as permanent.
+        // `status` on this payload is sometimes the boolean success flag, so only
+        // a plausible HTTP code counts — Number(true) would otherwise arrive as
+        // "status 1" and make every failure look like a server verdict.
+        const rawStatus = Number(payloadData?.statusCode || payloadData?.status || 0);
+        if (rawStatus >= 100 && rawStatus <= 599) uploadFailure.statusCode = rawStatus;
+        throw uploadFailure;
       }
 
       setUploadProgress((prev) => ({ ...prev, [tempId]: 1 }));
@@ -9385,7 +9500,23 @@ export default function useChatLogic({ navigation, route }) {
         return { success: false, paused: true };
       }
 
-      const isNetworkFailure = /network request failed|timeout|aborted|socket not connected/i.test(message);
+      const httpStatus = Number(
+        err?.statusCode || err?.status || err?.response?.status || 0,
+      );
+      // NOTE the exact strings. Our own uploader (Config/Https.js `xhrUpload`)
+      // rejects a transport failure with "Network error" and a timeout with
+      // "Request timed out", and a rejected upload thunk that carried no message
+      // of its own surfaces the generic "upload failed" — none of which matched
+      // the old "network request failed" pattern, so the app's most common
+      // upload failures were not classified as retryable at all.
+      //
+      // A status of 0 means the request never got an answer (transport). 408 and
+      // 429 are the server telling us to come back later. Anything else with a
+      // real status is the server's verdict, not a blip.
+      const isNetworkFailure =
+        /network request failed|network error|failed to fetch|request timed out|timeout|aborted|socket not connected|upload failed/i
+          .test(message)
+        && (!httpStatus || httpStatus === 408 || httpStatus === 429 || httpStatus >= 500);
 
       // A 4xx is the server saying this upload will NEVER succeed — blocked file
       // type, too large, malformed. The kill-safe queue row was persisted BEFORE
@@ -9412,16 +9543,28 @@ export default function useChatLogic({ navigation, route }) {
         fileName: file?.name,
       });
 
-      markMediaFailed(tempId);
+      // A TRANSIENT transport error is not something the user has to act on —
+      // the block below re-queues the task and it is retried automatically (and
+      // usually succeeds on the next attempt; the receiver gets the media fine).
+      // Painting "Failed — tap to retry" here regardless is what made a shared
+      // photo/file look broken the moment it was sent, only to show as sent
+      // once the user left the chat and came back (reopening the chat repaints
+      // every still-queued row as 'sending' — see rehydratePendingUploadBubbles).
+      // Keep the sending spinner while a retry is still coming; the bubble only
+      // goes red once the retry budget is spent or the server refused the file
+      // outright.
+      const queueSnapshot = [...(queuedMediaUploadsRef.current || [])];
+      const existingIndex = queueSnapshot.findIndex((item) => item?.tempId === tempId);
+      const nextRetries = Number((existingIndex >= 0 ? queueSnapshot[existingIndex]?.retries : 0) || 0);
+      const willAutoRetry = isNetworkFailure && nextRetries < MEDIA_UPLOAD_MAX_RETRIES;
+      if (!willAutoRetry) markMediaFailed(tempId);
 
       // The queue row was persisted BEFORE the upload started (kill-safe), so
       // any failure — network or otherwise — leaves it in place for the
       // reconnect flush / manual retry. Keep the chunk session on the row so a
       // large upload resumes instead of restarting.
       if (isNetworkFailure) {
-        const queue = [...(queuedMediaUploadsRef.current || [])];
-        const existingIndex = queue.findIndex((item) => item?.tempId === tempId);
-        const nextRetries = Number((existingIndex >= 0 ? queue[existingIndex]?.retries : 0) || 0);
+        const queue = queueSnapshot;
         const task = {
           tempId,
           chatId: chatIdRef.current,
@@ -9438,6 +9581,7 @@ export default function useChatLogic({ navigation, route }) {
         else queue.push(task);
         queuedMediaUploadsRef.current = queue;
         await persistMediaUploadQueue(queue);
+        if (willAutoRetry) scheduleMediaRetry(tempId, nextRetries);
       } else if (isPermanentRejection) {
         console.warn('[SEND MEDIA] permanent rejection — not retrying', {
           status: rejectionStatus,
@@ -9518,7 +9662,17 @@ export default function useChatLogic({ navigation, route }) {
               return m;
             }
             // Upload never completed while online → a real failure the user
-            // should be able to retry.
+            // should be able to retry — UNLESS the task is still sitting in the
+            // upload queue with retries left. This watchdog runs from `finally`,
+            // so it fires 12s after a transient transport error too, and would
+            // otherwise undo the whole point of keeping the bubble on 'sending'
+            // while the automatic re-send is still coming.
+            const stillQueued = (queuedMediaUploadsRef.current || []).some(
+              (q) => q?.tempId === tempId
+                && Number(q?.retries || 0) < MEDIA_UPLOAD_MAX_RETRIES
+                && q?.paused !== true && q?.cancelled !== true,
+            );
+            if (stillQueued) return m;
             if (m.status === 'sending' || m.status === 'uploading') {
               changed = true;
               return { ...m, status: 'failed' };
@@ -9548,6 +9702,7 @@ export default function useChatLogic({ navigation, route }) {
     validateMediaMessagePayload,
     sendMessageViaSocket,
     persistMediaUploadQueue,
+    scheduleMediaRetry,
   ]);
 
   /* ========== WhatsApp-style media album send ==========
@@ -9758,10 +9913,13 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     if (!isConnected) {
+      // Queued, not failed — the single-media path already keeps the sending
+      // ring here (NetInfo reports false for a beat on a cold start, which is
+      // exactly when a share sends), and an album must behave the same.
       await queueAlbumTask();
       setAllMessages((prev) => prev.map((m) => (
         m.tempId === tempId
-          ? { ...m, status: 'failed', payload: { ...(m.payload || {}), uploadQueued: true } }
+          ? { ...m, status: 'sending', payload: { ...(m.payload || {}), uploadQueued: true } }
           : m
       )));
       return { success: false, queued: true, error: 'offline queued' };
@@ -9962,9 +10120,16 @@ export default function useChatLogic({ navigation, route }) {
       const failedCount = results.length - uploaded.length;
 
       if (!uploaded.length) {
-        markMediaFailed(tempId);
-        const allNetwork = results.every((r) => /network request failed|timeout|aborted/i.test(String(r?.error || '')));
-        if (allNetwork) await queueAlbumTask();
+        // Same widened pattern as the single-media path — our uploader says
+        // "Network error" / "Request timed out", and "upload failed" is what a
+        // rejected upload thunk surfaces.
+        const allNetwork = results.every((r) => /network request failed|network error|failed to fetch|request timed out|timeout|aborted|socket not connected|upload failed/i.test(String(r?.error || '')));
+        if (allNetwork) {
+          await queueAlbumTask();
+          scheduleMediaRetry(tempId, 0);
+        } else {
+          markMediaFailed(tempId);
+        }
         return { success: false, error: 'all uploads failed' };
       }
 
@@ -10121,9 +10286,13 @@ export default function useChatLogic({ navigation, route }) {
       if (isUploadPaused(tempId)) {
         return { success: false, paused: true };
       }
-      markMediaFailed(tempId);
-      if (/network request failed|timeout|aborted|socket not connected/i.test(message)) {
+      // Same rule as the single-media path: a transient transport error is
+      // retried automatically, so don't tell the user it failed yet.
+      const albumRetryable = /network request failed|network error|timeout|aborted|socket not connected/i.test(message);
+      if (!albumRetryable) markMediaFailed(tempId);
+      if (albumRetryable) {
         await queueAlbumTask();
+        scheduleMediaRetry(tempId, 0);
       }
       return { success: false, error: message };
     } finally {
@@ -10149,6 +10318,7 @@ export default function useChatLogic({ navigation, route }) {
     getOrCreateDeviceId,
     sendMessageViaSocket,
     persistMediaUploadQueue,
+    scheduleMediaRetry,
   ]);
 
   const flushQueuedMediaUploads = useCallback(async () => {
@@ -10213,6 +10383,12 @@ export default function useChatLogic({ navigation, route }) {
         const retries = Number(item?.retries || 0);
         if (retries >= MEDIA_UPLOAD_MAX_RETRIES) {
           doneIds.add(item?.tempId);
+          // Budget spent — THIS is the moment the bubble legitimately turns red.
+          // sendMedia no longer marks a retryable network error as failed, so
+          // without this the row would be dropped from the queue while still
+          // showing a spinner (the orphan reconciler would only catch it a
+          // minute later, on the next chat read).
+          markMediaFailed(item?.tempId);
           continue;
         }
 
@@ -10239,6 +10415,9 @@ export default function useChatLogic({ navigation, route }) {
           // as-is (park flag already persisted); parking never burns a retry.
         } else {
           retryPatch.set(item?.tempId, retries + 1);
+          // Keep the ladder going without waiting for a reconnect or a reopen.
+          if (retries + 1 < MEDIA_UPLOAD_MAX_RETRIES) scheduleMediaRetry(item?.tempId, retries + 1);
+          else markMediaFailed(item?.tempId);
         }
       }
 
@@ -10255,7 +10434,7 @@ export default function useChatLogic({ navigation, route }) {
       mediaUploadQueueInFlightRef.current = false;
       globalMediaFlushInFlight = false;
     }
-  }, [isConnected, persistMediaUploadQueue, sendMedia, sendMediaGroup]);
+  }, [isConnected, persistMediaUploadQueue, sendMedia, sendMediaGroup, markMediaFailed, scheduleMediaRetry]);
 
   flushQueuedMediaUploadsRef.current = flushQueuedMediaUploads;
 

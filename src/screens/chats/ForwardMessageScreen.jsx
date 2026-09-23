@@ -383,9 +383,16 @@ export default function ForwardMessageScreen({ navigation, route }) {
 
         if (targetChat) {
           const isGroup = targetChat?.chatType === 'group' || targetChat?.isGroup;
+          // The REST chat list carries `peerUserId` and no `peerUser` object, so
+          // reading only `peerUser._id` minted `u_<me>_unknown` — a thread id
+          // that matches nothing. Take the peer id from either shape, and fall
+          // back to the row's own chatId rather than inventing one.
+          const peerId = targetChat?.peerUser?._id || targetChat?.peerUserId || null;
           const navChatId = isGroup
             ? (targetChat.groupId || targetChat.group?._id || targetChat._id || targetChat.chatId)
-            : `u_${[String(currentUserId), String(targetChat?.peerUser?._id || 'unknown')].sort().join('_')}`;
+            : (peerId
+              ? `u_${[String(currentUserId), String(peerId)].sort().join('_')}`
+              : (targetChat.chatId || targetChat._id || null));
 
           showToast(`Message${msgCount > 1 ? 's' : ''} forwarded`);
 
