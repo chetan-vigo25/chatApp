@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
-import { Platform } from 'react-native';
-import { useShareIntentContext } from 'expo-share-intent';
+import { AppState, Platform } from 'react-native';
+import { ShareIntentModule, useShareIntentContext } from 'expo-share-intent';
+import * as Linking from 'expo-linking';
 
 import { navigationRef } from '../Redux/Services/navigationService';
 import { getStoredSession } from '../services/sessionManager';
@@ -42,6 +43,47 @@ const isBootingRoute = () => {
 
 export default function ShareIntentGate() {
   const { hasShareIntent, shareIntent, resetShareIntent } = useShareIntentContext();
+
+  // iOS ONLY — re-arm the native read on EVERY share.
+  //
+  // The share extension always opens the same url: `talkstry://dataUrl=talkstryShareKey#media`.
+  // The key is a constant, so the string never differs between shares. Meanwhile
+  // expo-share-intent only reads the App Group when expo-linking's
+  // `useLinkingURL()` STATE changes — and React bails out of a setState with an
+  // identical string, so that effect never re-ran. The first share of a session
+  // worked (null → url) and every later one was dropped on the floor: the share
+  // extension flashed open, wrote the file, opened the url, and the app ignored
+  // it. (Verified on device: the native url event fires every time; the library
+  // logs nothing, and a manual getShareIntent() immediately produced the share
+  // that had been sitting unread in the App Group.)
+  //
+  // A share that arrives from ANOTHER app still recovered, because launching us
+  // is a background→active transition and the library re-reads on that. Sharing
+  // our own QR into TalksTry does not: the extension is presented inside our own
+  // window, we never leave the foreground, and the url event is the only signal
+  // there is. So read the App Group from that event ourselves. Android is
+  // untouched — it re-reads the intent on its own.
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return undefined;
+    const pull = (url) => {
+      // Only the share-extension handoff url; a normal deep link has no payload.
+      if (!url || !url.includes('://dataUrl=')) return;
+      console.log('[SHARE] ios re-read app group', { url });
+      // Harmless when nothing is waiting: the native side answers "empty" and
+      // emits no event, so this can't replay a share we already consumed.
+      try { ShareIntentModule?.getShareIntent(url); } catch (_) {}
+    };
+    const urlSub = Linking.addEventListener('url', (event) => pull(event?.url));
+    // Coming back from the share sheet is the other moment content can be
+    // waiting — the extension writes the App Group BEFORE it opens the url, and
+    // a url that never changed can't wake the library by itself.
+    const appSub = AppState.addEventListener('change', (next) => {
+      if (next !== 'active') return;
+      try { pull(Linking.getLinkingURL?.()); } catch (_) {}
+    });
+    return () => { urlSub?.remove?.(); appSub?.remove?.(); };
+  }, []);
+
   const handlingRef = useRef(false);
   const unmountedRef = useRef(false);
 
