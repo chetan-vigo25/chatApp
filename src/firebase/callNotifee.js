@@ -151,6 +151,14 @@ const emitCallAction = (action, data) => {
     callerName: data?.callerName || null,
     callerImage: data?.callerImage || null,
     callType: data?.callType || data?.media || 'audio',
+    // Identity/privacy bits when the source has them (a replayed push does; the
+    // native notification intent doesn't — CallProvider then reads an "@handle"
+    // name as hidden). Dropping them made the ring resolve to a phonebook name.
+    ...(data?.callerUserName ? { callerUserName: data.callerUserName } : {}),
+    ...(data?.callerHideContact != null && data?.callerHideContact !== ''
+      ? { callerHideContact: String(data.callerHideContact) } : {}),
+    ...(data?.callerPushName ? { callerPushName: data.callerPushName } : {}),
+    ...(data?.callerMobile ? { callerMobile: data.callerMobile } : {}),
     _fullScreen: true,
   };
   if (action === 'decline') {

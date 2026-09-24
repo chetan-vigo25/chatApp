@@ -54,7 +54,7 @@ class CallForegroundService : Service() {
     val callId = intent?.getStringExtra(EXTRA_CALL_ID)
     if (callId.isNullOrBlank()) {
       startHandled()
-      stopSelf()
+      stopSelf(startId)
       return START_NOT_STICKY
     }
     val name = intent.getStringExtra(EXTRA_CALLER_NAME)?.takeIf { it.isNotBlank() } ?: "Ongoing call"
@@ -92,7 +92,13 @@ class CallForegroundService : Service() {
     if (startHandled()) {
       android.util.Log.i(TAG, "applying stop() that arrived while this start was pending")
       stopForegroundCompat()
-      stopSelf()
+      // stopSelf(startId), NOT stopSelf(): during a ring re-post burst another
+      // startForegroundService() can already be queued behind this one. A plain
+      // stopSelf() destroyed the service under it → that start never reached
+      // startForeground → ForegroundServiceDidNotStartInTimeException, app killed
+      // mid-ring (2026-09-24). With the id, a newer start keeps the service alive
+      // and promotes it itself.
+      stopSelf(startId)
       return START_NOT_STICKY
     }
     if (!promoted) {

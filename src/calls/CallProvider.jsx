@@ -359,6 +359,7 @@ export const CallProvider = ({ children }) => {
   // cleared so the next call can never inherit a stale snapshot.
   const rtcStatsRef = useRef(null);
   const connectingRef = useRef(false);
+  const lastPopUpRef = useRef({ id: null, at: 0 }); // OS ring re-post throttle (see popUp)
   const htmlReadyRef = useRef(false);      // engine WebView HTML/SDK loaded
   const pendingConnectRef = useRef(null);  // { token, url } queued before HTML was ready
   const resetTimerRef = useRef(null);
@@ -3780,6 +3781,26 @@ export const CallProvider = ({ children }) => {
       // pull). That is by definition a "present this call" event, so a banner the
       // user swiped away earlier must come back with it.
       if (snap.bannerDismissed) dispatch({ type: ACT.SET_FLAG, key: 'bannerDismissed', value: false });
+      // Same caller, RICHER identity (the socket ring after a thin intent/push
+      // payload): refine the ringing peer. Without this the first, thinnest
+      // payload decided the name for the whole ring — a hidden caller stayed on
+      // my phonebook name even after the socket said hideContact:true.
+      const from = payload?.from || null;
+      if (from && snap.peer?.id && String(snap.peer.id) === String(callerId)) {
+        const handle = from.userName || from.publicUsername || from.username || null;
+        const hasHide = from.hideContact !== undefined && from.hideContact !== null;
+        const adds = (handle && handle !== snap.peer.userName)
+          || (hasHide && Boolean(from.hideContact) !== Boolean(snap.peer.hideContact))
+          || (from.mobile && !snap.peer.mobile);
+        if (adds) {
+          const refined = buildIncomingPeer({ ...from, id: callerId }, snap.peer);
+          dispatch({
+            type: ACT.SET_FLAG,
+            key: 'peer',
+            value: { ...snap.peer, ...refined, avatar: refined.avatar || snap.peer.avatar || null },
+          });
+        }
+      }
       // CallKit UUID CONVERGENCE for the engine-rang-first case. When the media
       // server's ring stages the call, it reports CallKit under the ENGINE callId
       // and mints its own uuid; if a VoIP push then reports the SAME logical call
@@ -4544,6 +4565,14 @@ export const CallProvider = ({ children }) => {
       return [];
     };
     const isConference = flag(data?.isConference);
+    // Thin payloads (the Android full-screen / notification-tap intent carries
+    // only callerName) have no privacy bits. The backend sends a caller who hides
+    // their details as name "@handle" on every channel — so read that as hidden,
+    // or the peer resolves to MY phonebook name for their number (the lock-screen
+    // ring showed "4422localtest" for "@jangid", 2026-09-24).
+    const redactedHandle = !data?.callerUserName && /^@\S+$/.test(String(data?.callerName || '').trim())
+      ? String(data.callerName).trim().slice(1)
+      : null;
     return {
       from: {
         id: data?.callerId ? String(data.callerId) : null,
@@ -4556,10 +4585,10 @@ export const CallProvider = ({ children }) => {
         // saved contact name until the socket ring arrived. hideContact stays
         // undefined when the push has no flag, so buildIncomingPeer keeps what it
         // already knows instead of reading "not hidden".
-        userName: data?.callerUserName || null,
+        userName: data?.callerUserName || redactedHandle || null,
         hideContact: data?.callerHideContact != null && data?.callerHideContact !== ''
           ? flag(data.callerHideContact)
-          : undefined,
+          : (redactedHandle ? true : undefined),
       },
       callId: data?.callId || null, // signaling id → onSignalIncoming stores as signalId
       media: data?.callType || data?.media || 'audio',
@@ -4979,6 +5008,16 @@ export const CallProvider = ({ children }) => {
       if (snap.status !== CALL_STATUS.INCOMING || snap.accepted || snap.answeredAt) return;
       const id = snap.signalId || snap.callId;
       if (!id) return;
+      // Over the lock screen the activity can flap active↔background every
+      // ~200ms while the ring is up; each 'active' re-posted the ring, which
+      // re-launched the full-screen activity — a loop (14 re-posts / 17 ring
+      // service starts in 3s, ringtone muted as "recently noisy", and it fed a
+      // service start/stop race that crashed the app, 2026-09-24). One re-post
+      // per open is enough: repeats inside 1.5s for the same call are that loop.
+      const now = Date.now();
+      const last = lastPopUpRef.current;
+      if (why === 'app-opened' && last.id === id && now - last.at < 1500) return;
+      lastPopUpRef.current = { id, at: now };
       // The notification channel carries the ringtone; silence the in-app one
       // so a foreground ring does not play two at once.
       stopRinging();
