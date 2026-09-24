@@ -5,6 +5,7 @@ import { Platform, NativeModules } from 'react-native';
 // (weak, collision-prone) is replaced with this. expo-crypto is not installed;
 // `uuid` + the crypto polyfill is the strongest option available in the build.
 import { v4 as uuidGen } from 'uuid';
+import { markCallEvent } from '../diagnostics/callDiagnostics';
 
 /**
  * Native phone-call UI bridge (CallKit on iOS / ConnectionService on Android)
@@ -150,6 +151,24 @@ export const registerCallUuid = (callId, uuid) => {
 };
 
 const callIdForUuid = (uuid) => uuidToId[String(uuid || '')] || null;
+
+/** The CallKit uuid already bound to this callId, or null (never mints one). */
+export const knownUuidFor = (callId) => idToUuid[String(callId || '')] || null;
+
+/**
+ * iOS: every call CallKit currently knows about (ALL apps + cellular), as
+ * { callUUID, outgoing, onHold, hasConnected, hasEnded }. Always resolves.
+ */
+export const getSystemCalls = () => {
+  if (Platform.OS !== 'ios' || !isAvailable()) return Promise.resolve([]);
+  try {
+    return Promise.resolve(RNCallKeep.getCalls())
+      .then((c) => (Array.isArray(c) ? c : []))
+      .catch(() => []);
+  } catch (_) {
+    return Promise.resolve([]);
+  }
+};
 
 const forget = (callId) => {
   const key = String(callId || '');
@@ -468,7 +487,10 @@ export const resetAll = () => {
  */
 export const registerEvents = (handlers = {}) => {
   if (!isAvailable()) return () => {};
-  const answer = ({ callUUID }) => handlers.onAnswer && handlers.onAnswer(callIdForUuid(callUUID));
+  const answer = ({ callUUID }) => {
+    markCallEvent('callkit:answer', { uuid: String(callUUID || ''), callId: callIdForUuid(callUUID) });
+    return handlers.onAnswer && handlers.onAnswer(callIdForUuid(callUUID));
+  };
   // Forward an endCall ONLY for the call's CURRENT uuid. CallKit can fire endCall
   // for (a) a STALE duplicate of the same call (uuid split between the JS socket
   // path and the VoIP push — ending the duplicate must not hang up the live call
@@ -477,6 +499,13 @@ export const registerEvents = (handlers = {}) => {
   // down the current call.
   const end = ({ callUUID }) => {
     const u = String(callUUID || '');
+    // Diagnostics: every CallKit end, with what we know about its uuid. A ring
+    // that "declines itself" in 3-4s (reported 2026-09-24) goes through here.
+    markCallEvent('callkit:end', {
+      uuid: u, selfEnded: wasSelfEnded(u), callId: callIdForUuid(u),
+      current: callIdForUuid(u) ? idToUuid[callIdForUuid(u)] : null,
+      known: Object.keys(idToUuid).length,
+    });
     // The echo of an end WE filed (finalizeEnd's endCall/endAllCalls, a stale-push
     // dismissIncoming, a uuid re-bind). It arrives 1-2s late, after the mapping is
     // gone, and a fresh ring can already be up by then — forwarding it declined the
@@ -505,7 +534,10 @@ export const registerEvents = (handlers = {}) => {
   // the WKWebView engine can legally start in the background. If we don't re-assert
   // our play-and-record session here, a CallKit-answered call can connect SILENT
   // (no in/out audio) until the app is foregrounded. These events carry no callUUID.
-  const audioOn = () => handlers.onAudioSessionActivated && handlers.onAudioSessionActivated();
+  const audioOn = () => {
+    markCallEvent('callkit:audioOn');
+    return handlers.onAudioSessionActivated && handlers.onAudioSessionActivated();
+  };
   const audioOff = () => handlers.onAudioSessionDeactivated && handlers.onAudioSessionDeactivated();
   try {
     // MUST be attached FIRST: RNCallKeep buffers every CallKit action that fired
@@ -517,6 +549,11 @@ export const registerEvents = (handlers = {}) => {
     // onto the same handlers as the live listeners.
     RNCallKeep.addEventListener('didLoadWithEvents', (events) => {
       if (!Array.isArray(events)) return;
+      markCallEvent('callkit:replay', events.map((e) => e && e.name));
+      // RNCallKeep re-sends its WHOLE buffer on every startObserving and never
+      // clears it on its own — so without this an old End from a previous call
+      // replays onto the next ring and "declines" it. We handle them now; drop them.
+      try { RNCallKeep.clearInitialEvents(); } catch (_) { /* older native module */ }
       events.forEach((event) => {
         if (!event || !event.name) return;
         const data = event.data || {};
@@ -565,4 +602,6 @@ export default {
   dismissIncoming,
   resetAll,
   registerEvents,
+  knownUuidFor,
+  getSystemCalls,
 };

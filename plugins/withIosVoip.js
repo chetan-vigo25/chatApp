@@ -156,6 +156,15 @@ const PUSHKIT_METHODS = `
     // Holding/DTMF are OFF: the WebView engine has no hold or keypad path, so
     // advertising them puts dead buttons on the CallKit screen (and a Hold from
     // the OS would silently break the call's audio session).
+    // Give CallKit a delegate BEFORE the ring goes up. On a killed app the JS
+    // bundle (and with it RN's RNCallKeep module) loads seconds after this push;
+    // until then the CXProvider had NO delegate, so an Answer tapped in that
+    // window was dropped ("[WARN] Asked to perform a delegate callback but no
+    // delegate queue exists") and CallKit sat on "Connecting…" forever — seen on
+    // device 2026-09-24. RNCallKeep is a singleton: its init builds the provider
+    // from the stored settings and sets itself as delegate, so the answer is now
+    // buffered until JS attaches; RN later reuses this same instance.
+    _ = RNCallKeep()
     RNCallKeep.reportNewIncomingCall(
       uuid,
       handle: callerName,

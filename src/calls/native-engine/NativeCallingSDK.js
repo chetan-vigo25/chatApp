@@ -444,7 +444,10 @@ export default class NativeCallingSDK {
   }
 
   _wire(s) {
-    s.on('users', (users) => { this._users = users || []; });
+    s.on('users', (users) => {
+      this._users = users || [];
+      this._redialOnLobbyChange();
+    });
 
     s.on('incomingCall', (p = {}) => {
       this._prunePendingIn();
@@ -832,6 +835,27 @@ export default class NativeCallingSDK {
     });
   }
 
+  // EVENT-driven redial. The retry loop runs on setInterval, and Android pauses
+  // JS timers while the activity is paused — so a caller who locked the phone /
+  // pocketed it right after dialing never re-dialed, and a callee that came
+  // online a few seconds later (killed app woken by push) rang with no media
+  // leg: answered → "Connecting…" → cut (reproduced 2026-09-24, iPhone callee).
+  // The media server broadcasts `users` whenever anyone (un)registers, and
+  // socket events are delivered even while timers are paused — so dial the
+  // moment our pending callee shows up in the lobby.
+  _redialOnLobbyChange() {
+    const target = this._dialTarget;
+    if (!target || this._out || this._acceptedId || (this._room && !this._room.preAnswer)) return;
+    // Only while THIS dial is still live: decline / accept / hangup all clear the
+    // retry loop, so a callee re-joining the lobby later is never re-rung.
+    if (!this._retryTimer) return;
+    if (!this._retryUntil || Date.now() > this._retryUntil) return; // ring window over
+    const present = (this._users || []).some((u) => u && String(u.id) === String(target));
+    if (!present) return;
+    this._log(`callee ${target} joined the lobby — dialing now`);
+    this._dial1to1Tick(target);
+  }
+
   // One retry-loop tick for a 1:1 dial. Two jobs, same mechanics:
   //  - REDIAL: callee was offline on the media server → first successful
   //    callUser puts the ring up the moment their engine registers.
@@ -876,7 +900,12 @@ export default class NativeCallingSDK {
         this._preJoinOut(res.roomId);
       }
       return false; // keep looping until answered/declined/window end
-    }).catch(() => false);
+    }).catch((e) => {
+      // Was silent: a redial that never succeeded left no trace at all, so a
+      // callee who "was ready" but never got the ring could not be diagnosed.
+      this._log(`redial to ${target} failed: ${(e && e.message) || e}`);
+      return false;
+    });
   }
 
   // Ring-time warm-up for an outgoing 1:1: join the room + build transports +

@@ -109,6 +109,9 @@ export const recordCallFailure = (reason, { context, engine } = {}) => {
   return writeChain;
 };
 
+/** The in-memory call event trace (oldest first) — for live debugging. */
+export const getCallTrace = () => trace.map((e) => ({ ...e, ago: Date.now() - e.t }));
+
 /** All saved reports, newest last (parsed). */
 export const readCallFailures = async () => {
   const lines = await readReports();
@@ -122,4 +125,8 @@ export const clearCallFailures = async () => {
   try { await FileSystem.deleteAsync(path, { idempotent: true }); } catch (_) { /* */ }
 };
 
-export default { markCallEvent, recordCallFailure, readCallFailures, clearCallFailures };
+// Dev: pull the live trace over Metro/CDP (`__callTrace()`), even from a
+// process a push cold-started before any debugger attached.
+if (__DEV__) globalThis.__callTrace = getCallTrace;
+
+export default { markCallEvent, recordCallFailure, readCallFailures, clearCallFailures, getCallTrace };

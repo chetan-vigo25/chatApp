@@ -62,6 +62,50 @@ const REPLACEMENTS = [
   ['startCall overload', START_FROM, START_TO],
 ];
 
+// ── iOS: RNCallKeep.m ──────────────────────────────────────────────────────
+// The AppDelegate now creates RNCallKeep on a VoIP push BEFORE React Native is
+// up (so CallKit has a delegate and an early Answer is not dropped — see
+// AppDelegate.swift). Its init registers an AVAudioSession route-change
+// observer that calls sendEventWithName: DIRECTLY; with no JS attached yet that
+// throws "RCTCallableJSModules is not set" and kills the app mid-ring
+// (reproduced 2026-09-24: "provider crashed", ring gone / call auto-ended).
+// A route event before JS listens is meaningless — drop it.
+const IOS_MODULE_REL = path.join(
+  'node_modules', 'react-native-callkeep', 'ios', 'RNCallKeep', 'RNCallKeep.m',
+);
+const IOS_ROUTE_FROM = `    if (output == nil) {
+        return;
+    }
+
+    [self sendEventWithName:RNCallKeepDidChangeAudioRoute body:@{`;
+const IOS_ROUTE_TO = `    if (output == nil) {
+        return;
+    }
+    // ${PATCH_MARKER}: no JS listener yet (VoIP-woken app) → sending would throw.
+    if (!_hasListeners) {
+        return;
+    }
+
+    [self sendEventWithName:RNCallKeepDidChangeAudioRoute body:@{`;
+
+function patchCallKeepIos(projectRoot) {
+  const target = path.join(projectRoot, IOS_MODULE_REL);
+  if (!fs.existsSync(target)) {
+    console.warn(`[withCallKeepAndroidInteropFix] not found, skipping: ${IOS_MODULE_REL}`);
+    return false;
+  }
+  const original = fs.readFileSync(target, 'utf8');
+  if (original.includes(IOS_ROUTE_TO)) return false;
+  if (!original.includes(IOS_ROUTE_FROM)) {
+    console.warn('[withCallKeepAndroidInteropFix] iOS anchor not found — RNCallKeep.m changed; '
+      + 're-check onAudioRouteChange before shipping.');
+    return false;
+  }
+  fs.writeFileSync(target, original.replace(IOS_ROUTE_FROM, IOS_ROUTE_TO));
+  console.log('[withCallKeepAndroidInteropFix] patched RNCallKeep.m (route event guard)');
+  return true;
+}
+
 function patchCallKeepModule(projectRoot) {
   const target = path.join(projectRoot, MODULE_REL);
 
@@ -102,20 +146,30 @@ function patchCallKeepModule(projectRoot) {
   return true;
 }
 
-const withCallKeepAndroidInteropFix = (config) =>
-  withDangerousMod(config, [
+const withCallKeepAndroidInteropFix = (config) => {
+  const withAndroid = withDangerousMod(config, [
     'android',
     (cfg) => {
       patchCallKeepModule(cfg.modRequest.projectRoot);
       return cfg;
     },
   ]);
+  return withDangerousMod(withAndroid, [
+    'ios',
+    (cfg) => {
+      patchCallKeepIos(cfg.modRequest.projectRoot);
+      return cfg;
+    },
+  ]);
+};
 
 module.exports = withCallKeepAndroidInteropFix;
 module.exports.patchCallKeepModule = patchCallKeepModule;
+module.exports.patchCallKeepIos = patchCallKeepIos;
 
 // Allow re-applying after `npm install` without a full prebuild:
 //   node plugins/withCallKeepAndroidInteropFix.js
 if (require.main === module) {
   patchCallKeepModule(path.join(__dirname, '..'));
+  patchCallKeepIos(path.join(__dirname, '..'));
 }

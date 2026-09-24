@@ -360,6 +360,7 @@ export const CallProvider = ({ children }) => {
   const rtcStatsRef = useRef(null);
   const connectingRef = useRef(false);
   const lastPopUpRef = useRef({ id: null, at: 0 }); // OS ring re-post throttle (see popUp)
+  const incomingSinceRef = useRef({ at: 0 }); // when the current incoming ring started (diagnostics)
   const htmlReadyRef = useRef(false);      // engine WebView HTML/SDK loaded
   const pendingConnectRef = useRef(null);  // { token, url } queued before HTML was ready
   const resetTimerRef = useRef(null);
@@ -476,6 +477,16 @@ export const CallProvider = ({ children }) => {
   useEffect(() => { callSession.publish(state); }, [state]);
   useEffect(() => { engineReadyRef.current = engineReady; }, [engineReady]);
   useEffect(() => { authedRef.current = !!isAuthenticated; }, [isAuthenticated]);
+  // Ring start time for the current incoming call (diagnostics: how fast a ring
+  // was rejected). Set once per ring, cleared when the call state resets.
+  useEffect(() => {
+    if (state.status === CALL_STATUS.INCOMING && !incomingSinceRef.current.at) {
+      incomingSinceRef.current = { at: Date.now() };
+      markCallEvent('ring:start', { signalId: state.signalId, callId: state.callId });
+    } else if (state.status === CALL_STATUS.IDLE) {
+      incomingSinceRef.current = { at: 0 };
+    }
+  }, [state.status, state.signalId, state.callId]);
 
   // This device's id — used to ignore a `call:cancelled-elsewhere` whose
   // `winnerDeviceId` is US (a stale duplicate socket of the winning device can
@@ -3174,11 +3185,21 @@ export const CallProvider = ({ children }) => {
     armMediaWatchdog();
   }, [state.pendingAccept, state.callId, state.status, state.accepted, state.media, state.isGroup, state.peer, sendCmd, armMediaWatchdog]);
 
-  const reject = useCallback(() => {
+  const reject = useCallback((sourceArg) => {
+    // Also used directly as an onPress handler (first arg = press event).
+    const source = typeof sourceArg === 'string' ? sourceArg : 'ui';
     const snap = stateRef.current;
+    const ringAgeMs = incomingSinceRef.current.at ? Date.now() - incomingSinceRef.current.at : null;
+    markCallEvent('reject', { source, callId: snap.callId, signalId: snap.signalId, status: snap.status, ringAgeMs });
+    // A ring that dies within seconds is the "call declined itself" report
+    // (2026-09-24). Save a report either way — a real quick Decline is cheap to
+    // tell apart in the trace (no callkit:end / source 'ui' from a tap).
+    if (snap.direction === 'incoming' && !snap.accepted && ringAgeMs != null && ringAgeMs < 10000) {
+      reportCallFailure(`incoming rejected ${ringAgeMs}ms after ringing (source: ${source})`);
+    }
     if (snap.callId) sendCmd({ cmd: CMD.REJECT, callId: snap.callId });
     finalizeEnd('rejected');
-  }, [finalizeEnd, sendCmd]);
+  }, [finalizeEnd, sendCmd, reportCallFailure]);
 
   const hangup = useCallback(() => {
     const snap = stateRef.current;
@@ -3190,7 +3211,7 @@ export const CallProvider = ({ children }) => {
     if (__DEV__) console.log('[CALL][APP] hangup() invoked', { platform: Platform.OS, status: snap.status, signalId: snap.signalId, callId: snap.callId });
     // Ringing incoming (not yet answered) → decline. Once answered (accepted,
     // connecting) or active → a normal hangup tear-down.
-    if (snap.status === CALL_STATUS.INCOMING && !snap.accepted) { reject(); return; }
+    if (snap.status === CALL_STATUS.INCOMING && !snap.accepted) { reject('hangup'); return; }
     // Conference HOST tapping End → choose (WhatsApp-style): just leave (host
     // migrates, call continues) or end the whole conference. Backend enforces
     // host-only on `call:conference:end` regardless of what the client claims.
@@ -5230,9 +5251,45 @@ export const CallProvider = ({ children }) => {
   }, [isAuthenticated, pullStillRingingInvites]);
 
   // Keep the latest action handles available to the native OS-call listeners.
+  // iOS SAFETY NET for a lost CallKit answer. Reproduced 2026-09-24: app killed
+  // + locked, VoIP ring, user answered on the lock screen — CallKit showed the
+  // call as answered but no answer event reached JS (no accept at all), so the
+  // app sat "ringing" behind a CallKit screen stuck on "Connecting…" until the
+  // caller gave up. CallKit itself knows the truth: our call's CXCall reports
+  // hasConnected once answered. Only OUR uuid counts — the observer also lists
+  // cellular / other apps' calls.
+  const acceptIfCallKitAnswered = useCallback((why) => {
+    if (Platform.OS !== 'ios' || !nativeCall.isAvailable()) return;
+    const snap = stateRef.current;
+    if (snap.status !== CALL_STATUS.INCOMING || snap.accepted || acceptingRef.current) return;
+    const mine = [snap.signalId, snap.callId]
+      .map((id) => nativeCall.knownUuidFor(id))
+      .filter(Boolean)
+      .map((u) => String(u).toLowerCase());
+    if (!mine.length) return;
+    nativeCall.getSystemCalls().then((calls) => {
+      const hit = calls.find((c) => c && !c.outgoing && c.hasConnected && !c.hasEnded
+        && mine.includes(String(c.callUUID || '').toLowerCase()));
+      if (!hit) return;
+      const cur = stateRef.current;
+      if (cur.status !== CALL_STATUS.INCOMING || cur.accepted || acceptingRef.current) return;
+      markCallEvent('callkit:answer-recovered', { why, uuid: hit.callUUID });
+      if (__DEV__) console.log('[CALL][APP] CallKit shows the call ANSWERED but no answer event reached JS — accepting now', { why });
+      accept();
+    });
+  }, [accept]);
+
+  // Poll while an iOS ring is up: covers an answer whose audio-session event
+  // was also missed. Cheap (CXCallObserver read), stops the moment we leave INCOMING.
+  useEffect(() => {
+    if (Platform.OS !== 'ios' || state.status !== CALL_STATUS.INCOMING || state.accepted) return undefined;
+    const iv = setInterval(() => acceptIfCallKitAnswered('poll'), 1500);
+    return () => clearInterval(iv);
+  }, [state.status, state.accepted, acceptIfCallKitAnswered]);
+
   actionsRef.current = {
     accept, reject, hangup, toggleMic, applyMic, reassertCallAudio, restartEngineAudio, pullStillRingingInvites,
-    reassertSpeakerRoute, scheduleOutgoingAudioRecovery,
+    reassertSpeakerRoute, scheduleOutgoingAudioRecovery, acceptIfCallKitAnswered,
   };
   onEngineEventRef.current = onEngineEvent;
 
@@ -5384,7 +5441,7 @@ export const CallProvider = ({ children }) => {
             return;
           }
           if (__DEV__) console.log('[CALL][APP] native end while ringing → rejecting', { endedCallId, signalId: snap.signalId });
-          actionsRef.current.reject && actionsRef.current.reject();
+          actionsRef.current.reject && actionsRef.current.reject('callkit-end');
           return;
         }
         // ENDED = the echo of OUR OWN teardown: finalizeEnd's endCall/endAllCalls
@@ -5426,6 +5483,10 @@ export const CallProvider = ({ children }) => {
       // 'live' but their WebKit audio units are dead (silence both ways). A short
       // second pass catches producers that finish setup just after this event.
       onAudioSessionActivated: () => {
+        // CallKit activates the audio session only when a call is ANSWERED — if
+        // we are still "ringing", the answer action never reached JS.
+        actionsRef.current.acceptIfCallKitAnswered
+          && actionsRef.current.acceptIfCallKitAnswered('audio-activated');
         // NATIVE engine: hand the CallKit-activated session to WebRTC FIRST —
         // react-native-webrtc never learns about CallKit on its own, and its
         // audio unit (re)starts only against a session it knows is live. This
