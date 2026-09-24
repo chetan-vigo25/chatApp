@@ -50,6 +50,17 @@ export const claimNotification = (key) => {
   return true;
 };
 
+/**
+ * Give a claim back. Call this when a claimed key ended up rendering NOTHING
+ * (e.g. the tray notification failed to display) — otherwise the claim keeps
+ * silencing the other path for the whole 60s window and the message is never
+ * announced at all.
+ */
+export const releaseNotification = (key) => {
+  if (!key) return;
+  shown.delete(String(key));
+};
+
 /** Record an id as notified without claiming (e.g. surfaced elsewhere). */
 export const markNotified = (key) => {
   if (!key) return;

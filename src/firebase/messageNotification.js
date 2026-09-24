@@ -125,7 +125,7 @@ export const displayGroupedMessage = async (data) => {
   const msgs = prior.slice(-MAX_LINES);
   await saveMessages(chatId, msgs);
 
-  const { AndroidImportance, AndroidStyle, AndroidVisibility } = _consts;
+  const { AndroidImportance, AndroidStyle, AndroidVisibility, AndroidGroupAlertBehavior } = _consts;
   try {
     await notifee.createChannel({
       id: CHANNEL_ID,
@@ -180,7 +180,7 @@ export const displayGroupedMessage = async (data) => {
         },
       },
     });
-    await ensureGroupSummary(notifee, AndroidImportance, AndroidVisibility);
+    await ensureGroupSummary(notifee, AndroidImportance, AndroidVisibility, AndroidGroupAlertBehavior);
     await cancelForeignChatNotifications(notifee);
     return true;
   } catch (err) {
@@ -218,7 +218,7 @@ const cancelForeignChatNotifications = async (notifee) => {
 // Android only renders the summary once 2+ notifications share the group, so a
 // single chat still shows its own MessagingStyle notification — exactly like
 // WhatsApp, which only shows the "N chats" summary when several chats are unread.
-const ensureGroupSummary = async (notifee, AndroidImportance, AndroidVisibility) => {
+const ensureGroupSummary = async (notifee, AndroidImportance, AndroidVisibility, AndroidGroupAlertBehavior) => {
   try {
     await notifee.displayNotification({
       id: GROUP_SUMMARY_ID,
@@ -232,6 +232,14 @@ const ensureGroupSummary = async (notifee, AndroidImportance, AndroidVisibility)
         visibility: AndroidVisibility.PRIVATE,
         groupId: ANDROID_GROUP_KEY,
         groupSummary: true,
+        // The summary is posted right after the chat's own MessagingStyle
+        // notification, on the same HIGH channel. Left to alert on its own,
+        // Android treats the pair as one app being noisy and silences one of
+        // them ("NotifAttentionHelper: Muting recently noisy") — measured on
+        // device, and the one it silenced was sometimes the REAL message, so
+        // the phone stayed quiet for an incoming message. CHILDREN says only
+        // the per-chat notifications may make a sound.
+        ...(AndroidGroupAlertBehavior ? { groupAlertBehavior: AndroidGroupAlertBehavior.CHILDREN } : {}),
         pressAction: { id: 'default', launchActivity: 'default' },
       },
     });

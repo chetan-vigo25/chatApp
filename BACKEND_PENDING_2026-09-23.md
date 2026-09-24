@@ -126,6 +126,26 @@ See `CALL_PUSH_BACKEND_SPEC.md` § PushKit for the full contract.
 
 ---
 
+## Message pushes — re-measured 2026-09-24, **working, no action needed**
+
+Reported as "message push never arrived on a locked Android phone". Re-measured
+six times on device (app killed, app cached-and-frozen, swiped out of Recents,
+and deep Doze with the charger unplugged). In every run:
+
+- the FCM push woke the app **2–4 s** after the send, including in deep Doze —
+  so the push is being sent **high priority**, as specified;
+- the `message:send` ack carried `delivered: false, offline: true`, i.e. the
+  server correctly knew the recipient had no socket **and pushed anyway** (this
+  is the "never gate the push on a live socket" rule — it is being followed);
+- presence for the killed device read `offline` with a correct `lastSeen` within
+  1 s of the app being swiped away.
+
+The delay the user saw was client-side and is a **debug-build artifact**: a cold
+start has to download the JS bundle from Metro (`loadJSBundleFromMetro` → first
+JS log measured at 20–38 s). A release APK carries the bundle inside it.
+
+---
+
 ## Being worked on client-side — no backend action
 
 - **Answered Android calls run silent.** Proven on a live connected call: the

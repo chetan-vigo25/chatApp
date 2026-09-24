@@ -20,7 +20,7 @@ import { onlyDigits } from '../utils/savedContactName';
 import {
   formatPhoneNumber, peerHidesContact, getPeerIdentity, handleFromRedactedName,
 } from '../services/contactNameStore';
-import { claimNotification } from '../firebase/notificationDedupe';
+import { claimNotification, markNotified, releaseNotification, wasNotified } from '../firebase/notificationDedupe';
 import { displayGroupedMessage, isMessageGroupingAvailable } from '../firebase/messageNotification';
 import { translateNotificationBody } from './Translate';
 
@@ -439,7 +439,13 @@ export default function WhatsAppBannerHost() {
     // socket then re-flushes the same message), suppress the banner. Keyed on
     // messageId so it matches what the OS push path claims; payloads without a
     // messageId fall back to the in-session seenRef guard above.
-    if (item.messageId && !claimNotification(item.messageId)) return;
+    //
+    // This is only a READ. The CLAIM is taken further down, at the moment
+    // something is actually rendered — every `return` between here and there
+    // shows the user nothing, and a claim taken before them silences the OS
+    // push for the same message for the next 60s. That is a message that
+    // arrives with no banner and no notification at all.
+    if (item.messageId && wasNotified(item.messageId)) return;
 
     // Only when the app is ON SCREEN: in the background the route snapshot is
     // whatever chat was last open, which must not silence its notifications.
@@ -455,7 +461,14 @@ export default function WhatsAppBannerHost() {
     // mute:sync / mute:updated. Lazy expiry: a timed mute that has passed no
     // longer suppresses. getChatById matches on chat_id OR group_id, so one
     // lookup covers both 1:1 and group banners.
-    if (await isMutedNow(item)) return;
+    // A muted chat is suppressed on BOTH surfaces, so record the id as notified
+    // even though nothing is shown — otherwise the push path (which has no mute
+    // check of its own) would raise a tray notification for a chat the user
+    // muted. This is the one `return` that deliberately keeps the claim.
+    if (await isMutedNow(item)) {
+      markNotified(item.messageId);
+      return;
+    }
 
     // ── Display-name resolution (matches the chat list AND the OS push) ─────
     // The sender is shown exactly as THIS DEVICE knows them, applying the
@@ -547,9 +560,19 @@ export default function WhatsAppBannerHost() {
     if (inBackground) {
       // Tray notification instead of the (invisible) banner. notifee owns the
       // sound here, so don't play our own on top of it.
-      try { await displayGroupedMessage(item); } catch (_) { /* best effort */ }
+      if (item.messageId && !claimNotification(item.messageId)) return;
+      let shown = false;
+      try { shown = await displayGroupedMessage(item); } catch (_) { /* best effort */ }
+      // displayGroupedMessage returns false when it rendered nothing (no
+      // notifee, no chatId, empty preview, a rejected displayNotification).
+      // Hand the claim back so the push path can still announce the message.
+      if (!shown && item.messageId) releaseNotification(item.messageId);
       return;
     }
+
+    // The banner is about to be shown — now the claim is real, so a push for
+    // the same message doesn't stack an OS notification on top of it.
+    if (item.messageId && !claimNotification(item.messageId)) return;
 
     // Play notification sound for every new banner
     playNotificationSound();
