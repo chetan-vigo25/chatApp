@@ -8,7 +8,6 @@ import {
   Dimensions,
   StyleSheet,
   StatusBar,
-  Platform,
   Linking,
   ScrollView,
   Switch,
@@ -25,7 +24,6 @@ import ContactDatabase from "../../services/ContactDatabase";
 import useSaveContact, { SAVE_CONTACT_STATUS } from "../../hooks/useSaveContact";
 import { formatPhoneNumber } from "../../services/contactNameStore";
 import { useCall } from "../../calls/useCall";
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import ReportBottomSheet from "../../components/ReportBottomSheet";
 import CopyFieldButton from "../../components/CopyFieldButton";
 import { formatLastSeen } from "../../presence/services/lastSeenFormatter.service";
@@ -35,7 +33,6 @@ import useDisplayName from "../../hooks/useDisplayName";
 import { getAvatarColor, getAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
 
 const { width } = Dimensions.get('window');
-const STATUS_BAR_HEIGHT = Platform.OS === 'ios' ? 50 : StatusBar.currentHeight || 24;
 const HERO_HEIGHT = Math.min(width, 430);
 
 // Smooth dark bottom gradient over the hero photo (stacked bands → no
@@ -59,16 +56,17 @@ function HeroGradient() {
   );
 }
 
-// Dark scrim at the TOP of the hero so the white status-bar icons (time, signal,
-// battery) and the back button stay readable over a bright photo. Without it,
-// light-content status-bar icons vanish on a light image on both iOS & Android.
-const TOP_SCRIM_HEIGHT = STATUS_BAR_HEIGHT + 56;
-function HeroTopScrim({ topInset = STATUS_BAR_HEIGHT }) {
+// Dark scrim at the TOP of the hero so the back button stays readable over a
+// bright photo.
+//
+// This used to also darken the strip behind the status-bar icons, sized to the
+// notch inset. That is no longer its job: the app-wide <SafeAreaView> in
+// RootNavigator means the hero never reaches under the status bar, so a band
+// that tall just put an unexplained dark stripe across the top of the photo.
+// `topInset` therefore defaults to 0 and only the short fade is kept.
+function HeroTopScrim({ topInset = 0 }) {
   return (
     <View pointerEvents="none" style={styles.heroTopScrimWrap}>
-      {/* Solid-ish dark band directly behind the status bar icons (time/signal/
-          battery) so white light-content icons stay readable over a busy photo.
-          Sized to the REAL top inset so it matches the notch / Dynamic Island. */}
       <View style={{ height: topInset + 6, backgroundColor: 'rgba(0,0,0,0.5)' }} />
       {/* Short fade-out below it so the band blends into the photo. Many thin
           bands (54px split into ~1px steps) so the fade is smooth — not striped. */}
@@ -81,17 +79,22 @@ function HeroTopScrim({ topInset = STATUS_BAR_HEIGHT }) {
   );
 }
 
+// Last server profile per peer, for the life of the app. Reopening a profile
+// paints it instantly from here while a fresh copy loads in the background.
+const peerProfileCache = new Map(); // peerId → profileDetails().data
+
 export default function UserB({ navigation, route }) {
   const { item: routeItem } = route.params || {};
-  // Real per-device top inset (notch / Dynamic Island on iOS, status-bar height
-  // on Android). Drives the floating header so its solid background fills the
-  // whole top strip when scrolled — no empty gap above it on any device.
-  const insets = useSafeAreaInsets();
+  // NOTE: this screen deliberately takes NO top inset of its own — the app-wide
+  // <SafeAreaView> in RootNavigator already applies it. See the top bar below.
   const { theme, isDarkMode } = useTheme();
   const { startAudioCall, startVideoCall, callBusy } = useCall();
   const dispatch = useDispatch();
-  const [peerProfile, setPeerProfile] = useState(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [peerProfile, setPeerProfile] = useState(() => {
+    const p = route.params?.item;
+    const id = (p?.peerUser || p)?._id || (p?.peerUser || p)?.userId || (p?.peerUser || p)?.id;
+    return id ? (peerProfileCache.get(String(id)) || null) : null;
+  });
   const [scrolledPastHeader, setScrolledPastHeader] = useState(false);
   const [reportVisible, setReportVisible] = useState(false);
   const [blockBusy, setBlockBusy] = useState(false);
@@ -138,18 +141,33 @@ export default function UserB({ navigation, route }) {
     return unsub;
   }, [navigation]);
 
-  // Fetch peer profile into local state (not Redux) to avoid polluting shared profileData
+  // Fetch peer profile into local state (not Redux) to avoid polluting shared profileData.
+  // Background refresh only — the screen already renders from the route item
+  // (chat row: name / avatar / handle / privacy) plus the local contact, and the
+  // server copy only refines it (about, last seen, block state). The old
+  // full-screen spinner hid all of that for the whole request (0.6–1.9s on
+  // device, 2026-09-24) on EVERY open, even for a profile seen seconds ago.
   useEffect(() => {
-    if (peerId) {
-      setIsLoading(true);
-      profileServices.profileDetails(peerId)
-        .then((response) => {
-          setPeerProfile(response?.data || null);
-        })
-        .catch(() => {})
-        .finally(() => setIsLoading(false));
-    }
+    if (!peerId) return undefined;
+    let cancelled = false;
+    const cached = peerProfileCache.get(String(peerId));
+    if (cached) setPeerProfile(cached);
+    profileServices.profileDetails(peerId)
+      .then((response) => {
+        if (cancelled) return;
+        const data = response?.data || null;
+        if (data) peerProfileCache.set(String(peerId), data);
+        // Keep what we have if the refresh comes back empty.
+        setPeerProfile((prev) => data || prev);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
   }, [peerId, reloadVersion]);
+
+  // Live patches (contact:updated) must survive a reopen too.
+  useEffect(() => {
+    if (peerId && peerProfile) peerProfileCache.set(String(peerId), peerProfile);
+  }, [peerId, peerProfile]);
 
   // Realtime: when this peer changes their own profile (photo / name / about),
   // patch the displayed profile live — no reopen needed.
@@ -506,14 +524,6 @@ export default function UserB({ navigation, route }) {
     setScrolledPastHeader(y > HERO_HEIGHT - 90);
   }, []);
 
-  if (isLoading) {
-    return (
-      <View style={[styles.loadingContainer, { backgroundColor: theme.colors.background }]}>
-        <ActivityIndicator size="large" color={theme.colors.themeColor} />
-      </View>
-    );
-  }
-
   // Theme-driven grouped palette. The page uses the app's actual background
   // token (so this screen matches the chat list / settings / rest of the app in
   // any theme), and the inset cards sit on the elevated `surface` token a shade
@@ -548,17 +558,32 @@ export default function UserB({ navigation, route }) {
 
   return (
     <View style={[styles.container, { backgroundColor: pageBg }]}>
-      <StatusBar hidden={false} translucent backgroundColor="transparent" barStyle={scrolledPastHeader && !isDarkMode ? "dark-content" : "light-content"} />
+      {/* Status-bar icon colour follows the THEME, not the scroll position.
+          The whole app is wrapped in a <SafeAreaView> (RootNavigator), whose top
+          padding is painted with `theme.colors.background` — so the strip behind
+          the clock/battery is ALWAYS the page background, never the hero photo.
+          Keying the style off `scrolledPastHeader` meant that while the hero was
+          expanded we asked for white ("light-content") icons on that white strip,
+          and the time / signal / battery simply vanished on Android. */}
+      <StatusBar
+        hidden={false}
+        translucent
+        backgroundColor="transparent"
+        barStyle={isDarkMode ? 'light-content' : 'dark-content'}
+      />
 
       {/* Floating top bar — transparent over the photo, solid once scrolled */}
       <View
         style={[
           styles.topBarSafe,
           {
-            // Push the row below the notch/status bar, and let the solid
-            // background (when scrolled) fill from y=0 up through the inset so
-            // there's never a bare strip above the header.
-            paddingTop: insets.top,
+            // NO paddingTop here. This screen is already rendered INSIDE the
+            // app-wide <SafeAreaView> in RootNavigator, which has consumed the
+            // top inset. `useSafeAreaInsets()` still reports the raw window
+            // inset (it cannot know the parent absorbed it), so adding it again
+            // applied the notch inset TWICE — on this device 136px + 136px —
+            // and pushed the back arrow and the collapsed name/last-seen far
+            // down the screen, leaving a large empty band under the status bar.
             backgroundColor: scrolledPastHeader ? headerBg : 'transparent',
             borderBottomColor: scrolledPastHeader ? dividerClr : 'transparent',
             borderBottomWidth: scrolledPastHeader ? StyleSheet.hairlineWidth : 0,
@@ -621,7 +646,7 @@ export default function UserB({ navigation, route }) {
             </View>
           )}
           <HeroGradient />
-          <HeroTopScrim topInset={insets.top} />
+          <HeroTopScrim />
           <View style={styles.heroOverlay}>
             <View style={styles.heroNameRow}>
               <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>
