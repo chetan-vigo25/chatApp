@@ -613,6 +613,41 @@ const updateContactNames = async (items) => {
   }));
 };
 
+/**
+ * Apply the server's public identity for already-synced registered contacts:
+ * their @handle and "hide my contact details" flag. Touches only those two
+ * columns (no highlight, no name), and only when a value actually changed, so
+ * a periodic pull costs nothing when nobody toggled anything.
+ * @returns number of rows that changed
+ */
+const updateContactPrivacy = async (items) => {
+  if (!Array.isArray(items) || items.length === 0) return 0;
+  return runExclusive(() => withDB(async (db) => {
+    let changed = 0;
+    for (const c of items) {
+      const uid = c?.userId ? String(c.userId) : null;
+      if (!uid || c.hideContact === undefined || c.hideContact === null) continue;
+      try {
+        const res = await db.runAsync(
+          `UPDATE contacts SET user_name = $user_name, hide_contact = $hide_contact
+           WHERE user_id = $user_id
+             AND (hide_contact IS NOT $hide_contact OR user_name IS NOT $user_name)`,
+          {
+            $user_name: c.userName ? String(c.userName).replace(/^@+/, '') : null,
+            $hide_contact: c.hideContact ? 1 : 0,
+            $user_id: uid,
+          },
+        );
+        changed += res?.changes || 0;
+      } catch (err) {
+        console.warn('[ContactDB] privacy update error for', uid, err?.message);
+      }
+    }
+    if (changed) emitContactsChanged('privacy');
+    return changed;
+  }));
+};
+
 const clearAllContacts = async () => {
   return runExclusive(() => withDB(async (db) => {
     await db.execAsync('DELETE FROM contacts; DELETE FROM contact_sync_meta;');
@@ -729,6 +764,7 @@ export default {
   getExistingNumbers,
   getExistingNameMap,
   updateContactNames,
+  updateContactPrivacy,
   clearAllContacts,
   removeStaleContacts,
   searchContacts,

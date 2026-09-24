@@ -73,6 +73,14 @@ const PERMISSION_EXPLAIN_DEBOUNCE_MS = 1200;
 // (MAX_CONTACTS_PER_BATCH = 1000 in contect.handler.js).
 const SYNC_BATCH_SIZE = 800;
 
+// Server-side identity (a match's @handle / "hide contact" toggle) changes
+// without the phonebook changing, and the delta sync below sends nothing when
+// the phonebook is unchanged. A throttled contact:refresh pulls just those
+// fields; a user-initiated refresh always pulls.
+const PRIVACY_PULL_MIN_MS = 10 * 60 * 1000;
+let _lastPrivacyPullAt = 0;
+let _privacyPullInFlight = false;
+
 // The FIRST chunk of a large first-sync is deliberately small so the earliest
 // matched contacts render almost immediately (the whole point of progressive
 // reveal) instead of the user staring at a spinner while an 800-contact batch is
@@ -891,6 +899,37 @@ export const useContactSync = () => {
   // last time (+ a removed list) — not the whole phonebook. Adding one contact
   // costs one small round-trip, not a full re-upload + re-match.
   const runDeltaSyncRef = useRef(null);
+
+  // Pull the server's current @handle + hideContact for every registered match
+  // and write ONLY those two columns (no highlight, no names). Never throws:
+  // it is a background freshness pass riding on a sync.
+  const pullServerPrivacy = useCallback(async ({ force = false } = {}) => {
+    if (!socket?.emit || _privacyPullInFlight) return;
+    if (!force && Date.now() - _lastPrivacyPullAt < PRIVACY_PULL_MIN_MS) return;
+    _privacyPullInFlight = true;
+    _lastPrivacyPullAt = Date.now();
+    try {
+      const sessionId = await ContactDatabase.getSyncSessionId();
+      if (!sessionId) return;
+      const deviceId = await getDeviceId();
+      const raw = await emitWithAckAndEvent('contact:refresh', {
+        syncSessionId: sessionId,
+        deviceId: deviceId || 'unknown_device',
+        syncOptions: { incremental: true, includeStats: false, includeProfileImages: false },
+      }, 'contact:refresh:response');
+      const items = (parseSyncResponse(raw).contacts || []).map((c) => ({
+        userId: c?.userId || c?.matchedUserId || null,
+        userName: c?.userName || c?.username || null,
+        hideContact: c?.hideContact ?? c?.privacySettings?.hideContact ?? null,
+      }));
+      await ContactDatabase.updateContactPrivacy(items);
+    } catch (err) {
+      console.warn('[ContactSync] privacy pull failed:', err?.message);
+    } finally {
+      _privacyPullInFlight = false;
+    }
+  }, [socket, emitWithAckAndEvent, parseSyncResponse, getDeviceId]);
+
   const runDeltaSync = useCallback(async ({ reason = 'delta', silent = true, userInitiated = false } = {}) => {
     if (!socket?.emit) throw new Error('Socket not available for delta sync');
 
@@ -931,6 +970,9 @@ export const useContactSync = () => {
     if (added.length === 0 && removed.length === 0 && renamed.length === 0) {
       if (prevHash !== contactsHash) await ContactDatabase.setContactsHash(contactsHash);
       await applyFromDB();
+      // Phonebook unchanged — but a match may have changed their @handle or
+      // privacy toggle on the server. Not awaited: the list is already painted.
+      pullServerPrivacy({ force: userInitiated });
       return;
     }
 
@@ -1009,13 +1051,15 @@ export const useContactSync = () => {
       await ContactDatabase.setSyncMetadata({ ...prevMeta, syncedAt: now, lastSyncStatus: `delta_${reason}` });
 
       await applyFromDB();
+      // The delta echo covers only the added rows; refresh everyone else's privacy.
+      pullServerPrivacy({ force: userInitiated });
     } catch (err) {
       if (mountedRef.current) setError(err?.message || 'Failed to sync contacts');
       throw err;
     } finally {
       if (mountedRef.current) setIsSyncing(false);
     }
-  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB, explainContactsPermission]);
+  }, [socket, getE164Contacts, getClientInfo, withRetry, emitWithAckAndEvent, parseSyncResponse, normalizeIncomingContacts, applyFromDB, explainContactsPermission, pullServerPrivacy]);
   runDeltaSyncRef.current = runDeltaSync;
 
   // ─── INCREMENTAL REFRESH ───
