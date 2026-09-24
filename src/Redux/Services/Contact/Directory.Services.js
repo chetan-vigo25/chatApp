@@ -1,4 +1,5 @@
 import { apiCall } from '../../../Config/Https';
+import { seedPeerIdentities } from '../../../services/contactNameStore';
 
 /**
  * User directory search — find a REGISTERED user by their public handle
@@ -87,6 +88,8 @@ export async function searchDirectory(query, { limit = 10, useCache = true } = {
     const users = res?.data?.users || res?.users || [];
     const rows = Array.isArray(users) ? users : [];
     cacheResult(query, rows);
+    // A fresh answer: its privacy bits reach every phonebook-built surface.
+    seedPeerIdentities(rows.map((u) => ({ userId: u?.userId, hideContact: u?.hideContact, userName: u?.userName })));
     return rows;
   } catch {
     return [];

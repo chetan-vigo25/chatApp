@@ -133,10 +133,20 @@ export default function CallDetailScreen() {
 
   // Saved phone number from the device contact directory (the server only keeps
   // a hash, so the human-readable number lives on-device).
+  // Withheld entirely for a peer who hides their contact details: the name line
+  // already shows their "@handle", and printing the phonebook number under it
+  // undoes the toggle.
   const phone = useMemo(() => {
+    const privacy = peerPrivacyOf(peer);
+    if (privacy.hideContact) return null;
+    // A name the server redacted to the peer's own "@handle" is the same flag
+    // on a row that forgot to ship `hideContact` (see handleFromRedactedName).
+    const handle = String(privacy.username || '').replace(/^@+/, '').toLowerCase();
+    const push = String(peer?.fullName || peer?.name || '').trim().toLowerCase();
+    if (handle && push === `@${handle}`) return null;
     const c = peerId ? directory?.[peerId] : null;
     return c?.phone || c?.normalizedPhone || null;
-  }, [directory, peerId]);
+  }, [directory, peerId, peer, peerPrivacyOf]);
 
   // Derive stats from the loaded rows as an instant fallback; the server stats
   // (full history) replace them once fetched.

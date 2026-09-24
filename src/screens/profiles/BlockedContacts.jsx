@@ -17,6 +17,7 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import { fetchBlockedContacts, unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import ChatDatabase from "../../services/ChatDatabase";
+import { peerHidesContact } from "../../services/contactNameStore";
 
 // Settings → Privacy → Blocked Contacts. Lists everyone the user has blocked
 // (profile photo, name, phone, block date) with search + unblock.
@@ -126,7 +127,7 @@ export default function BlockedContacts({ navigation }) {
           {item.fullName || "Unknown"}
         </Text>
         <Text numberOfLines={1} style={[styles.meta, { color: subText }]}>
-          {item.phone ? `${item.phone} · ` : ""}Blocked {formatDate(item.blockedAt)}
+          {item.phone && !peerHidesContact(item.userId, item) ? `${item.phone} · ` : ""}Blocked {formatDate(item.blockedAt)}
         </Text>
       </View>
       <TouchableOpacity

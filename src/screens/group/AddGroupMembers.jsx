@@ -12,6 +12,7 @@ import { useDispatch } from 'react-redux';
 import { viewGroup } from '../../Redux/Reducer/Group/Group.reducer';
 import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
 import { MIN_DIRECTORY_QUERY } from '../../Redux/Services/Contact/Directory.Services';
+import { hiddenHandleLabel } from '../../services/contactNameStore';
 
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
@@ -140,7 +141,9 @@ export default function AddGroupMembers({ navigation, route }) {
   };
 
   const renderContactItem = ({ item }) => {
-    const name = item?.fullName || item?.name || 'Unknown';
+    // A member who hides their details: "@handle" only, never name or number.
+    const hiddenHandle = hiddenHandleLabel(item?.userId || item?._id, item);
+    const name = hiddenHandle || item?.fullName || item?.name || 'Unknown';
     const profileImage = item?.profileImage || item?.profilePicture;
     const avatarColor = getAvatarColor(name);
     const selected = isSelected(item.userId);
@@ -175,8 +178,8 @@ export default function AddGroupMembers({ navigation, route }) {
             numberOfLines={1}
           >
             {item?.fromDirectory
-              ? (item?.mobileFormatted || (item?.userName ? `@${item.userName}` : 'Not in your contacts'))
-              : (item?.about || item?.mobileFormatted || '')}
+              ? (((!hiddenHandle && item?.mobileFormatted) || (item?.userName ? `@${item.userName}` : 'Not in your contacts')))
+              : (item?.about || (hiddenHandle ? '' : item?.mobileFormatted) || '')}
           </Text>
         </View>
       </TouchableOpacity>

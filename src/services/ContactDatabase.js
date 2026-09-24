@@ -8,7 +8,7 @@ const DB_NAME = 'TalksTry_contacts.db';
 // sync markers — the next open triggers a fresh full sync that repopulates it.
 // v4: composite (type, full_name) index so the first-paint LIMIT query returns
 // without sorting the whole table.
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 let _db = null;
 let _dbInitPromise = null; // prevents race conditions — only one init at a time
@@ -208,6 +208,8 @@ const runMigrations = async (db) => {
       is_blocked INTEGER DEFAULT 0,
       is_verified INTEGER DEFAULT 0,
       is_favorite INTEGER DEFAULT 0,
+      user_name TEXT,
+      hide_contact INTEGER,
       last_contacted TEXT,
       joined_at INTEGER,
       is_new_until INTEGER,
@@ -232,6 +234,14 @@ const runMigrations = async (db) => {
   // already got it from the CREATE TABLE above, hence the ignored duplicate error.
   if (currentVersion === 2) {
     await db.execAsync('ALTER TABLE contacts ADD COLUMN is_verified INTEGER DEFAULT 0;').catch(() => {});
+  }
+
+  // v5: the peer's public handle + "hide my contact details" flag, as sent on
+  // contact:sync / contact:refresh rows. hide_contact NULL = server never said
+  // (older backend), which is NOT the same as 0.
+  if (currentVersion >= 2 && currentVersion < 5) {
+    await db.execAsync('ALTER TABLE contacts ADD COLUMN user_name TEXT;').catch(() => {});
+    await db.execAsync('ALTER TABLE contacts ADD COLUMN hide_contact INTEGER;').catch(() => {});
   }
 
   await db.execAsync(`PRAGMA user_version = ${DB_VERSION};`);
@@ -312,6 +322,8 @@ const contactToRow = (c, now) => {
     $is_blocked: c.isBlocked ? 1 : 0,
     $is_verified: c.isVerified ? 1 : 0,
     $is_favorite: c.isFavorite ? 1 : 0,
+    $user_name: c.userName ? String(c.userName).replace(/^@+/, '') : null,
+    $hide_contact: (c.hideContact === undefined || c.hideContact === null) ? null : (c.hideContact ? 1 : 0),
     $last_contacted: c.lastContacted || null,
     $joined_at: c.joinedWhatsAppAt || null,
     $is_new_until: c.isNewUntil || null,
@@ -348,6 +360,9 @@ const rowToContact = (row) => {
     isBlocked: Boolean(row.is_blocked),
     isVerified: Boolean(row.is_verified),
     isFavorite: Boolean(row.is_favorite),
+    userName: row.user_name || null,
+    // null = unknown (the server did not send it), kept distinct from false.
+    hideContact: (row.hide_contact === null || row.hide_contact === undefined) ? null : Boolean(row.hide_contact),
     lastContacted: row.last_contacted,
     joinedWhatsAppAt: row.joined_at,
     isNewUntil: row.is_new_until,
@@ -363,12 +378,14 @@ const UPSERT_SQL = `INSERT INTO contacts (
   phone_number, original_id, user_id, type, full_name, email, phone,
   mobile_code, mobile_number, profile_image, about,
   is_active, last_login, can_message, is_blocked, is_verified, is_favorite,
+  user_name, hide_contact,
   last_contacted, joined_at,
   is_new_until, updated_highlight_until, synced_at, updated_at
 ) VALUES (
   $phone_number, $original_id, $user_id, $type, $full_name, $email, $phone,
   $mobile_code, $mobile_number, $profile_image, $about,
   $is_active, $last_login, $can_message, $is_blocked, $is_verified, $is_favorite,
+  $user_name, $hide_contact,
   $last_contacted, $joined_at,
   $is_new_until, $updated_highlight_until, $synced_at, $updated_at
 ) ON CONFLICT(phone_number) DO UPDATE SET
@@ -388,6 +405,8 @@ const UPSERT_SQL = `INSERT INTO contacts (
   is_blocked = $is_blocked,
   is_verified = $is_verified,
   is_favorite = MAX(is_favorite, $is_favorite),
+  user_name = COALESCE($user_name, user_name),
+  hide_contact = COALESCE($hide_contact, hide_contact),
   last_contacted = COALESCE($last_contacted, last_contacted),
   joined_at = COALESCE($joined_at, joined_at),
   is_new_until = COALESCE($is_new_until, is_new_until),

@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useEffect, useState } from 'react';
 import { ActivityIndicator, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import VerifiedBadge from './VerifiedBadge';
 
@@ -36,7 +36,13 @@ const UserSearchRow = memo(function UserSearchRow({
   onPress,
 }) {
   const label = name || subtitle || '?';
-  const initials = String(label).charAt(0).toUpperCase();
+  // First letter or digit, skipping "@" / "+" so a handle or number still
+  // gets a real initial.
+  const initials = (String(label).replace(/^[@+\s(]+/, '').charAt(0) || '?').toUpperCase();
+  // A dead avatar URL (404 or an old media host) rendered as an empty circle.
+  // Fall back to the initials instead; reset when the row gets a new URL.
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => { setImageFailed(false); }, [avatarUri]);
 
   return (
     <TouchableOpacity
@@ -45,8 +51,14 @@ const UserSearchRow = memo(function UserSearchRow({
       style={styles.row}
     >
       <View style={styles.avatarWrap}>
-        {avatarUri ? (
-          <Image source={{ uri: avatarUri }} style={styles.avatar} resizeMode="cover" fadeDuration={0} />
+        {avatarUri && !imageFailed ? (
+          <Image
+            source={{ uri: avatarUri }}
+            style={styles.avatar}
+            resizeMode="cover"
+            fadeDuration={0}
+            onError={() => setImageFailed(true)}
+          />
         ) : (
           <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: avatarColorFor(label) }]}>
             <Text style={styles.initials}>{initials}</Text>

@@ -6711,7 +6711,6 @@ export default function ChatScreen({ navigation, route }) {
     if (isCall) {
       return (
         <React.Fragment>
-          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
           <View style={{ paddingHorizontal: 12, paddingVertical: 2 }}>
             <CallMessageBubble
               msg={msg}
@@ -6739,6 +6738,9 @@ export default function ChatScreen({ navigation, route }) {
               } : null}
             />
           </View>
+          {/* Badge LAST: the inverted list flips each cell, so the last child
+              renders on top — same as the text-message row. */}
+          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
         </React.Fragment>
       );
     }
@@ -6766,7 +6768,6 @@ export default function ChatScreen({ navigation, route }) {
         const otpAccent = theme?.colors?.primary || '#03b0a2';
         return (
           <React.Fragment>
-            {dateBadgeKey && renderDateBadge(dateBadgeKey)}
             {/* Same geometry/colors as a normal RECEIVED text bubble (see the
                 generic bubble below: radius 8, top-left tail 3, #202C33 dark /
                 cardBackground light, same padding + shadow) — only the code
@@ -6802,6 +6803,7 @@ export default function ChatScreen({ navigation, route }) {
                 </Text>
               </View>
             </View>
+            {dateBadgeKey && renderDateBadge(dateBadgeKey)}
           </React.Fragment>
         );
       }
@@ -6844,7 +6846,6 @@ export default function ChatScreen({ navigation, route }) {
       }
       return (
         <React.Fragment>
-          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
           <View style={{ alignItems: 'center', paddingVertical: 3, paddingHorizontal: 30 }}>
             <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 10, maxWidth: '85%' }}>
               <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
@@ -6852,6 +6853,7 @@ export default function ChatScreen({ navigation, route }) {
               </Text>
             </View>
           </View>
+          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
         </React.Fragment>
       );
     }

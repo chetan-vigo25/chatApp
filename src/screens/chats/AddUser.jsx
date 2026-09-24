@@ -35,6 +35,8 @@ import { useCall } from "../../calls/useCall";
 import { selfChatLabel, selfIdentityOf, SELF_CHAT_SUBTITLE } from "../../utils/selfChat";
 import { buildQuery, contactMatchScore } from "../../utils/contactSearch";
 import useUserDirectorySearch from "../../hooks/useUserDirectorySearch";
+import useDisplayName from "../../hooks/useDisplayName";
+import { peerHidesContact, getPeerIdentity } from "../../services/contactNameStore";
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 // Only the SEARCH BAR collapses on scroll now (New Contact / New Group stay
@@ -63,12 +65,15 @@ const getAvatarColor = (name) => {
 const ContactRow = memo(function ContactRow({
   contactHash, contact, showInvite, isInviting,
   bgColor, textColor, subTextColor, themeColor, inviteBgColor,
-  onPressContact, onPressAvatar, onPressInfo, onPressInvite, displayPhone,
+  onPressContact, onPressAvatar, onPressInfo, onPressInvite, displayPhone, hiddenHandle,
 }) {
   // A contacts-screen row is by definition a DEVICE contact, so its saved name
   // is the label. When a row somehow has no device name (matched by number
   // only), fall back to the NUMBER — never to the peer's own account name.
-  const displayName = contact?.name
+  // A peer who hides their details is their "@handle" here too — ahead of the
+  // saved name, like every other surface (contactNameStore rule 1).
+  const displayName = (hiddenHandle ? `@${hiddenHandle}` : null)
+    || contact?.name
     || contact?.fullName
     || displayPhone
     || contact?.mobileFormatted
@@ -104,7 +109,11 @@ const ContactRow = memo(function ContactRow({
 
       <View style={styles.contactInfo}>
         <View style={styles.contactNameRow}>
-          <Text style={[styles.contactName, { color: textColor, flexShrink: 1 }]} numberOfLines={1}>
+          <Text
+            // A handle is case-exact — "capitalize" would print "@Jangid".
+            style={[styles.contactName, { color: textColor, flexShrink: 1 }, displayName.startsWith('@') && { textTransform: 'none' }]}
+            numberOfLines={1}
+          >
             {displayName}
           </Text>
           <VerifiedBadge verified={contact?.isVerified} size={14} />
@@ -144,6 +153,7 @@ const ContactRow = memo(function ContactRow({
     prev.showInvite === next.showInvite &&
     prev.isInviting === next.isInviting &&
     prev.displayPhone === next.displayPhone &&
+    prev.hiddenHandle === next.hiddenHandle &&
     prev.textColor === next.textColor &&
     prev.contact?.profilePicture === next.contact?.profilePicture &&
     prev.contact?.name === next.contact?.name;
@@ -151,6 +161,8 @@ const ContactRow = memo(function ContactRow({
 
 export default function AddUser({ navigation }) {
   const { theme } = useTheme();
+  // Bumps when a peer's privacy toggle lands in contactNameStore, so rows re-check it.
+  const { namesVersion } = useDisplayName();
   const { startAudioCall, startVideoCall } = useCall();
   // Start fully visible (was 0 → fade-in on mount). The entrance fade caused a
   // full-screen flash whenever this screen remounted — e.g. returning from the
@@ -997,6 +1009,12 @@ export default function AddUser({ navigation }) {
       case 'contact': {
         const c = item.contact;
         const cHash = c.hash || c.id || c.userId || String(item.index);
+        // The phonebook row carries no privacy bit; the store knows it from
+        // any fresh server payload that included this peer.
+        const hidesNumber = Boolean(c.userId) && peerHidesContact(c.userId, c);
+        const hiddenHandle = hidesNumber
+          ? (getPeerIdentity(c.userId)?.userName || c.username || c.userName || null)
+          : null;
         return (
           <ContactRow
             contactHash={cHash}
@@ -1008,8 +1026,10 @@ export default function AddUser({ navigation }) {
             subTextColor={subTextColor}
             themeColor={themeColor}
             inviteBgColor={inviteBgColor}
+            hiddenHandle={hiddenHandle}
             displayPhone={
-              item.fromDirectory
+              hidesNumber ? 'Registered'
+              : item.fromDirectory
                 // A peer who hides their number has none to show — their handle
                 // is what identifies them, so it takes the subtitle's place.
                 ? (c.mobileNumber || (c.username ? `@${c.username}` : 'Registered'))
@@ -1073,7 +1093,7 @@ export default function AddUser({ navigation }) {
       default:
         return null;
     }
-  }, [bgColor, textColor, subTextColor, themeColor, inviteBgColor, menuBgColor, badgeBgColor, textWhite, invitingContactId, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, SpacerItem, contactsPermission]);
+  }, [bgColor, textColor, subTextColor, themeColor, inviteBgColor, menuBgColor, badgeBgColor, textWhite, invitingContactId, getDisplayPhone, searchQuery, error, isSyncing, refreshing, handleRefresh, SpacerItem, contactsPermission, namesVersion]);
 
   const keyExtractor = useCallback((item, index) => {
     if (item.type === 'contact') {
@@ -1107,6 +1127,7 @@ export default function AddUser({ navigation }) {
         <FlatList
           data={listData}
           renderItem={renderItem}
+          extraData={namesVersion}
           keyExtractor={keyExtractor}
           // New Contact / New Group scroll WITH the list (they sit at the top of the
           // scroll content, above the sync bar + contacts). Only the search bar above

@@ -9,6 +9,7 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../../calls/useCall';
 import useContactDirectory from '../../hooks/useContactDirectory';
+import { peerHidesContact } from '../../services/contactNameStore';
 import useContactsPresence from '../../presence/hooks/useContactsPresence';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import ContactDatabase from '../../services/ContactDatabase';
@@ -113,7 +114,9 @@ export default function NewCallScreen() {
       const profileImageRaw = c.profileImage || c.profilePicture || null;
       const avatarUri = toSecureMediaUri(profileImageRaw) || null;
       const phone = c.mobileFormatted || c.originalPhone || c.normalizedPhone || '';
-      return { peerId, name, avatarUri, profileImageRaw, phone, isVerified: Boolean(c.isVerified) };
+      // Kept for search matching, but never shown for a peer hiding their details.
+      const hidesNumber = peerHidesContact(peerId, c);
+      return { peerId, name, avatarUri, profileImageRaw, phone, hidesNumber, isVerified: Boolean(c.isVerified) };
     });
     // De-dup by peerId + sort by name once (search keeps this order).
     const seen = new Set();
@@ -207,7 +210,7 @@ export default function NewCallScreen() {
       name={item.name}
       avatarUri={item.avatarUri}
       peerId={item.peerId}
-      subText={item.phone || 'Tap to call'}
+      subText={(!item.hidesNumber && item.phone) || 'Tap to call'}
       isVerified={item.isVerified}
       textColor={c.primaryTextColor}
       subColor={c.placeHolderTextColor}

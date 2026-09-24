@@ -248,7 +248,7 @@ export default function ScannedContactSheet({ card, onScanAgain, onDone, onChat,
           {card.userName && !displayName.startsWith('@') ? (
             <Text style={[styles.sub, { color: subText }]} numberOfLines={1}>@{card.userName}</Text>
           ) : null}
-          {phone ? (
+          {phone && !card.hideContact ? (
             <Text style={[styles.sub, { color: subText }]} numberOfLines={1}>{formatPhoneNumber(phone)}</Text>
           ) : null}
         </View>

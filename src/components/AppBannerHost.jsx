@@ -17,7 +17,9 @@ import {
 import { subscribeSessionReset } from '../services/sessionEvents';
 import { previewFor, buildNotificationModel } from '../firebase/notificationModel';
 import { onlyDigits } from '../utils/savedContactName';
-import { formatPhoneNumber } from '../services/contactNameStore';
+import {
+  formatPhoneNumber, peerHidesContact, getPeerIdentity, handleFromRedactedName,
+} from '../services/contactNameStore';
 import { claimNotification } from '../firebase/notificationDedupe';
 import { displayGroupedMessage, isMessageGroupingAvailable } from '../firebase/messageNotification';
 import { translateNotificationBody } from './Translate';
@@ -485,7 +487,15 @@ export default function WhatsAppBannerHost() {
       // name. The server name is the sender's own account name (a push name);
       // promoting it above the number is what made banners show a name for
       // people the user never saved.
-      const resolvedName = localName
+      // A sender who hides their details is their "@handle" and nothing else —
+      // above my saved name and never their number (contactNameStore rule 1).
+      // The server marks it by sending the handle AS the name.
+      const redactedHandle = handleFromRedactedName(rawName);
+      const liveHandle = getPeerIdentity(item.senderId)?.userName || null;
+      const hiddenHandle = redactedHandle
+        || (peerHidesContact(item.senderId) && liveHandle ? liveHandle : null);
+      const resolvedName = (hiddenHandle ? `@${hiddenHandle}` : null)
+        || localName
         || formatPhoneNumber(mobile)
         || serverRealName
         || item.senderName

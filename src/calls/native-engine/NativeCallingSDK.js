@@ -775,9 +775,17 @@ export default class NativeCallingSDK {
   }
 
   // ---- outgoing ----
-  startCall(to, media) {
+  startCall(to, media, opts = {}) {
     const targets = (Array.isArray(to) ? to : [to]).map(String).filter(Boolean);
     this._media = media === 'video' ? 'video' : 'audio';
+    // Redial/reassert must cover the WHOLE ring the app shows, not a fixed 40s:
+    // the ring length is server-configurable (10–180s) and a callee that
+    // registers after the loop stopped can never receive the call (the media
+    // server keeps no record for an offline callee — verified 2026-09-24).
+    const ringMs = Number(opts.ringMs);
+    this._retryWindowMs = Number.isFinite(ringMs) && ringMs > 0
+      ? Math.max(RETRY_WINDOW_MS, ringMs + 5000)
+      : RETRY_WINDOW_MS;
     if (!targets.length) return Promise.reject(new Error('no callee'));
     this._outIds = {};        // fresh dial — never inherit a previous dial's ids
     this._acceptedFrom = null;
@@ -940,7 +948,7 @@ export default class NativeCallingSDK {
 
   _armRetry(fn) {
     this._clearRetry();
-    this._retryUntil = Date.now() + RETRY_WINDOW_MS;
+    this._retryUntil = Date.now() + (this._retryWindowMs || RETRY_WINDOW_MS);
     this._retryTimer = setInterval(() => {
       if (Date.now() > this._retryUntil) { this._clearRetry(); return; }
       Promise.resolve().then(fn).then((done) => { if (done) this._clearRetry(); }).catch(() => {});

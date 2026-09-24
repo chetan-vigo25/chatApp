@@ -416,7 +416,7 @@ export default function ArchivedChats({ navigation }) {
         userId: selectedChatItem?.peerUser?._id || selectedChatItem?.peerUserId,
         phone: selectedChatItem?.mobileNumber || selectedChatItem?.peerUser?.mobileNumber,
         pushName: selectedChatItem?.peerUser?.fullName,
-        username: selectedChatItem?.peerUser?.userName || null,
+        username: selectedChatItem?.peerUser?.userName || selectedChatItem?.userName || null,
         hideContact: Boolean(selectedChatItem?.peerUser?.hideContact),
         fallback: 'Unknown User',
       });

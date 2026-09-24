@@ -2839,6 +2839,9 @@ export const CallProvider = ({ children }) => {
       media,
       speaker: wantSpeaker,
       ref: `sc_${Date.now()}`,
+      // The engine keeps re-ringing the callee for this long, so a callee that
+      // wakes / re-registers late in a server-lengthened ring still gets it.
+      ringMs: getRingTimeoutMs(),
     };
     if (__DEV__) console.log('[CALL][APP][startCall] STEP 6 → engine CMD.START_CALL (WebRTC dial)', startPayload);
     sendCmd(startPayload);

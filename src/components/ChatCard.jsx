@@ -118,7 +118,7 @@ const ChatCard = ({
           phone: peerMobile,
           pushName: item?.peerUser?.fullName || item?.chatName || item?.peerUser?.userName,
           // Contact privacy — chat-list row is surface #1.
-          username: item?.peerUser?.userName || null,
+          username: item?.peerUser?.userName || item?.userName || null,
           hideContact: Boolean(item?.peerUser?.hideContact ?? item?.hideContact),
           fallback: 'Unknown',
         });

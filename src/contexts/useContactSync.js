@@ -410,6 +410,11 @@ export const useContactSync = () => {
         isBlocked: !!contact?.isBlocked,
         isVerified: !!contact?.isVerified,
         isFavorite: !!contact?.isFavorite,
+        // Contact privacy of a registered match: their public handle and the
+        // "hide my contact details" toggle. Left null when the server omits them
+        // so an older backend never overwrites a known value with "not hidden".
+        userName: contact?.userName || contact?.username || null,
+        hideContact: contact?.hideContact ?? contact?.privacySettings?.hideContact ?? null,
         lastContacted: contact?.lastContacted || null,
         isNewUntil: contact?.isNewUntil || null,
         updatedHighlightUntil: contact?.updatedHighlightUntil || null,

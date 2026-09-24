@@ -131,7 +131,7 @@ class NativeCallEngine {
           this._log(`startCall → [${targets.join(',')}] media=${this._currentMedia}`);
           AudioRoute.start({ video: this._currentMedia === 'video' });
           if (msg.speaker) AudioRoute.setSpeaker(true);
-          Promise.resolve(this._sdk.startCall(targets, msg.media)).then((res = {}) => {
+          Promise.resolve(this._sdk.startCall(targets, msg.media, { ringMs: msg.ringMs })).then((res = {}) => {
             this._enableLocalMic(true);
             if (this._currentMedia === 'video') this._enableLocalCamera(true);
             const offline = Array.isArray(res.offline) ? res.offline.map(String)

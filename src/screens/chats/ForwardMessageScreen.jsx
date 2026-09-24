@@ -28,7 +28,7 @@ const privateChatLabel = (chat) => resolveCanonicalName({
   pushName: chat?.peerUser?.fullName || chat?.chatName,
   // Contact privacy — the forward picker is a full list of peers, so a hidden
   // number showing here would defeat the toggle everywhere else.
-  username: chat?.peerUser?.userName || null,
+  username: chat?.peerUser?.userName || chat?.userName || null,
   hideContact: Boolean(chat?.peerUser?.hideContact ?? chat?.hideContact),
   fallback: 'Unknown',
 });

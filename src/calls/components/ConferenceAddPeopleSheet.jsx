@@ -8,6 +8,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useAuth } from '../../contexts/AuthContext';
 import ContactDatabase from '../../services/ContactDatabase';
+import { hiddenHandleLabel } from '../../services/contactNameStore';
 import { useContactSync } from '../../contexts/useContactSync';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import CallAvatar from './CallAvatar';
@@ -82,12 +83,18 @@ function ConferenceAddPeopleSheetInner({
     const rows = await ContactDatabase.loadRegisteredContacts().catch(() => []);
     const mapped = (rows || [])
       .filter((r) => r && (r.user_id || r.userId))
-      .map((r) => ({
-        id: String(r.user_id || r.userId),
-        name: r.full_name || r.fullName || r.name || r.phone_number || 'Unknown',
-        phone: r.phone_number || r.phoneNumber || null,
+      .map((r) => {
+        const id = String(r.user_id || r.userId);
+        // A peer who hides their details: "@handle" only, and no number — not
+        // in the row, and not in the roster entry built from it on invite.
+        const hiddenHandle = hiddenHandleLabel(id, r);
+        return {
+        id,
+        name: hiddenHandle || r.full_name || r.fullName || r.name || r.phone_number || 'Unknown',
+        phone: hiddenHandle ? null : (r.phone_number || r.phoneNumber || null),
         avatar: r.profile_image ? toSecureMediaUri(r.profile_image) : (r.profileImage ? toSecureMediaUri(r.profileImage) : null),
-      }));
+        };
+      });
     setContacts(mapped);
     return mapped;
   }, []);

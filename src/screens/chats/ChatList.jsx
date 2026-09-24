@@ -29,7 +29,9 @@ import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import useStatusIndicators from '../../hooks/useStatusIndicators';
 import useContactDirectory, { peerPrivacyOf } from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
-import { resolveDisplayName as resolveCanonicalName, isSavedContact } from '../../services/contactNameStore';
+import {
+  resolveDisplayName as resolveCanonicalName, isSavedContact, peerHidesContact, getPeerIdentity,
+} from '../../services/contactNameStore';
 import { getAvatarColor, getAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
 import { useCall } from '../../calls/useCall';
 import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Services';
@@ -166,7 +168,7 @@ const chatRowLabel = (item, me = null) => {
     // popup, the image viewer caption and the action sheet header — so without
     // these the popup kept showing the number even after the row itself had
     // switched to the "@handle".
-    username: item?.peerUser?.userName || item?.peerUser?.publicUsername || null,
+    username: item?.peerUser?.userName || item?.peerUser?.publicUsername || item?.userName || null,
     hideContact: Boolean(item?.peerUser?.hideContact ?? item?.hideContact),
     fallback: 'Unknown',
   });
@@ -180,6 +182,14 @@ const chatRowNumbers = (item) => [
   item?.peerUser?.mobile?.number,
   item?.peerUser?.phone,
 ].filter(Boolean).map(String);
+
+// Every @handle we know for a chat's peer, lower-cased and without the "@".
+const chatRowUsernames = (item) => [
+  item?.peerUser?.userName,
+  item?.peerUser?.username,
+  item?.peerUser?.publicUsername,
+  item?.otherUser?.userName,
+].filter(Boolean).map((u) => String(u).replace(/^@+/, '').toLowerCase());
 
 // Force the chat row's displayed name to match the user's saved contact name.
 // `contactMap` is userId -> { fullName, profileImage } built from the locally
@@ -606,7 +616,12 @@ export default function ChatList({ navigation }) {
       const queryDigits = query.replace(/\D/g, '');
       const numberHit = queryDigits.length >= 3
         && chatRowNumbers(item).some((n) => n.replace(/\D/g, '').includes(queryDigits));
-      return chatDisplayName.includes(query) || lastMessage.includes(query) || numberHit;
+      // And on the peer's @handle, even when the row shows a saved name — the
+      // same three keys (name, @username, number) the contact picker takes.
+      const handleQuery = query.replace(/^@+/, '');
+      const usernameHit = !isGroupItem && !isBroadcastItem && handleQuery.length > 0
+        && chatRowUsernames(item).some((u) => u.includes(handleQuery));
+      return chatDisplayName.includes(query) || lastMessage.includes(query) || numberHit || usernameHit;
     });
     // Ordered LAST, after every filter, so the visible list is always
     // pinned-first / newest-first regardless of where the rows came from. The
@@ -680,48 +695,87 @@ export default function ChatList({ navigation }) {
       if (score > 0) scored.push({ score, contact: c });
     });
     scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, LOCAL_USER_RESULT_LIMIT).map(({ contact }) => ({
-      id: String(contact.userId),
-      name: contact.fullName || contact.name || contact.phone || '',
-      subtitle: contact.phone || contact.phoneNumber || '',
-      avatarUri: contact.profileImage || contact.profilePicture || '',
-      isVerified: Boolean(contact.isVerified),
-      contact,
-    }));
-  }, [isSearching, searchQuery, registeredContacts, chatPeerIds]);
+    return scored.slice(0, LOCAL_USER_RESULT_LIMIT).map(({ contact }) => {
+      // A peer who hides their details shows as their "@handle" only — same
+      // rule as every other surface (contactNameStore), phonebook name included.
+      const hidden = peerHidesContact(contact.userId, contact);
+      const handle = getPeerIdentity(contact.userId)?.userName;
+      return {
+        id: String(contact.userId),
+        name: hidden && handle ? `@${handle}` : (contact.fullName || contact.name || (hidden ? '' : contact.phone) || ''),
+        subtitle: hidden ? '' : (contact.phone || contact.phoneNumber || ''),
+        avatarUri: contact.profileImage || contact.profilePicture || '',
+        isVerified: Boolean(contact.isVerified),
+        contact,
+      };
+    });
+    // namesVersion: a privacy toggle recorded in the store re-derives the rows.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSearching, searchQuery, registeredContacts, chatPeerIds, namesVersion]);
 
+  // Chat peers are NOT excluded from the lookup: a directory hit on someone you
+  // already talk to is how an @username search finds their chat when the row
+  // shows a saved name and the chat object carries no handle (see
+  // directoryChatHits). They are routed to the chat list instead of the
+  // "Not in your chats" section below.
   const directoryExcludeIds = useMemo(() => {
-    const ids = new Set(chatPeerIds);
+    const ids = new Set();
+    if (currentUserId) ids.add(String(currentUserId));
     localUserMatches.forEach((u) => ids.add(String(u.id)));
     return ids;
-  }, [chatPeerIds, localUserMatches]);
+  }, [currentUserId, localUserMatches]);
 
   const { results: directoryResults, loading: directoryLoading } = useUserDirectorySearch(
     searchQuery,
     { enabled: isSearching, excludeIds: directoryExcludeIds },
   );
 
+  // Existing chats the server matched by @username / number — shown as chat
+  // rows, the way WhatsApp surfaces a thread for any key that identifies it.
+  const displayedChats = useMemo(() => {
+    if (!isSearching || !(directoryResults || []).length) return filteredChats;
+    const hitIds = new Set(
+      directoryResults.map((u) => String(u?.userId || '')).filter((id) => id && chatPeerIds.has(id)),
+    );
+    if (hitIds.size === 0) return filteredChats;
+    const shown = new Set(filteredChats.map((c) => String(c?.chatId || c?._id)));
+    const extra = dedupedChatList.filter((c) => {
+      if (!c || c.chatType === 'group' || c.isGroup) return false;
+      if (activeFilter === 'groups') return false;
+      if (activeFilter === 'unread' && !(Number(c?.unreadCount || 0) > 0)) return false;
+      if (shown.has(String(c?.chatId || c?._id))) return false;
+      return hitIds.has(String(peerIdOf(c, currentUserId) || c?.peerUser?._id || ''));
+    });
+    return extra.length ? [...filteredChats, ...extra] : filteredChats;
+  }, [isSearching, directoryResults, filteredChats, chatPeerIds, dedupedChatList, activeFilter, currentUserId]);
+
   const userSearchResults = useMemo(() => {
     if (!isSearching) return [];
     const rows = [...localUserMatches];
     (directoryResults || []).forEach((u) => {
       const id = String(u?.userId || '');
-      if (!id) return;
+      if (!id || chatPeerIds.has(id)) return;
       const handle = u?.userName ? `@${String(u.userName).replace(/^@+/, '')}` : '';
-      const label = u?.name || handle || u?.mobileNumber || 'Unknown';
+      // With no profile name the server sends the number AS the name; leading
+      // with that put a "+" in the avatar and buried the @handle that matched.
+      const digitsOf = (s) => String(s || '').replace(/\D/g, '');
+      const nameIsNumber = !u?.name || (digitsOf(u.name).length >= 6 && digitsOf(u.name) === digitsOf(u.mobileNumber))
+        || /^[+\d][\d\s()+-]*$/.test(String(u.name).trim());
+      const realName = nameIsNumber ? '' : u.name;
+      const label = realName || handle || u?.mobileNumber || 'Unknown';
       rows.push({
         id,
         name: label,
         // Show the OTHER identifier below the name — the handle when we led
         // with the name, the number when the handle is all there is.
-        subtitle: (u?.name && handle) ? handle : (u?.mobileNumber || handle || ''),
+        subtitle: (realName && handle) ? handle : (label === handle ? (u?.hideContact ? '' : (u?.mobileNumber || '')) : handle),
         avatarUri: u?.avatar || '',
         isVerified: Boolean(u?.isVerified),
         contact: {
           _id: id,
           userId: id,
           type: 'registered',
-          fullName: label,
+          fullName: realName,
           name: label,
           profileImage: u?.avatar || '',
           profilePicture: u?.avatar || '',
@@ -2153,7 +2207,7 @@ export default function ChatList({ navigation }) {
           </View>
         ) : (
           <FlatList
-            data={filteredChats}
+            data={displayedChats}
             keyExtractor={(item) => String(item?.chatId || item?._id)}
             renderItem={renderChatRow}
             showsVerticalScrollIndicator={false}

@@ -5,6 +5,7 @@ import {
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import CallAvatar from './CallAvatar';
+import { peerHidesContact } from '../../services/contactNameStore';
 
 /**
  * Incoming-call screen body — WhatsApp style:
@@ -101,7 +102,7 @@ export default function IncomingCallCard({
         <View style={styles.mediaRow}>
           <Ionicons name={isVideo ? 'videocam' : 'call'} size={15} color={onBgSoft} />
           <Text style={[styles.mediaText, { color: onBgSoft }]}>
-            {peer?.mobile || peer?.phone || (isVideo ? 'Incoming video call' : 'Incoming voice call')}
+            {(!peerHidesContact(peer?.id, peer) && (peer?.mobile || peer?.phone)) || (isVideo ? 'Incoming video call' : 'Incoming voice call')}
           </Text>
         </View>
       </View>

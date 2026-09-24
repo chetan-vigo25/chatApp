@@ -60,6 +60,17 @@ function notify() {
 }
 
 const buildIndex = (rows) => {
+  // userId → { hideContact, userName } as the last contact sync reported it.
+  // Filled for EVERY row that carries the flag — before the name check below,
+  // since a hidden peer's row can have no device name at all.
+  const privacyByUserId = new Map();
+  for (const c of rows || []) {
+    if (!c?.userId || c.hideContact === null || c.hideContact === undefined) continue;
+    privacyByUserId.set(String(c.userId), {
+      hideContact: Boolean(c.hideContact),
+      ...(c.userName ? { userName: String(c.userName) } : {}),
+    });
+  }
   const byUserId = new Map();
   const byE164 = new Map();
   const byDigits = new Map();
@@ -85,7 +96,7 @@ const buildIndex = (rows) => {
       }
     }
   }
-  return { byUserId, byE164, byDigits };
+  return { byUserId, byE164, byDigits, privacyByUserId };
 };
 
 /** Load (or reload) the index from SQLite. Safe to call often — concurrent
@@ -143,10 +154,76 @@ export const setPeerIdentity = (userId, patch = {}) => {
   notify();
 };
 
-/** The override for a peer, or null. */
+/**
+ * The override for a peer, or null. A live value (socket event, fresh chat list
+ * or search) wins; otherwise the privacy the last contact sync stored.
+ */
 export const getPeerIdentity = (userId) => {
   const uid = userId != null ? String(userId) : '';
-  return (uid && _peerIdentity.get(uid)) || null;
+  if (!uid) return null;
+  return _peerIdentity.get(uid) || _index?.privacyByUserId?.get(uid) || null;
+};
+
+/**
+ * Record the privacy bits of many peers at once, from a FRESH server payload
+ * (the REST chat list, a directory search). One notify for the whole batch.
+ *
+ * Why: a contact picker, the New Call list or a search row is built from the
+ * phonebook table, whose privacy columns are only as good as the last contact
+ * sync (and empty until the backend sends hideContact/userName on sync rows).
+ * Every peer the app has seen on a fresh payload lands here, and those screens
+ * ask `peerHidesContact(userId)` — which falls back to the synced value.
+ *
+ * Never feed it SQLite-cached rows: a cached flag can be older than the peer's
+ * last toggle, and this overlay outranks what callers pass in.
+ */
+export const seedPeerIdentities = (entries = []) => {
+  let changed = false;
+  for (const e of entries || []) {
+    const uid = e?.userId != null ? String(e.userId) : '';
+    if (!uid) continue;
+    const prev = _peerIdentity.get(uid) || {};
+    const next = { ...prev };
+    if (e.hideContact !== undefined && e.hideContact !== null) next.hideContact = Boolean(e.hideContact);
+    if (e.userName) next.userName = String(e.userName).replace(/^@+/, '');
+    if (next.hideContact === prev.hideContact && next.userName === prev.userName) continue;
+    _peerIdentity.set(uid, next);
+    changed = true;
+  }
+  if (changed) {
+    _version += 1;
+    notify();
+  }
+};
+
+/**
+ * Does this peer hide their contact details? Use it to suppress any line that
+ * would print their NUMBER (subtitles, info headers, cards, banners).
+ *
+ * @param userId  the peer's user id (checked against the live overlay first)
+ * @param row     optional row in hand: `hideContact` / `privacySettings`, or a
+ *                name the server redacted to the peer's own "@handle"
+ */
+export const peerHidesContact = (userId, row = null) => {
+  const live = getPeerIdentity(userId);
+  if (live && live.hideContact !== undefined) return live.hideContact;
+  if (!row || typeof row !== 'object') return false;
+  const flag = row.hideContact ?? row.privacySettings?.hideContact;
+  if (flag !== undefined && flag !== null) return Boolean(flag);
+  const handle = String(row.userName || row.username || '').trim().replace(/^@+/, '').toLowerCase();
+  const name = String(row.fullName || row.name || '').trim().toLowerCase();
+  return Boolean(handle) && name === `@${handle}`;
+};
+
+/**
+ * "@handle" to show INSTEAD of a phonebook row's saved name and number when
+ * the peer hides their details; null when they don't (or have no handle).
+ */
+export const hiddenHandleLabel = (userId, row = null) => {
+  if (!userId || !peerHidesContact(userId, row)) return null;
+  const h = getPeerIdentity(userId)?.userName || row?.userName || row?.username || null;
+  const clean = String(h || '').trim().replace(/^@+/, '');
+  return clean ? `@${clean}` : null;
 };
 
 /**

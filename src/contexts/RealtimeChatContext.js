@@ -19,7 +19,7 @@ import { useLocationTracking } from '../hooks/useLocationTracking';
 import { useAppUsageTracking } from '../hooks/useAppUsageTracking';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../services/MediaDownloadManager';
 import { shouldAutoDownloadNow, AUTO_DOWNLOAD_ENABLED } from '../services/autoDownloadSettings';
-import { setPeerIdentity } from '../services/contactNameStore';
+import { setPeerIdentity, seedPeerIdentities } from '../services/contactNameStore';
 import { renderSystemMessage } from '../utils/systemMessage';
 import {
   getCurrentUserId, setCurrentUserId as publishCurrentUserId, primeCurrentUser,
@@ -887,6 +887,17 @@ const reducer = (state, action) => {
             fullName: chat.chatName || '',
             profileImage: chat.chatAvatar || null,
           };
+        }
+        // The REST row ships the peer's handle and privacy flag FLAT, beside
+        // peerUserId. Every name resolver reads them off peerUser, so leaving
+        // them behind made a hidden peer resolve to the saved phonebook name
+        // (or their number) instead of their "@handle".
+        if (!isGroupChat && chat.peerUser) {
+          const peer = { ...chat.peerUser };
+          if (peer.userName == null && chat.userName) peer.userName = chat.userName;
+          if (peer.hideContact == null && chat.hideContact != null) peer.hideContact = Boolean(chat.hideContact);
+          if (peer.mobileNumber == null && chat.mobileNumber != null) peer.mobileNumber = chat.mobileNumber;
+          chat.peerUser = peer;
         }
 
         // Build group object from flat fields if not already present (new API format)
@@ -5430,6 +5441,19 @@ export function RealtimeChatProvider({ children }) {
       if (chatId) tempMap[chatId] = chat;
     });
     subscribePresenceForChats(tempMap);
+
+    // The server chat list is the freshest record of each peer's privacy
+    // toggle. Publish it app-wide so surfaces built from the phonebook (which
+    // stores no privacy bit) also stop printing a hidden peer's number.
+    if (!opts.skipSQLiteWrite) {
+      seedPeerIdentities((chats || [])
+        .filter((c) => c && c.chatType !== 'group' && !c.isGroup && !c.isSelfChat)
+        .map((c) => ({
+          userId: c?.peerUserId || c?.peerUser?._id || null,
+          hideContact: c?.hideContact ?? c?.peerUser?.hideContact,
+          userName: c?.userName || c?.peerUser?.userName || null,
+        })));
+    }
 
     // Persist chatlist to SQLite (write-through on API sync / initial load)
     if (!opts.skipSQLiteWrite) {
