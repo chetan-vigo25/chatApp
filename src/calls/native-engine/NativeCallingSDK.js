@@ -868,6 +868,13 @@ export default class NativeCallingSDK {
     // must keep re-asserting through it.
     if ((this._room && !this._room.preAnswer) || this._acceptedId) return Promise.resolve(true);
     if (this._out && (Date.now() - this._lastDialAt) < REASSERT_MS) return Promise.resolve(false);
+    // ONE dial in flight at a time. The lobby-event redial and the interval tick
+    // can fire together (and `users` arrives in bursts); two concurrent callUser
+    // requests made the server mint SEPARATE call records/rooms for one call —
+    // callee accepted one, caller warmed up another, both sat alone in their
+    // rooms with no audio until the connect watchdog cut it (2026-09-24).
+    if (this._dialInFlight) return Promise.resolve(false);
+    this._dialInFlight = true;
     return this._req('callUser', { toUserId: target, callType: this._media }).then((res) => {
       // The call may have been ANSWERED while this request was in flight —
       // never resurrect dial state over a live call (the id becomes harmless
@@ -905,7 +912,7 @@ export default class NativeCallingSDK {
       // callee who "was ready" but never got the ring could not be diagnosed.
       this._log(`redial to ${target} failed: ${(e && e.message) || e}`);
       return false;
-    });
+    }).then((v) => { this._dialInFlight = false; return v; });
   }
 
   // Ring-time warm-up for an outgoing 1:1: join the room + build transports +
