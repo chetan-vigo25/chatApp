@@ -26,6 +26,7 @@ import {
 } from '../services/currentUser';
 import { computeSenderType } from '../utils/messageDirection';
 import { normalizeMentions } from '../utils/mentions';
+import { extractReplyFields } from '../utils/replyFields';
 
 const TYPING_TTL = 10000;
 const CHAT_HIGHLIGHT_TTL = 2000;
@@ -2935,15 +2936,20 @@ export function RealtimeChatProvider({ children }) {
         const first = deliveredEmittedRef.current.values().next().value;
         deliveredEmittedRef.current.delete(first);
       }
+      // Through emitSocketEvent, never a raw emit: on a reconnect the server
+      // (connection-state recovery) replays missed messages BEFORE the session is
+      // re-authenticated, and a receipt emitted in that window is rejected
+      // NOT_AUTHENTICATED — after the id was already claimed, so the sender was
+      // stuck on one tick for good. emitSocketEvent holds it until 'authenticated'.
       if (isGroup) {
-        socket.emit('group:message:delivered', {
+        emitSocketEvent('group:message:delivered', {
           groupId,
           messageIds: [messageId],
           userId: currentUserIdRef.current,
           deliveredAt: new Date().toISOString(),
         });
       } else {
-        socket.emit('message:delivered', { messageId, chatId, senderId });
+        emitSocketEvent('message:delivered', { messageId, chatId, senderId });
       }
     };
 
@@ -2972,6 +2978,71 @@ export function RealtimeChatProvider({ children }) {
         const messageId = m.messageId || m.serverMessageId || m.id || normalizeId(m._id);
         emitDeliveryReceipt({ isGroup, messageId, chatId, groupId: groupId || (isGroup ? chatId : null), senderId });
       }
+    };
+
+    // Persist RAW server message docs (catch-up / range fetch: messageId/_id/
+    // messageType, not the client shape) through the serialized writer, render
+    // them in any open thread, and acknowledge delivery.
+    const persistServerMessages = async (rawMsgs, chatId) => {
+      if (!Array.isArray(rawMsgs) || rawMsgs.length === 0) return;
+      // Normalize so upsert derives id/serverMessageId correctly (otherwise it
+      // inserts `unknown_*` rows) and preserves `seq` + media type.
+      const normalizedNew = rawMsgs.map((m) => {
+        const n = normalizeMessagePayload({ ...m, chatId: m.chatId || chatId });
+        return {
+          ...n,
+          type: m.messageType || m.type || n.type || 'text',
+          mediaUrl: m.mediaUrl || null,
+          mediaType: m.mediaType || null,
+          previewUrl: m.mediaThumbnailUrl || m.previewUrl || null,
+          mediaId: m.mediaId || null,
+          // Dedupe bridge (cleanBeforeUpsert rule 0): a row the warm restore
+          // stored under the Mongo _id is replaced, not doubled.
+          mongoId: normalizeId(m._id) || null,
+          synced: 1,
+        };
+      });
+      try {
+        const { default: SqliteWriter } = await import('../services/SqliteWriter');
+        SqliteWriter.enqueue('upsertMessages', normalizedNew).catch(() => {});
+      } catch {}
+      normalizedNew.forEach((m) => {
+        dispatch({ type: 'INCOMING_MESSAGE', payload: m });
+      });
+      emitReceiptsForFetched(rawMsgs, chatId);
+    };
+
+    // Seq gap repair (1:1). A message the server pushed over a socket that
+    // died before the app processed it (sent seconds before Android froze the
+    // backgrounded app, 2026-09-25) is never re-sent live, and the server
+    // skips FCM because the device looked online. The next live message then
+    // lands with a HIGHER seq, and every later sync asks "since MAX(seq)" — the
+    // hole is permanent: the receiver never sees it, the sender never gets a
+    // delivered tick. Seen seq > local max + 1 → fetch the missing range.
+    const seqGapInFlight = new Set();
+    const seqHolesChecked = new Set();
+    const fillSeqGap = (chatId, fromSeq, toSeq) => {
+      if (!chatId || !(fromSeq > 0) || !(toSeq >= fromSeq)) return;
+      const key = `${chatId}:${fromSeq}-${toSeq}`;
+      if (seqGapInFlight.has(key)) return;
+      const socket = getSocket();
+      if (!socket || !isSocketConnected() || !isSocketAuthed()) return;
+      seqGapInFlight.add(key);
+      let settled = false;
+      const done = (response) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        seqGapInFlight.delete(key);
+        const data = response?.data || response || {};
+        const msgs = Array.isArray(data?.messages) ? data.messages : [];
+        if (msgs.length) {
+          dlog('🩹 seq gap filled', { chatId, fromSeq, toSeq, got: msgs.length });
+          persistServerMessages(msgs, chatId).catch(() => {});
+        }
+      };
+      const timer = setTimeout(() => done(null), 15000);
+      try { socket.emit('message:fetch', { chatId, fromSeq, toSeq }, done); } catch { done(null); }
     };
 
     const onMessage = (payload) => {
@@ -3159,22 +3230,23 @@ export function RealtimeChatProvider({ children }) {
             senderId: normalized.senderId,
           });
         }
+        // Seq gap check — read the local max BEFORE this row is written.
+        const liveSeq = Number(source?.seq ?? normalized?.seq);
+        if (Number.isFinite(liveSeq) && liveSeq > 1 && normalized.chatId) {
+          ChatDatabase.getLatestSeq(normalized.chatId)
+            .then((localMax) => {
+              const max = Number(localMax) || 0;
+              if (max > 0 && liveSeq > max + 1) fillSeqGap(normalized.chatId, max + 1, liveSeq - 1);
+            })
+            .catch(() => {});
+        }
         const ts = normalized.createdAt ? new Date(normalized.createdAt).getTime() : Date.now();
 
-        // Extract reply data — server may send replyTo as object or string
-        const srcReplyTo = source?.replyTo;
-        const srcReplyIsObj = srcReplyTo && typeof srcReplyTo === 'object';
-        const replyToMsgId = source?.replyToMessageId || source?.quotedMessageId
-          || (srcReplyIsObj ? (srcReplyTo._id || srcReplyTo.id) : srcReplyTo)
-          || source?.reply_to_message_id || null;
-        const replyPreviewText = source?.replyPreviewText || source?.quotedText
-          || (srcReplyIsObj ? srcReplyTo.text : null) || null;
-        const replyPreviewType = source?.replyPreviewType
-          || (srcReplyIsObj ? (srcReplyTo.messageType || srcReplyTo.type) : null) || null;
-        const replySenderId = source?.replySenderId
-          || (srcReplyIsObj ? (srcReplyTo.senderId || srcReplyTo.sender?._id) : null) || null;
-        const replySenderName = source?.replySenderName || source?.quotedSender
-          || (srcReplyIsObj ? (srcReplyTo.senderName || srcReplyTo.sender?.fullName) : null) || null;
+        // Reply data — UUID id + replyPreview snapshot (see utils/replyFields).
+        const {
+          replyToMessageId: replyToMsgId, replyPreviewText, replyPreviewType,
+          replySenderId, replySenderName, replyPreviewThumbnail,
+        } = extractReplyFields(source);
 
         // Status reply / share snapshot — the status owner (receiver) is almost
         // never inside the chat when a status reply lands, so THIS global path is
@@ -3257,6 +3329,7 @@ export function RealtimeChatProvider({ children }) {
           replyPreviewType,
           replySenderName,
           replySenderId,
+          replyPreviewThumbnail,
           // Persist the status snapshot so the reply's status card renders when
           // the receiver opens the chat later (loaded back from SQLite payload).
           statusRef,
@@ -3970,22 +4043,39 @@ export function RealtimeChatProvider({ children }) {
     // "internet wapas aane par messages sync nahi hote" bug). Wait for the
     // auth bind (the 'authenticated' event flips the flag; the client's
     // AUTH_FLUSH fallback covers servers that never send it) before any round.
-    const waitForSocketAuth = async (timeoutMs = 15000) => {
-      const start = Date.now();
-      while (Date.now() - start < timeoutMs) {
-        if (!socket.connected) return false;
-        if (isSocketAuthed()) return true;
-        await new Promise((r) => setTimeout(r, 250));
-      }
-      return isSocketAuthed();
-    };
+    // Event-driven, not a setTimeout poll: Android pauses JS timers while the
+    // app is backgrounded, so a poll loop stalled the whole reconnect catch-up
+    // (a message missed during a network drop never arrived until the app was
+    // opened). The socket's own 'authenticated' event still fires then. The
+    // timeout is only a backstop.
+    const waitForSocketAuth = (timeoutMs = 15000) => new Promise((resolve) => {
+      if (!socket.connected) { resolve(false); return; }
+      if (isSocketAuthed()) { resolve(true); return; }
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.off('authenticated', onAuth);
+        socket.off('disconnect', onDrop);
+        resolve(ok);
+      };
+      const onAuth = (response) => done(response?.status === true || isSocketAuthed());
+      const onDrop = () => done(false);
+      const timer = setTimeout(() => done(isSocketAuthed()), timeoutMs);
+      socket.on('authenticated', onAuth);
+      socket.on('disconnect', onDrop);
+    });
 
     const onConnectCatchup = async () => {
       if (!(await waitForSocketAuth())) return;
-      // Await the list reconcile so a chat CREATED while offline is known
-      // (DB/memory) before the per-chat catch-up derives its chat list —
-      // otherwise the new chat's messages were skipped this pass.
-      try { await reconcileChatList(); } catch (_) { /* best-effort */ }
+      // The list reconcile runs in PARALLEL — never ahead of the message
+      // catch-up. `chat:list` measured 27s server-side (2026-09-25) while the
+      // catch-up round answers in <1s; awaiting it first (20s timeout) meant a
+      // message missed during a network drop surfaced ~26s after reconnect.
+      // A chat CREATED while offline is only known once the list lands, so it
+      // gets its own catch-up pass after the main one (below).
+      const listReconciled = reconcileChatList().catch(() => false);
       // Missed CALLS while offline: the server re-rings any still-pending
       // invite to this socket (call:incoming) — pullPendingCalls previously
       // had no caller at all, so a ring that landed while offline was lost.
@@ -4005,10 +4095,9 @@ export function RealtimeChatProvider({ children }) {
         try { dbChatIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
         const memChatIds = Object.keys(stateRef.current?.chatMap || {});
         const knownChatIds = Array.from(new Set([...dbChatIds, ...memChatIds]));
-        if (knownChatIds.length === 0) return;
 
         // Gather { chatId, lastSeq, mutatedSince } per chat.
-        const entries = await Promise.all(knownChatIds.map(async (chatId) => {
+        const entriesFor = (ids) => Promise.all(ids.map(async (chatId) => {
           try {
             const lastSeq = await ChatDatabase.getLatestSeq(chatId);
             const mutatedSince = await _getMutationCursor(chatId);
@@ -4042,39 +4131,10 @@ export function RealtimeChatProvider({ children }) {
             if (!entry || !entry.chatId) continue;
             const newMessages = Array.isArray(entry.newMessages) ? entry.newMessages : [];
 
-            // Persist through the writer queue — serialized, never races.
+            // Persist through the writer queue — serialized, never races —
+            // and acknowledge: the catch-up is how an offline device receives.
             if (newMessages.length > 0) {
-              // Catch-up rows are RAW Mongo docs (messageId/_id/messageType), not
-              // the client message shape. Normalize so upsert derives id/
-              // serverMessageId correctly (otherwise it inserts `unknown_*` rows
-              // and the thread stays empty) and preserves `seq` + media type.
-              const normalizedNew = newMessages.map((m) => {
-                const n = normalizeMessagePayload({ ...m, chatId: m.chatId || entry.chatId });
-                return {
-                  ...n,
-                  type: m.messageType || m.type || n.type || 'text',
-                  mediaUrl: m.mediaUrl || null,
-                  mediaType: m.mediaType || null,
-                  previewUrl: m.mediaThumbnailUrl || m.previewUrl || null,
-                  mediaId: m.mediaId || null,
-                  // Dedupe bridge (cleanBeforeUpsert rule 0): a row the warm
-                  // restore stored under the Mongo _id is replaced, not doubled.
-                  mongoId: normalizeId(m._id) || null,
-                  synced: 1,
-                };
-              });
-              try {
-                const { default: SqliteWriter } = await import('../services/SqliteWriter');
-                SqliteWriter.enqueue('upsertMessages', normalizedNew).catch(() => {});
-              } catch {}
-              // Dispatch realtime updates so any open chat screen renders the
-              // new tail immediately.
-              normalizedNew.forEach((m) => {
-                dispatch({ type: 'INCOMING_MESSAGE', payload: m });
-              });
-              // Tell the server these reached us — the catch-up is how an
-              // offline device receives, and it used to skip the receipt.
-              emitReceiptsForFetched(newMessages, entry.chatId);
+              await persistServerMessages(newMessages, entry.chatId);
             }
 
             // Mutation delta — edits/deletes applied to already-stored messages
@@ -4121,15 +4181,42 @@ export function RealtimeChatProvider({ children }) {
         // only the overflowing chats with the advanced cursor so a large
         // offline backlog fully converges (bounded to keep a hostile/buggy
         // server from looping us forever).
-        let pending = entries;
-        for (let round = 0; round < 10 && pending.length > 0; round += 1) {
-          const chats = await emitCatchupRound(pending);
-          if (!chats) break; // timeout / old server — per-chat message:sync remains the fallback
-          await processCatchupChats(chats);
-          pending = chats
-            .filter((c) => c && c.chatId && c.hasMore === true && Number(c.latestSeq) > 0)
-            .map((c) => ({ chatId: c.chatId, lastSeq: Number(c.latestSeq) }));
+        const runCatchup = async (ids) => {
+          if (!ids.length) return;
+          let pending = await entriesFor(ids);
+          for (let round = 0; round < 10 && pending.length > 0; round += 1) {
+            const chats = await emitCatchupRound(pending);
+            if (!chats) break; // timeout / old server — per-chat message:sync remains the fallback
+            await processCatchupChats(chats);
+            pending = chats
+              .filter((c) => c && c.chatId && c.hasMore === true && Number(c.latestSeq) > 0)
+              .map((c) => ({ chatId: c.chatId, lastSeq: Number(c.latestSeq) }));
+          }
+        };
+        await runCatchup(knownChatIds);
+
+        // Holes BELOW the max seq: the catch-up above only asks "since
+        // MAX(seq)", so a message lost before a later one arrived (see
+        // fillSeqGap) stays missing forever. One range fetch per 1:1 chat per
+        // session — the server has holes of its own, so never retry a range.
+        for (const chatId of knownChatIds) {
+          if (!String(chatId).startsWith('u_') || seqHolesChecked.has(chatId)) continue;
+          seqHolesChecked.add(chatId);
+          try {
+            const hole = await ChatDatabase.getRecentSeqHole(chatId);
+            if (hole) fillSeqGap(chatId, hole[0], hole[1]);
+          } catch { /* best-effort */ }
         }
+
+        // Chats the list reconcile just introduced (created while offline).
+        await listReconciled;
+        let laterDbIds = [];
+        try { laterDbIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
+        const known = new Set(knownChatIds);
+        const newChatIds = Array.from(new Set([
+          ...laterDbIds, ...Object.keys(stateRef.current?.chatMap || {}),
+        ])).filter((id) => id && !known.has(id));
+        await runCatchup(newChatIds);
       } catch (err) {
         // Best-effort — catchup is a non-essential reconciliation path.
       }
@@ -4457,22 +4544,14 @@ export function RealtimeChatProvider({ children }) {
         const ts = rawTimestamp
           ? (typeof rawTimestamp === 'number' ? rawTimestamp : new Date(rawTimestamp).getTime())
           : Date.now();
-        // Extract reply data from the payload — server may send replyTo as object or string
-        const rawReplyTo = data?.replyTo;
-        const replyIsObject = rawReplyTo && typeof rawReplyTo === 'object';
-        const replyToMessageId = data?.replyToMessageId || data?.quotedMessageId
-          || (replyIsObject ? (rawReplyTo._id || rawReplyTo.id) : rawReplyTo)
-          || data?.reply_to_message_id || null;
-        const replyPreviewText = data?.replyPreviewText || data?.quotedText || data?.reply_preview_text
-          || (replyIsObject ? rawReplyTo.text : null) || null;
-        const replyPreviewType = data?.replyPreviewType || data?.reply_preview_type
-          || (replyIsObject ? (rawReplyTo.messageType || rawReplyTo.type) : null) || null;
-
-        // Resolve reply sender name — try payload, then replyTo object, then group members
-        let replySenderId = data?.replySenderId || data?.reply_sender_id
-          || (replyIsObject ? (rawReplyTo.senderId || rawReplyTo.sender?._id) : null) || null;
-        let replySenderName = data?.replySenderName || data?.quotedSender || data?.reply_sender_name
-          || (replyIsObject ? (rawReplyTo.senderName || rawReplyTo.sender?.fullName || rawReplyTo.sender?.name) : null) || null;
+        // Reply data — UUID id + replyPreview snapshot (see utils/replyFields).
+        const replyFields = extractReplyFields(data);
+        const {
+          replyToMessageId, replyPreviewText, replyPreviewType, replyPreviewThumbnail,
+        } = replyFields;
+        // Sender name falls back to the group member list below.
+        const { replySenderId } = replyFields;
+        let { replySenderName } = replyFields;
         if (!replySenderName && replySenderId) {
           const currentState = stateRef.current;
           if (currentState.currentUserId && String(replySenderId) === String(currentState.currentUserId)) {
@@ -4534,6 +4613,7 @@ export function RealtimeChatProvider({ children }) {
           replyPreviewType: replyPreviewType || null,
           replySenderName: replySenderName || null,
           replySenderId: replySenderId || null,
+          replyPreviewThumbnail: replyPreviewThumbnail || null,
           contact: data?.contact ? JSON.stringify(data.contact) : null,
           forwardedFrom: data?.forwardedFrom || null,
         }).catch(() => {});

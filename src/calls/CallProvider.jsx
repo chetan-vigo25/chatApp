@@ -20,7 +20,11 @@ import CallEngineWebView from './engine/CallEngineWebView';
 import { isNativeCallEngine } from './engineSelector';
 import nativeEngine from './native-engine/NativeCallEngine';
 import { markCallEvent, recordCallFailure, readCallFailures } from './diagnostics/callDiagnostics';
-import { audioSessionDidActivate, audioSessionDidDeactivate } from './native-engine/webrtcGlobals';
+import {
+  audioSessionDidActivate, audioSessionDidDeactivate,
+  enableCallKitManualAudio, manualAudioActivated, manualAudioDeactivated,
+  ensureManualAudioEnabled, resetManualAudio,
+} from './native-engine/webrtcGlobals';
 // AudioRoute wraps react-native-incall-manager. It lives under native-engine/ for
 // historical reasons but is NOT native-engine-only: on Android the WebView engine
 // needs it just as much (see applyInitialCallRoute) — it is what puts the device
@@ -1369,6 +1373,10 @@ export const CallProvider = ({ children }) => {
       if (oar.timer) { clearTimeout(oar.timer); oar.timer = null; }
       oar.attempts = 0; oar.confirmed = false;
     }
+    // iOS manual audio: a call that never got a CallKit deactivation (the
+    // safety-net enable) must not leave the next call's audio unit enabled
+    // before CallKit hands over the session.
+    resetManualAudio();
     // Defensive: a pending "answer on next INCOMING" must never survive a call —
     // a leaked flag would auto-accept the NEXT incoming call without a tap.
     pushAcceptPendingRef.current = false;
@@ -2346,6 +2354,14 @@ export const CallProvider = ({ children }) => {
           // races reportOutgoingConnected's. No-op on Android / WebView engine.
           actionsRef.current.scheduleOutgoingAudioRecovery
             && actionsRef.current.scheduleOutgoingAudioRecovery();
+          // Manual audio safety net: connected but CallKit never activated the
+          // session → enable anyway rather than stay silent. A late activation
+          // still restarts the unit (manualAudioActivated).
+          setTimeout(() => {
+            const s = stateRef.current;
+            if (s.status !== CALL_STATUS.ACTIVE) return;
+            if (ensureManualAudioEnabled()) markCallEvent('audio:manual-fallback');
+          }, 1500);
         }
         break;
       }
@@ -5368,6 +5384,13 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     if (!nativeCall.isAvailable()) return undefined;
     nativeCall.setup();
+    // iOS: WebRTC's audio unit may only start once CallKit has activated the
+    // session (see webrtcGlobals). Switched on BEFORE registerEvents so a
+    // cold-start replayed activation is already counted.
+    if (Platform.OS === 'ios' && isNativeCallEngine()) {
+      const on = enableCallKitManualAudio();
+      markCallEvent('audio:manual', { on });
+    }
     const unsub = nativeCall.registerEvents({
       onAnswer: () => {
         const snap = stateRef.current;
@@ -5493,7 +5516,12 @@ export const CallProvider = ({ children }) => {
         // is deliberately NOT gated on call state: during a cold-start replay
         // the activation can arrive before the ring state is flushed, and the
         // sync is harmless when idle.
-        if (isNativeCallEngine()) audioSessionDidActivate();
+        if (isNativeCallEngine()) {
+          audioSessionDidActivate();
+          // Manual audio: (re)start the audio unit on THIS live session — also
+          // when CallKit's activation lands seconds after the call connected.
+          manualAudioActivated();
+        }
         actionsRef.current.reassertCallAudio && actionsRef.current.reassertCallAudio();
         actionsRef.current.restartEngineAudio && actionsRef.current.restartEngineAudio();
         setTimeout(() => {
@@ -5509,7 +5537,10 @@ export const CallProvider = ({ children }) => {
       // NEXT call's audio unit starts against a dead session — the classic
       // "second call is silent" pattern.
       onAudioSessionDeactivated: () => {
-        if (isNativeCallEngine()) audioSessionDidDeactivate();
+        if (isNativeCallEngine()) {
+          audioSessionDidDeactivate();
+          manualAudioDeactivated();
+        }
       },
     });
     return () => { unsub(); };

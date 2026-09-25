@@ -88,6 +88,25 @@ const IOS_ROUTE_TO = `    if (output == nil) {
 
     [self sendEventWithName:RNCallKeepDidChangeAudioRoute body:@{`;
 
+// performAnswerCallAction ran configureAudioSession, which ends with
+// setActive:TRUE. Apple: never activate the session yourself in a CallKit
+// action — CallKit activates it (didActivateAudioSession). From a locked /
+// background app the self-activation is refused ('!pri') and audiomxd
+// interrupts our session ("Stop Now"); on 2026-09-24 22:22 CallKit's own
+// activation then came 8s late and the call was silent. Set the category
+// only; didActivateAudioSession still runs the full configureAudioSession.
+const IOS_ANSWER_FROM = `    [self configureAudioSession];
+    [self sendEventWithNameWrapper:RNCallKeepPerformAnswerCallAction body:`;
+const IOS_ANSWER_TO = `    // ${PATCH_MARKER}: category only — never setActive here; CallKit activates
+    // the session itself and didActivateAudioSession configures it fully.
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionAllowBluetooth error:nil];
+    [self sendEventWithNameWrapper:RNCallKeepPerformAnswerCallAction body:`;
+
+const IOS_REPLACEMENTS = [
+  ['route event guard', IOS_ROUTE_FROM, IOS_ROUTE_TO],
+  ['answer without setActive', IOS_ANSWER_FROM, IOS_ANSWER_TO],
+];
+
 function patchCallKeepIos(projectRoot) {
   const target = path.join(projectRoot, IOS_MODULE_REL);
   if (!fs.existsSync(target)) {
@@ -95,14 +114,21 @@ function patchCallKeepIos(projectRoot) {
     return false;
   }
   const original = fs.readFileSync(target, 'utf8');
-  if (original.includes(IOS_ROUTE_TO)) return false;
-  if (!original.includes(IOS_ROUTE_FROM)) {
-    console.warn('[withCallKeepAndroidInteropFix] iOS anchor not found — RNCallKeep.m changed; '
-      + 're-check onAudioRouteChange before shipping.');
-    return false;
-  }
-  fs.writeFileSync(target, original.replace(IOS_ROUTE_FROM, IOS_ROUTE_TO));
-  console.log('[withCallKeepAndroidInteropFix] patched RNCallKeep.m (route event guard)');
+  let patched = original;
+  const applied = [];
+  IOS_REPLACEMENTS.forEach(([label, from, to]) => {
+    if (patched.includes(to)) return;
+    if (!patched.includes(from)) {
+      console.warn(`[withCallKeepAndroidInteropFix] iOS anchor not found (${label}) — RNCallKeep.m `
+        + 'changed; re-check it before shipping.');
+      return;
+    }
+    patched = patched.replace(from, to);
+    applied.push(label);
+  });
+  if (patched === original) return false;
+  fs.writeFileSync(target, patched);
+  console.log(`[withCallKeepAndroidInteropFix] patched RNCallKeep.m (${applied.join(', ')})`);
   return true;
 }
 

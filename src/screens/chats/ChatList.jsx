@@ -8,7 +8,6 @@ import {
   ActivityIndicator,
   Modal,
   Animated,
-  TextInput,
   Image,
   Platform,
   Alert,
@@ -49,6 +48,7 @@ import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
 import { requestContactsPermission } from '../../contexts/useContactSync';
 import useOpenUserChat from '../../hooks/useOpenUserChat';
 import UserSearchRow from '../../components/UserSearchRow';
+import AppSearchBar from '../../components/AppSearchBar';
 import { getUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 import {
   DELETED_PWD_SET_KEY,
@@ -1996,25 +1996,7 @@ export default function ChatList({ navigation }) {
   // Pinned (non-scrolling) section: ONLY the search bar.
   const pinnedSearchAndFilters = (
     <View style={[styles.pinnedHeaderWrap, { backgroundColor: theme.colors.background }]}>
-      <View style={[styles.searchBar, { backgroundColor: isDarkMode ? '#1F2C3380' : '#f0f2f5' }]}>
-        <Ionicons name="search" size={17} color={theme.colors.iconColor} />
-        <TextInput
-          keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-          placeholder="Search"
-          // Darker/higher-contrast placeholder than the default muted grey.
-          placeholderTextColor={isDarkMode ? '#9AA9B2' : '#54656F'}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
-        />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity onPress={clearSearch} activeOpacity={0.6} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-            <View style={[styles.searchClearCircle, { backgroundColor: theme.colors.placeHolderTextColor + '28' }]}>
-              <Ionicons name="close" size={12} color={theme.colors.placeHolderTextColor} />
-            </View>
-          </TouchableOpacity>
-        )}
-      </View>
+      <AppSearchBar value={searchQuery} onChangeText={setSearchQuery} onClear={clearSearch} />
     </View>
   );
 
@@ -2786,29 +2768,6 @@ const styles = StyleSheet.create({
   },
 
   // ─── SEARCH ───
-  searchBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderRadius: 20,
-    paddingHorizontal: 14,
-    height: 40,
-    gap: 10,
-  },
-  searchInput: {
-    flex: 1,
-    fontSize: 14,
-    fontFamily: 'Roboto-Regular',
-    paddingVertical: 0,
-    height: '100%',
-    letterSpacing: 0.1,
-  },
-  searchClearCircle: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
 
   // ─── FILTER PILLS ───
   filterRow: {

@@ -37,6 +37,7 @@ import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import { profileDetail } from '../../Redux/Reducer/Profile/Profile.reducer';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
+import { useTheme } from '../../contexts/ThemeContext';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 // Full-SCREEN height (incl. system bars). The keyboard's endCoordinates.screenY
@@ -154,24 +155,34 @@ export default function StatusViewer({ navigation, route }) {
   // So KeyboardAvoidingView can't lift it — we track the keyboard height
   // ourselves and offset the sheet above the keyboard manually.
   const [kbHeight, setKbHeight] = useState(0);
-  // Hide the system status bar ONLY while this viewer is focused, and always
-  // restore it on blur/unmount. Using the declarative `<StatusBar hidden />`
-  // leaked the hidden state onto the next screen (its prop persisted in RN's
-  // merge stack while this screen stayed mounted underneath), so other screens
-  // — e.g. a contact profile — opened with no time/battery/signal. This
-  // focus-scoped imperative control guarantees the bar comes back.
+  const { isDarkMode } = useTheme();
+  // Keep the system status bar (time/signal/battery) VISIBLE over the viewer.
+  // The viewer is always dark, so while it's focused we force light icons on
+  // a transparent, translucent bar; on blur/unmount we hand back the app's
+  // theme style. Hiding the bar also left a black band over the display
+  // cutout on Android, which made the dark-theme viewer look broken.
   useEffect(() => {
-    const hideBar = () => StatusBar.setHidden(true, 'fade');
-    const showBar = () => StatusBar.setHidden(false, 'fade');
-    hideBar();
-    const focusSub = navigation.addListener('focus', hideBar);
-    const blurSub = navigation.addListener('blur', showBar);
+    const applyViewerBar = () => {
+      StatusBar.setHidden(false, 'fade');
+      StatusBar.setBarStyle('light-content', true);
+      if (Platform.OS === 'android') {
+        StatusBar.setTranslucent(true);
+        StatusBar.setBackgroundColor('transparent', true);
+      }
+    };
+    const restoreAppBar = () => {
+      StatusBar.setHidden(false, 'fade');
+      StatusBar.setBarStyle(isDarkMode ? 'light-content' : 'dark-content', true);
+    };
+    applyViewerBar();
+    const focusSub = navigation.addListener('focus', applyViewerBar);
+    const blurSub = navigation.addListener('blur', restoreAppBar);
     return () => {
-      showBar();
+      restoreAppBar();
       focusSub();
       blurSub();
     };
-  }, [navigation]);
+  }, [navigation, isDarkMode]);
 
   // Attached for the SCREEN's lifetime — deliberately NOT gated on showReply.
   // The reply input autoFocuses, so the keyboard's show event can fire before
@@ -912,8 +923,15 @@ export default function StatusViewer({ navigation, route }) {
     }
   };
 
+  // WhatsApp-style status bar strip: content starts BELOW the system bar, and
+  // the strip takes the slide's colour — the text status background for text
+  // slides, solid black (the dark-theme ground) for photos/videos/links.
+  const isTextSlide = currentMediaType === 'text'
+    || (!currentMediaType && !!currentStatus?.textContent);
+  const statusBarTint = isTextSlide ? (currentStatus?.bgColor || '#026158') : '#000000';
+
   return (
-    <View style={styles.root}>
+    <View style={[styles.root, { paddingTop: insets.top, backgroundColor: statusBarTint }]}>
 
       {/* Content */}
       {renderContent()}
@@ -973,7 +991,7 @@ export default function StatusViewer({ navigation, route }) {
       })()}
 
       {/* Progress bars */}
-      <View style={styles.progressContainer}>
+      <View style={[styles.progressContainer, { top: insets.top + 8 }]}>
         {statuses.map((_, i) => (
           <View key={i} style={styles.progressTrack}>
             <Animated.View style={[styles.progressFill, {
@@ -988,7 +1006,7 @@ export default function StatusViewer({ navigation, route }) {
       </View>
 
       {/* Header */}
-      <View style={styles.header}>
+      <View style={[styles.header, { top: insets.top + 18 }]}>
         <TouchableOpacity onPress={() => safeGoBack()} style={styles.backBtn}>
           <Ionicons name="arrow-back" size={24} color="#fff" />
         </TouchableOpacity>
@@ -1060,7 +1078,7 @@ export default function StatusViewer({ navigation, route }) {
       {/* Bottom bar — WhatsApp-style: no dark scrim, no pill tabs */}
       {isMine ? (
         /* ── Owner bottom: single-row Views/Likes summary + delete ── */
-        <View style={styles.ownerBar}>
+        <View style={[styles.ownerBar, { paddingBottom: Math.max(26, insets.bottom + 12) }]}>
           <TouchableOpacity
             style={styles.ownerSummary}
             activeOpacity={0.7}
@@ -1096,7 +1114,7 @@ export default function StatusViewer({ navigation, route }) {
         </View>
       ) : (
         /* ── Viewer bottom: rounded reply + heart, no background scrim ── */
-        <View style={styles.viewerBar}>
+        <View style={[styles.viewerBar, { paddingBottom: Math.max(26, insets.bottom + 12) }]}>
           {/* Reply: hidden entirely for official admin broadcasts; for normal
               statuses it respects the per-status allowReplies flag. */}
           {isBroadcast ? (
@@ -1389,7 +1407,7 @@ export default function StatusViewer({ navigation, route }) {
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: '#111B21' },
+  root: { flex: 1, backgroundColor: '#000000' },
 
   textContent: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 30 },
   textBody:    { fontSize: 24, color: '#fff', textAlign: 'center', fontFamily: 'Roboto-Medium', lineHeight: 34 },

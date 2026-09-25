@@ -1,5 +1,7 @@
 import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, Image } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { Image } from 'expo-image';
+import { cachedImageSource } from '../utils/imageSource';
 
 const MEDIA_LABELS = {
   image: '📷 Photo',
@@ -90,7 +92,7 @@ const ReplyBubble = React.memo(function ReplyBubble({
         </Text>
       </View>
       {showThumb && (
-        <Image source={{ uri: replyThumbnailUrl }} style={styles.thumb} resizeMode="cover" />
+        <Image source={cachedImageSource(replyThumbnailUrl)} style={styles.thumb} contentFit="cover" cachePolicy="memory-disk" />
       )}
     </TouchableOpacity>
   );

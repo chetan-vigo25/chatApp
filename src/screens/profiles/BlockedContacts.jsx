@@ -9,7 +9,6 @@ import {
   Alert,
   RefreshControl,
   Text,
-  TextInput,
 } from 'react-native';
 
 import { useDispatch, useSelector } from "react-redux";
@@ -18,6 +17,7 @@ import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import { fetchBlockedContacts, unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
 import ChatDatabase from "../../services/ChatDatabase";
 import { peerHidesContact } from "../../services/contactNameStore";
+import AppSearchBar from "../../components/AppSearchBar";
 
 // Settings → Privacy → Blocked Contacts. Lists everyone the user has blocked
 // (profile photo, name, phone, block date) with search + unblock.
@@ -35,7 +35,6 @@ export default function BlockedContacts({ navigation }) {
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.secondaryTextColor;
   const pageBg = theme.colors.background;
-  const cardBg = theme.colors.background;
   const sepClr = isDarkMode ? "rgba(255,255,255,0.07)" : "rgba(15,30,50,0.07)";
   const accent = theme.colors.primaryColor || "#03b0a2";
 
@@ -154,16 +153,12 @@ export default function BlockedContacts({ navigation }) {
         <View style={styles.headerSpacer} />
       </View>
 
-      <View style={[styles.searchWrap, { backgroundColor: cardBg }]}>
-        <Ionicons name="search" size={18} color={subText} />
-        <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-          value={search}
-          onChangeText={setSearch}
-          placeholder="Search blocked contacts"
-          placeholderTextColor={subText}
-          style={[styles.searchInput, { color: primaryText }]}
-        />
-      </View>
+      <AppSearchBar
+        value={search}
+        onChangeText={setSearch}
+        placeholder="Search blocked contacts"
+        style={styles.searchWrap}
+      />
 
       {isLoading && !contacts.length ? (
         <View style={styles.center}>
@@ -202,17 +197,7 @@ const styles = StyleSheet.create({
   headerBackBtn: { width: 40, height: 40, borderRadius: 20, alignItems: "center", justifyContent: "center" },
   headerTitle: { flex: 1, fontFamily: "Roboto-Bold", fontSize: 22, letterSpacing: -0.3 },
   headerSpacer: { width: 40 },
-  searchWrap: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginHorizontal: 12,
-    marginVertical: 8,
-    paddingHorizontal: 14,
-    height: 44,
-    borderRadius: 12,
-    gap: 8,
-  },
-  searchInput: { flex: 1, fontFamily: "Roboto-Regular", fontSize: 15, padding: 0 },
+  searchWrap: { marginHorizontal: 12, marginTop: 4, marginBottom: 8 },
   center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10 },
   emptyText: { fontFamily: "Roboto-Regular", fontSize: 15 },
   listContent: { paddingBottom: 30 },

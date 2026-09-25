@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
-  Modal, View, Text, TouchableOpacity, FlatList, StyleSheet, TextInput, ScrollView,
+  Modal, View, Text, TouchableOpacity, FlatList, StyleSheet, ScrollView,
   ActivityIndicator, Animated, PanResponder, Keyboard, Dimensions,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -12,6 +12,7 @@ import { hiddenHandleLabel } from '../../services/contactNameStore';
 import { useContactSync } from '../../contexts/useContactSync';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import CallAvatar from './CallAvatar';
+import AppSearchBar from '../../components/AppSearchBar';
 
 /**
  * Conference "Add people" sheet (WhatsApp-style):
@@ -235,17 +236,12 @@ function ConferenceAddPeopleSheetInner({
           ) : null}
 
           {/* Add people — search (Image 6/8) */}
-          <View style={[styles.searchWrap, { borderColor: line }]}>
-            <Ionicons name="search" size={18} color={sub} />
-            <TextInput
-              style={[styles.search, { color: txt }]}
-              placeholder="Search name or number"
-              placeholderTextColor={sub}
-              value={query}
-              onChangeText={setQuery}
-              autoCorrect={false}
-            />
-          </View>
+          <AppSearchBar
+            style={styles.searchWrap}
+            placeholder="Search name or number"
+            value={query}
+            onChangeText={setQuery}
+          />
 
           {/* Selected chips */}
           {selectedList.length ? (
@@ -329,11 +325,7 @@ const styles = StyleSheet.create({
   rosterItem: { alignItems: 'center', width: 84, marginRight: 6 },
   rosterName: { fontSize: 12, marginTop: 5, maxWidth: 80, textAlign: 'center' },
   rosterState: { fontSize: 10.5, marginTop: 1.5 },
-  searchWrap: {
-    flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderRadius: 10,
-    paddingHorizontal: 10, height: 42, marginBottom: 8,
-  },
-  search: { flex: 1, marginLeft: 8, fontSize: 15, paddingVertical: 0 },
+  searchWrap: { marginBottom: 8 },
   chipsRow: { flexGrow: 0, marginBottom: 8 },
   chip: {
     flexDirection: 'row', alignItems: 'center', borderRadius: 16,

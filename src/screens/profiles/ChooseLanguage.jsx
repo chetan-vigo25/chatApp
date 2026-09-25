@@ -6,11 +6,12 @@ import { Ionicons } from '@expo/vector-icons';
 
 import { useTheme } from '../../contexts/ThemeContext';
 import {
-  Text, TextInput, useLanguage,
+  Text, useLanguage,
   SOURCE_LANGUAGE, getDownloadedLanguages, getSupportedLanguages,
   isTranslationAvailable, needsSystemFont,
 } from '../../components/Translate';
 import { LANGUAGES, NO_TRANSLATION, NO_TRANSLATION_OPTION } from '../../constant/languages';
+import AppSearchBar from '../../components/AppSearchBar';
 
 // Estimated-progress tuning (see the `progress` state below).
 const PROGRESS_CEILING = 0.92;   // never claim "done" before the native side says so
@@ -29,8 +30,7 @@ const PROGRESS_SETTLE_MS = 350;  // how long the full bar is shown before the ti
  * TRANSLATE_APP_UI in components/Translate.
  *
  * The language NAMES carry `ignore` — "हिन्दी" must never be fed back through
- * the translator. The search box uses the translated TextInput, which localises
- * the placeholder but never the text the user types.
+ * the translator. The search box is the shared AppSearchBar.
  */
 export default function ChooseLanguage({ navigation }) {
   const { theme, isDarkMode } = useTheme();
@@ -132,7 +132,6 @@ export default function ChooseLanguage({ navigation }) {
   const subText = theme.colors.placeHolderTextColor;
   const themeColor = theme.colors.themeColor;
   const divider = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
-  const searchBg = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.045)';
 
   // Matches the English name ("Thai"), the endonym ("ไทย") and the code ("th"),
   // so the list is reachable whichever script the user is thinking in.
@@ -183,25 +182,15 @@ export default function ChooseLanguage({ navigation }) {
       </View>
 
       {/* Search */}
-      <View style={[styles.searchBox, { backgroundColor: searchBg }]}>
-        <Ionicons name="search" size={18} color={subText} />
-        <TextInput
-          value={query}
-          onChangeText={setQuery}
-          placeholder="Search language"
-          placeholderTextColor={subText}
-          style={[styles.searchInput, { color: primaryText }]}
-          autoCorrect={false}
-          autoCapitalize="none"
-          returnKeyType="search"
-          onSubmitEditing={Keyboard.dismiss}
-        />
-        {query.length > 0 && (
-          <TouchableOpacity onPress={() => setQuery('')} hitSlop={8} accessibilityRole="button">
-            <Ionicons name="close-circle" size={18} color={subText} />
-          </TouchableOpacity>
-        )}
-      </View>
+      <AppSearchBar
+        value={query}
+        onChangeText={setQuery}
+        placeholder="Search language"
+        autoCapitalize="none"
+        returnKeyType="search"
+        onSubmitEditing={Keyboard.dismiss}
+        style={styles.searchBox}
+      />
 
       {!ready ? (
         <ActivityIndicator style={styles.loader} color={themeColor} />
@@ -348,15 +337,7 @@ const styles = StyleSheet.create({
   appBarTitle: { fontFamily: 'Roboto-Medium', fontSize: 20 },
   appBarSub: { fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: 1 },
 
-  searchBox: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    marginHorizontal: 16, marginTop: 4, marginBottom: 10,
-    paddingHorizontal: 12, height: 44, borderRadius: 22,
-  },
-  searchInput: {
-    flex: 1, padding: 0,
-    fontFamily: 'Roboto-Regular', fontSize: 15,
-  },
+  searchBox: { marginHorizontal: 12, marginTop: 4, marginBottom: 10 },
 
   scroll: { paddingBottom: 40 },
   row: {

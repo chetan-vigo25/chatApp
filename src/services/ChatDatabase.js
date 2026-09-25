@@ -1491,6 +1491,16 @@ const _runInsert = async (db, msg, _retried = false) => {
     } catch {}
   }
 
+  // Reply id to persist. The server's `replyTo` is the quoted message's Mongo
+  // _id, which matches no local row (rows are keyed by the UUID messageId); a
+  // later echo/sync carrying only that must not overwrite a UUID already
+  // stored — that is how a quote lost its image thumbnail.
+  const existingReplyId = existingReplyInPayload?._replyToMessageId || null;
+  const replyIdToWrite = (msg.replyToMessageId && existingReplyId
+    && isMongoObjectId(msg.replyToMessageId) && !isMongoObjectId(existingReplyId))
+    ? existingReplyId
+    : (msg.replyToMessageId || null);
+
   // Build payload — merge existing fields if incoming doesn't have them
   const payloadObj = {
     ...(msg.payload && typeof msg.payload === 'object' ? msg.payload : {}),
@@ -1528,14 +1538,17 @@ const _runInsert = async (db, msg, _retried = false) => {
       _replyPreviewType: existingReplyInPayload._replyPreviewType || null,
       _replySenderName: existingReplyInPayload._replySenderName || null,
       _replySenderId: existingReplyInPayload._replySenderId || null,
+      _replyPreviewThumbnail: existingReplyInPayload._replyPreviewThumbnail || null,
     } : {}),
-    // Override with current reply data if present
+    // Override with current reply data if present — a partial echo never blanks
+    // what an earlier, fuller write already stored.
     ...(msg.replyToMessageId ? {
-      _replyToMessageId: msg.replyToMessageId,
-      _replyPreviewText: msg.replyPreviewText || null,
-      _replyPreviewType: msg.replyPreviewType || null,
-      _replySenderName: msg.replySenderName || null,
-      _replySenderId: msg.replySenderId || null,
+      _replyToMessageId: replyIdToWrite,
+      _replyPreviewText: msg.replyPreviewText || existingReplyInPayload?._replyPreviewText || null,
+      _replyPreviewType: msg.replyPreviewType || existingReplyInPayload?._replyPreviewType || null,
+      _replySenderName: msg.replySenderName || existingReplyInPayload?._replySenderName || null,
+      _replySenderId: msg.replySenderId || existingReplyInPayload?._replySenderId || null,
+      _replyPreviewThumbnail: msg.replyPreviewThumbnail || existingReplyInPayload?._replyPreviewThumbnail || null,
     } : {}),
     // Status reply / share — snapshot kept so the preview survives status expiry
     // AND later partial upserts (carry forward the existing snapshot if the
@@ -1665,7 +1678,7 @@ const _runInsert = async (db, msg, _retried = false) => {
       reply_sender_name = COALESCE($reply_sender_name, reply_sender_name),
       reply_sender_id = COALESCE($reply_sender_id, reply_sender_id)`,
     { ...baseParams,
-      $reply_to_message_id: msg.replyToMessageId || null,
+      $reply_to_message_id: replyIdToWrite,
       $reply_preview_text: msg.replyPreviewText || null,
       $reply_preview_type: msg.replyPreviewType || null,
       $reply_sender_name: msg.replySenderName || null,
@@ -2555,6 +2568,32 @@ const getLatestSeq = async (chatId) => {
     { $c: chatId }
   );
   return Number(r?.max_seq || 0);
+};
+
+/**
+ * Missing seq range among a chat's most recent `window` locally stored seqs,
+ * as [fromSeq, toSeq] (lowest..highest missing), or null when contiguous.
+ * Delta sync asks "since MAX(seq)", so a hole BELOW the max is never filled by
+ * it — used for a one-off range fetch. The server has holes of its own (seqs
+ * never visible to this user), so a returned range may legitimately stay open.
+ */
+const getRecentSeqHole = async (chatId, window = 60) => {
+  if (!chatId) return null;
+  const db = await getDB();
+  const rows = await db.getAllAsync(
+    `SELECT DISTINCT seq FROM messages WHERE chat_id = $c AND seq IS NOT NULL AND seq > 0 ORDER BY seq DESC LIMIT $n`,
+    { $c: chatId, $n: window }
+  );
+  const seqs = rows.map((r) => Number(r.seq)).filter((n) => Number.isFinite(n));
+  let lo = null;
+  let hi = null;
+  for (let i = 0; i < seqs.length - 1; i += 1) {
+    if (seqs[i] - seqs[i + 1] > 1) {
+      if (hi == null) hi = seqs[i] - 1;
+      lo = seqs[i + 1] + 1;
+    }
+  }
+  return hi == null ? null : [lo, hi];
 };
 
 /**
@@ -3908,7 +3947,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSeq, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,

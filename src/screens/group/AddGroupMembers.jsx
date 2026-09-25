@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Image, TextInput,
+  View, Text, FlatList, TouchableOpacity, Image,
   ActivityIndicator, Animated, StyleSheet, Alert,
   Platform, ToastAndroid, ScrollView,
 } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
+import AppSearchBar from '../../components/AppSearchBar';
 import useContactSync from '../../contexts/useContactSync';
 import { useRealtimeChatActions } from '../../contexts/RealtimeChatContext';
 import { useDispatch } from 'react-redux';
@@ -252,30 +253,22 @@ export default function AddGroupMembers({ navigation, route }) {
       {renderSelectedBar()}
 
       {/* Search */}
-      <View style={styles.searchWrap}>
-        <View style={[styles.searchBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.04)' }]}>
-          <Ionicons name="search" size={17} color={theme.colors.placeHolderTextColor} />
-          <TextInput keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-            placeholder="Search contacts, @username or number"
-            placeholderTextColor={theme.colors.placeHolderTextColor}
-            autoCapitalize="none"
-            autoCorrect={false}
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
-          />
-          {/* Same in-bar "searching" cue as the contact picker: local matches
-              may already be listed, so an in-flight directory lookup would
-              otherwise be invisible. */}
-          {dirLoading && (
-            <ActivityIndicator size="small" color={theme.colors.themeColor} style={{ marginRight: 6 }} />
-          )}
-          {searchQuery.length > 0 && (
-            <TouchableOpacity onPress={() => setSearchQuery('')} activeOpacity={0.6}>
-              <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
-            </TouchableOpacity>
-          )}
-        </View>
+      <View style={[styles.searchWrap, { backgroundColor: theme.colors.background }]}>
+        <AppSearchBar
+          placeholder="Search contacts, @username or number"
+          autoCapitalize="none"
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          inputStyle={dirLoading ? styles.searchInputBusy : undefined}
+        />
+        {/* Same in-bar "searching" cue as the contact picker: local matches
+            may already be listed, so an in-flight directory lookup would
+            otherwise be invisible. Overlaid on the pill's right edge. */}
+        {dirLoading && (
+          <View pointerEvents="none" style={[styles.searchSpinner, { right: 12 + (searchQuery.length > 0 ? 44 : 14) }]}>
+            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+          </View>
+        )}
       </View>
 
       {/* Contact List */}
@@ -344,9 +337,10 @@ const styles = StyleSheet.create({
   selectedRemove: { position: 'absolute', top: 0, right: 0, width: 18, height: 18, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
   selectedName: { fontFamily: 'Roboto-Regular', fontSize: 11, marginTop: 3, textAlign: 'center' },
 
-  searchWrap: { paddingHorizontal: 14, paddingVertical: 6 },
-  searchBar: { flexDirection: 'row', alignItems: 'center', borderRadius: 24, paddingHorizontal: 14, height: 40, gap: 8 },
-  searchInput: { flex: 1, fontSize: 14, fontFamily: 'Roboto-Regular', paddingVertical: 0, height: '100%' },
+  // Same wrapper spacing as ChatList's pinnedHeaderWrap around the shared pill.
+  searchWrap: { paddingHorizontal: 12, paddingTop: 4, paddingBottom: 6 },
+  searchSpinner: { position: 'absolute', top: 4, height: 40, justifyContent: 'center' },
+  searchInputBusy: { paddingRight: 26 },
 
   contactRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 10, gap: 12 },
   avatarWrap: { position: 'relative' },

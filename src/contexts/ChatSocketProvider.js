@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { getSocket, isSocketConnected } from '../Redux/Services/Socket/socket';
+import { getSocket, isSocketConnected, emitSocketEvent } from '../Redux/Services/Socket/socket';
 import ChatDB from '../services/ChatDatabase';
 import moment from 'moment';
 import { claimDeliveryReceipt } from '../utils/deliveryReceiptGuard';
@@ -29,10 +29,12 @@ const flushDeliveredBatch = (key) => {
   const ids = Array.from(b.ids);
   if (!ids.length || !b.socket) return;
   try {
+    // Queued until the socket is authenticated — a pre-auth receipt is dropped
+    // by the server after the id was already claimed (sender stuck on one tick).
     if (ids.length === 1) {
-      b.socket.emit('message:delivered', { messageId: ids[0], chatId: b.chatId, senderId: b.senderId });
+      emitSocketEvent('message:delivered', { messageId: ids[0], chatId: b.chatId, senderId: b.senderId });
     } else {
-      b.socket.emit('message:delivered:bulk', { messageIds: ids, chatId: b.chatId, senderId: b.senderId });
+      emitSocketEvent('message:delivered:bulk', { messageIds: ids, chatId: b.chatId, senderId: b.senderId });
     }
   } catch {}
 };

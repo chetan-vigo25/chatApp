@@ -7,7 +7,6 @@ import {
   Easing,
   TouchableOpacity,
   Image,
-  TextInput,
   ActivityIndicator,
   Platform,
   ToastAndroid,
@@ -30,6 +29,7 @@ import { SALT_SECRET } from '@env';
 import contactHasher from "../../Redux/Services/Contact/ContactHasher";
 import * as SMS from 'expo-sms';
 import ProfilePreviewModal from "../../components/ProfilePreviewModal";
+import AppSearchBar from "../../components/AppSearchBar";
 import VerifiedBadge from "../../components/VerifiedBadge";
 import { useCall } from "../../calls/useCall";
 import { selfChatLabel, selfIdentityOf, SELF_CHAT_SUBTITLE } from "../../utils/selfChat";
@@ -820,34 +820,24 @@ export default function AddUser({ navigation }) {
       ]}
     >
       <View style={styles.searchBarOuter}>
-        <View style={[styles.searchBarInner, { backgroundColor: theme.colors.menuBackground }]}>
-          <Ionicons name="search-outline" size={18} color={theme.colors.placeHolderTextColor} style={{ marginLeft: 14 }} />
-          <TextInput
-            ref={searchInputRef}
-            placeholder="Search name, @username or number"
-            placeholderTextColor={theme.colors.placeHolderTextColor}
-            value={searchQuery}
-            onChangeText={setSearchQuery}
-            style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
-            returnKeyType="search"
-          />
-          {/* Live "searching" state, right in the bar. It covers BOTH waits:
-              the local ranking still catching up with what was typed, and the
-              directory request in flight — so the user is never looking at a
-              half-finished list wondering whether that is the answer. */}
-          {isSearchBusy && (
-            <ActivityIndicator
-              size="small"
-              color={theme.colors.themeColor}
-              style={{ marginRight: searchQuery.length > 0 ? 8 : 14 }}
-            />
-          )}
-          {searchQuery.length > 0 && (
-            <TouchableOpacity onPress={() => setSearchQuery('')} activeOpacity={0.6} style={{ marginRight: 12 }}>
-              <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
-            </TouchableOpacity>
-          )}
-        </View>
+        <AppSearchBar
+          inputRef={searchInputRef}
+          placeholder="Search name, @username or number"
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+          returnKeyType="search"
+          inputStyle={isSearchBusy ? styles.searchInputBusy : undefined}
+        />
+        {/* Live "searching" state, right in the bar. It covers BOTH waits:
+            the local ranking still catching up with what was typed, and the
+            directory request in flight — so the user is never looking at a
+            half-finished list wondering whether that is the answer. Overlaid
+            on the pill's right edge, just left of the clear button. */}
+        {isSearchBusy && (
+          <View pointerEvents="none" style={[styles.searchSpinner, { right: 12 + (searchQuery.length > 0 ? 44 : 14) }]}>
+            <ActivityIndicator size="small" color={theme.colors.themeColor} />
+          </View>
+        )}
       </View>
     </Animated.View>
   );
@@ -1238,24 +1228,21 @@ const styles = StyleSheet.create({
   collapsibleWrap: {
     overflow: 'hidden',
   },
+  // Same wrapper spacing as ChatList's pinnedHeaderWrap around the shared pill.
   searchBarOuter: {
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
     paddingTop: 4,
-    paddingBottom: 10,
+    paddingBottom: 6,
   },
-  searchBarInner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    borderRadius: 14,
-    height: 48,
+  // Spinner overlay sits inside the pill (wrapper paddingTop 4 / pill height 40).
+  searchSpinner: {
+    position: 'absolute',
+    top: 4,
+    height: 40,
+    justifyContent: 'center',
   },
-  searchInput: {
-    flex: 1,
-    fontFamily: 'Roboto-Regular',
-    fontSize: 14,
-    paddingHorizontal: 10,
-    paddingVertical: 0,
-    height: 48,
+  searchInputBusy: {
+    paddingRight: 26,
   },
   newContactBtn: {
     flexDirection: 'row',

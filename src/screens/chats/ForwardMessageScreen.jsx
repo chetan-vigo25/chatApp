@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, TextInput, Image,
+  View, Text, FlatList, TouchableOpacity, Image,
   ActivityIndicator, StyleSheet, Platform, ToastAndroid, Alert,
   Animated, Keyboard,
 } from 'react-native';
@@ -15,6 +15,7 @@ import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import OutboxWorker from '../../services/OutboxWorker';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
+import AppSearchBar from '../../components/AppSearchBar';
 
 // Same display rule as every other surface: my saved name → the peer's number
 // → their own account name only when no number is known.
@@ -494,23 +495,13 @@ export default function ForwardMessageScreen({ navigation, route }) {
       </View>
 
       {/* Search */}
-      <View style={[styles.searchWrap, { backgroundColor: theme.colors.menuBackground }]}>
-        <Ionicons name="search-outline" size={18} color={theme.colors.placeHolderTextColor} />
-        <TextInput
-          keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-          placeholder="Search chats..."
-          placeholderTextColor={theme.colors.placeHolderTextColor}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
-          returnKeyType="search"
-        />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity onPress={() => setSearchQuery('')}>
-            <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
-          </TouchableOpacity>
-        )}
-      </View>
+      <AppSearchBar
+        value={searchQuery}
+        onChangeText={setSearchQuery}
+        placeholder="Search chats..."
+        returnKeyType="search"
+        style={styles.searchWrap}
+      />
 
       {/* Selected chips */}
       {selectedChats.length > 0 && (
@@ -581,14 +572,7 @@ const styles = StyleSheet.create({
   headerInfo: { flex: 1 },
   headerTitle: { fontFamily: 'Roboto-SemiBold', fontSize: 18 },
   headerSub: { fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: -2 },
-  searchWrap: {
-    flexDirection: 'row', alignItems: 'center',
-    marginHorizontal: 14, marginBottom: 8,
-    borderRadius: 25, height: 42, paddingHorizontal: 14, gap: 8,
-  },
-  searchInput: {
-    flex: 1, fontFamily: 'Roboto-Regular', fontSize: 14, paddingVertical: 0, height: 42,
-  },
+  searchWrap: { marginHorizontal: 12, marginTop: 4, marginBottom: 8 },
   chipsWrap: {
     flexDirection: 'row', flexWrap: 'wrap',
     paddingHorizontal: 14, paddingBottom: 8, gap: 6,

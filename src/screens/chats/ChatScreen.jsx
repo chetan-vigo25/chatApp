@@ -103,6 +103,7 @@ import { translateDetailed, ensureTranslationCacheReady, peekTranslation, willTr
 import { isTranslationOff } from "../../constant/languages";
 import TranslatingBubble from "../../components/TranslatingBubble";
 import { renderSystemMessage } from '../../utils/systemMessage';
+import AppSearchBar from '../../components/AppSearchBar';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
@@ -8175,45 +8176,20 @@ export default function ChatScreen({ navigation, route }) {
         {showSearchBar && (
           <View style={{ 
             flexDirection: "row", 
-            padding: 8, 
+            paddingHorizontal: 16, 
+            paddingVertical: 8, 
             alignItems: "center", 
-            // borderBottomWidth: 1, 
-            borderBottomColor: theme.colors.borderColor,
             backgroundColor: theme.colors.background,
           }}>
-            <View style={{ 
-              flex: 1, 
-              flexDirection: "row", 
-              alignItems: "center", 
-              backgroundColor: theme.colors.menuBackground, 
-              borderRadius: 24, 
-              paddingHorizontal: 12, 
-              paddingVertical: Platform.OS === "ios" ? 8 : 4,
-            }}>
-              <Ionicons name="search" size={18} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
-              <TextInput 
-                keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-                placeholder="Search messages..." 
-                value={search} 
-                onChangeText={handleSearch} 
-                placeholderTextColor={theme.colors.placeHolderTextColor} 
-                returnKeyType="search" 
-                autoCorrect={false} 
-                autoFocus
-                style={{ 
-                  flex: 1, 
-                  fontSize: 14, 
-                  color: theme.colors.primaryTextColor, 
-                  fontFamily: "Roboto-Regular",
-                  paddingVertical: Platform.OS === "ios" ? 8 : 4,
-                }} 
-              />
-              {search.length > 0 && (
-                <TouchableOpacity onPress={clearSearch} style={{ marginLeft: 4 }}>
-                  <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
-                </TouchableOpacity>
-              )}
-            </View>
+            <AppSearchBar
+              style={{ flex: 1 }}
+              placeholder="Search messages..."
+              value={search}
+              onChangeText={handleSearch}
+              onClear={clearSearch}
+              returnKeyType="search"
+              autoFocus
+            />
             
             {isSearching && searchResults.length > 0 && (
               <View style={{ flexDirection: 'row', marginLeft: 8, gap: 4 }}>

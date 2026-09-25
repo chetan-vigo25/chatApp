@@ -1,6 +1,6 @@
 import React, { useMemo, useState, useCallback } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, TextInput, Image,
+  View, Text, FlatList, TouchableOpacity, Image,
   StyleSheet, SafeAreaView,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -8,6 +8,7 @@ import { useSelector } from 'react-redux';
 
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
+import AppSearchBar from '../../components/AppSearchBar';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const avatarColor = (name = '') => {
@@ -174,16 +175,11 @@ export default function ShareInboxScreen({ navigation, route }) {
       </View>
 
       <View style={styles.searchWrap}>
-        <View style={[styles.searchBox, { backgroundColor: colors.menuBackground }]}>
-          <Ionicons name="search" size={18} color={colors.placeHolderTextColor} />
-          <TextInput
-            value={query}
-            onChangeText={setQuery}
-            placeholder="Search chats"
-            placeholderTextColor={colors.placeHolderTextColor}
-            style={[styles.searchInput, { color: colors.primaryTextColor }]}
-          />
-        </View>
+        <AppSearchBar
+          value={query}
+          onChangeText={setQuery}
+          placeholder="Search chats"
+        />
       </View>
 
       <FlatList
@@ -211,12 +207,7 @@ const styles = StyleSheet.create({
   headerTitleWrap: { flex: 1 },
   headerTitle: { fontSize: 18, fontWeight: '600' },
   headerSub: { fontSize: 12, marginTop: 2 },
-  searchWrap: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 4 },
-  searchBox: {
-    flexDirection: 'row', alignItems: 'center',
-    borderRadius: 10, paddingHorizontal: 10, height: 42,
-  },
-  searchInput: { flex: 1, marginLeft: 8, fontSize: 15, padding: 0 },
+  searchWrap: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6 },
   row: {
     flexDirection: 'row', alignItems: 'center',
     paddingHorizontal: 14, paddingVertical: 14, borderBottomWidth: StyleSheet.hairlineWidth,

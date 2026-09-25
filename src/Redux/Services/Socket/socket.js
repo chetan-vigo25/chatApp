@@ -1225,6 +1225,16 @@ export const initSocket = async (deviceInfo, navigation) => {
       // capability change (the server accepts both: SOCKET_WEBSOCKET_ONLY=false).
       transports: ['polling', 'websocket'],
       upgrade: true,
+      // The socket server answers `400 Bad request` to ANY request that
+      // carries a non-empty Origin (verified 2026-09-25 with curl: no Origin
+      // → 101, `Origin: <anything>` → 400). React Native's WebSocket adds
+      // `origin: https://<host>` on its own, so the websocket upgrade failed on
+      // EVERY connect on both platforms ("probe error: websocket error") and
+      // the app lived on HTTP long-polling. An explicit empty origin replaces
+      // RN's default (RN only adds one when none is given); engine.io hands
+      // extraHeaders to the RN WebSocket, and to polling XHRs, which accept
+      // it too. Backend fix is to allow the app's Origin; this stays harmless.
+      extraHeaders: { origin: '' },
       // Must stay false: rememberUpgrade caches "websocket worked last time"
       // and makes the NEXT connect skip polling and go straight to a raw WS —
       // which is exactly the fragile path we just moved off.
@@ -1246,6 +1256,37 @@ export const initSocket = async (deviceInfo, navigation) => {
       timeout: 20000,
       autoConnect: true,
     });
+
+    // Dev: why the engine closed ("transport close" alone doesn't say whether
+    // polling, the websocket upgrade or the server ended it).
+    if (__DEV__) {
+      socket.io.on('open', () => {
+        const engine = socket.io.engine;
+        if (!engine) return;
+        engine.on('upgrade', (t) => console.log('[SOCKET][engine] upgraded →', t && t.name));
+        engine.on('upgradeError', (e) => console.log('[SOCKET][engine] upgrade error', e && e.message));
+        // The probe's real failure (engine.io flattens it to "websocket error").
+        const create = engine.createTransport && engine.createTransport.bind(engine);
+        if (create) {
+          engine.createTransport = (name) => {
+            const t = create(name);
+            if (name === 'websocket') {
+              t.on('error', (err) => console.log('[SOCKET][engine] ws transport error', {
+                desc: err && err.description && (err.description.message || err.description.type),
+              }));
+              t.on('close', (d) => console.log('[SOCKET][engine] ws transport close', {
+                desc: d && (d.description || d.reason || d.message), code: d && d.context && d.context.code,
+              }));
+            }
+            return t;
+          };
+        }
+        engine.on('close', (reason, desc) => console.log('[SOCKET][engine] close', {
+          reason, transport: engine.transport && engine.transport.name,
+          desc: desc && (desc.message || desc.description || String(desc)),
+        }));
+      });
+    }
 
     attachCoreSocketListeners(navigation);
     return socket;

@@ -538,7 +538,10 @@ export const registerEvents = (handlers = {}) => {
     markCallEvent('callkit:audioOn');
     return handlers.onAudioSessionActivated && handlers.onAudioSessionActivated();
   };
-  const audioOff = () => handlers.onAudioSessionDeactivated && handlers.onAudioSessionDeactivated();
+  const audioOff = () => {
+    markCallEvent('callkit:audioOff');
+    return handlers.onAudioSessionDeactivated && handlers.onAudioSessionDeactivated();
+  };
   try {
     // MUST be attached FIRST: RNCallKeep buffers every CallKit action that fired
     // before JS attached listeners — on a KILLED app the user's Answer on the
@@ -561,6 +564,7 @@ export const registerEvents = (handlers = {}) => {
         else if (event.name === 'RNCallKeepPerformEndCallAction') end(data);
         else if (event.name === 'RNCallKeepDidPerformSetMutedCallAction') mute(data);
         else if (event.name === 'RNCallKeepDidActivateAudioSession') audioOn();
+        else if (event.name === 'RNCallKeepDidDeactivateAudioSession') audioOff();
       });
     });
     RNCallKeep.addEventListener('answerCall', answer);

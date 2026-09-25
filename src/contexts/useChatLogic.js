@@ -2871,8 +2871,10 @@ export default function useChatLogic({ navigation, route }) {
       // fallbacks a refetched reply rendered as "Unknown / Message".
       replyToMessageId: apiMsg?.replyToMessageId || apiMsg?.quotedMessageId || apiMsg?.reply_to_message_id
         || normalizedPayload?.replyToMessageId || normalizedPayload?._replyToMessageId
-        || (replyObj ? (replyObj._id || replyObj.id || replyObj.messageId) : null)
+        // UUID before Mongo _id: local rows are keyed by the UUID messageId, and
+        // a quote pointing at the _id finds no original (no image in the quote).
         || apiMsg?.replyPreview?.messageId
+        || (replyObj ? (replyObj.messageId || replyObj._id || replyObj.id) : null)
         || (typeof apiMsg?.replyTo === 'string' ? apiMsg.replyTo : null)
         || null,
       replyPreviewText: apiMsg?.replyPreviewText || apiMsg?.quotedText || apiMsg?.reply_preview_text
@@ -8222,15 +8224,17 @@ export default function useChatLogic({ navigation, route }) {
       // message:new, and RealtimeChatContext acks it app-wide — one receipt only.
       if (socket && isSocketConnected() && chatIdRef.current && claimDeliveryReceipt(messageId)) {
         const isGrpDel = chatData?.chatType === 'group' || chatData?.isGroup;
+        // Queued until the socket is authenticated (see RealtimeChatContext
+        // emitDeliveryReceipt) — a pre-auth receipt is dropped by the server.
         if (isGrpDel) {
-          socket.emit('group:message:delivered', {
+          emitSocketEvent('group:message:delivered', {
             groupId: chatData?.groupId || chatData?.group?._id || chatIdRef.current,
             messageIds: [messageId],
             userId: currentUserIdRef.current,
             deliveredAt: new Date().toISOString(),
           });
         } else {
-          socket.emit('message:delivered', {
+          emitSocketEvent('message:delivered', {
             messageId,
             chatId: chatIdRef.current,
             senderId,

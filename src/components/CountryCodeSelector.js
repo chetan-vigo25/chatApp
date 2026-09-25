@@ -6,12 +6,12 @@ import {
   StyleSheet,
   Modal,
   FlatList,
-  TextInput,
   Animated,
   Platform,
   Keyboard,
 } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
+import AppSearchBar from './AppSearchBar';
 import countryCodes from '../jsonFile/countryCodes.json';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -225,26 +225,15 @@ const CountryCodeSelector = ({
             </View>
 
             {/* Search */}
-            <View style={[styles.searchContainer, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.04)' }]}>
-              <Ionicons name="search" size={18} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
-              <TextInput
-                keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-                ref={searchRef}
-                style={[styles.searchInput, { color: theme.colors.primaryTextColor }]}
-                placeholder="Search country or code..."
-                placeholderTextColor={theme.colors.placeHolderTextColor}
-                value={search}
-                onChangeText={setSearch}
-                autoCorrect={false}
-                autoCapitalize="none"
-                returnKeyType="search"
-              />
-              {search.length > 0 && (
-                <TouchableOpacity onPress={() => setSearch('')} activeOpacity={0.7}>
-                  <Ionicons name="close-circle" size={18} color={theme.colors.placeHolderTextColor} />
-                </TouchableOpacity>
-              )}
-            </View>
+            <AppSearchBar
+              style={styles.searchContainer}
+              inputRef={searchRef}
+              placeholder="Search country or code..."
+              value={search}
+              onChangeText={setSearch}
+              autoCapitalize="none"
+              returnKeyType="search"
+            />
 
             {/* List */}
             <FlatList
@@ -347,19 +336,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   searchContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginHorizontal: 12,
+    marginHorizontal: 16,
     marginBottom: 8,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    height: 42,
-  },
-  searchInput: {
-    flex: 1,
-    fontFamily: 'Roboto-Regular',
-    fontSize: 14,
-    paddingVertical: 0,
   },
   countryList: {
     flex: 1,

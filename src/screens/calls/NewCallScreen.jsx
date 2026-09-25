@@ -1,6 +1,6 @@
 import React, { useCallback, useMemo, useState, memo } from 'react';
 import {
-  View, Text, FlatList, TextInput, TouchableOpacity, StyleSheet, Image,
+  View, Text, FlatList, TouchableOpacity, StyleSheet, Image,
   ActivityIndicator, Platform, StatusBar,
 } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
@@ -16,6 +16,7 @@ import ContactDatabase from '../../services/ContactDatabase';
 import CallAvatar from '../../calls/components/CallAvatar';
 import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import VerifiedBadge from '../../components/VerifiedBadge';
+import AppSearchBar from '../../components/AppSearchBar';
 
 const ROW_HEIGHT = 72;
 
@@ -240,23 +241,13 @@ export default function NewCallScreen() {
       </View>
 
       {/* Search */}
-      <View style={styles.searchOuter}>
-        <View style={[styles.searchInner, { backgroundColor: c.menuBackground || c.surface }]}>
-          <Ionicons name="search-outline" size={18} color={c.placeHolderTextColor} style={styles.searchIcon} />
-          <TextInput
-            placeholder="Search contacts…"
-            placeholderTextColor={c.placeHolderTextColor}
-            value={query}
-            onChangeText={setQuery}
-            style={[styles.searchInput, { color: c.primaryTextColor }]}
-            returnKeyType="search"
-          />
-          {query.length > 0 ? (
-            <TouchableOpacity onPress={() => setQuery('')} activeOpacity={0.6} style={styles.searchClear}>
-              <Ionicons name="close-circle" size={18} color={c.placeHolderTextColor} />
-            </TouchableOpacity>
-          ) : null}
-        </View>
+      <View style={[styles.searchOuter, { backgroundColor: c.background }]}>
+        <AppSearchBar
+          placeholder="Search contacts…"
+          value={query}
+          onChangeText={setQuery}
+          returnKeyType="search"
+        />
       </View>
 
       {loading && !data.length ? (
@@ -324,11 +315,8 @@ const styles = StyleSheet.create({
   topTitle: { fontSize: 19, fontFamily: 'Roboto-SemiBold', letterSpacing: -0.2 },
   topSub: { fontSize: 12, fontFamily: 'Roboto-Regular', marginTop: 1 },
 
-  searchOuter: { paddingHorizontal: 14, paddingTop: 4, paddingBottom: 8 },
-  searchInner: { flexDirection: 'row', alignItems: 'center', borderRadius: 14, height: 46 },
-  searchIcon: { marginLeft: 14 },
-  searchInput: { flex: 1, fontFamily: 'Roboto-Regular', fontSize: 14, paddingHorizontal: 10, height: 46 },
-  searchClear: { marginRight: 12 },
+  // Same wrapper spacing as ChatList's pinnedHeaderWrap around the shared pill.
+  searchOuter: { paddingHorizontal: 12, paddingTop: 4, paddingBottom: 6 },
 
   sectionLabel: {
     fontSize: 11, fontFamily: 'Roboto-SemiBold', letterSpacing: 1.1,

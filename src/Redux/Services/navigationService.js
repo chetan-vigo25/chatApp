@@ -1,4 +1,5 @@
 import { createNavigationContainerRef, StackActions } from '@react-navigation/native';
+import { prewarmChat } from '../../services/ChatPrewarm';
 
 export const navigationRef = createNavigationContainerRef();
 
@@ -125,9 +126,25 @@ const pushAvatar = (data = {}) => (
 // groupName }. On a COLD launch the nav container isn't mounted yet, so retry
 // until it's ready (best-effort, ~30s — first-time sync can take a while)
 // instead of dropping the intent.
-export function navigateToChat(data = {}, attempt = 0) {
+// Longest a notification open waits for the thread to be in ChatCache before
+// navigating anyway (then ChatScreen takes its own async SQLite path).
+const PUSH_OPEN_WARM_WAIT_MS = 700;
+
+// chatId → in-flight prewarm started by a notification tap.
+const pushWarms = new Map();
+
+export function navigateToChat(data = {}, attempt = 0, warmed = false) {
   const chatId = normalizeId(data?.chatId || data?.groupId);
   if (!chatId) return false;
+
+  // Read the thread into ChatCache NOW, in parallel with Splash/boot. A chat
+  // list tap is instant because ChatList prewarms its top rows; a notification
+  // open lands on ChatScreen ~200ms after ChatList mounts, before that prewarm
+  // has run, so ChatScreen started EMPTY and waited on SQLite (and on socket
+  // sync) — "messages show after a few seconds".
+  if (attempt === 0 && !pushWarms.has(chatId)) {
+    pushWarms.set(chatId, prewarmChat(chatId).finally(() => pushWarms.delete(chatId)));
+  }
 
   if (!navigationRef.isReady()) {
     if (attempt < 150) setTimeout(() => navigateToChat(data, attempt + 1), 200);
@@ -140,6 +157,15 @@ export function navigateToChat(data = {}, attempt = 0) {
   if (curName && PRE_MAIN_ROUTES.has(curName)) {
     if (attempt < 150) setTimeout(() => navigateToChat(data, attempt + 1), 200);
     return false;
+  }
+
+  // Ready to navigate: give the warm a short head start so the first frame
+  // paints real bubbles. Capped — a slow DB must never hold the open.
+  const warm = pushWarms.get(chatId);
+  if (warm && !warmed) {
+    Promise.race([warm, new Promise((r) => setTimeout(r, PUSH_OPEN_WARM_WAIT_MS))])
+      .then(() => navigateToChat(data, attempt + 1, true));
+    return true;
   }
 
   const isBroadcast = data?.chatType === 'broadcast' || isTruthyFlag(data?.isBroadcast) || data?.kind === 'broadcast';

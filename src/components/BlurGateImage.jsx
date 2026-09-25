@@ -21,8 +21,18 @@
 //
 // Rendered as a COMPONENT (never called as a hook) so it is safe inside
 // FlatList renderItem per the project rule.
+//
+// Cache (expo-image, keyed WITHOUT the query string): chat media URLs are S3
+// presigned links that expire after 1h (X-Amz-Expires=3600 → 403) and are
+// re-signed on every sync. RN's <Image> cached by the FULL url, so an image
+// seen yesterday was a cache miss today: expired link → 403 → heal round trip
+// → re-download, and album tiles sat empty (bare green bubble) for seconds.
+// The object path is stable per media, so it is the cache key — a picture seen
+// once paints from disk even when its stored link has since expired.
 import React, { useEffect, useRef } from 'react';
-import { View, Image, Animated, StyleSheet } from 'react-native';
+import { View, Animated, StyleSheet } from 'react-native';
+import { Image } from 'expo-image';
+import { cachedImageSource } from '../utils/imageSource';
 
 // Constant heavy blur — clearly obscures content on both platforms (RN renders
 // the same number stronger on iOS than Android; 25 covers both). NEVER changes
@@ -31,6 +41,9 @@ const GATE_BLUR_RADIUS = 25;
 const REVEAL_MS = 250;
 
 const clamp01 = (value) => Math.max(0, Math.min(1, Number(value) || 0));
+
+const CONTENT_FIT = { cover: 'cover', contain: 'contain', stretch: 'fill', center: 'none' };
+
 
 export default function BlurGateImage({
   uri,
@@ -67,13 +80,18 @@ export default function BlurGateImage({
     return () => animation.stop();
   }, [gated, active, paused, progress, gateOpacity]);
 
+  const source = cachedImageSource(uri);
+  const contentFit = CONTENT_FIT[resizeMode] || 'cover';
+  const handleError = onError ? () => onError() : undefined;
+
   if (!gated) {
     return (
       <Image
-        source={{ uri }}
+        source={source}
         style={style}
-        resizeMode={resizeMode}
-        onError={onError || undefined}
+        contentFit={contentFit}
+        cachePolicy="memory-disk"
+        onError={handleError}
       />
     );
   }
@@ -81,17 +99,21 @@ export default function BlurGateImage({
   return (
     <View style={[style, styles.clip]}>
       <Image
-        source={{ uri }}
+        source={source}
         style={styles.fill}
-        resizeMode={resizeMode}
-        onError={onError || undefined}
+        contentFit={contentFit}
+        cachePolicy="memory-disk"
+        onError={handleError}
       />
-      <Animated.Image
-        source={{ uri }}
-        style={[styles.fill, { opacity: gateOpacity }]}
-        resizeMode={resizeMode}
-        blurRadius={GATE_BLUR_RADIUS}
-      />
+      <Animated.View style={[styles.fill, { opacity: gateOpacity }]} pointerEvents="none">
+        <Image
+          source={source}
+          style={styles.fill}
+          contentFit={contentFit}
+          cachePolicy="memory-disk"
+          blurRadius={GATE_BLUR_RADIUS}
+        />
+      </Animated.View>
     </View>
   );
 }

@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
-import { FlatList, RefreshControl, Text, TextInput, View } from 'react-native';
+import { FlatList, RefreshControl, Text, View } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
+import AppSearchBar from '../../components/AppSearchBar';
 import { useContactsPresence } from '../../presence/hooks';
 import { formatLastSeen } from '../../presence/services/lastSeenFormatter.service';
 
@@ -19,12 +20,11 @@ export default function ContactsPresenceScreen() {
       <View style={{ padding: 16, borderBottomWidth: 1, borderBottomColor: theme.colors.borderColor }}>
         <Text style={{ color: theme.colors.primaryTextColor, fontFamily: 'Roboto-Bold', fontSize: 20 }}>Contacts Presence</Text>
         <Text style={{ color: theme.colors.placeHolderTextColor, marginTop: 4 }}>{onlineCount} online</Text>
-        <TextInput
+        <AppSearchBar
           value={query}
           onChangeText={setQuery}
           placeholder="Search contact"
-          placeholderTextColor={theme.colors.placeHolderTextColor}
-          style={{ marginTop: 10, borderWidth: 1, borderColor: theme.colors.borderColor, borderRadius: 10, padding: 10, color: theme.colors.primaryTextColor }}
+          style={{ marginTop: 10 }}
         />
       </View>
 
