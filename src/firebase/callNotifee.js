@@ -408,6 +408,16 @@ export const displayIncomingCallNotifee = async (data) => {
     callType: (data?.callType || data?.media) === 'video' ? 'video' : 'audio',
   };
   if (!call.callId) return false;
+  // Caller already hung up (the native FCM service handled the `call_cancel`
+  // while this JS copy of the `call` push was still cold-starting): posting now
+  // would leave a stuck, undismissable ring for a dead call.
+  try {
+    const ui = isCallUi() ? getCallUi() : null;
+    if (ui && typeof ui.wasIncomingCancelled === 'function' && ui.wasIncomingCancelled(String(call.callId))) {
+      if (__DEV__) console.log('[CALL][notif] ring skipped — call already cancelled', { callId: call.callId });
+      return true;
+    }
+  } catch (_) { /* best-effort */ }
   // Same call, same caller, same type, same surface → the OS already shows it.
   // Re-posting only makes Android mute the ringtone (see the note above).
   const ringKey = [

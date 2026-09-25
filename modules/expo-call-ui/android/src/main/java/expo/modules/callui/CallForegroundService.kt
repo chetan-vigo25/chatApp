@@ -382,6 +382,7 @@ class CallForegroundService : Service() {
       ctx: Context, callId: String, name: String?, image: String?, type: String?, startedAtMs: Long,
       state: String? = "ongoing"
     ) {
+      ringingCallId = null
       val i = Intent(ctx, CallForegroundService::class.java).apply {
         putExtra(EXTRA_CALL_ID, callId)
         putExtra(EXTRA_CALLER_NAME, name)
@@ -396,10 +397,16 @@ class CallForegroundService : Service() {
     // Hand an incoming ring to the service so the OS keeps its notification alive
     // while the app is backgrounded. Best-effort: if the FGS start is refused the
     // service stops itself and the plain notification the module posted stays.
+    // callId whose incoming RING the service is holding (null while an ongoing
+    // call or nothing runs) — so a cancel for that call can stop the service
+    // without touching a different, live call.
+    @Volatile var ringingCallId: String? = null
+
     fun startForIncoming(
       ctx: Context, callId: String, callerId: String?, name: String?, image: String?, type: String?,
       fullScreen: Boolean = true
     ) {
+      ringingCallId = callId
       val i = Intent(ctx, CallForegroundService::class.java).apply {
         putExtra(EXTRA_CALL_ID, callId)
         putExtra(EXTRA_CALLER_ID, callerId)
@@ -450,6 +457,7 @@ class CallForegroundService : Service() {
     }
 
     fun stop(ctx: Context) {
+      ringingCallId = null
       if (pendingStarts.get() > 0) {
         android.util.Log.i(TAG, "stop() while a start is pending — deferring until startForeground ran")
         deferredStopPending = true

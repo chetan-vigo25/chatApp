@@ -85,6 +85,12 @@ export const addCallActionListener = (cb: (e: CallAction) => void) =>
 
 // Dismiss every posted incoming-call notification (answer/end) — robust to the
 // live call id having drifted from the posted id.
+// True when this call was already cancelled natively (caller hung up / ring
+// timed out) — a late push for it must not ring again.
+export const wasIncomingCancelled = (callId: string): boolean => {
+  try { return !!Native?.wasIncomingCancelled?.(callId); } catch { return false; }
+};
+
 export const cancelAllIncomingCalls = (): void => {
   Native?.cancelAllIncomingCalls?.();
 };

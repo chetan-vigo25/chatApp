@@ -154,10 +154,14 @@ class ExpoCallUiModule : Module() {
       }
     }
 
+    // True when this call was already cancelled (caller hung up / ring timed
+    // out) — a late push for it must not ring again.
+    Function("wasIncomingCancelled") { callId: String -> wasCancelled(callId) }
+
     Function("startRingService") { options: Map<String, Any?> ->
       val ctx = appContext.reactContext
       val callId = options["callId"] as? String
-      if (ctx != null && !callId.isNullOrBlank()) {
+      if (ctx != null && !callId.isNullOrBlank() && !wasCancelled(callId)) {
         CallForegroundService.startForIncoming(
           ctx,
           callId,
@@ -197,6 +201,7 @@ class ExpoCallUiModule : Module() {
     }
 
     Function("cancelIncomingCall") { callId: String ->
+      markCancelled(callId)
       appContext.reactContext?.let {
         CallForegroundService.stop(it)
         NotificationManagerCompat.from(it).cancel(callId.hashCode())
@@ -591,8 +596,34 @@ class ExpoCallUiModule : Module() {
     // waiting for the JS bridge to cold-start.
     fun cancelIncoming(ctx: Context, callId: String?) {
       if (callId.isNullOrBlank()) return
+      markCancelled(callId)
       try { NotificationManagerCompat.from(ctx).cancel(callId.hashCode()) } catch (_: Exception) {}
       postedIncomingIds.remove(callId.hashCode())
+      // The ring is held up by the call foreground service — cancelling only the
+      // notification left an undismissable "Incoming call" behind. Stop the
+      // service only when it is ringing THIS call, never a different live one.
+      if (CallForegroundService.ringingCallId == callId) CallForegroundService.stop(ctx)
+    }
+
+    // Calls cancelled in the last CANCEL_MEMORY_MS. A killed callee handles the
+    // FCM `call` push twice — natively at once, and again in JS once the RN
+    // runtime has cold-started (1–7 s later). If the caller hung up in between,
+    // the JS copy re-posted the ring for a dead call: a stuck, undismissable
+    // "Incoming voice call" (reproduced 2026-09-25). Every render path checks this.
+    private const val CANCEL_MEMORY_MS = 120_000L
+    private val cancelledCalls = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    fun markCancelled(callId: String?) {
+      if (callId.isNullOrBlank()) return
+      val now = System.currentTimeMillis()
+      cancelledCalls[callId] = now
+      cancelledCalls.entries.removeIf { now - it.value > CANCEL_MEMORY_MS }
+    }
+
+    fun wasCancelled(callId: String?): Boolean {
+      if (callId.isNullOrBlank()) return false
+      val t = cancelledCalls[callId] ?: return false
+      return System.currentTimeMillis() - t <= CANCEL_MEMORY_MS
     }
 
     // Map a raw FCM `data` payload to a native CallStyle render. Called by the
@@ -618,6 +649,7 @@ class ExpoCallUiModule : Module() {
       ctx: Context, callId: String, callerId: String?, callerName: String,
       callerImage: String?, callType: String
     ) {
+      if (wasCancelled(callId)) return // caller already hung up — never re-ring a dead call
       val notification = buildIncomingNotification(ctx, callId, callerId, callerName, callerImage, callType, true)
       try {
         NotificationManagerCompat.from(ctx).notify(callId.hashCode(), notification)
