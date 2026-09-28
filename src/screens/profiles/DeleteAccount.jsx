@@ -13,7 +13,7 @@ import {
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
 import { DELETE_REASONS, deleteAccount } from "../../Redux/Services/Account/Account.Services";
-import { clearLocalStorageAndDisconnect } from "../../Redux/Services/Socket/socket";
+import { clearLocalStorageAndDisconnect, setSelfDeleteInProgress } from "../../Redux/Services/Socket/socket";
 
 // What deleting the account removes — shown verbatim on the warning step.
 const WARNINGS = [
@@ -57,8 +57,14 @@ export default function DeleteAccount({ navigation }) {
   const performDeletion = async () => {
     if (submitting) return;
     setSubmitting(true);
+    // The server also pushes its deletion frames to THIS device. This screen
+    // owns the wipe, the navigation and the alert — tell the socket layer to
+    // stand down so the user sees exactly one screen and one alert.
+    setSelfDeleteInProgress(true);
+    let deleted = false;
     try {
       await deleteAccount({ reason: finalReason, customReason: isOther ? customReason.trim() : "" });
+      deleted = true;
 
       // Complete local-device cleanup + socket disconnect. Force-wipe the local
       // SQLite cache too — a deleted account's messages must not survive locally.
@@ -72,6 +78,9 @@ export default function DeleteAccount({ navigation }) {
     } catch (err) {
       Alert.alert("Couldn't delete account", typeof err === "string" ? err : "Please try again.");
     } finally {
+      // After a successful delete keep swallowing the server's trailing
+      // deletion frames for the guard window.
+      setSelfDeleteInProgress(false, { armGuard: deleted });
       setSubmitting(false);
     }
   };

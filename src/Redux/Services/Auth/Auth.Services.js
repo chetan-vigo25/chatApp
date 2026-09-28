@@ -40,6 +40,11 @@ async function generateOtp(payload) {
                 showToast(response.message);
                 return { otpMessage: response.message, otpData: response.data };
             } else {
+                // Deleted account: the Login screen shows a full alert with a
+                // support link — hand it the code, and don't toast on top.
+                if (response.errorCode === 'ACCOUNT_DELETED') {
+                    return Promise.reject({ message: response.message, errorCode: response.errorCode });
+                }
                 showToast(response.message)
                 console.error("[OTP:SEND] Unexpected response message:", response.message);
                 return Promise.reject(response.message);

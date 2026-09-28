@@ -454,6 +454,15 @@ const refreshAccessTokenInternal = async ({ refreshToken, deviceId }) => {
       if (status === 401 || status === 403) {
         sawAuthRejection = true;
       }
+      // The account itself was deleted — surface it once (AccountStatus
+      // screen) instead of treating it as an ordinary expired session. Lazy
+      // require: socket.js imports this module.
+      const code = error?.response?.data?.errorCode;
+      if (code === 'ACCOUNT_DELETED' || (status === 401 && code === 'ACCOUNT_NOT_FOUND')) {
+        try {
+          require('../Redux/Services/Socket/socket').handleAccountDeletedSignal(error?.response?.data?.message || null);
+        } catch (_) { /* best-effort */ }
+      }
     }
   }
 

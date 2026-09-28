@@ -94,11 +94,40 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
+// Auth / OTP / refresh endpoints answer ACCOUNT_DELETED themselves — the login
+// screens show that message, so those responses never trigger the teardown.
+const ACCOUNT_SIGNAL_EXEMPT_URL = /\/auth\/(send-otp|resend-otp|login|verify|register|signup)|\/refresh/i;
+
+// The account was deleted (web page, admin panel, another device): 403
+// ACCOUNT_DELETED on any authenticated request, or 401 ACCOUNT_NOT_FOUND.
+const isAccountDeletedResponse = (status, data) => {
+  const code = data?.errorCode;
+  return code === 'ACCOUNT_DELETED' || (status === 401 && code === 'ACCOUNT_NOT_FOUND');
+};
+
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error?.config;
     const status = error?.response?.status;
+
+    // Account deleted → route to the AccountStatus screen (once — the socket
+    // layer's teardown guard dedupes) and reject WITHOUT a token refresh: no
+    // refresh can revive a deleted account. Lazy require: socket.js imports
+    // modules that import this file.
+    if (
+      originalRequest
+      && isAccountDeletedResponse(status, error?.response?.data)
+      && !ACCOUNT_SIGNAL_EXEMPT_URL.test(originalRequest.url || '')
+    ) {
+      try {
+        const hasSession = await getAccessToken();
+        if (hasSession) {
+          require('../Redux/Services/Socket/socket').handleAccountDeletedSignal(error?.response?.data?.message || null);
+        }
+      } catch (_) { /* never block the rejection */ }
+      return Promise.reject(error);
+    }
 
     // One-shot retry for transient iOS network drops.
     // ERR_NETWORK on RN/iOS often means the underlying request was aborted
@@ -209,7 +238,9 @@ async function handleApiError(error) {
   // If response exists, use its message
   if (error.response) {
     const msg = error.response.data?.message || error.response.statusText || "API Error";
-    showToast(msg);
+    // An account-deleted answer gets a dedicated surface (the Login alert or
+    // the AccountStatus screen) — a toast on top would cut it off / double it.
+    if (!isAccountDeletedResponse(error.response.status, error.response.data)) showToast(msg);
     return Promise.reject(error.response.data || error);
   }
 

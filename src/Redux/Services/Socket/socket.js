@@ -833,6 +833,14 @@ const attachCoreSocketListeners = (navigation) => {
       lastError: error?.message || 'connect_error',
     });
 
+    // Handshake refused because the account is gone (deleted while this app
+    // was closed/offline) — no reauth can fix that; tear down once.
+    const acctCode = error?.data?.code || error?.data?.errorCode || error?.data?.data?.code;
+    if (acctCode === 'ACCOUNT_DELETED' || acctCode === 'ACCOUNT_NOT_FOUND') {
+      handleAccountDeletedSignal(error?.data?.message || null);
+      return;
+    }
+
     if (isAuthConnectError(error)) {
       requestSocketReauthentication('connect_error_auth', navigation).catch(() => {});
     }
@@ -878,6 +886,9 @@ const attachCoreSocketListeners = (navigation) => {
     if (response?.status === true) {
       // The server has bound socket.userId — app-level emits are now safe.
       isSocketAuthenticated = true;
+      // A fresh, authenticated session: an account-deletion teardown window
+      // from an earlier account can never swallow a genuine later logout.
+      accountTeardownUntil = 0;
       clearAuthFlushFallback();
       sessionId = String(response?.data?.sessionId || sessionId || '');
       if (sessionId) {
@@ -956,12 +967,14 @@ const attachCoreSocketListeners = (navigation) => {
   });
 
   socket.on('device:terminated', (response) => {
+    if (isAccountTeardownActive()) return; // trailing frame of an account deletion
     if (response?.status === true || response?.message) {
       handleLogout(navigation);
     }
   });
 
   socket.on('logout', (payload) => {
+    if (isAccountTeardownActive()) return; // trailing frame of an account deletion
     handleLogout(
       navigation,
       payload?.message || 'Your account has been temporarily logged out by the admin.',
@@ -973,6 +986,7 @@ const attachCoreSocketListeners = (navigation) => {
   // `force_logout` — wipe the local session and return to the login screen
   // immediately (don't wait for the next REST 401).
   socket.on('force_logout', (payload) => {
+    if (isAccountTeardownActive()) return; // trailing frame of an account deletion
     handleLogout(
       navigation,
       payload?.message || 'You have been logged out because your account was used on another device.',
@@ -987,7 +1001,9 @@ const attachCoreSocketListeners = (navigation) => {
   socket.on('error', (payload) => {
     const info = payload?.data || payload || {};
     const state = ACCOUNT_STATE_BY_CODE[info.code];
-    if (info.category === 'account' || state) {
+    if (state === 'deleted') {
+      handleAccountDeletedSignal(info.message);
+    } else if ((info.category === 'account' || state) && !isAccountTeardownActive()) {
       handleAccountStateError(state || 'blocked', info.message).catch(() => {});
     }
 
@@ -1109,11 +1125,24 @@ const attachCoreSocketListeners = (navigation) => {
   // force-logs-out every device — wipe local state and return to auth so the
   // app behaves like a fresh install (the regular 'logout' handler covers the
   // base case; these add a clearer, deletion-specific message).
+  // The server emits, in order: account:delete:requested →
+  // account:pending:deletion → account:logout:all:devices {reason:'account_deleted'}
+  // (+ trailing logout / force_logout / session:terminated / device:terminated),
+  // and account:permanently:deleted when the 30-day window purges the account.
+  // Every deletion signal funnels into handleAccountDeletedSignal, which runs
+  // the teardown ONCE and routes to the AccountStatus screen.
+  const deletionMessage = (payload) => payload?.message || payload?.data?.message || null;
+  socket.on('account:delete:requested', (payload) => handleAccountDeletedSignal(deletionMessage(payload)));
+  socket.on('account:pending:deletion', (payload) => handleAccountDeletedSignal(deletionMessage(payload)));
+  socket.on('account:permanently:deleted', (payload) => handleAccountDeletedSignal(deletionMessage(payload)));
   socket.on('account:logout:all:devices', (payload) => {
-    handleLogout(navigation, payload?.message || 'You have been logged out from all devices.');
-  });
-  socket.on('account:permanently:deleted', (payload) => {
-    handleLogout(navigation, payload?.message || 'Your account has been permanently deleted.');
+    const reason = payload?.reason || payload?.data?.reason;
+    if (reason === 'account_deleted') {
+      handleAccountDeletedSignal(deletionMessage(payload));
+      return;
+    }
+    if (isAccountTeardownActive()) return;
+    handleLogout(navigation, deletionMessage(payload) || 'You have been logged out from all devices.');
   });
 };
 
@@ -1130,7 +1159,51 @@ const ACCOUNT_STATE_BY_CODE = {
   ACCOUNT_NOT_FOUND: 'deleted',
 };
 
+// ── Account-deletion teardown guard ─────────────────────────────────────────
+// One deletion produces several signals at once — 3–4 socket frames plus any
+// REST calls in flight answering ACCOUNT_DELETED. Without a guard the user saw
+// the "Logged out" alert and the auth screen up to three times.
+//  - accountStateHandling: handleAccountStateError runs once; re-entries no-op.
+//  - accountTeardownUntil: a window (armed when handling starts and again when
+//    it ends) in which trailing logout/force_logout/device:terminated frames and
+//    403s are ignored. Cleared on the next successful socket 'authenticated'.
+//  - selfDeleteInProgress: the Delete Account screen owns its own wipe,
+//    navigation and alert — server deletion signals stand down meanwhile.
+const ACCOUNT_TEARDOWN_WINDOW_MS = 10000;
+let accountStateHandling = false;
+let accountTeardownUntil = 0;
+let selfDeleteInProgress = false;
+
+const armAccountTeardownGuard = () => {
+  accountTeardownUntil = Date.now() + ACCOUNT_TEARDOWN_WINDOW_MS;
+};
+
+const isAccountTeardownActive = () =>
+  selfDeleteInProgress || accountStateHandling || Date.now() < accountTeardownUntil;
+
+/**
+ * Called by the Delete Account screen around its own deletion: `true` before
+ * the API call, `false` in finally. `armGuard` (after a successful delete)
+ * keeps swallowing the server's trailing deletion frames for the window.
+ */
+export const setSelfDeleteInProgress = (on, { armGuard = false } = {}) => {
+  selfDeleteInProgress = !!on;
+  if (!on && armGuard) armAccountTeardownGuard();
+};
+
+/**
+ * The account was deleted (here or elsewhere: web page, admin panel, another
+ * device). Idempotent: safe to call from every socket frame and REST response.
+ */
+export const handleAccountDeletedSignal = (message = null) => {
+  if (isAccountTeardownActive()) return;
+  handleAccountStateError('deleted', message).catch(() => {});
+};
+
 const handleAccountStateError = async (state, message) => {
+  if (accountStateHandling) return;
+  accountStateHandling = true;
+  armAccountTeardownGuard();
   try {
     safeDisconnectSocket();
     updateSocketState({ status: 'logged_out', connected: false, lastDisconnectedAt: Date.now() });
@@ -1145,6 +1218,8 @@ const handleAccountStateError = async (state, message) => {
     }
   } finally {
     resetToAccountStatus(state, message || null);
+    armAccountTeardownGuard();
+    accountStateHandling = false;
   }
 };
 

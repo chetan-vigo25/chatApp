@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import {
   StyleSheet, View, Text, ActivityIndicator, Animated,
   TouchableOpacity, TextInput, Alert, Platform, ToastAndroid,
-  KeyboardAvoidingView, ScrollView,
+  KeyboardAvoidingView, ScrollView, Linking,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
@@ -111,6 +111,20 @@ export default function Login({ navigation }) {
       setPhoneNumber('');
     } else {
       console.log('[LOGIN] OTP request failed →', result?.error?.message || result?.payload);
+      // Soft-deleted account: a full alert (a toast would cut the message off)
+      // with a way to reach support, who can recover it within 30 days.
+      if (result?.payload?.errorCode === 'ACCOUNT_DELETED') {
+        Alert.alert(
+          'Account deleted',
+          result?.payload?.message
+            || 'This account has been deleted. If this was a mistake, contact support to recover it within 30 days.',
+          [
+            { text: 'Contact support', onPress: () => Linking.openURL('mailto:support@talkstry.app').catch(() => {}) },
+            { text: 'OK', style: 'cancel' },
+          ],
+        );
+        return;
+      }
       // The API layer already toasts a server-sent message (a reserved VIP
       // number, a wrong country code, a disabled number). Only fall back to a
       // generic prompt when nothing has been shown — otherwise the real

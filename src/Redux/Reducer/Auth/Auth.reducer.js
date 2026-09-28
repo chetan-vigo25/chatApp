@@ -18,8 +18,12 @@ export const generateOtpAction = createAsyncThunk(
       // explanation (e.g. a reserved VIP number / wrong country code) exactly
       // once instead of a generic retry prompt.
       const fromServer = typeof error === 'string';
+      // A 403 rejects with the server body — pass its errorCode through so the
+      // screen can special-case it (ACCOUNT_DELETED gets a full alert).
+      const errorCode = (!fromServer && (error?.errorCode || error?.data?.errorCode)) || null;
       return rejectWithValue({
         message: fromServer ? error : error?.message || 'OTP generation failed',
+        errorCode,
         alreadyNotified: fromServer,
       });
     }

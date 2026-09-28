@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, Linking } from 'react-native';
 import { MaterialIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
 import { resetToLogin } from '../Redux/Services/navigationService';
@@ -26,6 +26,8 @@ const STATE_COPY = {
   },
 };
 
+const SUPPORT_EMAIL = 'support@talkstry.app';
+
 export default function AccountStatus({ route }) {
   const { theme } = useTheme();
   const state = route?.params?.state || 'blocked';
@@ -39,6 +41,13 @@ export default function AccountStatus({ route }) {
       <Text style={[styles.body, { color: theme.colors.muted || 'gray' }]}>
         {serverMessage || copy.body}
       </Text>
+      <TouchableOpacity
+        onPress={() => Linking.openURL(`mailto:${SUPPORT_EMAIL}`).catch(() => {})}
+        accessibilityRole="link"
+        style={styles.supportLink}
+      >
+        <Text style={[styles.supportText, { color: theme.colors.primary || '#03b0a2' }]}>{SUPPORT_EMAIL}</Text>
+      </TouchableOpacity>
       <TouchableOpacity
         style={[styles.button, { backgroundColor: theme.colors.primary || '#03b0a2' }]}
         onPress={() => resetToLogin()}
@@ -69,6 +78,16 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 22,
     marginBottom: 32,
+  },
+  supportLink: {
+    marginTop: -16,
+    marginBottom: 32,
+    paddingVertical: 6,
+  },
+  supportText: {
+    fontSize: 15,
+    fontFamily: 'Roboto-Medium',
+    textDecorationLine: 'underline',
   },
   button: {
     paddingHorizontal: 32,
