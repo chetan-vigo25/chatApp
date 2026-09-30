@@ -86,7 +86,7 @@ const MODEL_RETRY_MS = 4000;
  * for good. The native side has its own guard too — this one also catches a
  * bridge that simply never answers.
  */
-const MODEL_DOWNLOAD_TIMEOUT_MS = 200000;
+const MODEL_DOWNLOAD_TIMEOUT_MS = 300000;
 
 /* ────────────────────────────── cache ────────────────────────────── */
 
@@ -197,7 +197,77 @@ export function getRetryDelay() {
   return Math.max(0, modelRetryUntil - Date.now());
 }
 
-const downloading = new Map();  // language → Promise<boolean>
+const downloading = new Map();  // language → { job: Promise<boolean>, requireWifi }
+
+/* ───────────── download status of PICKED languages (the picker reads it) ───────────── */
+
+/**
+ * language → { state: 'downloading' | 'failed', startedAt }
+ *
+ * Lives at MODULE scope, not in the picker, on purpose. The picker used to keep
+ * "which row is downloading / which failed" in its own state, so leaving the
+ * screen mid-download threw that away: coming back showed a plain "30 MB
+ * download" row (already ticked) with no progress, and a failure that landed
+ * while the user was elsewhere was never shown at all. The download itself
+ * never depended on the screen — only its visibility did.
+ *
+ * Only languages the reader PICKED are tracked (ensureLanguageReady). A
+ * sender's model fetched in the background (ensurePairReady) is not something
+ * the user asked for, so it must never paint a red "failed" row in the picker.
+ */
+const pickStatus = new Map();
+const pickListeners = new Set();
+/** Latest ensureLanguageReady call per language — only it may write the result. */
+const pickGeneration = new Map();
+
+function emitPickStatus() {
+  pickListeners.forEach((listener) => { try { listener(); } catch { /* a listener must not break the rest */ } });
+}
+
+function setPickStatus(language, status) {
+  if (status) pickStatus.set(language, status);
+  else pickStatus.delete(language);
+  emitPickStatus();
+}
+
+/** `{ state: 'downloading' | 'failed', startedAt }`, or null when idle/ready. */
+export function getLanguageDownloadStatus(language) {
+  return pickStatus.get(language) || null;
+}
+
+/** Called on every status change; returns an unsubscribe function. */
+export function subscribeLanguageDownloads(listener) {
+  pickListeners.add(listener);
+  return () => { pickListeners.delete(listener); };
+}
+
+/** Forget old failures (a new pick replaces them); running downloads are kept. */
+export function clearFailedLanguageDownloads() {
+  let changed = false;
+  pickStatus.forEach((status, language) => {
+    if (status.state === 'failed') { pickStatus.delete(language); changed = true; }
+  });
+  if (changed) emitPickStatus();
+}
+
+/**
+ * A model finished AFTER its caller had already been told "failed" — the JS
+ * timeout released the picker, but the native download kept going and landed.
+ * Clear every failure that is now actually usable.
+ */
+function onModelLanded() {
+  pickStatus.forEach((status, language) => {
+    if (status.state !== 'failed') return;
+    Promise.all([
+      MlkitTranslate.isModelDownloaded(SOURCE_LANGUAGE),
+      MlkitTranslate.isModelDownloaded(language),
+    ]).then((ready) => {
+      if (ready.every(Boolean) && pickStatus.get(language)?.state === 'failed') setPickStatus(language, null);
+    }).catch(() => {});
+  });
+  // The picker's "downloaded" list is stale either way.
+  emitPickStatus();
+}
 
 /**
  * Make a language usable, downloading its ~30MB model if needed.
@@ -207,15 +277,56 @@ const downloading = new Map();  // language → Promise<boolean>
  *
  * Resolves true when the language is ready. Never throws: a failed download
  * just means translations stay in the original text.
+ *
+ * `requireWifi` follows the reader's consent (see allowCellularModelDownloads).
+ * It used to default to TRUE, which is what made the relaunch/foreground resume
+ * of a picked language silently useless on mobile data: Android's ML Kit parks
+ * a Wi-Fi-only download until Wi-Fi shows up, the timeout fired, and the row
+ * came back "Download failed".
  */
-export function ensureLanguageReady(language, { requireWifi = true } = {}) {
+export function ensureLanguageReady(language, { requireWifi = !allowCellularModelDownloads() } = {}) {
   // Nothing to download when the reader asked for no translation at all.
   if (isTranslationOff(language)) return Promise.resolve(true);
   if (!language || language === SOURCE_LANGUAGE) return prepare(SOURCE_LANGUAGE, requireWifi);
-  return Promise.all([
-    prepare(SOURCE_LANGUAGE, requireWifi),
-    prepare(language, requireWifi),
-  ]).then(([en, target]) => en && target);
+  if (!MlkitTranslate.isAvailable()) return Promise.resolve(false);
+
+  const generation = (pickGeneration.get(language) || 0) + 1;
+  pickGeneration.set(language, generation);
+  const isLatest = () => pickGeneration.get(language) === generation;
+
+  return (async () => {
+    // Only show "downloading" when something is actually missing — re-selecting
+    // an on-device language must not flash a progress bar.
+    let present = false;
+    try {
+      const ready = await Promise.all([
+        MlkitTranslate.isModelDownloaded(SOURCE_LANGUAGE),
+        MlkitTranslate.isModelDownloaded(language),
+      ]);
+      present = ready.every(Boolean);
+    } catch { /* treat as missing; prepare() re-checks */ }
+
+    if (!present && isLatest()) {
+      const current = pickStatus.get(language);
+      // Keep the original start time across a resume so the estimated bar
+      // carries on from where it was instead of snapping back to 0%.
+      if (current?.state !== 'downloading') setPickStatus(language, { state: 'downloading', startedAt: Date.now() });
+    }
+
+    const [en, target] = await Promise.all([
+      prepare(SOURCE_LANGUAGE, requireWifi),
+      prepare(language, requireWifi),
+    ]);
+    const ok = en && target;
+    if (isLatest()) {
+      if (ok) {
+        if (pickStatus.has(language)) setPickStatus(language, null);
+      } else {
+        setPickStatus(language, { state: 'failed', startedAt: pickStatus.get(language)?.startedAt || Date.now() });
+      }
+    }
+    return ok;
+  })();
 }
 
 /**
@@ -284,8 +395,13 @@ function settleWithin(promise, ms, fallback) {
 
 function prepare(language, requireWifi) {
   if (!MlkitTranslate.isAvailable()) return Promise.resolve(false);
+  // Reuse a download already in flight — UNLESS it is Wi-Fi-only and this
+  // caller may use mobile data. Returning that job used to strand the user's
+  // own tap: a background Wi-Fi-only request for the same model got there
+  // first, so on mobile data the pick waited for Wi-Fi until the timeout and
+  // then showed "Download failed".
   const existing = downloading.get(language);
-  if (existing) return existing;
+  if (existing && (!existing.requireWifi || requireWifi)) return existing.job;
 
   const download = MlkitTranslate.isModelDownloaded(language)
     .then((ready) => {
@@ -299,10 +415,22 @@ function prepare(language, requireWifi) {
     })
     .catch(() => false);
 
-  const job = settleWithin(download, MODEL_DOWNLOAD_TIMEOUT_MS, false)
-    .finally(() => { downloading.delete(language); });
+  let timedOut = false;
+  const job = settleWithin(download, MODEL_DOWNLOAD_TIMEOUT_MS, null)
+    .then((ok) => {
+      if (ok === null) { timedOut = true; return false; }
+      return ok;
+    })
+    .finally(() => {
+      // Only drop OUR entry — a cellular retry may already have replaced it.
+      if (downloading.get(language)?.job === job) downloading.delete(language);
+    });
 
-  downloading.set(language, job);
+  // The caller was released by the timeout, but the native download may still
+  // land. When it does, un-fail whatever it was holding back.
+  download.then((ok) => { if (ok && timedOut) onModelLanded(); });
+
+  downloading.set(language, { job, requireWifi });
   return job;
 }
 
@@ -810,9 +938,20 @@ export function LanguageProvider({ children }) {
   // Make sure the restored language can actually be translated into. A model
   // deleted by the OS to reclaim space would otherwise leave the app silently
   // untranslated until the user re-picked the language.
+  //
+  // This is also the RESUME path: a download cut off by leaving the app (or by
+  // the app being killed) starts again on the next launch, and again whenever
+  // the app returns to the foreground while the model is still missing — so a
+  // failed or interrupted download heals without the user re-opening the picker.
   useEffect(() => {
-    if (!ready || language === SOURCE_LANGUAGE || isTranslationOff(language)) return;
+    if (!ready || language === SOURCE_LANGUAGE || isTranslationOff(language)) return undefined;
     ensureLanguageReady(language);
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      if (getLanguageDownloadStatus(language)?.state === 'downloading') return;
+      ensureLanguageReady(language);
+    });
+    return () => sub.remove();
   }, [ready, language]);
 
   /**

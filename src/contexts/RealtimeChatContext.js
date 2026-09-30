@@ -176,6 +176,23 @@ const MESSAGE_TYPE_ICON_MAP = {
 // count actually differs. Re-spreading every row made all chat objects new on
 // each message event, which defeated the per-row cache in buildChatRow and
 // re-rendered the whole (hidden) chat list on every send.
+// chatId → time the user read it here. A server chat list fetched right after
+// (its read not processed yet) must not re-badge the chat.
+const LOCAL_READ_GRACE_MS = 15000;
+const localReadAt = new Map();
+const noteLocalRead = (chatId) => {
+  const id = normalizeId(chatId);
+  if (id) localReadAt.set(id, Date.now());
+};
+const wasReadLocallyRecently = (chatId) => {
+  const t = localReadAt.get(normalizeId(chatId));
+  return !!t && Date.now() - t < LOCAL_READ_GRACE_MS;
+};
+const isChatOpenNow = (stateRefLike, chatId) => {
+  const active = stateRefLike?.current?.activeChatId;
+  return !!active && normalizeId(active) === normalizeId(chatId);
+};
+
 const syncRowUnreadCounts = (nextMap, unreadByChat) => {
   Object.keys(nextMap).forEach((id) => {
     const unreadCount = Number(unreadByChat[id] || 0);
@@ -199,6 +216,8 @@ const initialState = {
   highlightByChat: {},
   totalUnread: 0,
   hasHydratedCache: false,
+  // True once a SERVER chat list (HYDRATE_CHATS) has been applied this session.
+  hasServerHydrate: false,
   removedChatIds: {}, // Track removed chats to prevent re-hydration
   inactiveGroupIds: {}, // Groups the current user has left or been removed from — gates sending/receiving
 };
@@ -941,8 +960,18 @@ const reducer = (state, action) => {
           migratedUnreadPairs.push([aliasChatId, chatId]);
         }
 
+        // HYDRATE_CHATS carries the SERVER chat list (REST or socket chat:list;
+        // the SQLite cache comes in via HYDRATE_CHAT_CACHE) — its unreadCount
+        // is authoritative. Preferring the in-memory number made a stale local
+        // count stick forever: SQLite said 327, the server said 0, and the
+        // badge ("99+") came back on every cold start. hydrateChats already
+        // zeroes the open / just-read chats before dispatching. Only a row
+        // with no count at all keeps the previous value.
         const prevUnread = state.unreadByChat[chatId];
-        const unreadCount = typeof prevUnread === 'number' ? prevUnread : Number(chat?.unreadCount || 0);
+        const serverUnread = chat?.unreadCount;
+        const unreadCount = (serverUnread !== undefined && serverUnread !== null && Number.isFinite(Number(serverUnread)))
+          ? Number(serverUnread)
+          : (typeof prevUnread === 'number' ? prevUnread : 0);
         const normalizedPeerUser = isGroupChat
           ? null
           : {
@@ -1023,8 +1052,16 @@ const reducer = (state, action) => {
         delete unreadByChat[fromId];
       });
 
+      // Chats present in this SERVER list take its count (computed per row
+      // above). Only chats it doesn't mention keep their in-memory number.
+      const serverListedIds = new Set(
+        (Array.isArray(action.payload) ? action.payload : [])
+          .filter((c) => c && c.unreadCount !== undefined && c.unreadCount !== null)
+          .map((c) => normalizeId(c?.chatId || c?._id))
+          .filter(Boolean),
+      );
       Object.keys(nextMap).forEach((id) => {
-        if (typeof unreadByChat[id] !== 'number') {
+        if (serverListedIds.has(id) || typeof unreadByChat[id] !== 'number') {
           unreadByChat[id] = Number(nextMap[id]?.unreadCount || 0);
         }
       });
@@ -1047,6 +1084,7 @@ const reducer = (state, action) => {
         unreadByChat,
         totalUnread: recomputeTotalUnread(unreadByChat),
         hasHydratedCache: true,
+        hasServerHydrate: true,
       };
     }
 
@@ -1066,6 +1104,14 @@ const reducer = (state, action) => {
         const chat = normalizeCachedEntry(rawChat);
         if (!chat) return;
         const existing = nextMap[chat.chatId] || {};
+
+        // The SQLite read is slow at boot (it queues behind the boot writes)
+        // and can land AFTER the server chat list. It then overwrote the fresh
+        // server rows with the stale on-disk snapshot (unread 9, a Monday last
+        // message), the debounced save wrote that back to SQLite, and the
+        // phantom badge returned on every cold start. Once the server list is
+        // in, the cache only fills rows the server didn't send.
+        if (state.hasServerHydrate && nextMap[chat.chatId]) return;
 
         const cachePreserveEdit = (existing?.lastMessage?.isEdited || existing?.lastMessageEdited) && !chat?.lastMessage?.isEdited && !chat?.lastMessageEdited;
 
@@ -1912,12 +1958,20 @@ const reducer = (state, action) => {
             // update took max(1, 1) + 1 = 2 for a single message (verified on
             // device once the backend stopped sending message:received). Only
             // when the server sends no number do we fall back to local + 1.
+            // Group updates carry NO unreadCount, and group:message:new has
+            // already counted the message — so a local +1 here showed 2 for one
+            // group message (verified on device). Skip it when the local row
+            // already holds this message, or a newer one.
             const hasServerUnread = typeof item?.unreadCount === 'number';
+            const nmInId = normalizeId(incomingLmObj?.serverMessageId || incomingLmObj?.messageId
+              || incomingLmObj?._id || item?.lastMessageId);
+            const nmExId = normalizeId(existingLmObj?.serverMessageId || existingLmObj?.messageId || existingLmObj?.id);
+            const nmAlreadyCounted = keepNewerLocal || Boolean(nmInId && nmExId && String(nmInId) === String(nmExId));
             unreadByChat[chatId] = isActiveChat
               ? 0
               : (hasServerUnread
                 ? serverUnread
-                : (nmNonBadgingCall ? baseUnread : baseUnread + 1));
+                : ((nmNonBadgingCall || nmAlreadyCounted) ? baseUnread : baseUnread + 1));
 
             const nextLastMessageAt = isActiveChat
               ? (existing?.lastMessageAt || item?.lastMessageAt || lastMessage?.createdAt || timestamp)
@@ -2426,7 +2480,11 @@ const reducer = (state, action) => {
       // Increment unread if not the active chat — skip if preserving a delete
       const unreadByChat = { ...state.unreadByChat };
       const isOwnMessage = senderId && state.currentUserId && String(senderId) === String(state.currentUserId);
-      if (!preserveGrpDelete && senderId && state.currentUserId && !isOwnMessage && state.activeChatId !== resolvedId) {
+      // Already the row's last message = a chat:list:update for it landed first
+      // and counted it; a second +1 double-counts.
+      const grpAlreadyCounted = Boolean(incomingGrpMsgId && existingGrpMsgId
+        && String(incomingGrpMsgId) === String(existingGrpMsgId));
+      if (!preserveGrpDelete && !grpAlreadyCounted && senderId && state.currentUserId && !isOwnMessage && state.activeChatId !== resolvedId) {
         unreadByChat[resolvedId] = Number(unreadByChat[resolvedId] || existing?.unreadCount || 0) + 1;
         nextMap[resolvedId].unreadCount = unreadByChat[resolvedId];
       }
@@ -3407,7 +3465,9 @@ export function RealtimeChatProvider({ children }) {
               }
             : null,
         }).catch(() => {});
-        if (!isSelf) {
+        // Not for the open chat — its messages are read on arrival, and the
+        // +1 left SQLite with a phantom count that returned on cold start.
+        if (!isSelf && !isChatOpenNow(stateRef, normalized.chatId)) {
           ChatDatabase.incrementChatUnread(normalized.chatId).catch(() => {});
         }
       }
@@ -4651,7 +4711,9 @@ export function RealtimeChatProvider({ children }) {
           chatAvatar: data?.groupAvatar || data?.group?.avatar || null,
           group: { _id: groupId || chatKey, name: data?.groupName || data?.group?.name || null, avatar: data?.groupAvatar || data?.group?.avatar || null, description: data?.groupDescription || data?.group?.description || null },
         }).catch(() => {});
-        ChatDatabase.incrementChatUnread(chatKey).catch(() => {});
+        if (!isChatOpenNow(stateRef, chatKey)) {
+          ChatDatabase.incrementChatUnread(chatKey).catch(() => {});
+        }
       }
     };
 
@@ -5512,7 +5574,16 @@ export function RealtimeChatProvider({ children }) {
     dispatch({ type: 'RESET_STATE', payload: { currentUserId: state.currentUserId || null } });
   }, [state.currentUserId]);
 
-  const hydrateChats = useCallback(async (chats, opts = {}) => {
+  const hydrateChats = useCallback(async (inputChats, opts = {}) => {
+    // The server's count can lag a read that is still in flight — never let
+    // it re-badge the chat that is open or was read moments ago.
+    const liveActive = stateRef.current?.activeChatId ? normalizeId(stateRef.current.activeChatId) : null;
+    const chats = (inputChats || []).map((c) => {
+      const id = normalizeId(c?.chatId || c?._id);
+      if (!id || !(Number(c?.unreadCount) > 0)) return c;
+      if ((liveActive && id === liveActive) || wasReadLocallyRecently(id)) return { ...c, unreadCount: 0 };
+      return c;
+    });
     ChatCache.setChats(chats || []);
     dispatch({ type: 'HYDRATE_CHATS', payload: chats || [] });
     const tempMap = {};
@@ -5707,6 +5778,7 @@ export function RealtimeChatProvider({ children }) {
   }, [deferDispatch]);
 
   const markChatRead = useCallback((chatId) => {
+    noteLocalRead(chatId);
     deferDispatch({ type: 'MARK_READ', payload: chatId });
     // Reset unread in SQLite
     if (chatId) ChatDatabase.updateChatUnread(chatId, 0).catch(() => {});

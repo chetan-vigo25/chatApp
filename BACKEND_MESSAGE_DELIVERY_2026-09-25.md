@@ -13,12 +13,13 @@ The server event capture comes from the client's socket.io hooks. Every item bel
 | 2 | WebSocket upgrade is rejected (`400`) for every request that carries an `Origin` header | **High** | ✅ Fixed. |
 | 3 | First socket session after a push-started cold launch is closed by the server within ~1 s | Medium | ✅ Looks fixed. 2/2 clean runs (it was 4/5 failing). |
 | 4 | `replyTo` carries the Mongo `_id` instead of the message UUID | Low | ✅ Fixed. |
-| 5 | `chat:list` is slow | Medium | ⚠️ **Much better, not done.** 8 runs: 1.1, 1.3, 1.4, 1.4, 1.7, 2.1 s typical (median ~1.4 s), but **spikes of 4.8 s and 5.9 s**. For reference over the same socket: `mute:sync` 0.2 s, `catchup` 0.6–0.8 s. Target: always under 1 s, **no spikes**. |
+| 5 | `chat:list` is slow | Medium | ✅ **Done (re-tested 2026-09-30 16:12 IST).** 8 runs: 0.61, 0.73, 0.61, 1.16, 0.89, 0.64, 0.88, 0.85 s. No spikes. |
 | 6 | On reconnect, missed messages are replayed **before** the session is re-authenticated | Medium | ✅ **Fixed.** Order is now `connect → authenticated`; missed messages arrive after auth and reach `delivered` (2/2 network-drop runs, with a notification). |
 | 7 | Group chats: seq-range fetch | **High** | ✅ Server part done. |
 | 8 | iOS receivers get the push while away | **High** | ✅ Confirmed manually on the iPhone. |
+| 9 | REST and socket chat list `unreadCount` | Medium | ⚠️ **1:1 passing, groups not (re-tested 2026-09-30 17:40 IST).** 1:1 goes 3 → 2 → 1 → 0. In groups, `group:message:read` never lowers the count; only `group:message:read:all` does. See section 9, "Re-test 2". |
 
-**Remaining for the backend: item 5 only** (`chat:list` under 1 s).
+**Remaining for the backend: item 9, groups only.** `group:message:read` must lower the group unread count.
 
 The client already ships workarounds for 1, 2, 4 and 6, and they are described under each item. They reduce the damage but cannot replace the server fix.
 
@@ -260,6 +261,76 @@ iOS suspends a backgrounded app within seconds, and its socket goes silent witho
 - The push's `messageId` must be the UUID, so the client's notification dedupe matches the socket copy and doesn't show it twice.
 
 **Verify:** iPhone app in background (Home), lock the screen, wait 10 s, send it a message from Android. A notification appears within ~2 s, and the Android sender reaches `delivered` without the iPhone being unlocked.
+
+---
+
+## 9. REST chat list `unreadCount` ignores per-message reads — **MEDIUM** (added 2026-09-30)
+
+### Measured (Android `69a5185a…`, chat `u_69a5185a…_6a72cf2d…`)
+
+| Step | socket `chat:list` | REST `POST /user/chat/list` |
+|---|---|---|
+| Chat open on the phone, 3 messages arrive and are read in the open chat (`message:read` / `message:read:bulk`, server status of all 3 = `read`) | **0** ✅ | **3** ❌ |
+| Client then emits `message:read:all` for that chat | 0 | **0** |
+
+REST keeps its own unread counter, which only `message:read:all` resets. Messages read while the chat is open (per-message receipts) never decrement it. The app loads the REST list on every cold start and on first sync after a reinstall, so users saw badges like "99+" on chats they had fully read.
+
+**Ask:** compute REST `unreadCount` the same way as socket `chat:list`, or decrement it on `message:read`, `message:read:bulk` and `group:message:read`. Both lists must always agree.
+
+**Client side (shipped):**
+- After in-chat reads the app now also sends a debounced `message:read:all` / `group:message:read:all`, which masks this for new messages.
+- The server list is now authoritative for badges.
+
+**Verify:** open a chat, have the peer send 3 messages, and return to the list. REST `unreadCount` for that chat must be 0 **without** any `message:read:all`.
+
+### Re-test 2026-09-30, 16:10 IST (after the shared-function deploy): unread is now always 0 ❌
+
+REST and socket now agree, but both return **0 for messages nobody has read**.
+
+| Step | Server status of the messages | socket `chat:list` | REST `/user/chat/list` |
+|---|---|---|---|
+| Android is on the **chat list** (the chat is NOT open). The iPhone sends `i9-a`, `i9-b`, `i9-c` (seq 873–875). | `delivered` | **0** ❌ (expected 3) | **0** ❌ (expected 3) |
+| The iPhone sends `i9-d`, `i9-e` (seq 876–877). | `delivered` | **0** ❌ (expected 5) | **0** ❌ (expected 5) |
+
+- Chat `u_69a5185acf2a2ed928da5ffd_6a72cf2d26d07447d7a146a0`, reader `69a5185acf2a2ed928da5ffd`.
+- The client emits were logged during the test. Android sent **only** `message:delivered` for d0a12ca6… and 13898e7c…, plus `chat:list`. There was **no** `message:read`, `message:read:bulk` or `message:read:all`.
+- Every one of the 48 chats on Android and all chats on the iPhone show 0. Real users therefore get **no unread badge at all**.
+
+**Likely cause (please check):** the new read-watermark is being advanced by **`message:delivered`** (or by the message being emitted to the receiver), not only by reads. Only `message:read`, `message:read:bulk`, `message:read:all` and the `group:` equivalents may move it.
+
+**Verify:** with the receiver's chat list open (chat not open), send 3 messages. Both lists must show 3. Then send `message:read` for one of them: both lists must show 2. Then send `message:read:all`: both lists must show 0. Run the same for a group.
+
+### Re-test 2, 2026-09-30 17:35–17:45 IST (after the seq-counter fix)
+
+The seq counter is fixed: new 1:1 messages got seq 928, 929, 930 and group messages got 216–220. The Android app's own read emits were blocked during the test, so only the events listed below reached the server.
+
+**1:1** (chat `u_69a5185acf2a2ed928da5ffd_6a72cf2d26d07447d7a146a0`): ✅ all steps pass.
+
+| Step | socket | REST |
+|---|---|---|
+| iPhone sends `r9-a`, `r9-b`, `r9-c` | 3 | 3 |
+| Android `message:read` for `r9-a` | 2 | 2 |
+| Android `message:read:bulk` for `r9-b` | 1 | 1 |
+| Android `message:read:all` | 0 | 0 |
+
+**Group** (`Travel 🧳`, groupId `6a7ac21426d07447d75a4448`, reader `69a5185acf2a2ed928da5ffd`): ❌ per-message reads are ignored.
+
+| Step | socket | REST |
+|---|---|---|
+| iPhone sends `g9-a`, `g9-b`, `g9-c` (seq 216–218) | 3 ✅ | 3 ✅ |
+| Android `group:message:read {groupId, messageIds:['a15bb81a…'], userId, readAt}` | **3** ❌ (expected 2) | **3** ❌ |
+| Android `group:message:read:all {groupId}` | 0 ✅ | 0 ✅ |
+| iPhone sends `g9-d`, `g9-e` (seq 219–220) | 2 ✅ | 2 ✅ |
+| `group:message:read` for `g9-d` (41cfc1e0…); the server acked `{status:true, data:{acknowledged:true}}` | **2** ❌ (expected 1), still 2 after 10 s | **2** ❌ |
+| `group:message:read` for the **newest** message `g9-e` (629561f7…) | **2** ❌ (expected 0) | **2** ❌ |
+
+The server acknowledges `group:message:read` but does not advance this member's group read-watermark (or per-message read state) from it. Only `group:message:read:all` does. The app currently hides this, because it also sends a debounced `group:message:read:all` after reading in an open group. It is still wrong for any other client, and for reads sent while the app closes before the debounce fires.
+
+**Ask:** make `group:message:read` lower the reader's group unread count, the same way `message:read` does in 1:1. After reading the newest message the count must be 0.
+
+**Verify:** group of the two test users. Send 3 messages; count 3. `group:message:read` for the first; count 2. `group:message:read` for the newest; count 0. No `read:all` is sent in between.
+
+**Also (low):** the **group** `chat:list:update` (`type: new_message`, `reason: message.created`) carries no `unreadCount`, while the 1:1 one does. The client counted +1 from `group:message:new` and another +1 from this update, so one group message showed a badge of 2. That is fixed on the client, but please include `unreadCount` in the group `item` too, so the client can take the server's number.
 
 ---
 

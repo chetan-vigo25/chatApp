@@ -3019,6 +3019,33 @@ export default function useChatLogic({ navigation, route }) {
     refreshMessagesFromDB(true);
   }, [normalizeIncomingMessage, refreshMessagesFromDB]);
 
+  // Trailing chat-level read. Messages read WHILE the chat is open only send
+  // per-message receipts (message:read / read:bulk / group:message:read); the
+  // server's REST chat list counts unread from a counter that ONLY
+  // message:read:all resets (measured 2026-09-30: 3 in-chat reads left REST
+  // unreadCount=3 while the socket chat:list said 0; one read:all → 0). That
+  // stale count came back on every cold start as a phantom badge ("99+").
+  // Debounced so a burst of reads sends one read:all.
+  const readAllTimerRef = useRef(null);
+  const scheduleTrailingReadAll = useCallback(() => {
+    if (readAllTimerRef.current) clearTimeout(readAllTimerRef.current);
+    readAllTimerRef.current = setTimeout(() => {
+      readAllTimerRef.current = null;
+      const cid = chatIdRef.current;
+      const uid = currentUserIdRef.current;
+      if (!cid || !uid) return;
+      const isGrp = chatData?.chatType === 'group' || chatData?.isGroup;
+      if (isGrp) {
+        emitSocketEvent('group:message:read:all', { groupId: chatData?.groupId || chatData?.group?._id || cid });
+      } else {
+        emitSocketEvent('message:read:all', { chatId: cid, senderId: uid });
+      }
+    }, 1200);
+  }, [chatData]);
+  useEffect(() => () => {
+    if (readAllTimerRef.current) clearTimeout(readAllTimerRef.current);
+  }, []);
+
   const markMessagesAsRead = useCallback((messageIds = []) => {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return;
 
@@ -3101,6 +3128,7 @@ export default function useChatLogic({ navigation, route }) {
             });
           });
         }
+        scheduleTrailingReadAll();
       }
 
       // Update local state to 'seen'
@@ -3122,7 +3150,7 @@ export default function useChatLogic({ navigation, route }) {
         deferRealtimeUpdate(() => markChatRead(chatIdRef.current));
       }
     }, 500);
-  }, [saveMessagesToLocal, markChatRead, deferRealtimeUpdate, chatData]);
+  }, [saveMessagesToLocal, markChatRead, deferRealtimeUpdate, chatData, scheduleTrailingReadAll]);
 
   const scheduleMarkVisibleUnreadAsRead = useCallback(() => {
     if (readMarkTimeoutRef.current) {
@@ -3185,8 +3213,9 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       markMessagesAsRead(unreadIds);
+      scheduleTrailingReadAll();
     }, READ_MARK_DELAY);
-  }, [markMessagesAsRead, chatData]);
+  }, [markMessagesAsRead, chatData, scheduleTrailingReadAll]);
 
   const deduplicateMessages = useCallback((messagesArray) => {
     const uniqueMap = new Map();

@@ -1,19 +1,21 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
-  View, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator, Keyboard,
+  View, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator, Keyboard, AppState,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import { useTheme } from '../../contexts/ThemeContext';
+import { useNetwork } from '../../contexts/NetworkContext';
 import {
   Text, useLanguage,
   SOURCE_LANGUAGE, getDownloadedLanguages, getSupportedLanguages,
   isTranslationAvailable, needsSystemFont,
+  getLanguageDownloadStatus, subscribeLanguageDownloads, clearFailedLanguageDownloads,
 } from '../../components/Translate';
 import { LANGUAGES, NO_TRANSLATION, NO_TRANSLATION_OPTION } from '../../constant/languages';
 import AppSearchBar from '../../components/AppSearchBar';
 
-// Estimated-progress tuning (see the `progress` state below).
+// Estimated-progress tuning (see progressFor below).
 const PROGRESS_CEILING = 0.92;   // never claim "done" before the native side says so
 const PROGRESS_TAU_S = 25;       // seconds to reach ~63%
 const PROGRESS_SETTLE_MS = 350;  // how long the full bar is shown before the tick
@@ -35,19 +37,25 @@ const PROGRESS_SETTLE_MS = 350;  // how long the full bar is shown before the ti
 export default function ChooseLanguage({ navigation }) {
   const { theme, isDarkMode } = useTheme();
   const { language, setLanguage, ready } = useLanguage();
+  // Offline, ML Kit does not fail a download — it parks it and carries on when
+  // the network returns. Say so instead of letting the estimate climb.
+  const { isConnected } = useNetwork();
   const [query, setQuery] = useState('');
   // Which languages already have their ~30MB on-device model.
   const [downloaded, setDownloaded] = useState([]);
-  // The row currently fetching a model, so only it shows a spinner.
-  const [busyCode, setBusyCode] = useState(null);
-  const [failedCode, setFailedCode] = useState(null);
-  // 0..1 progress for the busy row. ML Kit's downloadModelIfNeeded reports
-  // completion only (no byte counts on either platform), so this is an
-  // ESTIMATE: a time-based curve that climbs quickly at first, slows as it
-  // nears the ceiling, and snaps to 100% the moment the native promise
-  // settles. It is honest about motion (the download IS progressing) without
-  // claiming a precision the SDK cannot give.
-  const [progress, setProgress] = useState(0);
+  // Which row is downloading / failed is NOT kept here — it lives in
+  // Translate's module-level store, so it survives this screen being left and
+  // re-opened mid-download. This screen only re-renders when it changes.
+  const [, bumpStatus] = useReducer((n) => n + 1, 0);
+  // The row that just finished, held at 100% for a beat before the tick.
+  const [settlingCode, setSettlingCode] = useState(null);
+  // Clock for the estimated progress. ML Kit's downloadModelIfNeeded reports
+  // completion only (no byte counts on either platform), so progress is an
+  // ESTIMATE from the download's start time: it climbs quickly at first, slows
+  // as it nears the ceiling, and snaps to 100% the moment the native promise
+  // settles. Using the store's startedAt (not this screen's mount time) means
+  // coming back to the screen continues the bar instead of restarting it.
+  const [now, setNow] = useState(() => Date.now());
   const aliveRef = useRef(true);
 
   useEffect(() => {
@@ -66,40 +74,58 @@ export default function ChooseLanguage({ navigation }) {
 
   useEffect(() => { refreshDownloaded(); }, [refreshDownloaded]);
 
+  // Follow downloads started anywhere (this screen before it was left, the
+  // launch/foreground resume) and re-read the on-disk list whenever one ends.
+  useEffect(() => subscribeLanguageDownloads(() => {
+    if (!aliveRef.current) return;
+    bumpStatus();
+    refreshDownloaded();
+  }), [refreshDownloaded]);
+
+  // A download can finish while the app is in the background.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') refreshDownloaded();
+    });
+    return () => sub.remove();
+  }, [refreshDownloaded]);
+
   const nativeReady = isTranslationAvailable();
 
-  // Which pick is the current one. Rows stay tappable during a download, so a
-  // slow first download must not clear the spinner (or post a failure) for a
-  // language the user picked afterwards.
+  // Which pick is the current one, so a slow earlier pick finishing cannot run
+  // the 100% settle for a row the user has since moved away from.
   const pickSeqRef = useRef(0);
 
-  // Tick the estimated progress while a row is busy. τ ≈ 25s: a 30MB model on
-  // an ordinary connection lands around there, so most real downloads finish
-  // while the bar is still visibly moving rather than parked at the ceiling.
+  const anyDownloading = LANGUAGES.some(({ code }) => getLanguageDownloadStatus(code)?.state === 'downloading');
+  // Tick while anything is downloading. τ ≈ 25s: a 30MB model on an ordinary
+  // connection lands around there, so most real downloads finish while the bar
+  // is still visibly moving rather than parked at the ceiling.
   useEffect(() => {
-    if (!busyCode) return undefined;
-    const startedAt = Date.now();
-    setProgress(0);
-    const timer = setInterval(() => {
-      const t = (Date.now() - startedAt) / 1000;
-      const estimate = Math.min(PROGRESS_CEILING, 1 - Math.exp(-t / PROGRESS_TAU_S));
-      setProgress(estimate);
-    }, 250);
+    if (!anyDownloading) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(timer);
-  }, [busyCode]);
+  }, [anyDownloading]);
+
+  const progressFor = (code) => {
+    if (settlingCode === code) return 1;
+    const startedAt = getLanguageDownloadStatus(code)?.startedAt;
+    if (!startedAt) return 0;
+    const t = Math.max(0, now - startedAt) / 1000;
+    return Math.min(PROGRESS_CEILING, 1 - Math.exp(-t / PROGRESS_TAU_S));
+  };
 
   const onPick = useCallback(async (code) => {
-    setFailedCode(null);
+    // A new pick replaces any old "failed" rows (a running download is kept).
+    clearFailedLanguageDownloads();
     // Neither English (the app's own language) nor "Don't translate" needs a
     // model — both apply the instant they are tapped, with nothing to download
     // and nothing that can fail.
     if (code === SOURCE_LANGUAGE || code === NO_TRANSLATION) { setLanguage(code); return; }
 
     // A model that is already on the device needs no download — apply it at
-    // once. Showing the progress bar here (it used to) made a plain re-select
-    // look like a fresh 30MB fetch. The list state is checked first for an
-    // instant answer, then the native side for the case where the listing
-    // failed or is stale.
+    // once. The list state is checked first for an instant answer, then the
+    // native side for the case where the listing failed or is stale.
     let onDevice = downloaded.includes(code);
     if (!onDevice) {
       try {
@@ -112,19 +138,19 @@ export default function ChooseLanguage({ navigation }) {
 
     pickSeqRef.current += 1;
     const seq = pickSeqRef.current;
-    setBusyCode(code);
     // requireWifi false: the user tapped this row and the size is on screen.
+    // The busy/failed state is published by the store, so leaving the screen
+    // now loses nothing — the download carries on and is shown on return.
     const ok = await setLanguage(code, { requireWifi: false });
     if (!aliveRef.current || pickSeqRef.current !== seq) return;
     if (ok) {
       // Let the bar visibly reach 100% before the row flips to "selected" —
       // a jump from 60% straight to a tick reads as if something was skipped.
-      setProgress(1);
+      setSettlingCode(code);
       await new Promise((r) => setTimeout(r, PROGRESS_SETTLE_MS));
-      if (!aliveRef.current || pickSeqRef.current !== seq) return;
+      if (!aliveRef.current) return;
+      setSettlingCode((current) => (current === code ? null : current));
     }
-    setBusyCode(null);
-    if (!ok) setFailedCode(code);
     refreshDownloaded();
   }, [setLanguage, refreshDownloaded, downloaded]);
 
@@ -209,14 +235,20 @@ export default function ChooseLanguage({ navigation }) {
           ) : (
             results.map((item) => {
               const selected = item.code === language;
-              const isBusy = busyCode === item.code;
               const isOffRow = item.code === NO_TRANSLATION;
+              const status = getLanguageDownloadStatus(item.code);
+              const onDisk = downloaded.includes(item.code);
+              const isBusy = settlingCode === item.code || status?.state === 'downloading';
+              // A model that is on disk is never "failed" — it may have landed
+              // after the timeout gave up on it.
+              const isFailed = !isBusy && status?.state === 'failed' && !onDisk;
+              const progress = isBusy ? progressFor(item.code) : 0;
               // English is the app's own language — nothing to download. Nor is
               // there anything to download for "Don't translate".
               const needsModel =
                 !isOffRow
                 && item.code !== SOURCE_LANGUAGE
-                && !downloaded.includes(item.code);
+                && !onDisk;
 
               return (
                 <TouchableOpacity
@@ -258,10 +290,18 @@ export default function ChooseLanguage({ navigation }) {
                     {isBusy ? (
                       <View>
                         <View style={styles.rowSubLine}>
-                          <Text style={[styles.rowSub, { color: themeColor }]}>Downloading language…</Text>
-                          <Text ignore style={[styles.rowSub, styles.rowPct, { color: themeColor }]}>
-                            {` ${Math.round(progress * 100)}%`}
-                          </Text>
+                          {isConnected || progress >= 1 ? (
+                            <>
+                              <Text style={[styles.rowSub, { color: themeColor }]}>Downloading language…</Text>
+                              <Text ignore style={[styles.rowSub, styles.rowPct, { color: themeColor }]}>
+                                {` ${Math.round(progress * 100)}%`}
+                              </Text>
+                            </>
+                          ) : (
+                            <Text style={[styles.rowSub, { color: subText }]}>
+                              Waiting for internet — download resumes automatically
+                            </Text>
+                          )}
                         </View>
                         <View
                           style={[styles.track, { backgroundColor: divider }]}
@@ -276,7 +316,7 @@ export default function ChooseLanguage({ navigation }) {
                           />
                         </View>
                       </View>
-                    ) : failedCode === item.code ? (
+                    ) : isFailed ? (
                       <Text style={[styles.rowSub, { color: theme.colors.danger || '#E5484D' }]}>
                         Download failed — tap to retry
                       </Text>
