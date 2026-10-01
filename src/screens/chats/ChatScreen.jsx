@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import GroupSenderAvatar from '../../components/GroupSenderAvatar';
 import {
   View,
   Text,
@@ -6976,15 +6977,12 @@ export default function ChatScreen({ navigation, route }) {
         >
           {showSenderAvatar ? (
             <TouchableOpacity onPress={openSenderProfile} activeOpacity={0.7} style={{ marginRight: 6, marginTop: 2 }}>
-              {senderAvatarUri ? (
-                <Image source={{ uri: senderAvatarUri }} style={{ width: 30, height: 30, borderRadius: 15 }} />
-              ) : (
-                <View style={{ width: 30, height: 30, borderRadius: 15, backgroundColor: getUserColor?.(msg.senderId) || theme.colors.themeColor, alignItems: 'center', justifyContent: 'center' }}>
-                  <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 13 }}>
-                    {String(senderLabel || 'M').charAt(0).toUpperCase()}
-                  </Text>
-                </View>
-              )}
+              <GroupSenderAvatar
+                userId={msg.senderId}
+                uri={senderAvatarUri}
+                label={senderLabel}
+                senderName={msg.senderName}
+              />
             </TouchableOpacity>
           ) : isGroupReceived ? (
             // Consecutive same-sender message: reserve the avatar's footprint so

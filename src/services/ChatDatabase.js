@@ -2546,6 +2546,19 @@ const searchMessages = async (chatId, query, limit = 50) => {
   return rows.map(rowToMsg);
 };
 
+// Most recent self-set name a user SENT messages under (sender_name), skipping
+// "@handle" redactions — the avatar letter's fallback when the profile API
+// hides the name (peer turned on "hide contact"). See peerProfileNameStore.
+const getLatestSenderName = async (senderId) => {
+  if (!senderId) return null;
+  const db = await getDB();
+  const r = await db.getFirstAsync(
+    `SELECT sender_name FROM messages WHERE sender_id = $s AND sender_name IS NOT NULL AND sender_name != '' AND sender_name NOT LIKE '@%' ORDER BY timestamp DESC LIMIT 1`,
+    { $s: String(senderId) },
+  );
+  return r?.sender_name || null;
+};
+
 const getLatestMessage = async (chatId) => {
   if (!chatId) return null;
   const db = await getDB();
@@ -2812,6 +2825,9 @@ const _chatToRow = (chat) => {
     : lmAtRaw;
   // Handle peerUser from flat API format (peerUserId + chatName + chatAvatar)
   const peerUserObj = isGroup ? null : (chat.peerUser || chat.otherUser || (chat.peerUserId ? { _id: chat.peerUserId, fullName: chat.chatName, profileImage: chat.chatAvatar } : null));
+  const isBroadcastRow = chat.chatType === 'broadcast' || Boolean(chat.isBroadcast);
+  const peerProfileKnown = Boolean(!isGroup && !isBroadcastRow && peerUserObj
+    && Object.prototype.hasOwnProperty.call(peerUserObj, 'profileImage'));
   return {
     $chatId: String(chatId),
     $chatType: chat.chatType || (isGroup ? 'group' : 'private'),
@@ -2820,13 +2836,20 @@ const _chatToRow = (chat) => {
     $groupData: isGroup ? JSON.stringify(chat.group || (chat.groupId ? { _id: chat.groupId, name: chat.chatName, avatar: chat.chatAvatar } : null)) : null,
     $groupId: chat.groupId || chat.group?._id || (isGroup ? chatId : null),
     $chatName: chat.chatName || chat.groupName || chat.group?.name || peerUserObj?.fullName || null,
-    $chatAvatar: chat.chatAvatar || chat.groupAvatar || chat.group?.avatar || peerUserObj?.profileImage || null,
+    // 1-1: the peer's own photo is the truth when the row knows it — including
+    // "no photo" (profileImage: null after the peer removed their DP). Falling
+    // back to a stored chatAvatar kept the removed DP forever.
+    $chatAvatar: peerProfileKnown
+      ? (peerUserObj.profileImage || null)
+      : (chat.chatAvatar || chat.groupAvatar || chat.group?.avatar || peerUserObj?.profileImage || null),
     // 1 = server branding is authoritative (broadcast channels): the fresh
     // name/avatar OVERWRITES what's stored instead of fill-if-missing. Without
     // this a row mis-seeded with a sender name (e.g. "admin") could never be
     // repaired by the branded API/socket rows, and an admin logo removal
     // (avatar → null) never cleared.
     $nameAuth: (chat.chatType === 'broadcast' || chat.isBroadcast) ? 1 : 0,
+    // Same overwrite for a 1-1 avatar the row actually knows (see $chatAvatar).
+    $avatarAuth: ((chat.chatType === 'broadcast' || chat.isBroadcast) || peerProfileKnown) ? 1 : 0,
     $lmText: lm.text || null,
     $lmType: lm.type || lm.messageType || 'text',
     $lmSenderId: lm.senderId || null,
@@ -2932,7 +2955,7 @@ const UPSERT_CHAT_SQL = `INSERT INTO chats (
   group_data = COALESCE($groupData, group_data),
   group_id = COALESCE($groupId, group_id),
   chat_name = CASE WHEN $nameAuth = 1 AND $chatName IS NOT NULL THEN $chatName ELSE COALESCE($chatName, chat_name) END,
-  chat_avatar = CASE WHEN $nameAuth = 1 THEN $chatAvatar ELSE COALESCE($chatAvatar, chat_avatar) END,
+  chat_avatar = CASE WHEN $avatarAuth = 1 THEN $chatAvatar ELSE COALESCE($chatAvatar, chat_avatar) END,
   last_message_text = CASE WHEN $lmKeep = 1 THEN last_message_text ELSE $lmText END,
   last_message_type = CASE WHEN $lmKeep = 1 THEN last_message_type ELSE $lmType END,
   last_message_sender_id = CASE WHEN $lmKeep = 1 THEN last_message_sender_id ELSE $lmSenderId END,
@@ -3947,7 +3970,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSenderName, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,

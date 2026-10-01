@@ -15,7 +15,7 @@ export const buildContactQrValue = (token) => `${CONTACT_QR_SCHEME_PREFIX}${toke
 
 /**
  * @returns {{ kind: 'contact', token: string }
- *         | { kind: 'device-link' }
+ *         | { kind: 'device-link', sessionId: string, publicKey: string, serverUrl: string }
  *         | { kind: 'unknown' }}
  */
 export function parseScannedQr(raw) {
@@ -30,13 +30,20 @@ export function parseScannedQr(raw) {
     return { kind: 'contact', token: match[1] };
   }
 
-  // The web client's device-linking QR is JSON { sessionId, publicKey } —
-  // recognise it so the user is pointed at "Linked devices" instead of a
-  // generic "invalid code".
+  // The web client's device-linking QR is JSON { sessionId, publicKey,
+  // serverUrl? } — the same scanner links the web session (WhatsApp-style:
+  // one camera reads both a contact code and a "log in on web" code).
   if (text.startsWith('{')) {
     try {
       const parsed = JSON.parse(text);
-      if (parsed?.sessionId && parsed?.publicKey) return { kind: 'device-link' };
+      if (parsed?.sessionId && parsed?.publicKey) {
+        return {
+          kind: 'device-link',
+          sessionId: String(parsed.sessionId),
+          publicKey: String(parsed.publicKey),
+          serverUrl: parsed.serverUrl ? String(parsed.serverUrl) : '',
+        };
+      }
     } catch { /* not JSON */ }
   }
 

@@ -1,8 +1,9 @@
 /**
- * Camera permission + scan parsing for the contact scanner.
+ * Camera permission + scan parsing for the "Scan code" tab.
  *
- * Separate from device-linking's useQRScanner, which only understands the web
- * client's `{ sessionId, publicKey }` JSON.
+ * Reads BOTH a contact QR (→ `token`) and the web client's device-linking QR
+ * (→ `deviceLink` = { sessionId, publicKey, serverUrl }); ScanCodeTab acts on
+ * whichever arrived. Either one keeps the scanner locked until reset().
  */
 import { useState, useCallback, useRef } from 'react';
 import { useCameraPermissions } from 'expo-camera';
@@ -15,6 +16,7 @@ const RETRY_DELAY_MS = 1500;
 export default function useContactQrScanner() {
   const [permission, requestCameraPermission] = useCameraPermissions();
   const [token, setToken] = useState(null);
+  const [deviceLink, setDeviceLink] = useState(null);
   const [error, setError] = useState(null);
   const lockedRef = useRef(false);
 
@@ -45,11 +47,14 @@ export default function useContactQrScanner() {
       return; // stays locked until reset()
     }
 
-    setError(
-      result.kind === 'device-link'
-        ? 'This code is for linking a device. Open Linked devices to scan it.'
-        : "This isn't a TalksTry contact QR code.",
-    );
+    if (result.kind === 'device-link') {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      setError(null);
+      setDeviceLink({ sessionId: result.sessionId, publicKey: result.publicKey, serverUrl: result.serverUrl });
+      return; // stays locked until reset()
+    }
+
+    setError("This isn't a TalksTry QR code.");
     setTimeout(() => { lockedRef.current = false; }, RETRY_DELAY_MS);
   }, []);
 
@@ -57,6 +62,7 @@ export default function useContactQrScanner() {
 
   const reset = useCallback(() => {
     setToken(null);
+    setDeviceLink(null);
     setError(null);
     lockedRef.current = false;
   }, []);
@@ -66,6 +72,7 @@ export default function useContactQrScanner() {
     canAskPermission,
     requestPermission,
     token,
+    deviceLink,
     error,
     handleBarcodeScanned,
     handleScannedValue,

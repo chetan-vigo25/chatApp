@@ -1,4 +1,4 @@
-import React, { memo, useRef } from 'react';
+import React, { memo, useEffect, useRef, useState } from 'react';
 import { useSelector } from 'react-redux';
 import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react-native';
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
@@ -6,7 +6,8 @@ import SegmentedRing from './SegmentedRing';
 import { useTranslatedText, needsSystemFont } from './Translate';
 import useDisplayName from '../hooks/useDisplayName';
 import { isSelfChat, selfChatLabel, selfIdentityOf } from '../utils/selfChat';
-import { getAvatarColor, getAvatarInitial } from '../utils/avatarIdentity';
+import { usePeerProfileName } from '../services/peerProfileNameStore';
+import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial } from '../utils/avatarIdentity';
 
 const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
 const RING_SIZE   = 53; // outer ring diameter — leaves a small gap around the avatar
@@ -35,7 +36,7 @@ const ChatCard = ({
   const scale = useRef(new Animated.Value(1)).current;
   // Canonical name resolution — the row re-renders by itself when the address
   // book changes (contact synced / saved / deleted).
-  const { resolveName, isSaved } = useDisplayName();
+  const { resolveName, savedNameOf } = useDisplayName();
   // Only the self-chat row reads this — my own handle/privacy toggle, which no
   // chat row carries. Selecting the slice object keeps the subscription cheap
   // (stable reference until the profile itself changes).
@@ -130,14 +131,32 @@ const ChatCard = ({
   // chatAvatar (the chat-list REST rows carry ONLY chatAvatar — without this
   // fallback a row whose peerUser wasn't hydrated yet rendered the default
   // person icon even though the URL was right there).
-  const peerAvatarUri = !isGroup && !isBroadcast
+  const rawPeerAvatarUri = !isGroup && !isBroadcast
     ? (item?.peerUser?.profileImage || item?.chatAvatar || null)
     : null;
-  // No photo: a saved contact gets its first letter on a per-user colour (the
-  // same one the profile popup and UserB show); an unsaved number keeps the
-  // person icon. See utils/avatarIdentity.
+  // A photo URL that fails to load (removed DP, expired link) rendered an
+  // empty circle — fall back to the no-photo avatar instead.
+  const [failedAvatarUri, setFailedAvatarUri] = useState(null);
+  useEffect(() => { setFailedAvatarUri(null); }, [rawPeerAvatarUri]);
+  const peerAvatarUri = rawPeerAvatarUri && rawPeerAvatarUri !== failedAvatarUri ? rawPeerAvatarUri : null;
+  // No photo: first letter of my saved name for them, else of their own profile
+  // name — even while the row shows their number or @username. No name at all
+  // and a number label → person icon. See utils/avatarIdentity.
+  // Profile name comes from the profile API (peerProfileNameStore) — the row's
+  // own peerUser.fullName / chatName is the server's per-viewer label (a number
+  // or a stale contact name), not what the peer set on their profile.
+  const peerSavedName = isGroup || isBroadcast || isSelf ? null : savedNameOf({ userId: peerUserId, phone: peerMobile });
+  const peerProfileName = usePeerProfileName(
+    peerUserId,
+    !isGroup && !isBroadcast && !isSelf && !rawPeerAvatarUri,
+  );
+  const peerInitialSource = avatarNameSource({
+    savedName: peerSavedName,
+    profileName: peerProfileName,
+    displayName: peerName,
+  });
   const showPeerInitial = !isGroup && !isBroadcast && !isSelf && !peerAvatarUri
-    && isSaved({ userId: peerUserId, phone: peerMobile });
+    && shouldShowAvatarInitial(peerInitialSource);
   // WhatsApp-style status ring: only for 1-1 chats whose peer has live statuses.
   const hasStatusRing = !isGroup && statusInfo && statusInfo.count > 0;
 
@@ -184,11 +203,12 @@ const ChatCard = ({
                 <Image
                   resizeMode="cover"
                   source={{ uri: peerAvatarUri }}
+                  onError={() => setFailedAvatarUri(peerAvatarUri)}
                   style={[styles.avatarImage, { borderColor: theme.colors.border }]}
                 />
               ) : showPeerInitial ? (
                 <View style={[styles.avatarFallback, { backgroundColor: getAvatarColor(peerUserId || peerName), borderColor: theme.colors.border }]}>
-                  <Text style={styles.avatarInitial}>{getAvatarInitial(peerName)}</Text>
+                  <Text style={styles.avatarInitial}>{getAvatarInitial(peerInitialSource)}</Text>
                 </View>
               ) : (
                 // No profile picture → default person avatar with a subtle theme border.

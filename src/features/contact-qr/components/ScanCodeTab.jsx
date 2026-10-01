@@ -1,5 +1,9 @@
 /**
- * "Scan code" tab — read someone's contact QR.
+ * "Scan code" tab — read someone's contact QR, or link TalksTry Web.
+ *
+ * A web "link device" QR scanned here runs the same link flow as Linked
+ * devices → "Link a device" (useDeviceLinking.linkDevice), then opens the
+ * Linked devices list.
  *
  * Scan (camera or a gallery image) → resolve the token on the server → show
  * ScannedContactSheet over the paused camera. Nothing navigates on a scan: the
@@ -25,7 +29,7 @@ import {
 } from 'react-native';
 import { CameraView, scanFromURLAsync } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
-import { CommonActions } from '@react-navigation/native';
+import { CommonActions, StackActions } from '@react-navigation/native';
 import { MaterialIcons, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../../contexts/ThemeContext';
 import { useRealtimeChatLists } from '../../../contexts/RealtimeChatContext';
@@ -35,6 +39,8 @@ import QROverlay from '../../device-linking/components/QROverlay';
 import useContactQrScanner from '../hooks/useContactQrScanner';
 import { resolveContactQrToken } from '../services/contactQrApi';
 import ScannedContactSheet from './ScannedContactSheet';
+import useDeviceLinking from '../../device-linking/hooks/useDeviceLinking';
+import LinkingLoader from '../../device-linking/components/LinkingLoader';
 
 const showToast = (msg) => {
   if (Platform.OS === 'android') ToastAndroid.show(msg, ToastAndroid.SHORT);
@@ -62,6 +68,7 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
     canAskPermission,
     requestPermission,
     token,
+    deviceLink,
     error: scanError,
     handleBarcodeScanned,
     handleScannedValue,
@@ -74,6 +81,38 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
   } catch { /* provider missing — openUserChat still creates the chat */ }
   const { openUserChat } = useOpenUserChat({ chats: chatList });
   const [openingChat, setOpeningChat] = useState(false);
+
+  // ── Web device linking (same flow as Linked devices → Link a device) ──
+  const { linkDevice, isLinking, error: linkHookError, clearError: clearLinkError } = useDeviceLinking();
+  const [linkSuccess, setLinkSuccess] = useState(false);
+  const [linkFailed, setLinkFailed] = useState(false);
+  const linkedSessionRef = useRef(null);
+  useEffect(() => {
+    if (!deviceLink?.sessionId || linkedSessionRef.current === deviceLink.sessionId) return;
+    linkedSessionRef.current = deviceLink.sessionId;
+    setLinkSuccess(false);
+    setLinkFailed(false);
+    (async () => {
+      const result = await linkDevice(deviceLink.sessionId, deviceLink.publicKey).catch(() => false);
+      if (linkedSessionRef.current !== deviceLink.sessionId) return; // scan abandoned
+      if (result) {
+        setLinkSuccess(true);
+        showToast('Device linked!');
+        setTimeout(() => {
+          // REPLACE the QR screen with Linked devices: Back from the list goes
+          // to where the scan started, never to this camera with the
+          // "Device Linked!" card still up (it never dismissed itself).
+          navigation.dispatch(StackActions.replace('LinkDevice'));
+          linkedSessionRef.current = null;
+          setLinkSuccess(false);
+          reset();
+        }, 1200);
+      } else {
+        setLinkFailed(true);
+      }
+    })();
+  }, [deviceLink, linkDevice, navigation, reset]);
+  const linkErrorText = linkFailed ? (linkHookError || 'Failed to link device. Please try again.') : null;
 
   // The pager must not swipe away from an open contact card.
   useEffect(() => { onSheetOpenChange?.(Boolean(card)); }, [card, onSheetOpenChange]);
@@ -125,17 +164,21 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
     setCard(null);
     setResolveError(null);
     setResolving(false);
+    linkedSessionRef.current = null;
+    setLinkFailed(false);
+    setLinkSuccess(false);
+    clearLinkError?.();
     reset();
-  }, [reset]);
+  }, [reset, clearLinkError]);
 
   // Hardware back closes the card first, like any bottom sheet.
   useEffect(() => {
-    if (!active || (!card && !resolveError)) return undefined;
+    if (!active || (!card && !resolveError && !linkErrorText)) return undefined;
     const sub = BackHandler.addEventListener('hardwareBackPress', () => { scanAgain(); return true; });
     return () => sub.remove();
-  }, [active, card, resolveError, scanAgain]);
+  }, [active, card, resolveError, linkErrorText, scanAgain]);
 
-  const idle = active && hasPermission && !token && !card;
+  const idle = active && hasPermission && !token && !deviceLink && !card;
   useEffect(() => {
     if (!idle) return undefined;
     const loop = Animated.loop(
@@ -199,7 +242,8 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
     );
   }
 
-  const bannerError = resolveError || (!token ? scanError : null);
+  const bannerError = resolveError || linkErrorText || (!token && !deviceLink ? scanError : null);
+  const linkBusy = Boolean(deviceLink) && (isLinking || linkSuccess);
 
   return (
     <View style={[styles.container, { backgroundColor: '#000' }]}>
@@ -209,7 +253,7 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
           facing="back"
           enableTorch={torch}
           barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
-          onBarcodeScanned={!token ? handleBarcodeScanned : undefined}
+          onBarcodeScanned={!token && !deviceLink ? handleBarcodeScanned : undefined}
         />
       ) : null}
 
@@ -217,7 +261,7 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
 
       {!card && (
         <View style={styles.hintWrap} pointerEvents="none">
-          <Text style={styles.hint}>Scan a TalksTry QR code to save or chat with someone</Text>
+          <Text style={styles.hint}>Scan a TalksTry QR code to chat with someone, or to link TalksTry Web</Text>
         </View>
       )}
 
@@ -230,13 +274,13 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
         </View>
       )}
 
-      {bannerError && !card && !resolving && (
+      {bannerError && !card && !resolving && !linkBusy && (
         <View style={styles.errorWrap}>
           <View style={styles.errorBadge}>
             <MaterialIcons name="error-outline" size={24} color="#FF5A5A" />
           </View>
           <Text style={styles.errorText}>{bannerError}</Text>
-          {resolveError ? (
+          {resolveError || linkErrorText ? (
             <TouchableOpacity onPress={scanAgain} style={[styles.retryBtn, { backgroundColor: accent }]}>
               <MaterialIcons name="refresh" size={18} color="#fff" />
               <Text style={styles.retryText}>Scan again</Text>
@@ -245,7 +289,7 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
         </View>
       )}
 
-      {!card && !resolving && !bannerError && (
+      {!card && !resolving && !bannerError && !linkBusy && (
         <View style={styles.bottomBar}>
           <TouchableOpacity onPress={pickFromGallery} style={styles.roundBtn} activeOpacity={0.8}>
             <Ionicons name="image-outline" size={24} color="#fff" />
@@ -255,6 +299,8 @@ export default function ScanCodeTab({ active, navigation, routeKey, onSheetOpenC
           </TouchableOpacity>
         </View>
       )}
+
+      <LinkingLoader visible={linkBusy} success={linkSuccess} />
 
       {card && (
         <>

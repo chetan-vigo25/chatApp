@@ -984,7 +984,13 @@ const reducer = (state, action) => {
               fullName: String(chat?.peerUser?.fullName || '').trim()
                 || String(prev?.peerUser?.fullName || '').trim()
                 || '',
-              profileImage: chat?.peerUser?.profileImage || prev?.peerUser?.profileImage || null,
+              // The server list is authoritative for the photo too: a peer who
+              // REMOVED their DP comes back as profileImage null/"" — keeping
+              // prev's URL showed the removed DP until reinstall. Only a row
+              // that carries no profileImage at all keeps the previous one.
+              profileImage: (chat?.peerUser && Object.prototype.hasOwnProperty.call(chat.peerUser, 'profileImage'))
+                ? (chat.peerUser.profileImage || null)
+                : (prev?.peerUser?.profileImage || null),
             };
 
         // Preserve locally edited lastMessage if server hasn't caught up
@@ -1018,7 +1024,12 @@ const reducer = (state, action) => {
           chatId,
           peerUser: normalizedPeerUser,
           chatName: String(chat?.chatName || '').trim() || prev?.chatName || null,
-          chatAvatar: chat?.chatAvatar || prev?.chatAvatar || null,
+          // 1-1: a server row that ships chatAvatar ("" / null = no photo) is
+          // authoritative, like peerUser.profileImage above — `|| prev` kept a
+          // removed DP. Groups keep the fill-if-missing merge.
+          chatAvatar: (!isGroupChat && Object.prototype.hasOwnProperty.call(chat || {}, 'chatAvatar'))
+            ? (chat.chatAvatar || normalizedPeerUser?.profileImage || null)
+            : (chat?.chatAvatar || prev?.chatAvatar || null),
           unreadCount,
           lastMessage: preserveLocal ? prevLastMsg : (incomingLastMsg || prevLastMsg),
           lastMessageEdited: preserveEdit ? true : (chat?.lastMessageEdited || prev?.lastMessageEdited || false),

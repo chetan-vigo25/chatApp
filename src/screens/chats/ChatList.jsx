@@ -29,9 +29,10 @@ import useStatusIndicators from '../../hooks/useStatusIndicators';
 import useContactDirectory, { peerPrivacyOf } from '../../hooks/useContactDirectory';
 import useDisplayName from '../../hooks/useDisplayName';
 import {
-  resolveDisplayName as resolveCanonicalName, isSavedContact, peerHidesContact, getPeerIdentity,
+  resolveDisplayName as resolveCanonicalName, getSavedName, peerHidesContact, getPeerIdentity,
 } from '../../services/contactNameStore';
-import { getAvatarColor, getAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
+import { getPeerProfileName } from '../../services/peerProfileNameStore';
+import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
 import { useCall } from '../../calls/useCall';
 import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Services';
 import ChatCache from '../../services/ChatCache';
@@ -1867,19 +1868,24 @@ export default function ChatList({ navigation }) {
     ? (selectedChatItem?.chatAvatar || selectedChatItem?.group?.avatar || selectedChatItem?.groupAvatar)
     : selectedChatItem?.peerUser?.profileImage;
   // Same avatar identity as the row (ChatCard): colour keyed by the peer's user
-  // id, letter only for a saved contact, person icon for an unsaved number.
+  // id, letter of the saved name / @username, person icon for a bare number.
   const previewPeerId = selectedChatItem?.peerUser?._id || selectedChatItem?.peerUser?.userId || selectedChatItem?.peerUserId;
-  const previewShowInitial = Boolean(
-    selectedChatItem && !isPreviewGroup && !isPreviewBroadcast && !isSelfChat(selectedChatItem)
-    && isSavedContact({
-      userId: previewPeerId,
-      phone: selectedChatItem?.mobileNumber
-        || selectedChatItem?.peerUser?.mobileNumber
-        || (selectedChatItem?.peerUser?.mobile?.number
-          ? `${selectedChatItem.peerUser.mobile.code || ''}${selectedChatItem.peerUser.mobile.number}`
-          : (typeof selectedChatItem?.peerUser?.mobile === 'string' ? selectedChatItem.peerUser.mobile : '')),
-    }),
-  );
+  const previewPhone = selectedChatItem?.mobileNumber
+    || selectedChatItem?.peerUser?.mobileNumber
+    || (selectedChatItem?.peerUser?.mobile?.number
+      ? `${selectedChatItem.peerUser.mobile.code || ''}${selectedChatItem.peerUser.mobile.number}`
+      : (typeof selectedChatItem?.peerUser?.mobile === 'string' ? selectedChatItem.peerUser.mobile : ''));
+  const previewIsPeer = Boolean(selectedChatItem && !isPreviewGroup && !isPreviewBroadcast && !isSelfChat(selectedChatItem));
+  // Letter from my saved name, else the peer's profile name (not the number /
+  // @username label) — same as ChatCard.
+  const previewInitialSource = previewIsPeer
+    ? avatarNameSource({
+        savedName: getSavedName({ userId: previewPeerId, phone: previewPhone }),
+        profileName: getPeerProfileName(previewPeerId),
+        displayName: previewName,
+      })
+    : previewName;
+  const previewShowInitial = previewIsPeer && shouldShowAvatarInitial(previewInitialSource);
   const previewAvatarColor = (isPreviewGroup || isPreviewBroadcast)
     ? getAvatarColor(previewName)
     : previewShowInitial ? getAvatarColor(previewPeerId || previewName) : UNSAVED_AVATAR_BG;
@@ -2308,7 +2314,7 @@ export default function ChatList({ navigation }) {
                       <Ionicons name="people" size={20} color="#fff" />
                     ) : previewShowInitial ? (
                       <Text style={styles.sheetUserInitial}>
-                        {getAvatarInitial(previewName)}
+                        {getAvatarInitial(previewInitialSource)}
                       </Text>
                     ) : (
                       <Ionicons name="person" size={20} color="#fff" />
@@ -2511,6 +2517,7 @@ export default function ChatList({ navigation }) {
         image={previewImage}
         avatarColor={previewAvatarColor}
         showInitial={previewShowInitial}
+        initialName={previewIsPeer ? previewInitialSource : null}
         isGroup={isPreviewGroup || isPreviewBroadcast}
         isBroadcast={isPreviewBroadcast}
         isVerified={Boolean(selectedChatItem?.isVerified || selectedChatItem?.peerUser?.isVerified)}
@@ -2565,7 +2572,7 @@ export default function ChatList({ navigation }) {
                   <Ionicons name="people" size={64} color="#fff" />
                 ) : previewShowInitial ? (
                   <Text style={styles.imageViewerFallbackLetter}>
-                    {getAvatarInitial(previewName)}
+                    {getAvatarInitial(previewInitialSource)}
                   </Text>
                 ) : (
                   <Ionicons name="person" size={64} color="#fff" />

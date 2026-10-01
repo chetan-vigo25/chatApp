@@ -19,8 +19,10 @@
  *   image         uri|null  — avatar URL (falls back to a colored initial)
  *   avatarColor   string    — fallback circle background
  *   isGroup       bool      — group → people fallback icon
- *   showInitial   bool      — 1-1 with no photo: letter (saved contact) vs
- *                             person icon (unsaved number). Default true.
+ *   showInitial   bool      — 1-1 with no photo: letter vs person icon.
+ *                             Default true. A known profile name forces the letter.
+ *   initialName   string?   — name the letter comes from (default: the peer's
+ *                             profile name via peerId, else `name`)
  *   onMessage     fn?       — show Message button when provided
  *   onCall        fn?       — show Call button when provided (1-1 + group)
  *   onVideo       fn?       — show Video button when provided (1-1 + group)
@@ -42,7 +44,8 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useSelector } from 'react-redux';
 import { useTheme } from '../contexts/ThemeContext';
 import { useCall } from '../calls/useCall';
-import { getAvatarInitial } from '../utils/avatarIdentity';
+import { avatarNameSource, getAvatarInitial } from '../utils/avatarIdentity';
+import { usePeerProfileName } from '../services/peerProfileNameStore';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -58,6 +61,7 @@ export default function ProfilePreviewModal({
   isVerified = false,
   subtitle = null,
   peerId = null,
+  initialName = null,
   onMessage,
   onCall,
   onVideo,
@@ -99,11 +103,16 @@ export default function ProfilePreviewModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible]);
 
+  // Letter from the peer's OWN profile name (utils/avatarIdentity), not the
+  // label — "4422localtest" saved for a user whose profile says "Chetan" → C.
+  const peerProfileName = usePeerProfileName(peerId, !isGroup && !image);
+
   if (!mounted) return null;
 
   // WhatsApp's popup action icons are bright green (dark) / teal-green (light).
   const actionGreen = isDarkMode ? theme.colors.themeColor : '#028578';
-  const initial = getAvatarInitial(name);
+  const initial = getAvatarInitial(initialName || avatarNameSource({ profileName: peerProfileName, displayName: name }));
+  const showLetter = showInitial || Boolean(!isGroup && peerProfileName);
 
   const showMessage = typeof onMessage === 'function';
   // Call/video appear whenever the PARENT supplied a handler — for a group that
@@ -145,7 +154,7 @@ export default function ProfilePreviewModal({
                     <Ionicons name="megaphone" size={88} color="rgba(255,255,255,0.95)" />
                   ) : isGroup ? (
                     <Ionicons name="people" size={92} color="rgba(255,255,255,0.95)" />
-                  ) : showInitial ? (
+                  ) : showLetter ? (
                     <Text style={styles.fallbackText}>{initial}</Text>
                   ) : (
                     <Ionicons name="person" size={96} color="rgba(255,255,255,0.95)" />

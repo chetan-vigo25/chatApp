@@ -30,7 +30,8 @@ import { formatLastSeen } from "../../presence/services/lastSeenFormatter.servic
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getCommonGroups } from "../../Redux/Services/Group/Group.Services";
 import useDisplayName from "../../hooks/useDisplayName";
-import { getAvatarColor, getAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
+import { getPeerProfileName } from "../../services/peerProfileNameStore";
+import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
 
 const { width } = Dimensions.get('window');
 const HERO_HEIGHT = Math.min(width, 430);
@@ -127,7 +128,7 @@ export default function UserB({ navigation, route }) {
   const [commonGroups, setCommonGroups] = useState([]);
   const [commonGroupsLoading, setCommonGroupsLoading] = useState(false);
   const [selfUserId, setSelfUserId] = useState(null);
-  const { resolveName: resolveMemberName, isSaved } = useDisplayName();
+  const { resolveName: resolveMemberName, savedNameOf } = useDisplayName();
   const [reloadVersion, setReloadVersion] = useState(0);
 
   // Force the system status bar visible whenever this screen is focused. Some
@@ -279,14 +280,19 @@ export default function UserB({ navigation, route }) {
     peer?.name ||
     peerHandle ||
     "User";
-  const initial = getAvatarInitial(displayName);
-  // Same avatar rule as the chat list row and profile popup: a saved contact
-  // shows its letter on a per-user colour, an unsaved number a person icon.
-  const isSavedPeer = Boolean(
-    localContact?.fullName
+  // Same avatar rule as the chat list row and profile popup: letter of my saved
+  // name, else the peer's profile name (not the number / @username label), on a
+  // per-user colour; person icon only when there is no name at all.
+  const initialSource = avatarNameSource({
+    savedName: localContact?.fullName
       || serverDisplayName
-      || isSaved({ userId: peerId, phone: countryCode ? `${countryCode}${phoneNumber}` : phoneNumber }),
-  );
+      || savedNameOf({ userId: peerId, phone: countryCode ? `${countryCode}${phoneNumber}` : phoneNumber }),
+    // profile API name only — peer.fullName is the chat row's per-viewer label.
+    profileName: peerProfile?.fullName || getPeerProfileName(peerId),
+    displayName,
+  });
+  const initial = getAvatarInitial(initialSource);
+  const isSavedPeer = shouldShowAvatarInitial(initialSource);
   const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
   const about = peerProfile?.about || peer?.about || '';
   // Admin-granted verified badge (from the profile view endpoint / chat item).

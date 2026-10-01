@@ -9,7 +9,9 @@ import { useRealtimeChatSlice } from '../../contexts/RealtimeChatContext';
 import ContactDatabase from '../../services/ContactDatabase';
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import useDisplayName from '../../hooks/useDisplayName';
+import { usePeerProfileName } from '../../services/peerProfileNameStore';
 import { isSelfChatId, selfChatLabel, selfIdentityOf } from '../../utils/selfChat';
+import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
 
 // Marquee for one-line header text: static while it fits; when it overflows
 // the available width it auto-scrolls right→left in a seamless loop (second
@@ -139,7 +141,7 @@ export default function ChatHeaderPresence({
   // contact while this chat is OPEN flips the header name immediately — no
   // re-navigation, no restart (the old effect keyed on user._id alone never
   // re-ran and left a stale number/name on screen).
-  const { resolveName, namesVersion } = useDisplayName();
+  const { resolveName, savedNameOf, namesVersion } = useDisplayName();
 
   const [localContact, setLocalContact] = useState(null);
   useEffect(() => {
@@ -269,12 +271,16 @@ export default function ChatHeaderPresence({
   // Prefer the live server photo (realtime override → chat's peerUser) so a
   // profile-picture change shows immediately; the locally-saved contact image
   // is only a stale snapshot, used last. Saved-contact NAME still wins above.
-  const peerAvatar =
+  const rawPeerAvatar =
     liveProfileImage ||
     user?.profileImage ||
     user?.profilePicture ||
     localContact?.profileImage ||
     null;
+  // A removed / expired photo URL rendered an empty circle — fall back.
+  const [failedAvatar, setFailedAvatar] = useState(null);
+  useEffect(() => { setFailedAvatar(null); }, [rawPeerAvatar]);
+  const peerAvatar = rawPeerAvatar && rawPeerAvatar !== failedAvatar ? rawPeerAvatar : null;
   const displayName = isGroup
     ? (groupName || 'Group')
     : isSelf
@@ -287,6 +293,23 @@ export default function ChatHeaderPresence({
           ...selfIdentityOf(myProfile),
         })
       : peerDisplayName;
+
+  // Same no-photo avatar as the chat-list row (utils/avatarIdentity): letter of
+  // my saved name, else the peer's profile name — not the number / @username
+  // label; person icon only when there's no name at all. Used to take
+  // charAt(0) of the label, which drew "+" for a number and "@" for a handle.
+  const headerSavedName = (isGroup || isSelf) ? null : savedNameOf({ userId: user?._id, phone: peerPhone });
+  // Real profile name (see services/peerProfileNameStore) — `user.fullName`
+  // here is the chat row's per-viewer label, not the peer's profile name.
+  const headerProfileName = usePeerProfileName(user?._id, !isGroup && !isSelf && !rawPeerAvatar);
+  const headerInitialSource = (isGroup || isSelf)
+    ? displayName
+    : avatarNameSource({
+        savedName: headerSavedName,
+        profileName: headerProfileName,
+        displayName,
+      });
+  const headerShowInitial = shouldShowAvatarInitial(headerInitialSource);
 
   const isPeerOnline = !isGroup && normalizedStatus === 'online';
   const isTyping = isPeerTyping || isRealtimeTyping;
@@ -336,12 +359,16 @@ export default function ChatHeaderPresence({
             </View>
           )
         ) : peerAvatar ? (
-          <Image source={{ uri: peerAvatar }} style={styles.avatarImg} />
-        ) : (
-          <View style={[styles.avatarFallback, { backgroundColor: getUserColor?.(user?._id || '') || '#888' }]}>
+          <Image source={{ uri: peerAvatar }} style={styles.avatarImg} onError={() => setFailedAvatar(peerAvatar)} />
+        ) : headerShowInitial ? (
+          <View style={[styles.avatarFallback, { backgroundColor: getAvatarColor(user?._id || displayName) }]}>
             <Text style={styles.avatarLetter}>
-              {displayName?.charAt(0)?.toUpperCase() || '?'}
+              {getAvatarInitial(headerInitialSource)}
             </Text>
+          </View>
+        ) : (
+          <View style={[styles.avatarFallback, { backgroundColor: UNSAVED_AVATAR_BG }]}>
+            <Ionicons name="person" size={20} color="#fff" />
           </View>
         )}
         {isPeerOnline && !isGroup && !isSelf && (
