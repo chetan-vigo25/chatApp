@@ -1,11 +1,12 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
-import { Ionicons, MaterialIcons } from '@expo/vector-icons';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useCall } from '../useCall';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
-import { directionMeta, isConnectedOutcome, CALL_RED_ON_ACCENT } from '../callDirectionMeta';
+import { directionMeta, isConnectedOutcome } from '../callDirectionMeta';
 import { resolveDirection, hasResolvableIdentity } from '../../utils/messageDirection';
+import { healCallDetails } from '../services/inThreadCallService';
 
 /**
  * In-thread "call" entry, WhatsApp style. Rendered by ChatScreen for messages of
@@ -19,12 +20,17 @@ import { resolveDirection, hasResolvableIdentity } from '../../utils/messageDire
  * the app's FlatList rule. Cross-platform (Android + iOS) — StyleSheet only,
  * shadows via Platform.select.
  */
+// WhatsApp wording: "1 sec", "55 secs", "1 min", "28 mins", "1 hr 5 mins".
+const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`;
 const fmtDuration = (sec) => {
   const s = Math.max(0, Math.floor(sec || 0));
   if (!s) return '';
+  if (s < 60) return plural(s, 'sec');
   const m = Math.floor(s / 60);
-  const ss = String(s % 60).padStart(2, '0');
-  return `${m}:${ss}`;
+  if (m < 60) return plural(m, 'min');
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${plural(h, 'hr')} ${plural(rm, 'min')}` : plural(h, 'hr');
 };
 
 export default function CallMessageBubble({
@@ -35,6 +41,12 @@ export default function CallMessageBubble({
   const { startAudioCall, startVideoCall, callBusy } = useCall();
 
   const payload = msg?.payload || {};
+  // Row saved without its call details (older ingest dropped `callDetails`):
+  // backfill from the server once per chat — the bubble re-renders from SQLite.
+  const missingDetails = !payload.outcome;
+  useEffect(() => {
+    if (missingDetails && chatId) healCallDetails(String(chatId));
+  }, [missingDetails, chatId]);
   const media = payload.media === 'video' ? 'video' : 'audio';
   const outcome = payload.outcome || 'completed';
   // Direction is derived per-viewer from the row's participant ids against the
@@ -97,53 +109,40 @@ export default function CallMessageBubble({
   // Nothing to dial (a group bubble with no roster yet) → don't offer the tap.
   const canCallBack = !!onCallBackProp || !!peerObj?.id;
 
-  // Direction arrow: one shared convention with the calls list and the call
-  // detail screen (green ↗/↙ when the call connected, red ↗/↙ when it did not),
-  // so the same call never reads as two different states in two places.
-  const { icon: arrowName, color: arrowStateColor } = directionMeta(direction, outcome);
+  const { color: arrowStateColor } = directionMeta(direction, outcome);
 
-  let label;
+  // WhatsApp layout: title "Voice call" / "Video call", subtitle = duration
+  // ("55 secs") or the state ("No answer", "Tap to call back"), time bottom-right.
   const groupKind = isVideo ? 'Group video call' : 'Group voice call';
-  if (outcome === 'completed') label = isGroup ? groupKind : (isVideo ? 'Video call' : 'Voice call');
-  else if (outcome === 'rejected') label = isOutgoing ? 'Call declined' : 'Declined call';
-  else if (isMissed) label = `Missed ${kind} call`;
-  else if (outcome === 'cancelled') label = 'Cancelled call';
-  else if (outcome === 'missed') label = 'No answer';
-  else if (outcome === 'failed') label = 'Call not connected';
-  else label = isGroup ? groupKind : (isVideo ? 'Video call' : 'Voice call');
+  const title = isMissed
+    ? `Missed ${kind} call`
+    : (isGroup ? groupKind : (isVideo ? 'Video call' : 'Voice call'));
+  let subtitle;
+  if (connected) subtitle = fmtDuration(payload.durationSec) || (isOutgoing ? 'Outgoing' : 'Incoming');
+  else if (isMissed) subtitle = 'Tap to call back';
+  else if (outcome === 'rejected') subtitle = isOutgoing ? 'Declined' : 'You declined';
+  else if (outcome === 'failed') subtitle = 'Not connected';
+  else subtitle = 'No answer';
 
-  // WhatsApp bubble surfaces: sent = the user's chosen chat accent (white
-  // content), received = card surface (themed text). Mirrors the audio/text
-  // bubbles in ChatScreen so a custom Appearance accent applies here too —
-  // when no custom accent is set, fall back to WhatsApp's outgoing green.
-  // Received side reads the SAME token as every other incoming bubble
-  // (theme.colors.bubbleReceived). It used to be cardBackground / '#ffffff',
-  // which quietly drifted: once the received bubble was darkened for the
-  // true-black chat ground, a call log sat in the thread as a paler slab than
-  // the messages around it.
+  // Bubble surfaces match the text bubbles: sent = the user's chat accent
+  // (white content), received = theme.colors.bubbleReceived.
   const bubbleColor = isOutgoing
     ? ((chatColor && chatColor !== '#03b0a2') ? chatColor : '#03574f')
     : theme.colors.bubbleReceived;
   const onBubble = isOutgoing ? '#ffffff' : theme.colors.primaryTextColor;
-  const onBubbleSoft = isOutgoing ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;
-  const labelColor = isMissed ? theme.colors.danger : onBubble;
-  // The state color reads on the received surface as-is; on the outgoing bubble
-  // it sits on dark green, so connected keeps the bubble's own white and the
-  // unanswered red is lifted to stay legible.
-  const arrowColor = isOutgoing
-    ? (connected ? 'rgba(255,255,255,0.9)' : CALL_RED_ON_ACCENT)
-    : arrowStateColor;
+  const onBubbleSoft = isOutgoing ? 'rgba(255,255,255,0.72)' : theme.colors.placeHolderTextColor;
 
-  // Round icon chip — tinted to the call state, like WhatsApp's call-log glyph:
-  // themed for a connected call, red for one that never went through.
-  const chipStateColor = isOutgoing
-    ? '#ffffff'
-    : (connected ? theme.colors.themeColor : arrowStateColor);
-  const chipBg = isOutgoing ? 'rgba(255,255,255,0.18)' : (chipStateColor + '1F');
-  const chipColor = chipStateColor;
-
-  const durationText = outcome === 'completed' ? fmtDuration(payload.durationSec) : '';
-  const metaText = [timeText, durationText].filter(Boolean).join('  ·  ');
+  // Round chip with a directional phone glyph (↗ outgoing, ↙ incoming, missed
+  // = red). Video keeps the camera glyph — there is no directional variant.
+  const iconName = isVideo
+    ? 'video'
+    : (isMissed ? 'phone-missed' : (isOutgoing ? 'phone-outgoing' : 'phone-incoming'));
+  const iconColor = isMissed
+    ? arrowStateColor
+    : (isOutgoing ? '#ffffff' : onBubble);
+  const chipBg = isOutgoing
+    ? 'rgba(0,0,0,0.18)'
+    : (isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)');
 
   return (
     <View style={[styles.row, { justifyContent: isOutgoing ? 'flex-end' : 'flex-start' }]}>
@@ -163,21 +162,24 @@ export default function CallMessageBubble({
           },
         ]}
       >
-        <View style={[styles.chip, { backgroundColor: chipBg }]}>
-          <Ionicons name={isVideo ? 'videocam' : 'call'} size={18} color={chipColor} />
-        </View>
-
-        <View style={styles.textWrap}>
-          <Text style={[styles.label, { color: labelColor }]} numberOfLines={1}>
-            {label}
-          </Text>
-          <View style={styles.metaRow}>
-            <MaterialIcons name={arrowName} size={14} color={arrowColor} style={styles.metaArrow} />
-            <Text style={[styles.meta, { color: onBubbleSoft }]} numberOfLines={1}>
-              {metaText}
+        <View style={styles.body}>
+          <View style={[styles.chip, { backgroundColor: chipBg }]}>
+            <MaterialCommunityIcons name={iconName} size={17} color={iconColor} />
+          </View>
+          <View style={styles.textWrap}>
+            <Text style={[styles.label, { color: onBubble }]} numberOfLines={1}>
+              {title}
+            </Text>
+            <Text style={[styles.sub, { color: onBubbleSoft }]} numberOfLines={1}>
+              {subtitle}
             </Text>
           </View>
         </View>
+        {!!timeText && (
+          <Text style={[styles.time, { color: onBubbleSoft }]} numberOfLines={1}>
+            {timeText}
+          </Text>
+        )}
       </TouchableOpacity>
     </View>
   );
@@ -187,16 +189,16 @@ const styles = StyleSheet.create({
   row: {
     flexDirection: 'row',
     width: '100%',
-    paddingVertical: 3,
+    paddingVertical: 2,
   },
   bubble: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 9,
-    paddingHorizontal: 11,
-    borderRadius: 14,
+    paddingTop: 7,
+    paddingBottom: 4,
+    paddingLeft: 7,
+    paddingRight: 9,
+    borderRadius: 8,
     maxWidth: '78%',
-    minWidth: 168,
+    minWidth: 172,
     ...Platform.select({
       ios: {
         shadowColor: '#000',
@@ -208,8 +210,9 @@ const styles = StyleSheet.create({
     }),
   },
   // WhatsApp asymmetric "tail" corner.
-  bubbleOut: { borderTopRightRadius: 4 },
-  bubbleIn: { borderTopLeftRadius: 4 },
+  bubbleOut: { borderTopRightRadius: 3 },
+  bubbleIn: { borderTopLeftRadius: 3 },
+  body: { flexDirection: 'row', alignItems: 'center', paddingRight: 18 },
   chip: {
     width: 34,
     height: 34,
@@ -218,9 +221,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginRight: 10,
   },
-  textWrap: { flex: 1 },
+  textWrap: { flexShrink: 1 },
   label: { fontFamily: 'Roboto-Medium', fontSize: 14.5 },
-  metaRow: { flexDirection: 'row', alignItems: 'center', marginTop: 2 },
-  metaArrow: { marginRight: 4 },
-  meta: { fontFamily: 'Roboto-Regular', fontSize: 11.5 },
+  sub: { fontFamily: 'Roboto-Regular', fontSize: 12.5, marginTop: 1 },
+  time: {
+    alignSelf: 'flex-end',
+    fontFamily: 'Roboto-Regular',
+    fontSize: 11,
+    marginTop: 1,
+  },
 });

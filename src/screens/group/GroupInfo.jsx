@@ -22,28 +22,22 @@ import ReportBottomSheet from '../../components/ReportBottomSheet';
 import VerifiedBadge from '../../components/VerifiedBadge';
 import GroupMemberSheet from '../../components/GroupMemberSheet';
 import useDisplayName from '../../hooks/useDisplayName';
+import FadeScrim, { easedStops } from '../../components/FadeScrim';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
 
-// Smooth dark bottom gradient (14 stacked bands, quadratic easing)
-const GRADIENT_BANDS = 14;
+// Dark fade at the bottom of the hero (name legibility). One SVG gradient —
+// the 14 stacked <View> bands it used to be showed visible horizontal stripes.
 const GRADIENT_HEIGHT = 220;
+const BOTTOM_STOPS = easedStops((t) => Math.min(0.62, t * t * 0.7));
 function HeroGradient() {
-  const bandH = GRADIENT_HEIGHT / GRADIENT_BANDS;
   return (
-    <View pointerEvents="none" style={{ position: 'absolute', left: 0, right: 0, bottom: 0, justifyContent: 'flex-end' }}>
-      {Array.from({ length: GRADIENT_BANDS }).map((_, i) => {
-        const t = (i + 1) / GRADIENT_BANDS;
-        const alpha = Math.min(0.62, t * t * 0.7);
-        return (
-          <View
-            key={i}
-            style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }}
-          />
-        );
-      })}
-    </View>
+    <FadeScrim
+      height={GRADIENT_HEIGHT}
+      stops={BOTTOM_STOPS}
+      style={{ position: 'absolute', left: 0, right: 0, bottom: 0 }}
+    />
   );
 }
 

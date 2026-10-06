@@ -1,6 +1,6 @@
 import { useCallback, useState, useEffect, useRef } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Image, StyleSheet,
+  View, Text, FlatList, TouchableOpacity, StyleSheet,
   RefreshControl, Platform, Animated, Easing,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
@@ -13,6 +13,25 @@ import SegmentedRing from '../../components/SegmentedRing';
 import { STATUS_ACCENT } from './_statusDesign';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
+import { Image as ExpoImage } from 'expo-image';
+import { cachedImageSource } from '../../utils/imageSource';
+import PersonAvatar from '../../components/GroupSenderAvatar';
+
+// Status media are S3 presigned links re-signed on every /my and /feed fetch,
+// and this list refetches on every focus. RN <Image> drops the old bitmap the
+// moment the url string changes, so the thumbs blinked blank on each visit.
+// expo-image keyed on the stable object path paints from cache instead.
+function RemoteThumb({ uri, style }) {
+  return (
+    <ExpoImage
+      source={cachedImageSource(toSecureMediaUri(uri))}
+      style={style}
+      contentFit="cover"
+      cachePolicy="memory-disk"
+      transition={0}
+    />
+  );
+}
 
 const IS_IPAD = Platform.OS === 'ios' && Platform.isPad;
 
@@ -36,7 +55,7 @@ function StatusThumb({ status, style }) {
     || (statusType !== 'video' ? (firstItem?.mediaUrl || status.mediaUrl) : null) || null;
 
   if ((statusType === 'image' || statusType === 'video') && thumbUrl) {
-    return <Image source={{ uri: toSecureMediaUri(thumbUrl) }} style={[style, styles.thumbCover]} />;
+    return <RemoteThumb uri={thumbUrl} style={style} />;
   }
   if (statusType === 'text') {
     return (
@@ -49,7 +68,7 @@ function StatusThumb({ status, style }) {
   }
   if (statusType === 'link') {
     const ogImage = status.ogMetadata?.image;
-    if (ogImage) return <Image source={{ uri: toSecureMediaUri(ogImage) }} style={[style, styles.thumbCover]} />;
+    if (ogImage) return <RemoteThumb uri={ogImage} style={style} />;
     return (
       <View style={[style, styles.thumbLink]}>
         <Feather name="link" size={16} color="#cbd5e1" />
@@ -115,6 +134,10 @@ export default function StatusList({ navigation }) {
   const dispatch = useDispatch();
   const { myStatuses, contactStatuses, viewedStatusIds, broadcasts, isLoading } = useSelector(state => state.status);
   const { user } = useSelector(state => state.authentication);
+  // My own profile name/photo — the profile slice is what the You tab uses.
+  const { profileData } = useSelector(state => state.profile || {});
+  const myName  = profileData?.fullName || user?.fullName;
+  const myPhoto = profileData?.profileImageThumbnailUrl || profileData?.profileImage || user?.profileImage;
   const [refreshing, setRefreshing] = useState(false);
   const { resolveName, refresh: refreshContacts, peerPrivacyOf } = useContactDirectory();
 
@@ -205,13 +228,16 @@ export default function StatusList({ navigation }) {
             ) : (
               <>
                 {/* Empty state — profile photo with a + badge */}
-                {user?.profileImage ? (
-                  <Image source={{ uri: user.profileImage }} style={styles.rowAvatarImg} />
-                ) : (
-                  <View style={[styles.rowAvatarImg, styles.rowAvatarFallback, { backgroundColor: theme.colors.themeColor }]}>
-                    <Ionicons name="person" size={20} color="#fff" />
-                  </View>
-                )}
+                {/* Photo, else the first letter of my own profile name —
+                    same rule as the chat list avatars. */}
+                <PersonAvatar
+                  userId={user?._id || user?.id}
+                  uri={myPhoto ? toSecureMediaUri(myPhoto) : null}
+                  label={myName}
+                  senderName={myName}
+                  size={46}
+                  style={{ position: 'absolute' }}
+                />
                 <View style={[styles.rowAddDot, { backgroundColor: theme.colors.themeColor, borderColor: theme.colors.background }]}>
                   <Ionicons name="add" size={11} color="#fff" />
                 </View>
@@ -270,7 +296,7 @@ export default function StatusList({ navigation }) {
             {/* Avatar slot previews the latest update (WhatsApp pattern). The
                 official entry shows the brand logo when one is configured. */}
             {isOfficial && item.avatar ? (
-              <Image source={{ uri: toSecureMediaUri(item.avatar) }} style={styles.rowAvatarImg} />
+              <RemoteThumb uri={item.avatar} style={styles.rowAvatarImg} />
             ) : (
               <StatusThumb status={(item.statuses || [])[0]} style={styles.rowAvatarImg} />
             )}
@@ -480,7 +506,6 @@ const styles = StyleSheet.create({
   },
   rowAvatar:    { width: 56, height: 56, alignItems: 'center', justifyContent: 'center', position: 'relative' },
   rowAvatarImg: { width: 46, height: 46, borderRadius: 23, position: 'absolute', overflow: 'hidden' },
-  rowAvatarFallback: { alignItems: 'center', justifyContent: 'center' },
   nameRow:      { flexDirection: 'row', alignItems: 'center' },
   nameVerified: { marginLeft: 4 },
   rowAddDot: {
@@ -565,7 +590,6 @@ const styles = StyleSheet.create({
   },
 
   // ── Status thumbnail fallbacks ───────────────────────────────────────────
-  thumbCover:    { resizeMode: 'cover' },
   thumbNeutral:  { backgroundColor: '#2A3942' },
   thumbText:     { justifyContent: 'center', alignItems: 'center', padding: 3 },
   thumbTextBody: { color: '#fff', fontSize: 7, textAlign: 'center', lineHeight: 9 },

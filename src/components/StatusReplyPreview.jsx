@@ -2,13 +2,15 @@ import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
-  Image,
   TouchableOpacity,
   StyleSheet,
 } from 'react-native';
+import { Image } from 'expo-image';
 import { Ionicons } from '@expo/vector-icons';
 import { toSecureMediaUri } from '../utils/mediaService';
 import { statusServices } from '../Redux/Services/Status/Status.Services';
+import { cachedImageSource } from '../utils/imageSource';
+import { useLocalStatusThumb, saveStatusThumb } from '../services/statusThumbStore';
 
 // statusId → { mediaUrl, thumbnailUrl } | null. Messages persisted before the
 // backend stored preview keys have NULL preview URLs in SQLite forever — this
@@ -64,10 +66,17 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
   const [healed, setHealed] = useState(
     statusId ? (healedUrlCache.get(statusId) || null) : null
   );
+  // Durable on-device copy (services/statusThumbStore) — survives the 1h link
+  // expiry and the 24h status expiry, like WhatsApp's embedded thumbnail.
+  const localThumb = useLocalStatusThumb(statusId);
+  // The stored presigned link failed to load (expired) → heal once from the
+  // live status if it still exists, else fall back to the type icon.
+  const [storedFailed, setStoredFailed] = useState(false);
+  const [thumbFailed, setThumbFailed] = useState(false);
 
   useEffect(() => {
-    // Only media previews with NO stored URL need healing.
-    if (!statusId || storedThumb || (!isImage && !isVideo)) return;
+    // Media previews with NO stored URL, or whose stored URL expired.
+    if (!statusId || (storedThumb && !storedFailed) || (!isImage && !isVideo)) return;
     if (healedUrlCache.has(statusId)) {
       setHealed(healedUrlCache.get(statusId) || null);
       return;
@@ -93,11 +102,14 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
       }
     })();
     return () => { alive = false; };
-  }, [statusId, storedThumb, isImage, isVideo]);
+  }, [statusId, storedThumb, storedFailed, isImage, isVideo]);
 
   if (!statusRef || !statusPreview) return null;
 
-  const thumb = toSecureMediaUri(storedThumb || healed?.thumbnailUrl) || null;
+  const remoteThumb = toSecureMediaUri(
+    (storedFailed ? null : storedThumb) || healed?.thumbnailUrl,
+  ) || null;
+  const thumb = localThumb || remoteThumb;
 
   // Accent colour: green when the bubble is mine, light-teal otherwise.
   // chatColor is honoured if the user has customised the theme.
@@ -198,12 +210,25 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
 
       {/* Thumbnail */}
       <View style={styles.thumbWrap}>
-        {(isImage || isVideo) && thumb ? (
+        {(isImage || isVideo) && thumb && !thumbFailed ? (
           <>
             <Image
-              source={{ uri: thumb }}
+              source={localThumb ? { uri: localThumb } : cachedImageSource(remoteThumb)}
               style={styles.thumbImage}
-              resizeMode="cover"
+              contentFit="cover"
+              cachePolicy="memory-disk"
+              onLoad={() => {
+                // First successful paint → keep a copy for after expiry.
+                if (!localThumb && remoteThumb && statusId) saveStatusThumb(statusId, remoteThumb);
+              }}
+              onError={() => {
+                if (localThumb) return;
+                if (remoteThumb && remoteThumb === toSecureMediaUri(storedThumb) && !storedFailed) {
+                  setStoredFailed(true); // try a healed (fresh) link next
+                } else {
+                  setThumbFailed(true);
+                }
+              }}
             />
             {isVideo && (
               <View style={styles.playBadge}>
@@ -211,6 +236,12 @@ const StatusReplyPreview = React.memo(function StatusReplyPreview({
               </View>
             )}
           </>
+        ) : (isImage || isVideo) ? (
+          // Media whose picture is gone (link + status expired, never cached):
+          // a type glyph instead of an empty gray box.
+          <View style={[styles.textSwatch, { backgroundColor: isDark ? '#2a3942' : '#c9d3d8' }]}>
+            <Ionicons name={isVideo ? 'videocam' : 'image'} size={20} color="#fff" />
+          </View>
         ) : (
           // Text / link status — render a coloured swatch with the first
           // letter of the caption, mirroring WhatsApp's text-status card.

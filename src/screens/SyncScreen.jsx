@@ -100,6 +100,7 @@ const _normalizeMessage = (msg, chat, chatId) => {
     isForwarded: Boolean(msg.isForwarded || msg.forwardedFrom),
     forwardedFrom: msg.forwardedFrom || null,
     systemEvent: (msg.systemEvent && typeof msg.systemEvent === 'object') ? msg.systemEvent : null,
+    callDetails: msg.callDetails || null,
     mentions: normalizeMentions(msg),
     replyToMessageId: msg.replyToMessageId || (typeof msg.replyTo === 'string' ? msg.replyTo : msg.replyTo?._id) || null,
     replyPreviewText: msg.replyPreviewText || msg.replyTo?.text || null,

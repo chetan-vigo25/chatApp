@@ -7,6 +7,8 @@
   <android.arch.persistence/>
   <android.arch.persistence.room/>
   <android.arch.work/>
+  <androidx.a2ui/>
+  <androidx.a2ui.compose/>
   <androidx.activity/>
   <androidx.ads/>
   <androidx.annotation/>
@@ -40,6 +42,7 @@
   <androidx.compose.material3/>
   <androidx.compose.material3.adaptive/>
   <androidx.compose.remote/>
+  <androidx.compose.remote.foundation/>
   <androidx.compose.runtime/>
   <androidx.compose.ui/>
   <androidx.concurrent/>
@@ -68,6 +71,7 @@
   <androidx.games/>
   <androidx.gaming/>
   <androidx.glance/>
+  <androidx.glance.adaptive/>
   <androidx.glance.wear/>
   <androidx.gradle/>
   <androidx.graphics/>
@@ -128,6 +132,7 @@
   <androidx.startup/>
   <androidx.swiperefreshlayout/>
   <androidx.test/>
+  <androidx.test.backup/>
   <androidx.test.espresso/>
   <androidx.test.espresso.idling/>
   <androidx.test.ext/>
@@ -215,6 +220,7 @@
   <com.android.tools.androidtest/>
   <com.android.tools.apkdeployer/>
   <com.android.tools.apkparser/>
+  <com.android.tools.backup/>
   <com.android.tools.build/>
   <com.android.tools.build.jetifier/>
   <com.android.tools.chunkio/>

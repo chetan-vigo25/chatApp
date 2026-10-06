@@ -87,3 +87,36 @@ export const appendCallEntry = async ({
     // best-effort; the backend CallLog is the durable record
   }
 };
+
+// chatId → in-flight/done heal. Once per chat per session.
+const healedChats = new Map();
+
+/**
+ * Backfill call rows that were saved without their details (no duration /
+ * outcome — the global ingest paths used to drop the wire `callDetails`). One
+ * REST page per chat per session; only rows still missing an outcome are
+ * patched, then the open thread reloads from SQLite.
+ */
+export const healCallDetails = (chatId) => {
+  if (!chatId || healedChats.has(chatId)) return healedChats.get(chatId) || null;
+  const job = (async () => {
+    try {
+      const { chatServices } = require('../../Redux/Services/Chat/Chat.Services');
+      const resp = await chatServices.chatMessageList({ chatId, page: 1, limit: 100 });
+      const docs = resp?.data?.docs || [];
+      let any = false;
+      for (const m of docs) {
+        if ((m?.messageType || m?.type) !== 'call' || !m?.callDetails) continue;
+        const ok = await ChatDatabase.patchCallDetails(
+          [m.messageId, m._id, m.clientMessageId], m.callDetails,
+        );
+        any = any || ok;
+      }
+      if (any) DeviceEventEmitter.emit('call:thread:update', { chatId });
+    } catch (_) {
+      healedChats.delete(chatId); // retry on a later render
+    }
+  })();
+  healedChats.set(chatId, job);
+  return job;
+};

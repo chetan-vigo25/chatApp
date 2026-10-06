@@ -31,53 +31,27 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getCommonGroups } from "../../Redux/Services/Group/Group.Services";
 import useDisplayName from "../../hooks/useDisplayName";
 import { getPeerProfileName } from "../../services/peerProfileNameStore";
+import FadeScrim, { easedStops } from "../../components/FadeScrim";
 import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
 
 const { width } = Dimensions.get('window');
 const HERO_HEIGHT = Math.min(width, 430);
 
-// Smooth dark bottom gradient over the hero photo (stacked bands → no
-// LinearGradient dependency; renders identically on Android + iOS).
-// Use MANY ~1px bands so the fake gradient reads as smooth. A low band count
-// (e.g. 14 → ~14px steps) shows visible horizontal STRIPS on the photo; at ~1px
-// per band the alpha delta between neighbours is imperceptible. Still JS-only —
-// no expo-linear-gradient native dependency / rebuild needed.
-const GRADIENT_BANDS = 200;
+// Dark fade at the bottom of the hero photo (name legibility) and a short one
+// at the top (back button legibility). One SVG gradient each — the stacked 1dp
+// <View> bands these used to be showed horizontal lines on Android.
 const GRADIENT_HEIGHT = 200;
+const BOTTOM_STOPS = easedStops((t) => Math.min(0.7, t * t * 0.8));
+const TOP_STOPS = [
+  { offset: 0, opacity: 0.5 },
+  // the fade's first stop (t=0) is the 0.5 at offset 0.1 — the hard edge.
+  ...easedStops((t) => 0.5 * (1 - t), 8).map((s) => ({ offset: 0.1 + s.offset * 0.9, opacity: s.opacity })),
+];
 function HeroGradient() {
-  const bandH = GRADIENT_HEIGHT / GRADIENT_BANDS;
-  return (
-    <View pointerEvents="none" style={styles.heroGradientWrap}>
-      {Array.from({ length: GRADIENT_BANDS }).map((_, i) => {
-        const t = (i + 1) / GRADIENT_BANDS;
-        const alpha = Math.min(0.7, t * t * 0.8);
-        return <View key={i} style={{ height: bandH, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
-      })}
-    </View>
-  );
+  return <FadeScrim height={GRADIENT_HEIGHT} stops={BOTTOM_STOPS} style={styles.heroGradientWrap} />;
 }
-
-// Dark scrim at the TOP of the hero so the back button stays readable over a
-// bright photo.
-//
-// This used to also darken the strip behind the status-bar icons, sized to the
-// notch inset. That is no longer its job: the app-wide <SafeAreaView> in
-// RootNavigator means the hero never reaches under the status bar, so a band
-// that tall just put an unexplained dark stripe across the top of the photo.
-// `topInset` therefore defaults to 0 and only the short fade is kept.
-function HeroTopScrim({ topInset = 0 }) {
-  return (
-    <View pointerEvents="none" style={styles.heroTopScrimWrap}>
-      <View style={{ height: topInset + 6, backgroundColor: 'rgba(0,0,0,0.5)' }} />
-      {/* Short fade-out below it so the band blends into the photo. Many thin
-          bands (54px split into ~1px steps) so the fade is smooth — not striped. */}
-      {Array.from({ length: 54 }).map((_, i) => {
-        const t = (i + 1) / 54;
-        const alpha = 0.5 * (1 - t);
-        return <View key={i} style={{ height: 1, backgroundColor: `rgba(0,0,0,${alpha.toFixed(3)})` }} />;
-      })}
-    </View>
-  );
+function HeroTopScrim() {
+  return <FadeScrim height={60} stops={TOP_STOPS} style={styles.heroTopScrimWrap} />;
 }
 
 // Last server profile per peer, for the life of the app. Reopening a profile
@@ -651,8 +625,12 @@ export default function UserB({ navigation, route }) {
               )}
             </View>
           )}
-          <HeroGradient />
-          <HeroTopScrim />
+          {/* The banded scrims only earn their place over a photo (name and
+              back button legibility). Over the flat letter colour they drew
+              visible horizontal lines — 1dp bands round unevenly to device
+              pixels — so the letter hero stays a clean solid colour. */}
+          {imageSource ? <HeroGradient /> : null}
+          {imageSource ? <HeroTopScrim /> : null}
           <View style={styles.heroOverlay}>
             <View style={styles.heroNameRow}>
               <Text style={styles.heroName} numberOfLines={1}>{displayName}</Text>

@@ -1431,6 +1431,23 @@ const _runUpsertBatch = async (db, messages) => {
   }
 };
 
+// Call-log render fields from a payload and/or wire `callDetails`, or null when
+// neither carries an outcome (a payload holding only statusPreview etc.).
+const pickCallFields = (payload, callDetails) => {
+  const p = (payload && typeof payload === 'object') ? payload : {};
+  const cd = (callDetails && typeof callDetails === 'object') ? callDetails : {};
+  const outcome = p.outcome || cd.outcome || null;
+  if (!outcome) return null;
+  const callId = p.callId || cd.callId || null;
+  return {
+    kind: 'call',
+    ...(callId ? { callId: String(callId) } : {}),
+    media: (p.media || cd.media) === 'video' ? 'video' : 'audio',
+    outcome,
+    durationSec: Math.max(0, Number(p.durationSec ?? cd.durationSec) || 0),
+  };
+};
+
 /**
  * Actually run the INSERT SQL. Uses reply columns if available, falls back to base.
  */
@@ -1475,10 +1492,19 @@ const _runInsert = async (db, msg, _retried = false) => {
   let existingStatusInPayload = null;
   let existingViewOnceInPayload = null;
   let existingMentionsInPayload = null;
+  let existingCallInPayload = null;
   const incomingMentions = Array.isArray(msg.mentions) && msg.mentions.length
     ? msg.mentions
     : (Array.isArray(msg.payload?.mentions) && msg.payload.mentions.length ? msg.payload.mentions : null);
-  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview || !msg.viewOnce || !incomingMentions) {
+  // Call log details. The wire carries them as top-level `callDetails` (REST /
+  // sync / socket) and the local optimistic row as `payload.*`; CallMessageBubble
+  // reads only the payload. The global ingest paths never passed either, so a
+  // call that landed with the thread closed was saved with no duration/outcome
+  // and the bubble showed a bare time (iOS, whenever the call ended off-screen).
+  const isCallRow = (msg.type || msg.messageType) === 'call';
+  const incomingCall = isCallRow ? pickCallFields(msg.payload, msg.callDetails) : null;
+  if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview || !msg.viewOnce || !incomingMentions
+    || (isCallRow && !incomingCall)) {
     try {
       const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id LIMIT 1`, { $id: id });
       if (ex?.payload) {
@@ -1487,6 +1513,7 @@ const _runInsert = async (db, msg, _retried = false) => {
         if (ep?.statusRef || ep?.statusPreview) existingStatusInPayload = ep;
         if (ep?.isViewOnce || ep?.viewOnce) existingViewOnceInPayload = ep;
         if (Array.isArray(ep?.mentions) && ep.mentions.length) existingMentionsInPayload = ep.mentions;
+        if (isCallRow) existingCallInPayload = pickCallFields(ep, null);
       }
     } catch {}
   }
@@ -1570,6 +1597,12 @@ const _runInsert = async (db, msg, _retried = false) => {
       : (existingViewOnceInPayload?.viewOnce
           ? { viewOnce: existingViewOnceInPayload.viewOnce }
           : {})),
+    // Call log — incoming details win, else carry forward (a tick upsert must
+    // not strip the duration off the bubble).
+    ...(incomingCall || existingCallInPayload || {}),
+    ...((incomingCall && existingCallInPayload && !incomingCall.durationSec
+      && existingCallInPayload.durationSec && incomingCall.outcome === existingCallInPayload.outcome)
+      ? { durationSec: existingCallInPayload.durationSec } : {}),
   };
 
   const baseParams = {
@@ -2557,6 +2590,33 @@ const getLatestSenderName = async (senderId) => {
     { $s: String(senderId) },
   );
   return r?.sender_name || null;
+};
+
+// Heal a call row saved without its details (older ingest paths dropped
+// `callDetails`). Matches the local row by any of its ids; merges into the
+// payload only when the row has no outcome yet. Returns true when patched.
+const patchCallDetails = async (ids, callDetails) => {
+  const fields = pickCallFields(null, callDetails);
+  const keys = (ids || []).filter(Boolean).map(String);
+  if (!fields || !keys.length) return false;
+  const db = await getDB();
+  const ph = keys.map((_, i) => `$k${i}`).join(',');
+  const params = Object.fromEntries(keys.map((k, i) => [`$k${i}`, k]));
+  const rows = await db.getAllAsync(
+    `SELECT id, payload FROM messages WHERE type = 'call' AND (id IN (${ph}) OR server_message_id IN (${ph}) OR client_message_id IN (${ph}))`,
+    params,
+  );
+  let patched = false;
+  for (const r of rows) {
+    let p = {};
+    try { p = r.payload ? JSON.parse(r.payload) : {}; } catch { p = {}; }
+    if (p?.outcome) continue;
+    await db.runAsync(`UPDATE messages SET payload = $p WHERE id = $id`, {
+      $p: JSON.stringify({ ...p, ...fields }), $id: r.id,
+    });
+    patched = true;
+  }
+  return patched;
 };
 
 const getLatestMessage = async (chatId) => {
@@ -3970,7 +4030,7 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSenderName, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSenderName, patchCallDetails, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
   updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,

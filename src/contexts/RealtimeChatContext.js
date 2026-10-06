@@ -3386,6 +3386,11 @@ export function RealtimeChatProvider({ children }) {
           // payload JSON so the thread can re-render "X added Y" with names
           // resolved locally after a reload.
           systemEvent: (source?.systemEvent && typeof source.systemEvent === 'object') ? source.systemEvent : null,
+          // Call log details (duration/outcome) — see ChatDatabase pickCallFields.
+          // A call that ends with the thread closed lands HERE; without this the
+          // bubble showed no duration.
+          callDetails: source?.callDetails
+            || ((source?.messageType || source?.type) === 'call' ? source?.payload : null) || null,
           // @mentions. THIS is the path a mention normally arrives on — the
           // chat screen's own ingest only runs while that screen is mounted,
           // so a group mention received with the thread closed came through
@@ -4674,6 +4679,9 @@ export function RealtimeChatProvider({ children }) {
           // account-name text the server had to bake in. Also rides the payload
           // JSON, so it survives the SQLite round-trip.
           systemEvent: (data?.systemEvent && typeof data.systemEvent === 'object') ? data.systemEvent : null,
+          // Group call log details (duration/outcome).
+          callDetails: data?.callDetails
+            || ((data?.messageType || data?.type) === 'call' ? data?.payload : null) || null,
           // @mentions — a group thread is where they actually get used, and
           // this is the write that lands when the thread is not open. Without
           // it the row reloads as flat text and the highlight the sender saw

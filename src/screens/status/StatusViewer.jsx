@@ -35,8 +35,13 @@ import {
 import { getSocket } from '../../Redux/Services/Socket/socket';
 import useContactDirectory from '../../hooks/useContactDirectory';
 import { toSecureMediaUri } from '../../utils/mediaService';
+import { Image as ExpoImage } from 'expo-image';
+import { cachedImageSource } from '../../utils/imageSource';
 import { profileDetail } from '../../Redux/Reducer/Profile/Profile.reducer';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
+// Same avatar rule as the chat list: photo, else the first letter of the
+// person's OWN profile name (never the @username / saved label).
+import PersonAvatar from '../../components/GroupSenderAvatar';
 import { useTheme } from '../../contexts/ThemeContext';
 
 const { width: SW, height: SH } = Dimensions.get('window');
@@ -83,38 +88,6 @@ function FloatingHeart({ delay, x, onDone }) {
     </Animated.View>
   );
 }
-
-// ── Fallback avatar — NEVER the app logo ──────────────────────────────────────
-// No profile image → teal circle with the person's initial; if the display
-// name isn't alphabetic (phone number, empty), a neutral person glyph instead.
-
-function FallbackAvatar({ name, style }) {
-  const trimmed = String(name || '').trim();
-  const letter  = /^[a-z]/i.test(trimmed) ? trimmed.charAt(0).toUpperCase() : null;
-  return (
-    <View style={[style, fallbackAvatarStyles.circle]}>
-      {letter ? (
-        <Text style={fallbackAvatarStyles.letter}>{letter}</Text>
-      ) : (
-        <Ionicons name="person" size={16} color="rgba(255,255,255,0.9)" />
-      )}
-    </View>
-  );
-}
-
-const fallbackAvatarStyles = StyleSheet.create({
-  circle: {
-    backgroundColor: '#03b0a2',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  letter: {
-    color: '#fff',
-    fontSize: 15,
-    fontFamily: 'Roboto-SemiBold',
-    fontWeight: '600',
-  },
-});
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
@@ -229,6 +202,10 @@ export default function StatusViewer({ navigation, route }) {
   // WhatsApp-style: hold the progress bar until the slide's media has actually
   // loaded, and show a blurred placeholder until then. Reset for every slide.
   const [mediaLoaded, setMediaLoaded]     = useState(false);
+  // The spinner only appears if the media is genuinely slow. A re-opened
+  // status paints from the expo-image cache within a frame or two, and showing
+  // the spinner for that blink made seen statuses look like they reloaded.
+  const [showSpinner, setShowSpinner]     = useState(false);
 
   const progressAnim = useRef(new Animated.Value(0)).current;
   const animRef      = useRef(null);
@@ -282,9 +259,16 @@ export default function StatusViewer({ navigation, route }) {
   // playback position on every status update (buffering/seeks stay honest).
   const videoSyncRef = useRef({ active: false, startedAt: 0, fromPos: 0, durMs: 0 });
 
+  useEffect(() => {
+    if (mediaLoaded) { setShowSpinner(false); return undefined; }
+    const t = setTimeout(() => setShowSpinner(true), 350);
+    return () => clearTimeout(t);
+  }, [mediaLoaded, currentIndex]);
+
   // Every slide starts "not loaded" so the bar waits for its own media.
   useEffect(() => {
     setMediaLoaded(false);
+    setShowSpinner(false);
     setVideoFailed(false);
     animRef.current?.stop();
     progressAnim.setValue(0);
@@ -781,26 +765,35 @@ export default function StatusViewer({ navigation, route }) {
           );
         }
         return (
-          <View style={styles.mediaContent}>
+          <View style={styles.mediaFill}>
             {/* Blurred low-res placeholder (WhatsApp blur-up) — visible until the
                 full-resolution image finishes loading, then it clears sharp. */}
             {!mediaLoaded && thumbUrl ? (
-              <Image
-                source={{ uri: thumbUrl }}
+              <ExpoImage
+                source={cachedImageSource(thumbUrl)}
                 style={StyleSheet.absoluteFill}
-                resizeMode="contain"
+                contentFit="cover"
+                cachePolicy="memory-disk"
                 blurRadius={18}
+                transition={0}
               />
             ) : null}
-            <Image
-              source={{ uri: mediaUrl }}
-              style={styles.mediaContent}
-              resizeMode="contain"
+            {/* WhatsApp-style: media fills the whole screen edge-to-edge with
+                `cover` — no black letterbox bars on the sides/top/bottom.
+                expo-image keyed on the object path: status urls are presigned
+                and re-signed on every fetch, so RN <Image> re-downloaded a
+                status the user had already seen (spinner + bar stuck at 0). */}
+            <ExpoImage
+              source={cachedImageSource(mediaUrl)}
+              style={StyleSheet.absoluteFill}
+              contentFit="cover"
+              cachePolicy="memory-disk"
+              transition={0}
               onLoad={() => setMediaLoaded(true)}
               // Never hang the progress bar forever on a broken URL.
               onError={() => setMediaLoaded(true)}
             />
-            {!mediaLoaded ? (
+            {showSpinner && !mediaLoaded ? (
               <View
                 style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}
                 pointerEvents="none"
@@ -819,9 +812,9 @@ export default function StatusViewer({ navigation, route }) {
         // <Video> — it errors instantly and the slide got skipped.
         if (!videoUrl || videoFailed) {
           return (
-            <View style={styles.mediaContent}>
+            <View style={styles.mediaFill}>
               {thumbUrl ? (
-                <Image source={{ uri: thumbUrl }} style={StyleSheet.absoluteFill} resizeMode="contain" />
+                <ExpoImage source={cachedImageSource(thumbUrl)} style={StyleSheet.absoluteFill} contentFit="cover" cachePolicy="memory-disk" />
               ) : null}
               <View
                 style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}
@@ -833,21 +826,25 @@ export default function StatusViewer({ navigation, route }) {
           );
         }
         return (
-          <View style={styles.mediaContent}>
+          <View style={styles.mediaFill}>
             {/* Poster blur-up while the video buffers — same as images. */}
             {!mediaLoaded && thumbUrl ? (
-              <Image
-                source={{ uri: thumbUrl }}
+              <ExpoImage
+                source={cachedImageSource(thumbUrl)}
                 style={StyleSheet.absoluteFill}
-                resizeMode="contain"
+                contentFit="cover"
+                cachePolicy="memory-disk"
                 blurRadius={18}
+                transition={0}
               />
             ) : null}
+            {/* WhatsApp-style: video fills the whole screen edge-to-edge with
+                `cover` — no black letterbox bars on the sides/top/bottom. */}
             <Video
               ref={videoRef}
               source={{ uri: videoUrl }}
-              style={styles.mediaContent}
-              resizeMode={ResizeMode.CONTAIN}
+              style={StyleSheet.absoluteFill}
+              resizeMode={ResizeMode.COVER}
               shouldPlay={!paused}
               isLooping={false}
               isMuted={isMuted}
@@ -856,7 +853,7 @@ export default function StatusViewer({ navigation, route }) {
               onError={() => { setVideoFailed(true); setMediaLoaded(true); }}
               useNativeControls={false}
             />
-            {!mediaLoaded ? (
+            {showSpinner && !mediaLoaded ? (
               <View
                 style={[StyleSheet.absoluteFill, { alignItems: 'center', justifyContent: 'center' }]}
                 pointerEvents="none"
@@ -933,8 +930,9 @@ export default function StatusViewer({ navigation, route }) {
   return (
     <View style={[styles.root, { paddingTop: insets.top, backgroundColor: statusBarTint }]}>
 
-      {/* Content */}
-      {renderContent()}
+      {/* Content — wrapped so the absolute-fill media sits BELOW the system
+          bar strip (absolute children ignore the root's paddingTop). */}
+      <View style={styles.contentArea}>{renderContent()}</View>
 
       {/* Caption */}
       {currentStatus.caption && (
@@ -991,7 +989,7 @@ export default function StatusViewer({ navigation, route }) {
       })()}
 
       {/* Progress bars */}
-      <View style={[styles.progressContainer, { top: insets.top + 8 }]}>
+      <View style={[styles.progressContainer, { top: insets.top + 6 }]}>
         {statuses.map((_, i) => (
           <View key={i} style={styles.progressTrack}>
             <Animated.View style={[styles.progressFill, {
@@ -1006,7 +1004,7 @@ export default function StatusViewer({ navigation, route }) {
       </View>
 
       {/* Header */}
-      <View style={[styles.header, { top: insets.top + 18 }]}>
+      <View style={[styles.header, { top: insets.top + 16 }]}>
         <TouchableOpacity onPress={() => safeGoBack()} style={styles.backBtn}>
           <Ionicons name="arrow-back" size={24} color="#fff" />
         </TouchableOpacity>
@@ -1031,11 +1029,16 @@ export default function StatusViewer({ navigation, route }) {
             }
           }}
         >
-          {displayImage ? (
-            <Image source={{ uri: displayImage }} style={styles.headerAvatar} />
-          ) : (
-            <FallbackAvatar name={displayName} style={styles.headerAvatar} />
-          )}
+          <PersonAvatar
+            userId={isMine ? (user?._id || user?.id) : userId}
+            uri={displayImage}
+            label={displayName}
+            // My own name lives in the profile slice (same as the You tab);
+            // the auth slice's user.fullName is often empty → "M" of "My Status".
+            senderName={isMine ? (profileData?.fullName || user?.fullName) : null}
+            size={38}
+            style={{ marginRight: 10 }}
+          />
           <View style={styles.headerText}>
             <View style={styles.headerNameRow}>
               <Text style={styles.headerName}>{displayName}</Text>
@@ -1233,11 +1236,13 @@ export default function StatusViewer({ navigation, route }) {
                           onPress={openProfile}
                           accessibilityLabel={`Open ${displayName}'s profile`}
                         >
-                          {viewer?.profileImage ? (
-                            <Image source={{ uri: viewer.profileImage }} style={styles.viewerAvatar} />
-                          ) : (
-                            <FallbackAvatar name={displayName} style={styles.viewerAvatar} />
-                          )}
+                          <PersonAvatar
+                            userId={viewerIdStr}
+                            uri={viewer?.profileImage || null}
+                            label={displayName}
+                            senderName={serverName}
+                            size={42}
+                          />
                           <View style={{ flex: 1 }}>
                             <Text style={styles.viewerName}>{displayName}</Text>
                             <Text style={styles.viewerTime}>{timeAgo(item.viewedAt)}</Text>
@@ -1283,11 +1288,13 @@ export default function StatusViewer({ navigation, route }) {
                       onPress={openProfile}
                       accessibilityLabel={`Open ${displayName}'s profile`}
                     >
-                      {item.avatar ? (
-                        <Image source={{ uri: item.avatar }} style={styles.viewerAvatar} />
-                      ) : (
-                        <FallbackAvatar name={displayName} style={styles.viewerAvatar} />
-                      )}
+                      <PersonAvatar
+                        userId={likerIdStr}
+                        uri={item.avatar || null}
+                        label={displayName}
+                        senderName={item.name}
+                        size={42}
+                      />
                       <View style={{ flex: 1 }}>
                         <Text style={styles.viewerName}>{displayName}</Text>
                         <Text style={styles.viewerTime}>{timeAgo(item.likedAt)}</Text>
@@ -1412,7 +1419,13 @@ const styles = StyleSheet.create({
   textContent: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 30 },
   textBody:    { fontSize: 24, color: '#fff', textAlign: 'center', fontFamily: 'Roboto-Medium', lineHeight: 34 },
   audioLabel:  { color: '#fff', marginTop: 12, fontSize: 16 },
+  // Kept for legacy references (e.g. link type if extended later).
   mediaContent:{ flex: 1, width: SW },
+  // WhatsApp-style full-bleed media container. Absolutely fills the screen so
+  // the image/video touches every edge (no side gaps, no letterbox bars).
+  // All overlays (progress, header, caption, bars) render on top as siblings.
+  mediaFill:   { ...StyleSheet.absoluteFillObject },
+  contentArea: { flex: 1 },
 
   captionOverlay: { position: 'absolute', bottom: 80, left: 0, right: 0, backgroundColor: 'rgba(0,0,0,0.55)', padding: 12 },
   captionText:    { color: '#fff', fontSize: 15, textAlign: 'center' },
@@ -1423,18 +1436,17 @@ const styles = StyleSheet.create({
   rightZone:  { flex: 1 },
 
   // ── Progress bars — WhatsApp top edge ────────────────────────────────────
-  progressContainer: { position: 'absolute', top: 46, left: 8, right: 8, flexDirection: 'row', gap: 3 },
+  progressContainer: { position: 'absolute', top: 6, left: 8, right: 8, flexDirection: 'row', gap: 3 },
   progressTrack:     { flex: 1, height: 2.5, backgroundColor: 'rgba(255,255,255,0.35)', borderRadius: 2, overflow: 'hidden' },
   progressFill:      { height: '100%', backgroundColor: '#fff', borderRadius: 2 },
 
   // ── Header — WhatsApp style: compact, transparent, text-shadow for legibility ──
   header: {
-    position: 'absolute', top: 56, left: 0, right: 0,
+    position: 'absolute', top: 16, left: 0, right: 0,
     flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12,
   },
   backBtn:       { padding: 4, marginRight: 6 },
   headerProfile: { flex: 1, flexDirection: 'row', alignItems: 'center' },
-  headerAvatar:  { width: 38, height: 38, borderRadius: 19, marginRight: 10 },
   headerText:    { flex: 1 },
   headerNameRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   headerVerified: { marginLeft: 1 },
@@ -1548,7 +1560,6 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: 'rgba(255,255,255,0.06)',
   },
-  viewerAvatar: { width: 42, height: 42, borderRadius: 21 },
   viewerName:   {
     color: '#fff', fontSize: 15, fontWeight: '500', marginBottom: 2,
     fontFamily: Platform.select({ ios: 'Georgia', android: 'serif', default: 'serif' }),

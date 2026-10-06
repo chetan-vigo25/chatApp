@@ -16,6 +16,9 @@ import ChatDatabase from '../../services/ChatDatabase';
 import OutboxWorker from '../../services/OutboxWorker';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 import AppSearchBar from '../../components/AppSearchBar';
+// 1-1 avatar = same rule as the chat list: photo, else the first letter of the
+// peer's OWN profile name (never their @username or a "+" from the number).
+import PersonAvatar from '../../components/GroupSenderAvatar';
 
 // Same display rule as every other surface: my saved name → the peer's number
 // → their own account name only when no number is known.
@@ -101,6 +104,22 @@ const getAvatarColor = (name) => {
   for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 };
+
+// Group photo with a fallback to the people glyph when the url is dead — a
+// failed load used to leave a blank coloured circle.
+function GroupAvatar({ uri, bg }) {
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setFailed(false); }, [uri]);
+  return (
+    <View style={[styles.avatarWrap, { backgroundColor: bg }]}>
+      {uri && !failed ? (
+        <Image source={{ uri }} style={styles.avatarImage} resizeMode="cover" onError={() => setFailed(true)} />
+      ) : (
+        <Ionicons name="people" size={20} color="#fff" />
+      )}
+    </View>
+  );
+}
 
 const showToast = (msg) => {
   if (Platform.OS === 'android') ToastAndroid.show(msg, ToastAndroid.SHORT);
@@ -427,8 +446,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
     const avatar = getChatAvatar(item);
     const isSelected = selectedReceivers.includes(chatId);
     const isGroup = item?.chatType === 'group' || item?.isGroup;
-    const initials = (name || '?').charAt(0).toUpperCase();
-    const avatarBg = getAvatarColor(name);
+    const peerId = item?.peerUser?._id || item?.peerUser?.userId || item?.peerUserId || null;
 
     return (
       <TouchableOpacity
@@ -436,15 +454,12 @@ export default function ForwardMessageScreen({ navigation, route }) {
         activeOpacity={0.6}
         style={[styles.chatRow, { backgroundColor: theme.colors.background }]}
       >
-        <View style={[styles.avatarWrap, { backgroundColor: avatarBg }]}>
-          {avatar ? (
-            <Image source={{ uri: avatar }} style={styles.avatarImage} resizeMode="cover" />
-          ) : isGroup ? (
-            <Ionicons name="people" size={20} color="#fff" />
-          ) : (
-            <Text style={styles.avatarText}>{initials}</Text>
-          )}
-        </View>
+        {isGroup ? (
+          <GroupAvatar uri={avatar} bg={getAvatarColor(name)} />
+        ) : (
+          // "Unknown" is a placeholder label, not a name — no letter from it.
+          <PersonAvatar userId={peerId} uri={avatar || null} label={name === 'Unknown' ? null : name} size={48} />
+        )}
 
         <View style={styles.chatInfo}>
           <Text style={[styles.chatName, { color: theme.colors.primaryTextColor }]} numberOfLines={1}>
@@ -593,7 +608,6 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center', overflow: 'hidden',
   },
   avatarImage: { width: 48, height: 48, borderRadius: 24 },
-  avatarText: { color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 18 },
   chatInfo: { flex: 1 },
   chatName: { fontFamily: 'Roboto-Medium', fontSize: 15, textTransform: 'capitalize' },
   chatSub: { fontFamily: 'Roboto-Regular', fontSize: 12, marginTop: 1 },

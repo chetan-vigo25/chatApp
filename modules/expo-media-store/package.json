@@ -1,0 +1,7 @@
+{
+  "name": "expo-media-store",
+  "version": "1.0.0",
+  "description": "Android: WhatsApp-style media folders under Android/media/<package>/TalksTry/Media, visible in the gallery, written without storage permission.",
+  "main": "index.ts",
+  "private": true
+}

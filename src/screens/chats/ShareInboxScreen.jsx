@@ -9,6 +9,9 @@ import { useSelector } from 'react-redux';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
 import AppSearchBar from '../../components/AppSearchBar';
+// 1-1 avatar = same rule as the chat list: photo, else the first letter of the
+// peer's OWN profile name (not my saved name, their @username or a "+").
+import PersonAvatar from '../../components/GroupSenderAvatar';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const avatarColor = (name = '') => {
@@ -16,6 +19,20 @@ const avatarColor = (name = '') => {
   for (let i = 0; i < name.length; i += 1) h = name.charCodeAt(i) + ((h << 5) - h);
   return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
 };
+
+// Group photo; a dead url falls back to the name letter instead of leaving a
+// blank circle.
+function GroupAvatar({ uri, name }) {
+  const [failed, setFailed] = useState(false);
+  if (uri && !failed) {
+    return <Image source={{ uri }} style={styles.avatar} onError={() => setFailed(true)} />;
+  }
+  return (
+    <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: avatarColor(name) }]}>
+      <Text style={styles.avatarLetter}>{name.charAt(0).toUpperCase()}</Text>
+    </View>
+  );
+}
 
 // An id may arrive as a raw string or as a populated object — flatten both.
 const flatId = (v) => {
@@ -101,8 +118,9 @@ export default function ShareInboxScreen({ navigation, route }) {
     (c?.chatType === 'group' || c?.isGroup)
       ? (c.chatName || c.group?.name || c.groupName || 'Group')
       : (c?.peerUser?.fullName || c?.chatName || 'Unknown');
+  const isGroupChat = (c) => c?.chatType === 'group' || !!c?.isGroup;
   const getAvatar = (c) =>
-    (c?.chatType === 'group')
+    isGroupChat(c)
       ? (c.chatAvatar || c.group?.avatar || c.groupAvatar)
       : (c?.peerUser?.profileImage || c?.chatAvatar);
 
@@ -147,12 +165,16 @@ export default function ShareInboxScreen({ navigation, route }) {
         style={[styles.row, { borderBottomColor: colors.borderColor }]}
         onPress={() => onSelect(item)}
       >
-        {avatar ? (
-          <Image source={{ uri: avatar }} style={styles.avatar} />
+        {isGroupChat(item) ? (
+          <GroupAvatar key={avatar || 'none'} uri={avatar} name={name} />
         ) : (
-          <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: avatarColor(name) }]}>
-            <Text style={styles.avatarLetter}>{name.charAt(0).toUpperCase()}</Text>
-          </View>
+          <PersonAvatar
+            userId={flatId(item?.peerUser?._id) || flatId(item?.peerUser?.userId) || flatId(item?.peerUserId)}
+            uri={avatar || null}
+            label={name === 'Unknown' ? null : name}
+            size={44}
+            style={{ marginRight: 14 }}
+          />
         )}
         <Text style={[styles.name, { color: colors.primaryTextColor }]} numberOfLines={1}>
           {name}

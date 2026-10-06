@@ -1,5 +1,6 @@
 // utils/mediaService.js
 import * as FileSystem from 'expo-file-system/legacy';
+import { moveSentToWhatsappFolder } from './whatsappMediaFolders';
 import * as MediaLibrary from 'expo-media-library';
 import { Platform, Alert, Linking } from 'react-native';
 import { apiCall } from '../Config/Https';
@@ -300,7 +301,17 @@ const reserveCopyDestination = async (destDir, filename) => {
 };
 
 // Copy file to app folder
+// Outgoing copies land in the WhatsApp-style "<Folder>/Sent" (Android, hidden
+// from the gallery by .nomedia); other destinations / iOS are unchanged.
 export const copyToAppFolder = async (inputUri, suggestedName = null, destDir = SENT_DIR, onProgress = null) => {
+  const out = await copyToAppFolderLocal(inputUri, suggestedName, destDir, onProgress);
+  const intoSent = typeof destDir !== 'string' || String(destDir).startsWith(SENT_DIR);
+  if (!out || !intoSent) return out;
+  const moved = await moveSentToWhatsappFolder(out, suggestedName || out);
+  return moved || out;
+};
+
+const copyToAppFolderLocal = async (inputUri, suggestedName = null, destDir = SENT_DIR, onProgress = null) => {
   let claimedDestination = null;
   try {
     if (!inputUri) return null;

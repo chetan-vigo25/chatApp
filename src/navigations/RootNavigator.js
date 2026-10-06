@@ -1,9 +1,9 @@
-import React, { useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Platform } from "react-native";
 import { NavigationContainer } from "@react-navigation/native";
 import { createStackNavigator, CardStyleInterpolators } from "@react-navigation/stack";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { navigationRef, updateNavigationSnapshot } from "../Redux/Services/navigationService";
+import { navigationRef, updateNavigationSnapshot, subscribeNavigationSnapshot } from "../Redux/Services/navigationService";
 
 import Splash from "../screens/Splash";
 import { PermissionsGate } from "../features/permissions";
@@ -71,11 +71,26 @@ import { useTheme } from "../contexts/ThemeContext";
 
 const Stack = createStackNavigator();
 
+// Full-bleed screens that lay out their own safe-area insets. The root
+// SafeAreaView must not pad them too: its padding strip is painted with the
+// theme background, so the status viewer got a white band behind its
+// light-content status bar (time/battery invisible) and a doubled top inset.
+const FULL_BLEED_ROUTES = new Set(["StatusViewer"]);
+const ALL_EDGES = ["top", "right", "bottom", "left"];
+const NO_EDGES = [];
+
 export default function RootNavigator() {
   const { theme, isDarkMode } = useTheme();
+  const [fullBleed, setFullBleed] = useState(false);
+  useEffect(() => subscribeNavigationSnapshot((route) => {
+    setFullBleed(FULL_BLEED_ROUTES.has(route?.name));
+  }), []);
 
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: theme.colors.background }}>
+    <SafeAreaView
+      edges={fullBleed ? NO_EDGES : ALL_EDGES}
+      style={{ flex: 1, backgroundColor: fullBleed ? "#000000" : theme.colors.background }}
+    >
       <NavigationContainer
         ref={navigationRef}
         onReady={updateNavigationSnapshot}

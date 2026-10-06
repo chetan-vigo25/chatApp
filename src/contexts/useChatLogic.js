@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { showMediaUnavailable } from '../utils/mediaUnavailableBus';
 import { Alert, AppState, Keyboard, Platform, DeviceEventEmitter, Image } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as FileSystem from 'expo-file-system/legacy';
@@ -36,6 +37,7 @@ import {
 import {
   normalizeUri,
   uploadMediaFile,
+  mediaResolve,
 } from "../utils/mediaService";
 import { abortChunkSession, CHUNKED_UPLOAD_THRESHOLD } from '../utils/chunkedUpload';
 import { captionOf } from '../utils/mediaCaption';
@@ -1860,7 +1862,13 @@ export default function useChatLogic({ navigation, route }) {
       const voFp = mvo
         ? `:vo${Number(mvo.openedCount || 0)}.${mvo.myStatus || ''}.${mvo.mediaDeleted ? 1 : 0}`
         : '';
-      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}${voFp}`;
+      // Call log details can land after the row (healed from callDetails) —
+      // without them here the gate swallowed the patch and the bubble never
+      // showed its duration.
+      const callFp = (m.type === 'call' || m.messageType === 'call')
+        ? `:c${m.payload?.outcome || ''}.${m.payload?.durationSec ?? ''}`
+        : '';
+      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}${voFp}${callFp}`;
       if (m.status !== 'sending' && m.status !== 'uploading') return base;
       // localThumbUri flags: locally extracted video posters land via async
       // patches on sending rows — without them in the fingerprint the gate
@@ -8808,13 +8816,24 @@ export default function useChatLogic({ navigation, route }) {
         resolvedMediaUrl: resolvedIdentity?.mediaUrl,
       }));
       if (!mediaId) {
-        Alert.alert('Download failed', 'Media identifier missing for this message');
+        showMediaUnavailable({ reason: 'no-media-id' });
         return;
       }
 
       if (!resolvedIdentity?.mediaUrl && !msg?.mediaUrl && !msg?.previewUrl && !msg?.url) {
-        Alert.alert('Download failed', 'Media URL missing for this message');
-        return;
+        // The row carries no link (cleared / never shipped) but the server may
+        // still have the file — ask for a fresh one before giving up.
+        let freshUrl = null;
+        try {
+          const resolved = await mediaResolve([mediaId]);
+          const r = resolved?.[mediaId] || null;
+          freshUrl = r?.mediaUrl || r?.previewUrl || null;
+        } catch { /* fall through to the dialog */ }
+        if (!freshUrl) {
+          showMediaUnavailable({ reason: 'no-media-url' });
+          return;
+        }
+        msg = { ...msg, mediaUrl: freshUrl };
       }
 
       const effectiveChatId = normalizeId(msg?.chatId || msg?.groupId || chatIdRef.current);
@@ -8945,7 +8964,14 @@ export default function useChatLogic({ navigation, route }) {
       }
 
       console.log("❌ handleDownloadMedia error:", error);
-      Alert.alert("Download failed", error?.message || "Unable to download media");
+      // Storage full is the user's to fix — say so. Anything else (expired /
+      // deleted on the server, HTTP error, no URL) → the "Couldn't download"
+      // dialog ChatScreen shows (utils/mediaUnavailableBus).
+      if (/storage full/i.test(errText)) {
+        Alert.alert("Download failed", errText);
+      } else {
+        showMediaUnavailable({ reason: 'download-failed', detail: errText });
+      }
 
       const failedId = stoppedId;
       if (failedId) {

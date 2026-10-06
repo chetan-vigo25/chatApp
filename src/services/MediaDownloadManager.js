@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import { moveReceivedToWhatsappFolder } from '../utils/whatsappMediaFolders';
 import mediaService, { isDownloadPausedError, isDownloadCancelledError } from './MediaService';
 import localStorageService from './LocalStorageService';
 
@@ -301,7 +302,7 @@ class MediaDownloadManager {
 
       for (let attempt = 0; attempt <= RETRY_LIMIT; attempt += 1) {
         try {
-          const localPath = await mediaService.downloadToLocal({
+          let localPath = await mediaService.downloadToLocal({
             mediaId: key,
             chatId: options?.chatId || identity.chatId || message?.chatId,
             messageType: identity.messageType,
@@ -332,6 +333,14 @@ class MediaDownloadManager {
             },
           });
 
+          // Android: one shared file in the WhatsApp-style folder
+          // (Android/media/<pkg>/TalksTry/Media/TalksTry Images/…) instead of a
+          // private copy + a separate gallery copy — so a gallery delete
+          // reaches the chat. See utils/whatsappMediaFolders.
+          const sharedPath = await moveReceivedToWhatsappFolder(localPath, identity.messageType);
+          const movedToShared = Boolean(sharedPath && sharedPath !== localPath);
+          if (movedToShared) localPath = sharedPath;
+
           await localStorageService.upsertMediaFile({
             mediaId: key,
             id: key,
@@ -355,10 +364,13 @@ class MediaDownloadManager {
             error: null,
           });
 
-          // Auto-save to device gallery (WhatsApp-style visible folder)
-          try {
-            mediaService.saveToDeviceMedia(localPath, identity.messageType).catch(() => {});
-          } catch {}
+          // Auto-save to device gallery — only when the file did NOT go to the
+          // shared folder (that one IS the gallery copy already).
+          if (!movedToShared) {
+            try {
+              mediaService.saveToDeviceMedia(localPath, identity.messageType).catch(() => {});
+            } catch {}
+          }
 
           return localPath;
         } catch (error) {

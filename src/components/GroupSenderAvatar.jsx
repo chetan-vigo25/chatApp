@@ -15,7 +15,7 @@ import {
  * charAt(0) of the label, which drew "@" for a hidden sender and "+" for a
  * number.
  */
-const GroupSenderAvatar = ({ userId, uri, label, senderName, size = 30 }) => {
+const GroupSenderAvatar = ({ userId, uri, label, senderName, size = 30, style }) => {
   const [failedUri, setFailedUri] = useState(null);
   useEffect(() => { setFailedUri(null); }, [uri]);
   const photo = uri && uri !== failedUri ? uri : null;
@@ -28,19 +28,19 @@ const GroupSenderAvatar = ({ userId, uri, label, senderName, size = 30 }) => {
       <Image
         source={{ uri: photo }}
         onError={() => setFailedUri(photo)}
-        style={{ width: size, height: size, borderRadius: radius }}
+        style={[{ width: size, height: size, borderRadius: radius }, style]}
       />
     );
   }
   if (!shouldShowAvatarInitial(source)) {
     return (
-      <View style={{ width: size, height: size, borderRadius: radius, backgroundColor: UNSAVED_AVATAR_BG, alignItems: 'center', justifyContent: 'center' }}>
+      <View style={[{ width: size, height: size, borderRadius: radius, backgroundColor: UNSAVED_AVATAR_BG, alignItems: 'center', justifyContent: 'center' }, style]}>
         <Ionicons name="person" size={size * 0.55} color="#fff" />
       </View>
     );
   }
   return (
-    <View style={{ width: size, height: size, borderRadius: radius, backgroundColor: getAvatarColor(userId || source), alignItems: 'center', justifyContent: 'center' }}>
+    <View style={[{ width: size, height: size, borderRadius: radius, backgroundColor: getAvatarColor(userId || source), alignItems: 'center', justifyContent: 'center' }, style]}>
       <Text style={{ color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: size * 0.43 }}>
         {getAvatarInitial(source)}
       </Text>

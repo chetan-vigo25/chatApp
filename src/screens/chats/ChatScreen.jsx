@@ -72,6 +72,10 @@ import ReplyPreviewBox from '../../components/ReplyPreviewBox';
 import ScheduleTimePicker from '../../components/ScheduleTimePicker';
 import ReplyBubble from '../../components/ReplyBubble';
 import StatusReplyPreview from '../../components/StatusReplyPreview';
+import StatusUnavailableModal from '../../components/StatusUnavailableModal';
+import { showMediaUnavailable, subscribeMediaUnavailable } from '../../utils/mediaUnavailableBus';
+import { isInWhatsappMediaFolder, whatsappMediaFileExists } from '../../utils/whatsappMediaFolders';
+import { AppState as RNAppState } from 'react-native';
 import { statusServices } from '../../Redux/Services/Status/Status.Services';
 import LocationBubble from '../../components/LocationBubble';
 import AlbumMessage from '../../components/AlbumMessage';
@@ -1471,9 +1475,62 @@ const MessageRow = React.memo(
     && a.lineCount === b.lineCount,
 );
 
+const GONE_MEDIA_KEY = 'media_deleted_from_device_v1';
+// mediaKey → Photos/gallery asset id of the copy the user saved from the chat.
+const GALLERY_ASSETS_KEY = 'media_gallery_assets_v1';
+
 export default function ChatScreen({ navigation, route }) {
   // Reporting state
   const [reportModalVisible, setReportModalVisible] = useState(false);
+  // Status-reply quote whose status can't be opened (expired / deleted / fetch
+  // failed) → "Status Expired" dialog instead of a black viewer.
+  const [statusUnavailable, setStatusUnavailable] = useState(null);
+  // Media that can't be opened/fetched (file deleted from the device and the
+  // server copy can't be downloaded, or the download failed) → one
+  // "Couldn't download" dialog. Raised from anywhere via utils/mediaUnavailableBus.
+  const [mediaUnavailable, setMediaUnavailable] = useState(false);
+  useEffect(() => subscribeMediaUnavailable(() => setMediaUnavailable(true)), []);
+
+  // Media the USER deleted from the device/gallery (WhatsApp behaviour): the
+  // bubble falls back to the blurred "download" state, and tapping download
+  // shows "Couldn't download". Keyed by media key, persisted so it survives a
+  // restart (the message row still carries its old "downloaded" flags).
+  const [goneMedia, setGoneMedia] = useState({});
+  useEffect(() => {
+    AsyncStorage.getItem(GONE_MEDIA_KEY)
+      .then((raw) => { const o = raw ? JSON.parse(raw) : null; if (o && typeof o === 'object') setGoneMedia(o); })
+      .catch(() => {});
+  }, []);
+  const markMediaGone = useCallback((keys) => {
+    const list = (keys || []).filter(Boolean);
+    if (!list.length) return;
+    setGoneMedia((prev) => {
+      if (list.every((k) => prev[k])) return prev;
+      const next = { ...prev };
+      list.forEach((k) => { next[k] = Date.now(); });
+      AsyncStorage.setItem(GONE_MEDIA_KEY, JSON.stringify(next)).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // iOS keeps chat media in the app sandbox, separate from Photos — so a
+  // photo the user saved ("download" in the viewer) and then deleted in
+  // Photos never reached the chat. Remember the saved asset; when it is gone
+  // from Photos/gallery, the chat copy counts as deleted too (blurred bubble +
+  // "Couldn't download"), same as Android's shared folder.
+  const galleryAssetsRef = useRef({});
+  useEffect(() => {
+    AsyncStorage.getItem(GALLERY_ASSETS_KEY)
+      .then((raw) => { const o = raw ? JSON.parse(raw) : null; if (o && typeof o === 'object') galleryAssetsRef.current = o; })
+      .catch(() => {});
+  }, []);
+  const rememberGalleryAsset = useCallback((msg, asset) => {
+    const id = asset?.id ? String(asset.id) : null;
+    const key = normalizeId(msg?.serverMessageId) || normalizeId(msg?.id) || getMessageKey(msg);
+    if (!id || !key) return;
+    galleryAssetsRef.current = { ...galleryAssetsRef.current, [key]: id };
+    AsyncStorage.setItem(GALLERY_ASSETS_KEY, JSON.stringify(galleryAssetsRef.current)).catch(() => {});
+  }, []);
   const [reportPayload, setReportPayload] = useState({});
   // Tracks media whose local downloaded file failed to render, so we fall back
   // to the remote https URL (keyed by message key).
@@ -1517,55 +1574,17 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   // Tap the status-reply preview pill in a chat bubble → open the StatusViewer
-  // for that owner. We try the live status first so the viewer can render the
-  // full slideshow (with reactions, viewers, etc.). If that fails for any
-  // reason (expired, network, auth) we silently fall back to a single-card
-  // viewer seeded from the snapshot we captured at reply-time, so the user
-  // still sees the status they originally replied to.
+  // for that owner when the status is still live. If it isn't (expired after
+  // 24h, deleted, or the fetch failed) show the StatusUnavailableModal dialog.
   const handleOpenStatusFromChat = useCallback(async (statusRef, statusPreview) => {
-    const buildSnapshotStatus = () => ({
-      _id:         statusRef,
-      ownerId:     statusPreview?.ownerId || null,
-      mediaItems: [{
-        _id:          `${statusRef}_snap`,
-        mediaType:    statusPreview?.mediaType || 'text',
-        mediaUrl:     statusPreview?.mediaUrl || null,
-        thumbnailUrl: statusPreview?.thumbnailUrl || statusPreview?.mediaUrl || null,
-        order:        0,
-      }],
-      caption:     statusPreview?.text || null,
-      textContent: statusPreview?.text || null,
-      bgColor:     statusPreview?.backgroundColor || '#026158',
-      createdAt:   statusPreview?.createdAt || new Date().toISOString(),
-      expiresAt:   null,
-      viewCount:   0,
-      likeCount:   0,
-      dislikeCount: 0,
-      replyCount:  0,
-      myReaction:  null,
-      _isExpiredSnapshot: true,
-    });
-
-    const ownerIdForResolve = String(statusPreview?.ownerId || '');
-    const isOwnStatusNav = currentUserId && ownerIdForResolve === String(currentUserId);
-    const resolvedNavName = isOwnStatusNav
-      ? (statusPreview?.ownerName || 'You')
-      : resolveContactName(
-          ownerIdForResolve,
-          statusPreview?.ownerName,
-          statusPreview?.ownerPhone || statusPreview?.phone
-        );
-
-    const navigateWithSnapshot = () => {
-      const fallback = buildSnapshotStatus();
-      navigation.navigate('StatusViewer', {
-        statuses:   [fallback],
-        startIndex: 0,
-        isMine:     isOwnStatusNav,
-        userName:   resolvedNavName,
-        userImage:  '',
-        userId:     ownerIdForResolve,
-      });
+    // The status itself can't be opened. Opening the viewer on the snapshot
+    // showed a BLACK screen (its presigned link is long expired) that then
+    // auto-closed — show a "Status Expired" dialog instead.
+    // `expired`: 24h passed or the server no longer has it; false = fetch error.
+    const showUnavailable = (expired) => {
+      const created = Date.parse(statusPreview?.createdAt || '');
+      const pastTtl = Number.isFinite(created) && Date.now() - created > 24 * 60 * 60 * 1000;
+      setStatusUnavailable({ expired: expired || pastTtl });
     };
 
     try {
@@ -1595,12 +1614,10 @@ export default function ChatScreen({ navigation, route }) {
         return;
       }
 
-      // Live fetch returned null/empty (expired, hidden, etc.) — silently use
-      // the snapshot. The viewer will render the preview without the live-only
-      // affordances (reactions, view count) which is fine for an old status.
-      navigateWithSnapshot();
+      // Live fetch returned null/empty (expired, deleted, hidden).
+      showUnavailable(true);
     } catch {
-      navigateWithSnapshot();
+      showUnavailable(false);
     }
   }, [navigation, currentUserId, resolveContactName]);
 
@@ -1755,7 +1772,7 @@ export default function ChatScreen({ navigation, route }) {
   // guards the loop), re-derived again on the next mount if still needed.
   const resolvedFullUrlRef = useRef({});
   const mediaHealTriedRef = useRef(new Set());
-  const [, setThumbnailCacheVersion] = useState(0);
+  const [thumbnailCacheVersion, setThumbnailCacheVersion] = useState(0);
   const lastScrollStateRef = useRef({ isAtLatest: true, isAtTop: false, showScrollButton: false });
   const visibleMapRef = useRef({});
   const [stickyDateLabel, setStickyDateLabel] = useState('');
@@ -2145,11 +2162,24 @@ export default function ChatScreen({ navigation, route }) {
     Boolean((chatData?.chatType === 'broadcast' || chatData?.isBroadcast) &&
       (msg?.mediaUrl || msg?.mediaThumbnailUrl || msg?.previewUrl));
 
+  // Per MESSAGE, never per mediaId: a forward / re-send reuses the same
+  // mediaId, and deleting one copy from the gallery must not blur the others.
+  const goneKeysFor = (msg) => Array.from(new Set([
+    normalizeId(msg?.serverMessageId),
+    normalizeId(msg?.id),
+    normalizeId(msg?.tempId),
+    getMessageKey(msg),
+  ].filter(Boolean)));
+  const isMediaGone = (msg) => goneKeysFor(msg).some((k) => goneMedia[k]);
+
   const isMediaDownloaded = (msg) => {
     if (!msg) return false;
 
     // Broadcast media is always "available" — served directly from its remote URL.
     if (isBroadcastMedia(msg)) return true;
+
+    // Deleted by the user from the device/gallery → not downloaded any more.
+    if (isMediaGone(msg)) return false;
 
     // Check persisted download flag on the message itself (survives app restart)
     if (msg.isMediaDownloaded === true || msg.downloadStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED) {
@@ -2192,6 +2222,8 @@ export default function ChatScreen({ navigation, route }) {
       const remote = msg.mediaUrl || msg.mediaThumbnailUrl || msg.previewUrl;
       if (remote) return toSecureMediaUri(remote);
     }
+
+    if (isMediaGone(msg)) return null;
 
     // Check msg.localUri first (persisted across app restarts)
     if (msg.localUri) {
@@ -2383,6 +2415,64 @@ export default function ChatScreen({ navigation, route }) {
     replyTarget, startReply, cancelReply,
     toggleReaction, removeReaction, fetchReactionList,
   } = useChatLogic({ navigation, route });
+
+  // A downloaded file in the shared WhatsApp-style folder that no longer exists
+  // was deleted from the gallery → mark it gone (blurred bubble). Checked when
+  // the messages change and whenever the app returns to the foreground (the
+  // user deletes it in the gallery app, then comes back).
+  const scanGoneMediaRef = useRef(null);
+  scanGoneMediaRef.current = () => {
+    const gone = [];
+    (messages || []).forEach((m) => {
+      const t = String(m?.type || m?.messageType || '').toLowerCase();
+      if (!['image', 'video', 'audio', 'voice', 'file', 'document'].includes(t)) return;
+      if (isMediaGone(m)) {
+        // Already gone: make sure a server link exists for the blurred preview.
+        healExpiredMediaUrl(m).catch?.(() => {});
+        return;
+      }
+      const uri = resolveDownloadedUri(m);
+      if (uri && isInWhatsappMediaFolder(uri) && !whatsappMediaFileExists(uri)) {
+        gone.push(...goneKeysFor(m));
+      }
+    });
+    if (gone.length) markMediaGone(gone);
+
+    // Saved-to-Photos/gallery copies the user has since deleted there.
+    const tracked = galleryAssetsRef.current || {};
+    const assetKeyOf = (m) => normalizeId(m?.serverMessageId) || normalizeId(m?.id) || getMessageKey(m);
+    const candidates = (messages || []).filter((m) => {
+      const key = assetKeyOf(m);
+      return key && tracked[key] && !isMediaGone(m);
+    });
+    if (!candidates.length) return;
+    (async () => {
+      try {
+        const perm = await MediaLibrary.getPermissionsAsync();
+        if (!perm?.granted) return; // can't tell deleted from not-visible
+        const deleted = [];
+        for (const m of candidates) {
+          const assetId = tracked[assetKeyOf(m)];
+          let info = null;
+          let lookupFailed = false;
+          try { info = await MediaLibrary.getAssetInfoAsync(assetId); }
+          catch (e) { lookupFailed = !/not.?found|doesn.?t exist|no asset/i.test(String(e?.message || '')); }
+          if (!info && !lookupFailed) {
+            deleted.push(...goneKeysFor(m));
+            healExpiredMediaUrl(m).catch?.(() => {});
+          }
+        }
+        if (deleted.length) markMediaGone(deleted);
+      } catch { /* best-effort */ }
+    })();
+  };
+  useEffect(() => { scanGoneMediaRef.current?.(); }, [messages]);
+  useEffect(() => {
+    const sub = RNAppState.addEventListener('change', (st) => {
+      if (st === 'active') scanGoneMediaRef.current?.();
+    });
+    return () => sub.remove();
+  }, []);
 
   useEffect(() => {
     translationMountedRef.current = true;
@@ -3031,6 +3121,38 @@ export default function ChatScreen({ navigation, route }) {
   // Abort function for the viewer's in-flight save/share fetch (✕ on the ring).
   const viewerDownloadCancelRef = useRef(null);
 
+  // iOS only: a voice note uploaded by older Android builds is an MP4/AAC
+  // container (.m4a) mislabelled ".aac". AVPlayer trusts the extension, parses
+  // it as raw ADTS and fails (-11800 'optm'). Fetch it once and keep a ".m4a"
+  // copy in the cache when the bytes say MP4 ("ftyp" at offset 4).
+  const ensureIosPlayableAudio = async (uri, msg) => {
+    if (Platform.OS !== 'ios' || !uri) return uri;
+    const path = String(uri).split('?')[0];
+    if (!/\.aac$/i.test(path)) return uri;
+    try {
+      const key = String(getResolvedMediaId(msg) || path.split('/').pop() || Date.now()).replace(/[^A-Za-z0-9_-]/g, '_');
+      const target = `${FileSystem.cacheDirectory}voice-${key}.m4a`;
+      const cached = await FileSystem.getInfoAsync(target).catch(() => null);
+      if (cached?.exists && cached.size > 0) return target;
+
+      let local = uri;
+      if (/^https?:\/\//i.test(String(uri))) {
+        const tmp = `${FileSystem.cacheDirectory}voice-${key}.aac`;
+        const res = await FileSystem.downloadAsync(String(uri), tmp);
+        if (res?.status && (res.status < 200 || res.status >= 300)) return uri;
+        local = res?.uri || tmp;
+      }
+      const head = await FileSystem.readAsStringAsync(local, { encoding: 'base64', position: 0, length: 12 });
+      const bytes = typeof atob === 'function' ? atob(head) : '';
+      if (bytes.slice(4, 8) !== 'ftyp') return local; // genuine ADTS .aac plays as-is
+      await FileSystem.copyAsync({ from: local, to: target });
+      return target;
+    } catch (e) {
+      console.warn('[audio] iOS .aac fix failed:', e?.message);
+      return uri;
+    }
+  };
+
   // Media handling functions
   const verifyFileExists = async (uri) => {
     if (!uri) return false;
@@ -3342,8 +3464,13 @@ export default function ChatScreen({ navigation, route }) {
       }
     }
 
+    // Saved copy deleted from the device → stream / re-fetch from the server.
+    if (uri && !/^https?:\/\//i.test(String(uri)) && !(await verifyFileExists(uri))) {
+      uri = toSecureMediaUri(msg?.mediaUrl) || (await resolveFileForOpen(msg));
+    }
+
     if (!uri) {
-      Alert.alert('Audio unavailable', 'Could not load this audio file.');
+      showMediaUnavailable({ reason: 'audio-unavailable' });
       return;
     }
 
@@ -3353,6 +3480,10 @@ export default function ChatScreen({ navigation, route }) {
         playsInSilentModeIOS: true,
         staysActiveInBackground: false,
       });
+
+      // Old Android voice notes are MP4/AAC files named ".aac"; AVPlayer goes
+      // by the extension and fails on them (-11800 'optm'). Play a ".m4a" copy.
+      uri = await ensureIosPlayableAudio(uri, msg);
 
       const { sound } = await Audio.Sound.createAsync(
         { uri },
@@ -3378,7 +3509,7 @@ export default function ChatScreen({ navigation, route }) {
       setPlayingAudioId(msgKey);
     } catch (err) {
       console.error('Audio playback error:', err);
-      Alert.alert('Error', 'Failed to play audio.');
+      showMediaUnavailable({ reason: 'audio-play-failed' });
       setPlayingAudioId(null);
     }
   }, [playingAudioId, currentUserId, stopCurrentAudio]);
@@ -3486,7 +3617,7 @@ export default function ChatScreen({ navigation, route }) {
       if (msgType === 'file' || msgType === 'document' || isDocumentMime(mime)) {
         const localUri = await resolveLocalFileUri(msg);
         if (!localUri) {
-          Alert.alert('File unavailable', 'Could not load this file. Check your internet connection and try again.');
+          (isConnected ? showMediaUnavailable({ reason: 'file-unavailable' }) : Alert.alert('Offline', 'Connect to the internet to download this file.'));
           return;
         }
         await openDocumentWithChooser(await withOriginalName(localUri, msg), msg);
@@ -3496,13 +3627,13 @@ export default function ChatScreen({ navigation, route }) {
       // ── All other media (images, videos, etc.): use sharing ──
       const localUri = await resolveLocalFileUri(msg);
       if (!localUri) {
-        Alert.alert('File unavailable', 'Could not load this file. Check your internet connection and try again.');
+        (isConnected ? showMediaUnavailable({ reason: 'file-unavailable' }) : Alert.alert('Offline', 'Connect to the internet to download this file.'));
         return;
       }
       await openFileWithSharing(await withOriginalName(localUri, msg), msg);
     } catch (error) {
       console.error('Error sharing media:', error);
-      Alert.alert('Error', 'Failed to open file.');
+      showMediaUnavailable({ reason: 'file-open-failed' });
     }
   };
 
@@ -3512,7 +3643,7 @@ export default function ChatScreen({ navigation, route }) {
       const localUri = await resolveFileForOpen(msg);
 
       if (!localUri) {
-        Alert.alert('File unavailable', 'Could not load this file. Check your internet connection and try again.');
+        (isConnected ? showMediaUnavailable({ reason: 'file-unavailable' }) : Alert.alert('Offline', 'Connect to the internet to download this file.'));
         return;
       }
 
@@ -3526,10 +3657,10 @@ export default function ChatScreen({ navigation, route }) {
       // Same album + same dialog-free path as an auto-download save, so a manual
       // save never raises Android's "Allow … to modify this photo?" prompt and
       // lands where the auto-saved media already lives.
-      await saveAssetToAlbum(
+      rememberGalleryAsset(msg, await saveAssetToAlbum(
         await ensureSaveableFileUri(localUri, msg),
         (msg?.type || '').toLowerCase() === 'video' ? 'TalksTry Video' : 'TalksTry Images',
-      );
+      ));
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
     } catch (error) {
@@ -3621,6 +3752,10 @@ export default function ChatScreen({ navigation, route }) {
   // IMPROVED: Enhanced download function with better persistence
   const handleDownloadWithPersistence = async (msg) => {
     try {
+      if (isMediaGone(msg)) {
+        showMediaUnavailable({ reason: 'deleted-from-device' });
+        return null;
+      }
       if (!isConnected) {
         Alert.alert('Offline', 'Connect to the internet to download this media.');
         return;
@@ -3671,14 +3806,52 @@ export default function ChatScreen({ navigation, route }) {
       return downloadedUri || null;
     } catch (error) {
       console.error('Error downloading media:', error);
-      Alert.alert('Error', 'Failed to download media');
+      showMediaUnavailable({ reason: 'download-failed' });
       return null;
     }
   };
 
+  const isRemoteUri = (u) => /^https?:\/\//i.test(String(u || ''));
+
+  // Every bubble tap opens media through here. A saved copy the user deleted
+  // from the device/gallery used to open the viewer on a dead file:// path
+  // (black screen). Check it first: gone → fetch it again from the server;
+  // that fails too → "Couldn't download".
   const openMediaViewer = (msg, uri, type = 'image', album = null) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const target = uri || resolveDownloadedUri(msg) || msg?.mediaUrl;
+    if (!target || isRemoteUri(target)) {
+      showMediaViewerNow(msg, target, type, album);
+      return;
+    }
+    (async () => {
+      if (await verifyFileExists(target)) {
+        showMediaViewerNow(msg, target, type, album);
+        return;
+      }
+      // The saved file is gone — the user deleted it from the device/gallery.
+      // WhatsApp: the bubble goes back to its blurred "download" state and the
+      // media can't be re-downloaded ("ask that it be resent"). Album pages
+      // still fall back to their own server copy.
+      const albumItem = album?.items?.[album.index || 0]?.item;
+      if (albumItem && isRemoteUri(albumItem.mediaUrl)) {
+        showMediaViewerNow(msg, albumItem.mediaUrl, type, album);
+        return;
+      }
+      markMediaGone(goneKeysFor(msg));
+      showMediaUnavailable({ reason: 'deleted-from-device' });
+    })();
+  };
+
+  const showMediaViewerNow = (msg, uri, type = 'image', album = null) => {
     const isDownloaded = !!resolveDownloadedUri(msg);
+    // Album pages whose saved copy is gone fall back to their server URL
+    // (checked lazily by the viewer's onError).
+    const albumItems = album?.items?.length > 1
+      ? album.items.map((pg) => (pg?.item?.mediaUrl && pg.uri === pg.item.localUri
+        ? { ...pg, fallbackUri: pg.item.mediaUrl }
+        : pg))
+      : null;
 
     setLocalMediaViewer({
       visible: true,
@@ -3687,7 +3860,7 @@ export default function ChatScreen({ navigation, route }) {
       type: type,
       message: msg,
       isDownloaded: isDownloaded,
-      albumItems: album?.items?.length > 1 ? album.items : null,
+      albumItems,
       albumIndex: album?.index || 0,
     });
   };
@@ -3728,6 +3901,28 @@ export default function ChatScreen({ navigation, route }) {
     setViewerSavedToast(false);
     setViewerVideoStatus({ isPlaying: false, positionMillis: 0, durationMillis: 0, isLoaded: false });
     if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
+  };
+
+  // The open media can't be shown (dead local file, server copy gone, heal
+  // failed): close the viewer instead of leaving it black, then explain.
+  const failViewerMedia = () => {
+    closeLocalMediaViewer();
+    showMediaUnavailable({ reason: 'viewer-load-failed' });
+  };
+
+  // Album page failed to load: its saved copy was deleted → switch that page
+  // to its server URL once; nothing left to try → "Couldn't download".
+  const onAlbumPageError = (index) => {
+    const page = localMediaViewer.albumItems?.[index];
+    if (page?.fallbackUri && page.uri !== page.fallbackUri) {
+      setLocalMediaViewer((prev) => {
+        if (!prev.visible || !prev.albumItems) return prev;
+        const items = prev.albumItems.map((pg, i) => (i === index ? { ...pg, uri: pg.fallbackUri } : pg));
+        return { ...prev, albumItems: items, uri: prev.albumIndex === index ? page.fallbackUri : prev.uri };
+      });
+      return;
+    }
+    failViewerMedia();
   };
 
   // ── Fullscreen video controls (Android custom bar) ──
@@ -3989,14 +4184,18 @@ export default function ChatScreen({ navigation, route }) {
       }
 
       const fileInfo = await FileSystem.getInfoAsync(uri);
-      const ext = Platform.OS === 'ios' ? 'm4a' : 'aac';
+      // HIGH_QUALITY records MPEG-4/AAC (an .m4a) on BOTH platforms. Android
+      // used to label it ".aac"/audio/aac — iOS's AVPlayer then parsed the MP4
+      // container as raw ADTS and failed (-11800 'optm'), so iPhones couldn't
+      // play Android voice notes.
+      const ext = 'm4a';
       const duration = Number(status?.durationMillis || recordingDurationMs || 0);
 
       setPendingMedia({
         file: {
           uri,
           name: `voice_${Date.now()}.${ext}`,
-          type: Platform.OS === 'ios' ? 'audio/m4a' : 'audio/aac',
+          type: 'audio/m4a',
           size: Number(fileInfo?.size || 0),
           duration,
         },
@@ -5761,7 +5960,12 @@ export default function ChatScreen({ navigation, route }) {
     const sendingProgress = resolveUploadProgress(msg);
     const downloaded = isMediaDownloaded(msg);
     const downloadedUri = downloaded ? resolveDownloadedUri(msg) : null;
-    const status = normalizeDownloadStatus(downloadState?.status);
+    // A file the user deleted from the gallery/Photos keeps the download
+    // manager's DOWNLOADED state for the session — which drew an EMPTY overlay
+    // (no download arrow). Gone media reads as not downloaded.
+    const status = isMediaGone(msg)
+      ? MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED
+      : normalizeDownloadStatus(downloadState?.status);
     const mediaInfo = resolveMediaInfo(msg);
 
     // Remote https URL (server thumbnail / full media) — the fallback when the
@@ -5771,18 +5975,33 @@ export default function ChatScreen({ navigation, route }) {
     // the stored one, which may be an expired signed URL.
     const healMediaId = getResolvedMediaId(msg);
     const healedUrl = healMediaId ? resolvedFullUrlRef.current[healMediaId] : null;
-    const remoteImageSource = toSecureMediaUri(healedUrl || getServerThumbnailUrl(msg) || msg?.mediaUrl);
-    const localImageSource = toSecureMediaUri(isMyMessage
+    const remoteImageSourceRaw = toSecureMediaUri(healedUrl || getServerThumbnailUrl(msg) || msg?.mediaUrl);
+    // After a download the row's url fields can hold the local file path too;
+    // for media deleted from the device only a real server URL is usable.
+    const remoteImageSource = (isMediaGone(msg) && !/^https?:\/\//i.test(String(remoteImageSourceRaw || '')))
+      ? null
+      : remoteImageSourceRaw;
+    // Deleted from the device/gallery: never point at the dead file (expo-image
+    // kept painting it SHARP from its memory cache while the blur layer, which
+    // has to decode the file, came up empty) — only the server thumbnail,
+    // shown blurred behind the download button, like WhatsApp.
+    const goneFromDevice = isMediaGone(msg);
+    const localImageSource = goneFromDevice ? null : toSecureMediaUri(isMyMessage
       ? (msg.localUri || resolveCachedThumbnailUrl(msg) || msg.mediaUrl)
       : (downloadedUri || resolveCachedThumbnailUrl(msg)));
-    // If the local file already failed to render once, use the remote URL.
-    const imageSource = (failedLocalMedia[messageKey] && remoteImageSource)
+    // If THIS local file already failed to render, use the remote URL. Keyed
+    // by the failed path, not a boolean: a download moves the file into the
+    // shared media folder, so the bubble briefly tries the old (now gone)
+    // private path — a boolean then pinned it to the remote URL forever (blank
+    // bubble). A new local path gets tried again.
+    const localFailed = Boolean(localImageSource) && failedLocalMedia[messageKey] === localImageSource;
+    const imageSource = (localFailed && remoteImageSource)
       ? remoteImageSource
       : (localImageSource || remoteImageSource);
     const onImageLoadError = () => {
-      if (!failedLocalMedia[messageKey] && remoteImageSource && imageSource !== remoteImageSource) {
+      if (!localFailed && localImageSource && remoteImageSource && imageSource !== remoteImageSource) {
         // Step 1: fall back from the (missing/unreadable) local file to remote.
-        setFailedLocalMedia(prev => (prev[messageKey] ? prev : { ...prev, [messageKey]: true }));
+        setFailedLocalMedia(prev => (prev[messageKey] === localImageSource ? prev : { ...prev, [messageKey]: localImageSource }));
         return;
       }
       // Step 2: the remote (or only) source also errored — most likely an
@@ -5832,6 +6051,10 @@ export default function ChatScreen({ navigation, route }) {
         <Animated.View style={animationStyle}>
           {shouldRenderThumbnail ? (
             <BlurGateImage
+              // Remount when the gate flips: a downloaded photo whose file the
+              // user deleted (gallery) must come back FULLY blurred — the gate
+              // opacity is seeded at mount, and an in-place flip left it sharp.
+              key={isGated ? 'gated' : 'open'}
               uri={imageSource}
               style={imageStyle}
               resizeMode="cover"
@@ -5887,7 +6110,12 @@ export default function ChatScreen({ navigation, route }) {
     const videoStyle = getAdaptiveMediaStyle(msg, 220, 140);
     const downloaded = isMediaDownloaded(msg);
     const downloadedUri = downloaded ? resolveDownloadedUri(msg) : null;
-    const status = normalizeDownloadStatus(downloadState?.status);
+    // A file the user deleted from the gallery/Photos keeps the download
+    // manager's DOWNLOADED state for the session — which drew an EMPTY overlay
+    // (no download arrow). Gone media reads as not downloaded.
+    const status = isMediaGone(msg)
+      ? MEDIA_DOWNLOAD_STATUS.NOT_DOWNLOADED
+      : normalizeDownloadStatus(downloadState?.status);
     const sendingProgress = resolveUploadProgress(msg);
     const videoStillUploading = isMediaStillUploading(msg);
     const thumbnailSource = toSecureMediaUri(resolveCachedThumbnailUrl(msg));
@@ -7415,7 +7643,7 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys]);
+  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys, goneMedia, thumbnailCacheVersion]);
 
 
   // FlatList extraData for media rows. Its identity changes only when one of
@@ -7432,9 +7660,13 @@ export default function ChatScreen({ navigation, route }) {
   // seeded bubbles have already painted. Without it here those mounted cells
   // keep their first verdict — every row stuck on the received side — until
   // something unrelated recycles them.
+  // goneMedia / thumbnailCacheVersion: a file deleted in the gallery/Photos
+  // must blur its bubble the moment it's detected (app back in front), not
+  // only after leaving and re-entering the chat — and the healed server
+  // thumbnail behind that blur must paint as soon as it arrives.
   const mediaRenderExtra = useMemo(
-    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId }),
-    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId]
+    () => ({ downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId, goneMedia, thumbnailCacheVersion }),
+    [downloadedMedia, mediaDownloadStates, downloadProgress, uploadProgress, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId, goneMedia, thumbnailCacheVersion]
   );
 
   // The list cell renderer. VirtualizedList (RN 0.81 / React 19) hands every
@@ -9138,10 +9370,10 @@ export default function ChatScreen({ navigation, route }) {
                       // Same album + same dialog-free path as an auto-download save, so a manual
       // save never raises Android's "Allow … to modify this photo?" prompt and
       // lands where the auto-saved media already lives.
-      await saveAssetToAlbum(
+      rememberGalleryAsset(msg, await saveAssetToAlbum(
         await ensureSaveableFileUri(localUri, msg),
         (msg?.type || '').toLowerCase() === 'video' ? 'TalksTry Video' : 'TalksTry Images',
-      );
+      ));
                       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                       setViewerSavedToast(true);
                       if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);
@@ -9195,6 +9427,7 @@ export default function ChatScreen({ navigation, route }) {
                           <Video
                             ref={ref => { videoRefs.current[page.uri] = ref; }}
                             source={{ uri: toSecureMediaUri(page.uri) }}
+                            onError={() => onAlbumPageError(index)}
                             style={{ width: '100%', height: '100%' }}
                             // iOS keeps native controls (they respect the home
                             // indicator); Android uses the custom bar below so the
@@ -9214,6 +9447,7 @@ export default function ChatScreen({ navigation, route }) {
                               two-finger pan moves a zoomed image */}
                           <ImageZoom
                             uri={toSecureMediaUri(page.uri)}
+                            onError={() => onAlbumPageError(index)}
                             minScale={1}
                             maxScale={5}
                             doubleTapScale={3}
@@ -9266,17 +9500,22 @@ export default function ChatScreen({ navigation, route }) {
                       // resolve, then swap the fresh URL into the open viewer.
                       // Local files don't expire; leave those errors alone.
                       onError={() => {
-                        if (!/^https?:\/\//i.test(String(localMediaViewer.uri || ''))) return;
+                        // Can't be shown at all (dead local file, or the
+                        // server copy is gone) → close + "Couldn't download".
+                        if (!/^https?:\/\//i.test(String(localMediaViewer.uri || ''))) {
+                          failViewerMedia();
+                          return;
+                        }
                         const msg = viewerActiveMessage();
                         const mediaId = getResolvedMediaId(msg);
-                        if (!mediaId) return;
+                        if (!mediaId) { failViewerMedia(); return; }
                         healExpiredMediaUrl(msg)
                           .then(() => {
                             const fresh = resolvedFullUrlRef.current[mediaId];
-                            if (!fresh || fresh === localMediaViewer.uri) return;
+                            if (!fresh || fresh === localMediaViewer.uri) { failViewerMedia(); return; }
                             setLocalMediaViewer((prev) => (prev.visible ? { ...prev, uri: fresh } : prev));
                           })
-                          .catch(() => {});
+                          .catch(() => failViewerMedia());
                       }}
                     />
                   </GestureHandlerRootView>
@@ -9295,6 +9534,7 @@ export default function ChatScreen({ navigation, route }) {
                     progressUpdateIntervalMillis={250}
                     resizeMode={ResizeMode.CONTAIN}
                     shouldPlay
+                    onError={() => failViewerMedia()}
                   />
                 )}
               </>
@@ -9477,6 +9717,21 @@ export default function ChatScreen({ navigation, route }) {
         onSelectOption={handleMediaOptionSelect}
         onSendMedia={handleSheetSendMedia}
         onOpenSystemPicker={handleSheetOpenSystemPicker}
+      />
+      <StatusUnavailableModal
+        visible={mediaUnavailable}
+        onClose={() => setMediaUnavailable(false)}
+        title="Couldn't download"
+        message="Can't download. Please ask that it be resent to you."
+        theme={theme}
+        isDarkMode={isDarkMode}
+      />
+      <StatusUnavailableModal
+        visible={Boolean(statusUnavailable)}
+        onClose={() => setStatusUnavailable(null)}
+        expired={statusUnavailable?.expired !== false}
+        theme={theme}
+        isDarkMode={isDarkMode}
       />
     </GestureHandlerRootView>
   );
