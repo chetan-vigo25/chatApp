@@ -55,6 +55,14 @@ class PermissionManager {
   }
 
   /**
+   * The subset the first-run screen asks for (Notifications, Location). Everything
+   * else is requested in context by its feature via ensurePermission.
+   */
+  listStartup() {
+    return this.listApplicable().filter((entry) => entry.startup);
+  }
+
+  /**
    * Passive status read — safe from any context, never shows a dialog.
    * Layers the remembered "permanently denied" verdict on top of the live result,
    * because some platform APIs cannot report `canAskAgain` on a passive check.
@@ -140,10 +148,10 @@ class PermissionManager {
   }
 
   /**
-   * Fire the NATIVE OS permission dialog for every applicable permission, one at a
-   * time, in catalog order. Used by the startup flow: right after Splash the app
-   * asks each permission via the real Android/iOS system dialog — no custom UI in
-   * between.
+   * Fire the NATIVE OS permission dialog for each STARTUP permission (Notifications,
+   * Location), one at a time, in catalog order. Used by the first-run screen right
+   * after Continue — no custom UI in between. Mic / camera / photos / files are
+   * not asked here; their features ask just-in-time via ensurePermission.
    *
    * Rules kept intact:
    *   • already-granted permissions are skipped (never re-asked);
@@ -158,7 +166,7 @@ class PermissionManager {
   async requestAllSequentially(onProgress) {
     const results = {};
 
-    for (const entry of this.listApplicable()) {
+    for (const entry of this.listStartup()) {
       // Read the live status first — only raise a dialog when the OS will actually
       // show one (undetermined / re-askable denied). Granted or blocked → skip.
       let status = await this.check(entry.id);
@@ -176,7 +184,7 @@ class PermissionManager {
 
   /** True when every `required: true` applicable permission is satisfied. */
   areRequiredSatisfied(statuses = {}) {
-    return this.listApplicable()
+    return this.listStartup()
       .filter((entry) => entry.required)
       .every((entry) => isSatisfied(statuses[entry.id]));
   }

@@ -18,10 +18,11 @@ import { releaseNotificationPrompt } from '../notificationPromptGate';
  * collection that isn't obvious to the user (location attached to logins and
  * calls) must be disclosed prominently, not only in the OS rationale string.
  *
- * STEP 2 — After Continue, this screen fires the NATIVE Android/iOS permission
- * dialogs, one after another, for every permission the app uses (except
- * Contacts, which is asked in context by its own feature). Each system dialog
- * carries the OS usage string as its rationale.
+ * STEP 2 — After Continue, this screen fires the NATIVE Android/iOS dialogs for
+ * Notifications and Location only (catalog `startup: true`), one after another.
+ * Microphone, Camera, Photos and Files are asked the first time their feature is
+ * used (call / voice note, capture, gallery or profile photo, documents) via
+ * ensurePermission; Contacts by its own feature. Once granted, the OS keeps it.
  *
  * Once every dialog has been answered (granted or not — we never force or fake
  * a grant), onboarding is marked complete and the app navigates to its real

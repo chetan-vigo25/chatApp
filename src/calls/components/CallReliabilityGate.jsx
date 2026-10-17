@@ -1,17 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Modal, View, Text, TouchableOpacity, StyleSheet, AppState, Platform, DeviceEventEmitter,
+  Modal, View, Text, TouchableOpacity, StyleSheet, AppState, Platform, DeviceEventEmitter, Linking,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useAuth } from '../../contexts/AuthContext';
 import { useTheme } from '../../contexts/ThemeContext';
 import {
-  requestDisableBatteryOptimization, openAutoStartSettings,
+  requestDisableBatteryOptimization, openAutoStartSettings, openFullScreenIntentSettings,
 } from '../../../modules/expo-call-ui';
 import {
-  shouldOfferReliability, snoozeReliability, dismissReliabilityForever,
-  clearReliabilityFlags, isBackgroundAllowed, RELIABILITY_OPEN_EVENT,
-  maybeAutoRequestBackground,
+  evaluateReliability, getReliabilityIssues, snoozeReliability, dismissReliabilityForever,
+  clearReliabilityFlags, RELIABILITY_OPEN_EVENT, maybeAutoRequestBackground,
+  acknowledgeAutoStart,
 } from '../services/callReliability';
 
 /**
@@ -21,16 +21,18 @@ import {
  * from battery optimization AND enables OEM Autostart — this card jumps straight
  * to both toggles. Self-contained: mount it once (CallProvider) with no wiring.
  *
- * Shows only when: Android + signed in + battery-optimization NOT granted + not
- * snoozed / permanently dismissed. Re-checks whenever the app returns to the
- * foreground (e.g. right after the user grants the exemption) and closes itself
- * the moment background activity is actually allowed.
+ * Shows only when: Android + signed in + at least one reliability problem (see
+ * callReliabilityPolicy: notifications off, calls channel off, Android 14+
+ * full-screen intent denied, battery exemption missing, known-OEM Autostart not
+ * yet pointed at) + not snoozed / permanently dismissed. Re-checks whenever the
+ * app returns to the foreground (e.g. right after the user fixes a setting).
  */
 export default function CallReliabilityGate() {
   const { isAuthenticated } = useAuth();
   const { theme, isDarkMode } = useTheme();
   const c = theme?.colors || {};
   const [visible, setVisible] = useState(false);
+  const [issues, setIssues] = useState([]);
   const evaluatingRef = useRef(false);
 
   const evaluate = useCallback(async () => {
@@ -38,18 +40,22 @@ export default function CallReliabilityGate() {
     if (evaluatingRef.current) return;
     evaluatingRef.current = true;
     try {
-      const offer = await shouldOfferReliability();
+      const { offer, issues: found } = await evaluateReliability();
+      setIssues(found);
       if (offer) {
-        // First entry: fire the OS's own "allow background activity" dialog
-        // directly instead of our onboarding card — the user grants it in one
-        // tap with no in-app interruption. The card only ever auto-shows later
-        // (post-snooze) if the exemption is still missing; Settings can always
-        // open it manually.
-        const systemDialogFired = await maybeAutoRequestBackground();
+        // First entry with ONLY the battery exemption missing: fire the OS's own
+        // "allow background activity" dialog directly instead of our onboarding
+        // card - the user grants it in one tap with no in-app interruption. Any
+        // other problem (notifications, full-screen, Autostart) needs the card,
+        // which also lists the battery row. Settings can always open it manually.
+        const onlyBattery = found.length === 1 && found[0] === 'battery';
+        const systemDialogFired = onlyBattery ? await maybeAutoRequestBackground() : false;
         setVisible(!systemDialogFired);
       } else {
         setVisible(false);
-        if (isBackgroundAllowed()) clearReliabilityFlags();
+        // Clean slate only when EVERYTHING is fixed; clearing snooze while another
+        // problem remains would make the card nag again at once.
+        if (found.length === 0) clearReliabilityFlags();
       }
     } finally {
       evaluatingRef.current = false;
@@ -70,7 +76,10 @@ export default function CallReliabilityGate() {
 
   // Manual open from Settings — always shows (ignores snooze / "don't show again").
   useEffect(() => {
-    const sub = DeviceEventEmitter.addListener(RELIABILITY_OPEN_EVENT, () => setVisible(true));
+    const sub = DeviceEventEmitter.addListener(RELIABILITY_OPEN_EVENT, async () => {
+      try { setIssues(await getReliabilityIssues()); } catch (_) { /* no-op */ }
+      setVisible(true);
+    });
     return () => sub.remove();
   }, []);
 
@@ -82,6 +91,16 @@ export default function CallReliabilityGate() {
 
   const onOpenAutostart = useCallback(() => {
     openAutoStartSettings();
+    acknowledgeAutoStart(); // pointed at it once per install (P-C-09)
+  }, []);
+
+  const onOpenNotificationSettings = useCallback(() => {
+    // App notification settings (POST_NOTIFICATIONS / the calls channel live here).
+    Linking.openSettings().catch(() => {});
+  }, []);
+
+  const onOpenFullScreenSettings = useCallback(() => {
+    openFullScreenIntentSettings();
   }, []);
 
   const onLater = useCallback(async () => {
@@ -96,7 +115,7 @@ export default function CallReliabilityGate() {
 
   if (Platform.OS !== 'android' || !visible) return null;
 
-  const bg = isDarkMode ? '#1F2C34' : '#FFFFFF';
+  const bg = c.menuSurface || (isDarkMode ? '#202323' : '#FFFFFF');
   const text = isDarkMode ? '#FFFFFF' : (c.primaryTextColor || '#111');
   const subText = isDarkMode ? 'rgba(255,255,255,0.72)' : (c.secondaryTextColor || '#555');
   const brand = c.primary || '#03b0a2';
@@ -111,28 +130,56 @@ export default function CallReliabilityGate() {
           </View>
           <Text style={[styles.title, { color: text }]}>Don’t miss incoming calls</Text>
           <Text style={[styles.body, { color: subText }]}>
-            To receive calls and notifications when the app is closed or after you
-            restart your phone, allow the app to run in the background. On some
-            phones you also need to turn on “Autostart”.
+            {issues.includes('notifications') || issues.includes('callChannel')
+              ? 'Notifications for this app are turned off, so incoming calls cannot ring. Turn them on to receive calls.'
+              : 'To receive calls and notifications when the app is closed or after you restart your phone, allow the app to run in the background. On some phones you also need to turn on “Autostart”.'}
           </Text>
 
-          <TouchableOpacity
-            style={[styles.primaryBtn, { backgroundColor: brand }]}
-            activeOpacity={0.85}
-            onPress={onAllowBackground}
-          >
-            <Ionicons name="battery-charging" size={18} color="#fff" />
-            <Text style={styles.primaryBtnText}>Allow background activity</Text>
-          </TouchableOpacity>
+          {(issues.includes('notifications') || issues.includes('callChannel')) && (
+            <TouchableOpacity
+              style={[styles.primaryBtn, { backgroundColor: brand }]}
+              activeOpacity={0.85}
+              onPress={onOpenNotificationSettings}
+            >
+              <Ionicons name="notifications" size={18} color="#fff" />
+              <Text style={styles.primaryBtnText}>
+                {issues.includes('notifications') ? 'Turn on notifications' : 'Turn on call notifications'}
+              </Text>
+            </TouchableOpacity>
+          )}
 
-          <TouchableOpacity
-            style={[styles.secondaryBtn, { borderColor: divider }]}
-            activeOpacity={0.85}
-            onPress={onOpenAutostart}
-          >
-            <Ionicons name="rocket-outline" size={18} color={text} />
-            <Text style={[styles.secondaryBtnText, { color: text }]}>Open autostart settings</Text>
-          </TouchableOpacity>
+          {issues.includes('fullScreen') && (
+            <TouchableOpacity
+              style={[styles.secondaryBtn, { borderColor: divider }]}
+              activeOpacity={0.85}
+              onPress={onOpenFullScreenSettings}
+            >
+              <Ionicons name="phone-portrait-outline" size={18} color={text} />
+              <Text style={[styles.secondaryBtnText, { color: text }]}>Allow full-screen calls</Text>
+            </TouchableOpacity>
+          )}
+
+          {(issues.length === 0 || issues.includes('battery')) && (
+            <TouchableOpacity
+              style={[styles.primaryBtn, { backgroundColor: brand }]}
+              activeOpacity={0.85}
+              onPress={onAllowBackground}
+            >
+              <Ionicons name="battery-charging" size={18} color="#fff" />
+              <Text style={styles.primaryBtnText}>Allow background activity</Text>
+            </TouchableOpacity>
+          )}
+
+          {(issues.length === 0 || issues.includes('battery') || issues.includes('autostart')) && (
+            <TouchableOpacity
+              style={[styles.secondaryBtn, { borderColor: divider }]}
+              activeOpacity={0.85}
+              onPress={onOpenAutostart}
+            >
+              <Ionicons name="rocket-outline" size={18} color={text} />
+              <Text style={[styles.secondaryBtnText, { color: text }]}>Open autostart settings</Text>
+            </TouchableOpacity>
+          )}
 
           <View style={styles.footer}>
             <TouchableOpacity onPress={onLater} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>

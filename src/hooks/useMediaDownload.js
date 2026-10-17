@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import localStorageService from '../services/LocalStorageService';
 import downloadQueue from '../services/DownloadQueue';
+import { isRebasableAppPath } from '../utils/mediaLocalPaths';
 
 export default function useMediaDownload(mediaId) {
   const [status, setStatus] = useState('idle');
@@ -16,10 +17,23 @@ export default function useMediaDownload(mediaId) {
     const bootstrap = async () => {
       const record = await localStorageService.getMediaFile(mediaId);
       if (mounted && record?.localPath) {
-        setLocalPath(record.localPath);
-        setStatus('completed');
-        setProgress(100);
-        return;
+        // The record is the tile's whole state, so check the file it points at: a stale iOS
+        // container path is re-based (and the record healed); a file that is really gone
+        // drops the record so the tile offers the download again instead of showing a
+        // permanent blank "downloaded" tile. Only the app's own files are judged.
+        let live = record.localPath;
+        if (isRebasableAppPath(record.localPath)) {
+          live = await localStorageService.resolveExistingPath(record.localPath);
+          if (!mounted) return;
+          if (live && live !== record.localPath) localStorageService.repointMediaRecord(mediaId, live).catch(() => {});
+          if (!live) localStorageService.forgetMediaRecord(mediaId).catch(() => {});
+        }
+        if (live) {
+          setLocalPath(live);
+          setStatus('completed');
+          setProgress(100);
+          return;
+        }
       }
       // RE-ATTACH, don't assume idle: downloads are owned by the module-level
       // DownloadQueue/MediaService and keep running across navigation — the

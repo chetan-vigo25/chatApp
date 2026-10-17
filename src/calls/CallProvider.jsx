@@ -56,7 +56,7 @@ import nativeCall from './services/nativeCallService';
 import { registerVoipPush } from './services/voipPushService';
 import {
   ringCall, cancelCall, acceptCallSignal, rejectCallSignal, endCallSignal,
-  registerCallSignalListeners, pullPendingCalls, syncCallState, buildCallDeviceInfo,
+  registerCallSignalListeners, pullPendingCalls, syncCallState, buildCallDeviceInfo, emitRinging,
   conferenceInvite, conferenceMedia, conferenceState, conferenceEnd, conferenceRemove,
   conferenceAccept, conferenceReject, conferenceLeave,
 } from './services/callSignalService';
@@ -68,7 +68,12 @@ import { subscribeSocketState } from '../Redux/Services/Socket/socket';
 // build (required for the ExpoCallUi CallStyle notification anyway), enabling
 // cold-start Answer replay (consumeInitialNotifeeCall) and dismissing the
 // incoming-call notification once answered/ended (cancelIncomingCallNotifee).
-import { CALL_PUSH_EVENTS, isStaleCallPush, callPushAgeMs, AGED_CALL_PUSH_MS } from '../firebase/callEvents';
+import { CALL_PUSH_EVENTS } from '../firebase/callEvents';
+import {
+  classifyCallPush, decideSessionGuard, selectDeclinesToSend, isDifferentCall,
+} from './callPushGuards';
+import { getServerOffsetMs, observeServerTime } from './services/callServerClock';
+import { getPendingDeclines, clearPendingDeclines } from '../../modules/expo-call-ui';
 import {
   cancelAllIncomingCallNotifee, consumeInitialNotifeeCall, displayIncomingCallNotifee,
   startOngoingCallNotification, stopOngoingCallNotification,
@@ -246,6 +251,47 @@ const PEER_REDIAL_GUARD_MS = 4000;
 // guarantees the call still ends even if no server signal arrives.
 const RECONNECT_TIMEOUT_MS = 7000;
 
+// OUR OWN media path dropped (ICE failed/disconnected, media socket flap —
+// wifi↔4G handover, lift, tunnel). The peer is still there, so the 5s
+// peer-gone rule above does not apply: give the SDK's recovery ladder (ICE
+// restart every 3s, full rebuild at 12s, gives up at 30s) room to work instead
+// of hanging up at 7s, before the rebuild had even started.
+const RECONNECT_SELF_TIMEOUT_MS = 25000;
+
+// After the engine reports the media-plane accept itself failed (cmdError).
+const ACCEPT_FAIL_GRACE_MS = 8000;
+
+// A media-plane decline on a 1:1 dial waits this long for the authoritative
+// app-plane verdict (call:rejected / call:accepted) before ending the call.
+const MEDIA_DECLINE_GRACE_MS = 2500;
+
+// Why THIS device ended the call — rides on call:end / cancel / reject as the
+// server CallTraces' endCode/endTrigger/endSource (same vocabulary as web's
+// deriveEndCause). Without it every app-side end looked identical in the trace.
+const deriveEndCause = (reason, message, snap, opts) => {
+  const appState = AppState.currentState || null;
+  if (opts?.byUser) {
+    let code = 'user_hangup';
+    if (reason === 'rejected') code = 'user_decline';
+    else if (snap.direction === 'outgoing' && !snap.answeredAt) code = 'user_cancel';
+    else if (opts.endAll) code = 'host_end_all';
+    const trig = typeof opts.trigger === 'string' && /^[a-z0-9_.:-]{1,32}$/.test(opts.trigger) ? opts.trigger : 'call_screen';
+    return { code, trigger: trig, source: 'user', appState };
+  }
+  const m = String(message || '');
+  let code = 'remote_ended';
+  if (reason === 'failed') {
+    if (/connection lost/i.test(m)) code = 'connection_lost';
+    else if (/could not connect the call media/i.test(m)) code = 'media_failed';
+    else if (/could not connect/i.test(m)) code = 'connect_timeout';
+    else if (/microphone|permission/i.test(m)) code = 'permission_denied';
+    else code = 'call_failed';
+  } else if (reason === 'missed') code = 'remote_missed';
+  else if (reason === 'rejected') code = 'remote_declined';
+  else if (reason === 'cancelled') code = /no answer/i.test(m) ? 'ring_timeout' : 'remote_cancelled';
+  return { code, trigger: 'system', source: 'app_auto', message: m || null, appState };
+};
+
 // The same bound for a call whose app is NOT in the foreground (screen locked,
 // app switched away). Everything the 7s assumes stops being true there: iOS
 // throttles timers and networking the instant the screen locks, so an ICE
@@ -414,6 +460,9 @@ export const CallProvider = ({ children }) => {
   // IDLE, making the provider stage a duplicate instead of reconciling the
   // engine callId (accept then hangs on pendingAccept — "Connecting…" forever).
   const stagedIncomingRef = useRef({ peerId: null, ts: 0 });
+  const acceptRef = useRef(null); // latest accept() — startCall (declared earlier) calls it
+  const pullStillRingingRef = useRef(null); // latest pullStillRingingInvites (same reason)
+  const glareAcceptRef = useRef(null); // { peerId, until } — auto-accept their ring after a lost glare
   const pushAcceptPendingRef = useRef(false); // Accept tapped on a call push → answer once INCOMING is committed
   // The call THIS device just accepted (id + ts). A `call:cancelled-elsewhere`
   // with reason answered_elsewhere for this same call is our OWN win echoing on
@@ -1485,10 +1534,11 @@ export const CallProvider = ({ children }) => {
     // (an id is present); pure-WebRTC fallbacks have no lock to clear.
     if (snap.signalId && snap.peer?.id) {
       const otherIds = (snap.peers || []).map((p) => p.id).filter(Boolean);
+      const cause = deriveEndCause(reason, message, snap, opts);
       if (reason === 'rejected' && snap.direction === 'incoming') {
-        rejectCallSignal({ callId: snap.signalId, callerId: snap.peer.id });
+        rejectCallSignal({ callId: snap.signalId, callerId: snap.peer.id, cause });
       } else if (snap.direction === 'outgoing' && !snap.answeredAt) {
-        cancelCall({ callId: snap.signalId, toUserIds: otherIds });
+        cancelCall({ callId: snap.signalId, toUserIds: otherIds, cause });
       } else if (opts?.leaveOnly && snap.isConference) {
         // LEAVING a real CONFERENCE that continues without me. `call:end` is the
         // 1:1 "this call is over" vocabulary, broadcast to every other member —
@@ -1506,7 +1556,7 @@ export const CallProvider = ({ children }) => {
         // one participant", not "end the call".
         if (__DEV__) console.log('[CALL][APP] leaving a multi-party call — conference:leave only, no broadcast call:end');
       } else {
-        endCallSignal({ callId: snap.signalId, otherUserIds: otherIds });
+        endCallSignal({ callId: snap.signalId, otherUserIds: otherIds, cause });
       }
       // CONFERENCE: the emits above are the 1:1 vocabulary — they release the busy
       // lock and notify the peer, but they do NOT tell the server we left the
@@ -1813,7 +1863,7 @@ export const CallProvider = ({ children }) => {
   // Arm the post-answer connect watchdog. Fires once if an ANSWERED call hasn't
   // reached ACTIVE (remote media flowing) within CONNECT_TIMEOUT_MS — turning an
   // otherwise-indefinite "Connecting…" hang into a clean "Couldn't connect".
-  const armConnectWatchdog = useCallback(() => {
+  const armConnectWatchdog = useCallback((ms = CONNECT_TIMEOUT_MS) => {
     clearConnectWatchdog();
     connectWatchdogRef.current = setTimeout(() => {
       connectWatchdogRef.current = null;
@@ -1828,7 +1878,7 @@ export const CallProvider = ({ children }) => {
       }
       reportCallFailure('connect-watchdog: answered but never reached ACTIVE');
       finalizeEnd('failed', 'Could not connect the call');
-    }, CONNECT_TIMEOUT_MS);
+    }, Number.isFinite(ms) && ms > 0 ? ms : CONNECT_TIMEOUT_MS);
   }, [clearConnectWatchdog, finalizeEnd, reportCallFailure]);
 
   // Arm the media-ring watchdog. Only meaningful while the accept is parked on
@@ -1882,9 +1932,12 @@ export const CallProvider = ({ children }) => {
   // Arm the mid-call reconnect watchdog (APP-6). Fires once if the dropped media
   // layer hasn't recovered within RECONNECT_TIMEOUT_MS — ending the call as
   // "Connection lost" rather than leaving a live-looking but dead call on screen.
-  const armReconnectWatchdog = useCallback(() => {
+  // kind: 'peer' (peerLeft — the other side vanished) | 'self' (our own media
+  // path is down). See RECONNECT_TIMEOUT_MS vs RECONNECT_SELF_TIMEOUT_MS.
+  const armReconnectWatchdog = useCallback((kind = 'peer') => {
     clearReconnectWatchdog();
     const armedAt = Date.now();
+    const fgLimitMs = kind === 'self' ? RECONNECT_SELF_TIMEOUT_MS : RECONNECT_TIMEOUT_MS;
     const tick = () => {
       reconnectWatchdogRef.current = null;
       const snap = stateRef.current;
@@ -1902,14 +1955,20 @@ export const CallProvider = ({ children }) => {
         reconnectWatchdogRef.current = setTimeout(tick, RECONNECT_TIMEOUT_MS);
         return;
       }
+      // Came back to the foreground mid-hold: still allow the full foreground
+      // window measured from the drop before declaring it lost.
+      if (elapsedMs < fgLimitMs) {
+        reconnectWatchdogRef.current = setTimeout(tick, Math.max(1000, fgLimitMs - elapsedMs));
+        return;
+      }
       if (__DEV__) {
         console.log('[CALL] reconnect watchdog — media never recovered → ending', {
-          platform: Platform.OS, appState: AppState.currentState, elapsedMs,
+          platform: Platform.OS, appState: AppState.currentState, elapsedMs, kind,
         });
       }
       finalizeEnd('failed', 'Connection lost');
     };
-    reconnectWatchdogRef.current = setTimeout(tick, RECONNECT_TIMEOUT_MS);
+    reconnectWatchdogRef.current = setTimeout(tick, fgLimitMs);
   }, [clearReconnectWatchdog, finalizeEnd]);
 
   // Flip the live call's UI to VIDEO (mid-call upgrade — self camera on, or the
@@ -2085,8 +2144,13 @@ export const CallProvider = ({ children }) => {
             && (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED)
             && re.peerId === fromId
             && Date.now() - re.ts < PEER_REDIAL_GUARD_MS) {
-            if (__DEV__) console.log('[CALL][APP] redial-loop re-ring from just-declined peer — auto-declining', payload?.callId);
-            if (payload?.callId) sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
+            // DROP it locally — never REJECT. A reject travels to the caller as
+            // "Call declined", and when this was a GENUINE quick redial whose
+            // app-socket ring had not landed yet, it killed the new call while
+            // the backend kept this phone ringing (live repro Oct-12). Releasing
+            // only clears the SDK's pending ring so the next ring can reconcile.
+            if (__DEV__) console.log('[CALL][APP] redial-loop re-ring from just-declined peer — dropped locally (no decline sent)', payload?.callId);
+            sendCmd({ cmd: CMD.RELEASE_PEER_RING, peerId: fromId });
             break;
           }
         }
@@ -2188,6 +2252,7 @@ export const CallProvider = ({ children }) => {
           if (payload?.callId) sendCmd({ cmd: CMD.REJECT, callId: payload.callId });
           break;
         }
+        if (resetTimerRef.current) { clearTimeout(resetTimerRef.current); resetTimerRef.current = null; } // new call — see onSignalIncoming
         endedRef.current = false;
         // A previous call's accept lock must never block this ring. The app-socket
         // path clears this; the engine path (a call that only ever arrives over the
@@ -2514,7 +2579,15 @@ export const CallProvider = ({ children }) => {
       // accept) ends it cleanly. Either way the call gets its chance to connect.
       case 'cmdError': {
         if (payload?.cmd === 'accept') {
-          if (__DEV__) console.log('[CALL][APP] cmdError:accept — letting connect watchdog / server signal decide (no instant end)');
+          // The media-plane accept failed after the SDK's own retries. Don't
+          // end instantly (the caller's redial loop can still re-ring us and
+          // the reconcile re-accepts), but don't sit on "Connecting…" for the
+          // full 30s either: shorten the connect watchdog to a short grace.
+          const snap = stateRef.current;
+          if (__DEV__) console.log('[CALL][APP] cmdError:accept — short grace before failing', { message: payload?.message });
+          if (snap.status !== CALL_STATUS.ACTIVE && snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
+            armConnectWatchdog(ACCEPT_FAIL_GRACE_MS);
+          }
         }
         break;
       }
@@ -2549,8 +2622,28 @@ export const CallProvider = ({ children }) => {
           // Unattributed decline on a call we are already IN says nothing about
           // us — the engine cannot tell us whose it was, so it cannot end us.
           if (snap.answeredAt || snap.status === CALL_STATUS.ACTIVE) break;
+          finalizeEnd('rejected');
+          break;
         }
-        finalizeEnd('rejected');
+        // 1:1 MEDIA-plane decline. The APP plane (call:rejected → onSignalRejected)
+        // is authoritative for a real decline. Live repro (Oct-12): the callee
+        // answered on one web tab; their OTHER linked tab withdrew its media ring
+        // (declineCall) and that decline ended our just-answered call as
+        // "remote_declined". So: answered → ignore; still ringing → short grace,
+        // and end only if the app plane never answered in it.
+        if (snap.answeredAt || snap.accepted || snap.status === CALL_STATUS.ACTIVE) {
+          if (__DEV__) console.log('[CALL][APP] media-plane decline after answer — ignored (sibling device)');
+          break;
+        }
+        {
+          const sig = snap.signalId;
+          setTimeout(() => {
+            const now = stateRef.current;
+            if (endedRef.current || now.signalId !== sig) return;
+            if (now.answeredAt || now.accepted || now.status !== CALL_STATUS.OUTGOING) return;
+            finalizeEnd('rejected');
+          }, MEDIA_DECLINE_GRACE_MS);
+        }
         break;
       }
       case 'cancelled': {
@@ -2625,7 +2718,7 @@ export const CallProvider = ({ children }) => {
             });
           }
           dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: true });
-          armReconnectWatchdog();
+          armReconnectWatchdog('self');
           // Nudge the transport to renegotiate immediately (in addition to any
           // NetInfo-triggered restart) so recovery is as fast as possible.
           sendCmd({ cmd: CMD.RESTART_ICE });
@@ -2633,6 +2726,23 @@ export const CallProvider = ({ children }) => {
           // ('stream' re-arms it when the media path comes back).
           const oar = outgoingAudioRecoveryRef.current;
           if (oar.timer) { clearTimeout(oar.timer); oar.timer = null; }
+        }
+        break;
+      }
+      // The PEER's media path died / recovered (media server ICE consent):
+      // their network dropped. Show "Reconnecting…" here too, bounded by the
+      // same 25s window the dropping side gives itself.
+      case 'peerMedia': {
+        const snap = stateRef.current;
+        if (snap.isGroup || snap.status !== CALL_STATUS.ACTIVE) break;
+        if (payload?.state === 'disconnected') {
+          if (!snap.reconnecting) {
+            dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: true });
+            armReconnectWatchdog('self');
+          }
+        } else if (payload?.state === 'connected' && snap.reconnecting) {
+          clearReconnectWatchdog();
+          dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: false });
         }
         break;
       }
@@ -2683,7 +2793,7 @@ export const CallProvider = ({ children }) => {
       }
       default: break;
     }
-  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording, upgradeUiToVideo, applyInitialCallRoute, removeGroupParticipant, scheduleEngineRetry, clearEngineRetry]);
+  }, [doConnect, finalizeEnd, myId, sendCmd, startRinging, stopRinging, armRingTimeout, clearRingTimeout, clearMediaWatchdog, armMediaWatchdog, clearConnectWatchdog, armConnectWatchdog, clearReconnectWatchdog, armReconnectWatchdog, maybeStartRecording, upgradeUiToVideo, applyInitialCallRoute, removeGroupParticipant, scheduleEngineRetry, clearEngineRetry]);
 
   // ---- public actions ----
   // `peerOrPeers` is a single peer object OR an array (group, up to
@@ -2759,6 +2869,26 @@ export const CallProvider = ({ children }) => {
       Alert.alert('Calling service', 'Still connecting to the call service. Please try again in a moment.');
       return;
     }
+    // RE-CHECK after the awaits above (permission + engine-ready probes take
+    // ~0.5s): a ring may have landed meanwhile. Dispatching START_OUTGOING now
+    // overwrote that INCOMING state — the server then refused our dial as glare
+    // and the phone was left on "They are calling you" with their ring LOST
+    // (live repro Oct-12). WhatsApp parity: calling someone who is calling you
+    // answers their call; any other live call → don't dial over it.
+    {
+      const cur = stateRef.current;
+      if (cur.status !== CALL_STATUS.IDLE && cur.status !== CALL_STATUS.ENDED) {
+        const samePeer = !isGroup && cur.status === CALL_STATUS.INCOMING && !cur.accepted
+          && cur.peer?.id && String(cur.peer.id) === String(peers[0]?.id);
+        if (__DEV__) console.log('[CALL][APP][startCall] a call arrived while dialing →', samePeer ? 'answering THEIR call' : 'abort', { status: cur.status });
+        if (samePeer) acceptRef.current?.();
+        return;
+      }
+    }
+    // A NEW call is starting: the previous call's end-linger RESET (3s / 500ms,
+    // see finalizeEnd) must not fire into it — it wiped a call-back that
+    // arrived within the linger ("call-back right after a decline does nothing").
+    if (resetTimerRef.current) { clearTimeout(resetTimerRef.current); resetTimerRef.current = null; }
     endedRef.current = false;
     initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
     // A GROUP call now carries its thread id when the caller knows it (the chat
@@ -2821,6 +2951,20 @@ export const CallProvider = ({ children }) => {
 
     const everyoneBusy = ack && ack.busy
       && (!isGroup || (Array.isArray(ack.ringingUserIds) && ack.ringingUserIds.length === 0));
+    // GLARE, 1:1: we dialed each other at once and THEIR call won the server's
+    // tie-break. The user tapped "call" on exactly this person, so connect to
+    // their call (WhatsApp parity) instead of showing "They are calling you"
+    // while their ring got dropped as busy (it landed while we were OUTGOING —
+    // live repro Oct-12). Drop our dead dial silently, re-pull their pending
+    // ring from the server, and auto-accept it when it commits.
+    if (everyoneBusy && ack.glare && !isGroup && peers[0]?.id) {
+      stopRinging();
+      glareAcceptRef.current = { peerId: String(peers[0].id), until: Date.now() + 15000 };
+      dispatch({ type: ACT.RESET });
+      setTimeout(() => { try { pullStillRingingRef.current?.(); } catch (_) {} }, 300);
+      if (__DEV__) console.log('[CALL][APP][startCall] glare lost → answering their call', { peerId: peers[0].id });
+      return;
+    }
     if (everyoneBusy) {
       stopRinging();
       dispatch({
@@ -2979,6 +3123,13 @@ export const CallProvider = ({ children }) => {
     if (__DEV__) console.log('[CALL][APP][accept] STEP 2 media permission', { media: permMedia, permOk });
     // ensureMediaPermissions already showed the prompt / Settings guidance; if
     // it wasn't granted, decline the incoming call cleanly.
+    // The caller may have cancelled (or the ring timed out) while the permission
+    // prompt was up — answering now would start the audio route / CallKit answer
+    // for a dead call. endedRef flips synchronously in finalizeEnd.
+    if (endedRef.current || stateRef.current.status !== CALL_STATUS.INCOMING) {
+      if (__DEV__) console.log('[CALL][APP][accept] call ended during the permission prompt — abort');
+      return;
+    }
     if (!permOk) { finalizeEnd('rejected', 'Permission denied'); return; }
     // Camera denied but mic granted on a VIDEO call → answer as a VOICE call
     // instead of declining. effMedia drives this accept synchronously; the
@@ -2999,6 +3150,10 @@ export const CallProvider = ({ children }) => {
     // iOS: arm the play-and-record audio session before answering so the callee
     // hears the call even with the silent switch on (no-op on Android).
     await configureIOSAudioSession();
+    if (endedRef.current || stateRef.current.status !== CALL_STATUS.INCOMING) {
+      if (__DEV__) console.log('[CALL][APP][accept] call ended while arming the audio session — abort');
+      return;
+    }
     clearRingTimeout();
     stopRinging();
     // Answering on the in-app screen → dismiss the OS call notification too, so
@@ -3174,6 +3329,7 @@ export const CallProvider = ({ children }) => {
       armMediaRingWatchdog();
     }
   }, [sendCmd, stopRinging, clearRingTimeout, ensureConnected, ensureMediaPermissions, configureIOSAudioSession, applyAudioRoute, finalizeEnd, armMediaWatchdog, armConnectWatchdog, armMediaRingWatchdog]);
+  acceptRef.current = accept;
 
   // ── pendingAccept flush (state-driven, race-proof) ─────────────────────────
   // The engine 'incoming' handler reads stateRef, which can be one commit
@@ -3214,7 +3370,7 @@ export const CallProvider = ({ children }) => {
       reportCallFailure(`incoming rejected ${ringAgeMs}ms after ringing (source: ${source})`);
     }
     if (snap.callId) sendCmd({ cmd: CMD.REJECT, callId: snap.callId });
-    finalizeEnd('rejected');
+    finalizeEnd('rejected', undefined, { byUser: true, trigger: source });
   }, [finalizeEnd, sendCmd, reportCallFailure]);
 
   const hangup = useCallback(() => {
@@ -3244,13 +3400,13 @@ export const CallProvider = ({ children }) => {
         { text: 'Cancel', style: 'cancel' },
         // Leave: the call carries on for everyone else — the host migrates
         // server-side. Must NOT broadcast call:end (see finalizeEnd).
-        { text: 'Leave call', onPress: () => finalizeEnd('completed', undefined, { leaveOnly: true }) },
+        { text: 'Leave call', onPress: () => finalizeEnd('completed', undefined, { leaveOnly: true, byUser: true }) },
         {
           text: 'End for everyone',
           style: 'destructive',
           onPress: () => {
             conferenceEnd({ callId: snap.signalId }).catch(() => {});
-            finalizeEnd('completed');
+            finalizeEnd('completed', undefined, { byUser: true, endAll: true });
           },
         },
       ]);
@@ -3258,7 +3414,7 @@ export const CallProvider = ({ children }) => {
     }
     const reason = (snap.status === CALL_STATUS.OUTGOING
       || (snap.status === CALL_STATUS.INCOMING && snap.accepted)) ? 'cancelled' : 'completed';
-    finalizeEnd(reason);
+    finalizeEnd(reason, undefined, { byUser: true });
   }, [finalizeEnd, reject, myId]);
 
   // HOST-ONLY kick — backend validates; a non-host gets a FORBIDDEN ack.
@@ -3734,6 +3890,11 @@ export const CallProvider = ({ children }) => {
     if (__DEV__) console.log('\n[CALL][APP] ═════ INCOMING STEP 0 call:incoming signal (app socket) ═════', { callerId, currentStatus: snap.status, payload });
     markCallEvent('signal:incoming', { callerId, status: snap.status, callId: payload?.callId, via: payload?.uuid ? 'socket' : 'push' });
     if (!callerId) return;
+    // P-C-16: learn the server-minus-device clock offset, from a ring that came
+    // LIVE over the socket only (a push can be hours late; the pending-pull stamps
+    // device time) — push staleness is then judged on server time, so a phone
+    // whose clock runs fast no longer drops live calls.
+    if (opts.liveSocket && payload?.ts) observeServerTime(payload.ts);
     // A ring for a call we JUST ended/declined — a late VoIP push (APNs queued
     // it while the device was unreachable), a socket re-ring, or the caller's
     // redial-loop reassert. The ENGINE 'incoming' path has these guards; this
@@ -3807,8 +3968,26 @@ export const CallProvider = ({ children }) => {
       const rel = getBlockRelation(callerId);
       if (rel.iBlocked || rel.blockedMe) {
         if (__DEV__) console.log('[CALL][APP] incoming ignored — blocked contact', { callerId, rel });
+        // P-C-05: a VoIP push has ALREADY raised the CallKit ring (Apple rule) —
+        // end it, or it rings on with no JS state behind it. 3 = unanswered, which
+        // looks like a missed ring (the caller must not learn they are blocked),
+        // and no reject goes to the server for the same reason.
+        if (opts.skipNativeUi) nativeCall.dismissIncoming(payload?.callId, payload?.uuid || null, 3);
         return;
       }
+    }
+    if (snap.status === CALL_STATUS.INCOMING && isDifferentCall(snap, payload?.callId)) {
+      // P-C-20: a SECOND, different call while one is ringing. It is NOT a
+      // re-assertion of the ring we hold: the uuid re-binding below would point
+      // the live call at this call's CallKit uuid and end the first CallKit call.
+      // The backend busy-gates, so this needs a race; if its VoIP push already put
+      // a CallKit ring up, end that one (busy) and tell the caller (event-driven).
+      if (__DEV__) console.log('[CALL][APP] second call while ringing — not re-binding', { live: snap.signalId, incoming: payload?.callId });
+      if (opts.skipNativeUi) {
+        nativeCall.dismissIncoming(payload?.callId, payload?.uuid || null, 3);
+        rejectCallSignal({ callId: payload?.callId || null, callerId });
+      }
+      return;
     }
     if (snap.status === CALL_STATUS.INCOMING) {
       // Already ringing (e.g. WebRTC arrived first, or it rang notification-only in
@@ -3868,7 +4047,20 @@ export const CallProvider = ({ children }) => {
       }
       return;
     }
-    if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) return; // busy
+    if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
+      // busy. P-C-05: when a VoIP push already raised a CallKit ring for a
+      // DIFFERENT call, end it (provably different callId only — a duplicate push
+      // for the live call must leave it alone) and reject for the caller.
+      if (opts.skipNativeUi && isDifferentCall(snap, payload?.callId)) {
+        nativeCall.dismissIncoming(payload?.callId, payload?.uuid || null, 3);
+        rejectCallSignal({ callId: payload?.callId || null, callerId });
+      }
+      return;
+    }
+    // A NEW call is starting: the previous call's end-linger RESET (3s / 500ms,
+    // see finalizeEnd) must not fire into it — it wiped a call-back that
+    // arrived within the linger ("call-back right after a decline does nothing").
+    if (resetTimerRef.current) { clearTimeout(resetTimerRef.current); resetTimerRef.current = null; }
     endedRef.current = false;
     acceptingRef.current = false; // new ring → a previous call's accept lock must never block this one
     initialRouteAppliedRef.current = false; // new call → re-arm the initial route (see the engine-'incoming' note)
@@ -4011,6 +4203,7 @@ export const CallProvider = ({ children }) => {
         callerImage: peer?.avatar || null,
         callType: payload?.media || 'audio',
       });
+      emitRinging(payload?.callId); // ring-ack: the OS ring is up
       armRingTimeout();
       ensureConnected();
       return;
@@ -4030,6 +4223,9 @@ export const CallProvider = ({ children }) => {
     // activity up. Playing the in-app ringtone too would double-ring.
     const appVisible = AppState.currentState === 'active';
     if (!useCallKit && (Platform.OS !== 'android' || appVisible)) startRinging('incoming');
+    // Ring-ack: this device is ringing (in-app ring, CallStyle or CallKit) →
+    // the caller may switch "Calling…" → "Ringing…".
+    emitRinging(payload?.callId);
     armRingTimeout();
     // Record whether the device was locked when this call arrived → back/end will
     // return to the lock screen instead of exposing the app. Use BOTH the live
@@ -4442,6 +4638,7 @@ export const CallProvider = ({ children }) => {
       });
     } catch (_) { /* best-effort recovery */ }
   }, [onSignalIncoming]);
+  pullStillRingingRef.current = pullStillRingingInvites;
 
   // ── Conference roster handlers (server-authoritative) ─────────────────────
   // The backend broadcasts the full roster on every change; clients render
@@ -4515,7 +4712,7 @@ export const CallProvider = ({ children }) => {
   useEffect(() => {
     if (!isAuthenticated) return undefined;
     const handlers = {
-      onIncoming: onSignalIncoming,
+      onIncoming: (payload) => onSignalIncoming(payload, { liveSocket: true }),
       onCancelled: onSignalCancelled,
       onAccepted: onSignalAccepted,
       onRejected: onSignalRejected,
@@ -4531,6 +4728,18 @@ export const CallProvider = ({ children }) => {
       onConferenceHostChanged,
       onConferenceEnded,
       onConferenceRemoved,
+      // Ring-ack: a callee device is really ringing → "Calling…" → "Ringing…".
+      onRinging: (p) => {
+        const snap = stateRef.current;
+        if (!p?.callId || snap.status !== CALL_STATUS.OUTGOING || snap.ringingConfirmed) return;
+        if (String(p.callId) !== String(snap.signalId || '')) return;
+        dispatch({ type: ACT.SET_FLAG, key: 'ringingConfirmed', value: true });
+      },
+      onPrewarm: (p) => {
+        if (p && typeof p.token === 'string' && p.token) {
+          sendCmd({ cmd: CMD.SET_TOKEN, token: p.token, iceServers: Array.isArray(p.iceServers) ? p.iceServers : null });
+        }
+      },
     };
     let unsub = () => {};
     let wasConnected = false;
@@ -4583,7 +4792,7 @@ export const CallProvider = ({ children }) => {
       wasConnected = connected;
     });
     return () => { unsub(); unsubState(); };
-  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantUpdated, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, onConferenceRemoved, finalizeEnd]);
+  }, [isAuthenticated, onSignalIncoming, onSignalCancelled, onSignalAccepted, onSignalRejected, onSignalEnded, onSignalUnavailable, onSignalTimeout, onSignalCancelledElsewhere, pullStillRingingInvites, onConferenceConverted, onConferenceRoster, onConferenceParticipantUpdated, onConferenceParticipantLeft, onConferenceHostChanged, onConferenceEnded, onConferenceRemoved, finalizeEnd, sendCmd]);
 
   // ---- incoming call from an FCM PUSH (callee offline / app backgrounded) ----
   // The push wakes the device; we reuse onSignalIncoming (which shows the ring +
@@ -4662,7 +4871,11 @@ export const CallProvider = ({ children }) => {
     // arrived while the device was locked/killed): that replay carries no backend
     // `ts`, but isStaleCallPush falls back to the dial time embedded in the
     // signaling callId. Dismiss the dead notification so it can't ring again.
-    if (isStaleCallPush(data)) {
+    // P-C-16: classified on SERVER time (learned offset) so a fast device clock
+    // does not drop a live call; with no offset yet a clock-based "stale" is only
+    // downgraded to 'aged' (verified with the server below), never dropped blind.
+    const pushClass = classifyCallPush(data, Date.now(), getServerOffsetMs());
+    if (pushClass === 'stale') {
       if (__DEV__) console.log('[CALL][APP] stale incoming push/tap dropped — call is over', { callId: data?.callId });
       cancelAllIncomingCallNotifee();
       // iOS: the AppDelegate ALREADY reported this dead call to CallKit (Apple
@@ -4670,6 +4883,17 @@ export const CallProvider = ({ children }) => {
       // remote-ended instead of letting a call that's long over ring the
       // full-screen CallKit UI until its timeout.
       if (data?._voip) nativeCall.dismissIncoming(data?.callId, data?.uuid);
+      return;
+    }
+    // P-C-02 (app half): the push is addressed to a DIFFERENT user than the one
+    // signed in here (account switch / reinstall left an old session's VoIP or FCM
+    // token on this device). Never join; end the CallKit ring the AppDelegate
+    // already raised and clear any call notification. recipientId is additive: an
+    // old server omits it and this is a no-op.
+    if (decideSessionGuard({ recipientId: data?.recipientId, signedInUserId: myId }).action === 'reject') {
+      if (__DEV__) console.log('[CALL][APP] push for another account — ignored', { callId: data?.callId });
+      cancelAllIncomingCallNotifee();
+      if (data?._voip) nativeCall.dismissIncoming(data?.callId, data?.uuid, 3);
       return;
     }
     // iOS VoIP push: the AppDelegate already reported this call to CallKit with
@@ -4692,18 +4916,10 @@ export const CallProvider = ({ children }) => {
     // to A ki kati hui purani call bajne lagi" — while a fresh push (the live
     // path, seconds old) still rings instantly.
     {
-      const age = callPushAgeMs(data);
-      // MULTI-PARTY invites (conference AND group — same reused-id call) get a
-      // wider direct-ring window (25s vs 12s): the backend `ts` is mint-time so
-      // it can't be a stale-flush ghost, but a cold RN boot on a slow device
-      // easily eats >12s after the VoIP push — and the pull fallback needs
-      // auth+socket the boot may not have yet. isStaleCallPush above still drops
-      // anything past the ring window.
-      const truthyFlag = (v) => v === '1' || v === true || v === 1 || v === 'true';
-      const isMultiPush = truthyFlag(data?.isConference) || truthyFlag(data?.isGroup);
-      const agedWindow = isMultiPush ? 25000 : AGED_CALL_PUSH_MS;
-      if (Number.isFinite(age) && age > agedWindow) {
-        if (__DEV__) console.log('[CALL][APP] aged call push — verifying with server before ringing', { callId: data?.callId, ageSec: Math.round(age / 1000) });
+      // 'aged' = older than the direct-ring window (12 s; 25 s for multi-party,
+      // see callPushGuards) but not provably dead.
+      if (pushClass === 'aged') {
+        if (__DEV__) console.log('[CALL][APP] aged call push — verifying with server before ringing', { callId: data?.callId });
         cancelAllIncomingCallNotifee();
         pullStillRingingInvites();
         return;
@@ -4722,7 +4938,7 @@ export const CallProvider = ({ children }) => {
       fullScreen: !!data?._fullScreen,
       skipNativeUi: !!data?._voip,
     });
-  }, [onSignalIncoming, mapPushToIncoming]);
+  }, [onSignalIncoming, mapPushToIncoming, myId, pullStillRingingInvites]);
 
   // Is this OS action (notification button / CallKit / notifee) about a call OTHER
   // than the one we're currently on?
@@ -4767,7 +4983,7 @@ export const CallProvider = ({ children }) => {
     // ended → don't build a ghost ringing state that hangs 30s on the connect
     // watchdog. Same staleness test as onPushIncoming (dial time embedded in the
     // signaling callId when the replay carries no backend `ts`); clear the notif.
-    if (isStaleCallPush(data)) {
+    if (classifyCallPush(data, Date.now(), getServerOffsetMs()) === 'stale') {
       if (__DEV__) console.log('[CALL][APP] stale accept-tap dropped — call is over', { callId: data?.callId });
       cancelAllIncomingCallNotifee();
       // Same fast-dismiss as onPushIncoming: the CallKit ring for this dead
@@ -4851,6 +5067,24 @@ export const CallProvider = ({ children }) => {
     consumeInitialNotifeeCall();
   }, [isAuthenticated]);
 
+  // P-C-06 (Android): a Decline tapped on the ring notification while JS was not
+  // running/observing is persisted natively (CallActionReceiver). Send those
+  // rejects now that we are authenticated — the caller used to ring for the full
+  // ~40 s. Entries older than the ring window are dropped (selectDeclinesToSend).
+  // rejectCallSignal queues until the socket is authenticated, so no timers/polls.
+  useEffect(() => {
+    if (!isAuthenticated || Platform.OS !== 'android') return;
+    let pending = [];
+    try { pending = getPendingDeclines(); } catch (_) { pending = []; }
+    if (!pending.length) return;
+    const { send } = selectDeclinesToSend(pending, { now: Date.now() });
+    send.forEach(({ callId, callerId }) => {
+      if (__DEV__) console.log('[CALL][APP] replaying native DECLINE', { callId });
+      rejectCallSignal({ callId, callerId });
+    });
+    try { clearPendingDeclines(); } catch (_) { /* no-op */ }
+  }, [isAuthenticated]);
+
   // Fire the deferred Accept (from a call-push / CallKit Answer that landed
   // before the ringing state committed) — or the deferred Decline (CallKit End
   // on a cold boot) — the moment the ringing state is committed. accept()
@@ -4873,8 +5107,15 @@ export const CallProvider = ({ children }) => {
     if (pushAcceptPendingRef.current) {
       pushAcceptPendingRef.current = false;
       accept();
+      return;
     }
-  }, [state.status, state.accepted, accept, reject]);
+    // Lost glare → this ring is the call the user just tried to place: answer it.
+    const g = glareAcceptRef.current;
+    if (g && Date.now() < g.until && state.peer?.id && String(state.peer.id) === g.peerId) {
+      glareAcceptRef.current = null;
+      accept();
+    }
+  }, [state.status, state.accepted, state.peer?.id, accept, reject]);
 
   // Enforce "one incoming-call UI at a time" (FCM heads-up OR in-app banner — not
   // both). While the app is foreground the in-app ringing screen is the single
@@ -5673,6 +5914,8 @@ export const CallProvider = ({ children }) => {
               selfAvatar={user?.profileImage || user?.profilePicture || user?.profilePic || user?.avatar || null}
               micOn={state.micOn !== false}
               activeSpeakerId={state.activeSpeakerId}
+              // Full-screen video only: tap the video → show/hide controls.
+              tapToToggle={videoActive && !state.minimized}
             />
           ) : (
             <CallEngineWebView

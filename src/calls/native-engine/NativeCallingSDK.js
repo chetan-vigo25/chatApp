@@ -1,6 +1,8 @@
 import { io } from 'socket.io-client';
 import { Device } from 'mediasoup-client';
 import { getWebrtc } from './webrtcGlobals';
+import { Platform } from 'react-native';
+import { showPicker as showIosBroadcastPicker } from 'expo-screen-broadcast';
 
 /**
  * NATIVE port of the WebView engine's CallingSDK (callEngineHtml.js) — the
@@ -90,6 +92,21 @@ const decodeToken = (token) => {
   return null;
 };
 
+// JWT `exp` in ms (0 = unknown / not a JWT).
+const jwtExpMs = (token) => {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return 0;
+    const exp = Number(b64ToJson(parts[1]).exp);
+    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
+  } catch (_) { return 0; }
+};
+// Re-mint when the join token has less than this left. A call that starts
+// (or resumes / self-heal rebuilds) late in a token's 2h life otherwise hit
+// "invalid or expired token" at joinRoom and the callee never joined media.
+const TOKEN_MIN_LIFE_MS = 10 * 60 * 1000;
+const isTokenError = (msg) => /invalid or expired token|join token required/i.test(String(msg || ''));
+
 export default class NativeCallingSDK {
   constructor(opts = {}) {
     this.url = String(opts.url || '').replace(/\/+$/, '');
@@ -102,6 +119,10 @@ export default class NativeCallingSDK {
       ? opts.token : '';
     this._fallbackIceServers = (Array.isArray(opts.iceServers) && opts.iceServers.length)
       ? opts.iceServers : null;
+    // async () => freshJwtString — supplied by the engine; re-mints from the
+    // backend. Optional (no provider → keep the current token).
+    this._tokenProvider = typeof opts.tokenProvider === 'function' ? opts.tokenProvider : null;
+    this._tokenStale = false;
     this._onLog = typeof opts.onLog === 'function' ? opts.onLog : () => {};
 
     this._handlers = {};
@@ -124,6 +145,7 @@ export default class NativeCallingSDK {
     this._outIds = {};          // EVERY callId minted for the current dial (redials + ring reasserts)
     this._lastDialAt = 0;       // rate-limits the ring-reassert loop
     this._declinedPeer = {};    // 1:1 peerId -> declined-at ms (swallow ring reasserts after decline)
+    this._declinedPeerApp = {}; // 1:1 peerId -> app (signal) call id that was declined
     this._acceptedFrom = null;  // 1:1 peerId whose call we accepted (dedupe post-accept reasserts)
     this._acceptedId = null;    // 1:1 callId accepted; waiting for callAccepted
     this._room = null;          // { roomId, groupId, callId, media, joined }
@@ -156,6 +178,25 @@ export default class NativeCallingSDK {
   }
 
   _log(msg) { this._onLog(`[sdk] ${msg}`); }
+
+  // Resolve once the join token is good for at least TOKEN_MIN_LIFE_MS (or the
+  // server just rejected it). Never rejects — a failed re-mint keeps the old
+  // token and lets joinRoom report the real error.
+  _freshToken() {
+    const exp = jwtExpMs(this._token);
+    const needs = this._tokenStale || !this._token || (exp && exp - Date.now() < TOKEN_MIN_LIFE_MS);
+    if (!needs || !this._tokenProvider) return Promise.resolve();
+    if (this._tokenRefresh) return this._tokenRefresh;
+    this._log(`join token ${this._tokenStale ? 'rejected' : 'near expiry'} — re-minting`);
+    this._tokenRefresh = Promise.resolve()
+      .then(() => this._tokenProvider())
+      .then((t) => {
+        if (typeof t === 'string' && t.split('.').length === 3) { this._token = t; this._tokenStale = false; }
+      })
+      .catch((e) => { this._log(`token re-mint failed: ${e && e.message}`); })
+      .then(() => { this._tokenRefresh = null; });
+    return this._tokenRefresh;
+  }
 
   _req(event, data) {
     return new Promise((resolve, reject) => {
@@ -479,12 +520,20 @@ export default class NativeCallingSDK {
           return;
         }
         if (dupRinging || dupActive) { this._log(`duplicate 1:1 ring from ${fromId} (${key}) — swallowed`); return; }
-        // Just declined this peer → quietly decline their reasserts too instead
-        // of ghost-re-ringing (parity with the group _declined window).
-        const dec = this._declinedPeer[fromId];
+        // Just declined this peer → swallow their in-flight ring REASSERTS
+        // instead of ghost-re-ringing. Two rules learned live (Oct-12):
+        //  • a ring for a DIFFERENT app call than the one we declined is a fresh
+        //    call-back, not a ghost — never touch it (web parity);
+        //  • otherwise SWALLOW, never declineCall: auto-declining killed a
+        //    genuine redial made ~3s after a decline (caller saw "Call declined"
+        //    while this phone kept ringing on the app plane for 40s). A real
+        //    redial is re-delivered by the caller's 2.5s reassert loop once the
+        //    window passes / the new app call id lands; a ghost just dies.
+        let dec = this._declinedPeer[fromId];
+        const decApp = this._declinedPeerApp && this._declinedPeerApp[fromId];
+        if (dec && decApp && this._appCallId && decApp !== this._appCallId) dec = 0;
         if (dec && (Date.now() - dec) < DECLINED_PEER_GUARD_MS) {
-          this._log(`ring ${key} from just-declined peer ${fromId} — auto-declined`);
-          try { s.emit('declineCall', { callId: key }); } catch (_) {}
+          this._log(`ring ${key} from just-declined peer ${fromId} — swallowed (reassert window)`);
           return;
         }
         delete this._declinedPeer[fromId];
@@ -758,6 +807,11 @@ export default class NativeCallingSDK {
     };
     s.on('producerPaused', (p) => peerVideoPause(p, true));
     s.on('producerResumed', (p) => peerVideoPause(p, false));
+    // Media server: a peer's upstream media path died / recovered (ICE consent).
+    s.on('peerMediaState', (p) => {
+      if (!p || !this._room || (p.roomId && String(p.roomId) !== String(this._room.roomId))) return;
+      this._emit('peermedia', { peerId: p.peerId != null ? String(p.peerId) : null, state: p.state });
+    });
     s.on('activeSpeaker', (p) => {
       this._emit('activespeaker', { peerId: p && p.peerId != null ? String(p.peerId) : null });
     });
@@ -1154,7 +1208,10 @@ export default class NativeCallingSDK {
     delete this._pendingIn[key];
     // Remember the declined peer so their ring reasserts (fresh callIds every
     // few seconds) are quietly declined instead of ghost-re-ringing.
-    if (p && !p.group && p.from && p.from.id != null) this._declinedPeer[String(p.from.id)] = Date.now();
+    if (p && !p.group && p.from && p.from.id != null) {
+      this._declinedPeer[String(p.from.id)] = Date.now();
+      this._declinedPeerApp[String(p.from.id)] = this._appCallId || null;
+    }
     try {
       if (p && p.group) { this._declined[key] = Date.now(); this._socket && this._socket.emit('declineGroupCall', { groupId: p.groupId }); }
       else this._socket && this._socket.emit('declineCall', { callId: key });
@@ -1181,7 +1238,10 @@ export default class NativeCallingSDK {
         // Hangup in the answered-but-not-joined window: the caller's dial loop
         // may re-ring on the pre-answer callEnded — quietly decline those
         // reasserts instead of ghost-re-ringing.
-        if (this._acceptedFrom) this._declinedPeer[this._acceptedFrom] = Date.now();
+        if (this._acceptedFrom) {
+          this._declinedPeer[this._acceptedFrom] = Date.now();
+          this._declinedPeerApp[this._acceptedFrom] = this._appCallId || null;
+        }
       }
       else {
         // Cancel EVERY id minted for this dial (redials + reasserts), not just
@@ -1214,6 +1274,7 @@ export default class NativeCallingSDK {
   }
 
   _teardownMedia(leaveRoom) {
+    this._stopStats();
     this._clearRecovery();
     // Drop any pending ICE-disconnected debounce timers (transports are about
     // to close; a late fire would emitDown on a dead call).
@@ -1231,6 +1292,7 @@ export default class NativeCallingSDK {
     // the room server-side (socket.io orders the frames, so the server sees
     // join → leave cleanly; leaveRoom on a never-joined socket is a no-op).
     try { if (leaveRoom && this._socket && this._room) this._socket.emit('leaveRoom'); } catch (_) {}
+    if (leaveRoom) this._srvRoomId = null;
     Object.keys(this._producers).forEach((k) => { try { this._producers[k].close(); } catch (_) {} });
     this._producers = {};
     Object.keys(this._consumers).forEach((k) => { try { this._consumers[k].close(); } catch (_) {} });
@@ -1356,12 +1418,25 @@ export default class NativeCallingSDK {
     const superseded = () => (this._joinGen !== gen || this._room !== room);
     let joinRes = null;
     let device = null;
-    // Defensive: drop any stale server-side room membership.
-    try { this._socket && this._socket.emit('leaveRoom'); } catch (_) {}
-    return this._req('joinRoom', {
+    // Drop a stale server-side membership ONLY when it is a DIFFERENT room.
+    // Re-joining the SAME room (self-heal rebuild, join retry, resume fallback)
+    // must NOT leaveRoom first: the server broadcasts `peerLeft` on leaveRoom and
+    // the remote 1:1 client hung up — the recovery path itself killed the call.
+    // The server silently replaces a same-session peer in the same room
+    // (signaling.js stale-replace) and auto-leaves a different room on join.
+    if (this._srvRoomId && String(this._srvRoomId) !== String(room.roomId)) {
+      try { this._socket && this._socket.emit('leaveRoom'); } catch (_) {}
+    }
+    return this._freshToken().then(() => this._req('joinRoom', {
       roomId: room.roomId, name: this.name, sessionId: this.userId, token: this._token || undefined,
+      appCallId: this._appCallId || undefined,
+    })).catch((e) => {
+      // Mark the token so the resilient retry re-mints before re-joining.
+      if (isTokenError(e && e.message)) this._tokenStale = true;
+      throw e;
     }).then((res) => {
       if (superseded()) throw new Error('join superseded');
+      this._srvRoomId = room.roomId;
       joinRes = res || {};
       device = this._makeDevice();
       return device.load({ routerRtpCapabilities: joinRes.rtpCapabilities });
@@ -1465,8 +1540,68 @@ export default class NativeCallingSDK {
         if (this._softDown[t.id]) { clearTimeout(this._softDown[t.id]); delete this._softDown[t.id]; }
         this._emitUp('ice:connected');
         if (t.direction === 'recv') this._flushPendingStreams();
+        this._startStats();
       }
     });
+  }
+
+  // ── Call-quality telemetry (diagnostics only — never drives UI state) ──
+  // Every 10s while transports exist: getStats() on both transports → one
+  // compact summary ('stats' event). The provider keeps the latest and writes
+  // it into the CallLog's qualityMetrics at hang-up; the path line (host/srflx/
+  // relay + udp/tcp) is logged whenever it changes so a bad call is
+  // diagnosable from logs alone.
+  _startStats() {
+    if (this._statsTimer) return;
+    this._statsAgg = { rttSum: 0, rttN: 0, jitSum: 0, jitN: 0, path: null };
+    this._statsTimer = setInterval(() => { this._sampleStats(); }, 10000);
+    setTimeout(() => this._sampleStats(), 3000); // first sample soon after connect
+  }
+
+  _stopStats() {
+    if (this._statsTimer) { clearInterval(this._statsTimer); this._statsTimer = null; }
+  }
+
+  _sampleStats() {
+    const agg = this._statsAgg;
+    const ts = [this._sendTransport, this._recvTransport].filter((t) => t && !t.closed);
+    if (!agg || !ts.length) return;
+    Promise.all(ts.map((t) => t.getStats().then((r) => ({ t, r })).catch(() => null))).then((list) => {
+      let lost = 0; let recv = 0; let framesDecoded = 0; let rtt = null; let jit = null;
+      let candidateType = null; let protocol = null; let iceState = null;
+      list.filter(Boolean).forEach(({ t, r }) => {
+        iceState = iceState || t.connectionState;
+        r.forEach((st) => {
+          if (st.type === 'candidate-pair' && st.state === 'succeeded' && (st.nominated || st.selected)) {
+            if (typeof st.currentRoundTripTime === 'number') rtt = st.currentRoundTripTime * 1000;
+            const local = r.get && r.get(st.localCandidateId);
+            if (local) { candidateType = local.candidateType || candidateType; protocol = local.protocol || local.relayProtocol || protocol; }
+          }
+          if (st.type === 'inbound-rtp') {
+            if (typeof st.jitter === 'number') jit = Math.max(jit || 0, st.jitter * 1000);
+            if (typeof st.packetsLost === 'number') lost += Math.max(0, st.packetsLost);
+            if (typeof st.packetsReceived === 'number') recv += st.packetsReceived;
+            if (typeof st.framesDecoded === 'number') framesDecoded += st.framesDecoded;
+          }
+        });
+      });
+      if (rtt != null) { agg.rttSum += rtt; agg.rttN += 1; }
+      if (jit != null) { agg.jitSum += jit; agg.jitN += 1; }
+      const path = candidateType ? `${candidateType}/${protocol || '?'}` : null;
+      if (path && path !== agg.path) { agg.path = path; this._log(`[stats] media path ${path}`); }
+      const total = lost + recv;
+      this._emit('stats', {
+        iceConnectionState: iceState,
+        turnUsed: candidateType === 'relay',
+        candidateType,
+        protocol,
+        avgRttMs: agg.rttN ? Math.round(agg.rttSum / agg.rttN) : null,
+        jitterMs: agg.jitN ? Math.round((agg.jitSum / agg.jitN) * 10) / 10 : null,
+        packetLossPct: total > 0 ? Math.round((lost / total) * 1000) / 10 : null,
+        lastRttMs: rtt != null ? Math.round(rtt) : null,
+        framesDecoded,
+      });
+    }).catch(() => {});
   }
 
   // Producers created during a PRE-ANSWER warm-up start PAUSED — nothing is
@@ -1499,6 +1634,15 @@ export default class NativeCallingSDK {
             track: video,
             encodings: CAM_ENCODINGS,
             codecOptions: { videoGoogleStartBitrate: 1000 },
+            // Pausing the producer (the pre-answer privacy hold while it rings)
+            // must NOT disable the local track: mediasoup-client's default
+            // (disableTrackOnPause) sets track.enabled=false, and
+            // react-native-webrtc stops the CAMERA CAPTURER when a video track is
+            // disabled — the caller's own preview froze on its last frame for the
+            // whole ring ("CameraCapturer: Stop capture" ~0.7s after start, then
+            // 0 frames). The pause still stops everything being SENT; and the
+            // user's camera-off toggle disables the track itself (toggleCamera).
+            disableTrackOnPause: false,
             appData: { source: 'camera' },
           };
           if (vp8) opts.codec = vp8;
@@ -1654,9 +1798,11 @@ export default class NativeCallingSDK {
   _resume() {
     const room = this._room;
     if (!room) return;
-    this._req('joinRoom', {
+    this._freshToken().then(() => this._req('joinRoom', {
       roomId: room.roomId, name: this.name, sessionId: this.userId, resume: true, token: this._token || undefined,
-    }).then((res) => {
+      appCallId: this._appCallId || undefined,
+    })).then((res) => {
+      this._resumeTokenRetried = false;
       if (res && res.resumed) {
         this.restartIce();
         // Heal any pause/resume command the dying socket ate mid-flap.
@@ -1671,6 +1817,14 @@ export default class NativeCallingSDK {
       return this._rebuildMedia();
     }).catch((e) => {
       this._log(`resume failed: ${e && e.message}`);
+      // An expired token is fixable right now: re-mint and resume once more
+      // instead of waiting for a reconnect that may never come.
+      if (isTokenError(e && e.message) && !this._resumeTokenRetried && this._room === room) {
+        this._resumeTokenRetried = true;
+        this._tokenStale = true;
+        this._resume();
+        return;
+      }
       // Next socket reconnect retries; RN's reconnect watchdog bounds the wait.
     });
   }
@@ -1866,15 +2020,15 @@ export default class NativeCallingSDK {
   // ---- screen share ----
   // Android: react-native-webrtc implements getDisplayMedia natively via
   // MediaProjection + its own bundled foreground service (WhatsApp-style
-  // whole-screen capture). NOT SHIPPABLE AS-IS: the app no longer declares
-  // FOREGROUND_SERVICE_MEDIA_PROJECTION (removed from app.json — Play Console
-  // demands a declaration + demo video for it, and no UI ever exposed the
-  // feature), so starting the service would throw on Android 14+. Nothing
-  // calls this today. Re-add the permission + prebuild before wiring a share
-  // button. iOS: whole-screen capture needs a ReplayKit broadcast
-  // extension the app doesn't ship, so getDisplayMedia rejects → reported as
-  // `unsupported` and the UI shows the "not supported" alert. Receiving a
-  // peer's shared screen works everywhere regardless.
+  // whole-screen capture). Needs FOREGROUND_SERVICE_MEDIA_PROJECTION in
+  // app.json (re-added 2026-10 with the in-call Share button — Android 14+
+  // refuses to start the service without it; Play Console wants the
+  // foreground-service declaration + demo video for it). iOS: getDisplayMedia
+  // opens a socket that the ReplayKit broadcast extension (TalksTryScreenShare,
+  // same App Group) streams frames into; the system sheet that starts the
+  // broadcast is opened here via expo-screen-broadcast, and the user must tap
+  // Start Broadcast (iOS rule). Receiving a peer's shared screen works
+  // everywhere regardless.
   startScreenShare() {
     if (this._producers.screen && !this._producers.screen.closed) return Promise.resolve(true);
     if (!this._room || !this._room.joined || !this._sendTransport) {
@@ -1894,7 +2048,30 @@ export default class NativeCallingSDK {
         throw new Error('no screen track');
       }
       this._screenStream = stream;
-      return this._sendTransport.produce({ track, appData: { source: 'screen' } }).then((pr) => {
+      // Pin VP8 (same as the camera and as the web's own screen share) and
+      // bound the stream. Unpinned, the device's preferred codec won — H.264 on
+      // many Androids — and the capture is the FULL display (e.g. 1080x2412),
+      // which exceeds what a hardware H.264 encoder accepts: the encoder never
+      // started, nothing was sent, and the web showed a black screen tile. One
+      // software-VP8 layer at ~0.66x, 15fps, 1.2 Mbps is sharp enough to read
+      // and cheap enough to hold.
+      const codecs = (this._device && this._device.rtpCapabilities && this._device.rtpCapabilities.codecs) || [];
+      const vp8 = codecs.find((c) => String(c.mimeType).toLowerCase() === 'video/vp8') || null;
+      const opts = {
+        track,
+        // Closing a producer must not stop the capture track (the default) —
+        // the diagnostic retry re-produces the SAME track.
+        stopTracks: false,
+        encodings: [{ maxBitrate: 1200000, maxFramerate: 15, scaleResolutionDownBy: 1.5 }],
+        codecOptions: { videoGoogleStartBitrate: 800 },
+        appData: { source: 'screen' },
+      };
+      if (vp8) opts.codec = vp8;
+      return this._sendTransport.produce(opts).catch((e) => {
+        // Tuning must never block sharing — retry plain once.
+        this._log(`screen produce with tuning failed (${e && e.message}) — retrying plain`);
+        return this._sendTransport.produce({ track, stopTracks: false, appData: { source: 'screen' } });
+      }).then((pr) => {
         this._producers.screen = pr;
         // The OS "stop sharing" affordance (status-bar chip / notification)
         // ends the track underneath us — mirror it as a clean stop so the UI
@@ -1904,6 +2081,19 @@ export default class NativeCallingSDK {
           this._emit('screenshare', { on: false });
         });
         this._log('screen share started (native capture)');
+        this._watchScreenTrackEnd(pr, track);
+        if (Platform.OS === 'ios') {
+          // The track exists but carries nothing until the user starts the
+          // broadcast in the system sheet.
+          return showIosBroadcastPicker().then(() => {
+            this._awaitIosBroadcast(pr, track);
+            return true;
+          }, (e) => {
+            this._log(`[screen] iOS broadcast picker failed: ${e && e.message}`);
+            return this.stopScreenShare().then(() => { throw e; });
+          });
+        }
+        this._watchScreenSend(pr, track, 0);
         return true;
       });
     }).catch((e) => {
@@ -1915,6 +2105,110 @@ export default class NativeCallingSDK {
       // device limitation — only flag `unsupported` when the API is missing.
       throw e;
     });
+  }
+
+  // Sender-side proof that the shared screen is actually leaving the phone.
+  // The remote tile can only say "waiting for the first frame" — whether the
+  // capture, the encoder or the network is at fault was invisible, so every
+  // report was "black / waiting" with nothing to go on. Samples the producer's
+  // outbound-rtp 3s after it starts (and again after a retry) and logs the
+  // numbers; if NOTHING was encoded, re-produces once with the plain default
+  // settings (in case the tuned codec/layer was what the device rejected).
+  _screenOutboundStats(pr) {
+    return pr.getStats().then((report) => {
+      const out = { frames: 0, bytes: 0, w: 0, h: 0, codec: null, encoder: null, limit: null, found: false };
+      const codecs = {};
+      report.forEach((st) => { if (st.type === 'codec') codecs[st.id] = st.mimeType; });
+      report.forEach((st) => {
+        if (st.type !== 'outbound-rtp') return;
+        if ((st.kind || st.mediaType) !== 'video') return;
+        out.found = true;
+        out.frames += Number(st.framesEncoded || 0);
+        out.bytes += Number(st.bytesSent || 0);
+        out.w = Math.max(out.w, Number(st.frameWidth || 0));
+        out.h = Math.max(out.h, Number(st.frameHeight || 0));
+        out.codec = codecs[st.codecId] || out.codec;
+        out.encoder = st.encoderImplementation || out.encoder;
+        out.limit = st.qualityLimitationReason || out.limit;
+      });
+      return out;
+    });
+  }
+
+  _watchScreenSend(pr, track, attempt, delay = 3000) {
+    setTimeout(() => {
+      if (!pr || pr.closed || this._producers.screen !== pr) return;
+      this._screenOutboundStats(pr).then((o) => {
+        this._log(`[screen] outbound#${attempt}: frames=${o.frames} bytes=${o.bytes} ${o.w}x${o.h} codec=${o.codec} encoder=${o.encoder} limit=${o.limit} trackState=${track && track.readyState} muted=${track && track.muted}`);
+        if (o.frames > 0) return;
+        // Android only delivers capture frames when the screen changes, so a
+        // quiet screen can look "dead" early — look again before acting.
+        if (attempt === 0) { this._watchScreenSend(pr, track, 1, 6000); return; }
+        if (attempt >= 3) return;
+        // Nothing encoded: retry once with the plain defaults.
+        this._log('[screen] no frames encoded — re-producing with default settings');
+        const old = pr;
+        delete this._producers.screen;
+        this._req('closeProducer', { producerId: old.id }).catch(() => {});
+        try { old.close(); } catch (_) {}
+        this._sendTransport.produce({ track, stopTracks: false, appData: { source: 'screen' } }).then((np) => {
+          this._producers.screen = np;
+          np.on('trackended', () => {
+            this.stopScreenShare().catch(() => {});
+            this._emit('screenshare', { on: false });
+          });
+          this._watchScreenSend(np, track, 3, 6000);
+        }).catch((e) => {
+          this._log(`[screen] re-produce failed: ${e && e.message}`);
+          this.stopScreenShare().catch(() => {});
+          this._emit('screenshare', { on: false });
+        });
+      }).catch((e) => { this._log(`[screen] stats failed: ${e && e.message}`); });
+    }, delay);
+  }
+
+  // Backstop for a share stopped by the OS rather than our button — Android's
+  // "Stop sharing" (cast chip / notification), iOS's red status-bar pill — when
+  // the producer's 'trackended' never fires. The capture track flips to
+  // 'ended'; close the producer so every peer drops the `#screen` tile and gets
+  // the normal video call back, instead of a frozen last frame.
+  _watchScreenTrackEnd(pr, track) {
+    const tick = () => {
+      if (!pr || pr.closed || this._producers.screen !== pr) return;
+      if (track && track.readyState === 'ended') {
+        this._log('[screen] capture track ended by the OS — stopping the share');
+        this.stopScreenShare().catch(() => {});
+        this._emit('screenshare', { on: false });
+        return;
+      }
+      setTimeout(tick, 2000);
+    };
+    setTimeout(tick, 2000);
+  }
+
+  // iOS: wait for the first broadcast frames. If the user dismisses the
+  // system sheet (or never taps Start Broadcast) nothing ever arrives — stop
+  // the share so the chip and the remote "waiting for screen" tile clear.
+  _awaitIosBroadcast(pr, track, waitedMs = 0) {
+    const STEP_MS = 2000;
+    const GIVE_UP_MS = 30000;
+    setTimeout(() => {
+      if (!pr || pr.closed || this._producers.screen !== pr) return;
+      this._screenOutboundStats(pr).then((o) => {
+        if (o.frames > 0) {
+          this._log(`[screen] iOS broadcast live: frames=${o.frames} ${o.w}x${o.h} codec=${o.codec}`);
+          return;
+        }
+        const waited = waitedMs + STEP_MS;
+        if (waited >= GIVE_UP_MS) {
+          this._log('[screen] iOS broadcast never started — stopping the share');
+          this.stopScreenShare().catch(() => {});
+          this._emit('screenshare', { on: false });
+          return;
+        }
+        this._awaitIosBroadcast(pr, track, waited);
+      }).catch((e) => { this._log(`[screen] stats failed: ${e && e.message}`); });
+    }, STEP_MS);
   }
 
   stopScreenShare() {

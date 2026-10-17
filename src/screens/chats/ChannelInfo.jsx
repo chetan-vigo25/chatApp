@@ -1,12 +1,18 @@
 import { useEffect, useState } from 'react';
 import {
-  View, Text, Image, ScrollView, TouchableOpacity, ActivityIndicator,
-  StyleSheet, Dimensions,
+  View,
+  Text,
+  ScrollView,
+  TouchableOpacity,
+  ActivityIndicator,
+  StyleSheet,
+  Dimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTheme } from '../../contexts/ThemeContext';
 import { apiCall } from '../../Config/Https';
+import AppImage from '../../components/AppImage';
 
 const { width: SCREEN_W } = Dimensions.get('window');
 
@@ -79,7 +85,7 @@ export default function ChannelInfo({ route, navigation }) {
         {/* Branding */}
         <View style={styles.brandWrap}>
           {channel.avatarUrl ? (
-            <Image source={{ uri: channel.avatarUrl }} style={styles.avatar} resizeMode="cover" />
+            <AppImage source={{ uri: channel.avatarUrl }} style={styles.avatar} resizeMode="cover" />
           ) : (
             <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: C.themeColor }]}>
               <Ionicons name="megaphone" size={48} color="#fff" />

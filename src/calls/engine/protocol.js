@@ -49,6 +49,9 @@ export const CMD = {
   // so the media server can file its server-side recording against the right
   // call. Purely a correlation key — no UI, no user-visible effect.
   APP_CALL_ID: 'appCallId',
+  // Fresh media-server join JWT ({ token, iceServers? }) — e.g. from the
+  // backend's call:prewarm. Applied in place; never rebuilds the engine socket.
+  SET_TOKEN: 'setToken',
   START_RECORDING: 'startRecording',
   STOP_RECORDING: 'stopRecording',
   // 1:1 peer identity for in-stage placeholders ({ peerId, name, avatar }) —

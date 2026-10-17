@@ -1,12 +1,15 @@
 import React, { memo, useEffect, useRef, useState } from 'react';
 import { useSelector } from 'react-redux';
-import { Animated, Image, Text, TouchableOpacity, View, StyleSheet } from 'react-native';
+import { Animated, Text, TouchableOpacity, View, StyleSheet } from 'react-native';
 import { MaterialCommunityIcons, Ionicons } from '@expo/vector-icons';
 import SegmentedRing from './SegmentedRing';
 import { useTranslatedText, needsSystemFont } from './Translate';
 import useDisplayName from '../hooks/useDisplayName';
 import { isSelfChat, selfChatLabel, selfIdentityOf } from '../utils/selfChat';
 import { usePeerProfileName } from '../services/peerProfileNameStore';
+import { useChatDraft } from '../services/chatDraftStore';
+import MessageTypeIcon, { iconNameForEmoji, stripPreviewEmoji } from './MessageTypeIcon';
+import AppImage from './AppImage';
 import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial } from '../utils/avatarIdentity';
 
 const AVATAR_SIZE = 47; // smaller chat-list avatar (was 52 → 48 → 44)
@@ -54,6 +57,10 @@ const ChatCard = ({
   const hasUnread = Number(item?.unreadCount || 0) > 0;
   const isTyping = item?.realtime?.typing?.isTyping;
   const isLastMsgDeleted = item?.lastMessageDisplay?.isDeleted || item?.lastMessage?.isDeleted;
+  // Unsent composer text (WhatsApp-style). Replaces the last-message preview
+  // until it is sent or erased; "typing…" from the peer still wins.
+  const draftText = useChatDraft(item?.chatId || item?._id);
+  const showDraft = Boolean(draftText) && !isTyping;
 
   // ── Translated summary ────────────────────────────────────────────────────
   //
@@ -76,6 +83,13 @@ const ChatCard = ({
   const summaryText = translatedBody
     ? `${display?.prefixText || ''}${translatedBody}${display?.suffixText || ''}`.trim()
     : getLastMessageText(item);
+  // Media-type icon: drawn as a vector icon between the tick and the text; the
+  // emoji marker is stripped from the string so it is not drawn twice.
+  const typeIconName = (!isTyping && !showDraft && !isLastMsgDeleted)
+    ? iconNameForEmoji(display?.icon, display?.body || display?.text)
+    : null;
+  const previewSource = typeIconName ? stripPreviewEmoji(summaryText, display?.icon) : summaryText;
+  const isMissed = Boolean(display?.isMissedCall);
   const isBroadcast = Boolean(item?.chatType === 'broadcast' || item?.isBroadcast);
   const isGroup = Boolean(item?.chatType === 'group' || item?.isGroup);
   // Self chat ("Message yourself"): rendered as "<my number> (You)" so it is
@@ -170,12 +184,16 @@ const ChatCard = ({
           onPressOut={() => animateTo(1)}
           activeOpacity={1}
           style={styles.card}
+          accessibilityRole="button"
+          accessibilityLabel={`${peerName}${hasUnread ? `, ${Number(item.unreadCount)} unread` : ''}`}
         >
           {/* Avatar */}
           <TouchableOpacity
             onPress={onAvatarPress || onPress}
             activeOpacity={0.85}
             style={styles.avatarTouch}
+            accessibilityRole="button"
+            accessibilityLabel={`${peerName} profile picture`}
           >
             {/* Status ring (segmented for multiple statuses): unseen = green,
                 viewed = grey. Sits outside the avatar with a small gap. */}
@@ -193,14 +211,14 @@ const ChatCard = ({
             <View style={styles.avatarInner}>
               {(isGroup || isBroadcast) ? (
                 groupAvatarUri ? (
-                  <Image resizeMode="cover" source={{ uri: groupAvatarUri }} style={[styles.avatarImage, { borderColor: theme.colors.border }]} />
+                  <AppImage resizeMode="cover" source={{ uri: groupAvatarUri }} style={[styles.avatarImage, { borderColor: theme.colors.border }]} />
                 ) : (
                   <View style={[styles.avatarFallback, { backgroundColor: getAvatarColor(peerName), borderColor: theme.colors.border }]}>
                     <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={18} color="#fff" />
                   </View>
                 )
               ) : peerAvatarUri ? (
-                <Image
+                <AppImage
                   resizeMode="cover"
                   source={{ uri: peerAvatarUri }}
                   onError={() => setFailedAvatarUri(peerAvatarUri)}
@@ -235,7 +253,8 @@ const ChatCard = ({
               <View style={styles.nameWrap}>
                 <Text
                   numberOfLines={1}
-                  style={[styles.nameText, { color: theme.colors.primaryTextColor }]}
+                  maxFontSizeMultiplier={1.3}
+                  style={[styles.nameText, { color: theme.colors.primaryTextColor }, needsSystemFont(peerName) && styles.systemFontTitle]}
                 >
                   {peerName}
                 </Text>
@@ -248,9 +267,10 @@ const ChatCard = ({
                   />
                 )}
               </View>
-              <Text style={[
+              <Text maxFontSizeMultiplier={1.2} style={[
                 styles.timeText,
-                { color: hasUnread ? theme.colors.themeColor : theme.colors.placeHolderTextColor }
+                // link (not the brand fill) for unread: brand teal is 2.7:1 on white.
+                { color: hasUnread ? theme.colors.link : theme.colors.secondaryTextColor, fontFamily: hasUnread ? 'Roboto-Medium' : 'Roboto-Regular' }
               ]}>
                 {getRelativeTime(item?.lastMessageAt || item?.timestamp)}
               </Text>
@@ -259,17 +279,38 @@ const ChatCard = ({
             {/* Row 2: Preview + Meta */}
             <View style={styles.bottomRow}>
               <View style={styles.previewWrap}>
-                {!isTyping && !isLastMsgDeleted && renderMessageStatus(item)}
+                {!isTyping && !showDraft && !isLastMsgDeleted && renderMessageStatus(item)}
+                {typeIconName ? (
+                  <MessageTypeIcon
+                    name={typeIconName}
+                    color={isMissed ? theme.colors.dangerText : theme.colors.secondaryTextColor}
+                  />
+                ) : null}
+                {showDraft ? (
+                  <Text
+                    numberOfLines={1}
+                    maxFontSizeMultiplier={1.2}
+                    style={[
+                      styles.previewText,
+                      { color: theme.colors.secondaryTextColor },
+                      needsSystemFont(draftText) && [styles.systemFont, { lineHeight: 22 }],
+                    ]}
+                  >
+                    <Text style={[styles.draftLabel, { color: theme.colors.link }]}>Draft: </Text>
+                    {getPreviewText(draftText.replace(/\s+/g, ' ').trim(), 38)}
+                  </Text>
+                ) : (
                 <Text
                   numberOfLines={1}
+                  maxFontSizeMultiplier={1.2}
                   style={[
                     styles.previewText,
                     {
                       color: isTyping
-                        ? theme.colors.themeColor
+                        ? theme.colors.link
                         : (item?.lastMessageDisplay?.isMissedCall
-                          ? theme.colors.danger
-                          : theme.colors.placeHolderTextColor),
+                          ? theme.colors.dangerText
+                          : theme.colors.secondaryTextColor),
                       fontStyle: (isTyping || isLastMsgDeleted) ? 'italic' : 'normal',
                       fontFamily: hasUnread ? 'Roboto-Medium' : 'Roboto-Regular',
                     },
@@ -279,25 +320,26 @@ const ChatCard = ({
                     // Hand those to the OS font. See docs/APP_LANGUAGE_GUIDE.md
                     // Section 7 — every new place foreign script can appear
                     // needs this, and the chat list is now one of them.
-                    needsSystemFont(summaryText) && { fontFamily: undefined },
+                    needsSystemFont(summaryText) && { fontFamily: undefined, lineHeight: 22 },
                   ]}
                 >
                   {isTyping
                     ? (item?.lastMessageDisplay?.text || 'Typing...')
-                    : getPreviewText(summaryText, 38)}
+                    : getPreviewText(previewSource, 38)}
                 </Text>
+                )}
               </View>
 
               <View style={styles.metaWrap}>
                 {item?.isPinned && (
-                  <MaterialCommunityIcons name="pin" size={13} color={theme.colors.placeHolderTextColor} style={{ marginRight: 4 }} />
+                  <MaterialCommunityIcons name="pin" size={14} color={theme.colors.secondaryTextColor} style={{ marginRight: 4 }} />
                 )}
                 {item?.isMuted && (
-                  <Ionicons name="volume-mute" size={13} color={theme.colors.placeHolderTextColor} style={{ marginRight: hasUnread ? 4 : 0 }} />
+                  <Ionicons name="volume-mute" size={14} color={theme.colors.secondaryTextColor} style={{ marginRight: hasUnread ? 4 : 0 }} />
                 )}
                 {hasUnread && (
                   <View style={[styles.unreadBadge, { backgroundColor: theme.colors.themeColor }]}>
-                    <Text style={styles.unreadText}>
+                    <Text style={styles.unreadText} maxFontSizeMultiplier={1.2}>
                       {Number(item.unreadCount) > 99 ? '99+' : Number(item.unreadCount)}
                     </Text>
                   </View>
@@ -409,10 +451,17 @@ const styles = StyleSheet.create({
   nameText: {
     // Chat-list title: slightly bold, matches the Settings screen name
     // (Roboto-SemiBold). Original case preserved, no extra letter-spacing.
-    fontSize: 15.5,
+    // Type scale: title 16 semibold, preview 14, time 12, badge 12.
+    fontSize: 16,
+    lineHeight: 22,
     fontFamily: 'Roboto-SemiBold',
     flexShrink: 1,
     letterSpacing: 0,
+  },
+  // Foreign scripts (Devanagari etc.) have no glyphs in Roboto — OS font.
+  systemFontTitle: {
+    fontFamily: undefined,
+    fontWeight: '600',
   },
   verifiedBadge: {
     marginLeft: 4,
@@ -433,13 +482,19 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flex: 1,
     marginRight: 10,
-    gap: 4,
+    gap: 5,
   },
   previewText: {
     fontSize: 14,
     flexShrink: 1,
-    lineHeight: 22,
+    lineHeight: 20,
     fontFamily: 'Roboto-Regular',
+  },
+  draftLabel: {
+    fontFamily: 'Roboto-Medium',
+  },
+  systemFont: {
+    fontFamily: undefined,
   },
   metaWrap: {
     flexDirection: 'row',
@@ -454,7 +509,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
   },
   unreadText: {
-    fontSize: 11,
+    fontSize: 12,
     fontFamily: 'Roboto-Bold',
     color: '#fff',
     letterSpacing: 0.1,

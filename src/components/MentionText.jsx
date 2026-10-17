@@ -1,5 +1,6 @@
 import React, { useMemo } from 'react';
 import { Text } from 'react-native';
+import { useTheme, sentBubbleBgFor, outgoingPaletteFor } from '../contexts/ThemeContext';
 
 // ── MentionText ──
 // Renders message text with highlighted @mentions.
@@ -12,8 +13,6 @@ import { Text } from 'react-native';
 //   style: object        — additional text styles
 //   onMentionPress: fn   — optional callback(userId, displayName)
 
-const MENTION_HIGHLIGHT_COLOR = '#03b0a2';
-
 const MentionText = React.memo(function MentionText({
   text,
   mentions,
@@ -23,6 +22,7 @@ const MentionText = React.memo(function MentionText({
   onMentionPress,
   isMyMessage,
 }) {
+  const { theme, chatColor } = useTheme();
   const segments = useMemo(() => {
     if (!text) return [];
     if (!mentions || mentions.length === 0) {
@@ -65,7 +65,10 @@ const MentionText = React.memo(function MentionText({
     return result;
   }, [text, mentions]);
 
-  const effectiveMentionColor = mentionColor || (isMyMessage ? '#D8ECFF' : MENTION_HIGHLIGHT_COLOR);
+  // Mention colour = the link token (>= 4.5:1), derived from the bubble when outgoing.
+  const effectiveMentionColor = mentionColor || (isMyMessage
+    ? outgoingPaletteFor(sentBubbleBgFor(chatColor, theme), theme).link
+    : theme.colors.link);
 
   if (segments.length === 0) {
     return (

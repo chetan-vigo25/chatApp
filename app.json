@@ -72,7 +72,8 @@
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.USE_FULL_SCREEN_INTENT",
         "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
-        "android.permission.FOREGROUND_SERVICE"
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"
       ],
       "notification": {
         "icon": "./assets/ic_notification.png",
@@ -162,6 +163,9 @@
       "./plugins/withIosPrivacyScreen",
       "./plugins/withCallKeepAndroidInteropFix",
       "./plugins/withWebrtcCallKitAudioFix",
+      "./plugins/withWebrtcMediaProjection",
+      "./plugins/withScreenShareExtension",
+      "./plugins/withWebrtcTextureView",
       [
         "@config-plugins/react-native-webrtc",
         {

@@ -20,7 +20,6 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Animated,
   Dimensions,
-  Image,
   Modal,
   PanResponder,
   StyleSheet,
@@ -37,6 +36,7 @@ import ContactDatabase from '../services/ContactDatabase';
 import { resolveDisplayName as resolveCanonicalName, formatPhoneNumber } from '../services/contactNameStore';
 import CopyFieldButton from './CopyFieldButton';
 import { formatLastSeen } from '../presence/services/lastSeenFormatter.service';
+import AppImage from './AppImage';
 
 const { height: SCREEN_H } = Dimensions.get('window');
 
@@ -210,7 +210,7 @@ export default function UserDetailsSheet({
           {/* Avatar */}
           <View style={styles.avatarWrap}>
             {imageSource ? (
-              <Image source={imageSource} style={styles.avatar} />
+              <AppImage source={imageSource} style={styles.avatar} />
             ) : (
               <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: avatarColor }]}>
                 <Text style={styles.avatarLetter}>{initial}</Text>

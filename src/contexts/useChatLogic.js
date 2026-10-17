@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { showMediaUnavailable } from '../utils/mediaUnavailableBus';
-import { Alert, AppState, Keyboard, Platform, DeviceEventEmitter, Image } from "react-native";
+import { Alert, AppState, Keyboard, Platform, DeviceEventEmitter, Image, ToastAndroid } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as FileSystem from 'expo-file-system/legacy';
 import moment from "moment";
@@ -18,12 +18,27 @@ import { useRealtimeChatActions, useRealtimeChatSlice } from "./RealtimeChatCont
 const selectInactiveGroupIds = (s) => s?.inactiveGroupIds;
 import localStorageService from '../services/LocalStorageService';
 import ChatDatabase from '../services/ChatDatabase';
+import { deriveMutationSeed } from '../utils/catchupChunks';
 import ContactDatabase from '../services/ContactDatabase';
 import { hashPhoneForMatch, onlyDigits } from '../utils/savedContactName';
 import ChatCache from '../services/ChatCache';
 import OutboxWorker from '../services/OutboxWorker';
 import { isInForwardWindow, clearForwardTimestamp } from '../utils/forwardState';
 import { shouldEmitReadAll } from '../utils/readAllThrottle';
+import { canSendReadReceipt, mergeStatus } from '../utils/receiptStatus';
+import {
+  MSG_OFFLINE,
+  getEditBlockReason,
+  blockReasonMessage,
+  editExitDecision,
+  editErrorCode,
+  editErrorMessage,
+  isEditRejected,
+  shouldRevertEdit,
+  editFingerprint,
+  checkEditText,
+  serverIdOf,
+} from '../utils/messageEditPolicy';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS, resolveMediaIdentity } from '../services/MediaDownloadManager';
 import { apiCall } from '../Config/Https';
 import {
@@ -134,7 +149,6 @@ const MANUAL_PRESENCE_QUEUE_KEY = "presence_manual_queue";
 const MEDIA_STATUS_QUEUE_KEY = 'media_status_update_queue';
 const DELETED_TOMBSTONES_PREFIX = "chat_deleted_tombstones_";
 const PENDING_EDITS_PREFIX = "chat_pending_edits_";
-const MUTATION_CURSOR_PREFIX = "chat_mutation_cursor_";
 const READ_MARK_DELAY = 800;
 const SOCKET_FETCH_LIMIT = 50;
 // First-paint page: small for the fastest possible initial render. Scroll-up
@@ -176,6 +190,26 @@ const normalizeId = (value) => {
     return String(candidate);
   }
   return null;
+};
+
+// Upper bound for a peer "read everything" event. A read receipt only covers
+// messages that existed when the peer read, so never mark later ones seen.
+// Bounded by the reader's synced seq ONLY. The event's own timestamp used to be
+// a fallback, but a server ack is stamped "now", so it covered every message sent
+// up to now — including ones the reader's device never received. Returns null
+// when the event carries no seq (caller leaves in-memory rows alone; the stored
+// peer watermark bounds the SQLite write; the explicit `message:read` with ids is
+// what blues individual bubbles).
+const readBoundOf = (source) => {
+  const seq = Number(source?.readUpToSeq);
+  if (Number.isFinite(seq) && seq > 0) return { seq };
+  return null;
+};
+const msgWithinReadBound = (msg, bound) => {
+  if (!bound) return false;
+  if (bound.seq != null) return msg?.seq != null && Number(msg.seq) <= bound.seq;
+  const t = Number(msg?.timestamp) || new Date(msg?.createdAt || 0).getTime() || 0;
+  return t > 0 && t <= bound.ts;
 };
 
 const sameId = (a, b) => {
@@ -695,6 +729,16 @@ export default function useChatLogic({ navigation, route }) {
   const typingTimeoutRef = useRef(null);
   const peerTypingTimeoutRef = useRef(null); // Separate timeout for peer typing
   const appState = useRef(AppState.currentState);
+  // T-A-06: read receipts need the chat on screen — app foreground AND this
+  // screen focused (not covered by Group info / Message info / a viewer pushed
+  // on top, which keep ChatScreen mounted). Both are event-driven refs.
+  const screenFocusedRef = useRef(true);
+  const foregroundReadRef = useRef(null);
+  const canReadNow = () => canSendReadReceipt({
+    appState: AppState.currentState,
+    screenFocused: screenFocusedRef.current,
+    chatOpen: Boolean(chatIdRef.current),
+  });
   const presenceCheckInterval = useRef(null);
   const hasSyncedRef = useRef(false);
   const chatIdRef = useRef(null);
@@ -1691,6 +1735,9 @@ export default function useChatLogic({ navigation, route }) {
           fetchAndSyncMessagesViaSocket(chatIdRef.current, { limit: SOCKET_FETCH_LIMIT });
         }
         hasSyncedRef.current = false;
+        // Back in the foreground with the chat open: reads that were withheld
+        // while backgrounded (T-A-06) go out now.
+        try { foregroundReadRef.current?.(); } catch { /* best-effort */ }
       } else if (nextAppState.match(/inactive|background/)) {
         if (!hasSyncedRef.current && chatIdRef.current) {
           syncMessagesToAPI();
@@ -1868,7 +1915,7 @@ export default function useChatLogic({ navigation, route }) {
       const callFp = (m.type === 'call' || m.messageType === 'call')
         ? `:c${m.payload?.outcome || ''}.${m.payload?.durationSec ?? ''}`
         : '';
-      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}${voFp}${callFp}`;
+      const base = `${m.serverMessageId || m.id || m.tempId}:${m.status}:${m.isEdited ? 1 : 0}:${m.isDeleted ? 1 : 0}:${m.reactions ? Object.keys(m.reactions).join(',') : ''}${voFp}${callFp}${editFingerprint(m)}`;
       if (m.status !== 'sending' && m.status !== 'uploading') return base;
       // localThumbUri flags: locally extracted video posters land via async
       // patches on sending rows — without them in the fingerprint the gate
@@ -2148,9 +2195,13 @@ export default function useChatLogic({ navigation, route }) {
       const isSameChat = lastInitializedChatRef.current === generatedChatId;
       setChatId(generatedChatId);
       chatIdRef.current = generatedChatId;
+      // T-A-06/18: the read receipts and the local unread clear are ONE action —
+      // setActiveChat resolves false when it withheld the receipts (app not in
+      // the foreground), and then the unread stays until foreground re-runs it.
       deferRealtimeUpdate(() => {
-        setActiveChat(generatedChatId);
-        markChatRead(generatedChatId);
+        Promise.resolve(setActiveChat(generatedChatId))
+          .then((sent) => { if (sent) markChatRead(generatedChatId); })
+          .catch(() => {});
       });
       lastInitializedChatRef.current = generatedChatId;
 
@@ -2329,11 +2380,14 @@ export default function useChatLogic({ navigation, route }) {
             // group ids with NOT_IN_CHAT. Route groups to the group handler.
             // Throttled: setActiveChat also emits read:all on open; collapse the
             // duplicate so the backend isn't hit with two read:all per open.
-            if (shouldEmitReadAll(generatedChatId)) {
+            if (canReadNow() && shouldEmitReadAll(generatedChatId)) {
               if (isGrpInit) {
                 socket.emit('group:message:read:all', { groupId: generatedChatId });
               } else {
-                socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId });
+                // bound by what this device holds (see RealtimeChatContext setActiveChat)
+                ChatDatabase.getLatestSeq(generatedChatId)
+                  .then((seq) => socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId, upToSeq: Number(seq) || 0 }))
+                  .catch(() => socket.emit('message:read:all', { chatId: generatedChatId, senderId: userId }));
               }
             }
             markUserOnline("chat-init");
@@ -2635,26 +2689,21 @@ export default function useChatLogic({ navigation, route }) {
   }, [persistPendingEdits]);
 
   // ─── MUTATION CURSOR (reconnect mutation delta — edits/deletes) ───
+  // A-07: last on-open `message:sync` request ({chatId, sinceSeq, rounds}) so a
+  // response flagged hasMore can continue the forward delta (bounded) instead of
+  // stopping at the first 50 rows.
+  const onOpenSyncReqRef = useRef(null);
+
+  // Kept in SQLite sync_meta (A-04) so it survives a same-account logout; the
+  // old AsyncStorage value is migrate-read inside ChatDatabase.
   const getMutationCursor = useCallback(async (chatIdParam) => {
-    try {
-      if (!chatIdParam) return 0;
-      const raw = await AsyncStorage.getItem(`${MUTATION_CURSOR_PREFIX}${chatIdParam}`);
-      const n = Number(raw);
-      return Number.isFinite(n) && n > 0 ? n : 0;
-    } catch {
-      return 0;
-    }
+    if (!chatIdParam) return 0;
+    return ChatDatabase.getMutationCursor(chatIdParam);
   }, []);
 
   const setMutationCursor = useCallback(async (chatIdParam, at) => {
-    try {
-      const n = Number(at);
-      if (!chatIdParam || !Number.isFinite(n) || n <= 0) return;
-      const prev = await getMutationCursor(chatIdParam);
-      if (n <= prev) return; // monotonic — never move the cursor backwards
-      await AsyncStorage.setItem(`${MUTATION_CURSOR_PREFIX}${chatIdParam}`, String(n));
-    } catch {}
-  }, [getMutationCursor]);
+    await ChatDatabase.setMutationCursor(chatIdParam, at);
+  }, []);
 
   const normalizeIncomingMessage = useCallback((apiMsg) => {
     const mediaMeta = apiMsg?.mediaMeta || apiMsg?.contact || apiMsg?.payload?.mediaMeta || apiMsg?.payload?.contact || {};
@@ -3035,10 +3084,10 @@ export default function useChatLogic({ navigation, route }) {
   // stale count came back on every cold start as a phantom badge ("99+").
   // Debounced so a burst of reads sends one read:all.
   const readAllTimerRef = useRef(null);
+  const fireReadAllRef = useRef(null);
   const scheduleTrailingReadAll = useCallback(() => {
     if (readAllTimerRef.current) clearTimeout(readAllTimerRef.current);
-    readAllTimerRef.current = setTimeout(() => {
-      readAllTimerRef.current = null;
+    fireReadAllRef.current = () => {
       const cid = chatIdRef.current;
       const uid = currentUserIdRef.current;
       if (!cid || !uid) return;
@@ -3046,12 +3095,34 @@ export default function useChatLogic({ navigation, route }) {
       if (isGrp) {
         emitSocketEvent('group:message:read:all', { groupId: chatData?.groupId || chatData?.group?._id || cid });
       } else {
-        emitSocketEvent('message:read:all', { chatId: cid, senderId: uid });
+        // Bound = what this device holds: SQLite's newest seq OR the newest seq
+        // of the thread on screen. SQLite is written through a queue, so right
+        // after a message arrives it can lag the thread — a lagging bound left
+        // the server's read watermark behind and the badge came back on the
+        // next app open.
+        const memSeq = (allMessagesRef.current || []).reduce((mx, m) => {
+          const n = Number(m?.seq);
+          return Number.isFinite(n) && n > mx ? n : mx;
+        }, 0);
+        ChatDatabase.getLatestSeq(cid)
+          .then((seq) => emitSocketEvent('message:read:all', { chatId: cid, senderId: uid, upToSeq: Math.max(Number(seq) || 0, memSeq) }))
+          .catch(() => emitSocketEvent('message:read:all', { chatId: cid, senderId: uid, ...(memSeq > 0 ? { upToSeq: memSeq } : {}) }));
       }
+    };
+    readAllTimerRef.current = setTimeout(() => {
+      readAllTimerRef.current = null;
+      fireReadAllRef.current?.();
     }, 1200);
   }, [chatData]);
+  // Leaving the chat inside the debounce window used to CANCEL the pending
+  // read-all, so a quick read-then-close never reached the server and the
+  // badge returned on the next open. Flush it instead.
   useEffect(() => () => {
-    if (readAllTimerRef.current) clearTimeout(readAllTimerRef.current);
+    if (readAllTimerRef.current) {
+      clearTimeout(readAllTimerRef.current);
+      readAllTimerRef.current = null;
+      try { fireReadAllRef.current?.(); } catch { /* best-effort */ }
+    }
   }, []);
 
   const markMessagesAsRead = useCallback((messageIds = []) => {
@@ -3089,6 +3160,9 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     visibilityReadTimeoutRef.current = setTimeout(() => {
+      // T-A-06: re-checked when the timer FIRES (the app may have been
+      // backgrounded / covered during the 500 ms): nothing is read off screen.
+      if (!canReadNow()) return;
       // Use ref for latest messages to avoid stale closure
       const latestMessages = allMessagesRef.current || [];
       const unreadVisibleIds = latestMessages
@@ -3166,6 +3240,8 @@ export default function useChatLogic({ navigation, route }) {
     }
 
     readMarkTimeoutRef.current = setTimeout(() => {
+      // T-A-06: re-check at fire time, not only when scheduled.
+      if (!canReadNow()) return;
       const latestMessages = allMessagesRef.current || [];
       const unreadIds = latestMessages
         .filter(msg =>
@@ -3224,6 +3300,26 @@ export default function useChatLogic({ navigation, route }) {
       scheduleTrailingReadAll();
     }, READ_MARK_DELAY);
   }, [markMessagesAsRead, chatData, scheduleTrailingReadAll]);
+
+  // Re-run the withheld "I read this chat" step when the chat becomes readable
+  // again: app returns to foreground, or the screen regains focus. Event-driven
+  // (AppState listener / useFocusEffect), no timer. Reads only rows already
+  // loaded locally (scheduleMark... walks allMessagesRef).
+  foregroundReadRef.current = () => {
+    const cid = chatIdRef.current;
+    if (!cid || !canReadNow()) return;
+    deferRealtimeUpdate(() => {
+      Promise.resolve(setActiveChat(cid))
+        .then((sent) => { if (sent) markChatRead(cid); })
+        .catch(() => {});
+    });
+    scheduleMarkVisibleUnreadAsRead();
+  };
+  useFocusEffect(useCallback(() => {
+    screenFocusedRef.current = true;
+    try { foregroundReadRef.current?.(); } catch { /* best-effort */ }
+    return () => { screenFocusedRef.current = false; };
+  }, []));
 
   const deduplicateMessages = useCallback((messagesArray) => {
     const uniqueMap = new Map();
@@ -3514,7 +3610,7 @@ export default function useChatLogic({ navigation, route }) {
           }
         }
 
-        const enriched = dbRegular.map(msg => {
+        const enrichedRaw = dbRegular.map(msg => {
           let status = msg.status;
           if ((status === 'sending' || status === 'uploaded') && msg.serverMessageId && msg.synced) {
             status = 'sent';
@@ -3560,6 +3656,32 @@ export default function useChatLogic({ navigation, route }) {
               previewUrl: msg.previewUrl || msg.localUri,
               mediaUrl: msg.mediaUrl || msg.localUri,
             } : {}),
+          };
+        });
+
+        // Identity is monotonic too. A row SQLite still holds as `temp_…` (the
+        // ack's id swap hasn't landed yet) must not replace the on-screen copy
+        // that already carries the server id: keep that id and the higher tick.
+        // Applied before both the screen merge and the ChatCache sync below, so
+        // reopening the chat doesn't flash the stale spinner either.
+        const liveByTemp = new Map();
+        for (const m of allMessagesRef.current || []) {
+          if (!m?.serverMessageId) continue;
+          if (m.tempId) liveByTemp.set(String(m.tempId), m);
+        }
+        const enriched = liveByTemp.size === 0 ? enrichedRaw : enrichedRaw.map((m) => {
+          if (m.serverMessageId) return m;
+          const live = liveByTemp.get(String(m.tempId || m.id || ''));
+          if (!live) return m;
+          const status = (m.status && getMessageStatusPriority(m.status) > getMessageStatusPriority(live.status))
+            ? m.status : live.status;
+          return {
+            ...m,
+            id: live.serverMessageId,
+            serverMessageId: live.serverMessageId,
+            synced: true,
+            status,
+            ...(m.seq == null && live.seq != null ? { seq: live.seq } : {}),
           };
         });
 
@@ -4099,6 +4221,12 @@ export default function useChatLogic({ navigation, route }) {
             placeholderText: deletedText,
             type: 'text',
             senderId: latestMsg.senderId || null,
+            // Every id the message is known by, so the chat list can tell this is the
+            // SAME message its server row describes (and keep the highest tick).
+            serverMessageId: latestMsg.serverMessageId || null,
+            messageId: latestMsg.serverMessageId || latestMsg.messageId || null,
+            tempId: latestMsg.tempId || null,
+            id: latestMsg.id || null,
             status: latestMsg.status || null,
             createdAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
             isDeleted: true,
@@ -4118,6 +4246,12 @@ export default function useChatLogic({ navigation, route }) {
             text: latestMsg.text || '',
             type: latestMsg.type || 'text',
             senderId: latestMsg.senderId || null,
+            // Every id the message is known by, so the chat list can tell this is the
+            // SAME message its server row describes (and keep the highest tick).
+            serverMessageId: latestMsg.serverMessageId || null,
+            messageId: latestMsg.serverMessageId || latestMsg.messageId || null,
+            tempId: latestMsg.tempId || null,
+            id: latestMsg.id || null,
             status: latestMsg.status || null,
             createdAt: latestMsg.createdAt || new Date(latestMsg.timestamp || Date.now()).toISOString(),
             isDeleted: false,
@@ -4141,6 +4275,12 @@ export default function useChatLogic({ navigation, route }) {
             text: nextVisible.text || '',
             type: nextVisible.type || 'text',
             senderId: nextVisible.senderId || null,
+            // Every id the message is known by, so the chat list can tell this is the
+            // SAME message its server row describes (and keep the highest tick).
+            serverMessageId: nextVisible.serverMessageId || null,
+            messageId: nextVisible.serverMessageId || nextVisible.messageId || null,
+            tempId: nextVisible.tempId || null,
+            id: nextVisible.id || null,
             status: nextVisible.status || null,
             createdAt: nextVisible.createdAt || new Date(nextVisible.timestamp || Date.now()).toISOString(),
             isDeleted: false,
@@ -4421,14 +4561,19 @@ export default function useChatLogic({ navigation, route }) {
           }
           // Mutation-delta cursor: pull edits/deletes applied to already-stored
           // messages since we last synced. With no stored cursor, seed from the
-          // newest stored message time so we only pull FUTURE mutations (the
-          // delta above already carries current state for anything it returns).
+          // OLDEST stored message time (minus a skew margin): a held message can't
+          // be mutated before it existed. Seeding from the NEWEST row (the old
+          // behaviour) skipped any edit/delete that predates the newest message.
           let mutatedSince = await getMutationCursor(chatIdParam);
           if (!mutatedSince) {
-            mutatedSince = currentMessages.reduce((mx, m) => {
-              const t = Number(m?.timestamp || new Date(m?.createdAt || 0).getTime() || 0);
-              return t > mx ? t : mx;
-            }, 0);
+            let oldestTs = await ChatDatabase.getOldestMessageTimestamp(chatIdParam);
+            if (!oldestTs) {
+              oldestTs = currentMessages.reduce((mn, m) => {
+                const t = Number(m?.timestamp || new Date(m?.createdAt || 0).getTime() || 0);
+                return t > 0 && (mn === 0 || t < mn) ? t : mn;
+              }, 0);
+            }
+            mutatedSince = deriveMutationSeed({ oldestLocalTs: oldestTs });
           }
           const liveSocket = socketRef.current || getSocket();
           if (!liveSocket || !isSocketConnected()) return;
@@ -4442,6 +4587,7 @@ export default function useChatLogic({ navigation, route }) {
             }
             if (!isSocketAuthed()) return;
           }
+          onOpenSyncReqRef.current = { chatId: chatIdParam, sinceSeq, rounds: 0 };
           liveSocket.emit('message:sync', {
             chatId: chatIdParam,
             sinceSeq,
@@ -5510,11 +5656,18 @@ export default function useChatLogic({ navigation, route }) {
       // Bulk read by chatId — peer has read all messages in this chat
       const sourceChatId = source?.chatId || source?.chat;
       if (sourceChatId && sourceChatId === currentChatId) {
+        const readBound = readBoundOf(source);
+        // Persist bounded (rows too, even if the thread unmounts mid-flight).
+        ChatDatabase.updateAllSentMessagesInChatToSeen(sourceChatId, currentUserIdRef.current, {
+          upToSeq: readBound?.seq, upToTimestamp: readBound?.ts,
+        }).catch(() => {});
+        if (!readBound) return;
         setAllMessages(prev => {
           let changed = false;
           const updated = prev.map(msg => {
             const isMine = msg.senderId === currentUserIdRef.current;
             if (!isMine) return msg;
+            if (!msgWithinReadBound(msg, readBound)) return msg;
             // Skip scheduled/processing/cancelled/failed — not real messages yet
             if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
             if (msg.status === 'sent' || msg.status === 'delivered') {
@@ -5585,7 +5738,12 @@ export default function useChatLogic({ navigation, route }) {
           // Match by messageId list OR by chatId (bulk-all case)
           const msgId = String(msg.serverMessageId || msg.id || msg.tempId || '');
           const matchById = idSet.size > 0 && idSet.has(msgId);
-          const matchByChat = !matchById && bulkChatId && sameId(msg.chatId, bulkChatId) && sameId(msg.senderId, currentUserIdRef.current);
+          // A chat-wide match is only valid when the ack names NO ids AND carries
+          // the reader's synced seq: matching every own message in the chat (what
+          // this did) blued messages the peer never received or had not read.
+          const matchByChat = !matchById && idSet.size === 0 && bulkChatId
+            && sameId(msg.chatId, bulkChatId) && sameId(msg.senderId, currentUserIdRef.current)
+            && msgWithinReadBound(msg, readBoundOf(source));
           if (!matchById && !matchByChat) return msg;
           if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           if (msg.status === 'seen' || msg.status === 'read') return msg;
@@ -5599,10 +5757,10 @@ export default function useChatLogic({ navigation, route }) {
           messageIds.forEach(msgId => {
             SqliteWriter.enqueue('updateMessageStatus', { id: String(msgId), status: 'seen' }).catch(() => {});
           });
-          // Update chats table last_message_status
-          if (bulkChatId) {
-            ChatDatabase.updateChatLastMessageStatus(bulkChatId, 'seen').catch(() => {});
-          }
+          // The chat-list tick in SQLite follows the LAST MESSAGE ROW (written per
+          // matched id above and by the global receipt handler) — never a blanket
+          // "seen" for the whole chat, which persisted a blue tick for a last
+          // message that was not among the ones read.
         }
         return changed ? updated : prev;
       });
@@ -5689,18 +5847,24 @@ export default function useChatLogic({ navigation, route }) {
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
 
       // Always update SQLite (even when this chat is not currently open)
-      ChatDatabase.updateAllSentMessagesInChatToSeen(responseChatId, currentUserIdRef.current)
-        .catch(() => {});
-      ChatDatabase.updateChatLastMessageStatus(responseChatId, 'seen').catch(() => {});
+      // Bounded (M-09): only messages that existed when the peer read. The
+      // chat-list last-message tick is synced inside the same SQLite txn, and
+      // only when the last message itself was covered.
+      const readBound = readBoundOf(source);
+      ChatDatabase.updateAllSentMessagesInChatToSeen(responseChatId, currentUserIdRef.current, {
+        upToSeq: readBound?.seq, upToTimestamp: readBound?.ts,
+      }).catch(() => {});
 
       // Update in-memory state only for the currently open chat
       if (!sameId(responseChatId, currentChatId)) return;
+      if (!readBound) return;
 
       setAllMessages(prev => {
         let changed = false;
         const updated = prev.map(msg => {
           // Only update OUR outgoing messages — not messages from the peer
           if (!sameId(msg.senderId, currentUserIdRef.current)) return msg;
+          if (!msgWithinReadBound(msg, readBound)) return msg;
           // Skip scheduled/processing/cancelled/failed — not real messages yet
           if (msg.status === 'scheduled' || msg.status === 'processing' || msg.status === 'cancelled' || msg.status === 'failed') return msg;
           if (msg.status === 'seen' || msg.status === 'read') return msg;
@@ -5742,6 +5906,7 @@ export default function useChatLogic({ navigation, route }) {
       const newText = source?.text || source?.newText || source?.message;
       const editedChatId = source?.chatId || source?.chat;
       const editedAt = source?.editedAt || source?.updatedAt || new Date().toISOString();
+      const editVersion = source?.editVersion;
       if (!messageId) return;
 
       if (editedChatId && !sameId(editedChatId, currentChatId)) return;
@@ -5754,7 +5919,8 @@ export default function useChatLogic({ navigation, route }) {
           registerPendingEdit(messageId, newText, editedAt);
           return;
         }
-        await ChatDatabase.updateMessageEdit(messageId, newText, editedAt);
+        // Version/ordering guarded (E-A-07): a replayed older edit is a no-op.
+        await ChatDatabase.updateMessageEdit(messageId, newText, editedAt, { editVersion });
         removePendingEdit(messageId);
       }
       refreshMessagesFromDB();
@@ -5903,7 +6069,22 @@ export default function useChatLogic({ navigation, route }) {
       const source = data?.data || data;
       const rows = source?.messages || [];
       if (Array.isArray(rows) && rows.length > 0) {
-        mergeMessagesIntoState(rows);
+        const merged = mergeMessagesIntoState(rows);
+        // A-07: forward delta flagged hasMore -> keep pulling from the LOCAL
+        // committed max (bounded; skipped when sinceSeq was 0, where the server
+        // returns the newest page and hasMore means "older exists").
+        const req = onOpenSyncReqRef.current;
+        if (source?.hasMore === true && req && req.sinceSeq > 0 && req.rounds < 10
+            && sameId(source?.chatId, req.chatId) && sameId(req.chatId, currentChatId)) {
+          Promise.resolve(merged).then(async () => {
+            const next = await ChatDatabase.getLatestSeq(req.chatId);
+            const liveSocket = socketRef.current || getSocket();
+            if (!(next > req.sinceSeq) || !liveSocket || !isSocketConnected() || !isSocketAuthed()) return;
+            req.sinceSeq = next;
+            req.rounds += 1;
+            liveSocket.emit('message:sync', { chatId: req.chatId, sinceSeq: next, limit: 50 });
+          }).catch(() => {});
+        }
         const latestTs = rows.reduce((acc, msg) => {
           const ts = new Date(msg?.createdAt || msg?.timestamp || 0).getTime();
           return Math.max(acc, Number.isNaN(ts) ? 0 : ts);
@@ -6132,7 +6313,16 @@ export default function useChatLogic({ navigation, route }) {
       const messageId = source?.messageId || source?._id;
       if (!messageId) return;
       // SQLite-first: update in DB then refresh UI
-      await ChatDatabase.updateMessageEdit(messageId, source?.text, source?.editedAt || new Date().toISOString());
+      const gEditedAt = source?.editedAt || new Date().toISOString();
+      if (source?.text) {
+        // Row not synced yet: stash like 1:1 so the edit lands with the message.
+        const existing = await ChatDatabase.getMessage(messageId);
+        if (!existing) {
+          registerPendingEdit(messageId, source.text, gEditedAt);
+          return;
+        }
+      }
+      await ChatDatabase.updateMessageEdit(messageId, source?.text, gEditedAt, { editVersion: source?.editVersion });
       refreshMessagesFromDB();
     };
     registerSocketHandler('group:message:edited', onGroupMessageEdited);
@@ -6940,6 +7130,16 @@ export default function useChatLogic({ navigation, route }) {
     // device's own messages are never seq-less (see acknowledgeMessage).
     const serverSeq = Number(serverData?.seq ?? serverData?.data?.seq);
     const hasServerSeq = Number.isFinite(serverSeq) && serverSeq > 0;
+    // T-A-01: a delivered/seen receipt that beat this ack matched no row (the row
+    // had no server id). ChatDatabase remembers it for 60 s; lift the ack's
+    // 'sent' with it so the bubble does not sit on one tick (forward-only).
+    let effectiveStatus = normalizedStatus;
+    if (serverMessageId && normalizedStatus === 'sent') {
+      try {
+        const early = ChatDatabase.peekEarlyReceipt([serverMessageId, tempId]);
+        if (early) effectiveStatus = mergeStatus('sent', early);
+      } catch { /* best-effort */ }
+    }
 
     // Do NOT update status for messages that are scheduled/processing/cancelled/failed
     // These statuses are managed by their own dedicated handlers
@@ -6973,13 +7173,18 @@ export default function useChatLogic({ navigation, route }) {
         // a stale 'sent' must not undo 'delivered', etc. 'failed' is the one
         // exception (an error state may replace a higher one), and scheduled/
         // processing/cancelled are owned by their dedicated handlers.
-        let nextStatus = normalizedStatus;
-        if (normalizedStatus !== 'failed') {
+        let nextStatus = effectiveStatus;
+        if (effectiveStatus !== 'failed') {
           if (STATUS_OWNED_BY_HANDLERS.has(m.status)) {
             nextStatus = m.status;
-          } else if (getMessageStatusPriority(normalizedStatus) < getMessageStatusPriority(m.status)) {
+          } else if (getMessageStatusPriority(effectiveStatus) < getMessageStatusPriority(m.status)) {
             nextStatus = m.status;
           }
+        } else if (!STATUS_OWNED_BY_HANDLERS.has(m.status)) {
+          // T-A-12: a late 'failed' (duplicate path, rejected socket ack while the
+          // REST outbox succeeded) must not downgrade a row the server accepted.
+          const hasProof = Boolean((m.serverMessageId && m.synced) || Number(m.seq) > 0);
+          nextStatus = mergeStatus(m.status, 'failed', { hasServerProof: hasProof });
         }
 
         const needsIdSync = !!serverMessageId &&
@@ -6998,9 +7203,34 @@ export default function useChatLogic({ navigation, route }) {
       return changed ? updated : prev;
     });
 
+    // Same forward-only tick (and id swap) into the in-memory ChatCache, which
+    // paints the thread first when it is reopened — a tick applied only to state
+    // came back as a stale spinner / single tick on reopen.
+    try {
+      const cid = chatIdRef.current;
+      const keys = [serverMessageId, tempId].filter(Boolean).map(String);
+      const cached = cid ? (ChatCache.getMessages(cid) || []).find((m) => keys.some((k) => (
+        String(m.id || '') === k || String(m.serverMessageId || '') === k || String(m.tempId || '') === k
+      ))) : null;
+      if (cached && effectiveStatus !== 'failed' && !STATUS_OWNED_BY_HANDLERS.has(cached.status)
+        && getMessageStatusPriority(effectiveStatus) >= getMessageStatusPriority(cached.status)) {
+        ChatCache.updateMessage(cid, cached.id, {
+          status: effectiveStatus,
+          ...(serverMessageId ? { serverMessageId, id: serverMessageId, synced: true } : {}),
+        });
+      }
+    } catch { /* cache is a paint accelerator only */ }
+
     // Background: persist to SQLite
     if (serverMessageId && tempId && serverMessageId !== tempId) {
-      ChatDatabase.acknowledgeMessage(tempId, serverMessageId, hasServerSeq ? serverSeq : null).catch(() => {});
+      // AWAITED: the refresh below must read the swapped row. Fired and
+      // forgotten, it queued behind the chat-open sync writes, the refresh read
+      // the stale `temp_… / sent` row and put it back on screen — the bubble
+      // then sat on a spinner / one tick for good, because every later receipt
+      // is addressed to the server id that row no longer carried.
+      try {
+        await ChatDatabase.acknowledgeMessage(tempId, serverMessageId, hasServerSeq ? serverSeq : null);
+      } catch { /* the merge in refreshMessagesFromDB still keeps the live id */ }
       const tempReply = await ChatDatabase.getReplyData(tempId);
       if (tempReply) {
         ChatDatabase.saveReplyData(serverMessageId, tempReply).catch(() => {});
@@ -7009,7 +7239,7 @@ export default function useChatLogic({ navigation, route }) {
 
     const targetId = serverMessageId || tempId;
     if (targetId) {
-      SqliteWriter.enqueue('updateMessageStatus', { id: targetId, status: normalizedStatus }).catch(() => {});
+      SqliteWriter.enqueue('updateMessageStatus', { id: targetId, status: effectiveStatus }).catch(() => {});
     }
 
     // Re-read SQLite only when the row's IDENTITY changed (the ack swapped the
@@ -7033,6 +7263,21 @@ export default function useChatLogic({ navigation, route }) {
     refreshMessagesFromDB,
     updateChatListLastMessagePreview,
   ]);
+
+  // T-A-21: the OutboxWorker (REST drain) acks in the provider, which cannot reach
+  // this hook's in-memory rows. It announces the ack; if the row is on screen
+  // here, apply the same update the socket ack path does (id swap + 'sent' + seq).
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener('chat:outbox:acked', (evt) => {
+      const clientId = evt?.clientMessageId;
+      const serverId = evt?.serverMessageId;
+      if (!clientId || !serverId) return;
+      const rows = allMessagesRef.current || [];
+      if (!rows.some((m) => m.id === clientId || m.tempId === clientId)) return;
+      updateMessageStatus(clientId, 'sent', { messageId: serverId, seq: evt?.seq });
+    });
+    return () => sub.remove();
+  }, [updateMessageStatus]);
 
   const sendMessageViaSocket = useCallback((payload, tempId) => {
     return new Promise(async (resolve, reject) => {
@@ -8434,7 +8679,7 @@ export default function useChatLogic({ navigation, route }) {
             if (!existing) {
               await registerPendingEdit(mid, newText, editedAt);
             } else {
-              await ChatDatabase.updateMessageEdit(mid, newText, editedAt);
+              await ChatDatabase.updateMessageEdit(mid, newText, editedAt, { editVersion: doc?.editVersion });
               await removePendingEdit(mid);
             }
           }
@@ -8499,6 +8744,17 @@ export default function useChatLogic({ navigation, route }) {
 
       if (selectedResolved.length === 0) {
         setSelectedMessages([]);
+        return;
+      }
+
+      // A-09: a delete is only meaningful to the server. Offline it used to
+      // change the local copy and never reach the server (the peer kept
+      // reading it; a reinstall brought it back). Same contract as edit: block
+      // with an alert, change nothing. Never-sent local rows (temp ids) can
+      // still be removed offline.
+      if ((!socket || !isSocketConnected())
+          && selectedResolved.some(({ resolvedId }) => !String(resolvedId).startsWith('temp_'))) {
+        Alert.alert('Error', 'Not connected. Please try again.');
         return;
       }
 
@@ -8571,17 +8827,46 @@ export default function useChatLogic({ navigation, route }) {
 
   // ─── MESSAGE EDITING ───
 
+  // Live stored row for an id-bearing message copy (menu snapshot, composer
+  // copy, toolbar selection). allMessagesRef mirrors the SQLite-fed list.
+  const findLiveMessageRow = useCallback((msg) => {
+    if (!msg) return null;
+    const ids = [msg.serverMessageId, msg.id, msg.messageId, msg.tempId].filter(Boolean);
+    if (!ids.length) return null;
+    const list = allMessagesRef.current || [];
+    return list.find((m) => ids.some((i) => sameId(m.serverMessageId, i) || sameId(m.id, i) || sameId(m.tempId, i))) || null;
+  }, []);
+
+  const editChatRef = useRef(chatData);
+  editChatRef.current = chatData;
+
+  // One notice path for edit problems: Android toast; iOS has no toast
+  // primitive in this app, so a title-only Alert is used there.
+  const notifyEdit = useCallback((msg) => {
+    if (!msg) return;
+    if (Platform.OS === 'android') ToastAndroid.show(msg, ToastAndroid.SHORT);
+    else Alert.alert(msg);
+  }, []);
+
   const startEditMessage = useCallback((msg) => {
     if (!msg) return;
-    const isMine = sameId(msg.senderId, currentUserIdRef.current);
-    if (!isMine) return;
-    if (msg.type !== 'text' && msg.type !== undefined) return;
-    if (msg.isDeleted) return;
-    // Must have server ID — temp messages can't be edited on server
-    if (!msg.serverMessageId || String(msg.serverMessageId).startsWith('temp_')) return;
-    setEditingMessage(msg);
+    // Decide from the LIVE stored row, never from the copy the menu captured.
+    const live = findLiveMessageRow(msg) || msg;
+    const serverId = serverIdOf(live) || serverIdOf(msg);
+    const candidate = { ...live, serverMessageId: serverId };
+    const reason = getEditBlockReason(candidate, {
+      chat: editChatRef.current,
+      myUserId: currentUserIdRef.current,
+      isOwn: sameId(live.senderId, currentUserIdRef.current),
+    });
+    if (reason) {
+      const note = blockReasonMessage(reason);
+      if (note) notifyEdit(note);
+      return;
+    }
+    setEditingMessage(candidate);
     setSelectedMessages([]);
-  }, []);
+  }, [findLiveMessageRow, notifyEdit]);
 
   const cancelEditMessage = useCallback(() => {
     setEditingMessage(null);
@@ -8612,37 +8897,87 @@ export default function useChatLogic({ navigation, route }) {
     setReplyTarget(null);
   }, []);
 
-  const submitEditMessage = useCallback(async (newText) => {
-    if (!editingMessage || !newText?.trim()) return;
-
-    // MUST use the server message ID — temp IDs are not known to the server
-    const serverMsgId = editingMessage.serverMessageId;
-    const localId = editingMessage.id || editingMessage.tempId;
-    const messageId = serverMsgId || localId;
+  // The chat list shows only the LAST message, so an edit touches the preview
+  // (Redux + SQLite chats.last_message*) only when the edited message is it.
+  const applyEditPreview = useCallback((row, serverMsgId, text, isEdited, editedAt) => {
     const cId = chatIdRef.current;
-    if (!messageId || !cId) return;
+    if (!cId || !row) return;
+    const list = allMessagesRef.current || [];
+    let latest = null;
+    for (const m of list) {
+      if (m.isDeleted || m.systemEvent) continue;
+      const t = Number(m.timestamp) || Date.parse(m.createdAt) || 0;
+      if (!latest || t >= latest.t) latest = { m, t };
+    }
+    const lm = latest?.m;
+    if (!lm || !(sameId(lm.serverMessageId, serverMsgId) || sameId(lm.id, serverMsgId))) return;
+    const preview = {
+      text,
+      type: row.type || 'text',
+      senderId: row.senderId || currentUserIdRef.current,
+      status: row.status || 'sent',
+      createdAt: row.createdAt || editedAt,
+      isEdited,
+      editedAt: isEdited ? editedAt : null,
+      serverMessageId: serverMsgId,
+      messageId: serverMsgId,
+    };
+    updateLocalLastMessagePreview({
+      chatId: cId,
+      lastMessage: preview,
+      lastMessageAt: row.createdAt || editedAt,
+      lastMessageType: row.type || 'text',
+      lastMessageSender: row.senderId || currentUserIdRef.current,
+      lastMessageEdited: isEdited,
+    });
+    ChatDatabase.updateChatLastMessage(cId, preview).catch(() => {});
+  }, [updateLocalLastMessagePreview]);
 
-    // Block editing if the message hasn't been acknowledged by the server yet
-    if (!serverMsgId || String(serverMsgId).startsWith('temp_')) {
-      Alert.alert('Cannot edit', 'Message is still sending. Please wait.');
+  const submitEditMessage = useCallback(async (newText) => {
+    if (!editingMessage) return;
+    const checked = checkEditText(newText);
+    if (!checked.ok) {
+      if (checked.reason === 'too_long') { notifyEdit('Message is too long'); return false; }
       return;
     }
 
-    try {
-      const socket = socketRef.current || getSocket();
-      if (!socket || !isSocketConnected()) {
-        Alert.alert('Error', 'Not connected. Please try again.');
-        return;
-      }
+    const cId = chatIdRef.current;
+    // Re-evaluate against the LIVE stored row at send time: a composer that
+    // outlived a read receipt (or a deletion) must not send.
+    const liveRow = findLiveMessageRow(editingMessage) || editingMessage;
+    const serverMsgId = serverIdOf(liveRow) || serverIdOf(editingMessage);
+    if (!serverMsgId || !cId) return;
+    const reason = getEditBlockReason({ ...liveRow, serverMessageId: serverMsgId }, {
+      chat: editChatRef.current,
+      myUserId: currentUserIdRef.current,
+      isOwn: sameId(liveRow.senderId, currentUserIdRef.current),
+    });
+    if (reason) {
+      notifyEdit(blockReasonMessage(reason) || "Can't edit this message");
+      setEditingMessage(null);
+      setText('');
+      return;
+    }
 
-      const trimmedText = newText.trim();
+    const socket = socketRef.current || getSocket();
+    if (!socket || !isSocketConnected()) {
+      // Offline edit is blocked on purpose (no queue). Returning false tells the
+      // caller to keep the composer so the typed text is not lost.
+      Alert.alert('Not connected', MSG_OFFLINE);
+      return false;
+    }
+
+    try {
+      const trimmedText = checked.text;
       const editedAt = new Date().toISOString();
 
-      // Snapshot pre-edit values so we can roll back if the server rejects.
+      // Server text = what the stored row holds RIGHT NOW (before our optimistic
+      // write), not the snapshot taken when the menu opened.
       const preEdit = {
-        text: editingMessage.text,
-        isEdited: Boolean(editingMessage.isEdited),
-        editedAt: editingMessage.editedAt || null,
+        text: liveRow.text,
+        isEdited: Boolean(liveRow.isEdited),
+        editedAt: liveRow.editedAt || null,
+        editVersion: liveRow.editVersion || 0,
       };
 
       // Optimistic UI: update state immediately
@@ -8652,28 +8987,11 @@ export default function useChatLogic({ navigation, route }) {
         return { ...m, text: trimmedText, isEdited: true, editedAt };
       }));
 
-      // Persist to SQLite
-      await ChatDatabase.updateMessageEdit(serverMsgId, trimmedText, editedAt);
+      // Persist to SQLite (local write: bypasses the version guard)
+      await ChatDatabase.updateMessageEdit(serverMsgId, trimmedText, editedAt, { force: true });
 
-      // Update chat list preview
-      updateLocalLastMessagePreview({
-        chatId: cId,
-        lastMessage: {
-          text: trimmedText,
-          type: editingMessage.type || 'text',
-          senderId: editingMessage.senderId || currentUserIdRef.current,
-          status: editingMessage.status || 'sent',
-          createdAt: editingMessage.createdAt || editedAt,
-          isEdited: true,
-          editedAt,
-          serverMessageId: serverMsgId,
-          messageId: serverMsgId,
-        },
-        lastMessageAt: editingMessage.createdAt || editedAt,
-        lastMessageType: editingMessage.type || 'text',
-        lastMessageSender: editingMessage.senderId || currentUserIdRef.current,
-        lastMessageEdited: true,
-      });
+      // Update chat list preview (only when this is the chat's last message)
+      applyEditPreview(liveRow, serverMsgId, trimmedText, true, editedAt);
 
       // Emit to server with the SERVER message ID
       const isGroupEdit = chatData?.chatType === 'group' || chatData?.isGroup;
@@ -8685,31 +9003,61 @@ export default function useChatLogic({ navigation, route }) {
         text: trimmedText,
       };
       socket.emit(editEvent, editPayload, (ack) => {
-        // Rollback on server rejection (NOT_MESSAGE_OWNER / EDIT_TIMEOUT /
-        // MESSAGE_DELETED / NO_EDIT_CONTENT). Restore the snapshot in state +
-        // SQLite so the optimistic edit doesn't stick.
-        if (ack?.status === false || ack?.success === false) {
-          setAllMessages(prev => prev.map(m => {
-            const isMatch = sameId(m.serverMessageId, serverMsgId) || sameId(m.id, serverMsgId);
-            if (!isMatch) return m;
-            return { ...m, text: preEdit.text, isEdited: preEdit.isEdited, editedAt: preEdit.editedAt };
-          }));
-          // Restore the pre-edit TEXT in SQLite. (upsert can't lower is_edited —
-          // its merge does MAX(is_edited) — so we write the original text back
-          // via updateMessageEdit; the in-memory state above governs the UI.)
-          if (preEdit.text) {
-            ChatDatabase.updateMessageEdit(serverMsgId, preEdit.text, preEdit.editedAt || editedAt).catch(() => {});
-          }
-          const code = ack?.code || ack?.error;
-          Alert.alert('Edit failed', ack?.message || (code ? String(code) : 'The message could not be edited.'));
+        if (!isEditRejected(ack)) return;
+        // Rejected (ALREADY_READ / NOT_EDITABLE / EDIT_TIMEOUT / ...). Roll the
+        // optimistic edit back to the pre-edit text in state, SQLite and the
+        // chat list - unless a newer edit already replaced our text.
+        const current = (allMessagesRef.current || []).find(
+          (m) => sameId(m.serverMessageId, serverMsgId) || sameId(m.id, serverMsgId));
+        if (!shouldRevertEdit({ optimisticText: trimmedText, currentText: current ? current.text : null })) {
+          notifyEdit(editErrorMessage(ack));
+          return;
         }
+        setAllMessages(prev => prev.map(m => {
+          const isMatch = sameId(m.serverMessageId, serverMsgId) || sameId(m.id, serverMsgId);
+          if (!isMatch) return m;
+          return {
+            ...m,
+            text: preEdit.text,
+            isEdited: preEdit.isEdited,
+            editedAt: preEdit.editedAt,
+          };
+        }));
+        if (preEdit.text) {
+          ChatDatabase.updateMessageEdit(serverMsgId, preEdit.text, preEdit.editedAt, {
+            force: true,
+            isEdited: preEdit.isEdited,
+          }).then(() => refreshMessagesFromDB()).catch(() => {});
+        }
+        applyEditPreview(liveRow, serverMsgId, preEdit.text, preEdit.isEdited, preEdit.editedAt);
+        notifyEdit(editErrorMessage(ack));
+        if (__DEV__) console.warn('[EDIT] rejected', editErrorCode(ack));
       });
     } catch (err) {
-      console.warn('[EDIT] submitEditMessage error:', err);
+      if (__DEV__) console.warn('[EDIT] submitEditMessage error:', err);
     } finally {
       setEditingMessage(null);
     }
-  }, [editingMessage, updateLocalLastMessagePreview]);
+  }, [editingMessage, applyEditPreview, findLiveMessageRow, notifyEdit, refreshMessagesFromDB, chatData]);
+
+  // Live watcher (E-A-02): the edit composer follows the stored row. When a read
+  // receipt (or delete) makes the message non-editable, leave edit mode with a
+  // short notice. Event-driven off allMessages, no timers.
+  useEffect(() => {
+    if (!editingMessage) return;
+    const live = findLiveMessageRow(editingMessage);
+    if (!live) return;
+    const d = editExitDecision({ ...live, serverMessageId: serverIdOf(live) }, {
+      chat: editChatRef.current,
+      myUserId: currentUserIdRef.current,
+      isOwn: sameId(live.senderId, currentUserIdRef.current),
+    });
+    if (d.exit) {
+      setEditingMessage(null);
+      setText('');
+      notifyEdit(d.message);
+    }
+  }, [allMessages, editingMessage, findLiveMessageRow, notifyEdit]);
 
   const handleDeleteSelected = useCallback(() => {
     if (selectedMessage.length === 0) return;
@@ -11496,6 +11844,13 @@ export default function useChatLogic({ navigation, route }) {
 
     console.log('[toggleReaction] action:', action, '| finalReactions:', JSON.stringify(reactions));
 
+    // A-09: a reaction taken offline used to be applied locally and never sent.
+    // Block with the same alert edit uses; nothing is changed or queued.
+    if (!isSocketConnected()) {
+      Alert.alert('Error', 'Not connected. Please try again.');
+      return;
+    }
+
     // INSTANT UI update — no DB round-trip, no flicker
     updateReactionsInState(msgId, reactions);
 
@@ -11588,6 +11943,13 @@ export default function useChatLogic({ navigation, route }) {
       }
     }
     if (!removed) return;
+
+    // A-09: a reaction taken offline used to be applied locally and never sent.
+    // Block with the same alert edit uses; nothing is changed or queued.
+    if (!isSocketConnected()) {
+      Alert.alert('Error', 'Not connected. Please try again.');
+      return;
+    }
 
     // INSTANT UI update
     updateReactionsInState(msgId, reactions);

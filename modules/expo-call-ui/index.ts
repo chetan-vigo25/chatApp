@@ -144,4 +144,43 @@ export const openAutoStartSettings = (): boolean =>
 export const getManufacturer = (): string =>
   (Native?.getManufacturer?.() as string) ?? '';
 
+// ---- Phase 2 call-push hardening (Android; all degrade safely elsewhere) ----
+
+// P-C-04: tell the native FCM service who is signed in (user id), "none" when
+// signed out, null to clear (= unknown). Never a token.
+export const setSessionMarker = (value: string | null): void => {
+  try { Native?.setSessionMarker?.(value ?? null); } catch (_) { /* no-op */ }
+};
+
+// P-C-16: server minus device clock in ms, learned from a live socket ring.
+export const setServerClockOffset = (offsetMs: number): void => {
+  try { if (Number.isFinite(offsetMs)) Native?.setServerClockOffset?.(offsetMs); } catch (_) { /* no-op */ }
+};
+
+export type PendingDecline = { callId: string; callerId?: string | null; ts: number };
+
+// P-C-06: Decline taps persisted while JS was not observing.
+export const getPendingDeclines = (): PendingDecline[] => {
+  try { return (Native?.getPendingDeclines?.() as PendingDecline[]) ?? []; } catch (_) { return []; }
+};
+export const clearPendingDeclines = (): void => {
+  try { Native?.clearPendingDeclines?.(); } catch (_) { /* no-op */ }
+};
+
+// P-C-10: unknown => true so we never nag on a build without the native module.
+export const areNotificationsEnabled = (): boolean => {
+  try { return Native?.areNotificationsEnabled?.() ?? true; } catch (_) { return true; }
+};
+export const isCallChannelEnabled = (): boolean => {
+  try { return Native?.isCallChannelEnabled?.() ?? true; } catch (_) { return true; }
+};
+
+// P-C-08: Android 14+ full-screen-intent grant. true when < 14 / unknown.
+export const canUseFullScreenIntent = (): boolean => {
+  try { return Native?.canUseFullScreenIntent?.() ?? true; } catch (_) { return true; }
+};
+export const openFullScreenIntentSettings = (): boolean => {
+  try { return Native?.openFullScreenIntentSettings?.() ?? false; } catch (_) { return false; }
+};
+
 export default Native;

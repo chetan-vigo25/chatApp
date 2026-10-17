@@ -72,11 +72,11 @@ export default function LinkingLoader({ visible, success }) {
           <ActivityIndicator size="large" color={theme.colors.themeColor} />
         )}
         <Text style={[styles.text, { color: theme.colors.primaryTextColor }]}>
-          {success ? 'Device Linked!' : 'Linking device...'}
+          {success ? 'Device Linked!' : 'Connecting...'}
         </Text>
         {!success && (
           <Text style={[styles.subtext, { color: theme.colors.placeHolderTextColor }]}>
-            Verifying and establishing connection
+            Waiting for your browser to connect
           </Text>
         )}
       </Animated.View>

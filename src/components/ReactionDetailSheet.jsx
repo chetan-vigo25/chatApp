@@ -1,10 +1,21 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
-  View, Text, Modal, TouchableOpacity, FlatList, Image,
-  ScrollView, StyleSheet, Dimensions, ActivityIndicator,
+  View,
+  Text,
+  Modal,
+  TouchableOpacity,
+  FlatList,
+  ScrollView,
+  StyleSheet,
+  Dimensions,
+  ActivityIndicator,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
+import { BottomSheetFlatList } from '@gorhom/bottom-sheet';
+import AppImage from './AppImage';
+import { useTheme } from '../contexts/ThemeContext';
+import AppSheet, { USE_GORHOM } from './AppSheet';
 
 const { height: SCREEN_H } = Dimensions.get('window');
 
@@ -23,7 +34,7 @@ const ReactorRow = React.memo(({
   >
     <View style={[styles.avatar, { backgroundColor: isDarkMode ? '#2A3A44' : '#E8E8E8' }]}>
       {avatar ? (
-        <Image source={{ uri: avatar }} style={styles.avatarImg} />
+        <AppImage source={{ uri: avatar }} style={styles.avatarImg} />
       ) : (
         <Ionicons name="person" size={18} color={isDarkMode ? '#6A7A84' : '#ADADAD'} />
       )}
@@ -57,6 +68,8 @@ const ReactionDetailSheet = React.memo(({
   fetchReactionList,
   messageId,
 }) => {
+  const { theme: appTheme } = useTheme();
+  const menuSurface = appTheme.colors.menuSurface;
   const [selectedEmoji, setSelectedEmoji] = useState(initialEmoji || 'all');
   const [serverReactors, setServerReactors] = useState(null);
 
@@ -155,6 +168,85 @@ const ReactionDetailSheet = React.memo(({
 
   const keyExtractor = useCallback((item, idx) => `${item.userId}_${item.emoji}_${idx}`, []);
 
+  // Same content in both paths; only the list component differs (the gorhom
+  // sheet needs its own FlatList so list scroll and sheet drag cooperate).
+  const renderInner = (ListComp) => (
+    <>
+    {/* Drag handle */}
+    <View style={styles.dragHandle}>
+      <View style={[styles.dragBar, { backgroundColor: isDarkMode ? '#3A4A54' : '#D0D0D0' }]} />
+    </View>
+
+    {/* Emoji tabs */}
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      style={[styles.tabBar, { borderBottomColor: isDarkMode ? '#2A3A44' : '#E0E0E0' }]}
+      contentContainerStyle={styles.tabContent}
+    >
+      {/* All tab */}
+      <TouchableOpacity
+        onPress={() => setSelectedEmoji('all')}
+        style={[styles.tab, selectedEmoji === 'all' && { borderBottomColor: themeColor || '#03b0a2' }]}
+      >
+        <Text style={[
+          styles.tabText,
+          { color: selectedEmoji === 'all' ? (themeColor || '#03b0a2') : (placeholderColor || '#999') },
+        ]}>All {totalCount}</Text>
+      </TouchableOpacity>
+      {entries.map(([emoji, data]) => {
+        const isSelected = selectedEmoji === emoji;
+        return (
+          <TouchableOpacity
+            key={emoji}
+            onPress={() => setSelectedEmoji(emoji)}
+            style={[styles.tab, isSelected && { borderBottomColor: themeColor || '#03b0a2' }]}
+          >
+            <Text style={styles.tabEmoji}>{emoji}</Text>
+            <Text style={[
+              styles.tabCount,
+              { color: isSelected ? (themeColor || '#03b0a2') : (placeholderColor || '#999') },
+            ]}>{data.count}</Text>
+          </TouchableOpacity>
+        );
+      })}
+    </ScrollView>
+
+    {/* Reactor list — render from local data immediately, server data refines it */}
+    <ListComp
+      data={reactorList}
+      renderItem={renderReactor}
+      keyExtractor={keyExtractor}
+      style={styles.list}
+      contentContainerStyle={styles.listContent}
+      showsVerticalScrollIndicator={false}
+      initialNumToRender={12}
+      maxToRenderPerBatch={12}
+      windowSize={5}
+      removeClippedSubviews
+    />
+    </>
+  );
+
+  if (USE_GORHOM) {
+    // Height the old content-sized Modal sheet had: handle + tab bar + rows +
+    // padding, capped at 55% of the screen. Based on the total count (not the
+    // selected tab) so switching tabs does not resize the sheet.
+    const sheetH = Math.min(SCREEN_H * 0.55, 24 + 40 + 8 + Math.max(1, totalCount) * 59 + 16 + 24);
+    return (
+      <AppSheet
+        visible={visible}
+        onClose={onClose}
+        snapPoints={[sheetH]}
+        backgroundColor={menuSurface}
+      >
+        <View style={styles.sheetBody}>
+          {renderInner(BottomSheetFlatList)}
+        </View>
+      </AppSheet>
+    );
+  }
+
   if (!visible) return null;
 
   return (
@@ -171,61 +263,9 @@ const ReactionDetailSheet = React.memo(({
       >
         <TouchableOpacity activeOpacity={1} onPress={() => {}} style={[
           styles.sheet,
-          { backgroundColor: isDarkMode ? '#1F2C34' : '#FFFFFF' },
+          { backgroundColor: menuSurface },
         ]}>
-          {/* Drag handle */}
-          <View style={styles.dragHandle}>
-            <View style={[styles.dragBar, { backgroundColor: isDarkMode ? '#3A4A54' : '#D0D0D0' }]} />
-          </View>
-
-          {/* Emoji tabs */}
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={[styles.tabBar, { borderBottomColor: isDarkMode ? '#2A3A44' : '#E0E0E0' }]}
-            contentContainerStyle={styles.tabContent}
-          >
-            {/* All tab */}
-            <TouchableOpacity
-              onPress={() => setSelectedEmoji('all')}
-              style={[styles.tab, selectedEmoji === 'all' && { borderBottomColor: themeColor || '#03b0a2' }]}
-            >
-              <Text style={[
-                styles.tabText,
-                { color: selectedEmoji === 'all' ? (themeColor || '#03b0a2') : (placeholderColor || '#999') },
-              ]}>All {totalCount}</Text>
-            </TouchableOpacity>
-            {entries.map(([emoji, data]) => {
-              const isSelected = selectedEmoji === emoji;
-              return (
-                <TouchableOpacity
-                  key={emoji}
-                  onPress={() => setSelectedEmoji(emoji)}
-                  style={[styles.tab, isSelected && { borderBottomColor: themeColor || '#03b0a2' }]}
-                >
-                  <Text style={styles.tabEmoji}>{emoji}</Text>
-                  <Text style={[
-                    styles.tabCount,
-                    { color: isSelected ? (themeColor || '#03b0a2') : (placeholderColor || '#999') },
-                  ]}>{data.count}</Text>
-                </TouchableOpacity>
-              );
-            })}
-          </ScrollView>
-
-          {/* Reactor list — render from local data immediately, server data refines it */}
-          <FlatList
-            data={reactorList}
-            renderItem={renderReactor}
-            keyExtractor={keyExtractor}
-            style={styles.list}
-            contentContainerStyle={styles.listContent}
-            showsVerticalScrollIndicator={false}
-            initialNumToRender={12}
-            maxToRenderPerBatch={12}
-            windowSize={5}
-            removeClippedSubviews
-          />
+          {renderInner(FlatList)}
         </TouchableOpacity>
       </TouchableOpacity>
     </Modal>
@@ -233,6 +273,10 @@ const ReactionDetailSheet = React.memo(({
 });
 
 const styles = StyleSheet.create({
+  sheetBody: {
+    flex: 1,
+    paddingBottom: 24,
+  },
   overlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.45)',

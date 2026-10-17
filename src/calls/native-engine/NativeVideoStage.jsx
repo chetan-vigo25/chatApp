@@ -10,6 +10,7 @@ import * as registry from './streamRegistry';
 import CallAvatar from '../components/CallAvatar';
 import useDraggablePip from '../components/useDraggablePip';
 import useCallRoster from '../useCallRoster';
+import { toggleChrome } from '../screens/callChromeStore';
 import {
   gridLayout, tileBox, fitAvatar, MAX_VIDEO_TILES,
 } from '../callGridLayout';
@@ -131,7 +132,7 @@ const CONTROLS_H = 94;  // 16 padding + 56 button + 22 padding
  */
 function CallGroupGrid({
   snap, RTCView, participants, rosterConnectedOnly,
-  selfId, selfName, selfAvatar, cameraOn, micOn, activeSpeakerId,
+  selfId, selfName, selfAvatar, cameraOn, micOn, activeSpeakerId, tapToToggle,
 }) {
   const roster = useCallRoster(participants, { connectedOnly: rosterConnectedOnly });
   const insets = useSafeAreaInsets();
@@ -239,6 +240,7 @@ function CallGroupGrid({
 
   return (
     <View style={styles.stage} pointerEvents="box-none">
+      {tapToToggle ? <TapLayer /> : null}
       <View
         style={[styles.gGrid, { paddingTop: padTop, paddingBottom: padBottom }]}
         pointerEvents="none"
@@ -322,6 +324,9 @@ export default function NativeVideoStage({
   selfAvatar = null,
   micOn = true,
   activeSpeakerId = null,
+  // Full-screen (not minimized) video: a tap on the video shows/hides the call
+  // controls. Off for the minimized PiP, whose own pan/tap must win.
+  tapToToggle = false,
 }) {
   const [snap, setSnap] = useState(registry.getSnapshot);
   // 1:1 only: true = local feed full-bleed, remote in the small tile.
@@ -329,11 +334,14 @@ export default function NativeVideoStage({
 
   useEffect(() => registry.subscribe(() => setSnap(registry.getSnapshot())), []);
 
-  const videoRemotes = (snap.remotes || []).filter((r) => r.stream && r.hasVideo);
+  const liveRemotes = (snap.remotes || []).filter((r) => r.stream && r.hasVideo);
+  // A shared screen is its own feed (`<peerId>#screen`), never a camera.
+  const screenRemotes = liveRemotes.filter((r) => String(r.key).endsWith('#screen'));
+  const videoRemotes = liveRemotes.filter((r) => !String(r.key).endsWith('#screen'));
   const local = snap.local;
   const showLocal = !!(local && local.stream && local.hasVideo);
   // A 2-person GROUP/conference call is NOT the 1:1 layout — it stacks (see below).
-  const oneToOne = !isGroup && videoRemotes.length === 1 && showLocal;
+  const oneToOne = !isGroup && videoRemotes.length === 1 && showLocal && !screenRemotes.length;
   const localOff = cameraOn === false;
   const remoteOff = remoteCameraOn === false;
 
@@ -345,8 +353,14 @@ export default function NativeVideoStage({
 
   // WhatsApp-style drag-and-snap for the small self/PiP tile. One shared pan —
   // the chosen spot survives a tap-to-swap.
+  // Free placement (no edge snap): the user parks the tiles wherever they
+  // cover the least of the video / shared screen.
   const { pan, panHandlers } = useDraggablePip({
-    width: PIP_W, height: PIP_H, enabled: true, initial: 'top-right',
+    width: PIP_W, height: PIP_H, enabled: true, initial: 'top-right', snapToEdge: false,
+  });
+  // The sharer's camera tile during a 1:1 screen share — movable the same way.
+  const { pan: camPan, panHandlers: camPanHandlers } = useDraggablePip({
+    width: PIP_W, height: PIP_H, enabled: true, initial: 'top-left', snapToEdge: false,
   });
 
   const webrtc = getWebrtc();
@@ -369,14 +383,91 @@ export default function NativeVideoStage({
         cameraOn={cameraOn}
         micOn={micOn}
         activeSpeakerId={activeSpeakerId}
+        tapToToggle={tapToToggle}
       />
     );
   }
 
-  if (!videoRemotes.length && !showLocal) return null; // audio-only 1:1
+  if (!videoRemotes.length && !showLocal && !screenRemotes.length) return null; // audio-only 1:1
 
   const grid = videoRemotes.length > 1;
   const mirrorLocal = !!(local && local.facing === 'user');
+
+  // The draggable self tile, shared by the layouts below. It is rendered with
+  // the SAME key and element tree (Animated.View → Pressable → RTCView keyed by
+  // the track) in every layout, so React keeps the native view mounted when the
+  // layout changes. Remounting it — e.g. when a peer's screen share ended and
+  // the stage went back to the 1:1 layout — left Android's new SurfaceView
+  // black (the old view of the same track was torn down in the same frame).
+  const renderSelfTile = (onPress) => (
+    <Animated.View
+      key="self-tile"
+      style={[styles.selfPreview, { transform: pan.getTranslateTransform() }]}
+      {...panHandlers}
+    >
+      <Pressable
+        onPress={onPress}
+        disabled={!onPress}
+        style={styles.smallFill}
+        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      >
+        {localOff ? (
+          <LocalCamOffCard />
+        ) : (
+          <RTCView
+            key={`local:${videoTrackId(local.stream)}`}
+            streamURL={local.stream.toURL()}
+            style={styles.smallFill}
+            objectFit="cover"
+            zOrder={1}
+            mirror={mirrorLocal}
+          />
+        )}
+        <TouchShield />
+      </Pressable>
+    </Animated.View>
+  );
+  const selfTile = showLocal ? renderSelfTile(null) : null;
+
+  // ---- 1:1 screen share (WhatsApp / Meet style) ----
+  // The shared screen owns the WHOLE stage, shown whole (contain, letterboxed
+  // on black) — a phone or desktop screen cropped to `cover` is unreadable.
+  // The sharer's camera (if on) is a small tile starting top-left, level with
+  // your own tile top-right (both draggable anywhere), so neither sits on top of the shared content's
+  // middle or of each other. (It used to split the stage 60/40, which shrank a
+  // portrait phone screen to a sliver with the self tile parked over it.)
+  if (screenRemotes.length) {
+    const share = screenRemotes[0];
+    const cam = !remoteOff ? videoRemotes.find((r) => r.peerId === share.peerId) || videoRemotes[0] : null;
+    return (
+      <View style={[styles.stage, styles.screenStage]} pointerEvents="box-none">
+        <RTCView
+          key={`screen:${share.key}:${videoTrackId(share.stream)}`}
+          streamURL={share.stream.toURL()}
+          style={styles.fillAbsolute}
+          objectFit="contain"
+          zOrder={0}
+        />
+        {tapToToggle ? <TapLayer /> : null}
+        {cam ? (
+          <Animated.View
+            style={[styles.shareCamTile, { transform: camPan.getTranslateTransform() }]}
+            {...camPanHandlers}
+          >
+            <RTCView
+              key={`cam:${cam.key}:${videoTrackId(cam.stream)}`}
+              streamURL={cam.stream.toURL()}
+              style={styles.smallFill}
+              objectFit="cover"
+              zOrder={1}
+            />
+            <TouchShield />
+          </Animated.View>
+        ) : null}
+        {selfTile}
+      </View>
+    );
+  }
 
   // ---- 1:1 with both feeds: full-bleed + swappable draggable self tile ----
   if (oneToOne) {
@@ -403,29 +494,33 @@ export default function NativeVideoStage({
             mirror={bigIsLocal && mirrorLocal}
           />
         )}
-        <Animated.View
-          style={[styles.selfPreview, { transform: pan.getTranslateTransform() }]}
-          {...panHandlers}
-        >
-          <Pressable
-            onPress={() => setSwapped((s) => !s)}
-            style={styles.smallFill}
-            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        {tapToToggle ? <TapLayer /> : null}
+        {smallIsLocal ? renderSelfTile(() => setSwapped((v) => !v)) : (
+          <Animated.View
+            key="peer-small-tile"
+            style={[styles.selfPreview, { transform: pan.getTranslateTransform() }]}
+            {...panHandlers}
           >
-            {smallOff ? (
-              smallIsLocal ? <LocalCamOffCard /> : <RemoteCamOffCard peer={peer} />
-            ) : (
-              <RTCView
-                key={`small:${smallIsLocal ? 'local' : remote.key}:${videoTrackId(small.stream)}`}
-                streamURL={small.stream.toURL()}
-                style={styles.smallFill}
-                objectFit="cover"
-                zOrder={1}
-                mirror={smallIsLocal && mirrorLocal}
-              />
-            )}
-          </Pressable>
-        </Animated.View>
+            <Pressable
+              onPress={() => setSwapped((v) => !v)}
+              style={styles.smallFill}
+              hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+            >
+              {smallOff ? (
+                <RemoteCamOffCard peer={peer} />
+              ) : (
+                <RTCView
+                  key={`small:${remote.key}:${videoTrackId(small.stream)}`}
+                  streamURL={small.stream.toURL()}
+                  style={styles.smallFill}
+                  objectFit="cover"
+                  zOrder={1}
+                />
+              )}
+              <TouchShield />
+            </Pressable>
+          </Animated.View>
+        )}
       </View>
     );
   }
@@ -463,6 +558,7 @@ export default function NativeVideoStage({
           ))}
         </View>
       )}
+      {tapToToggle ? <TapLayer /> : null}
       {showLocal && (
         soloLocal ? (
           <View pointerEvents="none" style={styles.fillAbsolute}>
@@ -479,31 +575,44 @@ export default function NativeVideoStage({
               />
             )}
           </View>
-        ) : (
-          <Animated.View
-            style={[styles.selfPreview, { transform: pan.getTranslateTransform() }]}
-            {...panHandlers}
-          >
-            {localOff ? (
-              <LocalCamOffCard />
-            ) : (
-              <RTCView
-                key={`local:${videoTrackId(local.stream)}`}
-                streamURL={local.stream.toURL()}
-                style={styles.smallFill}
-                objectFit="cover"
-                zOrder={1}
-                mirror={mirrorLocal}
-              />
-            )}
-          </Animated.View>
-        )
+        ) : renderSelfTile(null)
       )}
     </View>
   );
 }
 
+// Transparent cover over a small tile's video. On iOS (new architecture) the
+// RTCView is a legacy-interop native view that took the touch itself, so the
+// tile's drag (PanResponder) and tap-to-swap never saw it — the small window
+// couldn't be moved on iOS while Android's could. A plain View on top makes the
+// touch land on a React view every time.
+function TouchShield() {
+  return <View style={StyleSheet.absoluteFill} />;
+}
+
+// Transparent full-stage touch target BEHIND the self tile: tap → toggle the
+// call controls (CallOverlay owns the auto-hide timer).
+function TapLayer() {
+  return <Pressable style={styles.tapLayer} onPress={toggleChrome} />;
+}
+
 const styles = StyleSheet.create({
+  tapLayer: { ...StyleSheet.absoluteFillObject },
+  // 1:1 screen share: the screen fills the stage on black; the sharer's camera
+  // is a small fixed tile top-left (same size as the self tile).
+  screenStage: { backgroundColor: '#000' },
+  shareCamTile: {
+    position: 'absolute',
+    left: 0,
+    top: 0,
+    width: PIP_W,
+    height: PIP_H,
+    borderRadius: 14,
+    overflow: 'hidden',
+    backgroundColor: '#111',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.18)',
+  },
   stage: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: alwaysDark.background,
@@ -540,7 +649,7 @@ const styles = StyleSheet.create({
     top: 0,
     width: PIP_W,
     height: PIP_H,
-    borderRadius: 12,
+    borderRadius: 14,
     overflow: 'hidden',
     backgroundColor: '#111',
   },

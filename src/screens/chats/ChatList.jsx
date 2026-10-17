@@ -1,14 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react';
 import {
+  FlatList,
   View,
   Text,
   StatusBar,
-  FlatList,
   TouchableOpacity,
   ActivityIndicator,
   Modal,
   Animated,
-  Image,
   Platform,
   Alert,
   StyleSheet,
@@ -37,6 +36,7 @@ import { useCall } from '../../calls/useCall';
 import { viewGroup as viewGroupApi } from '../../Redux/Services/Group/Group.Services';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
+import { clearChatDraft } from '../../services/chatDraftStore';
 import ContactDatabase from '../../services/ContactDatabase';
 import { primeDeviceContactsIndex } from '../../services/SaveContactService';
 import { subscribeSessionReset } from '../../services/sessionEvents';
@@ -60,6 +60,8 @@ import {
 import { APP_TAG_NAME } from '@env';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { ChatListTick } from '../../components/MessageTicks';
+import AppImage from '../../components/AppImage';
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 // Debug switch for tracing WHERE the chat list comes from (SQLite cache vs the
@@ -1270,20 +1272,7 @@ export default function ChatList({ navigation }) {
     if (!isMine) return null;
     const status = String(item?.lastMessageStatus || item?.lastMessage?.status || item?.status || '').toLowerCase();
     if (!status) return null;
-    const grayColor = theme.colors.placeHolderTextColor;
-    if (status === 'read' || status === 'seen') {
-      return <Ionicons name="checkmark-done" size={14} color="#53BDEB" style={{ marginRight: 4 }} />;
-    }
-    if (status === 'delivered') {
-      return <Ionicons name="checkmark-done" size={14} color={grayColor} style={{ marginRight: 4 }} />;
-    }
-    if (status === 'sent' || status === 'sending' || status === 'pending' || status === 'uploaded') {
-      return <Ionicons name="checkmark" size={14} color={grayColor} style={{ marginRight: 4 }} />;
-    }
-    if (status === 'failed') {
-      return <Ionicons name="alert-circle" size={14} color="#FF8A80" style={{ marginRight: 4 }} />;
-    }
-    return null;
+    return <ChatListTick status={status} theme={theme} />;
   }, [theme, currentUserId]);
 
   const getUserColor = useCallback((str) => {
@@ -1666,6 +1655,7 @@ export default function ChatList({ navigation }) {
       try { await ChatDatabase.clearChat(chatId, Date.now()); } catch (e) { console.warn('clearChat failed', e); }
       // Remove the chat row from the list on the user's own side.
       try { await ChatDatabase.deleteChatRow(chatId); } catch (e) { console.warn('deleteChatRow failed', e); }
+      clearChatDraft(chatId);
       // Wipe the in-memory ChatCache — without this, openChat() finds cached
       // messages via ChatCache.hasMessages() and re-shows the deleted history.
       try { ChatCache.clearMessages(chatId); } catch (e) {}
@@ -1756,6 +1746,7 @@ export default function ChatList({ navigation }) {
         try {
           await ChatDatabase.deleteChatRow(chatId);
         } catch (e) { localErrors.push({ chatId, step: 'sqliteDeleteRow', error: e?.message }); }
+        clearChatDraft(chatId);
 
         // Wipe in-memory ChatCache so openChat() can't surface deleted messages
         // from the cache after the chat is re-created by a new peer message.
@@ -2137,7 +2128,7 @@ export default function ChatList({ navigation }) {
           {/* Logo mark — replaced by the wordmark below (WhatsApp shows the
               app NAME here, not its icon). Kept for an easy switch back. */}
           {/* <View style={styles.headerLogoWrap}>
-            <Image source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
+            <AppImage source={require('../../../assets/icon0.png')} resizeMethod='cover' style={styles.headerLogoImg} />
           </View> */}
           <Text
             style={[styles.headerBrand, { color: isDarkMode ? theme.colors.textWhite : theme.colors.themeColor }]}
@@ -2256,7 +2247,7 @@ export default function ChatList({ navigation }) {
               {
                 top: menuPos.top,
                 right: menuPos.right,
-                backgroundColor: isDarkMode ? '#0F1A21' : '#FFFFFF',
+                backgroundColor: theme.colors.menuSurface,
                 borderColor: isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)',
               },
             ]}
@@ -2298,7 +2289,7 @@ export default function ChatList({ navigation }) {
             <TouchableOpacity activeOpacity={1} onPress={closeActionMenu} style={StyleSheet.absoluteFill} />
           </Animated.View>
 
-          <Animated.View style={[styles.sheetCard, { backgroundColor: theme.colors.cardBackground, transform: [{ translateY: sheetSlideAnim }] }]}>
+          <Animated.View style={[styles.sheetCard, { backgroundColor: theme.colors.menuSurface, transform: [{ translateY: sheetSlideAnim }] }]}>
             <View style={styles.sheetHandle}>
               <View style={[styles.sheetHandleBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)' }]} />
             </View>
@@ -2307,7 +2298,7 @@ export default function ChatList({ navigation }) {
             {selectedChatItem && (
               <View style={styles.sheetUserRow}>
                 {previewImage ? (
-                  <Image source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
+                  <AppImage source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
                 ) : (
                   <View style={[styles.sheetUserAvatar, { backgroundColor: previewAvatarColor }]}>
                     {isPreviewGroup ? (
@@ -2351,7 +2342,7 @@ export default function ChatList({ navigation }) {
       {/* ─── MUTE SHEET MODAL ─── */}
       <Modal animationType="fade" transparent visible={muteSheetVisible} onRequestClose={() => setMuteSheetVisible(false)}>
         <TouchableOpacity activeOpacity={1} onPress={() => setMuteSheetVisible(false)} style={styles.muteOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.muteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.muteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={[styles.muteIconWrap, { backgroundColor: '#F0A03012' }]}>
               <Ionicons name="volume-mute" size={28} color="#F0A030" />
             </View>
@@ -2386,7 +2377,7 @@ export default function ChatList({ navigation }) {
       {/* ─── DELETE MODAL ─── */}
       <Modal animationType="fade" transparent visible={deleteModalVisible} onRequestClose={closeDeleteModal}>
         <TouchableOpacity activeOpacity={1} onPress={closeDeleteModal} style={styles.deleteOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={styles.deleteIconWrap}>
               <MaterialCommunityIcons name="delete-alert-outline" size={30} color="#E06A6A" />
             </View>
@@ -2448,7 +2439,7 @@ export default function ChatList({ navigation }) {
         onRequestClose={() => { /* swallow back-press during delete */ }}
       >
         <View style={styles.deleteProgressOverlay}>
-          <View style={[styles.deleteProgressCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <View style={[styles.deleteProgressCard, { backgroundColor: theme.colors.menuSurface }]}>
             <ActivityIndicator size="large" color={theme.colors.themeColor} />
             <Text style={[styles.deleteProgressLabel, { color: theme.colors.primaryTextColor }]}>
               {bulkDeleteProgress.label || 'Deleting...'}
@@ -2472,7 +2463,7 @@ export default function ChatList({ navigation }) {
           onPress={() => { if (!isBulkDeleting) setBulkDeleteModalVisible(false); }}
           style={styles.deleteOverlay}
         >
-          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={styles.deleteIconWrap}>
               <MaterialCommunityIcons name="delete-alert-outline" size={30} color="#E06A6A" />
             </View>

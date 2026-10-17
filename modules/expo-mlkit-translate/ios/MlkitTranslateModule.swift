@@ -125,6 +125,12 @@ public class MlkitTranslateModule: Module {
   public func definition() -> ModuleDefinition {
     Name("MlkitTranslateModule")
 
+    // onDownloadProgress { language, fraction } — real progress from the
+    // download's Progress object (iOS only; Android ML Kit reports none).
+    // onModelDownloaded { language } — a model landed after its promise had
+    // already timed out, so JS can clear the row it gave up on.
+    Events("onDownloadProgress", "onModelDownloaded")
+
     // Hand back the 30–150MB the translators hold when the app leaves the front.
     OnAppEntersBackground { self.closeAll() }
     OnDestroy { self.closeAll() }
@@ -163,22 +169,31 @@ public class MlkitTranslateModule: Module {
       // The iOS SDK reports completion through NotificationCenter rather than a
       // callback, so listen for this model's terminal event and settle exactly
       // once — including on a timeout, so a stalled download can never leave the
-      // picker spinning forever.
+      // picker spinning forever. The timeout only releases the CALLER: the
+      // observers stay until the download really ends, so a model that lands
+      // late is still announced (onModelDownloaded).
       let settleLock = NSLock()
       var didSettle = false
+      var timedOut = false
       var observers: [NSObjectProtocol] = []
+      var progressObservation: NSKeyValueObservation?
       var timeoutWork: DispatchWorkItem?
+      let languageTag = args.language
 
-      func finish(_ block: @escaping () -> Void) {
+      func settle(_ block: () -> Void) {
         settleLock.lock()
         if didSettle { settleLock.unlock(); return }
         didSettle = true
         settleLock.unlock()
-
         timeoutWork?.cancel()
+        block()
+      }
+
+      func cleanUp() {
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers.removeAll()
-        block()
+        progressObservation?.invalidate()
+        progressObservation = nil
       }
 
       let matches: (Notification) -> Bool = { note in
@@ -189,25 +204,32 @@ public class MlkitTranslateModule: Module {
 
       observers.append(NotificationCenter.default.addObserver(
         forName: .mlkitModelDownloadDidSucceed, object: nil, queue: nil
-      ) { note in
+      ) { [weak self] note in
         guard matches(note) else { return }
-        finish { promise.resolve(nil) }
+        settleLock.lock()
+        let late = timedOut
+        settleLock.unlock()
+        if late { self?.sendEvent("onModelDownloaded", ["language": languageTag]) }
+        settle { promise.resolve(nil) }
+        cleanUp()
       })
       observers.append(NotificationCenter.default.addObserver(
         forName: .mlkitModelDownloadDidFail, object: nil, queue: nil
       ) { note in
         guard matches(note) else { return }
         let error = note.userInfo?[ModelDownloadUserInfoKey.error.rawValue] as? Error
-        finish {
+        settle {
           promise.reject(TranslateFailedException(
             error?.localizedDescription ?? "Model download failed."))
         }
+        cleanUp()
       })
 
       let work = DispatchWorkItem {
-        // The download may still land later; the model check on the next attempt
-        // will pick it up. What matters is that the caller is unblocked now.
-        finish {
+        settleLock.lock()
+        timedOut = true
+        settleLock.unlock()
+        settle {
           promise.reject(TranslateFailedException(
             "Model download timed out after \(Int(downloadTimeout))s."))
         }
@@ -215,7 +237,15 @@ public class MlkitTranslateModule: Module {
       timeoutWork = work
       DispatchQueue.main.asyncAfter(deadline: .now() + downloadTimeout, execute: work)
 
-      self.modelManager.download(model, conditions: conditions)
+      let progress = self.modelManager.download(model, conditions: conditions)
+      var lastSent = -1.0
+      progressObservation = progress.observe(\.fractionCompleted, options: [.initial, .new]) { [weak self] p, _ in
+        let fraction = max(0, min(1, p.fractionCompleted))
+        // ~1% steps are plenty for a progress bar and keep the bridge quiet.
+        if fraction - lastSent < 0.01 && fraction < 1 { return }
+        lastSent = fraction
+        self?.sendEvent("onDownloadProgress", ["language": languageTag, "fraction": fraction])
+      }
     }
 
     AsyncFunction("deleteModel") { (language: String, promise: Promise) in

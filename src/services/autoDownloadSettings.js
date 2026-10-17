@@ -6,7 +6,7 @@
 // TODO(settings-ui): expose these toggles on a "Storage and data" settings
 // screen — until then the defaults apply and the service is the single source
 // of truth (getSettings / setSetting).
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { deviceKv } from './kvStorage';
 import NetInfo from '@react-native-community/netinfo';
 
 const STORAGE_KEY = 'auto_download_settings_v1';
@@ -41,7 +41,7 @@ export const getAutoDownloadSettings = async () => {
   if (loadPromise) return loadPromise;
   loadPromise = (async () => {
     try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
+      const raw = await deviceKv.getItem(STORAGE_KEY);
       cached = mergeWithDefaults(raw ? JSON.parse(raw) : {});
     } catch {
       cached = mergeWithDefaults({});
@@ -62,7 +62,7 @@ export const setAutoDownloadSetting = async (networkKind, mediaType, enabled) =>
     [network]: { ...settings[network], [mediaType]: Boolean(enabled) },
   };
   try {
-    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(cached));
+    await deviceKv.setItem(STORAGE_KEY, JSON.stringify(cached));
   } catch { /* keep in-memory value */ }
   return cached;
 };

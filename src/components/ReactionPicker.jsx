@@ -1,3 +1,4 @@
+import { useTheme } from '../contexts/ThemeContext';
 import React, { useCallback, useState, useMemo, useRef } from 'react';
 import {
   View, Text, TouchableOpacity, Modal, Pressable, StyleSheet,
@@ -5,6 +6,8 @@ import {
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
+import { BottomSheetSectionList } from '@gorhom/bottom-sheet';
+import AppSheet, { USE_GORHOM } from './AppSheet';
 
 const QUICK_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
 const windowDimensions = Dimensions.get('window') || {};
@@ -110,6 +113,7 @@ const ReactionPicker = React.memo(({
   onCloseFullKeyboard,
   style,
 }) => {
+  const { theme } = useTheme();
   const [showFullKeyboard, setShowFullKeyboard] = useState(false);
   const fullControlled = fullKeyboardVisible !== undefined;
   const fullOpen = fullControlled ? !!fullKeyboardVisible : showFullKeyboard;
@@ -164,22 +168,22 @@ const ReactionPicker = React.memo(({
   const renderSectionHeader = useCallback(({ section: { title, icon } }) => (
     <View style={[
       styles.sectionHeader,
-      { backgroundColor: isDarkMode ? '#1F2C34' : '#FFFFFF' }
+      { backgroundColor: theme.colors.menuSurface }
     ]}>
       <Ionicons 
         name={icon} 
         size={16} 
-        color={isDarkMode ? '#8696A0' : '#667781'} 
+        color={theme.colors.secondaryTextColor} 
         style={styles.sectionIcon}
       />
       <Text style={[
         styles.sectionTitle,
-        { color: isDarkMode ? '#8696A0' : '#667781' }
+        { color: theme.colors.secondaryTextColor }
       ]}>
         {title}
       </Text>
     </View>
-  ), [isDarkMode]);
+  ), [isDarkMode, theme]);
 
   const renderEmojiRow = useCallback(({ item: row }) => {
     return (
@@ -216,6 +220,60 @@ const ReactionPicker = React.memo(({
     }
   }
 
+  // Same content for both the gorhom sheet and the legacy Modal; only the list
+  // component differs (the sheet needs its own SectionList so scroll and drag
+  // cooperate).
+  const renderFullInner = (ListComp) => (
+    <>
+      {/* Drag handle */}
+      <View style={styles.dragHandle}>
+        <View style={[
+          styles.dragBar,
+          { backgroundColor: isDarkMode ? '#3A4A54' : '#D0D0D0' },
+        ]} />
+      </View>
+
+      {/* Header with search icon (like WhatsApp) */}
+      <View style={styles.modalHeader}>
+        <Text style={[
+          styles.modalTitle,
+          { color: theme.colors.bubbleReceivedText }
+        ]}>
+          Emojis
+        </Text>
+        <TouchableOpacity
+          onPress={closeFull}
+          style={styles.closeButton}
+          accessibilityRole="button"
+          accessibilityLabel="Close emoji picker"
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
+          <Ionicons 
+            name="close" 
+            size={24} 
+            color={theme.colors.bubbleReceivedText} 
+          />
+        </TouchableOpacity>
+      </View>
+
+      {/* SectionList for categorized emojis */}
+      <ListComp
+        ref={sectionListRef}
+        sections={sections}
+        keyExtractor={(item, index) => `row_${index}`}
+        renderItem={renderEmojiRow}
+        renderSectionHeader={renderSectionHeader}
+        stickySectionHeadersEnabled={true}
+        initialNumToRender={20}
+        maxToRenderPerBatch={20}
+        windowSize={10}
+        contentContainerStyle={styles.emojiList}
+        showsVerticalScrollIndicator={true}
+        keyboardShouldPersistTaps="handled"
+      />
+    </>
+  );
+
   return (
     <>
       {/* Quick picker bar - WhatsApp style */}
@@ -225,7 +283,7 @@ const ReactionPicker = React.memo(({
           styles.pickerContainer,
           {
             alignSelf: isMyMessage ? 'flex-end' : 'flex-start',
-            backgroundColor: isDarkMode ? '#1F2C34' : '#FFFFFF',
+            backgroundColor: theme.colors.menuSurface,
           },
           style,
         ]}
@@ -264,86 +322,55 @@ const ReactionPicker = React.memo(({
           <Ionicons 
             name="add" 
             size={20} 
-            color={isDarkMode ? '#8696A0' : '#667781'} 
+            color={theme.colors.secondaryTextColor} 
           />
         </TouchableOpacity>
       </View>
       )}
 
-      {/* Full emoji keyboard modal - WhatsApp style */}
-      <Modal
-        visible={fullOpen}
-        transparent
-        animationType="slide"
-        onRequestClose={closeFull}
-        statusBarTranslucent
-      >
-        <Pressable
-          style={styles.fullOverlay}
-          onPress={closeFull}
+      {/* Full emoji picker: gorhom sheet, or the previous Modal when USE_GORHOM is false */}
+      {USE_GORHOM ? (
+        <AppSheet
+          visible={fullOpen}
+          onClose={closeFull}
+          snapPoints={[SCREEN_H * 0.65]}
+          backgroundColor={theme.colors.menuSurface}
         >
-          <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-            style={styles.fullKeyboardWrap}
-            keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+          {renderFullInner(BottomSheetSectionList)}
+        </AppSheet>
+      ) : (
+        <Modal
+          visible={fullOpen}
+          transparent
+          animationType="slide"
+          onRequestClose={closeFull}
+          statusBarTranslucent
+        >
+          <Pressable
+            style={styles.fullOverlay}
+            onPress={closeFull}
           >
-            <Pressable
-              onPress={() => {}}
-              style={[
-                styles.fullKeyboardContainer,
-                {
-                  backgroundColor: isDarkMode ? '#1F2C34' : '#FFFFFF',
-                  maxHeight: SCREEN_H * 0.65,
-                },
-              ]}
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              style={styles.fullKeyboardWrap}
+              keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
             >
-              {/* Drag handle */}
-              <View style={styles.dragHandle}>
-                <View style={[
-                  styles.dragBar,
-                  { backgroundColor: isDarkMode ? '#3A4A54' : '#D0D0D0' },
-                ]} />
-              </View>
-
-              {/* Header with search icon (like WhatsApp) */}
-              <View style={styles.modalHeader}>
-                <Text style={[
-                  styles.modalTitle,
-                  { color: isDarkMode ? '#E9EDEF' : '#111B21' }
-                ]}>
-                  Emojis
-                </Text>
-                <TouchableOpacity
-                  onPress={closeFull}
-                  style={styles.closeButton}
-                >
-                  <Ionicons 
-                    name="close" 
-                    size={24} 
-                    color={isDarkMode ? '#E9EDEF' : '#111B21'} 
-                  />
-                </TouchableOpacity>
-              </View>
-
-              {/* SectionList for categorized emojis */}
-              <SectionList
-                ref={sectionListRef}
-                sections={sections}
-                keyExtractor={(item, index) => `row_${index}`}
-                renderItem={renderEmojiRow}
-                renderSectionHeader={renderSectionHeader}
-                stickySectionHeadersEnabled={true}
-                initialNumToRender={20}
-                maxToRenderPerBatch={20}
-                windowSize={10}
-                contentContainerStyle={styles.emojiList}
-                showsVerticalScrollIndicator={true}
-                keyboardShouldPersistTaps="handled"
-              />
-            </Pressable>
-          </KeyboardAvoidingView>
-        </Pressable>
-      </Modal>
+              <Pressable
+                onPress={() => {}}
+                style={[
+                  styles.fullKeyboardContainer,
+                  {
+                    backgroundColor: theme.colors.menuSurface,
+                    maxHeight: SCREEN_H * 0.65,
+                  },
+                ]}
+              >
+                {renderFullInner(SectionList)}
+              </Pressable>
+            </KeyboardAvoidingView>
+          </Pressable>
+        </Modal>
+      )}
     </>
   );
 });

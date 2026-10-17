@@ -137,6 +137,26 @@ export function navigateToChat(data = {}, attempt = 0, warmed = false) {
   const chatId = normalizeId(data?.chatId || data?.groupId);
   if (!chatId) return false;
 
+  // Recipient guard (additive push field `recipientId` = the user the push was
+  // addressed to). A stale notification from a previous account must not open
+  // that account's chat under the signed-in user. Absent field => unchanged
+  // behaviour. Unknown signed-in id fails open (login gate handles it).
+  const pushRecipient = normalizeId(data?.recipientId);
+  if (pushRecipient && !data?.__recipientChecked) {
+    try {
+      // Lazy require: sessionManager imports this module.
+      const { getStoredSession } = require('../../services/sessionManager');
+      getStoredSession().then((session) => {
+        const me = normalizeId(session?.userId);
+        if (me && me !== pushRecipient) return;
+        navigateToChat({ ...data, __recipientChecked: true }, 0);
+      }).catch(() => navigateToChat({ ...data, __recipientChecked: true }, 0));
+    } catch {
+      return navigateToChat({ ...data, __recipientChecked: true }, attempt);
+    }
+    return true;
+  }
+
   // Read the thread into ChatCache NOW, in parallel with Splash/boot. A chat
   // list tap is instant because ChatList prewarms its top rows; a notification
   // open lands on ChatScreen ~200ms after ChatList mounts, before that prewarm

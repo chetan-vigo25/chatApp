@@ -97,6 +97,16 @@ const callMetaLabel = (direction, outcome) => {
   }
 };
 
+// "5:36" / "1:02:03" — empty for a call that never connected.
+const durationText = (sec) => {
+  const n = Math.round(Number(sec) || 0);
+  if (n <= 0) return null;
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const ss = String(n % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+};
+
 // ── press-scale micro-interaction (matches StatusList rows) ──────────────────
 function PressScale({ children, onPress, onLongPress, style }) {
   const v = useRef(new Animated.Value(1)).current;
@@ -119,9 +129,11 @@ function PressScale({ children, onPress, onLongPress, style }) {
   );
 }
 
-// One row per call — consecutive calls with the same peer are NOT collapsed
-// (product decision: show every log entry individually, no "(n)" count badge).
-// The de-dup below still guards against realtime/pagination double-inserts.
+// Web parity: consecutive calls with the same peer (or group) on the same
+// calendar day collapse into ONE row — "@ravina (4)" — and tapping it expands
+// every individual call underneath (direction · time · duration). The row shows
+// the newest call's direction/outcome. The de-dup below still guards against
+// realtime/pagination double-inserts.
 
 // Every number a call-log peer record might carry. Passing this to the resolver
 // is what lets an UNSAVED caller render as their number instead of the account
@@ -147,10 +159,26 @@ const groupCalls = (items) => {
   }
 
   const groups = [];
+  let current = null;
   for (const it of deduped) {
     const peerId = String(it.peerId?._id || it.peerId || '');
-    groups.push({
-      peerKey: peerId,
+    const at = it.createdAt || it.endedAt || it.startedAt;
+    const peerKey = it.isGroup ? `group:${it.groupId || it.callId || it._id || ''}` : `peer:${peerId}`;
+    const dayKey = at ? new Date(at).toDateString() : 'unknown';
+
+    // Same peer + same day as the previous (newer) row → fold into it.
+    if (current && current.peerKey === peerKey && current.dayKey === dayKey) {
+      current.count += 1;
+      current.calls.push(it);
+      // Every underlying callId this collapsed row represents — so deleting the
+      // row removes ALL the calls it stands for, not just the most recent.
+      if (it.callId) current.callIds.push(String(it.callId));
+      continue;
+    }
+
+    current = {
+      peerKey,
+      dayKey,
       // Stable + unique: after the de-dup above, each group's first row has a
       // distinct callId/_id, so this never collides (React list-key invariant)
       // and — unlike an index-based key — survives realtime reordering, so a
@@ -170,12 +198,12 @@ const groupCalls = (items) => {
       direction: it.direction,
       outcome: it.outcome,
       media: it.media,
-      at: it.createdAt || it.endedAt || it.startedAt,
+      at,
       count: 1,
-      // Every underlying callId this collapsed row represents — so deleting the
-      // row removes ALL the calls it stands for, not just the most recent.
+      calls: [it],
       callIds: it.callId ? [String(it.callId)] : [],
-    });
+    };
+    groups.push(current);
   }
   return groups;
 };
@@ -198,6 +226,8 @@ export default function CallsScreen({ navigation }) {
   // ── multi-select + delete (WhatsApp-style) ──
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState([]); // group keys
+  // Rows (by group key) whose individual calls are expanded underneath.
+  const [expandedKeys, setExpandedKeys] = useState([]);
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -388,7 +418,9 @@ export default function CallsScreen({ navigation }) {
   // call-info detail page (the trailing call button is what redials).
   const onRowPress = (g) => {
     if (selectionMode) toggleSelect(g.key);
-    else openDetail(g);
+    else if (g.count > 1) {
+      setExpandedKeys((prev) => (prev.includes(g.key) ? prev.filter((k) => k !== g.key) : [...prev, g.key]));
+    } else openDetail(g);
   };
   const onRowLongPress = (g) => {
     if (selectionMode) toggleSelect(g.key);
@@ -440,7 +472,7 @@ export default function CallsScreen({ navigation }) {
   const renderItem = ({ item: g }) => {
     const isSelected = selectedKeys.includes(g.key);
     const p = g.peer || {};
-    const peerId = String(p._id || g.peerKey || '');
+    const peerId = String(p._id || String(g.peerKey || '').replace(/^peer:/, ''));
     const isVideo = g.media === 'video';
 
     // Group rows: label by group name or the participant names; no peer avatar.
@@ -468,8 +500,10 @@ export default function CallsScreen({ navigation }) {
     const missed = isMissedIncoming(g.direction, g.outcome);
     const nameColor = missed ? CALL_RED : theme.colors.primaryTextColor;
     const label = callMetaLabel(g.direction, g.outcome);
+    const isExpanded = g.count > 1 && expandedKeys.includes(g.key);
 
     return (
+      <View>
       <PressScale
         onPress={() => onRowPress(g)}
         onLongPress={() => onRowLongPress(g)}
@@ -501,6 +535,14 @@ export default function CallsScreen({ navigation }) {
               <Text style={[styles.rowName, { color: nameColor, flexShrink: 1 }]} numberOfLines={1}>
                 {name}{g.count > 1 ? `  (${g.count})` : ''}
               </Text>
+              {g.count > 1 && !selectionMode && (
+                <Ionicons
+                  name={isExpanded ? 'chevron-up' : 'chevron-down'}
+                  size={16}
+                  color={theme.colors.placeHolderTextColor}
+                  style={styles.expandChevron}
+                />
+              )}
             </View>
             <View style={styles.metaRow}>
               {/* direction arrow — green when connected, red when missed/declined */}
@@ -551,6 +593,32 @@ export default function CallsScreen({ navigation }) {
           </View>
         </View>
       </PressScale>
+      {isExpanded && (
+        <View style={styles.subList}>
+          {g.calls.map((c, i) => {
+            const meta = directionMeta(c.direction, c.outcome);
+            const cMissed = isMissedIncoming(c.direction, c.outcome);
+            const dur = durationText(c.durationSec);
+            return (
+              <TouchableOpacity
+                key={String(c.callId || c._id || i)}
+                activeOpacity={0.6}
+                onPress={() => openDetail(g)}
+                style={styles.subRow}
+              >
+                <MaterialIcons name={meta.icon} size={15} color={meta.color} style={styles.metaArrow} />
+                <Text style={[styles.subLabel, { color: cMissed ? CALL_RED : theme.colors.placeHolderTextColor }]} numberOfLines={1}>
+                  {callMetaLabel(c.direction, c.outcome)}
+                </Text>
+                <Text style={[styles.subTime, { color: theme.colors.placeHolderTextColor }]} numberOfLines={1}>
+                  {rowTime(c.createdAt || c.endedAt || c.startedAt)}{dur ? ` · ${dur}` : ''}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
+      </View>
     );
   };
 
@@ -620,7 +688,7 @@ export default function CallsScreen({ navigation }) {
       {/* Overflow menu → Clear call logs (WhatsApp top-right menu). */}
       <Modal animationType="fade" transparent visible={menuVisible} onRequestClose={() => setMenuVisible(false)}>
         <TouchableOpacity activeOpacity={1} onPress={() => setMenuVisible(false)} style={styles.menuOverlay}>
-          <View style={[styles.menuCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <View style={[styles.menuCard, { backgroundColor: theme.colors.menuSurface }]}>
             <TouchableOpacity
               activeOpacity={0.7}
               disabled={!items.length}
@@ -694,7 +762,7 @@ export default function CallsScreen({ navigation }) {
           onPress={() => !isDeleting && setDeleteModalVisible(false)}
           style={styles.deleteOverlay}
         >
-          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={[styles.deleteIconWrap, { backgroundColor: `${theme.colors.danger}1A` }]}>
               <MaterialCommunityIcons name="delete-alert-outline" size={28} color={theme.colors.danger} />
             </View>
@@ -740,7 +808,7 @@ export default function CallsScreen({ navigation }) {
           onPress={() => !isClearing && setClearModalVisible(false)}
           style={styles.deleteOverlay}
         >
-          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={[styles.deleteIconWrap, { backgroundColor: `${theme.colors.danger}1A` }]}>
               <MaterialCommunityIcons name="delete-sweep-outline" size={28} color={theme.colors.danger} />
             </View>
@@ -865,6 +933,12 @@ const styles = StyleSheet.create({
     minWidth: 56,
   },
   timeText: { fontSize: 12, fontFamily: 'Roboto-Regular' },
+  expandChevron: { marginLeft: 4 },
+  // expanded per-call list, indented under the avatar like the web panel
+  subList: { marginLeft: 84, marginRight: 18, marginBottom: 6 },
+  subRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 7 },
+  subLabel: { fontSize: 13, fontFamily: 'Roboto-Regular', flexShrink: 1 },
+  subTime: { flex: 1, fontSize: 12.5, fontFamily: 'Roboto-Regular', textAlign: 'right' },
   callBtnRight: {
     paddingVertical: 2,
     paddingLeft: 6,

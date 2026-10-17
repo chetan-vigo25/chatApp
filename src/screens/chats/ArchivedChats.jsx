@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo, useState, useRef } from 'react';
-import { Alert, Animated, FlatList, Image, Modal, Platform, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
+import { Alert, Animated, FlatList, Modal, Platform, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from 'react-native';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { ImageZoom } from '@likashefqet/react-native-image-zoom';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
@@ -9,6 +9,8 @@ import ChatCard from '../../components/ChatCard';
 import { apiCall } from '../../Config/Https';
 import { normalizeChatStorageId, removeMessagesByChatId } from '../../utils/chatClearStorage';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
+import { ChatListTick } from '../../components/MessageTicks';
+import AppImage from '../../components/AppImage';
 
 const MUTE_OPTIONS = [
   { key: '8h', label: '8 hours', icon: 'clock-time-eight-outline', duration: 8 * 60 * 60 * 1000 },
@@ -96,16 +98,7 @@ export default function ArchivedChats({ navigation }) {
   const renderMessageStatus = (item) => {
     const status = (getLastMessageStatus(item) || '').toLowerCase();
     if (!status) return null;
-    if (status === 'read' || status === 'seen') {
-      return <View style={{ flexDirection: 'row', marginRight: 4 }}><Ionicons name="checkmark-done" size={12} color="#34B7F1" /></View>;
-    }
-    if (status === 'delivered') {
-      return <View style={{ flexDirection: 'row', marginRight: 4 }}><Ionicons name="checkmark-done" size={12} color={theme.colors.placeHolderTextColor} /></View>;
-    }
-    if (status === 'sent') {
-      return <Ionicons name="checkmark" size={12} color={theme.colors.placeHolderTextColor} style={{ marginRight: 4 }} />;
-    }
-    return null;
+    return <ChatListTick status={status} theme={theme} />;
   };
 
   // ─── ACTION SHEET (animated) ───
@@ -550,7 +543,7 @@ export default function ArchivedChats({ navigation }) {
             <TouchableOpacity activeOpacity={1} onPress={closeActionMenu} style={StyleSheet.absoluteFill} />
           </Animated.View>
 
-          <Animated.View style={[styles.sheetCard, { backgroundColor: theme.colors.cardBackground, transform: [{ translateY: sheetSlideAnim }] }]}>
+          <Animated.View style={[styles.sheetCard, { backgroundColor: theme.colors.menuSurface, transform: [{ translateY: sheetSlideAnim }] }]}>
             <View style={styles.sheetHandle}>
               <View style={[styles.sheetHandleBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)' }]} />
             </View>
@@ -558,7 +551,7 @@ export default function ArchivedChats({ navigation }) {
             {selectedChatItem && (
               <View style={styles.sheetUserRow}>
                 {previewImage ? (
-                  <Image source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
+                  <AppImage source={{ uri: previewImage }} style={styles.sheetUserAvatar} />
                 ) : (
                   <View style={[styles.sheetUserAvatar, { backgroundColor: previewAvatarColor }]}>
                     {isGroupItem ? (
@@ -600,7 +593,7 @@ export default function ArchivedChats({ navigation }) {
       {/* ─── MUTE SHEET MODAL ─── */}
       <Modal animationType="fade" transparent visible={muteSheetVisible} onRequestClose={() => setMuteSheetVisible(false)}>
         <TouchableOpacity activeOpacity={1} onPress={() => setMuteSheetVisible(false)} style={styles.muteOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.muteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.muteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={[styles.muteIconWrap, { backgroundColor: '#F0A03012' }]}>
               <Ionicons name="volume-mute" size={28} color="#F0A030" />
             </View>
@@ -635,7 +628,7 @@ export default function ArchivedChats({ navigation }) {
       {/* ─── DELETE MODAL ─── */}
       <Modal animationType="fade" transparent visible={deleteModalVisible} onRequestClose={closeDeleteModal}>
         <TouchableOpacity activeOpacity={1} onPress={closeDeleteModal} style={styles.deleteOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.deleteCard, { backgroundColor: theme.colors.menuSurface }]}>
             <View style={styles.deleteIconWrap}>
               <MaterialCommunityIcons name="delete-alert-outline" size={30} color="#E06A6A" />
             </View>
@@ -698,7 +691,7 @@ export default function ArchivedChats({ navigation }) {
           <Animated.View style={[
             styles.profileCard,
             {
-              backgroundColor: theme.colors.cardBackground,
+              backgroundColor: theme.colors.menuSurface,
               opacity: profileOpacityAnim,
               transform: [{ scale: profileScaleAnim }],
             }
@@ -712,7 +705,7 @@ export default function ArchivedChats({ navigation }) {
               style={[styles.profileImageWrap, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }]}
             >
               {previewImage ? (
-                <Image resizeMode="cover" source={{ uri: previewImage }} style={StyleSheet.absoluteFill} />
+                <AppImage resizeMode="cover" source={{ uri: previewImage }} style={StyleSheet.absoluteFill} />
               ) : (
                 <View style={[styles.profileFallback, { backgroundColor: previewAvatarColor }]}>
                   <Text style={styles.profileFallbackText}>

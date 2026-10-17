@@ -56,6 +56,9 @@ object CallUiBus {
   @Volatile var module: ExpoCallUiModule? = null
   @Volatile var pending: Map<String, Any?>? = null
 
+  // True only when a live module has JS listening right now.
+  fun isObserving(): Boolean = module?.isObservingActions == true
+
   fun dispatch(payload: Map<String, Any?>) {
     val m = module
     // Emit only when JS is actually LISTENING. A module instance exists long
@@ -318,6 +321,72 @@ class ExpoCallUiModule : Module() {
 
     Function("getManufacturer") { Build.MANUFACTURER ?: "" }
 
+    // ---- Phase 2 call-push hardening (P-C-04/06/08/10/16) ----
+
+    // P-C-04: JS writes the signed-in user id here on login/bootstrap, "none" on
+    // logout (null/blank clears it = unknown). The native FCM service reads it
+    // BEFORE rendering a ring. Plain SharedPreferences: it is a user id, not a token.
+    Function("setSessionMarker") { value: String? ->
+      appContext.reactContext?.let { setSessionMarker(it, value) }
+    }
+
+    // P-C-16: server minus device clock (ms), learned by JS from a live socket
+    // ring. Lets the native staleness check judge a push by SERVER time.
+    Function("setServerClockOffset") { offsetMs: Double ->
+      appContext.reactContext?.let { setServerClockOffset(it, offsetMs.toLong()) }
+    }
+
+    // P-C-06: Decline taps the receiver persisted while JS was not observing.
+    Function("getPendingDeclines") {
+      val ctx = appContext.reactContext ?: return@Function emptyList<Map<String, Any?>>()
+      readPendingDeclines(ctx)
+    }
+    Function("clearPendingDeclines") {
+      appContext.reactContext?.let { clearPendingDeclines(it) }
+    }
+
+    // P-C-10: nothing can ring while app notifications are off / the calls channel
+    // is switched off. Both default to true when unknown.
+    Function("areNotificationsEnabled") {
+      val ctx = appContext.reactContext ?: return@Function true
+      try { NotificationManagerCompat.from(ctx).areNotificationsEnabled() } catch (_: Exception) { true }
+    }
+    Function("isCallChannelEnabled") {
+      val ctx = appContext.reactContext ?: return@Function true
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return@Function true
+      try {
+        ensureChannel(ctx)
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.getNotificationChannel(CHANNEL_ID)?.importance != NotificationManager.IMPORTANCE_NONE
+      } catch (_: Exception) { true }
+    }
+
+    // P-C-08: Android 14+ can deny the full-screen intent (Play-declaration
+    // dependent). False => a locked phone shows only a heads-up, not the call
+    // screen. < 14 always true. The settings screen is the app's own
+    // "Display over lock screen / full-screen notifications" page (existing
+    // USE_FULL_SCREEN_INTENT permission, no new permission).
+    Function("canUseFullScreenIntent") {
+      val ctx = appContext.reactContext ?: return@Function true
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return@Function true
+      try {
+        (ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).canUseFullScreenIntent()
+      } catch (_: Exception) { true }
+    }
+    Function("openFullScreenIntentSettings") {
+      val ctx = appContext.reactContext ?: return@Function false
+      if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return@Function false
+      try {
+        launchExternal(ctx, Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT).apply {
+          data = Uri.parse("package:" + ctx.packageName)
+        })
+        true
+      } catch (_: Exception) {
+        openAppDetails(ctx)
+        false
+      }
+    }
+
     // ---- active-call ongoing foreground service (CallStyle.forOngoingCall) ----
     Function("startOngoingCall") { options: Map<String, Any?> ->
       val ctx = appContext.reactContext ?: return@Function
@@ -468,6 +537,10 @@ class ExpoCallUiModule : Module() {
       "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
       "com.coloros.safecenter" to "com.coloros.safecenter.startupapp.StartupAppListActivity",
       "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity",
+      "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.FakeActivity",
+      // OnePlus / OxygenOS (dontkillmyapp.com)
+      "com.oneplus.security" to "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity",
+      "com.oplus.battery" to "com.oplus.powermanager.fuelgaue.PowerUsageModelActivity",
       // Huawei / Honor
       "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
       "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
@@ -569,6 +642,96 @@ class ExpoCallUiModule : Module() {
   }
 
   companion object {
+    // ---- native-readable state (SharedPreferences "expo_call_ui_state") ----
+    // Phase 2 call-push hardening. Everything here is a plain id / number / timestamp,
+    // never a token. Mirrors src/calls/callPushGuards.js (keep the rules in step).
+    private const val PREFS = "expo_call_ui_state"
+    private const val PREF_SESSION = "sessionMarker"
+    private const val PREF_OFFSET = "serverOffsetMs"
+    private const val PREF_DECLINES = "pendingDeclines"
+    const val SESSION_SIGNED_OUT = "none"
+    private const val STALE_CALL_PUSH_MS = 60_000L
+    // Without a learned server offset the device clock may be minutes off, so only
+    // drop a push that is stale by more than this (see callPushGuards.classifyCallPush).
+    private const val UNKNOWN_OFFSET_HARD_STALE_MS = 10 * 60_000L
+    private const val PENDING_DECLINE_MAX = 10
+    private val prefsLock = Any()
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun setSessionMarker(ctx: Context, value: String?) {
+      val v = value?.trim()
+      prefs(ctx).edit().apply {
+        if (v.isNullOrEmpty()) remove(PREF_SESSION) else putString(PREF_SESSION, v)
+      }.apply()
+    }
+
+    // P-C-04: should this device ring for a call addressed to recipientId? No
+    // recipientId (old server) or no marker (never written / unknown) => ring as before.
+    fun shouldRingFor(ctx: Context, recipientId: String?): Boolean {
+      val rid = recipientId?.trim()
+      if (rid.isNullOrEmpty()) return true
+      val marker = prefs(ctx).getString(PREF_SESSION, null)?.trim()
+      if (marker.isNullOrEmpty()) return true
+      return marker != SESSION_SIGNED_OUT && marker == rid
+    }
+
+    fun setServerClockOffset(ctx: Context, offsetMs: Long) {
+      prefs(ctx).edit().putLong(PREF_OFFSET, offsetMs).apply()
+    }
+
+    private fun serverClockOffset(ctx: Context): Long? {
+      val p = prefs(ctx)
+      return if (p.contains(PREF_OFFSET)) p.getLong(PREF_OFFSET, 0L) else null
+    }
+
+    // P-C-16: is a call push (backend `ts`, SENDER clock) still worth ringing for?
+    fun isFreshCallPush(ctx: Context, ts: Long, nowMs: Long = System.currentTimeMillis()): Boolean {
+      if (ts <= 0L) return true
+      val off = serverClockOffset(ctx)
+      val age = nowMs + (off ?: 0L) - ts
+      if (age <= STALE_CALL_PUSH_MS) return true
+      return off == null && age <= UNKNOWN_OFFSET_HARD_STALE_MS
+    }
+
+    // P-C-06: persist a Decline the JS side could not observe. commit() (sync):
+    // the process may be reclaimed right after the receiver returns.
+    fun persistPendingDecline(ctx: Context, callId: String, callerId: String?) {
+      synchronized(prefsLock) {
+        try {
+          val arr = org.json.JSONArray(prefs(ctx).getString(PREF_DECLINES, "[]"))
+          arr.put(org.json.JSONObject().apply {
+            put("callId", callId)
+            put("callerId", callerId ?: org.json.JSONObject.NULL)
+            put("ts", System.currentTimeMillis())
+          })
+          val trimmed = org.json.JSONArray()
+          for (i in maxOf(0, arr.length() - PENDING_DECLINE_MAX) until arr.length()) trimmed.put(arr.get(i))
+          prefs(ctx).edit().putString(PREF_DECLINES, trimmed.toString()).commit()
+        } catch (_: Exception) { /* best-effort */ }
+      }
+    }
+
+    fun readPendingDeclines(ctx: Context): List<Map<String, Any?>> {
+      synchronized(prefsLock) {
+        return try {
+          val arr = org.json.JSONArray(prefs(ctx).getString(PREF_DECLINES, "[]"))
+          (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            mapOf(
+              "callId" to o.optString("callId"),
+              "callerId" to (if (o.isNull("callerId")) null else o.optString("callerId")),
+              "ts" to o.optLong("ts", 0L).toDouble()
+            )
+          }
+        } catch (_: Exception) { emptyList() }
+      }
+    }
+
+    fun clearPendingDeclines(ctx: Context) {
+      synchronized(prefsLock) { prefs(ctx).edit().remove(PREF_DECLINES).commit() }
+    }
+
     // Notification ids (callId.hashCode()) of every incoming-call notification
     // currently posted, so cancelAllIncomingCalls can dismiss them all even when
     // the live call state's id has drifted from the posted id (APP-3).
@@ -633,11 +796,28 @@ class ExpoCallUiModule : Module() {
     // back; a blank callId is ignored.
     fun renderIncoming(ctx: Context, data: Map<String, String?>) {
       val callId = data["callId"]?.takeIf { it.isNotBlank() } ?: return
+      // P-C-12: a group/conference keeps ONE callId for its whole life, so the
+      // 120 s "cancelled" memory must not swallow a genuine RE-INVITE. Only an
+      // invite minted AFTER the cancel is let through (mirrors
+      // callPushGuards.canReInviteAfterCancel); a stale re-delivery of the old
+      // ring was minted before it and stays blocked.
+      val multiParty = data["isConference"] == "true" || data["isConference"] == "1" ||
+        data["isGroup"] == "true" || data["isGroup"] == "1"
+      if (multiParty && wasCancelled(callId)) {
+        val cancelledAt = cancelledCalls[callId] ?: 0L
+        val ts = data["ts"]?.toLongOrNull() ?: 0L
+        val off = serverClockOffset(ctx)
+        val margin = if (off != null) 1_000L else 5_000L
+        if (ts > 0L && (ts - (off ?: 0L)) > cancelledAt + margin) cancelledCalls.remove(callId)
+      }
       render(
         ctx,
         callId,
         data["callerId"],
-        data["callerName"]?.takeIf { it.isNotBlank() } ?: "Incoming call",
+        // Group / conference ring: label it with the group (additive groupName),
+        // like the JS notification does; otherwise the caller.
+        (if (multiParty) (data["groupName"]?.takeIf { it.isNotBlank() } ?: "Group call")
+         else data["callerName"]?.takeIf { it.isNotBlank() }) ?: "Incoming call",
         data["callerImage"],
         data["callType"] ?: "audio"
       )

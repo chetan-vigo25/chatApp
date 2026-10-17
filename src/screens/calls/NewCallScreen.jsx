@@ -1,7 +1,13 @@
 import React, { useCallback, useMemo, useState, memo } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, StyleSheet, Image,
-  ActivityIndicator, Platform, StatusBar,
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  StyleSheet,
+  ActivityIndicator,
+  Platform,
+  StatusBar,
 } from 'react-native';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -17,6 +23,7 @@ import CallAvatar from '../../calls/components/CallAvatar';
 import ProfilePreviewModal from '../../components/ProfilePreviewModal';
 import VerifiedBadge from '../../components/VerifiedBadge';
 import AppSearchBar from '../../components/AppSearchBar';
+import AppImage from '../../components/AppImage';
 
 const ROW_HEIGHT = 72;
 
@@ -38,7 +45,7 @@ const ContactRow = memo(function ContactRow({
       {/* Avatar → opens the WhatsApp-style profile preview modal. */}
       <TouchableOpacity onPress={onPressAvatar} activeOpacity={0.7}>
         {avatarUri ? (
-          <Image source={{ uri: avatarUri }} style={styles.avatar} fadeDuration={0} />
+          <AppImage source={{ uri: avatarUri }} style={styles.avatar} />
         ) : (
           <CallAvatar uri={null} name={name} id={peerId} size={48} />
         )}

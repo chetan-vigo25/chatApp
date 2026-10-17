@@ -1,7 +1,14 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import {
-  Modal, View, Text, TouchableOpacity, FlatList, StyleSheet, Image,
-  Platform, ToastAndroid, Alert,
+  Modal,
+  View,
+  Text,
+  TouchableOpacity,
+  FlatList,
+  StyleSheet,
+  Platform,
+  ToastAndroid,
+  Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -12,6 +19,7 @@ import { viewGroup } from '../../Redux/Reducer/Group/Group.reducer';
 import { toSecureMediaUri } from '../../utils/mediaService';
 import { useCall } from '../useCall';
 import CallAvatar from './CallAvatar';
+import AppImage from '../../components/AppImage';
 
 /**
  * WhatsApp-style PRE-CALL "Select people" sheet for a GROUP chat. Lists the
@@ -134,7 +142,7 @@ export default function SelectPeopleSheet({
           <View style={styles.header}>
             <View style={[styles.groupAvatar, { backgroundColor: isDarkMode ? '#233138' : '#E9EDEF' }]}>
               {avatarUri ? (
-                <Image source={{ uri: avatarUri }} style={styles.groupAvatarImg} resizeMode="cover" />
+                <AppImage source={{ uri: avatarUri }} style={styles.groupAvatarImg} resizeMode="cover" />
               ) : (
                 <Ionicons name="people" size={22} color={soft} />
               )}

@@ -225,7 +225,7 @@ export const setup = async () => {
   try {
     await RNCallKeep.setup({
       ios: {
-        appName: 'BaatCheet',
+        appName: 'TalksTry',
         supportsVideo: true,
         maximumCallGroups: '1',
         // ONE call at a time: with >1, a second incoming ring offers iOS's
@@ -236,13 +236,13 @@ export const setup = async () => {
       },
       android: {
         alertTitle: 'Permissions required',
-        alertDescription: 'BaatCheet needs access to display incoming calls',
+        alertDescription: 'TalksTry needs access to display incoming calls',
         cancelButton: 'Cancel',
         okButton: 'OK',
         foregroundService: {
           channelId: 'calls',
           channelName: 'Calls',
-          notificationTitle: 'BaatCheet is running call services',
+          notificationTitle: 'TalksTry is running call services',
         },
         // Self-managed connection service (we draw our own in-call UI overlay).
         selfManaged: true,

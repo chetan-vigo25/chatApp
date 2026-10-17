@@ -3,8 +3,8 @@ import {
   View, Text, ScrollView, TouchableOpacity, Animated,
   StyleSheet, Dimensions,
 } from 'react-native';
-import { useTheme } from '../../contexts/ThemeContext';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useTheme, outgoingPaletteFor, sentBubbleBgFor, DEFAULT_CHAT_COLOR } from '../../contexts/ThemeContext';
+import { kv } from '../../services/kvStorage';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { updateUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 
@@ -13,11 +13,11 @@ const { width: SCREEN_W } = Dimensions.get('window');
 const COLOR_CARD_W = 88;
 const COLOR_CARD_GAP = 12;
 
-// Curated, cohesive palette. #03b0a2 (the brand teal) leads as the
-// default so the out-of-the-box selection always resolves to a swatch.
+// Curated, cohesive palette. The default (DEFAULT_CHAT_COLOR) is one of the
+// swatches so the out-of-the-box selection always resolves to a swatch.
 // Row 1-2: bold/vivid accents. Row 3: soft, muted tones (gentler accents that
 // still keep white text legible on sent bubbles & buttons).
-const DEFAULT_ACCENT = '#03b0a2';
+const DEFAULT_ACCENT = DEFAULT_CHAT_COLOR;
 const ACCENT_COLORS = [
   // Bold
   '#03b0a2', '#02958a', '#026158', '#05d3c2',
@@ -65,13 +65,13 @@ export default function ChatColorTheme({ navigation }) {
   const [selectedColor, setSelectedColor] = useState(null);
 
   useEffect(() => {
-    AsyncStorage.getItem('selectedColor').then((saved) => {
-      const initial = saved || theme.colors.themeColor;
+    kv.getItem('selectedColor').then((saved) => {
+      const initial = saved || DEFAULT_CHAT_COLOR;
       setSelectedColor(initial);
       updateChatColor(initial);
     }).catch(() => {
-      setSelectedColor(theme.colors.themeColor);
-      updateChatColor(theme.colors.themeColor);
+      setSelectedColor(DEFAULT_CHAT_COLOR);
+      updateChatColor(DEFAULT_CHAT_COLOR);
     });
 
     Animated.parallel([
@@ -91,7 +91,7 @@ export default function ChatColorTheme({ navigation }) {
     ]).start();
     setSelectedColor(color);
     try {
-      await AsyncStorage.setItem('selectedColor', color);
+      await kv.setItem('selectedColor', color);
       updateChatColor(color);
     } catch (e) {}
   };
@@ -110,7 +110,7 @@ export default function ChatColorTheme({ navigation }) {
   };
 
   const activeThemeKey = !hasManualTheme ? 'system' : isDarkMode ? 'dark' : 'light';
-  const accent = selectedColor || theme.colors.themeColor;
+  const accent = selectedColor || DEFAULT_CHAT_COLOR;
 
   const primaryText = theme.colors.primaryTextColor;
   const subText = theme.colors.secondaryTextColor;
@@ -123,6 +123,8 @@ export default function ChatColorTheme({ navigation }) {
   // wallpaper went transparent (the chat ground is theme.colors.background now).
   const bubbleRecvBg = theme.colors.bubbleReceived;
   const previewBg = theme.colors.chatBackground;
+  // Same outgoing-bubble rule as the real chat (bubble = swatch; default accent = theme bubble).
+  const outPal = outgoingPaletteFor(sentBubbleBgFor(accent, theme), theme);
   const sepClr = isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(15,30,50,0.07)';
 
   // ─── Chat preview (WhatsApp wallpaper-style) ───
@@ -162,11 +164,11 @@ export default function ChatColorTheme({ navigation }) {
           </View>
 
           <View style={styles.previewRowRight}>
-            <View style={[styles.bubbleSent, { backgroundColor: accent }]}>
-              <Text style={styles.bubbleSentText}>Almost done — looks great ✨</Text>
+            <View style={[styles.bubbleSent, { backgroundColor: outPal.bg }]}>
+              <Text style={[styles.bubbleSentText, { color: outPal.text }]}>Almost done — looks great ✨</Text>
               <View style={styles.bubbleSentMeta}>
-                <Text style={styles.bubbleSentTime}>10:31 AM</Text>
-                <Ionicons name="checkmark-done" size={14} color="rgba(255,255,255,0.9)" style={styles.gap4} />
+                <Text style={[styles.bubbleSentTime, { color: outPal.meta }]}>10:31 AM</Text>
+                <Ionicons name="checkmark-done" size={16} color={outPal.tick.read} style={styles.gap4} />
               </View>
             </View>
           </View>

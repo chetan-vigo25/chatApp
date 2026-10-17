@@ -1,7 +1,11 @@
 import React, { useMemo, useState, useCallback } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Image,
-  StyleSheet, SafeAreaView,
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  StyleSheet,
+  SafeAreaView,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useSelector } from 'react-redux';
@@ -12,6 +16,7 @@ import AppSearchBar from '../../components/AppSearchBar';
 // 1-1 avatar = same rule as the chat list: photo, else the first letter of the
 // peer's OWN profile name (not my saved name, their @username or a "+").
 import PersonAvatar from '../../components/GroupSenderAvatar';
+import AppImage from '../../components/AppImage';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const avatarColor = (name = '') => {
@@ -25,7 +30,7 @@ const avatarColor = (name = '') => {
 function GroupAvatar({ uri, name }) {
   const [failed, setFailed] = useState(false);
   if (uri && !failed) {
-    return <Image source={{ uri }} style={styles.avatar} onError={() => setFailed(true)} />;
+    return <AppImage source={{ uri }} style={styles.avatar} onError={() => setFailed(true)} />;
   }
   return (
     <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: avatarColor(name) }]}>

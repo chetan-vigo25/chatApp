@@ -1,8 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View, Text, TouchableOpacity, Image, ScrollView,
-  ActivityIndicator, Animated, StyleSheet, Alert, Modal,
-  Platform, ToastAndroid, Dimensions, StatusBar,
+  View,
+  Text,
+  TouchableOpacity,
+  ScrollView,
+  ActivityIndicator,
+  Animated,
+  StyleSheet,
+  Alert,
+  Modal,
+  Platform,
+  ToastAndroid,
+  Dimensions,
+  StatusBar,
 } from 'react-native';
 
 const { width: SCREEN_W } = Dimensions.get('window');
@@ -23,6 +33,7 @@ import VerifiedBadge from '../../components/VerifiedBadge';
 import GroupMemberSheet from '../../components/GroupMemberSheet';
 import useDisplayName from '../../hooks/useDisplayName';
 import FadeScrim, { easedStops } from '../../components/FadeScrim';
+import AppImage from '../../components/AppImage';
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393', '#00CEC9', '#FDCB6E', '#D63031'];
 const getAvatarColor = (n) => { if (!n) return AVATAR_COLORS[0]; let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length]; };
 const showToast = (m) => { Platform.OS === 'android' ? ToastAndroid.show(m, ToastAndroid.SHORT) : Alert.alert('', m); };
@@ -472,7 +483,7 @@ export default function GroupInfo({ navigation, route }) {
           activeOpacity={isSelf ? 1 : 0.7}
         >
           {user.profileImage ? (
-            <Image source={{ uri: user.profileImage }} style={styles.memberAvatar} />
+            <AppImage source={{ uri: user.profileImage }} style={styles.memberAvatar} />
           ) : (
             <View style={[styles.memberAvatar, { backgroundColor: color }]}>
               <Text style={styles.memberAvatarText}>{(displayName || 'U').charAt(0).toUpperCase()}</Text>
@@ -607,7 +618,7 @@ export default function GroupInfo({ navigation, route }) {
         {/* ═══ TELEGRAM-STYLE GROUP HERO ═══ */}
         <View style={[styles.tgHero, { backgroundColor: groupAvatarUrl ? '#000' : getAvatarColor(groupName) }]}>
           {groupAvatarUrl ? (
-            <Image source={{ uri: groupAvatarUrl }} style={styles.tgHeroImg} resizeMode="cover" />
+            <AppImage source={{ uri: groupAvatarUrl }} style={styles.tgHeroImg} resizeMode="cover" />
           ) : (
             <View style={styles.tgHeroFallback}>
               <Ionicons name="people" size={92} color="rgba(255,255,255,0.85)" />
@@ -815,7 +826,7 @@ export default function GroupInfo({ navigation, route }) {
       {/* ═══ TRANSFER OWNERSHIP MODAL ═══ */}
       <Modal transparent visible={transferModalVisible} onRequestClose={() => setTransferModalVisible(false)} animationType="fade">
         <TouchableOpacity activeOpacity={1} onPress={() => setTransferModalVisible(false)} style={styles.modalOverlay}>
-          <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: theme.colors.cardBackground || theme.colors.menuBackground, maxHeight: '60%' }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: theme.colors.menuSurface || theme.colors.menuBackground, maxHeight: '60%' }]}>
             <Text style={[styles.transferTitle, { color: theme.colors.primaryTextColor }]}>Transfer Ownership</Text>
             <Text style={[styles.transferSub, { color: theme.colors.placeHolderTextColor }]}>Select a new owner</Text>
             <View style={[styles.modalDivider, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)', marginTop: 10 }]} />
@@ -825,7 +836,7 @@ export default function GroupInfo({ navigation, route }) {
                 const c = getAvatarColor(u.fullName);
                 return (
                   <TouchableOpacity key={u.id} onPress={() => handleTransferOwnership(member)} activeOpacity={0.6} style={styles.transferRow}>
-                    {u.profileImage ? <Image source={{ uri: u.profileImage }} style={styles.transferAvatar} /> : (
+                    {u.profileImage ? <AppImage source={{ uri: u.profileImage }} style={styles.transferAvatar} /> : (
                       <View style={[styles.transferAvatar, { backgroundColor: c }]}><Text style={styles.transferAvatarText}>{u.fullName.charAt(0).toUpperCase()}</Text></View>
                     )}
                     <View style={{ flex: 1 }}>

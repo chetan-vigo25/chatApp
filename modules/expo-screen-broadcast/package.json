@@ -1,0 +1,7 @@
+{
+  "name": "expo-screen-broadcast",
+  "version": "1.0.0",
+  "description": "Opens the iOS ReplayKit broadcast picker for the TalksTry screen-share extension.",
+  "main": "index.ts",
+  "private": true
+}

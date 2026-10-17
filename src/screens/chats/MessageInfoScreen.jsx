@@ -5,7 +5,6 @@ import {
   StyleSheet,
   TouchableOpacity,
   FlatList,
-  Image,
   ActivityIndicator,
   RefreshControl,
   Platform,
@@ -20,6 +19,7 @@ import { getSocket } from '../../Redux/Services/Socket/socket';
 import { resolveDisplayName as resolveCanonicalName } from '../../services/contactNameStore';
 import useDisplayName from '../../hooks/useDisplayName';
 import { useRealtimeChatSlice } from '../../contexts/RealtimeChatContext';
+import AppImage from '../../components/AppImage';
 
 const READ_BLUE = '#53BDEB';
 const GRAY_LIGHT = '#8696A0';
@@ -153,7 +153,7 @@ const ReceiptRow = ({ entry, timestamp, palette, resolveName, identityById }) =>
   return (
     <View style={[styles.row, { borderBottomColor: palette.divider, backgroundColor: palette.surface }]}>
       {who.profileImage ? (
-        <Image source={{ uri: who.profileImage }} style={styles.avatar} />
+        <AppImage source={{ uri: who.profileImage }} style={styles.avatar} />
       ) : (
         <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: palette.brand }]}>
           <Text style={[styles.avatarInitial, { color: '#fff' }]}>{initial}</Text>

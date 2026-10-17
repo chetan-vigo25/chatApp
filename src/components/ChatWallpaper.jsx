@@ -21,7 +21,7 @@ import { StyleSheet, View, Image } from 'react-native';
 // This file used to hard-code #EFEAE2 / #0B141A, which made the chat the only
 // surface in the app ignoring the theme — on dark mode that near-black sat
 // visibly apart from the app's true black. The ground is a THEME token now:
-// true black on dark (continuous with every other surface), a warm off-white
+// #0B141A on dark, a warm off-white
 // on light (pure white would swallow the white incoming bubbles).
 //
 // Ink strength lives in the ASSET, not here: see

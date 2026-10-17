@@ -1,8 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Image,
-  ActivityIndicator, Animated, StyleSheet, Alert,
-  Platform, ToastAndroid, ScrollView,
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+  Animated,
+  StyleSheet,
+  Alert,
+  Platform,
+  ToastAndroid,
+  ScrollView,
 } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
@@ -14,6 +22,7 @@ import { viewGroup } from '../../Redux/Reducer/Group/Group.reducer';
 import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
 import { MIN_DIRECTORY_QUERY } from '../../Redux/Services/Contact/Directory.Services';
 import { hiddenHandleLabel } from '../../services/contactNameStore';
+import AppImage from '../../components/AppImage';
 
 const AVATAR_COLORS = [
   '#6C5CE7', '#00B894', '#E17055', '#0984E3',
@@ -157,7 +166,7 @@ export default function AddGroupMembers({ navigation, route }) {
       >
         <View style={styles.avatarWrap}>
           {profileImage ? (
-            <Image source={{ uri: profileImage }} style={styles.avatar} />
+            <AppImage source={{ uri: profileImage }} style={styles.avatar} />
           ) : (
             <View style={[styles.avatar, { backgroundColor: avatarColor }]}>
               <Text style={styles.avatarText}>{name.charAt(0).toUpperCase()}</Text>
@@ -199,7 +208,7 @@ export default function AddGroupMembers({ navigation, route }) {
             return (
               <TouchableOpacity key={c.userId} onPress={() => toggleContact(c)} activeOpacity={0.7} style={styles.selectedChip}>
                 {img ? (
-                  <Image source={{ uri: img }} style={styles.selectedAvatar} />
+                  <AppImage source={{ uri: img }} style={styles.selectedAvatar} />
                 ) : (
                   <View style={[styles.selectedAvatar, { backgroundColor: color }]}>
                     <Text style={styles.selectedAvatarText}>{name.charAt(0).toUpperCase()}</Text>

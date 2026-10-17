@@ -33,7 +33,6 @@ import { useEffect, useRef, useState } from 'react';
 import {
   Animated,
   Dimensions,
-  Image,
   Modal,
   StyleSheet,
   Text,
@@ -46,6 +45,7 @@ import { useTheme } from '../contexts/ThemeContext';
 import { useCall } from '../calls/useCall';
 import { avatarNameSource, getAvatarInitial } from '../utils/avatarIdentity';
 import { usePeerProfileName } from '../services/peerProfileNameStore';
+import AppImage from './AppImage';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -132,7 +132,7 @@ export default function ProfilePreviewModal({
         <Animated.View
           style={[
             styles.card,
-            { backgroundColor: theme.colors.cardBackground, opacity, transform: [{ scale }] },
+            { backgroundColor: theme.colors.menuSurface, opacity, transform: [{ scale }] },
           ]}
         >
           {/* Absorb taps on the card so only an outside tap dismisses. */}
@@ -146,7 +146,7 @@ export default function ProfilePreviewModal({
                   onPress={onViewPhoto || undefined}
                   disabled={!onViewPhoto}
                 >
-                  <Image resizeMode="cover" source={{ uri: image }} style={styles.imageInner} fadeDuration={0} />
+                  <AppImage resizeMode="cover" source={{ uri: image }} style={styles.imageInner} />
                 </TouchableOpacity>
               ) : (
                 <View style={styles.fallback}>

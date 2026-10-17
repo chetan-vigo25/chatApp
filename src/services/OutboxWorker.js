@@ -13,6 +13,8 @@
 
 import ChatDatabase from './ChatDatabase';
 import { apiCall } from '../Config/Https';
+import NetInfo from '@react-native-community/netinfo';
+import { shouldCountOutboxFailure } from '../utils/catchupChunks';
 
 let _running = false;
 let _timer = null;
@@ -21,6 +23,13 @@ let _wakeResolve = null;
 
 const POLL_INTERVAL_MS = 1500;
 const MAX_BATCH = 5;
+
+// Device connectivity, kept current by NetInfo events (no polling). Starts
+// optimistic: an unknown state must not stall the first send.
+let _netOnline = true;
+let _netUnsub = null;
+let _sockUnsub = null;
+const toOnline = (s) => !(s?.isConnected === false || s?.isInternetReachable === false);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -89,6 +98,9 @@ const sendOnce = async (row) => {
 };
 
 const tick = async () => {
+  // Offline: nothing can succeed, so don't burn attempts (A-08). The NetInfo /
+  // socket-connect listeners in start() wake the loop the moment we're back.
+  if (!_netOnline) return;
   let rows = [];
   try {
     rows = await ChatDatabase.outboxDrainDue(MAX_BATCH);
@@ -106,6 +118,10 @@ const tick = async () => {
       // Tell any listener that this client message is now settled.
       try { _onAckListeners.forEach((cb) => cb({ clientMessageId: cid, ack })); } catch {}
     } catch (err) {
+      // A-08: only count failures that happened ONLINE and aren't pure
+      // transport errors ("socket offline"); an offline failure leaves the row
+      // due, to be retried on reconnect with its attempts untouched.
+      if (!shouldCountOutboxFailure({ online: _netOnline, errorMessage: err?.message })) continue;
       const { exhausted } = await ChatDatabase.outboxRecordFailure(cid, err?.message);
       if (exhausted) {
         // Final failure — drop and surface to UI via listener.
@@ -126,6 +142,25 @@ export const start = () => {
   if (_running) return;
   _running = true;
 
+  try {
+    NetInfo.fetch().then((s) => { _netOnline = toOnline(s); }).catch(() => {});
+    _netUnsub = NetInfo.addEventListener((s) => {
+      const was = _netOnline;
+      _netOnline = toOnline(s);
+      if (_netOnline && !was) wake();
+    });
+  } catch {}
+  try {
+    // Socket (re)connect also wakes the drain — group rows go over the socket.
+    const { subscribeSocketState, isSocketConnected, isSocketAuthed } = require('../Redux/Services/Socket/socket');
+    let wasUp = isSocketConnected() && isSocketAuthed();
+    _sockUnsub = subscribeSocketState(() => {
+      const up = isSocketConnected() && isSocketAuthed();
+      if (up && !wasUp) wake();
+      wasUp = up;
+    });
+  } catch {}
+
   const loop = async () => {
     while (_running) {
       await tick();
@@ -142,6 +177,9 @@ export const start = () => {
 
 export const stop = () => {
   _running = false;
+  try { _netUnsub?.(); } catch {}
+  try { _sockUnsub?.(); } catch {}
+  _netUnsub = null; _sockUnsub = null;
   if (_timer) { clearTimeout(_timer); _timer = null; }
   if (_wakeResolve) { _wakeResolve(); _wakeResolve = null; _wakePromise = null; }
 };

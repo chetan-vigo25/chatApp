@@ -4,17 +4,17 @@
  * detail screen and the in-thread call bubble.
  *
  * Glyphs are MaterialIcons (the same set WhatsApp Android draws), colored by
- * whether the call actually connected — green when answered, red when not:
- *   outgoing answered      → call-made            (green ↗ with corner)
+ * whether the call actually connected — brand teal when answered, red when not:
+ *   outgoing answered      → call-made            (teal ↗ with corner)
  *   outgoing not answered  → call-missed-outgoing (red ↗)
- *   incoming answered      → call-received        (green ↙ with corner)
+ *   incoming answered      → call-received        (teal ↙ with corner)
  *   incoming missed/decl.  → call-missed          (red ↙)
  *
  * NOTE: the glyph names below exist in MaterialIcons only. MaterialCommunityIcons
  * has no `call-missed-outgoing`, so rendering these with MCI silently drops the
  * outgoing-missed arrow — that is what this module exists to prevent.
  */
-export const CALL_GREEN = '#1DAB61'; // WhatsApp connected-call green
+export const CALL_GREEN = '#03b0a2'; // brand teal — connected calls (never WhatsApp green)
 export const CALL_RED = '#F15C6D';   // WhatsApp missed-call red
 // Same red, lifted for legibility on the outgoing bubble's dark green ground.
 export const CALL_RED_ON_ACCENT = '#FF9BA6';

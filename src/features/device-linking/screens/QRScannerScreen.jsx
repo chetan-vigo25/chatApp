@@ -150,9 +150,11 @@ export default function QRScannerScreen({ navigation }) {
           if (navigation.canGoBack()) navigation.goBack();
           else navigation.navigate('LinkDevice');
         }, 1400);
-      } else {
-        setLinkErrorState(linkError || 'Something went wrong. Please try again.');
       }
+      // On failure the hook has already set its own specific `error` (expired
+      // QR, browser never connected, …) and activeError shows it. Setting a
+      // generic string here used to mask it.
+
     } catch (err) {
       setLinkErrorState(err?.message || 'Something went wrong. Please try again.');
     }

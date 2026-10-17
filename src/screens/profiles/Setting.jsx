@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   View,
-  Image,
   Animated,
   TouchableOpacity,
   ScrollView,
@@ -26,6 +25,7 @@ import { APP_TAG_NAME } from '@env';
 import ChatBackupService from '../../services/ChatBackupService';
 import VerifiedBadge from '../../components/VerifiedBadge';
 import { openCallReliability } from '../../calls/services/callReliability';
+import AppImage from '../../components/AppImage';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
@@ -220,7 +220,7 @@ export default function Setting({ navigation }) {
     >
       <View style={[styles.profileAvatar, { backgroundColor: avatarBg }]}>
         {profileData?.profileImage ? (
-          <Image resizeMode="cover" source={{ uri: profileData.profileImage }} style={styles.profileAvatarImage} />
+          <AppImage resizeMode="cover" source={{ uri: profileData.profileImage }} style={styles.profileAvatarImage} />
         ) : (
           <Text style={styles.profileAvatarText}>{getInitials(profileData?.fullName)}</Text>
         )}

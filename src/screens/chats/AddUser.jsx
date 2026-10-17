@@ -6,7 +6,6 @@ import {
   Animated,
   Easing,
   TouchableOpacity,
-  Image,
   ActivityIndicator,
   Platform,
   ToastAndroid,
@@ -37,6 +36,7 @@ import { buildQuery, contactMatchScore } from "../../utils/contactSearch";
 import useUserDirectorySearch from "../../hooks/useUserDirectorySearch";
 import useDisplayName from "../../hooks/useDisplayName";
 import { peerHidesContact, getPeerIdentity } from "../../services/contactNameStore";
+import AppImage from '../../components/AppImage';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 // Only the SEARCH BAR collapses on scroll now (New Contact / New Group stay
@@ -94,11 +94,10 @@ const ContactRow = memo(function ContactRow({
         style={styles.avatarWrap}
       >
         {contact.profilePicture ? (
-          <Image
+          <AppImage
             resizeMode="cover"
             source={{ uri: contact.profilePicture }}
             style={styles.avatarImage}
-            fadeDuration={0}
           />
         ) : (
           <View style={[styles.avatarFallback, { backgroundColor: avatarBg }]}>
@@ -917,7 +916,7 @@ export default function AddUser({ navigation }) {
           style={styles.selfRow}
         >
           {selfContact?.profileImage ? (
-            <Image source={{ uri: selfContact.profileImage }} style={styles.selfAvatar} />
+            <AppImage source={{ uri: selfContact.profileImage }} style={styles.selfAvatar} />
           ) : (
             <View style={[styles.selfAvatar, styles.selfAvatarFallback, { backgroundColor: theme.colors.themeColor }]}>
               <Ionicons name="person" size={20} color={theme.colors.textWhite} />

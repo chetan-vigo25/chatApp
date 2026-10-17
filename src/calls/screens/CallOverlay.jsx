@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar, Alert, Platform,
+  View, Text, TouchableOpacity, StyleSheet, BackHandler, StatusBar, Alert, Platform, Animated,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -22,6 +22,7 @@ import PulsingRing from '../components/PulsingRing';
 import CallMiniBanner from '../components/CallMiniBanner';
 import AddParticipantSheet from '../components/AddParticipantSheet';
 import ConferenceAddPeopleSheet from '../components/ConferenceAddPeopleSheet';
+import { setChromeVisible, useChromeVisible } from './callChromeStore';
 
 const END_TEXT = {
   completed: 'Call ended',
@@ -31,6 +32,10 @@ const END_TEXT = {
   failed: 'Call failed',
   busy: 'User is busy on another call',
 };
+
+// Live video call: the top bar + control row fade out after this long without
+// a touch (WhatsApp-style); a tap on the video brings them back.
+const CONTROLS_AUTO_HIDE_MS = 8000;
 
 export default function CallOverlay() {
   const {
@@ -113,6 +118,31 @@ export default function CallOverlay() {
     || (status === CALL_STATUS.INCOMING && accepted);
 
   const minimized = !!call?.minimized;
+
+  // ---- Video controls auto-hide ----
+  // Only once media is live and nothing on screen needs the controls up
+  // (dialing/connecting, reconnecting, the add-people sheet, the unmute
+  // prompt). The tap-to-toggle surface lives in NativeVideoStage, under this
+  // overlay; touching the controls themselves restarts the countdown.
+  const chromeShown = useChromeVisible();
+  const autoHideChrome = isVideoActive && mediaConnected && !minimized && !showAddSheet
+    && !call?.reconnecting && !call?.needsUnmuteGesture;
+  const [chromeTouch, setChromeTouch] = useState(0);
+  const keepChrome = () => setChromeTouch((n) => n + 1);
+  useEffect(() => {
+    if (!autoHideChrome) { setChromeVisible(true); return undefined; }
+    if (!chromeShown) return undefined;
+    const t = setTimeout(() => setChromeVisible(false), CONTROLS_AUTO_HIDE_MS);
+    return () => clearTimeout(t);
+  }, [autoHideChrome, chromeShown, chromeTouch]);
+  useEffect(() => () => setChromeVisible(true), []);
+  const chromeFade = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    Animated.timing(chromeFade, {
+      toValue: chromeShown ? 1 : 0, duration: 220, useNativeDriver: true,
+    }).start();
+  }, [chromeShown, chromeFade]);
+  const chromePointer = chromeShown ? 'box-none' : 'none';
 
   // What the group roster grid actually SHOWS:
   //  • receiver, once answered → ONLY people actually connected (no
@@ -278,8 +308,10 @@ export default function CallOverlay() {
     // connects still fails via the connect watchdog.
     if (connecting && !timerRunning) return 'Connecting…';
     if (status === CALL_STATUS.OUTGOING) {
-      if (isGroup) return call?.callId ? 'Ringing…' : 'Calling group…';
-      return call?.callId ? 'Ringing…' : 'Calling…';
+      // "Ringing…" only once a callee DEVICE confirmed its ring (call:ringing
+      // ring-ack) — the media-plane callId only meant the SFU accepted the dial.
+      if (isGroup) return call?.ringingConfirmed ? 'Ringing…' : 'Calling group…';
+      return call?.ringingConfirmed ? 'Ringing…' : 'Calling…';
     }
     if (status === CALL_STATUS.INCOMING) {
       // Conference invites must NEVER read as a normal 1:1/group call.
@@ -359,7 +391,11 @@ export default function CallOverlay() {
       <View style={styles.videoRoot} pointerEvents="box-none">
         {/* video call surface is always dark by design */}
         <StatusBar barStyle="light-content" />
-        <View style={[styles.videoTopBar, { paddingTop: insets.top + 8 }]} pointerEvents="box-none">
+        <Animated.View
+          style={[styles.videoTopBar, { paddingTop: insets.top + 8, opacity: chromeFade }]}
+          pointerEvents={chromePointer}
+          onTouchStart={keepChrome}
+        >
           {canMinimize ? (
             <TouchableOpacity
               onPress={minimize}
@@ -388,7 +424,7 @@ export default function CallOverlay() {
               <Ionicons name="person-add" size={22} color="#fff" />
             </TouchableOpacity>
           ) : null}
-        </View>
+        </Animated.View>
 
         {call?.needsUnmuteGesture ? (
           <TouchableOpacity style={styles.unmuteBanner} onPress={resumeAudio} activeOpacity={0.9}>
@@ -399,7 +435,11 @@ export default function CallOverlay() {
 
         {addSheet}
 
-        <View style={[styles.videoControls, { paddingBottom: insets.bottom + 22 }]} pointerEvents="box-none">
+        <Animated.View
+          style={[styles.videoControls, { paddingBottom: insets.bottom + 22, opacity: chromeFade }]}
+          pointerEvents={chromePointer}
+          onTouchStart={keepChrome}
+        >
           <CallControls
             isVideo
             forceDark
@@ -415,7 +455,7 @@ export default function CallOverlay() {
             onToggleSpeaker={toggleSpeaker}
             onHangup={hangup}
           />
-        </View>
+        </Animated.View>
       </View>
     );
   }

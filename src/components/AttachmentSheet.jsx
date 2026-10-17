@@ -634,7 +634,7 @@ export default function AttachmentSheet({
             styles.sheet,
             {
               height: FULL_H,
-              backgroundColor: colors.cardBackground,
+              backgroundColor: colors.menuSurface,
               borderTopColor: colors.divider,
             },
             sheetStyle,
@@ -684,7 +684,7 @@ export default function AttachmentSheet({
 
             {isLimitedAccess && media.permissionGranted ? (
               <TouchableOpacity
-                style={[styles.limitedBar, { backgroundColor: colors.surface, borderColor: colors.divider }]}
+                style={[styles.limitedBar, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : colors.surface, borderColor: colors.divider }]}
                 onPress={media.openSettings}
                 accessibilityRole="button"
                 accessibilityLabel="Allow access to all photos"
@@ -818,7 +818,7 @@ export default function AttachmentSheet({
           <Reanimated.View
             style={[
               styles.attachWrap,
-              { top: HANDLE_H, height: ATTACH_H, backgroundColor: colors.cardBackground },
+              { top: HANDLE_H, height: ATTACH_H, backgroundColor: colors.menuSurface },
               attachStyle,
             ]}
             pointerEvents={expanded ? 'none' : 'auto'}
@@ -831,7 +831,7 @@ export default function AttachmentSheet({
                 accessibilityRole="button"
                 accessibilityLabel={option.label}
               >
-                <View style={[styles.attachDisc, { backgroundColor: colors.surface }]}>
+                <View style={[styles.attachDisc, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : colors.surface }]}>
                   <Ionicons
                     name={option.icon}
                     size={26}
@@ -859,7 +859,7 @@ export default function AttachmentSheet({
       {/* Album dropdown — a sibling of the sheet so it is never clipped by the
           sliding picker block. */}
       {albumOpen && expanded && (
-        <View style={[styles.albumSheet, { top: HEADER_H + HANDLE_H + PICKER_H, backgroundColor: colors.cardBackground, borderColor: colors.divider }]}>
+        <View style={[styles.albumSheet, { top: HEADER_H + HANDLE_H + PICKER_H, backgroundColor: colors.menuSurface, borderColor: colors.divider }]}>
           <ScrollView bounces={false} style={{ maxHeight: 260 }}>
             {[{ id: null, title: 'Recents' }, ...media.albums].map((a) => {
               const active = (media.album?.id || null) === (a.id || null);

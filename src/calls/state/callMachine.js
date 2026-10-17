@@ -82,6 +82,8 @@ export const initialCallState = {
   // disconnect/ICE-failed. The overlay shows "Reconnecting…" while true; a
   // watchdog ends the call if it doesn't recover. Cleared on media recovery.
   reconnecting: false,
+  // Caller: a callee device confirmed its ring (server relayed `call:ringing`).
+  ringingConfirmed: false,
   needsUnmuteGesture: false,
   endReason: null,       // 'completed'|'rejected'|'cancelled'|'missed'|'failed'
   startedAt: null,

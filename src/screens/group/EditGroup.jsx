@@ -1,8 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View, Text, TouchableOpacity, Image, TextInput,
-  ActivityIndicator, Animated, StyleSheet, Alert,
-  Platform, ToastAndroid, ScrollView, KeyboardAvoidingView,
+  View,
+  Text,
+  TouchableOpacity,
+  TextInput,
+  ActivityIndicator,
+  Animated,
+  StyleSheet,
+  Alert,
+  Platform,
+  ToastAndroid,
+  ScrollView,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
@@ -14,6 +23,7 @@ import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ens
 import { BACKEND_URL } from '@env';
 import { apiCall } from '../../Config/Https';
 import { getAccessToken } from '../../services/secureTokenStore';
+import AppImage from '../../components/AppImage';
 
 function showToast(msg) {
   if (Platform.OS === 'android') ToastAndroid.show(msg, ToastAndroid.SHORT);
@@ -208,7 +218,7 @@ export default function EditGroup({ navigation, route }) {
           <View style={styles.avatarSection}>
             <TouchableOpacity onPress={pickAvatar} disabled={isSaving} activeOpacity={0.7} style={[styles.avatarWrap, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)' }]}>
               {groupAvatar ? (
-                <Image source={{ uri: groupAvatar }} style={styles.avatarImg} />
+                <AppImage source={{ uri: groupAvatar }} style={styles.avatarImg} />
               ) : (
                 <Ionicons name="people" size={36} color={theme.colors.placeHolderTextColor} />
               )}

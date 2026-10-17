@@ -1,6 +1,8 @@
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { loadContactNames, resolveDisplayName as resolveCanonicalName } from '../services/contactNameStore';
+import { createKeyedSerial } from '../utils/keyedSerial';
+import { buildAndroidMessageActions, supportsInlineActions } from '../utils/messagePushPolicy';
 
 /**
  * WhatsApp-style message notifications (Android) via notifee's MessagingStyle.
@@ -68,6 +70,18 @@ const toNotifeeData = (obj = {}) => {
   return out;
 };
 
+// P-A-09: every read-modify-write of a chat's stored lines (and the notification
+// rebuilt from them) runs through this per-chat chain, so two pushes for the same
+// chat can no longer both read the old list and overwrite each other's line.
+const runForChat = createKeyedSerial();
+
+// Inline Reply (P-A-10) on 1:1 and group threads only.
+const inlineActionsFor = (data) => {
+  if (!supportsInlineActions(data)) return {};
+  const actions = buildAndroidMessageActions();
+  return actions.length ? { actions } : {};
+};
+
 const loadMessages = async (chatId) => {
   try {
     const raw = await AsyncStorage.getItem(STORE_PREFIX + chatId);
@@ -88,6 +102,10 @@ export const displayGroupedMessage = async (data) => {
   if (!notifee) return false;
   const chatId = data?.chatId;
   if (!chatId) return false;
+  return runForChat(String(chatId), () => displayGroupedMessageUnlocked(notifee, chatId, data));
+};
+
+const displayGroupedMessageUnlocked = async (notifee, chatId, data) => {
 
   const isGroup = typeof data?.isGroup === 'boolean'
     ? data.isGroup
@@ -121,7 +139,7 @@ export const displayGroupedMessage = async (data) => {
 
   // Accumulate this message into the chat's recent-message list.
   const prior = await loadMessages(chatId);
-  prior.push({ text, timestamp, senderName, senderId });
+  prior.push({ text, timestamp, senderName, senderId, ...(data?.messageId ? { messageId: String(data.messageId) } : {}) });
   const msgs = prior.slice(-MAX_LINES);
   await saveMessages(chatId, msgs);
 
@@ -164,6 +182,7 @@ export const displayGroupedMessage = async (data) => {
         importance: AndroidImportance.HIGH,
         visibility: AndroidVisibility.PRIVATE,
         pressAction: { id: 'default', launchActivity: 'default' },
+        ...inlineActionsFor(data),
         // Join the shared group so multiple chats collapse under one summary.
         groupId: ANDROID_GROUP_KEY,
         style: {
@@ -248,8 +267,7 @@ const ensureGroupSummary = async (notifee, AndroidImportance, AndroidVisibility,
 
 // Call when the user opens/reads a chat → clear its notification + accumulated
 // lines so the thread doesn't keep showing already-seen messages.
-export const clearMessageNotification = async (chatId) => {
-  if (!chatId) return;
+const clearMessageNotificationUnlocked = async (chatId) => {
   const notifee = getNotifee();
   try { if (notifee) await notifee.cancelNotification(`msg-${chatId}`); } catch (_) { /* */ }
   try { await AsyncStorage.removeItem(STORE_PREFIX + chatId); } catch (_) { /* */ }
@@ -264,4 +282,131 @@ export const clearMessageNotification = async (chatId) => {
       if (!stillHasChat) await notifee.cancelNotification(GROUP_SUMMARY_ID);
     }
   } catch (_) { /* best-effort */ }
+};
+
+export const clearMessageNotification = async (chatId) => {
+  if (!chatId) return;
+  return runForChat(String(chatId), () => clearMessageNotificationUnlocked(chatId));
+};
+
+// Re-post the chat's notification IN PLACE from `lines` (silent: same id,
+// onlyAlertOnce). Title / data / group flag are not stored with the lines, so
+// they are read back from the notification currently in the tray. Returns false
+// when nothing is visible to update.
+const refreshNotificationInPlace = async (notifee, chatId, lines) => {
+  const displayed = await notifee.getDisplayedNotifications();
+  const entry = (displayed || []).find((n) => String(n?.id || '') === `msg-${chatId}`);
+  if (!entry?.notification) return false;
+  const cur = entry.notification;
+  const curStyle = cur.android?.style || {};
+  const { AndroidImportance, AndroidStyle, AndroidVisibility } = _consts;
+  const last = lines[lines.length - 1];
+  await notifee.displayNotification({
+    id: `msg-${chatId}`,
+    title: cur.title,
+    body: last.text,
+    data: cur.data || {},
+    android: {
+      channelId: CHANNEL_ID,
+      smallIcon: 'notification_icon',
+      color: '#03b0a2',
+      importance: AndroidImportance.HIGH,
+      visibility: AndroidVisibility.PRIVATE,
+      pressAction: { id: 'default', launchActivity: 'default' },
+      ...inlineActionsFor(cur.data || {}),
+      groupId: ANDROID_GROUP_KEY,
+      onlyAlertOnce: true, // silent in-place refresh: no sound / heads-up
+      style: {
+        type: AndroidStyle.MESSAGING,
+        person: { name: 'You' },
+        group: !!curStyle.group,
+        ...(curStyle.title ? { title: curStyle.title } : {}),
+        messages: lines.map((m) => ({
+          text: m.text,
+          timestamp: m.timestamp,
+          person: { name: m.senderName || 'Unknown', id: String(m.senderId || m.senderName || '') },
+        })),
+      },
+    },
+  });
+  return true;
+};
+
+// A message was deleted for everyone (silent `message_deleted` push, or the live
+// socket event). Drop its line from the chat's stored thread and refresh the
+// notification IN PLACE with the remaining lines, or cancel it when none remain.
+// Never alerts. Lines stored before messageId was recorded cannot be matched, so
+// the notification is left as is (best-effort). Returns true when a stored line
+// was removed.
+export const removeMessageFromNotification = async (chatId, deletedMessageId) => {
+  if (!chatId || !deletedMessageId) return false;
+  const notifee = getNotifee();
+  if (!notifee) return false;
+  const target = String(deletedMessageId);
+  return runForChat(String(chatId), async () => {
+    try {
+      const msgs = await loadMessages(chatId);
+      const remaining = msgs.filter((m) => String(m?.messageId || '') !== target);
+      if (remaining.length === msgs.length) return false;
+
+      if (!remaining.length) {
+        await clearMessageNotificationUnlocked(chatId);
+        return true;
+      }
+      await saveMessages(chatId, remaining);
+      await refreshNotificationInPlace(notifee, chatId, remaining);
+      return true;
+    } catch (_) { return false; }
+  });
+};
+
+// A displayed message was EDITED for everyone (P-A-05): swap the line's text and
+// refresh the notification in place, silently. Returns true when a line matched.
+export const updateMessageInNotification = async (chatId, messageId, newText) => {
+  const text = String(newText == null ? '' : newText);
+  if (!chatId || !messageId || !text) return false;
+  const notifee = getNotifee();
+  if (!notifee) return false;
+  const target = String(messageId);
+  return runForChat(String(chatId), async () => {
+    try {
+      const msgs = await loadMessages(chatId);
+      let hit = false;
+      const next = msgs.map((m) => {
+        if (String(m?.messageId || '') !== target) return m;
+        hit = true;
+        return { ...m, text };
+      });
+      if (!hit) return false;
+      await saveMessages(chatId, next);
+      await refreshNotificationInPlace(notifee, chatId, next);
+      return true;
+    } catch (_) { return false; }
+  });
+};
+
+// Logout / session reset: drop every displayed message notification and the
+// accumulated @msgnotif/* lines so a stale notification from the old account
+// cannot be tapped. Best-effort; never throws.
+export const clearAllMessageNotifications = async () => {
+  try {
+    const notifee = getNotifee();
+    if (notifee) {
+      try { await notifee.cancelAllNotifications(); } catch (_) { /* */ }
+    }
+  } catch (_) { /* */ }
+  try {
+    const Notifications = require('expo-notifications');
+    await Notifications.dismissAllNotificationsAsync();
+  } catch (_) { /* */ }
+  // The previous account's unread count must not stay on the launcher icon.
+  try {
+    const notifee = getNotifee();
+    if (notifee && typeof notifee.setBadgeCount === 'function') await notifee.setBadgeCount(0);
+  } catch (_) { /* */ }
+  try {
+    const keys = await AsyncStorage.getAllKeys();
+    const mine = keys.filter((k) => k.startsWith(STORE_PREFIX));
+    if (mine.length) await AsyncStorage.multiRemove(mine);
+  } catch (_) { /* */ }
 };

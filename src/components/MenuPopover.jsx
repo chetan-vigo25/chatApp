@@ -62,7 +62,7 @@ const MenuPopover = ({ visible, onClose, items = [], anchor, children }) => {
           <View
             style={[
               styles.card,
-              { backgroundColor: colors.cardBackground, borderColor: colors.divider },
+              { backgroundColor: colors.menuSurface, borderColor: colors.divider },
               // A shadow is invisible on a dark card over a dark scrim, and on
               // Android it just costs frames — the hairline border separates it.
               isDarkMode ? null : styles.shadow,
@@ -80,12 +80,14 @@ const MenuPopover = ({ visible, onClose, items = [], anchor, children }) => {
                   item.onPress?.();
                 }}
                 style={styles.item}
+                accessibilityRole="button"
+                accessibilityLabel={item.label}
               >
-                <View style={[styles.disc, { backgroundColor: colors.surface }]}>
+                <View style={[styles.disc, { backgroundColor: isDarkMode ? 'rgba(255,255,255,0.08)' : colors.surface }]}>
                   <Ionicons
                     name={item.icon}
                     size={17}
-                    color={item.danger ? colors.danger : colors.iconColor}
+                    color={item.danger ? colors.dangerText : colors.iconColor}
                   />
                 </View>
                 <Text
@@ -93,7 +95,7 @@ const MenuPopover = ({ visible, onClose, items = [], anchor, children }) => {
                   style={[
                     styles.label,
                     {
-                      color: item.danger ? colors.danger : colors.primaryTextColor,
+                      color: item.danger ? colors.dangerText : colors.primaryTextColor,
                       fontFamily: theme.fonts?.medium || 'Roboto-Medium',
                     },
                   ]}

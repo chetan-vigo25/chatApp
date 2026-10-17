@@ -5,12 +5,17 @@ import NetInfo from '@react-native-community/netinfo';
 import { getSocket, isSocketConnected, isSocketAuthed, subscribeSocketState, emitSocketEvent } from '../Redux/Services/Socket/socket';
 import { subscribeSessionReset, subscribeUserChanged } from '../services/sessionEvents';
 import { claimDeliveryReceipt } from '../utils/deliveryReceiptGuard';
+import {
+  CATCHUP_CHUNK_SIZE, orderChatIdsByActivity, chunk, continuationEntries, effectiveLocalMax, followUpEntries,
+  deriveMutationSeed, committedIdSet, deliveredWatermarkToSend, forwardOnlyStatus,
+} from '../utils/catchupChunks';
 import ChatDatabase from '../services/ChatDatabase';
 import ChatCache from '../services/ChatCache';
 import { getChatActivityValue, compareChatsByActivity } from '../utils/chatOrder';
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
 import { shouldEmitReadAll } from '../utils/readAllThrottle';
+import { watermarkTickDecision, canSendReadReceipt, readAllUpToSeq } from '../utils/receiptStatus';
 import { isFileNameCaption } from '../utils/mediaCaption';
 // Firebase/notifee message notifications disabled in Expo Go / dev builds.
 // import { clearMessageNotification } from '../firebase/messageNotification';
@@ -33,10 +38,6 @@ const CHAT_HIGHLIGHT_TTL = 2000;
 const CHAT_UPDATE_BATCH_WINDOW = 90;
 const CHAT_LIST_CACHE_KEY = 'CHAT_LIST_CACHE';
 const CHAT_LIST_SAVE_DEBOUNCE_MS = 300;
-// Per-chat mutation-delta cursor (edits/deletes applied while away). MUST match
-// the prefix in useChatLogic so both share one cursor per chat.
-const MUTATION_CURSOR_PREFIX = 'chat_mutation_cursor_';
-
 // AUTO-DOWNLOAD (background chats): when an incoming media message lands in a
 // chat that is NOT open, fetch it per the user's per-network auto-download
 // matrix. The open-chat path (useChatLogic.handleReceivedMessage) has its own
@@ -72,23 +73,10 @@ const maybeAutoDownloadIncomingMedia = (rawSource) => {
   })().catch(() => {});
 };
 
-const _getMutationCursor = async (chatId) => {
-  try {
-    const raw = await AsyncStorage.getItem(`${MUTATION_CURSOR_PREFIX}${chatId}`);
-    const n = Number(raw);
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  } catch { return 0; }
-};
-
-const _setMutationCursor = async (chatId, at) => {
-  try {
-    const n = Number(at);
-    if (!chatId || !Number.isFinite(n) || n <= 0) return;
-    const prev = await _getMutationCursor(chatId);
-    if (n <= prev) return; // monotonic
-    await AsyncStorage.setItem(`${MUTATION_CURSOR_PREFIX}${chatId}`, String(n));
-  } catch {}
-};
+// Mutation cursor lives in SQLite sync_meta (A-04); ChatDatabase migrate-reads
+// the old AsyncStorage value on first use.
+const _getMutationCursor = (chatId) => ChatDatabase.getMutationCursor(chatId);
+const _setMutationCursor = (chatId, at) => ChatDatabase.setMutationCursor(chatId, at);
 
 // Apply a single server mutation doc to SQLite idempotently (absolute values).
 // Returns 'delete' | 'edit' | null so the caller can skip re-dispatching a row
@@ -109,7 +97,7 @@ const _applyMutatedDoc = async (doc, myUserId) => {
     return 'delete';
   }
   if (doc?.isEdited === true && (doc?.text || doc?.content)) {
-    await ChatDatabase.updateMessageEdit(String(mid), doc.text || doc.content, doc?.editedAt || doc?.updatedAt || new Date().toISOString());
+    await ChatDatabase.updateMessageEdit(String(mid), doc.text || doc.content, doc?.editedAt || doc?.updatedAt || new Date().toISOString(), { editVersion: doc?.editVersion });
     return 'edit';
   }
   return null;
@@ -118,7 +106,7 @@ const _applyMutatedDoc = async (doc, myUserId) => {
 // Debug switch for the incoming-message → SQLite-store pipeline. Flip to false
 // (or remove the logs) once the storage path is verified. Kept here so all the
 // message-store debugging can be toggled from one place.
-const DEBUG_MSG_STORE = true;
+const DEBUG_MSG_STORE = typeof __DEV__ !== 'undefined' && __DEV__ === true;
 const dlog = (...args) => { if (DEBUG_MSG_STORE) console.log('[MSG-STORE]', ...args); };
 
 const REASON_TYPE_MAP = {
@@ -669,6 +657,27 @@ const getMessageIdentifier = (message = {}) => {
   );
 };
 
+// EVERY id a message can be known by (server uuid, mongo _id, optimistic temp id,
+// client id). The chat list and the thread build a row's preview from different
+// sources, so they hold different aliases of the same message — matching on one
+// preferred alias made the same message look like two, which reset a delivered
+// tick back to 'sent' and kept a read receipt from ever reaching the list.
+const collectMessageIds = (message = {}) => {
+  const out = new Set();
+  [
+    message?.serverMessageId, message?.messageId, message?.id,
+    message?.tempId, message?._id, message?.clientMessageId,
+  ].forEach((v) => {
+    const n = normalizeId(v);
+    if (n) out.add(String(n));
+  });
+  return out;
+};
+const sharesMessageId = (a, b) => {
+  for (const id of a) if (b.has(id)) return true;
+  return false;
+};
+
 const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
   const baseLastMessage = existingChat?.lastMessage || {};
   const incomingText =
@@ -684,7 +693,15 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
 
   // If the existing lastMessage was edited locally and the incoming update refers to the same message,
   // preserve the edited text (server may not have caught up yet)
-  const isSameMessage = incomingMsgId && existingMsgId && String(incomingMsgId) === String(existingMsgId);
+  const incomingIds = collectMessageIds({
+    ...(item?.lastMessage || {}),
+    messageId: item?.lastMessage?.messageId || item?.messageId,
+    id: item?.lastMessage?.id || item?.id,
+  });
+  const isSameMessage = Boolean(
+    (incomingMsgId && existingMsgId && String(incomingMsgId) === String(existingMsgId))
+    || sharesMessageId(incomingIds, collectMessageIds(baseLastMessage))
+  );
   const keepLocalEdit = isSameMessage && baseLastMessage?.isEdited && !item?.lastMessage?.isEdited && !item?.isEdited;
 
   // If the existing lastMessage was deleted locally, preserve the deleted state unless
@@ -706,6 +723,7 @@ const buildLastMessageFromItem = (existingChat, item, fallbackTimestamp) => {
 
   return {
     ...baseLastMessage,
+    seq: item?.lastMessage?.seq ?? item?.lastMessageSeq ?? baseLastMessage?.seq ?? null,
     serverMessageId: item?.lastMessage?.serverMessageId || item?.lastMessage?.messageId || item?.messageId || baseLastMessage?.serverMessageId || null,
     messageId: item?.lastMessage?.messageId || item?.messageId || baseLastMessage?.messageId || null,
     tempId: item?.lastMessage?.tempId || item?.tempId || baseLastMessage?.tempId || null,
@@ -1392,6 +1410,28 @@ const reducer = (state, action) => {
       // Same message? Preserve highest status. Different message? Use the incoming status only —
       // a fresh message must not inherit the previous message's 'delivered'/'read' state.
       const isSameLastMessage = incomingMsgId && existingMsgId && String(incomingMsgId) === String(existingMsgId);
+
+      // Backfill guard. Catch-up, seq-hole fills and edit replays push OLDER
+      // messages through this reducer. Without this check every one of them
+      // bumped the unread badge (+1 each, so read chats re-badged on every app
+      // open) and dragged the row's last message/time back to the old message
+      // (rows jumped down, or — with no createdAt — to the top). A message older
+      // than the row's current last message is history: the thread/SQLite keep
+      // it, the list row does not move. seq decides when both have it; else the
+      // timestamp with a 5s allowance for client/server clock skew.
+      if (!isSameLastMessage && existingMsgId) {
+        const exSeq = Number(existingLastMsg?.seq);
+        const inSeq = Number(message.seq ?? message.chatSeq);
+        let isOlder = false;
+        if (exSeq > 0 && inSeq > 0) {
+          isOlder = inSeq < exSeq;
+        } else {
+          const exTs = toTimestamp(existingLastMsg?.createdAt || existing?.lastMessageAt);
+          const inTs = message.createdAt ? toTimestamp(message.createdAt) : 0;
+          isOlder = exTs > 0 && inTs > 0 && inTs + 5000 < exTs;
+        }
+        if (isOlder) return state;
+      }
       const resolvedStatus = isSameLastMessage
         ? pickHighestMessageStatus(existingLastMsg?.status, message.status)
         : (normalizeMessageDeliveryStatus(message.status) || 'sent');
@@ -1412,6 +1452,7 @@ const reducer = (state, action) => {
             createdAt: lastMessageAt,
             senderId: message.senderId,
             status: resolvedStatus,
+            seq: (Number(message.seq ?? message.chatSeq) > 0) ? Number(message.seq ?? message.chatSeq) : (isSameLastMessage ? (existingLastMsg?.seq ?? null) : null),
             // Carry call render details so the chat-list preview can show a
             // perspective/outcome-aware line (e.g. "Missed video call").
             ...(incomingType === 'call'
@@ -1636,7 +1677,33 @@ const reducer = (state, action) => {
       }
 
       const existing = state.chatMap[chatId] || { _id: chatId, chatId };
-      const lastMsg = payload.lastMessage || existing.lastMessage || { text: 'No messages yet', type: 'text' };
+      const incomingLastMsg = payload.lastMessage || existing.lastMessage || { text: 'No messages yet', type: 'text' };
+
+      // The row renders its tick from the FLAT `lastMessageStatus` before it ever
+      // looks at lastMessage.status, and this override used to replace only the
+      // latter — so the thread (double tick) kept telling the list (stuck on the
+      // old flat 'sent'). Carry the status onto both, and never lower it when the
+      // override describes the SAME message the row already shows.
+      const exLm = existing.lastMessage || null;
+      const exStatus = normalizeMessageDeliveryStatus(existing.lastMessageStatus || exLm?.status);
+      const inStatus = normalizeMessageDeliveryStatus(incomingLastMsg?.status);
+      const tsOf = (m) => {
+        const v = m?.createdAt;
+        const n = typeof v === 'number' ? v : Date.parse(v);
+        return Number.isFinite(n) ? n : 0;
+      };
+      const inIds = collectMessageIds(incomingLastMsg);
+      const exIds = collectMessageIds(exLm || {});
+      const sameLastMessage = !payload.lastMessage
+        || (inIds.size && exIds.size
+          ? sharesMessageId(inIds, exIds)
+          : (tsOf(incomingLastMsg) > 0 && Math.abs(tsOf(incomingLastMsg) - tsOf(exLm)) < 2000));
+      const resolvedStatus = sameLastMessage
+        ? (pickHighestMessageStatus(exStatus, inStatus) || inStatus || exStatus || null)
+        : (inStatus || null);
+      const lastMsg = resolvedStatus && incomingLastMsg && typeof incomingLastMsg === 'object'
+        ? { ...incomingLastMsg, status: resolvedStatus }
+        : incomingLastMsg;
       // Broadcast-channel branding: when the live payload carries it (fan-out
       // emits name/avatar/verified), persist it so a FIRST broadcast row created
       // off this event renders the channel — not an "Unknown" placeholder —
@@ -1659,10 +1726,13 @@ const reducer = (state, action) => {
             broadcastChannelId: payload.broadcastChannelId || existing.broadcastChannelId || null,
           } : {}),
           lastMessage: lastMsg,
+          lastMessageStatus: resolvedStatus ?? existing.lastMessageStatus ?? null,
           lastMessageType: payload.lastMessageType || lastMsg?.type || existing.lastMessageType || 'text',
           lastMessageSender: payload.lastMessageSender ?? lastMsg?.senderId ?? existing.lastMessageSender ?? null,
           lastMessageAt: payload.lastMessageAt || lastMsg?.createdAt || existing.lastMessageAt || null,
-          lastMessageEdited: payload.lastMessageEdited || lastMsg?.isEdited ? true : (existing.lastMessageEdited || false),
+          lastMessageEdited: typeof payload.lastMessageEdited === 'boolean'
+            ? payload.lastMessageEdited
+            : (lastMsg?.isEdited ? true : (existing.lastMessageEdited || false)),
         },
       };
 
@@ -1723,7 +1793,7 @@ const reducer = (state, action) => {
     }
 
     case 'UPDATE_LAST_MESSAGE_STATUS': {
-      const { chatId: rawChatId, status, messageId: rawMessageId } = action.payload || {};
+      const { chatId: rawChatId, status, messageId: rawMessageId, messageIds: rawMessageIds, upToSeq: rawUpToSeq } = action.payload || {};
       const chatId = normalizeId(rawChatId);
       const messageId = normalizeId(rawMessageId);
       const normalizedIncomingStatus = normalizeMessageDeliveryStatus(status);
@@ -1733,9 +1803,30 @@ const reducer = (state, action) => {
       const existing = chatMap[chatId];
 
       const existingLastMessage = existing?.lastMessage || null;
-      const lastMessageId = getMessageIdentifier(existingLastMessage);
-      if (messageId && lastMessageId && messageId !== lastMessageId) {
+      // The receipt may name ONE message or a batch (a read-all arrives as
+      // {messageId: <oldest>, messageIds: [...]}). It applies when ANY id it
+      // names is ANY alias of the row's last message — not only when one
+      // preferred alias equals the first id of the batch.
+      const namedIds = new Set();
+      if (messageId) namedIds.add(String(messageId));
+      if (Array.isArray(rawMessageIds)) {
+        rawMessageIds.forEach((m) => { const n = normalizeId(m); if (n) namedIds.add(String(n)); });
+      }
+      const lastIds = collectMessageIds(existingLastMessage || {});
+      if (namedIds.size && lastIds.size && !sharesMessageId(namedIds, lastIds)) {
         return state;
+      }
+      // A READ/SEEN tick needs proof it covers THIS last message: either the
+      // receipt names it (above), or it carries the reader's synced seq and the
+      // last message is at/below it. A bare chat-wide "read all" (no ids, no seq)
+      // used to blue whatever the last message was — including one sent after, or
+      // never received by, the reader.
+      if (!namedIds.size && getMessageStatusPriority(normalizedIncomingStatus) >= getMessageStatusPriority('seen')) {
+        const upTo = Number(rawUpToSeq);
+        const lastSeq = Number(existingLastMessage?.seq ?? existing?.lastMessageSeq);
+        if (!(Number.isFinite(upTo) && upTo > 0 && Number.isFinite(lastSeq) && lastSeq > 0 && lastSeq <= upTo)) {
+          return state;
+        }
       }
 
       const currentStatus = normalizeMessageDeliveryStatus(existing?.lastMessageStatus || existingLastMessage?.status);
@@ -2286,6 +2377,31 @@ const reducer = (state, action) => {
             break;
           }
 
+          case 'peer_read_watermark': {
+            // T-A-02: the peer's read/delivered WATERMARK can cover our last
+            // message without any per-message event (offline recovery, bulk
+            // read). Lift the list tick forward-only; the row keeps the new
+            // watermark seqs (merged from `item`) either way.
+            if (!existing) break;
+            const wmLast = existing?.lastMessage || null;
+            const wmMine = Boolean(wmLast && state.currentUserId
+              && String(wmLast.senderId || existing?.lastMessageSender || '') === String(state.currentUserId));
+            const wmNext = watermarkTickDecision({
+              currentStatus: normalizeMessageDeliveryStatus(existing?.lastMessageStatus || wmLast?.status) || 'sent',
+              lastSeq: wmLast?.seq ?? existing?.lastMessageSeq,
+              lastIsMine: wmMine,
+              readUpToSeq: item?.peerReadUpToSeq,
+              deliveredUpToSeq: item?.peerDeliveredUpToSeq,
+            });
+            const wmStatus = wmNext ? normalizeMessageDeliveryStatus(wmNext) : null;
+            nextMap[chatId] = {
+              ...mergedBase,
+              ...(wmStatus && wmLast ? { lastMessageStatus: wmStatus, lastMessage: { ...wmLast, status: wmStatus } } : {}),
+              unreadCount: Number(unreadByChat[chatId] || existing?.unreadCount || 0),
+            };
+            break;
+          }
+
           default: {
             nextMap[chatId] = {
               ...mergedBase,
@@ -2433,6 +2549,14 @@ const reducer = (state, action) => {
       const existingGrpMsgId = normalizeId(existingGrpLastMsg?.serverMessageId || existingGrpLastMsg?.messageId || existingGrpLastMsg?.id);
       const isNewDiffGrpMsg = incomingGrpMsgId && existingGrpMsgId && String(incomingGrpMsgId) !== String(existingGrpMsgId);
       const preserveGrpDelete = existingGrpDeleted && !isNewDiffGrpMsg;
+
+      // Backfill guard (same rule as INCOMING_MESSAGE): an OLDER group message
+      // replayed by catch-up must not bump unread or pull the row back in time.
+      if (isNewDiffGrpMsg && createdAt) {
+        const exTs = toTimestamp(existingGrpLastMsg?.createdAt || existing?.lastMessageAt);
+        const inTs = toTimestamp(createdAt);
+        if (exTs > 0 && inTs > 0 && inTs + 5000 < exTs) return state;
+      }
 
       // Restore group metadata when the chat was deleted locally (existing is
       // empty) so it reappears with its real name/image — never "Unknown Group".
@@ -2848,6 +2972,31 @@ export function RealtimeChatProvider({ children }) {
     setInactiveGroupIds(state.inactiveGroupIds);
   }, [state.inactiveGroupIds]);
 
+  // T-A-02/03: a peer read/delivered watermark must also move the CHAT-LIST tick.
+  // SQLite chat row first (alias-aware, forward-only, seq proof from the last
+  // message's own row); when it changed, tell the in-memory list with every alias
+  // of that message so the Redux reducer's alias-set match accepts it.
+  // Safe to call from any handler: it never throws and ignores our own echo.
+  const applyWatermarkToChatList = (chatId, readUpTo, delUpTo) => {
+    const me = currentUserIdRef.current;
+    if (!chatId || !me) return;
+    ChatDatabase.applyPeerWatermarkToChatRow(chatId, me, readUpTo, delUpTo)
+      .then((res) => {
+        if (!res || !res.status) return;
+        dispatch({
+          type: 'UPDATE_LAST_MESSAGE_STATUS',
+          payload: {
+            chatId,
+            status: res.status === 'seen' ? 'read' : res.status,
+            messageId: res.ids[0] || null,
+            messageIds: res.ids,
+            upToSeq: res.status === 'seen' ? (Number(readUpTo) || null) : null,
+          },
+        });
+      })
+      .catch(() => {});
+  };
+
   // Start the durable send-outbox worker once per provider lifetime.
   // It drains the SQLite `outbox` table on a 1.5s poll (or wakes
   // immediately when something is enqueued).
@@ -2867,7 +3016,12 @@ export function RealtimeChatProvider({ children }) {
       if (!clientMessageId) return;
       const serverMessageId = ack?.messageId || ack?._id || null;
       if (serverMessageId && serverMessageId !== clientMessageId) {
-        ChatDatabase.acknowledgeMessage(clientMessageId, serverMessageId).catch(() => {});
+        // A-14: pass the ack seq so the row can take peer watermark ticks.
+        ChatDatabase.acknowledgeMessage(clientMessageId, serverMessageId, ack?.seq ?? ack?.data?.seq).catch(() => {});
+        // T-A-21: tell a mounted thread so its in-memory row swaps id / ticks too.
+        DeviceEventEmitter.emit('chat:outbox:acked', {
+          clientMessageId, serverMessageId, seq: ack?.seq ?? ack?.data?.seq,
+        });
       }
       ChatDatabase.updateMessageStatus(serverMessageId || clientMessageId, 'sent').catch(() => {});
     });
@@ -2992,19 +3146,26 @@ export function RealtimeChatProvider({ children }) {
     // when we're on the chat list and haven't opened the conversation. (When
     // the chat IS open, useChatLogic also emits this; duplicate delivered
     // receipts are idempotent on the sender side.)
-    const emitDeliveryReceipt = ({ isGroup, messageId, chatId, groupId, senderId }) => {
-      if (!messageId) return;
+    // True when THIS call owns the receipt for `messageId` (socket up, not yet
+    // emitted by any path). Marks it emitted; a false return means skip.
+    const claimReceiptForEmit = (messageId) => {
+      if (!messageId) return false;
       const key = String(messageId);
-      if (deliveredEmittedRef.current.has(key)) return;
+      if (deliveredEmittedRef.current.has(key)) return false;
       const socket = getSocket();
-      if (!socket || !isSocketConnected()) return;
+      if (!socket || !isSocketConnected()) return false;
       // App-wide guard: the open chat screen and ChatSocketProvider emit too.
-      if (!claimDeliveryReceipt(key)) { deliveredEmittedRef.current.add(key); return; }
+      if (!claimDeliveryReceipt(key)) { deliveredEmittedRef.current.add(key); return false; }
       deliveredEmittedRef.current.add(key);
       if (deliveredEmittedRef.current.size > 2000) {
         const first = deliveredEmittedRef.current.values().next().value;
         deliveredEmittedRef.current.delete(first);
       }
+      return true;
+    };
+
+    const emitDeliveryReceipt = ({ isGroup, messageId, chatId, groupId, senderId }) => {
+      if (!claimReceiptForEmit(messageId)) return;
       // Through emitSocketEvent, never a raw emit: on a reconnect the server
       // (connection-state recovery) replays missed messages BEFORE the session is
       // re-authenticated, and a receipt emitted in that window is rejected
@@ -3033,6 +3194,12 @@ export function RealtimeChatProvider({ children }) {
     const emitReceiptsForFetched = (msgs, fallbackChatId) => {
       if (!Array.isArray(msgs) || msgs.length === 0) return;
       const me = String(currentUserIdRef.current || '');
+      // A-13: a backlog used to emit one event per message. Batch per
+      // (chat, sender) / per group through the bulk events the server already
+      // handles (message:delivered:bulk caps at 100 ids; group:message:delivered
+      // takes messageIds[]). One id keeps the original single-message event.
+      const privateBatches = new Map(); // `${chatId}|${senderId}` -> { chatId, senderId, ids[] }
+      const groupBatches = new Map();   // groupId -> ids[]
       for (const m of msgs) {
         if (!m || typeof m !== 'object') continue;
         const senderId = normalizeId(m.senderId || m.sender?._id || m.sender);
@@ -3045,15 +3212,52 @@ export function RealtimeChatProvider({ children }) {
         const groupId = normalizeId(m.groupId) || null;
         const isGroup = !!groupId || m.chatType === 'group' || (chatId && !String(chatId).startsWith('u_') && !String(chatId).includes('_'));
         const messageId = m.messageId || m.serverMessageId || m.id || normalizeId(m._id);
-        emitDeliveryReceipt({ isGroup, messageId, chatId, groupId: groupId || (isGroup ? chatId : null), senderId });
+        if (!claimReceiptForEmit(messageId)) continue;
+        if (isGroup) {
+          const gid = groupId || chatId;
+          if (!groupBatches.has(gid)) groupBatches.set(gid, []);
+          groupBatches.get(gid).push(messageId);
+        } else {
+          const k = `${chatId}|${senderId}`;
+          if (!privateBatches.has(k)) privateBatches.set(k, { chatId, senderId, ids: [] });
+          privateBatches.get(k).ids.push(messageId);
+        }
+      }
+      // Through emitSocketEvent (held until 'authenticated'), see emitDeliveryReceipt.
+      for (const { chatId, senderId, ids } of privateBatches.values()) {
+        if (ids.length === 1) {
+          emitSocketEvent('message:delivered', { messageId: ids[0], chatId, senderId });
+          continue;
+        }
+        for (let i = 0; i < ids.length; i += 100) {
+          emitSocketEvent('message:delivered:bulk', { messageIds: ids.slice(i, i + 100), chatId, senderId });
+        }
+      }
+      for (const [groupId, ids] of groupBatches) {
+        for (let i = 0; i < ids.length; i += 100) {
+          emitSocketEvent('group:message:delivered', {
+            groupId,
+            messageIds: ids.slice(i, i + 100),
+            userId: currentUserIdRef.current,
+            deliveredAt: new Date().toISOString(),
+          });
+        }
       }
     };
 
     // Persist RAW server message docs (catch-up / range fetch: messageId/_id/
     // messageType, not the client shape) through the serialized writer, render
     // them in any open thread, and acknowledge delivery.
-    const persistServerMessages = async (rawMsgs, chatId) => {
-      if (!Array.isArray(rawMsgs) || rawMsgs.length === 0) return;
+    //
+    // Resolves { committed, failed, aborted }. Only rows SQLite really committed
+    // are rendered and acknowledged (A-02): a failed row gets no delivered
+    // receipt and is not dispatched, and the caller derives its cursor from the
+    // local committed max so the next trigger re-fetches it (A-01/A-03).
+    // `runUserId` (A-15): the account that started the run; if the signed-in
+    // user changed since, nothing is dispatched or acknowledged.
+    const persistServerMessages = async (rawMsgs, chatId, runUserId = null) => {
+      if (!Array.isArray(rawMsgs) || rawMsgs.length === 0) return { committed: 0, failed: 0, aborted: false };
+      const sameUser = () => !runUserId || String(currentUserIdRef.current || '') === String(runUserId);
       // Normalize so upsert derives id/serverMessageId correctly (otherwise it
       // inserts `unknown_*` rows) and preserves `seq` + media type.
       const normalizedNew = rawMsgs.map((m) => {
@@ -3071,32 +3275,47 @@ export function RealtimeChatProvider({ children }) {
           synced: 1,
         };
       });
+      let outcome;
       try {
         const { default: SqliteWriter } = await import('../services/SqliteWriter');
-        SqliteWriter.enqueue('upsertMessages', normalizedNew).catch(() => {});
-      } catch {}
-      normalizedNew.forEach((m) => {
-        dispatch({ type: 'INCOMING_MESSAGE', payload: m });
+        outcome = await SqliteWriter.enqueue('upsertMessages', normalizedNew);
+      } catch { outcome = undefined; }
+      // A sealed/dropped write resolves undefined -> nothing committed.
+      const committedIds = committedIdSet(outcome);
+      const idOf = (m) => m?.serverMessageId || m?.id || m?.tempId;
+      const okIdx = [];
+      normalizedNew.forEach((m, i) => { const id = idOf(m); if (id != null && committedIds.has(String(id))) okIdx.push(i); });
+      const failed = normalizedNew.length - okIdx.length;
+      if (!sameUser()) return { committed: okIdx.length, failed, aborted: true };
+      okIdx.forEach((i) => {
+        dispatch({ type: 'INCOMING_MESSAGE', payload: normalizedNew[i] });
       });
-      emitReceiptsForFetched(rawMsgs, chatId);
+      // Receipt only for rows that landed (M-12); the rest are redelivered by
+      // the next catch-up because the cursor did not move past them.
+      emitReceiptsForFetched(okIdx.map((i) => rawMsgs[i]), chatId);
+      return { committed: okIdx.length, failed, aborted: false };
     };
 
-    // Seq gap repair (1:1). A message the server pushed over a socket that
+    // Seq gap repair. A message the server pushed over a socket that
     // died before the app processed it (sent seconds before Android froze the
     // backgrounded app, 2026-09-25) is never re-sent live, and the server
     // skips FCM because the device looked online. The next live message then
     // lands with a HIGHER seq, and every later sync asks "since MAX(seq)" — the
     // hole is permanent: the receiver never sees it, the sender never gets a
     // delivered tick. Seen seq > local max + 1 → fetch the missing range.
+    // Groups share the repair (A-16) and a range over the server's page cap
+    // continues from the last seq received (hasMore) instead of stopping.
     const seqGapInFlight = new Set();
     const seqHolesChecked = new Set();
-    const fillSeqGap = (chatId, fromSeq, toSeq) => {
+    const seqHoleRecheck = new Set(); // chats with a failed local commit: repair until clean
+    const fillSeqGap = (chatId, fromSeq, toSeq, depth = 0) => {
       if (!chatId || !(fromSeq > 0) || !(toSeq >= fromSeq)) return;
       const key = `${chatId}:${fromSeq}-${toSeq}`;
       if (seqGapInFlight.has(key)) return;
       const socket = getSocket();
       if (!socket || !isSocketConnected() || !isSocketAuthed()) return;
       seqGapInFlight.add(key);
+      const runUser = currentUserIdRef.current;
       let settled = false;
       const done = (response) => {
         if (settled) return;
@@ -3107,7 +3326,12 @@ export function RealtimeChatProvider({ children }) {
         const msgs = Array.isArray(data?.messages) ? data.messages : [];
         if (msgs.length) {
           dlog('🩹 seq gap filled', { chatId, fromSeq, toSeq, got: msgs.length });
-          persistServerMessages(msgs, chatId).catch(() => {});
+          persistServerMessages(msgs, chatId, runUser).then((r) => {
+            if (!data?.hasMore || depth >= 10 || r?.aborted || r?.failed > 0) return;
+            // Server clamped the window (200): walk on from where it stopped.
+            const end = Number(data?.toSeq) || msgs.reduce((mx, m) => Math.max(mx, Number(m?.seq) || 0), 0);
+            if (end > 0 && end < toSeq) fillSeqGap(chatId, end + 1, toSeq, depth + 1);
+          }).catch(() => {});
         }
       };
       const timer = setTimeout(() => done(null), 15000);
@@ -3291,14 +3515,8 @@ export function RealtimeChatProvider({ children }) {
       if (msgId) {
         // Send delivery receipt back to the sender (double gray tick) regardless
         // of whether this chat is open — but never for our own echo.
-        if (!isSelf) {
-          emitDeliveryReceipt({
-            isGroup: false,
-            messageId: msgId,
-            chatId: normalized.chatId,
-            senderId: normalized.senderId,
-          });
-        }
+        // (M-12: the receipt is emitted from the upsert .then below, AFTER the
+        // row is stored; a failed write emits nothing so catch-up redelivers.)
         // Seq gap check — read the local max BEFORE this row is written.
         const liveSeq = Number(source?.seq ?? normalized?.seq);
         if (Number.isFinite(liveSeq) && liveSeq > 1 && normalized.chatId) {
@@ -3408,7 +3626,19 @@ export function RealtimeChatProvider({ children }) {
           // the receiver opens the chat later (loaded back from SQLite payload).
           statusRef,
           statusPreview,
-        }).then(async () => {
+        }).then(async (r) => {
+          // Row is durable — NOW tell the sender it was delivered (never for
+          // our own echo). Not awaited by the UI dispatch above. A row the
+          // write reported failed (or a sealed write) gets no receipt (A-02):
+          // the cursor stays below it, so catch-up redelivers and acks it.
+          if (!isSelf && r !== undefined && !(r?.failedIds?.length)) {
+            emitDeliveryReceipt({
+              isGroup: false,
+              messageId: msgId,
+              chatId: normalized.chatId,
+              senderId: normalized.senderId,
+            });
+          }
           // [3] Write landed — report how many rows this chatId now holds in SQLite.
           if (DEBUG_MSG_STORE) {
             try {
@@ -3493,20 +3723,56 @@ export function RealtimeChatProvider({ children }) {
       const source = unwrapPayload(payload);
       const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat || source?.data?.chatId || null);
       const messageId = normalizeId(source?.messageId || source?._id || source?.data?.messageId || source?.data?._id || null);
+      const messageIds = Array.isArray(source?.messageIds) ? source.messageIds : null;
       const status = normalizeMessageDeliveryStatus(source?.status || fallbackStatus);
       if (!chatId || !status) return;
 
       dispatch({
         type: 'UPDATE_LAST_MESSAGE_STATUS',
-        payload: { chatId, status, messageId },
+        payload: { chatId, status, messageId, messageIds, upToSeq: Number(source?.readUpToSeq) || null },
       });
 
       // Persist the bump to SQLite chat list so the tick survives reload.
       // Only updates when the row's last_message_id matches — prevents an ack
       // for an older message from overwriting a newer last-message.
-      if (messageId) {
-        ChatDatabase.updateChatLastMessageStatusById(chatId, messageId, status).catch(() => {});
+      // A batch receipt names several ids; the stored last_message_id is
+      // whichever alias the row was written with, so try each until one matches.
+      const persistIds = [messageId, ...((messageIds || []).map((m) => normalizeId(m)))].filter(Boolean);
+      if (persistIds.length) {
+        (async () => {
+          for (const id of [...new Set(persistIds.map(String))]) {
+            if (await ChatDatabase.updateChatLastMessageStatusById(chatId, id, status).catch(() => false)) return;
+          }
+        })();
       }
+    };
+
+    // Persist a peer receipt onto SQLite message ROWS from the global layer, so
+    // delivered/seen survive when no thread is mounted (UCL handlers only run
+    // while a thread is open). Monotonic via the CDB status coalescer
+    // (sent -> delivered -> seen, never backwards).
+    const persistPeerReceipt = (payload, status) => {
+      try {
+        const source = unwrapPayload(payload);
+        const ids = [];
+        if (source?.messageId) ids.push(source.messageId);
+        if (Array.isArray(source?.messageIds)) ids.push(...source.messageIds);
+        const clean = ids.map((i) => normalizeId(i)).filter(Boolean);
+        if (clean.length) {
+          clean.forEach((id) => { ChatDatabase.updateMessageStatus(String(id), status).catch(() => {}); });
+          return;
+        }
+        // Bulk-by-chat read: bounded (M-09) — seq, else the event's timestamp,
+        // else the stored peer watermark (inside CDB). Never unbounded.
+        const chatId = normalizeId(source?.chatId || source?.roomId || source?.chat);
+        if (status === 'seen' && chatId) {
+          // seq only — an ack's own timestamp is "now" and covers unseen messages
+          const seq = Number(source?.readUpToSeq);
+          ChatDatabase.updateAllSentMessagesInChatToSeen(chatId, currentUserIdRef.current, {
+            upToSeq: seq > 0 ? seq : undefined,
+          }).catch(() => {});
+        }
+      } catch (_) { /* best-effort */ }
     };
 
     const onMessageRead = (payload) => {
@@ -3521,14 +3787,19 @@ export function RealtimeChatProvider({ children }) {
       }
       // Only update last message status to 'read' if a peer triggered it
       if (readerId && String(readerId) !== String(currentUserIdRef.current)) {
+        persistPeerReceipt(payload, 'seen');
         dispatchLastMessageStatusUpdate(payload, 'read');
       }
     };
-    const onMessageDelivered = (payload) => dispatchLastMessageStatusUpdate(payload, 'delivered');
+    const onMessageDelivered = (payload) => {
+      persistPeerReceipt(payload, 'delivered');
+      dispatchLastMessageStatusUpdate(payload, 'delivered');
+    };
     const onMessageReadBulk = (payload) => {
       const source = unwrapPayload(payload);
       const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+      persistPeerReceipt(payload, 'seen');
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageReadBulkResponse = (payload) => {
@@ -3541,12 +3812,14 @@ export function RealtimeChatProvider({ children }) {
       const source = unwrapPayload(payload);
       const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+      persistPeerReceipt(payload, 'seen');
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onMessageSeen = (payload) => {
       const source = unwrapPayload(payload);
       const readerId = source?.readerId || source?.senderId || source?.readBy || source?.userId;
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+      persistPeerReceipt(payload, 'seen');
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
     const onPresence = (payload) => handlePresenceUpdate(payload);
@@ -3878,6 +4151,7 @@ export function RealtimeChatProvider({ children }) {
 
     // Handle message:delivered:response — update last message status in chat list
     const onMessageDeliveredResponse = (payload) => {
+      persistPeerReceipt(payload, 'delivered');
       dispatchLastMessageStatusUpdate(payload, 'delivered');
     };
 
@@ -3895,6 +4169,7 @@ export function RealtimeChatProvider({ children }) {
         if (chatId) dispatch({ type: 'MARK_READ', payload: chatId });
         return;
       }
+      persistPeerReceipt(payload, 'seen');
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
 
@@ -3906,6 +4181,7 @@ export function RealtimeChatProvider({ children }) {
       // no readerId (or our own id) must not bump the tick — it's the echo of our
       // own chat-open read, not the peer actually seeing the message.
       if (!readerId || String(readerId) === String(currentUserIdRef.current)) return;
+      persistPeerReceipt(payload, 'seen');
       dispatchLastMessageStatusUpdate(payload, 'read');
     };
 
@@ -3916,6 +4192,9 @@ export function RealtimeChatProvider({ children }) {
       const newText = source?.text || source?.newText;
       const chatId = normalizeId(source?.chatId);
       if (!messageId || !chatId || !newText) return;
+
+      // P-A-05: refresh the displayed notification line in place (Android).
+      try { require('../firebase/fcmService').refreshEditedMessageNotification(chatId, messageId, newText); } catch (_) { /* */ }
 
       // Queue as a message_edited chat list update so it goes through the reducer
       onChatListUpdate({
@@ -4008,7 +4287,7 @@ export function RealtimeChatProvider({ children }) {
       );
       if (ackClientId) {
         if (messageId && messageId !== ackClientId) {
-          ChatDatabase.acknowledgeMessage(ackClientId, messageId).catch(() => {});
+          ChatDatabase.acknowledgeMessage(ackClientId, messageId, source?.seq ?? source?.data?.seq).catch(() => {});
         }
         ChatDatabase.updateMessageStatus(messageId || ackClientId, 'sent').catch(() => {});
         ChatDatabase.outboxRemove(ackClientId).catch(() => {});
@@ -4143,8 +4422,50 @@ export function RealtimeChatProvider({ children }) {
       socket.on('disconnect', onDrop);
     });
 
+    // Single-flight (A-12): triggers (connect, foreground, network-regain, auth
+    // retry) arriving while a run is in flight set `catchupAgain` instead of
+    // starting a concurrent run — concurrent rounds used to share the
+    // `message:sync:catchup:response` event and could consume each other's reply.
+    let catchupInFlight = false;
+    let catchupAgain = false;
+    let authRetryArmed = false;
+    // Auth wait timed out (15s) while still connected: run again the moment
+    // 'authenticated' fires (event-driven, no timer).
+    const onAuthRetry = () => {
+      authRetryArmed = false;
+      try { socket.off('authenticated', onAuthRetry); } catch {}
+      onConnectCatchup();
+    };
+    // Last delivered watermark announced per chat (A-10); persisted in sync_meta
+    // so a restart does not re-announce every chat.
+    const deliveredWmSent = new Map();
+    let deliveredWmUser = null;
+
     const onConnectCatchup = async () => {
-      if (!(await waitForSocketAuth())) return;
+      if (catchupInFlight) { catchupAgain = true; return; }
+      catchupInFlight = true;
+      try {
+        await runCatchupOnce();
+      } catch (_) {
+        // Best-effort — catchup is a non-essential reconciliation path.
+      } finally {
+        catchupInFlight = false;
+        if (catchupAgain) { catchupAgain = false; onConnectCatchup(); }
+      }
+    };
+
+    const runCatchupOnce = async () => {
+      if (!(await waitForSocketAuth())) {
+        if (socket.connected && !authRetryArmed) {
+          authRetryArmed = true;
+          socket.on('authenticated', onAuthRetry);
+        }
+        return;
+      }
+      // A-15: the account this run belongs to. An account switch mid-run stops
+      // dispatches, receipts and cursor writes (writes are sealed separately).
+      const runUser = currentUserIdRef.current || getCurrentUserId() || null;
+      const sameRun = () => !runUser || String(currentUserIdRef.current || getCurrentUserId() || '') === String(runUser);
       // The list reconcile runs in PARALLEL — never ahead of the message
       // catch-up. `chat:list` measured 27s server-side (2026-09-25) while the
       // catch-up round answers in <1s; awaiting it first (20s timeout) meant a
@@ -4160,142 +4481,287 @@ export function RealtimeChatProvider({ children }) {
         const callSignals = require('../calls/services/callSignalService');
         callSignals.pullPendingCalls?.().catch?.(() => {});
       } catch (_) { /* calls module absent — non-fatal */ }
-      try {
-        // Source the chat list from BOTH the persistent DB and the live in-memory
-        // map (via stateRef — NOT the stale `state` captured when this effect was
-        // set up, which is empty/partial on a cold reopen). The DB list is
-        // available immediately on cold start, before the in-memory chatMap has
-        // finished loading, closing the race that left some chats un-synced — the
-        // "missed messages sometimes don't appear on reopen" bug.
-        let dbChatIds = [];
-        try { dbChatIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
-        const memChatIds = Object.keys(stateRef.current?.chatMap || {});
-        const knownChatIds = Array.from(new Set([...dbChatIds, ...memChatIds]));
 
-        // Gather { chatId, lastSeq, mutatedSince } per chat.
-        const entriesFor = (ids) => Promise.all(ids.map(async (chatId) => {
-          try {
-            const lastSeq = await ChatDatabase.getLatestSeq(chatId);
-            const mutatedSince = await _getMutationCursor(chatId);
-            return { chatId, lastSeq, ...(mutatedSince > 0 ? { mutatedSince } : {}) };
-          } catch { return { chatId, lastSeq: 0 }; }
-        }));
+      // Source the chat list from BOTH the persistent DB and the live in-memory
+      // map (via stateRef — NOT the stale `state` captured when this effect was
+      // set up, which is empty/partial on a cold reopen). The DB list is
+      // available immediately on cold start, before the in-memory chatMap has
+      // finished loading, closing the race that left some chats un-synced — the
+      // "missed messages sometimes don't appear on reopen" bug.
+      let dbChatIds = [];
+      try { dbChatIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
+      const memChatIds = Object.keys(stateRef.current?.chatMap || {});
+      const knownChatIds = Array.from(new Set([...dbChatIds, ...memChatIds]));
 
-        // One catch-up round-trip. Resolves from EITHER the Socket.IO ack
-        // callback (servers that honor it) or the `message:sync:catchup:response`
-        // event (the wrapHandler convention) — older servers NEVER invoked the
-        // ack callback, which silently killed this entire reconnect catch-up
-        // path (messages that arrived while the app was killed only surfaced
-        // on the next per-chat open). Whichever arrives first wins.
-        const emitCatchupRound = (entriesArg) => new Promise((resolve) => {
-          let settled = false;
-          const finish = (response) => {
-            if (settled) return;
-            settled = true;
-            try { socket.off('message:sync:catchup:response', finish); } catch {}
-            clearTimeout(timer);
-            const payload = response?.data || response || {};
-            resolve(Array.isArray(payload?.chats) ? payload.chats : null);
-          };
-          const timer = setTimeout(() => finish(null), 20000);
-          socket.on('message:sync:catchup:response', finish);
-          socket.emit('message:sync:catchup', { chats: entriesArg }, finish);
-        });
+      // Gather { chatId, lastSeq, mutatedSince } per chat. The mutation cursor is
+      // ALWAYS sent (A-04): stored value, else a seed derived from the oldest
+      // local message (see deriveMutationSeed); only a chat with no local rows
+      // has nothing to mutate and omits it.
+      const entriesFor = (ids) => Promise.all(ids.map(async (chatId) => {
+        try {
+          const lastSeq = await ChatDatabase.getLatestSeq(chatId);
+          const stored = await _getMutationCursor(chatId);
+          const oldestLocalTs = stored > 0 ? 0 : await ChatDatabase.getOldestMessageTimestamp(chatId);
+          const mutatedSince = deriveMutationSeed({ stored, oldestLocalTs });
+          return { chatId, lastSeq, ...(mutatedSince > 0 ? { mutatedSince } : {}) };
+        } catch { return { chatId, lastSeq: 0 }; }
+      }));
 
-        const processCatchupChats = async (chats) => {
-          for (const entry of chats) {
-            if (!entry || !entry.chatId) continue;
-            const newMessages = Array.isArray(entry.newMessages) ? entry.newMessages : [];
-
-            // Persist through the writer queue — serialized, never races —
-            // and acknowledge: the catch-up is how an offline device receives.
-            if (newMessages.length > 0) {
-              await persistServerMessages(newMessages, entry.chatId);
+      // One catch-up round-trip. Resolves from EITHER the Socket.IO ack
+      // callback (servers that honor it) or the `message:sync:catchup:response`
+      // event (the wrapHandler convention) — older servers NEVER invoked the
+      // ack callback, which silently killed this entire reconnect catch-up
+      // path (messages that arrived while the app was killed only surfaced
+      // on the next per-chat open). Whichever arrives first wins. Because the
+      // run is single-flight there is one request in flight; the event path
+      // additionally ignores a reply that names chats we did not ask for.
+      // Resolves { chats, truncated, skippedChatIds } or null (timeout/error).
+      const emitCatchupRound = (entriesArg) => new Promise((resolve) => {
+        let settled = false;
+        const asked = new Set(entriesArg.map((e) => e.chatId));
+        const finish = (response, viaEvent) => {
+          const payload = response?.data || response || {};
+          if (viaEvent && Array.isArray(payload?.chats) && !payload.chats.every((c) => !c || asked.has(c.chatId))) return;
+          if (settled) return;
+          settled = true;
+          try { socket.off('message:sync:catchup:response', onEvent); } catch {}
+          clearTimeout(timer);
+          resolve(Array.isArray(payload?.chats)
+            ? {
+              chats: payload.chats,
+              truncated: payload.truncated === true,
+              skippedChatIds: Array.isArray(payload.skippedChatIds) ? payload.skippedChatIds.map(String) : [],
             }
+            : null);
+        };
+        const onEvent = (r) => finish(r, true);
+        const timer = setTimeout(() => finish(null, false), 20000);
+        socket.on('message:sync:catchup:response', onEvent);
+        socket.emit('message:sync:catchup', { chats: entriesArg }, (r) => finish(r, false));
+      });
 
-            // Mutation delta — edits/deletes applied to already-stored messages
-            // while we were away. Idempotent absolute-value writes, then advance
-            // the per-chat mutation cursor.
-            const mutated = Array.isArray(entry.mutatedMessages) ? entry.mutatedMessages : [];
-            if (mutated.length > 0) {
-              const myId = currentUserIdRef.current;
-              for (const doc of mutated) {
-                let kind = null;
-                try { kind = await _applyMutatedDoc(doc, myId); } catch {}
-                // Only re-dispatch edits into the chat map; deletes must not
-                // resurrect a removed row in the list.
-                if (kind === 'edit') {
-                  const n = normalizeMessagePayload({ ...doc, chatId: doc.chatId || entry.chatId });
-                  dispatch({ type: 'INCOMING_MESSAGE', payload: n });
-                }
+      // Apply one round's per-chat results. Resolves { aborted, stats } where
+      // stats[chatId] = { failed } (rows not committed locally).
+      const processCatchupChats = async (chats) => {
+        const stats = {};
+        for (const entry of chats) {
+          if (!entry || !entry.chatId) continue;
+          if (!sameRun()) return { aborted: true, stats };
+          const newMessages = Array.isArray(entry.newMessages) ? entry.newMessages : [];
+          let failed = 0;
+
+          // Persist through the writer queue — serialized, never races —
+          // and acknowledge only what committed: the catch-up is how an offline
+          // device receives.
+          if (newMessages.length > 0) {
+            const r = await persistServerMessages(newMessages, entry.chatId, runUser);
+            if (r.aborted) return { aborted: true, stats };
+            failed = r.failed;
+          }
+          stats[entry.chatId] = { failed };
+
+          // Mutation delta — edits/deletes applied to already-stored messages
+          // while we were away. Idempotent absolute-value writes, then advance
+          // the per-chat mutation cursor (only when every doc applied).
+          const mutated = Array.isArray(entry.mutatedMessages) ? entry.mutatedMessages : [];
+          let mutErr = false;
+          if (mutated.length > 0) {
+            const myId = currentUserIdRef.current;
+            for (const doc of mutated) {
+              let kind = null;
+              try { kind = await _applyMutatedDoc(doc, myId); } catch { mutErr = true; }
+              // Only re-dispatch edits into the chat map; deletes must not
+              // resurrect a removed row in the list.
+              if (kind === 'edit') {
+                const n = normalizeMessagePayload({ ...doc, chatId: doc.chatId || entry.chatId });
+                dispatch({ type: 'INCOMING_MESSAGE', payload: n });
               }
             }
-            if (Number(entry.latestMutationAt) > 0) {
-              _setMutationCursor(entry.chatId, entry.latestMutationAt);
-            }
+          }
+          if (mutErr) entry.hasMoreMutations = false; // cursor held; next trigger retries
+          else if (Number(entry.latestMutationAt) > 0) {
+            await _setMutationCursor(entry.chatId, entry.latestMutationAt);
+          }
 
-            // Peer's read watermark — drives our outgoing-message ticks.
-            if (entry.peerReadUpToSeq) {
-              ChatDatabase.setPeerReadWatermark(entry.chatId, entry.peerReadUpToSeq, entry.peerReadUpToSeq).catch(() => {});
-            }
-
-            // Peer's chat-cleared timestamp — replay durable cleanup if
-            // we missed the live event.
-            if (entry.peerClearedAt) {
-              try {
-                const localClearedAt = (await ChatDatabase.getClearedAt(entry.chatId)) || 0;
-                if (entry.peerClearedAt > localClearedAt) {
-                  await performDurableChatClear(entry.chatId, { clearedAt: entry.peerClearedAt });
-                }
-              } catch {}
+          // Own group messages that reached delivered/read while we were away
+          // (A-11). Forward-only: updateMessageStatus never downgrades.
+          if (Array.isArray(entry.ownMessageStatuses)) {
+            for (const o of entry.ownMessageStatuses) {
+              const st = forwardOnlyStatus('sent', o?.status);
+              if (!o?.messageId || !st) continue;
+              ChatDatabase.updateMessageStatus(String(o.messageId), st === 'read' ? 'seen' : st).catch(() => {});
             }
           }
-        };
 
-        // Continuation loop: the server caps each round at 200 messages per
-        // chat and flags the overflow with { hasMore, latestSeq }. Re-issue
-        // only the overflowing chats with the advanced cursor so a large
-        // offline backlog fully converges (bounded to keep a hostile/buggy
-        // server from looping us forever).
-        const runCatchup = async (ids) => {
-          if (!ids.length) return;
-          let pending = await entriesFor(ids);
-          for (let round = 0; round < 10 && pending.length > 0; round += 1) {
-            const chats = await emitCatchupRound(pending);
-            if (!chats) break; // timeout / old server — per-chat message:sync remains the fallback
-            await processCatchupChats(chats);
-            pending = chats
-              .filter((c) => c && c.chatId && c.hasMore === true && Number(c.latestSeq) > 0)
-              .map((c) => ({ chatId: c.chatId, lastSeq: Number(c.latestSeq) }));
+          // Peer's read watermark — drives our outgoing-message ticks.
+          if (entry.peerReadUpToSeq) {
+            // Delivered watermark comes from its own field; fall back to the
+            // read seq only for servers that predate peerDeliveredUpToSeq
+            // (read implies delivered, so the fallback is never wrong).
+            const _peerDelSeq = Number(entry.peerDeliveredUpToSeq) || entry.peerReadUpToSeq;
+            ChatDatabase.setPeerReadWatermark(entry.chatId, entry.peerReadUpToSeq, _peerDelSeq).catch(() => {});
+            ChatDatabase.applyPeerWatermarkToOwnMessages(
+              entry.chatId, currentUserIdRef.current, entry.peerReadUpToSeq, _peerDelSeq,
+            ).then(() => applyWatermarkToChatList(entry.chatId, entry.peerReadUpToSeq, _peerDelSeq)).catch(() => {});
           }
-        };
-        await runCatchup(knownChatIds);
 
-        // Holes BELOW the max seq: the catch-up above only asks "since
-        // MAX(seq)", so a message lost before a later one arrived (see
-        // fillSeqGap) stays missing forever. One range fetch per 1:1 chat per
-        // session — the server has holes of its own, so never retry a range.
-        for (const chatId of knownChatIds) {
-          if (!String(chatId).startsWith('u_') || seqHolesChecked.has(chatId)) continue;
-          seqHolesChecked.add(chatId);
+          // Peer's chat-cleared timestamp — replay durable cleanup if
+          // we missed the live event.
+          if (entry.peerClearedAt) {
+            try {
+              const localClearedAt = (await ChatDatabase.getClearedAt(entry.chatId)) || 0;
+              if (entry.peerClearedAt > localClearedAt) {
+                await performDurableChatClear(entry.chatId, { clearedAt: entry.peerClearedAt });
+              }
+            } catch {}
+          }
+        }
+        return { aborted: false, stats };
+      };
+
+      // Fresh chat (nothing local, lastSeq 0): the catch-up scan is ascending, so
+      // it would hand back the OLDEST 200 and leave the thread without its head
+      // (A-07). Bootstrap the NEWEST page with message:history instead — older
+      // history is walked by the existing backward backfill — then the chat joins
+      // the normal catch-up with a real cursor (watermarks, clears, mutations).
+      const bootstrapNewestPage = (chatId) => new Promise((resolve) => {
+        let settled = false;
+        const done = (response) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          const data = response?.data || response || {};
+          resolve(Array.isArray(data?.messages) ? data.messages : null);
+        };
+        const timer = setTimeout(() => done(null), 12000);
+        try { socket.emit('message:history', { chatId, beforeSeq: null, limit: 50 }, done); } catch { done(null); }
+      }).then(async (msgs) => {
+        if (!msgs || !msgs.length) return;
+        await persistServerMessages(msgs, chatId, runUser);
+      });
+
+      // One chunk of chats: bounded continuation loop. The server caps each
+      // round at 200 messages per chat and flags the overflow with
+      // { hasMore, latestSeq }. The next cursor comes from what is COMMITTED
+      // locally (A-03); a chat whose cursor did not advance stops, so the next
+      // trigger retries the same cursor. Bounded to 10 rounds.
+      const failedChats = new Set();
+      const runChunk = async (idChunk) => {
+        let pending = await entriesFor(idChunk);
+        const fresh = pending.filter((e) => !(e.lastSeq > 0));
+        if (fresh.length) {
+          for (let i = 0; i < fresh.length; i += 5) {
+            if (!sameRun()) return;
+            await Promise.all(fresh.slice(i, i + 5).map((e) => bootstrapNewestPage(e.chatId).catch(() => {})));
+          }
+          const bootstrapped = await entriesFor(fresh.map((e) => e.chatId));
+          const byId = new Map(bootstrapped.map((e) => [e.chatId, e]));
+          // Still no cursor -> leave it out this run (retried next trigger)
+          // rather than fall back to the oldest-first window.
+          pending = pending.map((e) => byId.get(e.chatId) || e).filter((e) => e.lastSeq > 0 || !fresh.includes(e));
+        }
+        for (let round = 0; round < 10 && pending.length > 0; round += 1) {
+          if (!sameRun()) return;
+          const sentCursor = {};
+          const entriesById = {};
+          pending.forEach((e) => { sentCursor[e.chatId] = e.lastSeq; entriesById[e.chatId] = e; });
+          const resp = await emitCatchupRound(pending);
+          if (!resp) break; // timeout / old server — per-chat message:sync remains the fallback
+          const { aborted, stats } = await processCatchupChats(resp.chats);
+          if (aborted) return;
+          const localMax = {};
+          for (const c of resp.chats) {
+            if (!c || !c.chatId) continue;
+            const failed = stats[c.chatId]?.failed || 0;
+            if (failed > 0) { failedChats.add(c.chatId); seqHoleRecheck.add(c.chatId); }
+            const local = Number(await ChatDatabase.getLatestSeq(c.chatId)) || 0;
+            // No failed row: the server's latestSeq is safe; any failure holds at
+            // the local committed max (see effectiveLocalMax).
+            localMax[c.chatId] = effectiveLocalMax({ failed, local, latestSeq: c.latestSeq });
+          }
+          pending = continuationEntries(resp.chats, localMax, sentCursor);
+          // Server truncated the request (its per-request chat cap): re-request
+          // the skipped chats in the next round (A-06).
+          if (resp.truncated) pending = pending.concat(followUpEntries(resp, entriesById));
+        }
+      };
+
+      // Chunk by recency (A-06): <=100 chats per request, most recently active
+      // first, sequential rounds so a big account neither exceeds the server's
+      // 200-chat cap nor delays the chats the user is actually looking at.
+      const runCatchup = async (ids) => {
+        if (!ids.length) return;
+        const activity = await ChatDatabase.getChatActivityMap();
+        const ordered = orderChatIdsByActivity(ids, activity);
+        for (const idChunk of chunk(ordered, CATCHUP_CHUNK_SIZE)) {
+          if (!sameRun()) return;
+          await runChunk(idChunk);
+        }
+      };
+
+      // Re-announce a delivered watermark (A-10): an ACK lost to a kill, a
+      // dropped frame or a push-only arrival left the sender on one tick. For
+      // every chat whose local committed max seq is above the last watermark we
+      // announced, send the existing message:read:upto with deliveredUpToSeq
+      // ONLY (never read). Skips chats that failed to commit rows this run.
+      const announceDeliveredWatermarks = async (ids) => {
+        if (deliveredWmUser !== String(runUser || '')) { deliveredWmSent.clear(); deliveredWmUser = String(runUser || ''); }
+        for (const chatId of ids) {
+          if (!sameRun() || !isSocketConnected()) return;
+          if (!chatId || failedChats.has(chatId)) continue;
           try {
-            const hole = await ChatDatabase.getRecentSeqHole(chatId);
-            if (hole) fillSeqGap(chatId, hole[0], hole[1]);
+            const local = Number(await ChatDatabase.getLatestSeq(chatId)) || 0;
+            if (!(local > 0)) continue;
+            let last = deliveredWmSent.get(chatId);
+            if (last == null) {
+              last = Number(await ChatDatabase.getSyncMeta(`dlv_wm:${chatId}`)) || 0;
+              deliveredWmSent.set(chatId, last);
+            }
+            const send = deliveredWatermarkToSend(local, last);
+            if (!send) continue;
+            emitSocketEvent('message:read:upto', { chatId, deliveredUpToSeq: send });
+            deliveredWmSent.set(chatId, send);
+            ChatDatabase.setSyncMeta(`dlv_wm:${chatId}`, send).catch(() => {});
           } catch { /* best-effort */ }
         }
+      };
 
-        // Chats the list reconcile just introduced (created while offline).
-        await listReconciled;
-        let laterDbIds = [];
-        try { laterDbIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
-        const known = new Set(knownChatIds);
-        const newChatIds = Array.from(new Set([
-          ...laterDbIds, ...Object.keys(stateRef.current?.chatMap || {}),
-        ])).filter((id) => id && !known.has(id));
-        await runCatchup(newChatIds);
-      } catch (err) {
-        // Best-effort — catchup is a non-essential reconciliation path.
+      await runCatchup(knownChatIds);
+
+      // Reads requested from a notification's "Mark as read" while the socket
+      // was down / the app was killed: the pushed messages are in SQLite now, so
+      // emit the real read receipts (idempotent on the server).
+      try { require('../firebase/messageNotificationActions').flushPendingNotificationReads(); } catch (_) { /* */ }
+
+      // Holes BELOW the max seq: the catch-up above only asks "since
+      // MAX(seq)", so a message lost before a later one arrived (see
+      // fillSeqGap) stays missing forever. One range fetch per chat (1:1 and
+      // group) per session — the server has holes of its own, so never retry a range.
+      for (const chatId of knownChatIds) {
+        if (!sameRun()) return;
+        // A chat that had a row fail to commit is re-checked on EVERY trigger
+        // (wider window) until its hole is gone, not once per process.
+        const recheck = seqHoleRecheck.has(chatId);
+        if (seqHolesChecked.has(chatId) && !recheck) continue;
+        seqHolesChecked.add(chatId);
+        try {
+          const hole = await ChatDatabase.getRecentSeqHole(chatId, recheck ? 300 : 60);
+          if (hole) fillSeqGap(chatId, hole[0], hole[1]);
+          else seqHoleRecheck.delete(chatId);
+        } catch { /* best-effort */ }
       }
+      await announceDeliveredWatermarks(knownChatIds);
+
+      // Chats the list reconcile just introduced (created while offline).
+      await listReconciled;
+      let laterDbIds = [];
+      try { laterDbIds = await ChatDatabase.getAllChatIds(); } catch (_) {}
+      const known = new Set(knownChatIds);
+      const newChatIds = Array.from(new Set([
+        ...laterDbIds, ...Object.keys(stateRef.current?.chatMap || {}),
+      ])).filter((id) => id && !known.has(id));
+      await runCatchup(newChatIds);
+      await announceDeliveredWatermarks(newChatIds);
     };
     socket.on('connect', onConnectCatchup);
     if (socket.connected) onConnectCatchup();
@@ -4416,7 +4882,17 @@ export function RealtimeChatProvider({ children }) {
       if (!chatId) return;
       const readUpTo = Number(data?.readUpToSeq) || 0;
       const delUpTo  = Number(data?.deliveredUpToSeq) || 0;
+      // Our own echo (readerId === me) is OUR read, never the peer's watermark:
+      // storing it would blue our outgoing ticks for messages nobody read.
+      const _wmReader = data?.readerId || data?.userId;
+      const _wmIsOwnEcho = Boolean(_wmReader) && String(_wmReader) === String(currentUserIdRef.current);
+      if (_wmIsOwnEcho) return;
       ChatDatabase.setPeerReadWatermark(chatId, readUpTo, delUpTo).catch(() => {});
+      // Persist onto our own outgoing ROWS (monotonic) so ticks survive without
+      // a mounted thread.
+      ChatDatabase.applyPeerWatermarkToOwnMessages(chatId, currentUserIdRef.current, readUpTo, delUpTo)
+        .then(() => applyWatermarkToChatList(chatId, readUpTo, delUpTo))
+        .catch(() => {});
       // Tell the in-memory reducer too so open chat lists redraw ticks now.
       dispatch({
         type: 'APPLY_CHAT_LIST_UPDATES',
@@ -4606,14 +5082,10 @@ export function RealtimeChatProvider({ children }) {
         },
       });
 
-      // Send delivery receipt for incoming group messages from other members.
-      if (resolvedMessageId && !isSelf && !isSystemMsg) {
-        emitDeliveryReceipt({
-          isGroup: true,
-          messageId: resolvedMessageId,
-          groupId,
-        });
-      }
+      // Delivery receipt is emitted AFTER the row is persisted (see the upsert
+      // .then below): "delivered" must mean "stored on this device". On a
+      // failed write nothing is emitted, so the server still counts it
+      // undelivered and reconnect catch-up redelivers it.
 
       // Persist to SQLite so messages are available when ChatScreen opens later
       if (resolvedMessageId && !isSelf) {
@@ -4642,6 +5114,20 @@ export function RealtimeChatProvider({ children }) {
           }
         }
 
+        // Seq gap check for groups (A-16) — read the local max BEFORE this row is written.
+        {
+          const liveGrpSeq = Number(data?.seq);
+          const gapChat = chatId || groupId;
+          if (Number.isFinite(liveGrpSeq) && liveGrpSeq > 1 && gapChat) {
+            ChatDatabase.getLatestSeq(gapChat)
+              .then((localMax) => {
+                const max = Number(localMax) || 0;
+                if (max > 0 && liveGrpSeq > max + 1) fillSeqGap(gapChat, max + 1, liveGrpSeq - 1);
+              })
+              .catch(() => {});
+          }
+        }
+
         ChatDatabase.upsertMessage({
           id: resolvedMessageId,
           serverMessageId: resolvedMessageId,
@@ -4651,6 +5137,8 @@ export function RealtimeChatProvider({ children }) {
           mongoId: data?._id ? normalizeId(data._id) : null,
           clientMessageId: data?.clientMessageId || data?.clientId || null,
           tempId: data?.tempId || null,
+          // A-05: persist the server seq so getLatestSeq() advances for groups too.
+          seq: (data?.seq != null && !Number.isNaN(Number(data.seq))) ? Number(data.seq) : null,
           chatId: chatId || groupId,
           groupId: groupId || chatId,
           senderId,
@@ -4695,6 +5183,11 @@ export function RealtimeChatProvider({ children }) {
           replyPreviewThumbnail: replyPreviewThumbnail || null,
           contact: data?.contact ? JSON.stringify(data.contact) : null,
           forwardedFrom: data?.forwardedFrom || null,
+        }).then((r) => {
+          // Receipt only for a row that really committed (A-02).
+          if (!isSystemMsg && !(r?.failedIds?.length) && r !== undefined) {
+            emitDeliveryReceipt({ isGroup: true, messageId: resolvedMessageId, groupId });
+          }
         }).catch(() => {});
 
         // Save reply data to permanent reply table
@@ -4754,6 +5247,9 @@ export function RealtimeChatProvider({ children }) {
 
       const isEveryoneDel = Boolean(source?.deleteForEveryone);
       if (!isEveryoneDel) return;
+
+      // P-A-05: the deleted message must leave the tray too.
+      try { require('../firebase/fcmService').dismissDeletedMessageNotification(chatId, messageId); } catch (_) { /* */ }
 
       const deletedBy = normalizeId(source?.deletedBy || source?.senderId || source?.userId);
       const placeholderText = deletedBy && deletedBy === stateRef.current?.currentUserId
@@ -5314,7 +5810,122 @@ export function RealtimeChatProvider({ children }) {
     };
     socket.on('group:message:media:updated', onGroupMediaUpdated);
 
+    // ─── GROUP per-message receipts (T-A-04) ──────────────────────────────
+    // These used to be consumed ONLY by the open thread, so a group sender with
+    // the thread closed kept grey ticks / empty "delivered to" lists until the
+    // next catch-up. Persist from the global layer, forward-only, for rows WE
+    // sent (see ChatDatabase.applyGroupReceipt). The tick follows the server's
+    // all-recipients aggregate; one member's receipt alone never advances it.
+    const groupAggregateOf = (source, mid) => {
+      const fromBulk = source?.aggregateStatuses?.[String(mid)];
+      const agg = source?.aggregate;
+      return fromBulk || (agg?.allRead ? 'read' : (agg?.allDelivered ? 'delivered' : null));
+    };
+    const persistGroupReceipt = (payload, kind) => {
+      try {
+        const me = currentUserIdRef.current;
+        const source = unwrapPayload(payload);
+        if (!me || !source) return;
+        const rawIds = Array.isArray(source.messageIds) && source.messageIds.length
+          ? source.messageIds : [source.messageId];
+        const ids = rawIds.map((i) => normalizeId(i)).filter(Boolean).map(String);
+        if (!ids.length) return;
+        const userId = normalizeId(kind === 'read'
+          ? (source.userId || (typeof source.readBy === 'string' ? source.readBy : null))
+          : (source.userId || (typeof source.deliveredTo === 'string' ? source.deliveredTo : null)));
+        // Our own read/delivered echo is not a member's receipt.
+        if (userId && String(userId) === String(me)) return;
+        const at = kind === 'read' ? source.readAt : source.deliveredAt;
+        // Per-id aggregate (bulk read map) when present, else the single one.
+        const byAgg = new Map();
+        ids.forEach((mid) => {
+          const a = groupAggregateOf(source, mid) || null;
+          const key = a || '';
+          if (!byAgg.has(key)) byAgg.set(key, []);
+          byAgg.get(key).push(mid);
+        });
+        byAgg.forEach((list, a) => {
+          ChatDatabase.applyGroupReceipt({
+            messageIds: list, myUserId: me, userId, kind, at, aggregateStatus: a || null,
+          }).catch(() => {});
+        });
+      } catch (_) { /* best-effort */ }
+    };
+    const onGroupReceiptDelivered = (payload) => persistGroupReceipt(payload, 'delivered');
+    const onGroupReceiptRead = (payload) => persistGroupReceipt(payload, 'read');
+    const GROUP_DELIVERED_EVENTS = ['group:message:delivered:update', 'group:message:delivered', 'group:message:delivered:receipt'];
+    const GROUP_READ_EVENTS = ['group:message:read:update', 'group:message:read'];
+    GROUP_DELIVERED_EVENTS.forEach((ev) => socket.on(ev, onGroupReceiptDelivered));
+    GROUP_READ_EVENTS.forEach((ev) => socket.on(ev, onGroupReceiptRead));
+
+    // ─── MULTI-DEVICE status mirror (T-A-05) ──────────────────────────────
+    // Server shapes (chat.handler.js via multiDeviceSync.service):
+    //  a) per-message: messageStatusService.updateStatus() result
+    //     { messageId, chatId, userId (who reported it), status, effectiveStatus,
+    //       aggregate, skipped? } -> sender's devices AND the reporter's other devices
+    //  b) bulk read mirror: { chatId, status:'read', readerId, timestamp }
+    //     -> the reader's other devices (clear unread) / the sender's devices
+    //  c) bulk delivered: { chatId, status:'delivered', receiverId } (no ids)
+    // Forward-only, same paths as the live per-message events. Bulk shapes without
+    // ids never raise a peer tick (no proof which messages they cover).
+    const onNotificationStatusUpdate = (payload) => {
+      try {
+        const me = currentUserIdRef.current;
+        const source = unwrapPayload(payload);
+        if (!me || !source || source.skipped) return;
+        const chatId = normalizeId(source.chatId || source.roomId);
+        if (!chatId) return;
+        const status = String(source.status || '').toLowerCase();
+        const messageId = normalizeId(source.messageId);
+        const readerId = normalizeId(source.readerId);
+        if (status === 'read' || status === 'seen') {
+          // Read on ANOTHER of my devices: clear unread here.
+          if (readerId && String(readerId) === String(me) && !messageId) {
+            dispatch({ type: 'MARK_READ', payload: chatId });
+            ChatDatabase.updateChatUnread(chatId, 0)
+              .then(() => { try { require('../firebase/appBadge').syncAppBadge(); } catch (_) { /* */ } })
+              .catch(() => {});
+            // P-A-05: read on another device while this phone holds a live socket
+            // — the silent clear push is not sent to live devices, so drop this
+            // chat's tray notification here (same helper the clear push uses).
+            try { require('../firebase/fcmService').clearChatNotifications(chatId); } catch (_) { /* */ }
+            return;
+          }
+        }
+        if (!messageId) return;
+        const reporter = normalizeId(source.userId || source.receiverId || source.readerId);
+        const isGroup = !String(chatId).startsWith('u_');
+        if (reporter && String(reporter) === String(me)) {
+          // My other device reported it for a message I RECEIVED: mirror the
+          // read state onto that incoming row only.
+          if (status === 'read' || status === 'seen') {
+            ChatDatabase.updateMessageStatus(String(messageId), 'seen').catch(() => {});
+            // That one message was read elsewhere: drop its line from the tray.
+            try { require('../firebase/fcmService').dismissDeletedMessageNotification(chatId, messageId); } catch (_) { /* */ }
+          }
+          return;
+        }
+        if (isGroup) {
+          const kind = (status === 'read' || status === 'seen') ? 'read' : 'delivered';
+          const eff = String(source.effectiveStatus || '').toLowerCase();
+          const aggregate = source.aggregate || (eff === 'read' || eff === 'seen'
+            ? { allRead: true } : (eff === 'delivered' ? { allDelivered: true } : null));
+          persistGroupReceipt({ messageId, groupId: chatId, userId: reporter, aggregate, readAt: source.updatedAt, deliveredAt: source.updatedAt }, kind);
+          return;
+        }
+        if (status === 'delivered') {
+          onMessageDelivered({ messageId, chatId, receiverId: reporter });
+        } else if (status === 'read' || status === 'seen') {
+          onMessageRead({ messageId, chatId, readerId: reporter });
+        }
+      } catch (_) { /* best-effort */ }
+    };
+    socket.on('notification:status:update', onNotificationStatusUpdate);
+
     socketUnsubscribersRef.current = [
+      () => GROUP_DELIVERED_EVENTS.forEach((ev) => socket.off(ev, onGroupReceiptDelivered)),
+      () => GROUP_READ_EVENTS.forEach((ev) => socket.off(ev, onGroupReceiptRead)),
+      () => socket.off('notification:status:update', onNotificationStatusUpdate),
       () => socket.off('message:scheduled:cancelled', onScheduledCancelled),
       () => socket.off('message:cancel:scheduled', onScheduledCancelled),
       () => socket.off('message:cancel:scheduled:response', onScheduledCancelled),
@@ -5325,6 +5936,7 @@ export function RealtimeChatProvider({ children }) {
       () => socket.off('message:new', onMessage),
       () => socket.off('message:received', onMessage),
       () => socket.off('connect', onConnectCatchup),
+      () => { try { socket.off('authenticated', onAuthRetry); } catch (_) { /* */ } },
       () => { try { fgCatchupSub.remove(); } catch (_) { /* */ } },
       () => { try { netCatchupSub(); } catch (_) { /* */ } },
       () => socket.off('connect', onConnectMuteSync),
@@ -5734,9 +6346,18 @@ export function RealtimeChatProvider({ children }) {
     }, 0);
   }, []);
 
+  // Resolves true when the open-chat read receipts went out (or were queued),
+  // false when they were deliberately withheld because the app is not in the
+  // foreground (T-A-06). The caller re-invokes on the next foreground/focus —
+  // event-driven, no timer — and only then clears the local unread (T-A-18).
   const setActiveChat = useCallback(async (chatId) => {
     deferDispatch({ type: 'SET_ACTIVE_CHAT', payload: chatId || null });
     if (chatId) {
+      // "Read" needs a chat that is actually on screen: not while backgrounded.
+      // (Screen focus is checked by the caller, which owns the navigation state.)
+      if (!canSendReadReceipt({ appState: AppState.currentState, screenFocused: true, chatOpen: true })) {
+        return false;
+      }
       // Opening a chat → clear its WhatsApp-style grouped message notification +
       // accumulated thread so already-read messages don't linger in the shade.
       // Lazy require avoids pulling the firebase/notifee modules into this
@@ -5767,8 +6388,17 @@ export function RealtimeChatProvider({ children }) {
               const user = raw ? JSON.parse(raw) : null;
               const senderId = user?._id || user?.id;
               if (senderId) {
-                // Use message:read:all to mark all messages in this chat as read
-                sendOrQueue('message:read:all', { chatId, senderId });
+                // "Read" only covers what THIS device holds: bound the read-all by
+                // the newest local seq (0 = nothing yet). Unbounded, an offline
+                // recipient's read-all fired before catch-up and blued messages it
+                // had never received.
+                // T-A-06: ONLY rows already held locally. The chat-list row's seq
+                // can name a message that never committed to SQLite on this
+                // device (failed write / lag), and covering it marked a message
+                // read that was never displayed. The thread's own trailing
+                // read-all (in-memory + SQLite) raises the bound as rows load.
+                const dbSeq = await ChatDatabase.getLatestSeq(chatId).catch(() => 0);
+                sendOrQueue('message:read:all', { chatId, senderId, upToSeq: readAllUpToSeq(dbSeq) });
               }
             }
           } catch (e) {
@@ -5793,14 +6423,20 @@ export function RealtimeChatProvider({ children }) {
           }
         } catch (e) { /* best-effort */ }
       }
+      return true;
     }
+    return false;
   }, [deferDispatch]);
 
   const markChatRead = useCallback((chatId) => {
     noteLocalRead(chatId);
     deferDispatch({ type: 'MARK_READ', payload: chatId });
-    // Reset unread in SQLite
-    if (chatId) ChatDatabase.updateChatUnread(chatId, 0).catch(() => {});
+    // Reset unread in SQLite, then bring the launcher badge to the new total.
+    if (chatId) {
+      ChatDatabase.updateChatUnread(chatId, 0)
+        .then(() => { try { require('../firebase/appBadge').syncAppBadge(); } catch (_) { /* */ } })
+        .catch(() => {});
+    }
   }, [deferDispatch]);
 
   const onLocalOutgoingMessage = useCallback((message) => {

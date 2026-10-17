@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState, useRef } from 'react';
 import { useSelector } from 'react-redux';
-import { Animated, Easing, Image, ScrollView, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react-native';
+import { Animated, Easing, ScrollView, Text, TouchableOpacity, View, StyleSheet, Platform } from 'react-native';
 import { FontAwesome6, Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import useUserPresence from '../hooks/useUserPresence';
@@ -12,6 +12,7 @@ import useDisplayName from '../../hooks/useDisplayName';
 import { usePeerProfileName } from '../../services/peerProfileNameStore';
 import { isSelfChatId, selfChatLabel, selfIdentityOf } from '../../utils/selfChat';
 import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
+import AppImage from '../../components/AppImage';
 
 // Marquee for one-line header text: static while it fits; when it overflows
 // the available width it auto-scrolls right→left in a seamless loop (second
@@ -315,19 +316,21 @@ export default function ChatHeaderPresence({
   const isTyping = isPeerTyping || isRealtimeTyping;
   const themeColor = theme.colors.themeColor;
   const primaryText = theme.colors.primaryTextColor;
-  const subText = theme.colors.placeHolderTextColor;
+  // secondaryTextColor: 4.65:1 on white / 6.1 on dark (placeHolderTextColor was 2.3:1 on white).
+  const subText = theme.colors.secondaryTextColor;
   const bg = theme.colors.background;
   const borderColor = isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(15,30,50,0.08)';
   const ringColor = isPeerOnline ? theme.colors.themeColor :(themeColor + '30');
 
+  // `link` (not the brand fill) for status TEXT: brand teal is 2.7:1 on white.
   const statusColor = isTyping
-    ? themeColor
-    : isPeerOnline ? theme.colors.themeColor :subText;
+    ? theme.colors.link
+    : isPeerOnline ? theme.colors.link : subText;
 
   if (selectionCount > 0) {
     return (
       <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
-        <TouchableOpacity onPress={onBack} activeOpacity={0.6} style={styles.backBtn}>
+        <TouchableOpacity onPress={onBack} activeOpacity={0.6} style={styles.backBtn} hitSlop={BACK_HIT} accessibilityRole="button" accessibilityLabel="Cancel selection">
           <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
         </TouchableOpacity>
         <Text style={[styles.selectionCount, { color: primaryText }]} numberOfLines={1}>
@@ -341,7 +344,7 @@ export default function ChatHeaderPresence({
 
   return (
     <View style={[styles.root, { backgroundColor: bg, borderBottomColor: borderColor }]}>
-      <TouchableOpacity onPress={onBack} activeOpacity={0.6} style={styles.backBtn}>
+      <TouchableOpacity onPress={onBack} activeOpacity={0.6} style={styles.backBtn} hitSlop={BACK_HIT} accessibilityRole="button" accessibilityLabel="Back">
         <FontAwesome6 name="arrow-left" size={19} color={primaryText} />
       </TouchableOpacity>
 
@@ -349,17 +352,20 @@ export default function ChatHeaderPresence({
         onPress={onPressAvatar || onPressProfile}
         activeOpacity={0.85}
         style={[styles.avatarRing, { borderColor: ringColor }]}
+        accessibilityRole="button"
+        accessibilityLabel={`${displayName} profile picture`}
+        hitSlop={{ top: 4, bottom: 4, left: 2, right: 2 }}
       >
         {isGroup ? (
           groupAvatar ? (
-            <Image source={{ uri: groupAvatar }} style={styles.avatarImg} />
+            <AppImage source={{ uri: groupAvatar }} style={styles.avatarImg} />
           ) : (
             <View style={[styles.avatarFallback, { backgroundColor: getUserColor?.(groupName || 'Group') || '#6C5CE7' }]}>
               <Ionicons name={isBroadcast ? 'megaphone' : 'people'} size={20} color="#fff" />
             </View>
           )
         ) : peerAvatar ? (
-          <Image source={{ uri: peerAvatar }} style={styles.avatarImg} onError={() => setFailedAvatar(peerAvatar)} />
+          <AppImage source={{ uri: peerAvatar }} style={styles.avatarImg} onError={() => setFailedAvatar(peerAvatar)} />
         ) : headerShowInitial ? (
           <View style={[styles.avatarFallback, { backgroundColor: getAvatarColor(user?._id || displayName) }]}>
             <Text style={styles.avatarLetter}>
@@ -376,7 +382,7 @@ export default function ChatHeaderPresence({
         )}
       </TouchableOpacity>
 
-      <TouchableOpacity onPress={onPressProfile} activeOpacity={0.7} style={styles.textWrap}>
+      <TouchableOpacity onPress={onPressProfile} activeOpacity={0.7} style={styles.textWrap} accessibilityRole="button" accessibilityLabel={`${displayName}${statusText ? ', ' + statusText : ''}. Open contact info`}>
         <View style={styles.nameRow}>
           {/* Marquee, not a clipped Text. The header's text column is narrow
               (back + avatar on one side, video/call/menu on the other), so a
@@ -411,6 +417,10 @@ export default function ChatHeaderPresence({
     </View>
   );
 }
+
+// Back button is 34x40 visually (layout unchanged); hitSlop lifts the touch
+// target to >= 44x52.
+const BACK_HIT = { top: 6, bottom: 6, left: 10, right: 6 };
 
 const styles = StyleSheet.create({
   root: {

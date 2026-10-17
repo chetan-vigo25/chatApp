@@ -1,6 +1,8 @@
-import { Platform, DeviceEventEmitter } from 'react-native';
+import { Platform, DeviceEventEmitter, AppState } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 import { CALL_PUSH_EVENTS } from '../../firebase/callEvents';
-import { setVoipToken } from '../../Redux/Services/Socket/socket';
+import { setVoipToken, setVoipEnv, clearVoipToken } from '../../Redux/Services/Socket/socket';
+import { deriveVoipEnv } from '../../utils/voipEnv';
 
 /**
  * iOS PushKit (VoIP) bridge. Works with the AppDelegate PushKit handler added by
@@ -33,6 +35,38 @@ try {
 }
 
 export const isVoipAvailable = () => Platform.OS === 'ios' && !!VoipPush;
+
+// P-C-11: which APNs environment this build's VoIP token belongs to. Read from
+// the embedded provisioning profile via expo-application (aps-environment;
+// App Store builds carry no profile and are 'production'). Anything that cannot
+// be derived reliably stays null and the field is simply not sent.
+const resolveVoipEnv = async () => {
+  try {
+    const Application = require('expo-application');
+    const [apsEnvironment, releaseType] = await Promise.all([
+      Application.getIosPushNotificationServiceEnvironmentAsync(),
+      Application.getIosApplicationReleaseTypeAsync(),
+    ]);
+    setVoipEnv(deriveVoipEnv({ apsEnvironment, releaseType }));
+  } catch (_) { /* leave unset - backend falls back to its own env guess */ }
+};
+
+// P-C-18: the AppDelegate writes this Keychain note (epoch ms) from
+// pushRegistry(didInvalidatePushTokenFor:). Same key as withIosVoip.js.
+const VOIP_INVALIDATED_KEY = 'voipTokenInvalidatedAt';
+const SECURE_OPTIONS = { keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK };
+let lastTokenAt = 0;
+
+const consumeInvalidationNote = async () => {
+  try {
+    const raw = await SecureStore.getItemAsync(VOIP_INVALIDATED_KEY, SECURE_OPTIONS);
+    if (!raw) return;
+    await SecureStore.deleteItemAsync(VOIP_INVALIDATED_KEY, SECURE_OPTIONS);
+    // Only a token received BEFORE the invalidation is dead; a replacement that
+    // already arrived must survive.
+    if (Number(raw) > lastTokenAt) clearVoipToken();
+  } catch (_) { /* no-op */ }
+};
 
 // Normalise a VoIP push payload → the FCM-style `data` shape CallProvider's push
 // handlers expect.
@@ -71,6 +105,9 @@ const toCallData = (payload = {}) => ({
     : undefined,
   callerImage: payload.callerImage || null,
   callType: payload.callType || payload.media || 'audio',
+  // Callee user id (additive, P-C-02/04): lets CallProvider refuse a push that is
+  // addressed to a different account than the one signed in here.
+  recipientId: payload.recipientId != null && payload.recipientId !== '' ? String(payload.recipientId) : null,
   uuid: payload.uuid || null, // the CallKit UUID the AppDelegate reported with
   ts: payload.ts != null ? Number(payload.ts) : undefined,
   isConference: payload.isConference,
@@ -103,7 +140,7 @@ export const registerVoipPush = () => {
 
   try {
     VoipPush.addEventListener('register', (token) => {
-      if (token) setVoipToken(token);
+      if (token) { lastTokenAt = Date.now(); setVoipToken(token); }
     });
 
     VoipPush.addEventListener('notification', (payload) => {
@@ -117,6 +154,7 @@ export const registerVoipPush = () => {
       events.forEach((event) => {
         if (!event || !event.name) return;
         if (event.name === 'RNVoipPushRemoteNotificationsRegisteredEvent' && event.data) {
+          lastTokenAt = Date.now();
           setVoipToken(event.data);
         } else if (event.name === 'RNVoipPushRemoteNotificationReceivedEvent' && event.data) {
           onIncoming(event.data);
@@ -126,12 +164,20 @@ export const registerVoipPush = () => {
 
     // Kick off APNs VoIP registration → fires the 'register' event with a token.
     VoipPush.registerVoipToken();
+    resolveVoipEnv();
+    consumeInvalidationNote();
   } catch (err) {
     if (__DEV__) console.log('[VOIP] register failed', err?.message);
     return () => {};
   }
 
+  // Event-driven (no timer): re-check the invalidation note on foreground.
+  const appStateSub = AppState.addEventListener('change', (next) => {
+    if (next === 'active') consumeInvalidationNote();
+  });
+
   return () => {
+    try { appStateSub.remove(); } catch (_) { /* no-op */ }
     try {
       VoipPush.removeEventListener('register');
       VoipPush.removeEventListener('notification');

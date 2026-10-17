@@ -130,6 +130,10 @@ export default function RootNavigator() {
             },
             // Detach inactive screens to free memory
             detachPreviousScreen: true,
+            // Freeze the React tree of screens that are not focused (e.g. the chat
+            // list under an open chat) so they stop re-rendering on every store
+            // update while hidden; they catch up with the latest state on return.
+            freezeOnBlur: true,
           }}
           initialRouteName="Splash"
         >

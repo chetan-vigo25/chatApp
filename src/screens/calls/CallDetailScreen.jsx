@@ -574,7 +574,7 @@ export default function CallDetailScreen() {
           onPress={() => !isDeleting && setDeleteModalVisible(false)}
           style={styles.modalOverlay}
         >
-          <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: c.cardBackground }]}>
+          <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: c.menuSurface }]}>
             <View style={[styles.modalIconWrap, { backgroundColor: `${CALL_RED}1A` }]}>
               <MaterialCommunityIcons name="delete-alert-outline" size={28} color={CALL_RED} />
             </View>

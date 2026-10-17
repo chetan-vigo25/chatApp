@@ -10,14 +10,22 @@
  * (2) enable OEM Autostart. This module gates a prompt that jumps to those toggles.
  *
  * Non-intrusive rules:
- *   - Android only, and only while battery-optimization is NOT already granted.
+ *   - Android only. Offered while ANY reliability problem exists (see
+ *     callReliabilityPolicy): notifications off, calls channel off, Android 14+
+ *     full-screen-intent denied, battery exemption missing, or a known OEM whose
+ *     Autostart screen the user has not been pointed at yet (once per install -
+ *     no longer tied to the battery exemption, P-C-09).
  *   - Never after the user picked "Don't show again" (permaOff).
  *   - Snoozed for SNOOZE_DAYS after any dismissal, so it can't nag.
- *   - Stops offering forever the moment the exemption is actually granted.
+ *   - Stops offering the moment every problem is fixed.
  */
 import { Platform, DeviceEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { isIgnoringBatteryOptimizations, requestDisableBatteryOptimization } from '../../../modules/expo-call-ui';
+import {
+  isIgnoringBatteryOptimizations, requestDisableBatteryOptimization,
+  areNotificationsEnabled, isCallChannelEnabled, canUseFullScreenIntent, getManufacturer,
+} from '../../../modules/expo-call-ui';
+import { computeReliabilityIssues, shouldOffer } from './callReliabilityPolicy';
 
 // Fired by the Settings entry to force-open the reliability sheet on demand,
 // bypassing the snooze / "don't show again" gating (the auto-prompt respects
@@ -30,6 +38,8 @@ export const openCallReliability = () => {
 const PERMA_OFF_KEY = '@call/reliability/permaOff';
 const SNOOZE_UNTIL_KEY = '@call/reliability/snoozeUntil';
 const AUTO_ASKED_KEY = '@call/reliability/autoAsked';
+// OEM Autostart cannot be queried: the user is pointed at it ONCE per install.
+const AUTOSTART_ACK_KEY = '@call/reliability/autoStartAcked';
 
 // How long a dismissal quiets the prompt before it may reappear (only if the
 // exemption is still missing).
@@ -43,23 +53,54 @@ export const isBackgroundAllowed = () => {
   try { return !!isIgnoringBatteryOptimizations(); } catch (_) { return true; }
 };
 
-// Should we surface the onboarding right now?
-export const shouldOfferReliability = async () => {
-  if (Platform.OS !== 'android') return false;
-  if (isBackgroundAllowed()) return false; // already reliable — nothing to fix
+// Current reliability problems (see callReliabilityPolicy for the ids). Cheap
+// synchronous native reads + one AsyncStorage read; never throws.
+export const getReliabilityIssues = async () => {
+  if (Platform.OS !== 'android') return [];
+  let autoStartAcked = false;
+  try { autoStartAcked = (await AsyncStorage.getItem(AUTOSTART_ACK_KEY)) === 'true'; } catch (_) { autoStartAcked = true; }
+  let manufacturer = '';
+  try { manufacturer = getManufacturer(); } catch (_) { manufacturer = ''; }
+  return computeReliabilityIssues({
+    isAndroid: true,
+    notificationsEnabled: areNotificationsEnabled(),
+    callChannelEnabled: isCallChannelEnabled(),
+    canFullScreen: canUseFullScreenIntent(),
+    batteryAllowed: isBackgroundAllowed(),
+    manufacturer,
+    autoStartAcked,
+  });
+};
+
+// The user has been pointed at the OEM Autostart screen: do not raise it again
+// on its own (Settings can still open the sheet manually).
+export const acknowledgeAutoStart = async () => {
+  try { await AsyncStorage.setItem(AUTOSTART_ACK_KEY, 'true'); } catch (_) {}
+};
+
+// Should we surface the onboarding right now? Resolves { offer, issues }.
+export const evaluateReliability = async () => {
+  if (Platform.OS !== 'android') return { offer: false, issues: [] };
+  const issues = await getReliabilityIssues();
+  if (issues.length === 0) return { offer: false, issues };
   try {
     const [perma, snoozeUntil] = await Promise.all([
       AsyncStorage.getItem(PERMA_OFF_KEY),
       AsyncStorage.getItem(SNOOZE_UNTIL_KEY),
     ]);
-    if (perma === 'true') return false;
-    const until = parseInt(snoozeUntil || '0', 10);
-    if (Number.isFinite(until) && Date.now() < until) return false;
-    return true;
+    return {
+      offer: shouldOffer({
+        issues, permaOff: perma === 'true', snoozeUntil: parseInt(snoozeUntil || '0', 10), now: Date.now(),
+      }),
+      issues,
+    };
   } catch (_) {
-    return false; // storage hiccup → don't nag
+    return { offer: false, issues }; // storage hiccup -> don't nag
   }
 };
+
+// Back-compat boolean wrapper.
+export const shouldOfferReliability = async () => (await evaluateReliability()).offer;
 
 // First-entry auto-request: fire the SYSTEM battery-optimization dialog
 // directly (the small OS "Allow app to run in background?" prompt) instead of

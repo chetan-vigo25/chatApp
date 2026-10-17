@@ -1,8 +1,16 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Image,
-  ActivityIndicator, StyleSheet, Platform, ToastAndroid, Alert,
-  Animated, Keyboard,
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  ActivityIndicator,
+  StyleSheet,
+  Platform,
+  ToastAndroid,
+  Alert,
+  Animated,
+  Keyboard,
 } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useSelector } from 'react-redux';
@@ -19,6 +27,7 @@ import AppSearchBar from '../../components/AppSearchBar';
 // 1-1 avatar = same rule as the chat list: photo, else the first letter of the
 // peer's OWN profile name (never their @username or a "+" from the number).
 import PersonAvatar from '../../components/GroupSenderAvatar';
+import AppImage from '../../components/AppImage';
 
 // Same display rule as every other surface: my saved name → the peer's number
 // → their own account name only when no number is known.
@@ -113,7 +122,7 @@ function GroupAvatar({ uri, bg }) {
   return (
     <View style={[styles.avatarWrap, { backgroundColor: bg }]}>
       {uri && !failed ? (
-        <Image source={{ uri }} style={styles.avatarImage} resizeMode="cover" onError={() => setFailed(true)} />
+        <AppImage source={{ uri }} style={styles.avatarImage} resizeMode="cover" onError={() => setFailed(true)} />
       ) : (
         <Ionicons name="people" size={20} color="#fff" />
       )}
@@ -393,7 +402,6 @@ export default function ForwardMessageScreen({ navigation, route }) {
       };
       sendQueues.forEach((queue) => { emitInOrder(queue).catch(() => {}); });
 
-      const msgCount = messages.length;
       const chatCount = selectedReceivers.length;
 
       // ─── WHATSAPP BEHAVIOR ───
@@ -414,8 +422,6 @@ export default function ForwardMessageScreen({ navigation, route }) {
               ? `u_${[String(currentUserId), String(peerId)].sort().join('_')}`
               : (targetChat.chatId || targetChat._id || null));
 
-          showToast(`Message${msgCount > 1 ? 's' : ''} forwarded`);
-
           navigation.replace('ChatScreen', {
             item: targetChat,
             chatId: navChatId,
@@ -424,11 +430,9 @@ export default function ForwardMessageScreen({ navigation, route }) {
             openedFromForward: true,
           });
         } else {
-          showToast('Forwarded to 1 chat');
           navigation.goBack();
         }
       } else {
-        showToast(`Forwarded ${msgCount} message${msgCount > 1 ? 's' : ''} to ${chatCount} chats`);
         navigation.popToTop();
       }
     } catch (err) {

@@ -1,8 +1,16 @@
 import React, { useState, useRef, useCallback } from "react";
 import {
-  View, Text, Image, Animated, TouchableOpacity,
-  Alert, Platform, ToastAndroid, ActivityIndicator, StatusBar,
-  StyleSheet, ScrollView,
+  View,
+  Text,
+  Animated,
+  TouchableOpacity,
+  Alert,
+  Platform,
+  ToastAndroid,
+  ActivityIndicator,
+  StatusBar,
+  StyleSheet,
+  ScrollView,
 } from "react-native";
 import * as ImagePicker from 'expo-image-picker';
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
@@ -16,6 +24,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import { ensurePermission, PERMISSION_IDS } from '../../features/permissions/ensurePermission';
 import CopyFieldButton from '../../components/CopyFieldButton';
 import { getAccessToken } from '../../services/secureTokenStore';
+import AppImage from '../../components/AppImage';
 
 function showToast(message) {
   if (Platform.OS === 'android') ToastAndroid.show(message, ToastAndroid.SHORT);
@@ -164,7 +173,7 @@ export default function Profile({ navigation }) {
           <TouchableOpacity activeOpacity={0.85} onPress={showImagePickerOptions} disabled={loader}>
             <View style={styles.avatarWrap}>
               {imageUri ? (
-                <Image source={{ uri: imageUri }} style={styles.avatar} />
+                <AppImage source={{ uri: imageUri }} style={styles.avatar} />
               ) : (
                 <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: themeColor }]}>
                   <Ionicons name="person" size={72} color="#fff" />

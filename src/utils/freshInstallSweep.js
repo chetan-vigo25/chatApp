@@ -2,6 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import { KEYPAIR_STORAGE_KEY } from '../features/device-linking/constants';
 import { SECURE_TOKEN_KEYS } from '../services/secureTokenStore';
+import { writeCallSessionMarker } from '../calls/services/callSessionMarker';
 
 // Uninstalling the app wipes AsyncStorage and every SQLite database (they live
 // in the app sandbox), but iOS KEYCHAIN entries written via expo-secure-store
@@ -56,6 +57,9 @@ export async function runFreshInstallSweep() {
           SecureStore.deleteItemAsync(key).catch(() => {})
         )
       );
+      // A reinstall keeps the Keychain: mark the device signed OUT for the
+      // native call-push layer so a stale previous-user id cannot ring (P-C-04).
+      writeCallSessionMarker(null).catch(() => {});
     }
 
     // Set the marker either way: the install has now been accounted for.

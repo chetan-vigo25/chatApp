@@ -7,7 +7,10 @@ import { navigateToChat, getCurrentRouteSnapshot, getActiveChatFromRoute } from 
 import { CALL_PUSH_EVENTS, isStaleCallPush } from './callEvents';
 import { displayIncomingCallNotifee, cancelIncomingCallNotifee, isNotifeeCallAvailable, displayMissedCallNotification } from './callNotifee';
 import { isAvailable as isNativeCallKitAvailable, dismissIncoming as dismissCallKitIncoming } from '../calls/services/nativeCallService';
-import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification } from './messageNotification';
+import { displayGroupedMessage, isMessageGroupingAvailable, clearMessageNotification, removeMessageFromNotification, updateMessageInNotification } from './messageNotification';
+import { isPushForUser, ACTION_REPLY, ACTION_MARK_READ } from '../utils/messagePushPolicy';
+import { handleMessageNotificationAction } from './messageNotificationActions';
+import { syncAppBadge } from './appBadge';
 import { buildNotificationModel } from './notificationModel';
 import { claimNotification } from './notificationDedupe';
 // Guarantees the Firebase [DEFAULT] app exists before any messaging() call.
@@ -105,8 +108,15 @@ const CHANNEL_ID = `chat_messages_v${CHANNEL_VERSION}`;
 // Incoming-call channel — kept stable ('calls') to match the backend push.
 const CALL_CHANNEL_ID = 'calls';
 const MISSED_CALL_CHANNEL_ID = 'missed_calls';
+// Created ONCE here (P-A-15; channel-created-once rule) so a push that names
+// them lands on a real channel instead of the OS "Miscellaneous" fallback.
+// Message notifications still use CHANNEL_ID above (kept in lockstep with
+// messageNotification.js); these two are for server pushes that opt in.
+const GROUP_CHANNEL_ID = 'groups';
+const SILENT_CHANNEL_ID = 'silent';
 
 // All previous channel IDs that should be cleaned up
+const CHANNEL_MIGRATION_FLAG = '@notif_channel_migrated_v3';
 const OLD_CHANNEL_IDS = [
   'chat_messages',
   'chat_messages_v1',
@@ -118,16 +128,24 @@ const OLD_CHANNEL_IDS = [
 
 const setupNotificationChannel = async () => {
   if (Platform.OS === 'android') {
-    // Delete ALL old channels so Android doesn't reuse cached sound settings
-    for (const oldId of OLD_CHANNEL_IDS) {
-      await Notifications.deleteNotificationChannelAsync(oldId).catch(() => {});
-    }
+    // One-time migration: drop the retired channel ids. Guarded by a flag and
+    // awaited BEFORE creation, so it no longer runs on every JS import
+    // (including headless wakes). The current channel is never deleted here.
+    try {
+      const done = await AsyncStorage.getItem(CHANNEL_MIGRATION_FLAG);
+      if (!done) {
+        for (const oldId of OLD_CHANNEL_IDS) {
+          await Notifications.deleteNotificationChannelAsync(oldId).catch(() => {});
+        }
+        await AsyncStorage.setItem(CHANNEL_MIGRATION_FLAG, '1');
+      }
+    } catch (_) { /* best-effort */ }
 
-    // Also delete current channel to force recreation with correct sound
-    // (handles case where FCM created it with default sound before our code ran)
-    await Notifications.deleteNotificationChannelAsync(CHANNEL_ID).catch(() => {});
-
-    await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
+    // Create-if-missing: Android ignores sound/importance changes on an
+    // existing channel anyway, and delete+recreate raced with notifee's own
+    // createChannel and with headless message pushes.
+    const existingChannel = await Notifications.getNotificationChannelAsync(CHANNEL_ID).catch(() => null);
+    if (!existingChannel) await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
       name: 'Chat Messages',
       description: 'Notifications for new chat messages',
       importance: Notifications.AndroidImportance.MAX,
@@ -170,11 +188,38 @@ const setupNotificationChannel = async () => {
       enableVibrate: true,
       showBadge: true,
     });
+
+    // Create-if-missing, like the chat channel: Android ignores changes to an
+    // existing channel's importance/sound, so re-setting them is pointless.
+    const ensureChannel = async (id, spec) => {
+      const existing = await Notifications.getNotificationChannelAsync(id).catch(() => null);
+      if (!existing) await Notifications.setNotificationChannelAsync(id, spec).catch(() => {});
+    };
+    await ensureChannel(GROUP_CHANNEL_ID, {
+      name: 'Group Messages',
+      description: 'Notifications for group chat messages',
+      importance: Notifications.AndroidImportance.HIGH,
+      vibrationPattern: [0, 250, 250, 250],
+      sound: MESSAGE_SOUND_ANDROID,
+      lightColor: '#03b0a2',
+      enableLights: true,
+      enableVibrate: true,
+      showBadge: true,
+    });
+    await ensureChannel(SILENT_CHANNEL_ID, {
+      name: 'Silent Updates',
+      description: 'Low-priority updates with no sound or vibration',
+      importance: Notifications.AndroidImportance.LOW,
+      sound: null,
+      enableVibrate: false,
+      showBadge: false,
+    });
   }
 };
 
-// Create channel immediately on import
-setupNotificationChannel();
+// Create channel immediately on import (idempotent; errors must not surface as
+// unhandled rejections in a headless wake).
+setupNotificationChannel().catch(() => {});
 
 // Configure foreground notifications — tells expo-notifications to show alerts in foreground
 // SDK 54+ deprecated `shouldShowAlert`; iOS requires shouldShowBanner + shouldShowList to display.
@@ -190,16 +235,21 @@ Notifications.setNotificationHandler({
 // Setup iOS notification categories (for reply buttons, etc.)
 export const setupNotificationCategory = async () => {
   if (Platform.OS === 'ios') {
+    // Inline Reply is switched OFF for this release (owner decision) — it ships
+    // in a later update. The category is still registered, with NO actions, so a
+    // push carrying aps.category 'chat-message' shows no Reply box and the old
+    // registration (with Reply) is replaced on devices that already had it.
+    // Restore the action below to bring it back.
     await Notifications.setNotificationCategoryAsync('chat-message', [
-      {
-        identifier: 'reply',
-        buttonTitle: 'Reply',
-        options: { opensAppToForeground: true },
-        textInput: {
-          submitButtonTitle: 'Send',
-          placeholder: 'Type your reply...',
-        },
-      },
+      // {
+      //   identifier: 'reply',
+      //   buttonTitle: 'Reply',
+      //   options: { opensAppToForeground: true },
+      //   textInput: {
+      //     submitButtonTitle: 'Send',
+      //     placeholder: 'Type your reply...',
+      //   },
+      // },
     ]);
   }
 };
@@ -478,18 +528,29 @@ export const getFCMToken = async () => {
 // same "store it + tell the backend" behaviour.
 const _persistToken = (token) => {
   if (!token) return;
-  // ── TEMPORARY (production push debugging) — REMOVE AFTER VERIFICATION ──
-  // Deliberately NOT __DEV__-gated: prints the full FCM token in RELEASE
-  // builds so it can be grabbed from `adb logcat -s ReactNativeJS:I | grep
-  // FCM-TOKEN` and pasted into Firebase Console → Messaging → "Send test
-  // message" to prove the app/Firebase side end-to-end. The token is not a
-  // secret (it's device-addressing data), but this log is still noise —
-  // delete this block once production push is confirmed working.
-  console.log('══════════ [FCM-TOKEN] ══════════');
-  console.log('[FCM-TOKEN]', token);
-  console.log('═════════════════════════════════');
+  // P-A-11: never print the full token. Dev builds only, last 6 chars at most.
+  if (__DEV__) console.log('[FCM] token registered …' + String(token).slice(-6));
   try { setPushToken(token); } catch (_) {}
   AsyncStorage.setItem('fcmToken', token).catch(() => {});
+};
+
+// P-A-07: foreground/auth re-check of a rotated token. No-op until a first token
+// has been persisted (the boot path owns the first registration) and when the
+// current token equals the last registered one.
+let _revalidating = false;
+const revalidatePushToken = async () => {
+  if (_revalidating) return;
+  const m = getMessaging();
+  if (!m) return;
+  _revalidating = true;
+  try {
+    const last = await AsyncStorage.getItem('fcmToken').catch(() => null);
+    if (!last) return;
+    const current = await m().getToken();
+    if (current && current !== last) _persistToken(current);
+  } catch (_) { /* transient: next foreground retries */ } finally {
+    _revalidating = false;
+  }
 };
 
 // ─── FOREGROUND RE-TRIGGER ───
@@ -685,6 +746,11 @@ const showLocalNotification = async (remoteMessage) => {
   // channel.
   if (data?.type === 'call') return;
 
+  // P-A-01: a NEW-message push addressed to a different account (unclean account
+  // switch / logout with the socket down) must not be shown, and no line stored.
+  // Missing recipientId (older server) behaves as before.
+  if (!(await isForSignedInUser(data))) return;
+
   // Suppress message notifications for groups the user has left or been removed
   // from — an ex-member must not keep getting pinged. Checks groupId (and chatId,
   // which equals the group id for group chats) against the inactive registry.
@@ -820,6 +886,90 @@ export const clearChatNotifications = async (chatId) => {
   }
 };
 
+// Is this push addressed to the account signed in on this device? ONE helper for
+// new-message pushes (P-A-01), the silent clear pushes and the notification
+// actions. Fails OPEN (true) when the push has no recipientId (older server) or
+// the signed-in id cannot be read (headless keystore/storage miss).
+const isForSignedInUser = async (data) => {
+  if (!data?.recipientId) return true;
+  try {
+    const { getStoredSession } = require('../services/sessionManager');
+    const session = await getStoredSession();
+    return isPushForUser(data, session?.userId);
+  } catch (_) { return true; }
+};
+
+// A message was deleted for everyone: update/cancel its tray notification.
+// Android edits the MessagingStyle thread in place; iOS cannot edit a delivered
+// notification, so it dismisses the presented one(s) with that messageId.
+// Shared by the silent `message_deleted` push and the live socket events (P-A-05).
+export const dismissDeletedMessageNotification = async (chatId, deletedMessageId) => {
+  if (!chatId || !deletedMessageId) return;
+  try {
+    const changed = await removeMessageFromNotification(chatId, deletedMessageId);
+    if (!changed && Platform.OS === 'ios') {
+      try {
+        const presented = await Notifications.getPresentedNotificationsAsync();
+        for (const n of presented || []) {
+          const d = n?.request?.content?.data || {};
+          if (String(d.messageId || '') === String(deletedMessageId)) {
+            await Notifications.dismissNotificationAsync(n.request.identifier).catch(() => {});
+          }
+        }
+      } catch (_) { /* */ }
+    }
+  } catch (_) { /* best-effort */ }
+};
+
+// A displayed message was edited for everyone: refresh its line (Android only —
+// a delivered iOS notification cannot be edited).
+export const refreshEditedMessageNotification = async (chatId, messageId, newText) => {
+  if (Platform.OS !== 'android') return;
+  try { await updateMessageInNotification(chatId, messageId, newText); } catch (_) { /* */ }
+};
+
+// ─── SILENT NOTIFICATION-CLEAR PUSHES (message_read / message_deleted) ───
+// Data-only pushes from the backend to devices with no live socket. They must
+// NEVER create a notification: handled before any display code. Returns true
+// when the push was one of these types (consumed, even if ignored).
+const handleNotificationClearPush = async (data) => {
+  const type = data?.type;
+  if (type !== 'message_read' && type !== 'message_deleted') return false;
+  try {
+    // Account guard: ignore a push meant for a different signed-in account.
+    if (!(await isForSignedInUser(data))) return true;
+    const chatId = data?.chatId;
+    if (!chatId) return true;
+    if (type === 'message_read') {
+      await clearChatNotifications(chatId);
+    } else if (data?.deletedMessageId) {
+      await dismissDeletedMessageNotification(chatId, data.deletedMessageId);
+    }
+  } catch (_) { /* never throw out of a push handler */ }
+  return true;
+};
+
+// Staleness of a call push judged on SERVER time (P-C-16): a phone whose clock
+// runs fast must not drop a live call. Headless cold start: the in-memory offset
+// is not restored yet, so read the persisted estimate directly. Any failure falls
+// back to the previous raw-device-clock rule (never throws out of a push handler).
+const SERVER_CLOCK_OFFSET_KEY = '@call/serverClockOffsetMs';
+const isStaleCallPushSkewAware = async (data) => {
+  try {
+    const { classifyCallPush } = require('../calls/callPushGuards');
+    const { getServerOffsetMs } = require('../calls/services/callServerClock');
+    let offset = getServerOffsetMs();
+    if (!Number.isFinite(offset)) {
+      const raw = await AsyncStorage.getItem(SERVER_CLOCK_OFFSET_KEY);
+      const n = Number(raw);
+      if (raw != null && raw !== '' && Number.isFinite(n)) offset = n;
+    }
+    return classifyCallPush(data, Date.now(), offset) === 'stale';
+  } catch (_) {
+    return isStaleCallPush(data);
+  }
+};
+
 // ─── BACKGROUND MESSAGE HANDLER ───
 // MUST be called at top-level (index.js), NOT inside a React component
 // True only when a user session exists in storage. Logout runs AsyncStorage.clear()
@@ -859,6 +1009,9 @@ export const registerBackgroundHandler = () => {
       // before the backend deregisters this device's push/voip token.
       if (!(await hasActiveSession())) return;
 
+      // Silent clear/update pushes: route before anything that could display.
+      if (await handleNotificationClearPush(remoteMessage?.data)) return;
+
       // Incoming call (data-only, high priority). On Android show a notifee
       // FULL-SCREEN-INTENT notification → launches the app's full-screen call UI
       // over the lock screen (WhatsApp-style). On iOS (no full-screen intent)
@@ -888,7 +1041,7 @@ export const registerBackgroundHandler = () => {
         // the high-priority message, then delivers a burst when the device wakes).
         // The call is long over — showing it would ring a ghost and a backlog
         // would ring many at once.
-        if (isStaleCallPush(remoteMessage.data)) {
+        if (await isStaleCallPushSkewAware(remoteMessage.data)) {
           return;
         }
         try {
@@ -906,6 +1059,14 @@ export const registerBackgroundHandler = () => {
         } catch (err) {
           console.warn('[FCM][bg] full-screen call notif failed — falling back to heads-up:', err?.message);
           try { await presentIncomingCallNotification(remoteMessage.data); } catch (_) {}
+        }
+        // Ring-ack: the ring is on screen → caller may show "Ringing…".
+        // Group / conference invites have no 1:1 "Ringing…" line — skip.
+        if (remoteMessage.data.callId && remoteMessage.data.isGroup !== 'true' && remoteMessage.data.isConference !== 'true') {
+          try {
+            const { postRingingAck } = require('../calls/services/callSignalService');
+            postRingingAck(remoteMessage.data.callId);
+          } catch (_) {}
         }
         return;
       }
@@ -930,6 +1091,7 @@ export const initializeNotifications = () => {
   let unsubscribeOnOpen = () => {};
   let responseListener = { remove: () => {} };
   let notifeeForegroundUnsub = () => {};
+  let appStateSub = null;
   const m = getMessaging();
   try {
   if (!m) throw new Error('native module unavailable');
@@ -938,6 +1100,7 @@ export const initializeNotifications = () => {
     // console.log('Foreground message received:', JSON.stringify(remoteMessage));
     // Logged out → ignore any push that still lands (calls + messages).
     if (!(await hasActiveSession())) return;
+    if (await handleNotificationClearPush(remoteMessage?.data)) return;
     // Caller hung up / timed out → dismiss the incoming-call notification.
     if (remoteMessage?.data?.type === 'call_cancel') {
       dismissIncomingCallNotification(remoteMessage.data.callId, remoteMessage.data.uuid || null).catch(() => {});
@@ -1026,7 +1189,17 @@ export const initializeNotifications = () => {
         return;
       }
       if (action === 'reply') {
-        // console.log('Reply tapped!', data);
+        // iOS inline Reply (shown once the server sets aps.category =
+        // 'chat-message'): the app is foregrounded by the action, so the JS send
+        // path is alive — same outbox/REST path as the Android Reply.
+        const userText = typeof response?.userText === 'string' ? response.userText : '';
+        if (userText.trim() && (data?.chatId || data?.groupId)) {
+          handleMessageNotificationAction({
+            notification: { data },
+            pressAction: { id: ACTION_REPLY },
+            input: userText,
+          }).catch(() => {});
+        }
         return;
       }
       // Any other tap (the default body tap) on a message notification → open
@@ -1051,6 +1224,12 @@ export const initializeNotifications = () => {
         if (type === EventType.PRESS && d.type !== 'call' && (d.chatId || d.groupId)) {
           navigateToChat(d);
         }
+        // Inline Reply while the app is open (background/killed
+        // are handled by callNotifee's onBackgroundEvent).
+        if (type === EventType.ACTION_PRESS && d.type !== 'call'
+            && (detail?.pressAction?.id === ACTION_REPLY || detail?.pressAction?.id === ACTION_MARK_READ)) {
+          handleMessageNotificationAction(detail).catch(() => {});
+        }
       });
       // Cold launch from a notifee message notification (data-only push → FCM's
       // getInitialNotification won't carry it; notifee's does).
@@ -1064,7 +1243,26 @@ export const initializeNotifications = () => {
     console.warn('[FCM] initializeNotifications skipped:', err?.message);
   }
 
+  // Event-driven app state hooks (no timers):
+  //  • P-A-14: the launcher badge follows the SQLite unread total on every
+  //    foreground/background transition (and after reads, from the read paths).
+  //  • P-A-07: the FCM token can rotate while the app is dead; the next time it
+  //    comes to the foreground, re-register it if it differs from the last one
+  //    we registered. getToken() is a cached native read; _persistToken is
+  //    de-duplicated by value downstream.
+  try {
+    let prev = AppState.currentState;
+    syncAppBadge();
+    appStateSub = AppState.addEventListener('change', (next) => {
+      const was = prev;
+      prev = next;
+      if (next === 'active' || next === 'background') syncAppBadge();
+      if (next === 'active' && was !== 'active') revalidatePushToken();
+    });
+  } catch (_) { appStateSub = null; }
+
   return () => {
+    try { appStateSub?.remove?.(); } catch (_) {}
     try { unsubscribeOnMessage(); } catch (_) {}
     try { unsubscribeOnOpen(); } catch (_) {}
     try { responseListener.remove(); } catch (_) {}

@@ -18,6 +18,11 @@
  *   non-core permission (Location is the usual candidate), flip that ONE flag to
  *   `false` — the row still renders and can still be granted, it just stops
  *   blocking Continue. No other code needs to change.
+ * • `startup: true` = asked by the first-run screen right after Continue. ONLY
+ *   Notifications and Location are; every other entry is asked just-in-time by
+ *   its feature through ensurePermission (mic → call / voice note, camera →
+ *   capture, photos → gallery / profile photo, files → documents). The entries
+ *   stay here because ensurePermission reads their titles/settings hints.
  */
 
 export const PERMISSION_IDS = Object.freeze({
@@ -41,11 +46,13 @@ export const PERMISSION_IDS = Object.freeze({
  * @property {string} icon          Ionicons glyph name
  * @property {string} accent        Row icon tint (chip background is derived from it)
  * @property {boolean} required     Blocks the Continue button until satisfied
+ * @property {boolean} [startup]    Asked on the first-run screen (else just-in-time)
  * @property {string} settingsHint  Guidance shown when permanently denied
  */
 export const PERMISSION_CATALOG = Object.freeze([
   {
     id: PERMISSION_IDS.NOTIFICATIONS,
+    startup: true,
     title: 'Notifications',
     description: 'Receive messages, calls and important updates.',
     icon: 'chatbubble-ellipses',
@@ -73,6 +80,7 @@ export const PERMISSION_CATALOG = Object.freeze([
   },
   {
     id: PERMISSION_IDS.LOCATION,
+    startup: true,
     title: 'Location',
     description: 'Share your current location in a chat.',
     icon: 'location',

@@ -61,7 +61,7 @@ export default function ScheduleTimePicker({ visible, onClose, onSchedule, theme
 
   if (!visible) return null;
 
-  const bg = theme?.colors?.cardBackground || '#1F2C34';
+  const bg = theme?.colors?.menuSurface || '#202323';
   const textColor = theme?.colors?.primaryTextColor || '#E9EDEF';
   const subColor = theme?.colors?.placeHolderTextColor || '#8696A0';
   const accent = theme?.colors?.themeColor || '#03b0a2';

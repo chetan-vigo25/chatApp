@@ -8,7 +8,6 @@ import { useFonts } from 'expo-font';
 import { ThemeProvider, useTheme } from './src/contexts/ThemeContext';
 import { ContactProvider } from './src/contexts/ContactContext';
 import { DeviceInfoProvider } from './src/contexts/DeviceInfoContext';
-import { Provider as PaperProvider, MD3DarkTheme, MD3LightTheme } from 'react-native-paper';
 import { NetworkProvider, useNetwork } from './src/contexts/NetworkContext';
 import { DeviceLocationProvider } from './src/contexts/DeviceLoc';
 import { ImageProvider } from './src/contexts/ImageProvider';
@@ -20,6 +19,7 @@ import {  getFCMToken, initializeNotifications, setupNotificationCategory, setup
 import { registerNotifeeForeground, ensureCallChannel } from './src/firebase/callNotifee';
 import { setPushToken } from './src/Redux/Services/Socket/socket';
 import { runFreshInstallSweep } from './src/utils/freshInstallSweep';
+import { runMigrationSweep } from './src/services/kvStorage';
 import 'react-native-get-random-values';
 import NoInternet from './src/screens/NoInternet';
 import { CallProvider } from './src/calls/CallProvider';
@@ -29,27 +29,6 @@ import { ShareIntentProvider } from 'expo-share-intent';
 import { LanguageProvider } from './src/components/Translate';
  
 import 'react-native-gesture-handler';
- 
-// Paper components (Portal/Dialog/Menu/Snackbar) render from Paper's own theme,
-// not ThemeContext — without this bridge they'd stay MD3-light in dark mode.
-// Must sit INSIDE ThemeProvider so it re-renders on theme switch.
-const ThemedPaperProvider = ({ children }) => {
-  const { theme, isDarkMode } = useTheme();
-  const base = isDarkMode ? MD3DarkTheme : MD3LightTheme;
-  const paperTheme = {
-    ...base,
-    colors: {
-      ...base.colors,
-      primary: theme.colors.themeColor,
-      background: theme.colors.background,
-      surface: theme.colors.surface,
-      onSurface: theme.colors.primaryTextColor,
-      outline: theme.colors.border,
-      error: theme.colors.danger,
-    },
-  };
-  return <PaperProvider theme={paperTheme}>{children}</PaperProvider>;
-};
  
 export default function App() {
  
@@ -62,6 +41,9 @@ export default function App() {
           // keychain leftovers from the previous install (uninstall wipes
           // SQLite/AsyncStorage but NOT the keychain).
           await runFreshInstallSweep();
+          // One-time AsyncStorage→MMKV copy of the moved keys. Not awaited: reads are
+          // read-through, so nothing depends on it finishing.
+          runMigrationSweep().catch(() => {});
  
           // Setup iOS notification categories (reply buttons etc.)
           await setupNotificationCategory();
@@ -119,10 +101,6 @@ export default function App() {
   // silently when the activity isn't task root — the native side re-launches
   // itself and returns WITHOUT notifying JS — and these logs are the only way to
   // see which stage swallowed it.
-  // Two render-crash boundaries (AppErrorBoundary needs no provider):
-  //  • inner — around the navigation root only, so a crashing screen shows the
-  //    fallback while CallProvider (a live call) and AppLockGate keep running;
-  //  • outer — around the whole tree, for a crash inside a provider itself.
   return (
     <ShareIntentProvider options={{ debug: __DEV__ }}>
      <SafeAreaProvider>
@@ -133,7 +111,6 @@ export default function App() {
             user picks a different language — no app restart needed. */}
         <LanguageProvider>
          <NetworkProvider>
-          <ThemedPaperProvider>
            <DeviceInfoProvider>
             <AuthProvider>
               <ContactProvider>
@@ -143,7 +120,7 @@ export default function App() {
                   <RealtimeChatProvider>
                     <CallProvider>
                       <CallContentInset>
-                          <AppContent />
+                        <AppContent />
                         <AppLockGate />
                       </CallContentInset>
                     </CallProvider>
@@ -154,7 +131,6 @@ export default function App() {
               </ContactProvider>
             </AuthProvider>
            </DeviceInfoProvider>
-          </ThemedPaperProvider>
          </NetworkProvider>
         </LanguageProvider>
        </ThemeProvider>

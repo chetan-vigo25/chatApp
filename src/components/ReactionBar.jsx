@@ -1,6 +1,7 @@
 import React from 'react';
 import { View, Text, TouchableOpacity, Animated, StyleSheet } from 'react-native';
 import * as Haptics from 'expo-haptics';
+import { useTheme } from '../contexts/ThemeContext';
 
 const ReactionBar = React.memo(({
   reactions,
@@ -12,6 +13,7 @@ const ReactionBar = React.memo(({
   onShowDetail,
   scaleAnims,
 }) => {
+  const { theme } = useTheme();
   if (!reactions || Object.keys(reactions).length === 0) return null;
 
   const entries = Object.entries(reactions).filter(([, data]) => data?.count > 0);
@@ -63,7 +65,7 @@ const ReactionBar = React.memo(({
         style={[
           styles.pill,
           {
-            backgroundColor: isDarkMode ? '#1B2B34' : '#FFFFFF',
+            backgroundColor: theme.colors.menuSurface,
           },
         ]}
         accessibilityLabel={`${entries.map(([e]) => e).join(' ')} reactions, ${totalCount} total`}
@@ -75,7 +77,7 @@ const ReactionBar = React.memo(({
         {totalCount > 1 && (
           <Text style={[
             styles.count,
-            { color: isDarkMode ? '#8696A0' : '#6B7B85' },
+            { color: theme.colors.secondaryTextColor },
           ]}>
             {totalCount}
           </Text>

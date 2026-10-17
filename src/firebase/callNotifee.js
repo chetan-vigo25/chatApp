@@ -770,6 +770,14 @@ export const registerNotifeeBackground = () => {
       // so route them BEFORE the CallStyle early-return below.
       const data = detail?.notification?.data || {};
       if (data?.type !== 'call') {
+        // Inline Reply / Mark as read on a message notification (killed or
+        // backgrounded app). AWAITED so the headless task stays alive until the
+        // send / read has been handed off.
+        if (_consts && type === _consts.EventType.ACTION_PRESS
+            && (data?.chatId || data?.groupId)) {
+          try { await require('./messageNotificationActions').handleMessageNotificationAction(detail); } catch (_) { /* */ }
+          return;
+        }
         routeNotifeeEvent(type, detail);
         return;
       }

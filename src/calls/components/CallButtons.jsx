@@ -71,6 +71,9 @@ export default function CallButtons({ peer, chatId }) {
         activeOpacity={0.7}
         style={[styles.btn, disabled && styles.disabled]}
         hitSlop={styles.hit}
+        accessibilityRole="button"
+        accessibilityLabel="Video call"
+        accessibilityState={{ disabled }}
       >
         <Ionicons name="videocam-outline" size={23} color={color} />
       </TouchableOpacity>
@@ -80,6 +83,9 @@ export default function CallButtons({ peer, chatId }) {
         activeOpacity={0.7}
         style={[styles.btn, disabled && styles.disabled]}
         hitSlop={styles.hit}
+        accessibilityRole="button"
+        accessibilityLabel="Voice call"
+        accessibilityState={{ disabled }}
       >
         <Ionicons name="call-outline" size={21} color={color} />
       </TouchableOpacity>

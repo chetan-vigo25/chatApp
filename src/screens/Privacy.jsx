@@ -1,7 +1,7 @@
 import React from 'react';
 import { View, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { useTheme } from '../contexts/ThemeContext';
-import { WebView } from 'react-native-webview';
+import ThemedWebView from '../components/ThemedWebView';
 import { WEB_PAGE_URL, BACKEND_URL } from '@env';
 import { FontAwesome6 } from '@expo/vector-icons';
 
@@ -21,11 +21,7 @@ export default function Privacy({ navigation }) {
         </TouchableOpacity>
         <Text style={{ color: theme.colors.primaryTextColor, fontSize:16, fontFamily:'Roboto-Regular' }} >Privacy</Text>
       </View>
-      <WebView
-        source={{ uri: `${WEB_PAGE_URL}/webview/privacy-policy` }}
-        style={{ flex:1 }}
-        startInLoadingState={true}  // shows a loader while loading
-      />
+      <ThemedWebView uri={`${WEB_PAGE_URL}/webview/privacy-policy`} />
     </View>
   );
 }

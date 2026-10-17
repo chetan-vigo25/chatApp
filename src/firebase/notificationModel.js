@@ -17,6 +17,7 @@
  */
 // Pure JS (no react-native imports) — safe for the headless background handler.
 import { isFileNameCaption } from '../utils/mediaCaption';
+import { senderPrivacyFields, normalizeId as normalizeUserId } from '../utils/messagePushPolicy';
 
 // Media preview labels. MUST stay byte-for-byte identical to the backend's
 // MEDIA_PREVIEW in chat-backend/src/services/messageNotify.service.js so a
@@ -145,6 +146,14 @@ export const buildNotificationModel = (raw = {}) => {
   const channelName = data?.chatName || source?.chatName || notification?.title || '';
   const channelAvatar = data?.chatAvatar || source?.chatAvatar || null;
 
+  // Contact privacy + account guard fields the push carries (P-A-01/02/03). Kept
+  // on the model so the Notifee notification `data` (which IS the model) holds
+  // them: the tap guard needs `recipientId`, the display resolver needs the
+  // hide-contact flag + @handle.
+  const privacy = senderPrivacyFields(data, source);
+  const recipientId = normalizeUserId(data?.recipientId || source?.recipientId) || null;
+  const isViewOnce = isTruthyString(data?.isViewOnce || source?.isViewOnce);
+
   const messageType = data?.messageType || data?.type || source?.messageType || 'text';
   const rawText =
     data?.text || data?.body || data?.message || data?.content ||
@@ -166,6 +175,10 @@ export const buildNotificationModel = (raw = {}) => {
     senderId,
     senderName,
     senderMobile,
+    senderHideContact: privacy.senderHideContact,
+    senderUserName: privacy.senderUserName,
+    ...(recipientId ? { recipientId } : {}),
+    ...(isViewOnce ? { isViewOnce: true } : {}),
     avatar: isBroadcast ? (channelAvatar || avatar) : isGroup ? (groupAvatar || avatar) : avatar,
     isGroup,
     isBroadcast,

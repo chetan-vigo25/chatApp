@@ -106,7 +106,7 @@ export default function GroupCallButtons({
 
   // Dim + disable while another call is in progress (can't start a second call).
   const color = callBusy ? theme.colors.secondaryTextColor : theme.colors.primaryTextColor;
-  const menuBg = isDarkMode ? '#233138' : '#FFFFFF';
+  const menuBg = theme.colors.menuSurface;
   const menuText = theme.colors.primaryTextColor;
 
   return (
@@ -117,6 +117,9 @@ export default function GroupCallButtons({
         activeOpacity={0.7}
         style={[styles.btn, callBusy && styles.disabled]}
         hitSlop={styles.hit}
+        accessibilityRole="button"
+        accessibilityLabel="Start group call"
+        accessibilityState={{ disabled: !!callBusy }}
       >
         <View style={styles.combo}>
           <Ionicons name="videocam-outline" size={23} color={color} />

@@ -18,7 +18,7 @@ export default function StatusUnavailableModal({
   theme,
   isDarkMode = false,
 }) {
-  const bg = isDarkMode ? '#121b22' : '#ffffff';
+  const bg = theme?.colors?.menuSurface || (isDarkMode ? '#202323' : '#ffffff');
   const fg = theme?.colors?.primaryTextColor || (isDarkMode ? '#e9edef' : '#111b21');
   const sub = theme?.colors?.secondaryTextColor || (isDarkMode ? '#8696a0' : '#667781');
   const accent = isDarkMode ? '#e9edef' : (theme?.colors?.themeColor || '#03b0a2');

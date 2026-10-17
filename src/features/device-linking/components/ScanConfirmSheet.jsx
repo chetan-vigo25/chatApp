@@ -43,7 +43,7 @@ export default function ScanConfirmSheet({
       onRequestClose={onCancel}
     >
       <View style={styles.backdrop}>
-        <View style={[styles.sheet, { backgroundColor: theme.colors.cardBackground }]}>
+        <View style={[styles.sheet, { backgroundColor: theme.colors.menuSurface }]}>
           {/* Header */}
           <View style={styles.handle} />
 

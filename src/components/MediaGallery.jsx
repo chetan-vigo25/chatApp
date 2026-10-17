@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { FlatList, Image, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import useMediaGallery from '../hooks/useMediaGallery';
+import AppImage from './AppImage';
 
 const CATEGORIES = [
   { label: 'All', value: null },
@@ -60,7 +61,7 @@ export default function MediaGallery({ chatId, onOpenMedia }) {
           return (
             <Pressable style={styles.cell} onPress={() => onOpenMedia?.(item)}>
               {uri ? (
-                <Image source={{ uri }} style={styles.image} />
+                <AppImage source={{ uri }} style={styles.image} />
               ) : (
                 <View style={[styles.image, styles.placeholder]}>
                   <Ionicons name={isDoc ? 'document-text' : 'image-outline'} size={24} color="#fff" />

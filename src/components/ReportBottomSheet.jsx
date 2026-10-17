@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   View,
   Text,
@@ -11,10 +11,14 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  useWindowDimensions,
 } from 'react-native';
 import { REPORT_REASONS, REPORT_REASONS_BY_TYPE, REPORT_TYPE_LABELS } from '../constant/reportReasons';
 import { submitReport } from '../services/ReportService';
 import { useTheme } from '../contexts/ThemeContext';
+import { BottomSheetScrollView, BottomSheetTextInput } from '@gorhom/bottom-sheet';
+import { useKeyboardState } from 'react-native-keyboard-controller';
+import AppSheet, { USE_GORHOM } from './AppSheet';
 
 const REASON_ICONS = {
   spam: '🚫',
@@ -47,6 +51,21 @@ export const ReportBottomSheet = ({
 }) => {
   const { theme, isDarkMode } = useTheme();
   const colors = theme.colors;
+  // Inside the sheet the scroll view gets no height from its parent (gorhom's
+  // content container is not bounded), so it is capped explicitly: the sheet is
+  // 85% of the window and the handle + header + divider + bottom padding take
+  // the rest. Beyond that it scrolls — same limit the old Modal's maxHeight set.
+  const { height: winH } = useWindowDimensions();
+  const sheetH = Math.round(winH * 0.85);
+  // The app draws edge-to-edge (keyboard-controller), so the window does not
+  // resize for the keyboard and the sheet cannot rise past its top snap. Shrink
+  // the scroll area by the keyboard height and scroll the details box into view.
+  const kbH = useKeyboardState((st) => (st.isVisible ? st.height : 0));
+  const scrollRef = useRef(null);
+  useEffect(() => {
+    if (kbH > 0) setTimeout(() => scrollRef.current?.scrollToEnd?.({ animated: true }), 60);
+  }, [kbH]);
+  const scrollMaxH = sheetH - 160 - kbH;
 
   const [reason, setReason] = useState('');
   const [description, setDescription] = useState('');
@@ -113,7 +132,7 @@ export const ReportBottomSheet = ({
 
   const dynamicStyles = {
     sheet: {
-      backgroundColor: isDarkMode ? colors.cardBackground : '#fff',
+      backgroundColor: colors.menuSurface,
     },
     handleBar: {
       backgroundColor: isDarkMode ? '#3A4750' : '#DEDEDE',
@@ -175,6 +194,186 @@ export const ReportBottomSheet = ({
     },
   };
 
+  // Same content for the gorhom sheet and the legacy Modal; only the scroll view
+  // and the text input differ (inside the sheet they must be gorhom's own so the
+  // keyboard, scrolling and sheet drag cooperate).
+  const renderInner = (ScrollComp, InputComp) => (
+    <>
+  <View style={[styles.handleBar, dynamicStyles.handleBar]} />
+
+  {/* Header */}
+  <View style={styles.header}>
+    <View style={styles.headerLeft}>
+      <View style={[styles.headerIconWrap, dynamicStyles.headerIconWrap]}>
+        <Text style={styles.headerIcon}>🛡️</Text>
+      </View>
+      <View>
+        <Text style={[styles.title, dynamicStyles.title]}>Report {reportTypeLabel}</Text>
+        <Text style={[styles.subtitle, dynamicStyles.subtitle]}>Help us keep the community safe</Text>
+      </View>
+    </View>
+    <TouchableOpacity
+      style={[styles.closeIconBtn, dynamicStyles.closeIconBtn]}
+      onPress={() => { onClose() }}
+      disabled={loading}
+      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+    >
+      <Text style={[styles.closeIconText, dynamicStyles.closeIconText]}>✕</Text>
+    </TouchableOpacity>
+  </View>
+
+  <View style={[styles.divider, dynamicStyles.divider]} />
+
+  <ScrollComp
+    ref={ScrollComp === ScrollView ? undefined : scrollRef}
+    style={ScrollComp === ScrollView ? styles.scrollContent : { maxHeight: scrollMaxH }}
+    showsVerticalScrollIndicator={false}
+    bounces={false}
+    keyboardShouldPersistTaps="handled"
+  >
+    <Text style={[styles.sectionLabel, dynamicStyles.sectionLabel]}>Select a reason</Text>
+    <View style={styles.reasonList}>
+      {reasons.map(r => {
+        const isActive = reason === r.key;
+        return (
+          <TouchableOpacity
+            key={r.key}
+            style={[
+              styles.reasonBtn,
+              dynamicStyles.reasonBtn,
+              isActive && dynamicStyles.reasonBtnActive,
+            ]}
+            onPress={() => setReason(r.key)}
+            disabled={loading}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.reasonIcon}>{REASON_ICONS[r.key] || '📝'}</Text>
+            <Text style={[
+              styles.reasonText,
+              dynamicStyles.reasonText,
+              isActive && dynamicStyles.reasonTextActive,
+              isActive && { fontFamily: 'Roboto-SemiBold' },
+            ]}>
+              {r.label}
+            </Text>
+            {isActive && (
+              <View style={[styles.checkMark, { backgroundColor: themeColor }]}>
+                <Text style={styles.checkMarkText}>✓</Text>
+              </View>
+            )}
+          </TouchableOpacity>
+        );
+      })}
+    </View>
+
+    <Text style={[styles.sectionLabel, dynamicStyles.sectionLabel]}>Additional details (optional)</Text>
+    <InputComp
+      keyboardAppearance={isDarkMode ? 'dark' : 'light'}
+      style={[styles.input, dynamicStyles.input]}
+      value={description}
+      onChangeText={setDescription}
+      placeholder="Tell us more about what happened..."
+      placeholderTextColor={colors.placeHolderTextColor}
+      editable={!loading}
+      multiline
+      numberOfLines={3}
+      textAlignVertical="top"
+    />
+
+    {(payload?.canBlock || payload?.canDeleteChat) ? (
+      <View style={styles.optionList}>
+        {payload?.canBlock ? (
+          <TouchableOpacity
+            style={styles.optionRow}
+            onPress={() => setBlockUser(v => !v)}
+            disabled={loading}
+            activeOpacity={0.7}
+          >
+            <View style={[
+              styles.optionCheckbox,
+              { borderColor: blockUser ? themeColor : (isDarkMode ? '#3A4750' : '#CCC') },
+              blockUser && { backgroundColor: themeColor },
+            ]}>
+              {blockUser ? <Text style={styles.optionCheckMark}>✓</Text> : null}
+            </View>
+            <Text style={[styles.optionText, dynamicStyles.reasonText]}>Block user after report</Text>
+          </TouchableOpacity>
+        ) : null}
+        {payload?.canDeleteChat ? (
+          <TouchableOpacity
+            style={styles.optionRow}
+            onPress={() => setDeleteChat(v => !v)}
+            disabled={loading}
+            activeOpacity={0.7}
+          >
+            <View style={[
+              styles.optionCheckbox,
+              { borderColor: deleteChat ? themeColor : (isDarkMode ? '#3A4750' : '#CCC') },
+              deleteChat && { backgroundColor: themeColor },
+            ]}>
+              {deleteChat ? <Text style={styles.optionCheckMark}>✓</Text> : null}
+            </View>
+            <Text style={[styles.optionText, dynamicStyles.reasonText]}>Delete chat after report</Text>
+          </TouchableOpacity>
+        ) : null}
+      </View>
+    ) : null}
+
+    {error ? (
+      <View style={[styles.errorContainer, dynamicStyles.errorContainer]}>
+        <Text style={styles.errorIcon}>⚠</Text>
+        <Text style={styles.errorText}>{error}</Text>
+      </View>
+    ) : null}
+
+    <View style={styles.buttonRow}>
+      <TouchableOpacity
+        style={[styles.cancelBtn, dynamicStyles.cancelBtn]}
+        onPress={() => { onClose() }}
+        disabled={loading}
+        activeOpacity={0.7}
+      >
+        <Text style={[styles.cancelBtnText, dynamicStyles.cancelBtnText]}>Cancel</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={[
+          styles.submitBtn,
+          dynamicStyles.submitBtn,
+          (!reason || loading) && styles.submitBtnDisabled,
+        ]}
+        onPress={handleSubmit}
+        disabled={loading || !reason}
+        activeOpacity={0.7}
+      >
+        {loading ? (
+          <ActivityIndicator color="#fff" size="small" />
+        ) : (
+          <Text style={styles.submitBtnText}>Submit Report</Text>
+        )}
+      </TouchableOpacity>
+    </View>
+  </ScrollComp>
+    </>
+  );
+
+  if (USE_GORHOM) {
+    return (
+      <AppSheet
+        visible={visible}
+        onClose={onClose}
+        snapPoints={[sheetH]}
+        keyboardAware
+        backdropOpacity={0.5}
+        backgroundColor={dynamicStyles.sheet.backgroundColor}
+      >
+        <View style={styles.gorhomSheet}>
+          {renderInner(BottomSheetScrollView, BottomSheetTextInput)}
+        </View>
+      </AppSheet>
+    );
+  }
+
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={() => { onClose() }}>
       <KeyboardAvoidingView
@@ -184,160 +383,7 @@ export const ReportBottomSheet = ({
         <TouchableOpacity style={styles.overlayTouchable} activeOpacity={1} onPress={() => { onClose() }} />
 
         <View style={[styles.sheet, dynamicStyles.sheet]}>
-          <View style={[styles.handleBar, dynamicStyles.handleBar]} />
-
-          {/* Header */}
-          <View style={styles.header}>
-            <View style={styles.headerLeft}>
-              <View style={[styles.headerIconWrap, dynamicStyles.headerIconWrap]}>
-                <Text style={styles.headerIcon}>🛡️</Text>
-              </View>
-              <View>
-                <Text style={[styles.title, dynamicStyles.title]}>Report {reportTypeLabel}</Text>
-                <Text style={[styles.subtitle, dynamicStyles.subtitle]}>Help us keep the community safe</Text>
-              </View>
-            </View>
-            <TouchableOpacity
-              style={[styles.closeIconBtn, dynamicStyles.closeIconBtn]}
-              onPress={() => { onClose() }}
-              disabled={loading}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            >
-              <Text style={[styles.closeIconText, dynamicStyles.closeIconText]}>✕</Text>
-            </TouchableOpacity>
-          </View>
-
-          <View style={[styles.divider, dynamicStyles.divider]} />
-
-          <ScrollView
-            style={styles.scrollContent}
-            showsVerticalScrollIndicator={false}
-            bounces={false}
-            keyboardShouldPersistTaps="handled"
-          >
-            <Text style={[styles.sectionLabel, dynamicStyles.sectionLabel]}>Select a reason</Text>
-            <View style={styles.reasonList}>
-              {reasons.map(r => {
-                const isActive = reason === r.key;
-                return (
-                  <TouchableOpacity
-                    key={r.key}
-                    style={[
-                      styles.reasonBtn,
-                      dynamicStyles.reasonBtn,
-                      isActive && dynamicStyles.reasonBtnActive,
-                    ]}
-                    onPress={() => setReason(r.key)}
-                    disabled={loading}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={styles.reasonIcon}>{REASON_ICONS[r.key] || '📝'}</Text>
-                    <Text style={[
-                      styles.reasonText,
-                      dynamicStyles.reasonText,
-                      isActive && dynamicStyles.reasonTextActive,
-                      isActive && { fontFamily: 'Roboto-SemiBold' },
-                    ]}>
-                      {r.label}
-                    </Text>
-                    {isActive && (
-                      <View style={[styles.checkMark, { backgroundColor: themeColor }]}>
-                        <Text style={styles.checkMarkText}>✓</Text>
-                      </View>
-                    )}
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-
-            <Text style={[styles.sectionLabel, dynamicStyles.sectionLabel]}>Additional details (optional)</Text>
-            <TextInput
-              keyboardAppearance={isDarkMode ? 'dark' : 'light'}
-              style={[styles.input, dynamicStyles.input]}
-              value={description}
-              onChangeText={setDescription}
-              placeholder="Tell us more about what happened..."
-              placeholderTextColor={colors.placeHolderTextColor}
-              editable={!loading}
-              multiline
-              numberOfLines={3}
-              textAlignVertical="top"
-            />
-
-            {(payload?.canBlock || payload?.canDeleteChat) ? (
-              <View style={styles.optionList}>
-                {payload?.canBlock ? (
-                  <TouchableOpacity
-                    style={styles.optionRow}
-                    onPress={() => setBlockUser(v => !v)}
-                    disabled={loading}
-                    activeOpacity={0.7}
-                  >
-                    <View style={[
-                      styles.optionCheckbox,
-                      { borderColor: blockUser ? themeColor : (isDarkMode ? '#3A4750' : '#CCC') },
-                      blockUser && { backgroundColor: themeColor },
-                    ]}>
-                      {blockUser ? <Text style={styles.optionCheckMark}>✓</Text> : null}
-                    </View>
-                    <Text style={[styles.optionText, dynamicStyles.reasonText]}>Block user after report</Text>
-                  </TouchableOpacity>
-                ) : null}
-                {payload?.canDeleteChat ? (
-                  <TouchableOpacity
-                    style={styles.optionRow}
-                    onPress={() => setDeleteChat(v => !v)}
-                    disabled={loading}
-                    activeOpacity={0.7}
-                  >
-                    <View style={[
-                      styles.optionCheckbox,
-                      { borderColor: deleteChat ? themeColor : (isDarkMode ? '#3A4750' : '#CCC') },
-                      deleteChat && { backgroundColor: themeColor },
-                    ]}>
-                      {deleteChat ? <Text style={styles.optionCheckMark}>✓</Text> : null}
-                    </View>
-                    <Text style={[styles.optionText, dynamicStyles.reasonText]}>Delete chat after report</Text>
-                  </TouchableOpacity>
-                ) : null}
-              </View>
-            ) : null}
-
-            {error ? (
-              <View style={[styles.errorContainer, dynamicStyles.errorContainer]}>
-                <Text style={styles.errorIcon}>⚠</Text>
-                <Text style={styles.errorText}>{error}</Text>
-              </View>
-            ) : null}
-
-            <View style={styles.buttonRow}>
-              <TouchableOpacity
-                style={[styles.cancelBtn, dynamicStyles.cancelBtn]}
-                onPress={() => { onClose() }}
-                disabled={loading}
-                activeOpacity={0.7}
-              >
-                <Text style={[styles.cancelBtnText, dynamicStyles.cancelBtnText]}>Cancel</Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={[
-                  styles.submitBtn,
-                  dynamicStyles.submitBtn,
-                  (!reason || loading) && styles.submitBtnDisabled,
-                ]}
-                onPress={handleSubmit}
-                disabled={loading || !reason}
-                activeOpacity={0.7}
-              >
-                {loading ? (
-                  <ActivityIndicator color="#fff" size="small" />
-                ) : (
-                  <Text style={styles.submitBtnText}>Submit Report</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          </ScrollView>
+          {renderInner(ScrollView, TextInput)}
         </View>
       </KeyboardAvoidingView>
     </Modal>
@@ -345,6 +391,11 @@ export const ReportBottomSheet = ({
 };
 
 const styles = StyleSheet.create({
+  gorhomSheet: {
+    flex: 1,
+    paddingHorizontal: 20,
+    paddingBottom: Platform.OS === 'ios' ? 34 : 20,
+  },
   overlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',

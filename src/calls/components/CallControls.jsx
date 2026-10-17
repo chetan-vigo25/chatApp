@@ -1,8 +1,14 @@
 import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
+import { isAvailable as isIosBroadcastAvailable } from 'expo-screen-broadcast';
+
+// Android captures via MediaProjection; iOS via the ReplayKit broadcast
+// extension (TalksTryScreenShare) — offered only on a build that ships it.
+const SCREEN_SHARE_SUPPORTED = Platform.OS === 'android'
+  || (Platform.OS === 'ios' && isIosBroadcastAvailable());
 
 /**
  * Bottom control card for an active call — WhatsApp style (two rows inside a
@@ -13,8 +19,10 @@ import { useTheme } from '../../contexts/ThemeContext';
  *   video → [ Flip ] [ Camera ] [ Mute ] [ Speaker ] [ End ]
  *           (single compact row, no labels — WhatsApp video-call style)
  *
- * Screen share is temporarily hidden from both layouts (props still accepted
- * so callers don't break) — re-add shareBtn to the rows to bring it back.
+ * Screen share (VIDEO calls only): a chip in the video row. Android captures
+ * with MediaProjection; iOS opens the system broadcast sheet for the
+ * TalksTryScreenShare extension (the user taps Start Broadcast). Receiving a
+ * share works on both.
  *
  * A translucent chip is the idle state; a filled chip is the toggled-active
  * state (muted, speaker on, camera off, sharing). The red round button always
@@ -57,6 +65,7 @@ export default function CallControls({
   micOn,
   cameraOn,
   screenSharing = false,
+  screenShareSupported = SCREEN_SHARE_SUPPORTED,
   speakerOn,
   speakerSupported = true,
   onToggleMic,
@@ -133,6 +142,16 @@ export default function CallControls({
             palette={palette}
             onPress={onToggleCamera}
           />
+          {screenShareSupported && !!onToggleScreenShare && (
+            <CircleButton
+              lib="mci"
+              icon={screenSharing ? 'stop-screen-share' : 'screen-share'}
+              active={screenSharing}
+              compact
+              palette={palette}
+              onPress={onToggleScreenShare}
+            />
+          )}
           {muteBtn(true)}
           {speakerBtn(true)}
           {endBtn(true)}

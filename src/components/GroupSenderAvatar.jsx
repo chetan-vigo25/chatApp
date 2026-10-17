@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Image, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
+import AppImage from './AppImage';
 import { Ionicons } from '@expo/vector-icons';
 import { usePeerProfileName } from '../services/peerProfileNameStore';
 import {
@@ -25,7 +26,7 @@ const GroupSenderAvatar = ({ userId, uri, label, senderName, size = 30, style })
 
   if (photo) {
     return (
-      <Image
+      <AppImage
         source={{ uri: photo }}
         onError={() => setFailedUri(photo)}
         style={[{ width: size, height: size, borderRadius: radius }, style]}

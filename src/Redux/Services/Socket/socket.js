@@ -109,6 +109,10 @@ let pushToken = '';
 // calls and report them to CallKit. Separate from the APNs/FCM `pushToken` used
 // for message/data notifications.
 let voipToken = '';
+// APNs environment this build's VoIP token belongs to ('development' |
+// 'production'), derived from the embedded provisioning profile (see
+// src/utils/voipEnv.js). null = could not be derived reliably -> field omitted.
+let voipEnv = null;
 
 const socketStateSubscribers = new Set();
 const pendingEmitQueue = [];
@@ -357,6 +361,9 @@ const emitDeviceRegister = () => {
     // iOS-only PushKit token for incoming-call VoIP pushes (CallKit). Omitted on
     // Android, where call pushes ride the existing FCM data-message path.
     ...(voipToken ? { voipToken } : {}),
+    // Additive (P-C-11): lets the backend pick the right APNs host first time.
+    // An older backend ignores the unknown field.
+    ...(voipToken && voipEnv ? { voipEnv } : {}),
     deviceInfo: getDeviceInfoPayload(currentDeviceInfo),
   }, (response) => {
     if (response) {
@@ -399,6 +406,22 @@ export const setVoipToken = (token) => {
   voipToken = next;
   if (__DEV__) console.log('📞 VoIP (PushKit) token received', { len: next.length });
   emitDeviceRegister();
+};
+
+// P-C-11: remember which APNs environment the VoIP token belongs to. Re-registers
+// only when a VoIP token is already known (the env then rides along with it).
+export const setVoipEnv = (env) => {
+  const next = env === 'development' || env === 'production' ? env : null;
+  if (next === voipEnv) return;
+  voipEnv = next;
+  if (voipToken) emitDeviceRegister();
+};
+
+// P-C-18: PushKit invalidated the VoIP token (AppDelegate left a note). Stop
+// re-sending the dead token on every reconnect; the replacement arrives through
+// setVoipToken when PushKit issues it. Memory only - nothing is emitted.
+export const clearVoipToken = () => {
+  voipToken = '';
 };
 
 const reconnectSocketWithFreshToken = async ({ accessToken, deviceId }) => {
@@ -1675,4 +1698,6 @@ export default {
   reauthenticateSocket,
   setPushToken,
   setVoipToken,
+  setVoipEnv,
+  clearVoipToken,
 };

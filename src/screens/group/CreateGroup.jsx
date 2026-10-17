@@ -1,8 +1,18 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, Image, TextInput,
-  ActivityIndicator, Animated, StyleSheet, Alert,
-  Platform, ToastAndroid, ScrollView, KeyboardAvoidingView,
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  TextInput,
+  ActivityIndicator,
+  Animated,
+  StyleSheet,
+  Alert,
+  Platform,
+  ToastAndroid,
+  ScrollView,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { useTheme } from '../../contexts/ThemeContext';
 import { Ionicons } from '@expo/vector-icons';
@@ -13,6 +23,7 @@ import { createGroup } from '../../Redux/Reducer/Group/Group.reducer';
 import useUserDirectorySearch from '../../hooks/useUserDirectorySearch';
 import { MIN_DIRECTORY_QUERY } from '../../Redux/Services/Contact/Directory.Services';
 import { hiddenHandleLabel } from '../../services/contactNameStore';
+import AppImage from '../../components/AppImage';
 
 const MAX_MEMBERS = 100;
 
@@ -191,7 +202,7 @@ export default function CreateGroup({ navigation }) {
       >
         <View style={styles.contactAvatarWrap}>
           {profileImage ? (
-            <Image source={{ uri: profileImage }} style={styles.contactAvatar} />
+            <AppImage source={{ uri: profileImage }} style={styles.contactAvatar} />
           ) : (
             <View style={[styles.contactAvatar, { backgroundColor: avatarColor }]}>
               <Text style={styles.contactAvatarText}>{name.charAt(0).toUpperCase()}</Text>
@@ -237,7 +248,7 @@ export default function CreateGroup({ navigation }) {
             return (
               <TouchableOpacity key={c.userId} onPress={() => toggleContact(c)} activeOpacity={0.7} style={styles.selectedChip}>
                 {img ? (
-                  <Image source={{ uri: img }} style={styles.selectedAvatar} />
+                  <AppImage source={{ uri: img }} style={styles.selectedAvatar} />
                 ) : (
                   <View style={[styles.selectedAvatar, { backgroundColor: color }]}>
                     <Text style={styles.selectedAvatarText}>{name.charAt(0).toUpperCase()}</Text>
@@ -404,7 +415,7 @@ export default function CreateGroup({ navigation }) {
               return (
                 <View key={c.userId} style={styles.memberChip}>
                   {img ? (
-                    <Image source={{ uri: img }} style={styles.memberAvatar} />
+                    <AppImage source={{ uri: img }} style={styles.memberAvatar} />
                   ) : (
                     <View style={[styles.memberAvatar, { backgroundColor: color }]}>
                       <Text style={styles.memberAvatarText}>{name.charAt(0).toUpperCase()}</Text>

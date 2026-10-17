@@ -14,6 +14,9 @@ export const ENDPOINTS = {
 export const SOCKET_EVENTS = {
   LINK_REQUEST: 'device:link:request',
   LINK_SUCCESS: 'device:link:success',
+  // Sent by the server once the scanned BROWSER has authenticated and
+  // acknowledged — the moment the link is actually usable on the web side.
+  WEB_READY: 'device:link:web:ready',
   // A linked device logged out / was unlinked elsewhere (e.g. the web session
   // logged out) — the backend broadcasts this to the account's OTHER devices so
   // this list drops it in realtime instead of waiting for a refetch.
@@ -30,6 +33,7 @@ export const ERROR_CODES = {
   INVALID_SIGNATURE: 'INVALID_SIGNATURE',
   MAX_DEVICES_REACHED: 'MAX_DEVICES_REACHED',
   DEVICE_NOT_FOUND: 'DEVICE_NOT_FOUND',
+  BROWSER_ALREADY_LINKED: 'BROWSER_ALREADY_LINKED',
 };
 
 /** Human-readable error messages keyed by error code */
@@ -41,7 +45,11 @@ export const ERROR_MESSAGES = {
   [ERROR_CODES.INVALID_SIGNATURE]: 'Device verification failed. Please try again.',
   [ERROR_CODES.MAX_DEVICES_REACHED]: 'You have reached the maximum of 4 linked devices. Please remove a previous session to link a new one.',
   [ERROR_CODES.DEVICE_NOT_FOUND]: 'Device not found. It may have already been unlinked.',
+  [ERROR_CODES.BROWSER_ALREADY_LINKED]: 'You have already linked this browser. Please select another browser, or remove the existing linked device first.',
 };
+
+/** How long to wait for the browser to finish connecting after the scan (ms) */
+export const WEB_READY_TIMEOUT_MS = 30_000;
 
 /** Linking request timeout in ms */
 export const LINK_TIMEOUT_MS = 10_000;

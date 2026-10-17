@@ -19,7 +19,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { generateKeyPair, signData, storeKeyPair } from '../utils/deviceCrypto';
 import { getDeviceInfo } from '../utils/getDeviceInfo';
 import * as api from '../services/deviceLinkApi';
-import { ERROR_MESSAGES, SOCKET_EVENTS } from '../constants';
+import { ERROR_MESSAGES, SOCKET_EVENTS, WEB_READY_TIMEOUT_MS } from '../constants';
 import { getSocket } from '../../../Redux/Services/Socket/socket';
 
 const TAG = '[DeviceLink]';
@@ -119,6 +119,34 @@ export default function useDeviceLinking() {
     console.log(`${TAG} sessionId:`, sessionId);
     console.log(`${TAG} qrPublicKey (first 80 chars):`, qrPublicKey?.substring(0, 80));
 
+    // Listen for the browser's "I'm connected" signal BEFORE the REST call: it
+    // can land before the REST response does. Resolves true when the browser is
+    // up, false on timeout; true straight away when this phone has no live socket
+    // to hear it on (nothing to wait for — never block on a signal that can't come).
+    let webReady = Promise.resolve(true);
+    let cancelWebReady = () => {};
+    try {
+      const sock = getSocket();
+      if (sock && sock.connected) {
+        webReady = new Promise((resolve) => {
+          let settled = false;
+          const finish = (ok) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { sock.off(SOCKET_EVENTS.WEB_READY, onReady); } catch { /* gone */ }
+            resolve(ok);
+          };
+          const onReady = (d) => {
+            if (!d?.sessionId || String(d.sessionId) === String(sessionId)) finish(true);
+          };
+          const timer = setTimeout(() => finish(false), WEB_READY_TIMEOUT_MS);
+          cancelWebReady = () => finish(true);
+          sock.on(SOCKET_EVENTS.WEB_READY, onReady);
+        });
+      }
+    } catch { /* no socket — skip the wait */ }
+
     try {
       // 1. Generate mobile key pair for signing
       const keyPair = generateKeyPair();
@@ -160,9 +188,19 @@ export default function useDeviceLinking() {
       const tokenData = result?.token || {};
       const socketMeta = result?._socketMeta || {};
 
-      // 8. Store web session tokens if provided (for future reference)
-      if (tokenData.accessToken) {
-        await AsyncStorage.setItem('webLinkedToken', tokenData.accessToken);
+      // 8. The web session token is returned to the caller and NOT stored: it was
+      // once written to plaintext AsyncStorage as 'webLinkedToken' and never read
+      // back. Remove any copy an older build left behind.
+      await AsyncStorage.removeItem('webLinkedToken').catch(() => {});
+
+      // 9. Hold the "Connecting…" loader until the browser is really connected.
+      const browserUp = await webReady;
+      if (!browserUp) {
+        // The phone side is linked but the browser never came up (closed tab,
+        // dead network). Don't leave a ghost device behind or report success.
+        if (userData.deviceId) await api.unlinkDevice(userData.deviceId).catch(() => {});
+        setError('Could not connect to the browser. Reload the web page and scan the new QR code.');
+        return false;
       }
 
       console.log(`${TAG} ---- LINK FLOW SUCCESS ----`);
@@ -179,6 +217,7 @@ export default function useDeviceLinking() {
         platform: deviceInfo.os,
       };
     } catch (err) {
+      cancelWebReady();
       console.log(`${TAG} ---- LINK FLOW ERROR ----`);
       console.log(`${TAG} Error object:`, err);
       console.log(`${TAG} err.message:`, err?.message);
@@ -186,7 +225,7 @@ export default function useDeviceLinking() {
       console.log(`${TAG} err.response?.data:`, JSON.stringify(err?.response?.data, null, 2));
       console.log(`${TAG} err.code:`, err?.code);
 
-      const code = err?.code || err?.response?.data?.code || err?.response?.code;
+      const code = err?.response?.data?.errorCode || err?.errorCode || err?.code || err?.response?.data?.code || err?.response?.code;
       const message = ERROR_MESSAGES[code]
         || err?.message
         || 'Failed to link device. Please try again.';

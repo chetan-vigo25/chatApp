@@ -2,7 +2,6 @@ import React, { useState, useEffect, useCallback } from "react";
 import {
   View,
   Text,
-  Image,
   TouchableOpacity,
   ActivityIndicator,
   Dimensions,
@@ -33,6 +32,7 @@ import useDisplayName from "../../hooks/useDisplayName";
 import { getPeerProfileName } from "../../services/peerProfileNameStore";
 import FadeScrim, { easedStops } from "../../components/FadeScrim";
 import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
+import AppImage from '../../components/AppImage';
 
 const { width } = Dimensions.get('window');
 const HERO_HEIGHT = Math.min(width, 430);
@@ -615,7 +615,7 @@ export default function UserB({ navigation, route }) {
         {/* ─── Hero photo with name overlaid (WhatsApp) ─── */}
         <View style={[styles.hero, { backgroundColor: imageSource ? '#000' : avatarBgColor }]}>
           {imageSource ? (
-            <Image source={imageSource} style={styles.heroImage} resizeMode="cover" />
+            <AppImage source={imageSource} style={styles.heroImage} resizeMode="cover" />
           ) : (
             <View style={styles.heroFallback}>
               {isSavedPeer ? (
@@ -735,7 +735,7 @@ export default function UserB({ navigation, route }) {
                   style={[styles.groupRow, i > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: dividerClr }]}
                 >
                   {g.avatar ? (
-                    <Image source={{ uri: g.avatar }} style={styles.groupAvatar} />
+                    <AppImage source={{ uri: g.avatar }} style={styles.groupAvatar} />
                   ) : (
                     <View style={[styles.groupAvatar, { backgroundColor: themeColor + '22', alignItems: 'center', justifyContent: 'center' }]}>
                       <Ionicons name="people" size={22} color={themeColor} />

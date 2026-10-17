@@ -184,16 +184,13 @@ export default function UsernameEdit({ navigation, route }) {
           style={[
             styles.saveBtn,
             {
-              backgroundColor: theme.colors.primary,
-              // The theme exposes `disabledOpacity`, not a disabled colour —
-              // dim the brand colour rather than inventing a hardcoded grey.
-              opacity: canSave ? 1 : theme.colors.disabledOpacity,
+              backgroundColor: canSave ? theme.colors.primary : theme.colors.disabledSurface,
             },
           ]}
         >
           {saving
             ? <ActivityIndicator size="small" color="#fff" />
-            : <Text style={styles.saveLabel}>Save</Text>}
+            : <Text style={[styles.saveLabel, !canSave && { color: theme.colors.disabledText }]}>Save</Text>}
         </TouchableOpacity>
       </KeyboardAvoidingView>
     </SafeAreaView>

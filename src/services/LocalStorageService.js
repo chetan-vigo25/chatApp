@@ -1,5 +1,7 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { kv } from './kvStorage';
 import * as FileSystem from 'expo-file-system/legacy';
+import { createKeyedSerial } from '../utils/keyedSerial';
+import { candidateMediaPaths } from '../utils/mediaLocalPaths';
 
 const KEY_PREFIX = 'media_v2';
 const KEY_MEDIA_FILES = `${KEY_PREFIX}:media_files`;
@@ -27,6 +29,12 @@ const APP_MEDIA_VIDEOS = `${APP_MEDIA_ROOT}${APP_NAME} Video/`;
 const APP_MEDIA_AUDIO = `${APP_MEDIA_ROOT}${APP_NAME} Audio/`;
 const APP_MEDIA_DOCUMENTS = `${APP_MEDIA_ROOT}${APP_NAME} Documents/`;
 const APP_MEDIA_THUMBNAILS = `${APP_MEDIA_ROOT}.Thumbnails/`;
+
+// Every read-modify-write of one of the media maps runs strictly one after another.
+// upsertMediaFile used to read the whole `media_files` JSON, await an md5 of the file,
+// then write the stale map back — three album tiles finishing together erased each other's
+// records (and a progress tick could overwrite a `completed` queue row with `downloading`).
+const serial = createKeyedSerial();
 
 const safeJsonParse = (raw, fallback) => {
   try {
@@ -64,31 +72,36 @@ class LocalStorageService {
      */
     async hydrateDownloadedMedia() {
       await this.init();
-      const mediaMap = await this._readObject(KEY_MEDIA_FILES);
-      const validMedia = {};
-      let changed = false;
-      for (const [mediaId, record] of Object.entries(mediaMap)) {
-        if (record?.localPath) {
-          try {
-            const info = await FileSystem.getInfoAsync(record.localPath);
-            if (info.exists) {
-              validMedia[mediaId] = record.localPath;
+      return serial(KEY_MEDIA_FILES, async () => {
+        const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+        const validMedia = {};
+        let changed = false;
+        for (const [mediaId, record] of Object.entries(mediaMap)) {
+          if (record?.localPath) {
+            // A stored absolute path can point at a PREVIOUS app container (iOS update /
+            // reinstall / restore) while the file is fine under the current one — re-base
+            // before concluding the file is gone.
+            const live = await this.resolveExistingPath(record.localPath);
+            if (live) {
+              if (live !== record.localPath) {
+                mediaMap[mediaId] = { ...record, localPath: live };
+                changed = true;
+              }
+              validMedia[mediaId] = live;
             } else {
               // Remove stale entry
               delete mediaMap[mediaId];
               changed = true;
             }
-          } catch (err) {
-            delete mediaMap[mediaId];
-            changed = true;
           }
         }
-      }
-      if (changed) {
-        await this._writeObject(KEY_MEDIA_FILES, mediaMap);
-      }
-      return validMedia;
+        if (changed) {
+          await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+        }
+        return validMedia;
+      });
     }
+
   _initialized = false;
 
   async init() {
@@ -102,29 +115,29 @@ class LocalStorageService {
     await ensureDir(APP_MEDIA_THUMBNAILS);
 
     const [mediaRaw, thumbRaw, queueRaw, pendingRaw] = await Promise.all([
-      AsyncStorage.getItem(KEY_MEDIA_FILES),
-      AsyncStorage.getItem(KEY_THUMBNAILS),
-      AsyncStorage.getItem(KEY_DOWNLOAD_QUEUE),
-      AsyncStorage.getItem(KEY_PENDING_UPLOADS),
+      kv.getItem(KEY_MEDIA_FILES),
+      kv.getItem(KEY_THUMBNAILS),
+      kv.getItem(KEY_DOWNLOAD_QUEUE),
+      kv.getItem(KEY_PENDING_UPLOADS),
     ]);
 
-    if (!mediaRaw) await AsyncStorage.setItem(KEY_MEDIA_FILES, JSON.stringify({}));
-    if (!thumbRaw) await AsyncStorage.setItem(KEY_THUMBNAILS, JSON.stringify({}));
-    if (!queueRaw) await AsyncStorage.setItem(KEY_DOWNLOAD_QUEUE, JSON.stringify({}));
-    if (!pendingRaw) await AsyncStorage.setItem(KEY_PENDING_UPLOADS, JSON.stringify({}));
+    if (!mediaRaw) await kv.setItem(KEY_MEDIA_FILES, JSON.stringify({}));
+    if (!thumbRaw) await kv.setItem(KEY_THUMBNAILS, JSON.stringify({}));
+    if (!queueRaw) await kv.setItem(KEY_DOWNLOAD_QUEUE, JSON.stringify({}));
+    if (!pendingRaw) await kv.setItem(KEY_PENDING_UPLOADS, JSON.stringify({}));
 
     this._initialized = true;
   }
 
   async _readObject(key) {
     await this.init();
-    const raw = await AsyncStorage.getItem(key);
+    const raw = await kv.getItem(key);
     return safeJsonParse(raw, {});
   }
 
   async _writeObject(key, value) {
     await this.init();
-    await AsyncStorage.setItem(key, JSON.stringify(value || {}));
+    await kv.setItem(key, JSON.stringify(value || {}));
   }
 
   async getMediaRootByType(messageType) {
@@ -160,43 +173,82 @@ class LocalStorageService {
   }
 
   async upsertMediaFile(record) {
-    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
     const key = String(record?.id || record?.mediaId || record?.serverMessageId || Date.now());
 
+    // The md5 of a whole file can take a while: compute it BEFORE entering the serialized
+    // read-modify-write so progress ticks and other tiles are not queued behind it.
     const incomingFingerprint = record?.localPath
       ? await this._getFileFingerprint(record.localPath)
       : null;
 
-    if (incomingFingerprint) {
-      for (const [existingKey, existingRecord] of Object.entries(mediaMap)) {
-        if (existingKey === key) continue;
-        const existingFingerprint = existingRecord?.fingerprint || null;
-        if (existingFingerprint && existingFingerprint === incomingFingerprint) {
-          mediaMap[key] = {
-            ...(mediaMap[key] || {}),
-            ...existingRecord,
-            ...record,
-            localPath: existingRecord.localPath,
-            fingerprint: incomingFingerprint,
-            mediaId: key,
-            updatedAt: Date.now(),
-          };
-          await this._writeObject(KEY_MEDIA_FILES, mediaMap);
-          return mediaMap[key];
+    return serial(KEY_MEDIA_FILES, async () => {
+      const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+
+      if (incomingFingerprint) {
+        for (const [existingKey, existingRecord] of Object.entries(mediaMap)) {
+          if (existingKey === key) continue;
+          const existingFingerprint = existingRecord?.fingerprint || null;
+          if (existingFingerprint && existingFingerprint === incomingFingerprint) {
+            mediaMap[key] = {
+              ...(mediaMap[key] || {}),
+              ...existingRecord,
+              ...record,
+              localPath: existingRecord.localPath,
+              fingerprint: incomingFingerprint,
+              mediaId: key,
+              updatedAt: Date.now(),
+            };
+            await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+            return mediaMap[key];
+          }
         }
       }
+
+      mediaMap[key] = {
+        ...(mediaMap[key] || {}),
+        ...record,
+        fingerprint: incomingFingerprint || mediaMap[key]?.fingerprint || null,
+        mediaId: key,
+        updatedAt: Date.now(),
+      };
+
+      await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+      return mediaMap[key];
+    });
+  }
+
+  async resolveExistingPath(path) {
+    for (const candidate of candidateMediaPaths(path, FileSystem.documentDirectory)) {
+      try {
+        const info = await FileSystem.getInfoAsync(candidate);
+        if (info?.exists) return candidate;
+      } catch { /* try the next candidate */ }
     }
+    return null;
+  }
 
-    mediaMap[key] = {
-      ...(mediaMap[key] || {}),
-      ...record,
-      fingerprint: incomingFingerprint || mediaMap[key]?.fingerprint || null,
-      mediaId: key,
-      updatedAt: Date.now(),
-    };
+  /** Point an existing record at a new location (re-based path). Never creates a record. */
+  async repointMediaRecord(mediaId, localPath) {
+    if (!mediaId || !localPath) return;
+    const key = String(mediaId);
+    await serial(KEY_MEDIA_FILES, async () => {
+      const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+      if (!mediaMap[key]) return;
+      mediaMap[key] = { ...mediaMap[key], localPath, updatedAt: Date.now() };
+      await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+    });
+  }
 
-    await this._writeObject(KEY_MEDIA_FILES, mediaMap);
-    return mediaMap[key];
+  /** Drop the RECORD of a media whose file is gone (never touches files): the bubble offers a download again. */
+  async forgetMediaRecord(mediaId) {
+    if (!mediaId) return;
+    const key = String(mediaId);
+    await serial(KEY_MEDIA_FILES, async () => {
+      const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+      if (!mediaMap[key]) return;
+      delete mediaMap[key];
+      await this._writeObject(KEY_MEDIA_FILES, mediaMap);
+    });
   }
 
   async getMediaFile(mediaId) {
@@ -290,54 +342,54 @@ class LocalStorageService {
 
   async cleanupOrphanedMedia() {
     await this.init();
-    const mediaMap = await this._readObject(KEY_MEDIA_FILES);
-    const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
-    const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
+    return serial(KEY_MEDIA_FILES, () => serial(KEY_DOWNLOAD_QUEUE, async () => {
+      const mediaMap = await this._readObject(KEY_MEDIA_FILES);
+      const thumbnailMap = await this._readObject(KEY_THUMBNAILS);
+      const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
 
-    let removed = 0;
+      let removed = 0;
 
-    for (const [mediaId, record] of Object.entries(mediaMap)) {
-      const localPath = record?.localPath;
-      if (!localPath) continue;
-      try {
-        const info = await FileSystem.getInfoAsync(localPath);
-        if (!info?.exists) {
+      for (const [mediaId, record] of Object.entries(mediaMap)) {
+        const localPath = record?.localPath;
+        if (!localPath) continue;
+        // Re-base first: a stale iOS container path must not erase the record of a file
+        // that is still on disk under the current container.
+        const live = await this.resolveExistingPath(localPath);
+        if (live) {
+          if (live !== localPath) mediaMap[mediaId] = { ...record, localPath: live };
+        } else {
           delete mediaMap[mediaId];
           delete queueMap[mediaId];
           removed += 1;
         }
-      } catch {
-        delete mediaMap[mediaId];
-        delete queueMap[mediaId];
-        removed += 1;
       }
-    }
 
-    for (const [mediaId, thumb] of Object.entries(thumbnailMap)) {
-      const thumbPath = thumb?.path;
-      if (!thumbPath) {
-        delete thumbnailMap[mediaId];
-        continue;
-      }
-      try {
-        const info = await FileSystem.getInfoAsync(thumbPath);
-        if (!info?.exists) {
+      for (const [mediaId, thumb] of Object.entries(thumbnailMap)) {
+        const thumbPath = thumb?.path;
+        if (!thumbPath) {
+          delete thumbnailMap[mediaId];
+          continue;
+        }
+        try {
+          const info = await FileSystem.getInfoAsync(thumbPath);
+          if (!info?.exists) {
+            delete thumbnailMap[mediaId];
+            removed += 1;
+          }
+        } catch {
           delete thumbnailMap[mediaId];
           removed += 1;
         }
-      } catch {
-        delete thumbnailMap[mediaId];
-        removed += 1;
       }
-    }
 
-    await Promise.all([
-      this._writeObject(KEY_MEDIA_FILES, mediaMap),
-      this._writeObject(KEY_THUMBNAILS, thumbnailMap),
-      this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap),
-    ]);
+      await Promise.all([
+        this._writeObject(KEY_MEDIA_FILES, mediaMap),
+        this._writeObject(KEY_THUMBNAILS, thumbnailMap),
+        this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap),
+      ]);
 
-    return removed;
+      return removed;
+    }));
   }
 
   async clearCache({ clearThumbnails = true, clearFailedQueue = true } = {}) {
@@ -375,6 +427,7 @@ class LocalStorageService {
 
   async enforceStorageQuota(maxBytes = 1024 * 1024 * 1024) {
     await this.init();
+    return serial(KEY_MEDIA_FILES, async () => {
     const mediaMap = await this._readObject(KEY_MEDIA_FILES);
     const records = Object.entries(mediaMap || []).map(([mediaId, record]) => ({
       mediaId,
@@ -414,6 +467,7 @@ class LocalStorageService {
 
     await this._writeObject(KEY_MEDIA_FILES, mediaMap);
     return { evicted, totalBytes: total };
+    });
   }
 
   async getMediaFilesByChat(chatId) {
@@ -442,6 +496,7 @@ class LocalStorageService {
   async removeMediaFile(mediaId) {
     if (!mediaId) return;
     const key = String(mediaId);
+    return serial(KEY_MEDIA_FILES, () => serial(KEY_DOWNLOAD_QUEUE, async () => {
     const mediaMap = await this._readObject(KEY_MEDIA_FILES);
     const thumbnails = await this._readObject(KEY_THUMBNAILS);
     const queue = await this._readObject(KEY_DOWNLOAD_QUEUE);
@@ -471,6 +526,7 @@ class LocalStorageService {
       this._writeObject(KEY_THUMBNAILS, thumbnails),
       this._writeObject(KEY_DOWNLOAD_QUEUE, queue),
     ]);
+    }));
   }
 
   async saveThumbnail(mediaId, sourceUri) {
@@ -547,28 +603,32 @@ class LocalStorageService {
 
   async queueDownload(mediaId, payload = {}) {
     if (!mediaId) return;
-    const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
-    queueMap[String(mediaId)] = {
-      mediaId: String(mediaId),
-      status: 'pending',
-      progress: 0,
-      retries: 0,
-      createdAt: Date.now(),
-      ...payload,
-    };
-    await this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap);
+    await serial(KEY_DOWNLOAD_QUEUE, async () => {
+      const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
+      queueMap[String(mediaId)] = {
+        mediaId: String(mediaId),
+        status: 'pending',
+        progress: 0,
+        retries: 0,
+        createdAt: Date.now(),
+        ...payload,
+      };
+      await this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap);
+    });
   }
 
   async updateDownloadQueue(mediaId, patch = {}) {
     if (!mediaId) return;
     const key = String(mediaId);
-    const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
-    queueMap[key] = {
-      ...(queueMap[key] || { mediaId: key }),
-      ...patch,
-      updatedAt: Date.now(),
-    };
-    await this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap);
+    await serial(KEY_DOWNLOAD_QUEUE, async () => {
+      const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
+      queueMap[key] = {
+        ...(queueMap[key] || { mediaId: key }),
+        ...patch,
+        updatedAt: Date.now(),
+      };
+      await this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap);
+    });
   }
 
   async getDownloadQueueItem(mediaId) {
@@ -596,9 +656,11 @@ class LocalStorageService {
 
   async removeFromDownloadQueue(mediaId) {
     if (!mediaId) return;
-    const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
-    delete queueMap[String(mediaId)];
-    await this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap);
+    await serial(KEY_DOWNLOAD_QUEUE, async () => {
+      const queueMap = await this._readObject(KEY_DOWNLOAD_QUEUE);
+      delete queueMap[String(mediaId)];
+      await this._writeObject(KEY_DOWNLOAD_QUEUE, queueMap);
+    });
   }
 
   async queuePendingUpload(uploadId, payload = {}) {

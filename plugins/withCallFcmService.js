@@ -81,25 +81,28 @@ class ${SERVICE_CLASS} : ReactNativeFirebaseMessagingService() {
       }
       if (data["type"] == "call") {
         val ts = data["ts"]?.toLongOrNull() ?: 0L
-        val fresh = ts <= 0L || (System.currentTimeMillis() - ts) <= STALE_CALL_PUSH_MS
-        if (fresh) {
+        // P-C-16: judged by SERVER-relative time when the app has learned the
+        // clock offset (ExpoCallUiModule.setServerClockOffset); without one the
+        // device clock is only trusted to drop pushes older than 10 minutes, so a
+        // fast phone clock cannot silence live calls.
+        val fresh = ExpoCallUiModule.isFreshCallPush(applicationContext, ts)
+        // P-C-04: signed out / signed in as another user -> do not ring. The marker
+        // is written by JS (setSessionMarker); no recipientId (old server) or no
+        // marker (unknown) rings exactly as before.
+        val ring = ExpoCallUiModule.shouldRingFor(applicationContext, data["recipientId"])
+        if (fresh && ring) {
           ExpoCallUiModule.renderIncoming(applicationContext, data)
         }
-        // Handled natively (or dropped as stale). RN-firebase delivers the message
-        // to JS through its own broadcast receiver independently, so the JS
-        // background handler still runs and merely refreshes the same callId
-        // notification — no duplicate, no double-ring.
+        // Handled natively (or dropped as stale / not for this session). RN-firebase
+        // delivers the message to JS through its own broadcast receiver
+        // independently, so the JS background handler still runs and merely
+        // refreshes the same callId notification — no duplicate, no double-ring.
         return
       }
     } catch (t: Throwable) {
       // Never let a render error swallow a normal message — fall through.
     }
     super.onMessageReceived(remoteMessage)
-  }
-
-  companion object {
-    // A call push older than the ring window is for a dead call — drop it.
-    private const val STALE_CALL_PUSH_MS = 60_000L
   }
 }
 `;

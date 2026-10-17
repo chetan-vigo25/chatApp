@@ -16,7 +16,6 @@ import {
   Text,
   ScrollView,
   TouchableOpacity,
-  Image,
   StyleSheet,
   Platform,
 } from 'react-native';
@@ -29,6 +28,7 @@ import {
 import { useTheme } from '../contexts/ThemeContext';
 import { ensureStatusSocketListeners } from '../services/statusSocketWiring';
 import useContactDirectory from '../hooks/useContactDirectory';
+import AppImage from './AppImage';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -42,7 +42,7 @@ const ITEM_WIDTH    = 72;
 /** Ring avatar with a proper fallback — initial letter (or person glyph) on a
  *  teal disc when there's no profile image. NEVER the app logo. */
 const RingAvatar = ({ uri, name }) => {
-  if (uri) return <Image source={{ uri }} style={styles.avatar} />;
+  if (uri) return <AppImage source={{ uri }} style={styles.avatar} />;
   const trimmed = String(name || '').trim();
   const letter  = /^[a-z]/i.test(trimmed) ? trimmed.charAt(0).toUpperCase() : null;
   return (
@@ -164,7 +164,7 @@ export default function StatusFeedRow({ navigation, style }) {
             {/* Thumbnail preview or + badge */}
             {hasMyStatus && myStatuses[0]?.mediaItems?.[0]?.thumbnailUrl ? (
               <View style={styles.thumbnailBadge}>
-                <Image source={{ uri: myStatuses[0].mediaItems[0].thumbnailUrl }} style={styles.thumbnailImg} />
+                <AppImage source={{ uri: myStatuses[0].mediaItems[0].thumbnailUrl }} style={styles.thumbnailImg} />
               </View>
             ) : (
               <View style={[styles.addBadge, { backgroundColor: theme.colors.themeColor }]}>
@@ -219,7 +219,7 @@ export default function StatusFeedRow({ navigation, style }) {
                 {/* Status-thumbnail badge — same corner preview as "My Status". */}
                 {stThumb ? (
                   <View style={styles.thumbnailBadge}>
-                    <Image source={{ uri: stThumb }} style={styles.thumbnailImg} />
+                    <AppImage source={{ uri: stThumb }} style={styles.thumbnailImg} />
                   </View>
                 ) : null}
                 {/* Unseen count badge */}

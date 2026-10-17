@@ -3,6 +3,9 @@ import { ensureWebrtcGlobals, audioSessionDidActivate, getWebrtc } from './webrt
 import NativeCallingSDK from './NativeCallingSDK';
 import * as AudioRoute from './AudioRoute';
 import * as registry from './streamRegistry';
+import { getCallToken } from '../services/callTokenService';
+import { Platform } from 'react-native';
+import { isAvailable as isIosBroadcastAvailable } from 'expo-screen-broadcast';
 
 /**
  * Native call engine — drop-in replacement for the WebView engine behind the
@@ -116,7 +119,14 @@ class NativeCallEngine {
         }
 
         case CMD.RELEASE_PEER_RING: {
-          if (this._sdk && msg.peerId) this._sdk.releasePendingFrom(msg.peerId);
+          if (this._sdk && msg.peerId) {
+            this._sdk.releasePendingFrom(msg.peerId);
+            // We answered but the media server's ring never reached THIS
+            // device — the lobby routes a userId to the LAST registered socket,
+            // which may be this user's web tab / other device. Re-register so
+            // the caller's next media redial (every 2.5s) lands here.
+            this._sdk.verifyAlive(2500).then((ok) => this._log(`re-registered for a parked accept (${ok ? 'ok' : 'failed'})`));
+          }
           return;
         }
 
@@ -319,6 +329,24 @@ class NativeCallEngine {
         case CMD.STOP_RECORDING:
           return;
 
+        case CMD.APP_CALL_ID: {
+          // Correlation key for joinRoom (server-side recording → CallLog row).
+          this._appCallId = msg.callId ? String(msg.callId) : null;
+          if (this._sdk) this._sdk._appCallId = this._appCallId;
+          return;
+        }
+
+        case CMD.SET_TOKEN: {
+          if (this._sdk && typeof msg.token === 'string' && msg.token.split('.').length === 3) {
+            this._sdk._token = msg.token;
+            this._sdk._tokenStale = false;
+          }
+          if (this._sdk && Array.isArray(msg.iceServers) && msg.iceServers.length) {
+            this._sdk._fallbackIceServers = msg.iceServers;
+          }
+          return;
+        }
+
         default:
           this._log(`unknown command '${String(c)}'`);
       }
@@ -411,7 +439,14 @@ class NativeCallEngine {
     this._log(`connecting to ${url}`);
     const sdk = new NativeCallingSDK({
       url, token, userId, name, iceServers: iceServers || null, onLog: (m) => this._log(m),
+      // Re-mint the join JWT straight from the backend whenever the SDK finds
+      // it near expiry / rejected (see NativeCallingSDK._freshToken).
+      tokenProvider: () => getCallToken({ force: true }).then((r) => {
+        if (r && Array.isArray(r.iceServers) && r.iceServers.length && this._sdk === sdk) sdk._fallbackIceServers = r.iceServers;
+        return r && r.token;
+      }),
     });
+    sdk._appCallId = this._appCallId || null;
     this._sdk = sdk;
     this._wireEvents(sdk);
     Promise.resolve(sdk.connect()).then(() => {
@@ -427,10 +462,12 @@ class NativeCallEngine {
 
   // Whether THIS device can CAPTURE the screen (receiving always works).
   // Android: react-native-webrtc ships getDisplayMedia (MediaProjection).
-  // iOS: needs a ReplayKit broadcast extension the app doesn't bundle.
+  // iOS: getDisplayMedia reads frames from the ReplayKit broadcast extension,
+  // so it also needs a build that ships TalksTryScreenShare.
   _screenShareSupported() {
     const webrtc = getWebrtc();
-    return !!(webrtc && webrtc.mediaDevices && typeof webrtc.mediaDevices.getDisplayMedia === 'function');
+    const api = !!(webrtc && webrtc.mediaDevices && typeof webrtc.mediaDevices.getDisplayMedia === 'function');
+    return api && (Platform.OS !== 'ios' || isIosBroadcastAvailable());
   }
 
   /** Port of the WebView glue's wireEvents() — SDK events → EVT posts. */
@@ -545,6 +582,7 @@ class NativeCallEngine {
       this._post(EVT.CAMERACHANGED, { facingMode: this._localFacing });
     });
 
+    sdk.on('peermedia', (d) => { this._post('peerMedia', d || {}); });
     sdk.on('activespeaker', (data) => {
       this._post('activeSpeaker', { peerId: (data && data.peerId) || null });
     });
@@ -556,6 +594,8 @@ class NativeCallEngine {
     // Mid-call media-layer up/down (network resilience) — RN de-dupes.
     sdk.on('disconnected', (d) => { this._post(EVT.MEDIA_DOWN, { reason: (d && d.reason) || null }); });
     sdk.on('connected', (d) => { this._post(EVT.MEDIA_UP, { reason: (d && d.reason) || null }); });
+    // Periodic quality summary → provider (call-log qualityMetrics).
+    sdk.on('stats', (d) => { this._post('rtcStats', d || {}); });
   }
 
   /** Logout/unmount teardown (CallProvider auth effect). */

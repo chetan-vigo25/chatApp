@@ -1,8 +1,18 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
-  View, Text, ScrollView, Animated, TouchableOpacity, Image,
-  ActivityIndicator, Alert, StyleSheet, TextInput, Platform, KeyboardAvoidingView,
-  LayoutAnimation, UIManager,
+  View,
+  Text,
+  ScrollView,
+  Animated,
+  TouchableOpacity,
+  ActivityIndicator,
+  Alert,
+  StyleSheet,
+  TextInput,
+  Platform,
+  KeyboardAvoidingView,
+  LayoutAnimation,
+  UIManager,
 } from "react-native";
 
 if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
@@ -24,6 +34,7 @@ import { getPhoneRule, isPhoneValid, phoneLengthHint } from "../../utils/phoneVa
 import { APP_TAG_NAME } from '@env';
 import { Ionicons } from '@expo/vector-icons';
 import { formatPhoneNumber } from '../../services/contactNameStore';
+import AppImage from '../../components/AppImage';
 
 const DEBOUNCE_DELAY = 500;
 // Minimum characters before we search by username (system-generated, e.g. "ballu1").
@@ -604,7 +615,7 @@ export default function AddNewContact({ navigation }) {
                 >
                   <View style={[styles.userAvatarRing, { borderColor: accent + '40' }]}>
                     {userAvatar ? (
-                      <Image source={{ uri: userAvatar }} style={styles.userAvatar} />
+                      <AppImage source={{ uri: userAvatar }} style={styles.userAvatar} />
                     ) : (
                       <View style={[styles.userAvatar, styles.userAvatarFallback, { backgroundColor: accent }]}>
                         <Text style={styles.userAvatarLetter}>

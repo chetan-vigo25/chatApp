@@ -37,8 +37,8 @@ const OPS = {
                            ChatDatabase.bulkUpdateStatus(ids, status, extra),
   updateReactions:      ({ messageId, reactions }) =>
                            ChatDatabase.updateReactions(messageId, reactions),
-  updateMessageEdit:    ({ messageId, newText, editedAt }) =>
-                           ChatDatabase.updateMessageEdit(messageId, newText, editedAt),
+  updateMessageEdit:    ({ messageId, newText, editedAt, editVersion }) =>
+                           ChatDatabase.updateMessageEdit(messageId, newText, editedAt, { editVersion }),
   updateMessageViewOnce: ({ messageId, patch }) =>
                            ChatDatabase.updateMessageViewOnce(messageId, patch),
   markMessageDeleted:   ({ messageId, placeholderText, deletedBy }) =>

@@ -141,9 +141,22 @@ export const ringCall = ({ callId, toUserIds, media, isGroup, groupName }) => ne
   sendExactCallLocation(callId);
 });
 
-export const cancelCall = ({ callId, toUserIds }) => {
-  if (__DEV__) console.log('[CALL][APP][signal] → emit call:cancel', { callId, toUserIds });
-  return emitSocketEvent('call:cancel', { callId, toUserIds });
+// Who/why a call ended, for the server's CallTraces (same wire fields as web:
+// endCode / endTrigger / endSource ('user' | 'app_auto') / endMessage / appState).
+const endFields = (cause) => {
+  if (!cause) return {};
+  const out = {};
+  if (cause.code) out.endCode = String(cause.code);
+  if (cause.trigger) out.endTrigger = String(cause.trigger);
+  if (cause.source) out.endSource = String(cause.source);
+  if (cause.message) out.endMessage = String(cause.message).slice(0, 240);
+  if (cause.appState) out.appState = String(cause.appState);
+  return out;
+};
+
+export const cancelCall = ({ callId, toUserIds, cause }) => {
+  if (__DEV__) console.log('[CALL][APP][signal] → emit call:cancel', { callId, toUserIds, cause });
+  return emitSocketEvent('call:cancel', { callId, toUserIds, ...endFields(cause) });
 };
 
 // Emit `call:accept` and resolve with the server ack. The ack matters: the
@@ -165,9 +178,9 @@ export const acceptCallSignal = ({ callId, callerId }) => new Promise((resolve) 
   setTimeout(() => done({ ok: true, timedOut: true }), ACCEPT_ACK_TIMEOUT_MS);
 });
 
-export const rejectCallSignal = ({ callId, callerId }) => {
-  if (__DEV__) console.log('[CALL][APP][signal] → emit call:reject', { callId, callerId });
-  return emitSocketEvent('call:reject', { callId, callerId });
+export const rejectCallSignal = ({ callId, callerId, cause }) => {
+  if (__DEV__) console.log('[CALL][APP][signal] → emit call:reject', { callId, callerId, cause });
+  return emitSocketEvent('call:reject', { callId, callerId, ...endFields(cause) });
 };
 
 // ── Conference (multi-party) signaling ──────────────────────────────────────
@@ -214,9 +227,25 @@ export const conferenceRemove = ({ callId, targetUserId }) =>
 export const conferenceState = ({ callId }) =>
   emitWithAck('call:conference:state', { callId });
 
-export const endCallSignal = ({ callId, otherUserIds }) => {
-  if (__DEV__) console.log('[CALL][APP][signal] → emit call:end', { callId, otherUserIds });
-  return emitSocketEvent('call:end', { callId, otherUserIds });
+export const endCallSignal = ({ callId, otherUserIds, cause }) => {
+  if (__DEV__) console.log('[CALL][APP][signal] → emit call:end', { callId, otherUserIds, cause });
+  return emitSocketEvent('call:end', { callId, otherUserIds, ...endFields(cause) });
+};
+
+// Device ring-ack (F-2, additive). Tell the server this device's ring UI is up
+// so the CALLER can switch "Calling…" → "Ringing…". Socket when we have one;
+// a push-woken device without a live socket uses the REST fallback.
+export const emitRinging = (callId) => {
+  if (!callId) return;
+  emitSocketEvent('call:ringing', { callId: String(callId) });
+};
+export const postRingingAck = async (callId) => {
+  if (!callId) return;
+  try {
+    // Lazy: this runs inside the headless FCM handler — keep its import graph small.
+    const { apiCall } = require('../../Config/Https');
+    await apiCall('post', 'user/call/ringing', { callId: String(callId) }, { silent: true });
+  } catch (_) { /* best-effort: the caller just stays on "Calling…" */ }
 };
 
 // Recovery pull (XR-2 / APP-5). A push-woken / cold-started / just-reconnected
@@ -302,6 +331,12 @@ export const registerCallSignalListeners = (handlers = {}) => {
     'call:conference:ended': wrap('call:conference:ended', handlers.onConferenceEnded),
     // Sent ONLY to a kicked participant — their device tears the call down.
     'call:conference:removed': wrap('call:conference:removed', handlers.onConferenceRemoved),
+    // Backend mints a FRESH media join token for each callee at ring time
+    // (payload: callId, callBaseUrl, token, iceServers). Applied to the engine
+    // in place so the accept never joinRooms on a stale (expired) JWT.
+    'call:prewarm': wrap('call:prewarm', handlers.onPrewarm),
+    // Caller side of the ring-ack: a callee device is really ringing.
+    'call:ringing': wrap('call:ringing', handlers.onRinging),
   };
   if (__DEV__) console.log('[CALL][APP][signal] registered call:* listeners on socket', socket.id || '(no id yet)');
   Object.keys(map).forEach((evt) => socket.on(evt, map[evt]));

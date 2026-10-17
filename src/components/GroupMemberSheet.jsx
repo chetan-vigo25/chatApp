@@ -19,12 +19,20 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Animated, Dimensions, Image, Modal, PanResponder, StyleSheet, Text,
-  TouchableOpacity, View, ScrollView,
+  Animated,
+  Dimensions,
+  Modal,
+  PanResponder,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+  ScrollView,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 import { useTheme } from '../contexts/ThemeContext';
+import AppImage from './AppImage';
 
 const { height: SCREEN_H } = Dimensions.get('window');
 
@@ -149,7 +157,7 @@ export default function GroupMemberSheet({
 
             <TouchableOpacity onPress={after(onViewProfile)} activeOpacity={0.8} style={styles.avatarWrap}>
               {image ? (
-                <Image source={{ uri: image }} style={styles.avatar} />
+                <AppImage source={{ uri: image }} style={styles.avatar} />
               ) : (
                 <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: avatarColor }]}>
                   <Text style={styles.avatarLetter}>{initial}</Text>

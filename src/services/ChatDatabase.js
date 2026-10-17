@@ -2,9 +2,19 @@ import * as SQLite from 'expo-sqlite';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import { isMongoObjectId, sqlIsObjectId, dropAlternateIdTwins } from '../utils/messageIdentity';
+import { upsertWithRetry } from '../utils/catchupChunks';
+import { createEarlyReceiptBuffer, statusAtAck, watermarkTickDecision } from '../utils/receiptStatus';
+import { shouldApplyEdit } from '../utils/messageEditPolicy';
+
+// T-A-01: delivered/seen receipts that arrive before the temp->server id swap
+// match no row. Remembered here (60 s, bounded) by every id they name and
+// replayed, forward-only, when acknowledgeMessage swaps the id. Shared with the
+// open thread via peekEarlyReceipt() so its in-memory row agrees.
+const earlyReceipts = createEarlyReceiptBuffer({ ttlMs: 60000, max: 500 });
+const peekEarlyReceipt = (ids) => earlyReceipts.peek(ids);
 
 const DB_NAME = 'TalksTry.db';
-const DB_VERSION = 15;
+const DB_VERSION = 17;
 
 // Where the destructive recreate stashes pending unsent messages, and where the
 // last init outcome is recorded for telemetry. See _deleteCorruptDB / _recordOutcome.
@@ -797,6 +807,54 @@ const runMigrations = async (db) => {
       }
     }
 
+    // V16: undo blue ticks that were never earned. Older builds (and a server
+    // that let a message's author "read" it / a chat-wide read-all) stored
+    // 'seen' on OUR OWN messages the peer had not read, and the local merge only
+    // ever moves a tick UP — so the wrong blue survived every later sync. The
+    // peer's read watermark (chats.read_up_to_seq) is the proof: an own private
+    // message above it cannot have been seen. The chat-list tick is re-derived
+    // from the message row. True reads are restored by the watermark/receipts on
+    // the next catch-up. Private chats only (group ticks are a server aggregate).
+    if (currentVersion < 16) {
+      try {
+        const raw = await AsyncStorage.getItem('userInfo');
+        const me = raw ? (JSON.parse(raw)?._id || JSON.parse(raw)?.id) : null;
+        if (me) {
+          await db.runAsync(
+            `UPDATE messages SET status = 'delivered'
+             WHERE sender_id = $uid AND status IN ('seen', 'read') AND chat_id LIKE 'u_%'
+               AND (seq IS NULL
+                    OR seq > COALESCE((SELECT read_up_to_seq FROM chats WHERE chats.chat_id = messages.chat_id), 0))`,
+            { $uid: String(me) },
+          );
+          await db.runAsync(
+            `UPDATE chats SET last_message_status = COALESCE(
+               (SELECT m.status FROM messages m
+                 WHERE m.id = chats.last_message_id OR m.server_message_id = chats.last_message_id LIMIT 1),
+               'delivered')
+             WHERE last_message_sender_id = $uid AND last_message_status IN ('seen', 'read')
+               AND chat_id LIKE 'u_%'`,
+            { $uid: String(me) },
+          );
+        }
+      } catch (e) {
+        console.warn('[ChatDB] V16 tick repair skipped:', e?.message);
+      }
+    }
+
+    // V17: edit ordering (message-edit audit E-A-07). Nullable monotonic
+    // `edit_version` from the server's additive `editVersion`; NULL/0 = never
+    // versioned (old server or never edited). Guards every edit applier.
+    if (currentVersion < 17) {
+      try {
+        await db.execAsync(`ALTER TABLE messages ADD COLUMN edit_version INTEGER;`);
+      } catch (e) {
+        if (!/duplicate column/i.test(e?.message || '')) {
+          console.warn('[ChatDB] V17 migration warning:', e?.message);
+        }
+      }
+    }
+
     // The tracking module was removed — drop any leftover queued tracking rows
     // so they are never replayed as location fixes.
     try {
@@ -885,6 +943,7 @@ const rowToMsg = (row) => {
     placeholderText: row.placeholder_text,
     isEdited: Boolean(row.is_edited),
     editedAt: row.edited_at,
+    editVersion: row.edit_version != null ? Number(row.edit_version) : 0,
     mediaUrl: row.media_url,
     mediaType: row.media_type,
     previewUrl: row.preview_url,
@@ -1012,6 +1071,18 @@ const cleanBeforeUpsert = async (db, msg) => {
   //    `_id` rather than `mongoId`.
   const altMongoId = msg.mongoId || msg._id;
   if (altMongoId && isMongoObjectId(altMongoId) && String(altMongoId) !== String(id)) {
+    // The row about to be deleted may be the one that carries the DOWNLOADED FILE
+    // (`local_uri`): hand it over to the incoming message, or the bubble forgets that
+    // the media is on this device and shows the download button again.
+    if (!msg.localUri) {
+      try {
+        const doomed = await db.getFirstAsync(
+          `SELECT local_uri FROM messages WHERE (id = $alt OR server_message_id = $alt) AND id != $id AND local_uri IS NOT NULL AND local_uri != '' LIMIT 1`,
+          { $alt: String(altMongoId), $id: id }
+        );
+        if (doomed?.local_uri) msg.localUri = doomed.local_uri;
+      } catch {}
+    }
     await db.runAsync(
       `DELETE FROM messages WHERE (id = $alt OR server_message_id = $alt) AND id != $id`,
       { $alt: String(altMongoId), $id: id }
@@ -1303,16 +1374,34 @@ const _runCacheWrite = async (label, task, { attempts = 6, bypassSeal = false } 
   console.warn(`[ChatDB] ${label} failed:`, lastErr?.message);
 };
 
+// Stable identity of a message for per-row outcome reporting (same precedence
+// _runInsert uses to pick the primary key).
+const _upsertKey = (m) => m?.serverMessageId || m?.id || m?.tempId || null;
+
+// Bounded in-line retry of rows that failed inside a committed batch (lock
+// contention that outlasts the 25ms yield). Total extra passes, not per row.
+const UPSERT_ROW_RETRY_PASSES = 2;
+
+/**
+ * Upsert a batch of messages. Never throws (old callers rely on that) but now
+ * REPORTS what happened: resolves `{ committedIds, failedIds }`.
+ *  - committedIds: ids written (or deliberately skipped: delete-for-me /
+ *    alternate-id twin — nothing left to retry for those).
+ *  - failedIds: ids that are NOT in SQLite after the bounded in-line retries.
+ * A sealed write (account switch) resolves `undefined`; callers must treat
+ * that as "nothing committed". Callers that ignore the return keep working.
+ */
 const upsertMessages = async (messages) => {
-  if (!Array.isArray(messages) || messages.length === 0) return;
+  if (!Array.isArray(messages) || messages.length === 0) return { committedIds: [], failedIds: [] };
 
   // Ensure the delete-for-me registry is warm so _runUpsertBatch can filter
   // resurrected rows synchronously inside the transaction.
   await ensureDeletedForMeLoaded();
 
-  const run = async () => {
-    const db = await getDB();
-
+  // One transactional pass over `msgs`. Resolves { committed:[msg], failed:[msg] };
+  // a batch-level (transaction) failure rolls everything back, so ALL of `msgs`
+  // are reported failed for that pass.
+  const writePass = async (db, msgs) => {
     // Prefer the EXCLUSIVE transaction wrapper: it runs on a dedicated connection
     // and queues all other DB access for the transaction's duration, so the
     // high-frequency single-statement writers (delivery receipts / message-status
@@ -1324,42 +1413,61 @@ const upsertMessages = async (messages) => {
     if (typeof db.withExclusiveTransactionAsync === 'function') {
       for (let i = 1; i <= 4; i++) {
         try {
+          let out = null;
           await db.withExclusiveTransactionAsync(async (tx) => {
-            await _runUpsertBatch(tx, messages);
+            out = await _runUpsertBatch(tx, msgs);
           });
-          return;
+          return out || { committed: [], failed: msgs };
         } catch (err) {
           if (isTransientLockError(err) && i < 4) {
             await new Promise((r) => setTimeout(r, 60 * i));
             continue;
           }
           console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
-          return;
+          return { committed: [], failed: msgs };
         }
       }
-      return;
+      return { committed: [], failed: msgs };
     }
 
     if (typeof db.withTransactionAsync === 'function') {
       try {
+        let out = null;
         await db.withTransactionAsync(async () => {
-          await _runUpsertBatch(db, messages);
+          out = await _runUpsertBatch(db, msgs);
         });
+        return out || { committed: [], failed: msgs };
       } catch (err) {
         console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
+        return { committed: [], failed: msgs };
       }
-      return;
     }
 
     // Fallback for older expo-sqlite: manual BEGIN/COMMIT
     await db.execAsync('BEGIN TRANSACTION');
     try {
-      await _runUpsertBatch(db, messages);
+      const out = await _runUpsertBatch(db, msgs);
       await db.execAsync('COMMIT');
+      return out;
     } catch (err) {
       await db.execAsync('ROLLBACK').catch(() => {});
       console.warn('[ChatDB] upsertMessages transaction error:', err?.message);
+      return { committed: [], failed: msgs };
     }
+  };
+
+  const run = async () => {
+    const db = await getDB();
+    const out = await upsertWithRetry((msgs) => writePass(db, msgs), messages, {
+      retryPasses: UPSERT_ROW_RETRY_PASSES,
+      keyOf: _upsertKey,
+    });
+    if (out.failedIds.length) {
+      // A row that still failed after the retries is NOT in SQLite. It is reported
+      // to the caller (which must not advance past it / ack it), never swallowed.
+      console.warn(`[ChatDB] upsertMessages: ${out.failedIds.length} row(s) not committed after retries`);
+    }
+    return out;
   };
 
   // Serialize against every other write batch (status feed, broadcasts, …) too,
@@ -1370,10 +1478,12 @@ const upsertMessages = async (messages) => {
 };
 
 const _runUpsertBatch = async (db, messages) => {
+  const committed = [];
+  const failed = [];
   for (const msg of messages) {
     try {
         // Anti-resurrection: never re-insert a message the user delete-for-me'd.
-        if (isDeletedForMe(msg.serverMessageId, msg.id, msg.tempId)) continue;
+        if (isDeletedForMe(msg.serverMessageId, msg.id, msg.tempId)) { committed.push(msg); continue; }
         // Same 5-step flow as upsertMessage
         let replyData = null;
         const needsRecovery = !msg.replyToMessageId || (msg.replyToMessageId && !msg.replyPreviewText);
@@ -1404,7 +1514,7 @@ const _runUpsertBatch = async (db, messages) => {
           : msg;
         // 'alternate': this is the Mongo-_id copy of a message already stored
         // under its UUID — writing it would re-create the duplicate bubble.
-        if (await cleanBeforeUpsert(db, finalMsg) === 'alternate') continue;
+        if (await cleanBeforeUpsert(db, finalMsg) === 'alternate') { committed.push(msg); continue; }
         const merged = await _preserveLocalState(db, finalMsg);
         const writeMsg = merged || finalMsg;
         await _runInsert(db, writeMsg);
@@ -1416,19 +1526,23 @@ const _runUpsertBatch = async (db, messages) => {
             try { await saveReplyData(rid, writeMsg, db); } catch {}
           }
         }
+        committed.push(msg);
     } catch (err) {
       // A transient lock/busy/finalize rejection mid-transaction is recoverable
-      // once the contending statement drains; downgrade to a quiet yield-and-skip
-      // so it stops surfacing as a red warning (the message is re-upserted on the
-      // next sync/ack anyway). Only genuinely unexpected errors are warned.
+      // once the contending statement drains; downgrade to a quiet yield. The row
+      // is reported FAILED (not "re-upserted on the next sync" — a later committed
+      // seq moves the derived cursor past it), so upsertMessages retries it in-line
+      // and the caller holds its cursor/receipt if it still fails.
       if (isTransientLockError(err)) {
         // brief yield gives the busy writer time to finalize before we move on
         await new Promise((r) => setTimeout(r, 25));
-        continue;
+      } else {
+        console.warn('[ChatDB] upsertMessages row error:', err?.message);
       }
-      console.warn('[ChatDB] upsertMessages row error:', err?.message);
+      failed.push(msg);
     }
   }
+  return { committed, failed };
 };
 
 // Call-log render fields from a payload and/or wire `callDetails`, or null when
@@ -1776,6 +1890,17 @@ const _runInsert = async (db, msg, _retried = false) => {
 
   try {
     await runSQL();
+    // Keep the highest known edit version (E-A-07); a separate statement so the
+    // two large upserts above stay untouched.
+    const ev = Number(msg.editVersion);
+    if (Number.isFinite(ev) && ev > 0) {
+      try {
+        await db.runAsync(
+          `UPDATE messages SET edit_version = MAX(COALESCE(edit_version, 0), $v) WHERE id = $id`,
+          { $v: ev, $id: id },
+        );
+      } catch {}
+    }
   } catch (err) {
     // Handle unique constraint violation on server_message_id:
     // Another row with the same server_message_id but different id exists
@@ -2086,9 +2211,32 @@ const acknowledgeMessage = async (tempId, serverMessageId, seq = null) => {
   const tempPayload = tempRow ? parseJSON(tempRow.payload) : null;
   const isScheduledMsg = tempRow?.status === 'scheduled' || tempRow?.status === 'processing' || tempPayload?.isScheduled;
   const pickHigher = (a, b) => ((STATUS_PRIORITY[a] || 0) >= (STATUS_PRIORITY[b] || 0) ? a : b);
-  const ackStatus = isScheduledMsg
+  let ackStatus = isScheduledMsg
     ? (tempRow?.status || 'scheduled')
     : pickHigher(pickHigher(tempRow?.status || 'sent', serverRow?.status || 'sent'), 'sent');
+  // T-A-01: lift the ack status with a receipt that beat the ack, and with the
+  // stored peer watermark when it already covers this seq (forward-only).
+  if (!isScheduledMsg) {
+    try {
+      const early = earlyReceipts.peek([serverMessageId, tempId, tempRow?.id]);
+      const _seq = Number(seq);
+      let wm = null;
+      if (Number.isFinite(_seq) && _seq > 0) {
+        const cidRow = await db.getFirstAsync(
+          `SELECT c.read_up_to_seq AS r, c.delivered_up_to_seq AS d
+             FROM messages m JOIN chats c ON c.chat_id = m.chat_id
+            WHERE (m.id = $t OR m.temp_id = $t OR m.id = $s OR m.server_message_id = $s) AND COALESCE(c.is_group, 0) = 0 LIMIT 1`,
+          { $t: tempId, $s: serverMessageId }
+        );
+        if (cidRow) wm = cidRow;
+      }
+      const lifted = statusAtAck({
+        stored: ackStatus, early, seq,
+        readUpToSeq: wm?.r || 0, deliveredUpToSeq: wm?.d || 0,
+      });
+      if (lifted && (STATUS_PRIORITY[lifted] || 0) > (STATUS_PRIORITY[ackStatus] || 0)) ackStatus = lifted;
+    } catch {}
+  }
 
   if (serverRow && tempRow && serverRow.id !== tempRow.id) {
     // Rescue reactions from temp row before it gets deleted
@@ -2159,6 +2307,41 @@ const acknowledgeMessage = async (tempId, serverMessageId, seq = null) => {
       );
     } catch {}
   }
+  // T-A-01/03: (a) when the server row survived the swap (echo upsert won), lift
+  // its status forward-only to the ack status; (b) the chat row's stored last
+  // message id was written with the TEMP id at send time and receipts carry the
+  // server id: swap it, and lift its tick forward-only.
+  try {
+    const ap = STATUS_PRIORITY[ackStatus] || 0;
+    if (ap > STATUS_PRIORITY.sent) {
+      const lowerSt = Object.entries(STATUS_PRIORITY).filter(([, p]) => p > 0 && p < ap).map(([k]) => k);
+      const ph = lowerSt.map(() => '?').join(',');
+      await db.runAsync(
+        `UPDATE messages SET status = ? WHERE (id = ? OR server_message_id = ?) AND status IN (${ph})`,
+        [ackStatus, serverMessageId, serverMessageId, ...lowerSt]
+      );
+    }
+    const chatRef = await db.getFirstAsync(
+      `SELECT chat_id FROM messages WHERE id = $s OR server_message_id = $s LIMIT 1`,
+      { $s: serverMessageId }
+    );
+    if (chatRef?.chat_id) {
+      await db.runAsync(
+        `UPDATE chats SET last_message_id = $s WHERE chat_id = $cid AND last_message_id IN ($t, $tid)`,
+        { $s: serverMessageId, $cid: chatRef.chat_id, $t: String(tempId), $tid: String(tempRow?.id || tempId) }
+      );
+      const chatTick = ap >= STATUS_PRIORITY.seen ? 'seen' : (ap >= STATUS_PRIORITY.delivered ? 'delivered' : null);
+      if (chatTick) {
+        const lowerChat = chatTick === 'seen' ? ['sent', 'delivered'] : ['sent'];
+        const ph2 = lowerChat.map(() => '?').join(',');
+        await db.runAsync(
+          `UPDATE chats SET last_message_status = ?, updated_at = ?
+            WHERE chat_id = ? AND last_message_id = ? AND last_message_status IN (${ph2})`,
+          [chatTick, Date.now(), chatRef.chat_id, serverMessageId, ...lowerChat]
+        );
+      }
+    }
+  } catch {}
   // NUCLEAR CLEANUP: after acknowledge, delete ALL remaining temp rows that could
   // be orphans of this same message (matched by sender + text + timestamp).
   // This catches stale temp rows re-created by saveMessagesToLocal race conditions.
@@ -2223,6 +2406,10 @@ const _flushStatusBuffer = async () => {
         const lower = Object.entries(STATUS_PRIORITY)
           .filter(([, p]) => p > 0 && p < tp)
           .map(([s]) => s);
+        // T-A-12: a retry ('sending') may lift a row out of 'failed' so a stale
+        // red icon does not survive a re-read. Receipts (rank >= sent) never
+        // touch 'failed' here.
+        if (status === 'sending' || status === 'queued') lower.push('failed');
         if (!lower.length) continue;
         const CHUNK = 200; // keep bound SQLite variable count sane
         for (let i = 0; i < ids.length; i += CHUNK) {
@@ -2255,10 +2442,20 @@ const updateMessageStatus = async (messageId, newStatus) => {
   // not part of the monotonic forward chain, so write it directly (serialized),
   // bypassing the coalescer. Rare path (e.g. marking a send failed).
   if (np <= 0) {
+    // T-A-12: 'failed' must never downgrade a row the server already accepted
+    // (sent/delivered/seen, or carrying a server id): a late send-failure from
+    // a duplicate path was flipping delivered rows red.
+    const guardFailed = newStatus === 'failed';
+    if (guardFailed) {
+      // a buffered retry/send write must not resurrect the row after this
+      const buffered = _statusBuffer.get(String(messageId));
+      if (buffered && (STATUS_PRIORITY[buffered] || 0) <= STATUS_PRIORITY.sending) _statusBuffer.delete(String(messageId));
+    }
     return runExclusive(async () => {
       const db = await getDB();
       await db.runAsync(
-        `UPDATE messages SET status = $s WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+        `UPDATE messages SET status = $s WHERE (id = $id OR server_message_id = $id OR temp_id = $id)
+         ${guardFailed ? `AND status NOT IN ('sent','delivered','seen','read') AND (server_message_id IS NULL OR server_message_id = '')` : ''}`,
         { $s: newStatus, $id: String(messageId) }
       );
       return true;
@@ -2266,6 +2463,8 @@ const updateMessageStatus = async (messageId, newStatus) => {
   }
 
   const key = String(messageId);
+  // T-A-01: remember delivered/seen so an ack that lands later can replay it.
+  if (np >= STATUS_PRIORITY.delivered) earlyReceipts.record(key, newStatus);
   const prev = _statusBuffer.get(key);
   if (!prev || (STATUS_PRIORITY[prev] || 0) < np) {
     _statusBuffer.set(key, newStatus); // keep only the highest-rank target
@@ -2284,10 +2483,46 @@ const updateMessageStatus = async (messageId, newStatus) => {
   return true;
 };
 
-// Bulk-mark all outgoing (sent/delivered) messages in a chat as 'seen' (blue tick)
-// Called when the peer reads everything — e.g. message:read:all:ack arrives.
-const updateAllSentMessagesInChatToSeen = async (chatId, myUserId) => {
+// Chat-list tick follows the LAST MESSAGE ROW: bump chats.last_message_status
+// to 'seen' only when that very message is now seen (a bounded read must not
+// turn the preview tick blue for a newer, unread last message).
+const _syncChatLastStatusSeen = async (db, chatId) => {
+  await db.runAsync(
+    `UPDATE chats SET last_message_status = 'seen', updated_at = $n
+     WHERE chat_id = $cid AND last_message_status IN ('sent', 'delivered')
+       AND EXISTS (SELECT 1 FROM messages m
+                   WHERE m.chat_id = $cid AND m.status IN ('seen', 'read')
+                     AND (m.id = chats.last_message_id OR m.server_message_id = chats.last_message_id))`,
+    { $n: Date.now(), $cid: chatId }
+  );
+};
+
+// Bulk-mark outgoing (sent/delivered) messages in a chat as 'seen' (blue tick)
+// Called when the peer reads the chat — e.g. message:read:all:ack arrives.
+//
+// ALWAYS BOUNDED: an unbounded UPDATE here turned messages the peer had never
+// seen (sent after the read) blue. The bound, in order of preference:
+//   1. bound.upToSeq        — event carried readUpToSeq        → seq <= it
+//   2. bound.upToTimestamp  — event carried its own time        → timestamp <= it
+//   3. the stored peer read watermark (chats.read_up_to_seq)    → seq <= it
+// With none of those available nothing is marked; the message:read:upto
+// watermark (applyPeerWatermarkToOwnMessages) catches the rows up when it lands.
+const updateAllSentMessagesInChatToSeen = async (chatId, myUserId, bound = {}) => {
   if (!chatId || !myUserId) return 0;
+  const upToSeq = Number(bound?.upToSeq);
+  const upToTs = Number(bound?.upToTimestamp);
+  let boundSql;
+  const params = { $cid: chatId, $uid: myUserId };
+  if (Number.isFinite(upToSeq) && upToSeq > 0) {
+    boundSql = 'AND seq IS NOT NULL AND seq <= $bseq';
+    params.$bseq = upToSeq;
+  } else if (Number.isFinite(upToTs) && upToTs > 0) {
+    boundSql = 'AND timestamp <= $bts';
+    params.$bts = upToTs;
+  } else {
+    boundSql = `AND seq IS NOT NULL
+                AND seq <= COALESCE((SELECT read_up_to_seq FROM chats WHERE chat_id = $cid), 0)`;
+  }
   // Serialize through the global write mutex. This is a high-frequency single
   // statement writer (fires on every message:read:all:ack); run bare it raced the
   // exclusive-transaction batch writers (upsertMessages / status feed / presence)
@@ -2301,13 +2536,58 @@ const updateAllSentMessagesInChatToSeen = async (chatId, myUserId) => {
          WHERE chat_id = $cid
            AND sender_id = $uid
            AND status IN ('sent', 'delivered')
-           AND (is_deleted = 0 OR is_deleted IS NULL)`,
-        { $cid: chatId, $uid: myUserId }
+           AND (is_deleted = 0 OR is_deleted IS NULL)
+           ${boundSql}`,
+        params
       );
+      if (result?.changes) await _syncChatLastStatusSeen(db, chatId);
       return result?.changes || 0;
     });
   } catch (err) {
     console.warn('[ChatDB] updateAllSentMessagesInChatToSeen error:', err?.message);
+    return 0;
+  }
+};
+
+// Apply the peer's read/delivered watermark to OUR outgoing rows (monotonic:
+// sent -> delivered -> seen only, never backwards). Rows with seq <= readUpTo
+// become 'seen'; rows with seq <= deliveredUpTo become 'delivered'.
+const applyPeerWatermarkToOwnMessages = async (chatId, myUserId, readUpToSeq, deliveredUpToSeq) => {
+  if (!chatId || !myUserId) return 0;
+  const r = Number(readUpToSeq) || 0;
+  const d = Number(deliveredUpToSeq) || 0;
+  if (r <= 0 && d <= 0) return 0;
+  try {
+    return await runExclusive(async () => {
+      const db = await getDB();
+      let changes = 0;
+      if (r > 0) {
+        const res = await db.runAsync(
+          `UPDATE messages SET status = 'seen'
+           WHERE chat_id = $cid AND sender_id = $uid
+             AND status IN ('sent', 'delivered')
+             AND seq IS NOT NULL AND seq <= $r
+             AND (is_deleted = 0 OR is_deleted IS NULL)`,
+          { $cid: chatId, $uid: myUserId, $r: r }
+        );
+        changes += res?.changes || 0;
+        if (res?.changes) await _syncChatLastStatusSeen(db, chatId);
+      }
+      if (d > 0) {
+        const res = await db.runAsync(
+          `UPDATE messages SET status = 'delivered'
+           WHERE chat_id = $cid AND sender_id = $uid
+             AND status = 'sent'
+             AND seq IS NOT NULL AND seq <= $d
+             AND (is_deleted = 0 OR is_deleted IS NULL)`,
+          { $cid: chatId, $uid: myUserId, $d: d }
+        );
+        changes += res?.changes || 0;
+      }
+      return changes;
+    });
+  } catch (err) {
+    console.warn('[ChatDB] applyPeerWatermarkToOwnMessages error:', err?.message);
     return 0;
   }
 };
@@ -2465,14 +2745,45 @@ const updateReactions = async (messageId, reactions) => {
   });
 };
 
-const updateMessageEdit = async (messageId, newText, editedAt) => {
-  if (!messageId || !newText) return;
+// Apply an edit to a stored row.
+//  - Guarded (default): only when the incoming edit is newer than what is stored
+//    (editVersion, then editedAt - see shouldApplyEdit). Returns true if applied.
+//  - opts.force: local optimistic write / rollback, bypasses the guard.
+//  - opts.isEdited (force only): false restores an un-edited row (edited_at NULL).
+//  - opts.editVersion: the server's version, stored with the text.
+const updateMessageEdit = async (messageId, newText, editedAt, opts = {}) => {
+  if (!messageId || !newText) return false;
   try {
-    await runExclusive(async () => {
+    return await runExclusive(async () => {
       const db = await getDB();
-      await db.runAsync(`UPDATE messages SET text = $t, is_edited = 1, edited_at = $e WHERE id = $id OR server_message_id = $id OR temp_id = $id`, { $id: messageId, $t: newText, $e: editedAt || new Date().toISOString() });
+      const where = `id = $id OR server_message_id = $id OR temp_id = $id`;
+      const ev = Number(opts.editVersion);
+      const hasVer = opts.editVersion != null && Number.isFinite(ev);
+      if (!opts.force) {
+        const row = await db.getFirstAsync(
+          `SELECT edit_version, edited_at, is_edited FROM messages WHERE ${where} LIMIT 1`,
+          { $id: messageId },
+        );
+        if (!row) return false;
+        if (row.is_edited && !shouldApplyEdit(
+          { editVersion: row.edit_version, editedAt: row.edited_at },
+          { editVersion: hasVer ? ev : null, editedAt: editedAt || null },
+        )) return false;
+      }
+      const restoreUnedited = opts.force && opts.isEdited === false;
+      await db.runAsync(
+        `UPDATE messages SET text = $t, is_edited = $ie, edited_at = $e${hasVer ? ', edit_version = $v' : ''} WHERE ${where}`,
+        {
+          $id: messageId,
+          $t: newText,
+          $ie: restoreUnedited ? 0 : 1,
+          $e: restoreUnedited ? null : (editedAt || new Date().toISOString()),
+          ...(hasVer ? { $v: ev } : {}),
+        },
+      );
+      return true;
     });
-  } catch (err) { console.warn('[ChatDB] updateMessageEdit error:', err); }
+  } catch (err) { console.warn('[ChatDB] updateMessageEdit error:', err); return false; }
 };
 
 // View Once — merge a status patch into the row's payload.viewOnce (the
@@ -2515,6 +2826,24 @@ const updateMessageMediaUrl = async (messageId, { mediaUrl = null, mediaThumbnai
       await db.runAsync(`UPDATE messages SET ${u.join(', ')} WHERE id = $id OR server_message_id = $id OR temp_id = $id`, p);
     });
   } catch (err) { console.warn('[ChatDB] updateMessageMediaUrl error:', err?.message); }
+};
+
+/**
+ * Set (uri) or clear (null) the local file a message's media is stored at. Used when a render-time
+ * check finds the stored path stale (re-based after an iOS container change) or the file gone —
+ * the generic upsert keeps the OLD value (`COALESCE($local_uri, local_uri)`), so it cannot clear it.
+ */
+const setMessageLocalUri = async (messageId, uri = null) => {
+  if (!messageId) return;
+  try {
+    await runExclusive(async () => {
+      const db = await getDB();
+      await db.runAsync(
+        `UPDATE messages SET local_uri = $u WHERE id = $id OR server_message_id = $id OR temp_id = $id`,
+        { $id: String(messageId), $u: uri || null }
+      );
+    });
+  } catch (err) { console.warn('[ChatDB] setMessageLocalUri error:', err?.message); }
 };
 
 const clearChat = async (chatId, clearedAt = null) => {
@@ -2570,6 +2899,55 @@ const updateGroupMessageTracking = async (messageId, { deliveredTo, readBy } = {
     const db = await getDB();
     await db.runAsync(`UPDATE messages SET ${u.join(', ')} WHERE id = $id OR server_message_id = $id OR temp_id = $id`, p);
   });
+};
+
+// T-A-04: persist ONE group receipt onto OUR OWN message rows from the global
+// socket layer (no mounted thread needed). Forward-only on every axis:
+//  - per-member maps (delivered_to / read_by) only gain keys, never lose or change;
+//  - the row's tick moves only to the server's all-recipients aggregate status
+//    ('delivered' | 'seen'), only upward, and only for rows WE sent (a room-wide
+//    read broadcast must never touch a message somebody else sent).
+// kind: 'delivered' | 'read'. Returns the number of rows touched.
+const applyGroupReceipt = async ({ messageIds, myUserId, userId, kind, at, aggregateStatus } = {}) => {
+  const ids = (Array.isArray(messageIds) ? messageIds : []).filter(Boolean).map(String).slice(0, 200);
+  if (!ids.length || !myUserId) return 0;
+  const aggTarget = aggregateStatus === 'read' || aggregateStatus === 'seen' ? 'seen'
+    : (aggregateStatus === 'delivered' ? 'delivered' : null);
+  const field = kind === 'read' ? 'read_by' : 'delivered_to';
+  try {
+    return await runExclusive(async () => {
+      const db = await getDB();
+      let touched = 0;
+      for (const id of ids) {
+        const row = await db.getFirstAsync(
+          `SELECT id, sender_id, status, delivered_to, read_by FROM messages
+            WHERE id = $id OR server_message_id = $id OR temp_id = $id LIMIT 1`,
+          { $id: id }
+        );
+        if (!row || String(row.sender_id) !== String(myUserId)) continue;
+        const sets = []; const params = { $rid: row.id };
+        if (userId) {
+          const cur = parseJSON(row[field]);
+          const map = cur && typeof cur === 'object' && !Array.isArray(cur) ? cur : {};
+          if (!map[userId]) {
+            map[userId] = at || new Date().toISOString();
+            sets.push(`${field} = $map`); params.$map = JSON.stringify(map);
+          }
+        }
+        if (aggTarget && !['failed', 'scheduled', 'processing', 'cancelled'].includes(row.status)
+            && (STATUS_PRIORITY[aggTarget] || 0) > (STATUS_PRIORITY[row.status] || 0)) {
+          sets.push('status = $st'); params.$st = aggTarget;
+        }
+        if (!sets.length) continue;
+        await db.runAsync(`UPDATE messages SET ${sets.join(', ')} WHERE id = $rid`, params);
+        touched += 1;
+      }
+      return touched;
+    });
+  } catch (err) {
+    console.warn('[ChatDB] applyGroupReceipt error:', err?.message);
+    return 0;
+  }
 };
 
 const searchMessages = async (chatId, query, limit = 50) => {
@@ -2719,6 +3097,41 @@ const getAllChatIds = async () => {
   } catch (_) {
     return [];
   }
+};
+
+// chatId -> last activity (ms), newest message time known locally (messages
+// table, with the chats-row preview time as a floor). Orders the catch-up so a
+// user with >100 chats syncs the live ones first. Best-effort: {} on failure.
+const getChatActivityMap = async () => {
+  const out = {};
+  try {
+    const db = await getDB();
+    const rows = await db.getAllAsync(
+      `SELECT chat_id, MAX(timestamp) AS t FROM messages WHERE chat_id IS NOT NULL AND chat_id != '' GROUP BY chat_id`
+    );
+    for (const r of rows || []) out[r.chat_id] = Number(r.t) || 0;
+    const chatRows = await db.getAllAsync(`SELECT chat_id, last_message_at FROM chats WHERE last_message_at IS NOT NULL`);
+    for (const r of chatRows || []) {
+      const raw = r.last_message_at;
+      const t = /^\d+$/.test(String(raw)) ? Number(raw) : Date.parse(raw);
+      if (Number.isFinite(t) && t > (out[r.chat_id] || 0)) out[r.chat_id] = t;
+    }
+  } catch (_) { /* ordering only */ }
+  return out;
+};
+
+// Oldest local message time for a chat (0 = none) — lower bound for the
+// mutation-cursor seed (a held message can't be mutated before it existed).
+const getOldestMessageTimestamp = async (chatId) => {
+  if (!chatId) return 0;
+  try {
+    const db = await getDB();
+    const r = await db.getFirstAsync(
+      `SELECT MIN(timestamp) AS t FROM messages WHERE chat_id = $c AND timestamp > 0 AND id NOT LIKE 'temp_%'`,
+      { $c: chatId }
+    );
+    return Number(r?.t || 0);
+  } catch (_) { return 0; }
 };
 
 const deduplicateChat = async (chatId) => {
@@ -3130,6 +3543,25 @@ const getPeerIdentity = async (userId) => {
 // but rounded to the three states the chat list cares about.
 const CHAT_STATUS_PRIORITY = { sent: 1, delivered: 2, seen: 3, read: 3 };
 
+// T-A-03: do two ids name the SAME message? (server id / temp id / client id are
+// all aliases of one messages row.) Exact string equality first; only then one
+// indexed lookup. Mirrors the Redux alias-set logic (collectMessageIds).
+const _idsAreAliases = async (db, chatId, a, b) => {
+  if (!a || !b) return false;
+  if (String(a) === String(b)) return true;
+  try {
+    const r = await db.getFirstAsync(
+      `SELECT 1 AS ok FROM messages
+        WHERE chat_id = $c
+          AND (id = $a OR server_message_id = $a OR temp_id = $a OR client_message_id = $a)
+          AND (id = $b OR server_message_id = $b OR temp_id = $b OR client_message_id = $b)
+        LIMIT 1`,
+      { $c: chatId, $a: String(a), $b: String(b) }
+    );
+    return Boolean(r);
+  } catch { return false; }
+};
+
 const updateChatLastMessage = async (chatId, lm, opts = {}) => {
   if (!chatId || !lm) return;
   return runExclusive(async () => {
@@ -3199,7 +3631,12 @@ const updateChatLastMessage = async (chatId, lm, opts = {}) => {
     && String(existing.last_message_id) === String(incomingMsgId);
   const incomingPri = CHAT_STATUS_PRIORITY[lm.status] || 0;
   const existingPri = CHAT_STATUS_PRIORITY[existing?.last_message_status] || 0;
-  const keepExistingStatus = sameMessage && incomingPri < existingPri;
+  // Alias-aware (T-A-03): the stored id may be the temp id while the incoming
+  // one is the server id (or vice versa) — still the same message.
+  const sameMessageAny = sameMessage
+    || (existing?.last_message_id && incomingMsgId && incomingPri < existingPri
+        && await _idsAreAliases(db, chatId, existing.last_message_id, incomingMsgId));
+  const keepExistingStatus = sameMessageAny && incomingPri < existingPri;
   const resolvedStatus = keepExistingStatus ? existing.last_message_status : (lm.status || null);
 
   await db.runAsync(
@@ -3243,7 +3680,8 @@ const updateChatLastMessageStatusById = async (chatId, messageId, newStatus) => 
       `SELECT last_message_id, last_message_status FROM chats WHERE chat_id = $cid LIMIT 1`,
       { $cid: chatId }
     );
-    if (!row || String(row.last_message_id) !== String(messageId)) return false;
+    if (!row || !row.last_message_id) return false;
+    if (!(await _idsAreAliases(db, chatId, row.last_message_id, messageId))) return false;
     const cur = CHAT_STATUS_PRIORITY[row.last_message_status] || 0;
     const nxt = CHAT_STATUS_PRIORITY[newStatus] || 0;
     if (nxt <= cur) return false;
@@ -3253,6 +3691,52 @@ const updateChatLastMessageStatusById = async (chatId, messageId, newStatus) => 
     );
     return true;
   });
+};
+
+// T-A-02: the peer's read/delivered WATERMARK covers our last message -> lift the
+// chat-row tick (forward-only). Alias-aware: the last message row is found through
+// messages (id / server id / temp id / client id) and its seq decides. Returns
+// { status, ids } when the row changed (ids = every alias, for the Redux dispatch),
+// otherwise null.
+const applyPeerWatermarkToChatRow = async (chatId, myUserId, readUpToSeq, deliveredUpToSeq) => {
+  if (!chatId || !myUserId) return null;
+  try {
+    return await runExclusive(async () => {
+      const db = await getDB();
+      const row = await db.getFirstAsync(
+        `SELECT last_message_id, last_message_sender_id, last_message_status, is_group FROM chats WHERE chat_id = $cid LIMIT 1`,
+        { $cid: chatId }
+      );
+      if (!row || !row.last_message_id || row.is_group) return null;
+      const lm = await db.getFirstAsync(
+        `SELECT id, server_message_id, temp_id, client_message_id, seq, sender_id FROM messages
+          WHERE chat_id = $cid
+            AND (id = $l OR server_message_id = $l OR temp_id = $l OR client_message_id = $l)
+          LIMIT 1`,
+        { $cid: chatId, $l: String(row.last_message_id) }
+      );
+      if (!lm) return null;
+      const mine = String(lm.sender_id || row.last_message_sender_id || '') === String(myUserId);
+      const cur = row.last_message_status === 'read' ? 'seen' : row.last_message_status;
+      const next = watermarkTickDecision({
+        currentStatus: cur || 'sent',
+        lastSeq: lm.seq,
+        lastIsMine: mine,
+        readUpToSeq, deliveredUpToSeq,
+      });
+      if (!next) return null;
+      await db.runAsync(
+        `UPDATE chats SET last_message_status = $s, updated_at = $n WHERE chat_id = $cid`,
+        { $s: next, $n: Date.now(), $cid: chatId }
+      );
+      const ids = [lm.id, lm.server_message_id, lm.temp_id, lm.client_message_id, row.last_message_id]
+        .filter(Boolean).map(String);
+      return { status: next, ids: [...new Set(ids)] };
+    });
+  } catch (err) {
+    console.warn('[ChatDB] applyPeerWatermarkToChatRow error:', err?.message);
+    return null;
+  }
 };
 
 // Rewrite the chat-list preview to a delete placeholder ONLY when the deleted
@@ -3290,6 +3774,14 @@ const updateChatUnread = async (chatId, count) => {
     const db = await getDB();
     await db.runAsync(`UPDATE chats SET unread_count = $c, updated_at = $n WHERE chat_id = $id`, { $c: count, $n: Date.now(), $id: chatId });
   });
+};
+
+// Sum of every chat's unread count — the single source for the app-icon badge
+// (firebase/appBadge.js). Same numbers the in-app unread state mirrors.
+const getTotalUnread = async () => {
+  const db = await getDB();
+  const r = await db.getFirstAsync(`SELECT COALESCE(SUM(unread_count), 0) AS total FROM chats WHERE unread_count > 0`);
+  return Number(r?.total || 0);
 };
 
 const incrementChatUnread = async (chatId) => {
@@ -3643,6 +4135,36 @@ const setSyncMeta = async (key, value) => {
       { $k: key, $v: String(value), $n: Date.now() }
     );
   });
+};
+
+// Per-chat edit/delete delta cursor (A-04). Lives in sync_meta beside the
+// messages it describes, so a same-account logout (AsyncStorage.clear) can't
+// lose it while SQLite is kept, and clearSyncData wipes it with the data.
+const _mutCursorKey = (chatId) => `mut_cursor:${chatId}`;
+const getMutationCursor = async (chatId) => {
+  if (!chatId) return 0;
+  try {
+    const n = Number(await getSyncMeta(_mutCursorKey(chatId)));
+    if (Number.isFinite(n) && n > 0) return n;
+    // Migrate-read the pre-sync_meta AsyncStorage cursor once.
+    const legacyKey = `chat_mutation_cursor_${chatId}`;
+    const legacy = Number(await AsyncStorage.getItem(legacyKey));
+    if (Number.isFinite(legacy) && legacy > 0) {
+      await setSyncMeta(_mutCursorKey(chatId), legacy);
+      AsyncStorage.removeItem(legacyKey).catch(() => {});
+      return legacy;
+    }
+    return 0;
+  } catch (_) { return 0; }
+};
+const setMutationCursor = async (chatId, at) => {
+  const n = Number(at);
+  if (!chatId || !Number.isFinite(n) || n <= 0) return;
+  try {
+    const prev = await getMutationCursor(chatId);
+    if (n <= prev) return; // monotonic
+    await setSyncMeta(_mutCursorKey(chatId), n);
+  } catch (_) {}
 };
 
 const isInitialSyncDone = async (userId) => {
@@ -4030,24 +4552,24 @@ const loadMessagesWithReplies = loadMessages; // loadMessages now includes reply
 
 export default {
   getDB, upsertMessage, upsertMessages, acknowledgeMessage, updateMessageStatus, clearScheduleData,
-  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSenderName, patchCallDetails, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
+  loadMessages, loadMessagesWithReplies, getMessage, messageExists, findTempRowByContent, findPendingRowByMediaId, getLatestMessage, getLatestSenderName, patchCallDetails, getLatestSeq, getRecentSeqHole, getOldestSeq, isHistoryFullyLoaded, setHistoryFullyLoaded, getAllChatIds, getChatActivityMap, getOldestMessageTimestamp, getMessageCount, searchMessages, getClearedAt, getClearedAtSync,
   markMessageDeleted, deleteMessageForMe, restoreDeletedMessage, clearChat, deduplicateChat,
   registerDeletedForMe, isDeletedForMe, ensureDeletedForMeLoaded,
-  updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, updateGroupMessageTracking, bulkUpdateStatus,
+  updateReactions, updateMessageEdit, updateMessageViewOnce, updateMessageMediaUrl, setMessageLocalUri, updateGroupMessageTracking, applyGroupReceipt, bulkUpdateStatus,
   saveReplyData, getReplyData,
   repairSenderTypes, purgeInjectedJoinedRows,
   closeDB, closeCleanly, saveMessageSync, saveMessages,
   // Chatlist
   upsertChat, upsertChats, loadChatList, loadArchivedChats, getChatById, getPeerIdentity,
-  updateChatLastMessage, updateChatLastMessageStatusById, markChatLastMessageDeleted, updateChatUnread, incrementChatUnread,
+  updateChatLastMessage, updateChatLastMessageStatusById, applyPeerWatermarkToChatRow, peekEarlyReceipt, markChatLastMessageDeleted, updateChatUnread, incrementChatUnread, getTotalUnread,
   updateChatLastMessageStatus, updateAllSentMessagesInChatToSeen,
   updateChatPin, updateChatMute, updateChatArchive, updateChatGroupMeta, updatePeerVerified, updatePeerProfile, updateStatusFeedIdentity, deleteChatRow, getChatCount,
   // Sync meta
-  getSyncMeta, setSyncMeta, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner, ensureDBOwnedBy,
+  getSyncMeta, setSyncMeta, getMutationCursor, setMutationCursor, isInitialSyncDone, clearSyncData, getDBOwner, setDBOwner, ensureDBOwnedBy,
   sealWrites, unsealWrites, areWritesSealed,
   // Outbox + watermarks (V8)
   outboxEnqueue, outboxRemove, outboxRecordFailure, outboxDrainDue, outboxCount,
-  setPeerReadWatermark, getPeerReadWatermark,
+  setPeerReadWatermark, getPeerReadWatermark, applyPeerWatermarkToOwnMessages,
   // Broadcast status cache (V9)
   saveBroadcasts, loadBroadcasts, removeBroadcast,
   // Contact status-feed cache (V10)

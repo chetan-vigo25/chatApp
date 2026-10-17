@@ -34,7 +34,8 @@ import React, {
   useState,
 } from 'react';
 import { AppState, Text as RNText, TextInput as RNTextInput } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import { deviceKv } from '../services/kvStorage';
+import NetInfo from '@react-native-community/netinfo';
 import MlkitTranslate from '../../modules/expo-mlkit-translate';
 import { lookupUiString } from '../constant/uiStrings';
 import { hinglishToEnglish } from '../constant/hinglish';
@@ -98,7 +99,7 @@ let saveTimer = null;
 function loadCache() {
   if (cacheLoaded) return Promise.resolve();
   if (!loadPromise) {
-    loadPromise = AsyncStorage.getItem(CACHE_KEY)
+    loadPromise = deviceKv.getItem(CACHE_KEY)
       .then((raw) => {
         const parsed = raw ? JSON.parse(raw) : {};
         memoryCache = parsed && typeof parsed === 'object' ? parsed : {};
@@ -115,7 +116,7 @@ function writeCacheNow() {
     // Object key order is insertion order — drop the oldest overflow.
     keys.slice(0, keys.length - MAX_CACHE_ENTRIES).forEach((k) => delete memoryCache[k]);
   }
-  return AsyncStorage.setItem(CACHE_KEY, JSON.stringify(memoryCache)).catch(() => {});
+  return deviceKv.setItem(CACHE_KEY, JSON.stringify(memoryCache)).catch(() => {});
 }
 
 function persistCache() {
@@ -143,7 +144,7 @@ AppState.addEventListener('change', (state) => {
 export async function clearTranslationCache() {
   memoryCache = {};
   clearTimeout(saveTimer);
-  try { await AsyncStorage.removeItem(CACHE_KEY); } catch {}
+  try { await deviceKv.removeItem(CACHE_KEY); } catch {}
 }
 
 /* ─────────────────────── request queue + dedupe ─────────────────────── */
@@ -202,7 +203,14 @@ const downloading = new Map();  // language → { job: Promise<boolean>, require
 /* ───────────── download status of PICKED languages (the picker reads it) ───────────── */
 
 /**
- * language → { state: 'downloading' | 'failed', startedAt }
+ * language → { state: 'downloading' | 'paused' | 'failed', startedAt,
+ *              elapsedMs?, progress?, reason? }
+ *
+ * 'paused' = the user picked another language mid-download (reason
+ * 'switched'), or it stalled / lost the network ('stalled' / 'offline').
+ * ML Kit has no pause or cancel, so the native download carries on quietly —
+ * picking the language again re-attaches to it and the bar continues from
+ * `elapsedMs` (or the real `progress` on iOS) instead of restarting at 0%.
  *
  * Lives at MODULE scope, not in the picker, on purpose. The picker used to keep
  * "which row is downloading / which failed" in its own state, so leaving the
@@ -219,6 +227,15 @@ const pickStatus = new Map();
 const pickListeners = new Set();
 /** Latest ensureLanguageReady call per language — only it may write the result. */
 const pickGeneration = new Map();
+/**
+ * The ONE picked language shown as downloading, and its job. Picking another
+ * pauses it; background sender-language downloads wait for it (ensurePairReady)
+ * so they never compete with what the user is watching.
+ */
+let activePick = null;
+let activePickJob = null;
+/** Languages whose last download attempt ran out of time (not a hard failure). */
+const timedOutLanguages = new Set();
 
 function emitPickStatus() {
   pickListeners.forEach((listener) => { try { listener(); } catch { /* a listener must not break the rest */ } });
@@ -230,7 +247,7 @@ function setPickStatus(language, status) {
   emitPickStatus();
 }
 
-/** `{ state: 'downloading' | 'failed', startedAt }`, or null when idle/ready. */
+/** `{ state: 'downloading' | 'paused' | 'failed', … }`, or null when idle/ready. */
 export function getLanguageDownloadStatus(language) {
   return pickStatus.get(language) || null;
 }
@@ -257,17 +274,44 @@ export function clearFailedLanguageDownloads() {
  */
 function onModelLanded() {
   pickStatus.forEach((status, language) => {
-    if (status.state !== 'failed') return;
+    // A row the USER paused (picked another language) stays paused even when
+    // ML Kit's background download lands — it completes only once they come
+    // back to it. Stalled / offline rows were not the user's doing: finish them.
+    if (status.state !== 'failed' && !(status.state === 'paused' && status.reason !== 'switched')) return;
     Promise.all([
       MlkitTranslate.isModelDownloaded(SOURCE_LANGUAGE),
       MlkitTranslate.isModelDownloaded(language),
     ]).then((ready) => {
-      if (ready.every(Boolean) && pickStatus.get(language)?.state === 'failed') setPickStatus(language, null);
+      const now = pickStatus.get(language)?.state;
+      const keep = now === 'failed' || (now === 'paused' && pickStatus.get(language)?.reason !== 'switched');
+      if (ready.every(Boolean) && keep) setPickStatus(language, null);
     }).catch(() => {});
   });
   // The picker's "downloaded" list is stale either way.
   emitPickStatus();
 }
+
+/** Mark a downloading pick as paused, keeping how far it had got. */
+function pausePick(language, reason) {
+  const status = pickStatus.get(language);
+  if (status?.state !== 'downloading') return;
+  setPickStatus(language, {
+    ...status,
+    state: 'paused',
+    reason,
+    elapsedMs: Math.max(0, Date.now() - (status.startedAt || Date.now())),
+  });
+}
+
+// iOS reports real progress, and announces a model that landed after its
+// promise had timed out. Android emits neither; these are then no-ops.
+MlkitTranslate.addDownloadProgressListener?.(({ language, fraction }) => {
+  const status = pickStatus.get(language);
+  if (!status || status.state === 'failed') return;
+  const progress = Math.max(status.progress || 0, Number(fraction) || 0);
+  if (progress !== status.progress) setPickStatus(language, { ...status, progress });
+});
+MlkitTranslate.addModelDownloadedListener?.(() => onModelLanded());
 
 /**
  * Make a language usable, downloading its ~30MB model if needed.
@@ -294,7 +338,12 @@ export function ensureLanguageReady(language, { requireWifi = !allowCellularMode
   pickGeneration.set(language, generation);
   const isLatest = () => pickGeneration.get(language) === generation;
 
-  return (async () => {
+  // Only one picked language downloads in view at a time. The one being left
+  // is PAUSED, not abandoned: its native download keeps going (ML Kit cannot
+  // stop it), and picking it again picks it up where it is.
+  if (activePick && activePick !== language) pausePick(activePick, 'switched');
+
+  const job = (async () => {
     // Only show "downloading" when something is actually missing — re-selecting
     // an on-device language must not flash a progress bar.
     let present = false;
@@ -306,27 +355,67 @@ export function ensureLanguageReady(language, { requireWifi = !allowCellularMode
       present = ready.every(Boolean);
     } catch { /* treat as missing; prepare() re-checks */ }
 
-    if (!present && isLatest()) {
+    const resuming = pickStatus.get(language)?.state === 'paused';
+    // A paused row resumes through 'downloading' even if its model already
+    // landed underneath, so the bar finishes visibly instead of vanishing.
+    if ((!present || resuming) && isLatest()) {
       const current = pickStatus.get(language);
-      // Keep the original start time across a resume so the estimated bar
-      // carries on from where it was instead of snapping back to 0%.
-      if (current?.state !== 'downloading') setPickStatus(language, { state: 'downloading', startedAt: Date.now() });
+      // A resume carries on from where it was paused — the estimate restarts
+      // from the time already spent, iOS keeps its real progress — instead of
+      // snapping back to 0%.
+      if (current?.state !== 'downloading') {
+        setPickStatus(language, {
+          state: 'downloading',
+          startedAt: Date.now() - (current?.elapsedMs || 0),
+          progress: current?.progress,
+        });
+      }
     }
 
+    timedOutLanguages.delete(SOURCE_LANGUAGE);
+    timedOutLanguages.delete(language);
     const [en, target] = await Promise.all([
       prepare(SOURCE_LANGUAGE, requireWifi),
       prepare(language, requireWifi),
     ]);
     const ok = en && target;
     if (isLatest()) {
-      if (ok) {
-        if (pickStatus.has(language)) setPickStatus(language, null);
+      const current = pickStatus.get(language);
+      if (ok && current?.state === 'paused' && current.reason === 'switched') {
+        // Finished in the background after the user moved on. Leave the row
+        // paused — it completes when they pick it again (instantly, then).
+        setPickStatus(language, { ...current, landed: true });
+      } else if (ok) {
+        if (current) setPickStatus(language, null);
+      } else if (current?.state === 'paused') {
+        // The user moved on while it ran; it stays paused, not "failed".
       } else {
-        setPickStatus(language, { state: 'failed', startedAt: pickStatus.get(language)?.startedAt || Date.now() });
+        // Out of time or offline is not a failure: ML Kit carries on (or waits
+        // for the network), so offer to continue rather than to "retry".
+        let offline = false;
+        try { offline = (await NetInfo.fetch()).isConnected === false; } catch { /* unknown = online */ }
+        const stalled = timedOutLanguages.has(language) || timedOutLanguages.has(SOURCE_LANGUAGE);
+        if (offline || stalled) {
+          setPickStatus(language, {
+            ...current,
+            state: 'paused',
+            reason: offline ? 'offline' : 'stalled',
+            elapsedMs: Math.max(0, Date.now() - (current?.startedAt || Date.now())),
+          });
+        } else {
+          setPickStatus(language, { state: 'failed', startedAt: current?.startedAt || Date.now() });
+        }
       }
     }
     return ok;
   })();
+
+  activePick = language;
+  activePickJob = job;
+  job.finally(() => {
+    if (activePickJob === job) { activePick = null; activePickJob = null; }
+  });
+  return job;
 }
 
 /**
@@ -376,7 +465,11 @@ export function ensurePairReady(source, target, { requireWifi = !allowCellularMo
   if (isTranslationOff(target)) return Promise.resolve(true);
   if (!source || !target || source === target) return Promise.resolve(true);
   const needed = Array.from(new Set([SOURCE_LANGUAGE, source, target]));
-  return Promise.all(needed.map((code) => prepare(code, requireWifi)))
+  // The language the user just picked (and is watching download) goes first;
+  // a sender's model started now would only split the bandwidth.
+  const ahead = activePickJob ? activePickJob.catch(() => false) : Promise.resolve();
+  return ahead
+    .then(() => Promise.all(needed.map((code) => prepare(code, requireWifi))))
     .then((results) => results.every(Boolean));
 }
 
@@ -410,6 +503,9 @@ function prepare(language, requireWifi) {
         .then(() => { modelRetryUntil = 0; return true; })
         .catch((error) => {
           if (__DEV__) console.warn(`[translate] model download failed (${language})`, error?.message || error);
+          // iOS gives up natively after 180s while ML Kit carries on — that is
+          // "not yet", not a failure.
+          if (/timed out/i.test(error?.message || '')) timedOutLanguages.add(language);
           return false;
         });
     })
@@ -418,7 +514,7 @@ function prepare(language, requireWifi) {
   let timedOut = false;
   const job = settleWithin(download, MODEL_DOWNLOAD_TIMEOUT_MS, null)
     .then((ok) => {
-      if (ok === null) { timedOut = true; return false; }
+      if (ok === null) { timedOut = true; timedOutLanguages.add(language); return false; }
       return ok;
     })
     .finally(() => {
@@ -875,7 +971,7 @@ let languageLoadPromise = null;
 function loadLanguage() {
   if (cachedLanguage != null) return Promise.resolve(cachedLanguage);
   if (!languageLoadPromise) {
-    languageLoadPromise = AsyncStorage.getItem(LANGUAGE_STORAGE_KEY)
+    languageLoadPromise = deviceKv.getItem(LANGUAGE_STORAGE_KEY)
       .then((saved) => {
         cachedHasPreference = Boolean(saved);
         // No saved choice → "Don't translate" is the default, so the picker
@@ -951,7 +1047,17 @@ export function LanguageProvider({ children }) {
       if (getLanguageDownloadStatus(language)?.state === 'downloading') return;
       ensureLanguageReady(language);
     });
-    return () => sub.remove();
+    // Back online: carry on with the selected language if it was waiting for
+    // the network or had stalled. Event-driven — nothing polls.
+    let wasOffline = false;
+    const unsubscribeNet = NetInfo.addEventListener((net) => {
+      const offline = net.isConnected === false;
+      if (wasOffline && !offline && getLanguageDownloadStatus(language)?.state === 'paused') {
+        ensureLanguageReady(language);
+      }
+      wasOffline = offline;
+    });
+    return () => { sub.remove(); unsubscribeNet(); };
   }, [ready, language]);
 
   /**
@@ -967,7 +1073,7 @@ export function LanguageProvider({ children }) {
     setHasPreference(true);
     setLang(code);                       // every <Text> re-renders — no app restart
     try {
-      await AsyncStorage.setItem(LANGUAGE_STORAGE_KEY, code);
+      await deviceKv.setItem(LANGUAGE_STORAGE_KEY, code);
     } catch (error) {
       if (__DEV__) console.warn('[translate] could not save language', error);
     }

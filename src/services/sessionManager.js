@@ -6,6 +6,7 @@ import { emitSessionReset, emitUserChanged } from './sessionEvents';
 import ChatDatabase from './ChatDatabase';
 import secureTokenStore, { SECURE_TOKEN_KEYS } from './secureTokenStore';
 import { INSTALL_MARKER_KEY } from '../utils/freshInstallSweep';
+import { writeCallSessionMarker } from '../calls/services/callSessionMarker';
 
 // NOTE ON STORAGE BACKENDS
 // ------------------------
@@ -73,15 +74,15 @@ const decodeJwtPayload = (token) => {
   }
 };
 
-const clearMmkvIfAvailable = async () => {
+// Wipes the signed-in owner's MMKV account store (drafts, chat colour, media
+// maps) — the lifetime AsyncStorage.clear() gave those keys. Device keys
+// (theme, language, translation cache, auto-download) are NOT touched.
+const clearMmkvIfAvailable = async ({ keepMediaRecords = false } = {}) => {
   try {
-    const mmkvModule = require('react-native-mmkv');
-    if (mmkvModule?.MMKV) {
-      const storage = new mmkvModule.MMKV();
-      storage.clearAll();
-    }
+    const kvStorage = require('./kvStorage');
+    kvStorage.clearAccount({ preserve: keepMediaRecords ? kvStorage.MEDIA_RECORD_KEYS : [] });
   } catch {
-    // Optional dependency, ignore if not installed.
+    // MMKV unavailable in this runtime — AsyncStorage.clear() already ran.
   }
 };
 
@@ -233,6 +234,9 @@ export const saveAuthSession = async ({ userInfo, accessToken, refreshToken, ref
     } catch {}
   }
 
+  // Publish the signed-in user to the native call-push layer (P-C-04).
+  if (resolvedUserId) writeCallSessionMarker(resolvedUserId).catch(() => {});
+
   if (userInfo) {
     emitUserChanged({ userId: resolvedUserId, userInfo });
   }
@@ -283,13 +287,15 @@ const preserveDevicePreferences = async (wipe) => {
   }
 };
 
-export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
+export const clearAllSessionData = async ({ clearAllStorage = true, keepMediaRecords = false } = {}) => {
   // MUST come first and MUST be explicit: AsyncStorage.clear() below does not
   // reach the Keychain / AndroidKeyStore, so without this the auth tokens would
   // survive logout — the device would stay able to call the API as the
   // signed-out user. This also drops the in-memory token cache, so nothing
   // reads the old session's token after this point.
   await secureTokenStore.clearTokens();
+  // Native call-push layer: signed out => never ring (P-C-04).
+  writeCallSessionMarker(null).catch(() => {});
 
   if (clearAllStorage) {
     await preserveDevicePreferences(() => AsyncStorage.clear());
@@ -313,7 +319,10 @@ export const clearAllSessionData = async ({ clearAllStorage = true } = {}) => {
   }
 
   await clearPersistStorage();
-  await clearMmkvIfAvailable();
+  // Only on a full wipe: the non-wipe branch keeps chat caches on purpose.
+  // `keepMediaRecords`: the downloaded-media records follow the lifetime of the local
+  // database — kept while it is kept (same-account return), gone when it is wiped.
+  if (clearAllStorage) await clearMmkvIfAvailable({ keepMediaRecords });
 };
 
 export const resetRuntimeState = () => {
@@ -381,8 +390,16 @@ export const performSessionReset = async ({
     try { require('./SqliteWriter').default.dropPending(); } catch {}
   }
   try { require('./ChatCache').default.clearAll(); } catch {}
+  // Picture cache (expo-image, disk + memory) is keyed by object path, not by
+  // account — wipe it so account B never paints account A's cached images.
+  if (!isWeb) { try { require('../utils/imageCache').clearImageCache(); } catch {} }
 
-  await clearAllSessionData({ clearAllStorage });
+  // Dismiss displayed message notifications (+ their @msgnotif/* lines) so a
+  // stale notification from this account cannot be tapped after sign-out.
+  // Runs before the AsyncStorage wipe; failures never block logout.
+  try { await require('../firebase/messageNotification').clearAllMessageNotifications(); } catch {}
+
+  await clearAllSessionData({ clearAllStorage, keepMediaRecords: !shouldWipeLocalDB });
 
   // Apply the SQLite decision — skip on web (no SQLite there)
   try {
@@ -511,6 +528,7 @@ export const bootstrapSession = async () => {
 
   if (session.accessToken && !isTokenExpired(session.accessToken)) {
     await stampCacheOwnerForBootstrap(session.userId);
+    writeCallSessionMarker(session.userId).catch(() => {});
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap' });
     return { authenticated: true, refreshed: false, session };
   }
@@ -522,6 +540,7 @@ export const bootstrapSession = async () => {
   try {
     const refreshed = await refreshAccessToken({ force: true });
     await stampCacheOwnerForBootstrap(session.userId);
+    writeCallSessionMarker(session.userId).catch(() => {});
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap_refresh' });
     return {
       authenticated: true,
@@ -543,6 +562,7 @@ export const bootstrapSession = async () => {
       return { authenticated: false, refreshed: false, session, error };
     }
     await stampCacheOwnerForBootstrap(session.userId);
+    writeCallSessionMarker(session.userId).catch(() => {});
     emitUserChanged({ userId: session.userId, userInfo: session.userInfo, reason: 'bootstrap_offline' });
     return { authenticated: true, refreshed: false, offline: true, session, error };
   }

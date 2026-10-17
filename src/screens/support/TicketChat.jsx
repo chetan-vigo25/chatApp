@@ -1,7 +1,16 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
-  View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, ActivityIndicator,
-  Image, KeyboardAvoidingView, Platform, Alert, Linking,
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  FlatList,
+  StyleSheet,
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+  Alert,
+  Linking,
 } from "react-native";
 import { useTheme } from "../../contexts/ThemeContext";
 import { Ionicons, FontAwesome6 } from "@expo/vector-icons";
@@ -10,6 +19,7 @@ import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ens
 import { BACKEND_URL } from "@env";
 import { viewTicket, replyTicket, SUPPORT_STATUS_META } from "../../Redux/Services/Support/Support.Services";
 import { getSocket } from "../../Redux/Services/Socket/socket";
+import AppImage from '../../components/AppImage';
 
 // Resolve a relative /uploads/* path against the backend origin.
 const ORIGIN = (() => {
@@ -123,7 +133,7 @@ export default function TicketChat({ navigation, route }) {
           {item.mediaUrl ? (
             item.mediaType === "image" ? (
               <TouchableOpacity onPress={() => Linking.openURL(resolveUrl(item.mediaUrl))}>
-                <Image source={{ uri: resolveUrl(item.mediaUrl) }} style={styles.bubbleImage} />
+                <AppImage source={{ uri: resolveUrl(item.mediaUrl) }} style={styles.bubbleImage} />
               </TouchableOpacity>
             ) : (
               <TouchableOpacity onPress={() => Linking.openURL(resolveUrl(item.mediaUrl))} style={styles.fileRow}>
@@ -183,7 +193,7 @@ export default function TicketChat({ navigation, route }) {
           <View style={[styles.composer, { backgroundColor: cardBg }]}>
             {attachment && (
               <View style={styles.attachRow}>
-                <Image source={{ uri: attachment.uri }} style={styles.attachThumb} />
+                <AppImage source={{ uri: attachment.uri }} style={styles.attachThumb} />
                 <Text numberOfLines={1} style={[styles.attachName, { color: subText }]}>{attachment.name}</Text>
                 <TouchableOpacity onPress={() => setAttachment(null)}><Ionicons name="close-circle" size={20} color={subText} /></TouchableOpacity>
               </View>

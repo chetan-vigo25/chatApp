@@ -1,6 +1,7 @@
 import React, { memo, useEffect, useState } from 'react';
-import { ActivityIndicator, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import VerifiedBadge from './VerifiedBadge';
+import AppImage from './AppImage';
 
 /**
  * One person in a search result — someone you do NOT have a chat with yet.
@@ -52,11 +53,10 @@ const UserSearchRow = memo(function UserSearchRow({
     >
       <View style={styles.avatarWrap}>
         {avatarUri && !imageFailed ? (
-          <Image
+          <AppImage
             source={{ uri: avatarUri }}
             style={styles.avatar}
             resizeMode="cover"
-            fadeDuration={0}
             onError={() => setImageFailed(true)}
           />
         ) : (

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, AppState, Dimensions, Image, PanResponder, Platform, Text, TouchableOpacity, View,} from 'react-native';
+import { Animated, AppState, Dimensions, PanResponder, Platform, Text, TouchableOpacity, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Audio } from 'expo-av';
@@ -23,6 +23,7 @@ import {
 import { claimNotification, markNotified, releaseNotification, wasNotified } from '../firebase/notificationDedupe';
 import { displayGroupedMessage, isMessageGroupingAvailable } from '../firebase/messageNotification';
 import { translateNotificationBody } from './Translate';
+import AppImage from './AppImage';
 
 // Preload the notification sound once at module level
 // Fallback only — the banner plays the DEVICE DEFAULT notification tone
@@ -933,7 +934,7 @@ export default function WhatsAppBannerHost() {
     >
       {/* Header row — mirrors the OS push: app icon, "TalksTry • now", bell */}
       <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
-        <Image
+        <AppImage
           source={APP_ICON}
           style={{ width: 16, height: 16, borderRadius: 8, marginRight: 6 }}
           resizeMode="cover"
@@ -950,7 +951,7 @@ export default function WhatsAppBannerHost() {
       <View style={{ flexDirection: 'row', alignItems: 'center' }}>
         <View style={{ width: 42, height: 42, borderRadius: 21, overflow: 'hidden', marginRight: 12, backgroundColor: theme.colors.themeColor, alignItems: 'center', justifyContent: 'center' }}>
           {banner.avatarUrl ? (
-            <Image source={{ uri: banner.avatarUrl }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
+            <AppImage source={{ uri: banner.avatarUrl }} style={{ width: '100%', height: '100%' }} resizeMode="cover" />
           ) : (
             <Text style={{ color: theme.colors.textWhite, fontFamily: 'Roboto-SemiBold', fontSize: 16 }}>
               {(banner.senderName || 'U').charAt(0).toUpperCase()}

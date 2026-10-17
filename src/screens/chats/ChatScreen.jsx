@@ -26,7 +26,9 @@ import {
   Easing,
   StyleSheet,
   DeviceEventEmitter,
-  BackHandler
+  BackHandler,
+  useWindowDimensions,
+  AccessibilityInfo
 } from "react-native";
 import moment from "moment";
 import * as ImagePicker from "expo-image-picker";
@@ -37,11 +39,12 @@ import { isFileNameCaption } from "../../utils/mediaCaption";
 import { suspendAppLock, resumeAppLock } from "../../services/appLockGuard";
 import { ensurePermission, PERMISSION_IDS } from "../../features/permissions/ensurePermission";
 import useDelayedVisible from "../../hooks/useDelayedVisible";
-import { useTheme, onColorFor, metaOnColorFor, sentBubbleBgFor } from "../../contexts/ThemeContext";
+import { useTheme, onColorFor, sentBubbleBgFor, outgoingPaletteFor, senderNameColorFor, withAlpha } from "../../contexts/ThemeContext";
 import { useNetwork } from "../../contexts/NetworkContext";
 import { FontAwesome6, AntDesign, Ionicons, MaterialIcons, MaterialCommunityIcons, Entypo } from "@expo/vector-icons";
 import useChatLogic from "../../contexts/useChatLogic";
 import { isOutgoingMessage } from "../../utils/messageDirection";
+import { canEditMessage } from "../../utils/messageEditPolicy";
 import { mentionsOf, inferMentionsFromText, splitTextOnMentions } from "../../utils/mentions";
 import { useSelector, useDispatch } from "react-redux";
 import { unblockUser } from "../../Redux/Reducer/Block/Block.reducer";
@@ -63,6 +66,7 @@ import { useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import mediaDownloadManager, { MEDIA_DOWNLOAD_STATUS } from '../../services/MediaDownloadManager';
 import localStorageService from '../../services/LocalStorageService';
+import { isRebasableAppPath } from '../../utils/mediaLocalPaths';
 import { mediaDownloadSigned, toSecureMediaUri, mediaResolve, saveAssetToAlbum } from '../../utils/mediaService';
 import ReportBottomSheet from '../../components/ReportBottomSheet';
 import ChatWallpaper from '../../components/ChatWallpaper';
@@ -71,6 +75,7 @@ import MentionSuggestions, { useMentions } from '../../components/MentionInput';
 import ReplyPreviewBox from '../../components/ReplyPreviewBox';
 import ScheduleTimePicker from '../../components/ScheduleTimePicker';
 import ReplyBubble from '../../components/ReplyBubble';
+import MessageTicks, { TICK_SIZE } from '../../components/MessageTicks';
 import StatusReplyPreview from '../../components/StatusReplyPreview';
 import StatusUnavailableModal from '../../components/StatusUnavailableModal';
 import { showMediaUnavailable, subscribeMediaUnavailable } from '../../utils/mediaUnavailableBus';
@@ -82,6 +87,7 @@ import AlbumMessage from '../../components/AlbumMessage';
 import UploadRing from '../../components/UploadRing';
 import Svg, { Circle as SvgCircle, Path as SvgPath } from 'react-native-svg';
 import BlurGateImage from '../../components/BlurGateImage';
+import AppImage from '../../components/AppImage';
 import ReactionPicker from '../../components/ReactionPicker';
 import ReactionBar from '../../components/ReactionBar';
 import ReactionDetailSheet from '../../components/ReactionDetailSheet';
@@ -109,9 +115,14 @@ import { isTranslationOff } from "../../constant/languages";
 import TranslatingBubble from "../../components/TranslatingBubble";
 import { renderSystemMessage } from '../../utils/systemMessage';
 import AppSearchBar from '../../components/AppSearchBar';
+import { loadChatDrafts, getChatDraft, setChatDraft } from '../../services/chatDraftStore';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(SCREEN_WIDTH * 0.68);
+// MAX_MEDIA_BUBBLE_WIDTH / bubble width cap are derived from the CURRENT window
+// inside the component (useWindowDimensions) so rotation, split-screen and
+// tablets are handled; only the constants below are static.
+const BUBBLE_MAX_PX = 560; // tablet cap for a message bubble
+const MEDIA_BUBBLE_MAX_PX = 480;
 
 // Long-press action popover geometry.
 // The wrapper has to fit the quick-reaction pill (6 × 40 pt emoji buttons + a
@@ -215,17 +226,11 @@ const AUDIO_RECORDING_MAX_MS = 120000;
 // that chip was the palest thing on the screen: a date label was out-shouting
 // the messages. It now sits at the received-bubble value with a hairline, so it
 // reads as the same family of surface, one step quieter.
-const dateChipColors = (isDarkMode) => (isDarkMode
-  ? {
-      bg: 'rgba(21,30,35,0.94)',
-      border: 'rgba(233,237,239,0.10)',
-      text: 'rgba(233,237,239,0.78)',
-    }
-  : {
-      bg: 'rgba(240,242,245,0.96)',
-      border: 'rgba(0,0,0,0.06)',
-      text: '#5f6769',
-    });
+const dateChipColors = (theme) => ({
+  bg: theme.colors.dateChipBg,
+  border: theme.colors.systemBorder,
+  text: theme.colors.systemText,
+});
 
 
 // Theme-aware chat wallpaper. Rendered as a tiled SVG doodle pattern
@@ -515,12 +520,16 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
   //           pill's only edge was a 0.08-opacity shadow.
   // Both now get a hairline border, so the input's shape is defined in either
   // theme instead of relying on the shadow alone.
-  const composerBg = isDarkMode ? '#121A20' : theme.colors.cardBackground;
+  const composerBg = theme.colors.composerBg;
   const composerBorder = isDarkMode ? 'rgba(233,237,239,0.10)' : theme.colors.border;
-  const iconColor = isDarkMode ? 'rgba(212,229,240,0.68)': '#111111';
-  const inputTextColor = isDarkMode ? '#F2F8FC' : '#111111';
-  const pendingTextColor = isDarkMode ? '#E8F2F8' : '#111111';
-  const placeholderColor = isDarkMode ? 'rgba(212,229,240,0.68)' : 'rgba(17,17,17,0.58)';
+  const iconColor = theme.colors.iconColor;
+  const inputTextColor = theme.colors.composerText;
+  const pendingTextColor = theme.colors.composerText;
+  const placeholderColor = theme.colors.composerPlaceholder;
+
+  // White on the brand teal (kept, Q4); a custom accent derives its ink so a
+  // light swatch never gets a white glyph.
+  const sendIconColor = (!chatColor || chatColor === theme.colors.themeColor) ? '#FFFFFF' : onColorFor(chatColor);
 
   const sendAnim = useRef(new Animated.Value(hasContent ? 1 : 0)).current;
   const attachAnim = useRef(new Animated.Value(showAttachment ? 1 : 0)).current;
@@ -612,9 +621,9 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
             accessibilityLabel={showEmojiPanel ? "Open keyboard" : "Open emoji panel"}
             activeOpacity={0.75}
             style={{
-              width: 42,
-              height: 42,
-              borderRadius: 21,
+              width: 44,
+              height: 44,
+              borderRadius: 22,
               alignItems: 'center',
               justifyContent: 'center',
             }}
@@ -663,7 +672,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                     && onToggleViewOnce ? (
                     <TouchableOpacity
                       onPress={onToggleViewOnce}
-                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
                       accessibilityRole="button"
                       accessibilityState={{ selected: Boolean(pendingMedia.viewOnce) }}
                       accessibilityLabel={pendingMedia.viewOnce ? 'View once on' : 'View once'}
@@ -684,7 +693,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                   ) : null}
                   <TouchableOpacity
                     onPress={onRemovePendingMedia}
-                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
                     accessibilityRole="button"
                     accessibilityLabel="Remove selected media"
                   >
@@ -722,6 +731,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
                 scrollEnabled
                 textAlignVertical="center"
                 accessibilityLabel="Message input"
+                maxFontSizeMultiplier={1.5}
                 style={{
                   fontSize: 15,
                   color: inputTextColor,
@@ -737,7 +747,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
 
           <Animated.View
             style={{
-              width: attachAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 40] }),
+              width: attachAnim.interpolate({ inputRange: [0, 1], outputRange: [0, 44] }),
               opacity: attachAnim,
               transform: [
                 {
@@ -756,9 +766,9 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
               accessibilityLabel="Open attachment menu"
               activeOpacity={0.75}
               style={{
-                width: 40,
-                height: 40,
-                borderRadius: 20,
+                width: 44,
+                height: 44,
+                borderRadius: 22,
                 alignItems: 'center',
                 justifyContent: 'center',
               }}
@@ -778,7 +788,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
           onPressOut={handlePressOutSubmit}
           disabled={isSearching}
           accessibilityRole="button"
-          accessibilityLabel={hasContent ? 'Send message (long press to schedule)' : 'Voice message'}
+          accessibilityLabel={hasContent ? 'Send message' : 'Record voice message'}
           activeOpacity={0.85}
           style={{
             width: 52,
@@ -804,7 +814,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
               transform: [{ scale: sendAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 0.9] }) }],
             }}
           >
-            <Ionicons name="mic" size={24} color="#F7FEFF" />
+            <Ionicons name="mic" size={24} color={sendIconColor} />
           </Animated.View>
 
           <Animated.View
@@ -814,7 +824,7 @@ const ChatInputBar = React.memo(React.forwardRef(function ChatInputBar({
               transform: [{ scale: sendAnim }],
             }}
           >
-            <Ionicons name="send" size={21} color="#FFFFFF" />
+            <Ionicons name="send" size={21} color={sendIconColor} />
           </Animated.View>
         </TouchableOpacity>
       </Animated.View>
@@ -1076,7 +1086,7 @@ const ContactAvatar = React.memo(function ContactAvatar({ uri, size, iconSize, b
     );
   }
   return (
-    <Image
+    <AppImage
       source={{ uri: src }}
       style={{ width: size, height: size, borderRadius: radius }}
       onError={() => setFailed(true)}
@@ -1472,6 +1482,8 @@ const MessageRow = React.memo(
     && a.msg === b.msg
     && a.older === b.older
     && a.extra === b.extra
+    && a.ctx === b.ctx
+    && a.live === b.live
     && a.lineCount === b.lineCount,
 );
 
@@ -1512,6 +1524,13 @@ export default function ChatScreen({ navigation, route }) {
       return next;
     });
   }, []);
+
+  // Render-time check of the files the bubbles believe they have: storedPath → the path where the
+  // file really is right now (re-based onto the current app container), or null when it is gone.
+  // `undefined` = not checked yet (trusted meanwhile, so a downloaded file never flashes a button).
+  // Asked once per path, batched per message-list change — no timers, no polling.
+  const [mediaPathCheck, setMediaPathCheck] = useState({});
+  const mediaPathAskedRef = useRef(new Set());
 
   // iOS keeps chat media in the app sandbox, separate from Photos — so a
   // photo the user saved ("download" in the viewer) and then deleted in
@@ -1625,8 +1644,22 @@ export default function ChatScreen({ navigation, route }) {
   // Outgoing-bubble palette derived from the user's chatColor so text/meta
   // stay readable even when a LIGHT accent is selected (was hardcoded #E9EDEF).
   const sentBubbleBg = sentBubbleBgFor(chatColor, theme);
-  const sentBubbleText = onColorFor(sentBubbleBg);
-  const sentBubbleMeta = metaOnColorFor(sentBubbleBg);
+  // Ink / meta / ticks / links on the outgoing bubble, all derived from the
+  // bubble colour (contrast-checked) — memoised per (bubble, theme).
+  const outPal = outgoingPaletteFor(sentBubbleBg, theme);
+  const sentBubbleText = outPal.text;
+  const sentBubbleMeta = outPal.meta;
+  const tickColors = outPal.tick;
+  const { width: winW } = useWindowDimensions();
+  const MAX_MEDIA_BUBBLE_WIDTH = Math.floor(Math.min(winW * 0.68, MEDIA_BUBBLE_MAX_PX));
+  // Reduced motion: read once + follow changes (only gates optional springs).
+  const [reduceMotion, setReduceMotion] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    AccessibilityInfo.isReduceMotionEnabled?.().then((v) => { if (alive) setReduceMotion(!!v); }).catch(() => {});
+    const sub = AccessibilityInfo.addEventListener?.('reduceMotionChanged', (v) => setReduceMotion(!!v));
+    return () => { alive = false; sub?.remove?.(); };
+  }, []);
   const { isConnected, networkType } = useNetwork();
   // Reader's app language. Only the message BODY is translated (see the
   // translation state + effect below); the rest of this screen stays untouched.
@@ -2101,7 +2134,6 @@ export default function ChatScreen({ navigation, route }) {
 
       if (resolved) {
         thumbnailCacheRef.current[mediaId] = resolved;
-        Image.prefetch(resolved).catch(() => {});
         setThumbnailCacheVersion((v) => v + 1);
       }
     } finally {
@@ -2134,7 +2166,8 @@ export default function ChatScreen({ navigation, route }) {
       }
       if (freshUrl) {
         resolvedFullUrlRef.current[mediaId] = freshUrl;
-        Image.prefetch(toSecureMediaUri(freshUrl)).catch(() => {});
+        // No prefetch: the RN-cache prefetch of the FULL media URL bypassed
+        // tap-to-download (and warmed a cache nothing renders from).
       }
       if (freshUrl || freshThumb) {
         setThumbnailCacheVersion((v) => v + 1);
@@ -2172,6 +2205,30 @@ export default function ChatScreen({ navigation, route }) {
   ].filter(Boolean)));
   const isMediaGone = (msg) => goneKeysFor(msg).some((k) => goneMedia[k]);
 
+  // The ONE record behind a bubble: where this message's media file is stored on this device
+  // (the message row's `local_uri` / the media record kept under the media id). The server's own
+  // `isMediaDownloaded` flag is deliberately NOT consulted — it is shared by every group member
+  // and every device of the account, so another device's download must not unblur this one.
+  const rawLocalPath = (msg) => {
+    if (!msg) return null;
+    if (msg.localUri) return msg.localUri;
+    const state = resolveMediaState(msg);
+    if (state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && state?.localPath) return state.localPath;
+    for (const key of getMediaKeyCandidates(msg)) {
+      if (downloadedMedia[key]) return downloadedMedia[key];
+    }
+    return null;
+  };
+
+  // Stored path → where the file really is (see mediaPathCheck). Unchecked paths are trusted; a missing
+  // file never reaches here (its record + row are dropped, so there is no stored path left).
+  const liveLocalPath = (stored) => {
+    if (!stored) return null;
+    if (!isRebasableAppPath(stored)) return stored;
+    const checked = mediaPathCheck[stored];
+    return checked === undefined ? stored : checked;
+  };
+
   const isMediaDownloaded = (msg) => {
     if (!msg) return false;
 
@@ -2181,36 +2238,8 @@ export default function ChatScreen({ navigation, route }) {
     // Deleted by the user from the device/gallery → not downloaded any more.
     if (isMediaGone(msg)) return false;
 
-    // Check persisted download flag on the message itself (survives app restart)
-    if (msg.isMediaDownloaded === true || msg.downloadStatus === MEDIA_DOWNLOAD_STATUS.DOWNLOADED) {
-      return true;
-    }
-
-    // Check payload download flag
-    if (msg.payload?.isMediaDownloaded === true) {
-      return true;
-    }
-
-    const state = resolveMediaState(msg);
-    if (state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && state?.localPath) {
-      return true;
-    }
-
-    const keys = getMediaKeyCandidates(msg);
-
-    // Check in downloadedMedia state
-    for (const key of keys) {
-      if (downloadedMedia[key]) {
-        return true;
-      }
-    }
-
-    // Also check msg.localUri
-    if (msg.localUri) {
-      return true;
-    }
-
-    return false;
+    // Downloaded ⇔ the file is stored here (and, once checked, still exists).
+    return Boolean(resolveDownloadedUri(msg));
   };
 
   const resolveDownloadedUri = (msg) => {
@@ -2225,24 +2254,8 @@ export default function ChatScreen({ navigation, route }) {
 
     if (isMediaGone(msg)) return null;
 
-    // Check msg.localUri first (persisted across app restarts)
-    if (msg.localUri) {
-      return msg.localUri;
-    }
-
-    const state = resolveMediaState(msg);
-    if (state?.status === MEDIA_DOWNLOAD_STATUS.DOWNLOADED && state?.localPath) {
-      return state.localPath;
-    }
-
-    const keys = getMediaKeyCandidates(msg);
-
-    // Check downloadedMedia state
-    for (const key of keys) {
-      if (downloadedMedia[key]) {
-        return downloadedMedia[key];
-      }
-    }
+    const live = liveLocalPath(rawLocalPath(msg));
+    if (live) return live;
 
     // Fallback: check payload file uri (sender's own media)
     if (msg.payload?.file?.uri) {
@@ -2467,6 +2480,56 @@ export default function ChatScreen({ navigation, route }) {
     })();
   };
   useEffect(() => { scanGoneMediaRef.current?.(); }, [messages]);
+
+  // Check the stored files behind the visible media bubbles (see mediaPathCheck): a stale path
+  // from an old iOS app container is re-based and healed in place; a file that is really gone
+  // drops its record so the bubble offers the download again (and the download works).
+  const verifyMediaPathsRef = useRef(null);
+  verifyMediaPathsRef.current = () => {
+    const todo = new Map(); // stored path → messages that use it
+    for (const msg of messages || []) {
+      if (!msg || !isMediaType(msg) || isBroadcastMedia(msg)) continue;
+      if (msg?.isViewOnce || msg?.viewOnce || msg?.payload?.isViewOnce) continue;
+      const stored = rawLocalPath(msg);
+      if (!stored || !isRebasableAppPath(stored) || mediaPathAskedRef.current.has(stored)) continue;
+      if (!todo.has(stored)) todo.set(stored, []);
+      todo.get(stored).push(msg);
+    }
+    if (!todo.size) return;
+    todo.forEach((_, stored) => mediaPathAskedRef.current.add(stored));
+    (async () => {
+      const results = await Promise.all([...todo.keys()].map(async (stored) => [stored, await localStorageService.resolveExistingPath(stored)]));
+      // Only "the file is here (maybe re-based)" is remembered. A missing file is healed below
+      // (record + row dropped), and its path is asked about again if a later download recreates
+      // it — a remembered "missing" verdict would blur a freshly re-downloaded file.
+      setMediaPathCheck((prev) => {
+        const next = { ...prev };
+        results.forEach(([stored, live]) => { if (live) next[stored] = live; else delete next[stored]; });
+        return next;
+      });
+      for (const [stored, live] of results) {
+        for (const msg of todo.get(stored) || []) {
+          const rowId = msg?.serverMessageId || msg?.id || msg?.tempId || null;
+          const mediaId = getResolvedMediaId(msg);
+          if (live && live !== stored) {
+            // Same file, new container path: heal the row and the media record.
+            if (rowId) ChatDatabase.setMessageLocalUri(rowId, live).catch(() => {});
+            if (mediaId) localStorageService.repointMediaRecord(mediaId, live).catch(() => {});
+          } else if (!live) {
+            if (rowId) ChatDatabase.setMessageLocalUri(rowId, null).catch(() => {});
+            if (mediaId) localStorageService.forgetMediaRecord(mediaId).catch(() => {});
+            markMediaRemovedLocally(goneKeysFor(msg)).catch(() => {});
+            // Not found even after re-basing = the file was deleted from the device (the
+            // Android shared folder matches the same TalksTry/Media marker, so a gallery delete
+            // lands here). Blur the bubble; downloading it shows "Couldn't download".
+            markMediaGone(goneKeysFor(msg));
+          }
+        }
+        if (!live) mediaPathAskedRef.current.delete(stored);
+      }
+    })().catch(() => {});
+  };
+  useEffect(() => { verifyMediaPathsRef.current?.(); }, [messages, mediaDownloadStates, downloadedMedia]);
   useEffect(() => {
     const sub = RNAppState.addEventListener('change', (st) => {
       if (st === 'active') scanGoneMediaRef.current?.();
@@ -2783,6 +2846,58 @@ export default function ChatScreen({ navigation, route }) {
       }
     })();
   }, [route?.params?.pendingShare, activeChatId, currentUserId, sendMedia, setText, navigation]);
+
+  // ── Draft (WhatsApp-style) ────────────────────────────────────────────────
+  // Unsent text is kept per chat (chatDraftStore) so leaving the chat doesn't
+  // lose it: the list shows a green "Draft:" row and reopening puts it back in
+  // the box. Sending empties the box, which clears the draft. Saving only
+  // starts once this chat's draft has been restored, so the box's initial ''
+  // can't wipe it first. While editing a message the box holds THAT message's
+  // text — never saved — and the draft comes back when the edit ends.
+  // grp_<now> is initializeChat's last-resort id, not a real chat.
+  const draftChatId = activeChatId && !/^grp_\d+$/.test(String(activeChatId)) ? String(activeChatId) : '';
+  const draftRestoredForRef = useRef('');
+  const draftTextRef = useRef(text);
+  draftTextRef.current = text;
+  const draftEditingRef = useRef(Boolean(editingMessage));
+  draftEditingRef.current = Boolean(editingMessage);
+  const draftWasEditingRef = useRef(false);
+
+  useEffect(() => {
+    if (!draftChatId || draftRestoredForRef.current === draftChatId) return undefined;
+    let cancelled = false;
+    loadChatDrafts().then(() => {
+      if (cancelled) return;
+      draftRestoredForRef.current = draftChatId;
+      const saved = getChatDraft(draftChatId);
+      // Something already in the box (a shared link, fast typing) wins.
+      if (saved && !draftTextRef.current && !draftEditingRef.current) setText(saved);
+    });
+    return () => { cancelled = true; };
+  }, [draftChatId, setText]);
+
+  useEffect(() => {
+    if (!draftChatId || draftRestoredForRef.current !== draftChatId) return undefined;
+    if (editingMessage) {
+      draftWasEditingRef.current = true;
+      return undefined;
+    }
+    if (draftWasEditingRef.current) {
+      draftWasEditingRef.current = false;
+      const saved = getChatDraft(draftChatId);
+      if (saved && !text) setText(saved);
+      return undefined;
+    }
+    const t = setTimeout(() => setChatDraft(draftChatId, text), 300);
+    return () => clearTimeout(t);
+  }, [text, draftChatId, editingMessage, setText]);
+
+  // Leaving the chat: write whatever is in the box right now (the debounce
+  // above may not have fired yet).
+  useEffect(() => () => {
+    if (!draftChatId || draftRestoredForRef.current !== draftChatId || draftEditingRef.current) return;
+    setChatDraft(draftChatId, draftTextRef.current);
+  }, [draftChatId]);
 
   // ── First-paint loading UX (local-first + spinner) ────────────────────────
   // Messages render from SQLite instantly. A small spinner appears ONLY if
@@ -3752,6 +3867,9 @@ export default function ChatScreen({ navigation, route }) {
   // IMPROVED: Enhanced download function with better persistence
   const handleDownloadWithPersistence = async (msg) => {
     try {
+      // Deleted from the device/gallery → WhatsApp's "Couldn't download" dialog, never a
+      // silent re-download (product rule). A stale iOS container path is NOT "gone": it is
+      // re-based by verifyMediaPaths before it can be marked.
       if (isMediaGone(msg)) {
         showMediaUnavailable({ reason: 'deleted-from-device' });
         return null;
@@ -4302,8 +4420,9 @@ export default function ChatScreen({ navigation, route }) {
     // Handle edit mode submission
     if (editingMessage) {
       if (text.trim()) {
-        await submitEditMessage(text);
-        handleTextChange('');
+        const sent = await submitEditMessage(text);
+        // false = offline: keep the composer (and the typed text) in place.
+        if (sent !== false) handleTextChange('');
       }
       return;
     }
@@ -4890,6 +5009,11 @@ export default function ChatScreen({ navigation, route }) {
 
   // Animate scroll-to-bottom button
   useEffect(() => {
+    // Reduced motion: snap (no spring) when the OS asks for less animation.
+    if (reduceMotion) {
+      scrollBtnAnim.setValue(showScrollButton ? 1 : 0);
+      return;
+    }
     Animated.spring(scrollBtnAnim, {
       toValue: showScrollButton ? 1 : 0,
       damping: 18,
@@ -4897,7 +5021,7 @@ export default function ChatScreen({ navigation, route }) {
       mass: 0.6,
       useNativeDriver: true,
     }).start();
-  }, [showScrollButton, scrollBtnAnim]);
+  }, [showScrollButton, scrollBtnAnim, reduceMotion]);
 
   // New messages counter
   useEffect(() => {
@@ -5113,17 +5237,17 @@ export default function ChatScreen({ navigation, route }) {
           slightly-different literals, so the empty state's "TODAY" did not
           match the one a real conversation shows. */}
       <View style={{
-        backgroundColor: dateChipColors(isDarkMode).bg,
+        backgroundColor: dateChipColors(theme).bg,
         borderWidth: StyleSheet.hairlineWidth,
-        borderColor: dateChipColors(isDarkMode).border,
+        borderColor: dateChipColors(theme).border,
         paddingHorizontal: 14,
         paddingVertical: 5,
         borderRadius: 8,
         marginBottom: 10,
       }}>
-        <Text style={{
-          fontSize: 11.5,
-          color: dateChipColors(isDarkMode).text,
+        <Text maxFontSizeMultiplier={1.2} style={{
+          fontSize: 12,
+          color: dateChipColors(theme).text,
           fontFamily: 'Roboto-Medium',
           letterSpacing: 0.1,
         }}>
@@ -5131,21 +5255,21 @@ export default function ChatScreen({ navigation, route }) {
         </Text>
       </View>
       <View style={{
-        backgroundColor: dateChipColors(isDarkMode).bg,
+        backgroundColor: dateChipColors(theme).bg,
         borderWidth: StyleSheet.hairlineWidth,
-        borderColor: dateChipColors(isDarkMode).border,
+        borderColor: dateChipColors(theme).border,
         paddingHorizontal: 12,
         paddingVertical: 8,
         borderRadius: 8,
         alignItems: 'center',
         maxWidth: '85%',
       }}>
-        <Text style={{ color: theme.colors.placeHolderTextColor, fontSize: 11.5, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+        <Text maxFontSizeMultiplier={1.2} style={{ color: theme.colors.systemText, fontSize: 12.5, lineHeight: 18, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
           Messages and calls are end-to-end encrypted. Only people in this chat can read, listen to, or share them.
         </Text>
       </View>
     </View>
-  ), [theme.colors.placeHolderTextColor, isDarkMode]);
+  ), [theme]);
 
   useEffect(() => {
     // setLayoutAnimationEnabledExperimental is a no-op under the New Architecture
@@ -5160,7 +5284,7 @@ export default function ChatScreen({ navigation, route }) {
   // Render functions
   const renderDateBadge = useCallback((dateKey) => {
     const displayDate = getDateLabel(dateKey);
-    const chip = dateChipColors(isDarkMode);
+    const chip = dateChipColors(theme);
     return (
       <View style={{ alignItems: 'center', marginVertical: 8 }}>
         <View style={{
@@ -5176,8 +5300,8 @@ export default function ChatScreen({ navigation, route }) {
           shadowRadius: 2,
           elevation: 1,
         }}>
-          <Text style={{
-            fontSize: 11.5,
+          <Text maxFontSizeMultiplier={1.2} style={{
+            fontSize: 12,
             color: chip.text,
             fontFamily: 'Roboto-Medium',
             letterSpacing: 0.1,
@@ -5187,7 +5311,7 @@ export default function ChatScreen({ navigation, route }) {
         </View>
       </View>
     );
-  }, [isDarkMode, getDateLabel]);
+  }, [theme, getDateLabel]);
 
   // In inverted FlatList: index 0 = newest (bottom), last = oldest (top)
   // We render the badge AFTER the message item in JSX → appears ABOVE in inverted view
@@ -5536,9 +5660,9 @@ export default function ChatScreen({ navigation, route }) {
     // forcing a family that cannot draw them.
     const bodyFont = needsSystemFont(displayText) ? undefined : 'Roboto-Regular';
 
-    const baseColor = isMyMessage ? '#E9EDEF' : (isDarkMode ? '#E9EDEF' : theme.colors.primaryTextColor);
-    const linkColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
-    const mentionColor = isMyMessage ? '#D8ECFF' : theme.colors.themeColor;
+    const baseColor = isMyMessage ? outPal.text : theme.colors.bubbleReceivedText;
+    const linkColor = isMyMessage ? outPal.link : theme.colors.link;
+    const mentionColor = linkColor;
     // Metadata first. The roster fallback covers rows that reached this device
     // without it — anything stored before the ingest carried the array, or a
     // server that doesn't echo it back — by matching "@name" against the
@@ -5591,7 +5715,7 @@ export default function ChatScreen({ navigation, route }) {
                   key={key}
                   style={{
                     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-                    backgroundColor: isMyMessage ? 'rgba(255,255,255,0.16)' : 'rgba(0,0,0,0.09)',
+                    backgroundColor: withAlpha(baseColor, 0.12),
                     color: baseColor,
                   }}
                 >
@@ -5644,17 +5768,13 @@ export default function ChatScreen({ navigation, route }) {
                 <View
                   key={`codeblock_${messageKey}_${segIndex}`}
                   style={{
-                    backgroundColor: isMyMessage
-                      ? 'rgba(0,0,0,0.22)'
-                      : (isDarkMode ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)'),
+                    backgroundColor: withAlpha(baseColor, isMyMessage ? 0.10 : 0.07),
                     borderRadius: 8,
                     paddingHorizontal: 10,
                     paddingVertical: 8,
                     marginVertical: 4,
                     borderWidth: StyleSheet.hairlineWidth,
-                    borderColor: isMyMessage
-                      ? 'rgba(255,255,255,0.18)'
-                      : (isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.10)'),
+                    borderColor: withAlpha(baseColor, 0.18),
                   }}
                 >
                   <Text
@@ -5677,7 +5797,8 @@ export default function ChatScreen({ navigation, route }) {
             return (
               <Text
                 key={`textseg_${messageKey}_${segIndex}`}
-                style={{ fontSize: 15, color: baseColor, fontFamily: bodyFont, lineHeight: 20 }}
+                maxFontSizeMultiplier={1.5}
+                style={{ fontSize: 15, color: baseColor, fontFamily: bodyFont, lineHeight: 22 }}
               >
                 {renderInlineTokens(seg.lines, `_s${segIndex}`)}
               </Text>
@@ -5691,6 +5812,7 @@ export default function ChatScreen({ navigation, route }) {
       <View>
         <Text
           onTextLayout={handleMeasureLayout}
+          maxFontSizeMultiplier={1.5}
           style={{
             position: 'absolute',
             opacity: 0,
@@ -5698,20 +5820,21 @@ export default function ChatScreen({ navigation, route }) {
             fontSize: 15,
             color: baseColor,
             fontFamily: bodyFont,
-            lineHeight: 20,
+            lineHeight: 22,
           }}
         >
           {renderInlineTokens()}
         </Text>
 
         <Text
+          maxFontSizeMultiplier={1.5}
           numberOfLines={!isExpanded && showReadMore ? RICH_TEXT_COLLAPSED_LINES : undefined}
           ellipsizeMode="tail"
           style={{
             fontSize: 15,
             color: baseColor,
             fontFamily: bodyFont,
-            lineHeight: 20,
+            lineHeight: 22,
           }}
         >
           {renderInlineTokens()}
@@ -5729,7 +5852,7 @@ export default function ChatScreen({ navigation, route }) {
               style={{
                 fontSize: 12,
                 fontFamily: 'Roboto-Medium',
-                color: isMyMessage ? '#D8ECFF' : theme.colors.themeColor,
+                color: isMyMessage ? outPal.link : theme.colors.link,
                 textDecorationLine: 'underline',
               }}
             >
@@ -5743,41 +5866,20 @@ export default function ChatScreen({ navigation, route }) {
 
   // WhatsApp delivery ticks (single/double check, blue on read). Shared by the
   // inline text-bubble footer and the bottom status row.
-  const renderTicks = (msg, { size = 16 } = {}) => {
-    const c = 'rgba(233,237,239,0.65)';
-    switch (msg?.status) {
-      case 'scheduled':
-      case 'processing':
-      case 'pending':
-        return <Ionicons name="time-outline" size={14} color={c} style={{ marginLeft: 1 }} />;
-      case 'cancelled':
-        return <Ionicons name="close-circle" size={14} color="#FF8A80" style={{ marginLeft: 1 }} />;
-      case 'sending':
-        return <ActivityIndicator size={10} color={c} style={{ marginLeft: 1 }} />;
-      case 'uploaded':
-      case 'sent':
-        return <Ionicons name="checkmark" size={size} color={c} style={{ marginLeft: 1 }} />;
-      case 'delivered':
-        return <Ionicons name="checkmark-done" size={size} color={c} style={{ marginLeft: 1 }} />;
-      case 'seen':
-      case 'read':
-        return <Ionicons name="checkmark-done" size={size} color="#53BDEB" style={{ marginLeft: 1 }} />;
-      case 'failed':
-        return (
-          <TouchableOpacity onPress={() => resendMessage(msg)}>
-            <Ionicons name="alert-circle" size={14} color="#FF5252" style={{ marginLeft: 1 }} />
-          </TouchableOpacity>
-        );
-      default:
-        return null;
-    }
-  };
+  const renderTicks = (msg, { size = TICK_SIZE } = {}) => (
+    <MessageTicks
+      status={msg?.status}
+      colors={tickColors}
+      size={size}
+      onRetry={msg?.status === 'failed' ? () => resendMessage(msg) : undefined}
+    />
+  );
 
   // The "edited · 10:56 AM ✓✓" footer. `inline` floats it into the bottom-right
   // of a text bubble (WhatsApp tucks the meta onto the last line of text).
   const renderMessageMeta = (msg, isMyMessage, { inline = false } = {}) => {
     const showEdited = Boolean(msg?.isEdited || msg?.editedAt || msg?.edited);
-    const metaColor = isMyMessage ? 'rgba(233,237,239,0.6)' : theme.colors.placeHolderTextColor;
+    const metaColor = isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta;
     // A freshly-sent (optimistic) message may not have `time` populated yet —
     // derive it from the timestamp so the bubble never renders as bare text with
     // no time (the "sometimes it just shows the message" glitch). Mirrors the
@@ -5794,11 +5896,11 @@ export default function ChatScreen({ navigation, route }) {
         ]}
       >
         {showEdited && (
-          <Text style={{ fontSize: 11, color: metaColor, fontFamily: 'Roboto-Regular', fontStyle: 'italic' }}>
+          <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 11.5, color: metaColor, fontFamily: 'Roboto-Regular', fontStyle: 'italic' }}>
             edited
           </Text>
         )}
-        <Text style={{ fontSize: 11, color: metaColor, fontFamily: 'Roboto-Regular' }}>{timeText}</Text>
+        <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 11.5, lineHeight: 14, color: metaColor, fontFamily: 'Roboto-Regular' }}>{timeText}</Text>
         {isMyMessage && renderTicks(msg)}
       </View>
     );
@@ -5850,45 +5952,18 @@ export default function ChatScreen({ navigation, route }) {
 
     const renderTick = () => {
       if (!isMyMessage) return null;
-
-      // pending = message not yet sent (e.g. queued offline)
-      if (msg?.status === 'pending') {
-        return <Ionicons name="time-outline" size={11} color="rgba(255,255,255,0.75)" style={{ marginLeft: 3 }} />;
-      }
-      if (msg?.status === 'sending') {
-        return <ActivityIndicator size={8} color="rgba(255,255,255,0.85)" style={{ marginLeft: 3 }} />;
-      }
-      if (msg?.status === 'uploaded' || msg?.status === 'sent') {
-        // single gray tick — sent but not yet delivered
-        return <Ionicons name="checkmark" size={11} color="rgba(255,255,255,0.75)" style={{ marginLeft: 3 }} />;
-      }
-      if (msg?.status === 'delivered') {
-        // double gray tick
-        return <Ionicons name="checkmark-done" size={11} color="rgba(255,255,255,0.75)" style={{ marginLeft: 3 }} />;
-      }
-      if (msg?.status === 'seen' || msg?.status === 'read') {
-        // double blue tick — WhatsApp blue #53BDEB
-        return <Ionicons name="checkmark-done" size={11} color="#53BDEB" style={{ marginLeft: 3 }} />;
-      }
-      if (msg?.status === 'failed' || msg?.status === 'cancelled') {
-        // Tap-to-retry: re-runs the failed/cancelled upload+send (resendMessage
-        // routes not-yet-uploaded media through retryFailedMediaMessage; a
-        // parked chunked session resumes from the server offset).
-        return (
-          <TouchableOpacity
-            onPress={() => resendMessage(msg)}
-            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-          >
-            <Ionicons
-              name="refresh-circle"
-              size={13}
-              color={msg?.status === 'cancelled' ? theme.colors.themeColor : '#FF8A80'}
-              style={{ marginLeft: 3 }}
-            />
-          </TouchableOpacity>
-        );
-      }
-      return null;
+      // Media overlay sits on a dark scrim over the photo, so it uses the
+      // media* tick tokens (light neutral / bright blue / soft red).
+      return (
+        <MessageTicks
+          status={msg?.status}
+          colors={tickColors}
+          size={15}
+          variant="media"
+          style={{ marginLeft: 3 }}
+          onRetry={(msg?.status === 'failed' || msg?.status === 'cancelled') ? () => resendMessage(msg) : undefined}
+        />
+      );
     };
 
     return (
@@ -5897,8 +5972,8 @@ export default function ChatScreen({ navigation, route }) {
         position: 'absolute',
         right: 8,
         bottom: 7,
-        backgroundColor: 'rgba(0,0,0,0.4)',
-        borderRadius: 7,
+        backgroundColor: 'rgba(0,0,0,0.6)',
+        borderRadius: 8,
         paddingHorizontal: 6,
         paddingVertical: 2,
         flexDirection: 'row',
@@ -5906,11 +5981,11 @@ export default function ChatScreen({ navigation, route }) {
       }}
     >
       {edited && (
-        <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 9, marginRight: 3, fontFamily: 'Roboto-Regular' }}>
+        <Text maxFontSizeMultiplier={1.2} style={{ color: 'rgba(255,255,255,0.92)', fontSize: 11, marginRight: 3, fontFamily: 'Roboto-Regular' }}>
           edited
         </Text>
       )}
-      <Text style={{ color: '#fff', fontSize: 9, fontFamily: 'Roboto-Medium' }}>{msg?.time}</Text>
+      <Text maxFontSizeMultiplier={1.2} style={{ color: '#fff', fontSize: 11, fontFamily: 'Roboto-Medium' }}>{msg?.time}</Text>
       {renderTick()}
     </View>
     );
@@ -6233,14 +6308,13 @@ export default function ChatScreen({ navigation, route }) {
     // to download first, so the play button shows immediately.
     const remoteAudioUrl = toSecureMediaUri(msg?.mediaUrl);
     const canPlay = isMyMessage || downloaded || Boolean(remoteAudioUrl);
-    const bubbleColor = isMyMessage
-      ? (chatColor || '#03b0a2')
-      : (isDarkMode ? 'rgba(30, 45, 60, 0.95)' : '#fff');
-    const subColor = isMyMessage ? 'rgba(255,255,255,0.72)' : theme.colors.placeHolderTextColor;
-    const trackBg = isMyMessage ? 'rgba(255,255,255,0.30)' : 'rgba(0,0,0,0.16)';
-    const trackFill = isMyMessage ? '#fff' : theme.colors.themeColor;
-    const iconBg = isMyMessage ? 'rgba(255,255,255,0.22)' : (theme.colors.themeColor + '22');
-    const iconColor = isMyMessage ? '#fff' : theme.colors.themeColor;
+    // Ring colour of the avatar badge = the bubble it sits on.
+    const bubbleColor = isMyMessage ? sentBubbleBg : theme.colors.bubbleReceived;
+    const subColor = isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta;
+    const trackBg = isMyMessage ? withAlpha(sentBubbleText, 0.28) : 'rgba(127,127,127,0.30)';
+    const trackFill = isMyMessage ? sentBubbleText : theme.colors.link;
+    const iconBg = isMyMessage ? withAlpha(sentBubbleText, 0.16) : (theme.colors.themeColor + '22');
+    const iconColor = isMyMessage ? sentBubbleText : theme.colors.link;
 
     // Sender's avatar (with a mic badge) beside the waveform — mine on my
     // messages, the peer's / the group member's on received ones.
@@ -6286,12 +6360,12 @@ export default function ChatScreen({ navigation, route }) {
           <View style={{ width: 44, height: 44, marginRight: 6 }}>
             <View style={{
               width: 44, height: 44, borderRadius: 22, overflow: 'hidden',
-              backgroundColor: isMyMessage ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.10)',
+              backgroundColor: isMyMessage ? withAlpha(sentBubbleText, 0.16) : 'rgba(127,127,127,0.18)',
               alignItems: 'center', justifyContent: 'center',
             }}>
               {avatarUri
-                ? <Image source={{ uri: avatarUri }} style={{ width: 44, height: 44 }} />
-                : <Ionicons name="person" size={24} color={isMyMessage ? 'rgba(255,255,255,0.85)' : theme.colors.placeHolderTextColor} />}
+                ? <AppImage source={{ uri: avatarUri }} style={{ width: 44, height: 44 }} />
+                : <Ionicons name="person" size={24} color={isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta} />}
             </View>
             <View style={{
               position: 'absolute', right: -2, bottom: -2,
@@ -6392,10 +6466,10 @@ export default function ChatScreen({ navigation, route }) {
     // Inset panel tinted relative to the parent bubble (darker teal on sent,
     // subtle neutral on received) — WhatsApp parity instead of a flat menu card.
     const panelBg = isMyMessage
-      ? 'rgba(0,0,0,0.16)'
+      ? withAlpha(sentBubbleText, 0.10)
       : (isDarkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.045)');
-    const nameColor = isMyMessage ? '#E9EDEF' : theme.colors.primaryTextColor;
-    const metaColor = isMyMessage ? 'rgba(233,237,239,0.65)' : theme.colors.placeHolderTextColor;
+    const nameColor = isMyMessage ? sentBubbleText : theme.colors.bubbleReceivedText;
+    const metaColor = isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta;
     const extLabel = ext ? ext.toUpperCase() : '';
 
     const handleFileTap = async () => {
@@ -6471,8 +6545,8 @@ export default function ChatScreen({ navigation, route }) {
 
           {/* Download progress bar (kept visible, frozen, while paused) */}
           {(isDownloading || isDownloadPausedState) && (
-            <View style={{ height: 3, borderRadius: 3, backgroundColor: isMyMessage ? 'rgba(255,255,255,0.25)' : 'rgba(127,127,127,0.25)', marginTop: 5, marginBottom: 1, overflow: 'hidden' }}>
-              <View style={{ width: `${Math.round(Math.max(5, progress * 100))}%`, height: 3, borderRadius: 3, backgroundColor: isMyMessage ? '#E9EDEF' : fileIconColor }} />
+            <View style={{ height: 3, borderRadius: 3, backgroundColor: isMyMessage ? withAlpha(sentBubbleText, 0.25) : 'rgba(127,127,127,0.25)', marginTop: 5, marginBottom: 1, overflow: 'hidden' }}>
+              <View style={{ width: `${Math.round(Math.max(5, progress * 100))}%`, height: 3, borderRadius: 3, backgroundColor: isMyMessage ? sentBubbleText : fileIconColor }} />
             </View>
           )}
 
@@ -6539,8 +6613,8 @@ export default function ChatScreen({ navigation, route }) {
     const groupCounter = isMyMessage && (Number(vo.totalRecipients) || 0) > 1
       ? ` ${Number(vo.openedCount) || 0}/${Number(vo.totalRecipients)}`
       : '';
-    const baseColor = isMyMessage ? '#E9EDEF' : theme.colors.primaryTextColor;
-    const mutedColor = isMyMessage ? 'rgba(233,237,239,0.6)' : theme.colors.placeHolderTextColor;
+    const baseColor = isMyMessage ? sentBubbleText : theme.colors.bubbleReceivedText;
+    const mutedColor = isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta;
     const ringColor = consumed ? mutedColor : (tappable ? chatColor : baseColor);
     const sizeLabel = !isMyMessage && !consumed && vo.byteSize ? formatBytes(Number(vo.byteSize)) : null;
     // Sender upload state: while bytes are in flight the "1" circle BECOMES
@@ -6653,10 +6727,10 @@ export default function ChatScreen({ navigation, route }) {
     const isRegistered = contact.isRegistered === true;
     const contactUserId = contact.userId || null;
 
-    const textColor = isMyMessage ? '#fff' : theme.colors.primaryTextColor;
-    const subColor = isMyMessage ? 'rgba(255,255,255,0.7)' : theme.colors.placeHolderTextColor;
-    const dividerColor = isMyMessage ? 'rgba(255,255,255,0.18)' : theme.colors.borderColor;
-    const btnColor = isMyMessage ? '#fff' : theme.colors.themeColor;
+    const textColor = isMyMessage ? sentBubbleText : theme.colors.bubbleReceivedText;
+    const subColor = isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta;
+    const dividerColor = isMyMessage ? withAlpha(sentBubbleText, 0.18) : theme.colors.borderColor;
+    const btnColor = isMyMessage ? outPal.link : theme.colors.link;
 
     const openContactDetail = () => {
       setContactViewer({ visible: true, data: { ...contact, fullName: contactName, countryCode, mobileNumber, profileImage, isRegistered, userId: contactUserId } });
@@ -6727,8 +6801,8 @@ export default function ChatScreen({ navigation, route }) {
             uri={profileImage}
             size={46}
             iconSize={24}
-            bgColor={isMyMessage ? 'rgba(255,255,255,0.2)' : (theme.colors.themeColor + '20')}
-            iconColor={isMyMessage ? '#fff' : theme.colors.themeColor}
+            bgColor={isMyMessage ? withAlpha(sentBubbleText, 0.14) : (theme.colors.themeColor + '20')}
+            iconColor={isMyMessage ? sentBubbleText : theme.colors.link}
           />
           <View style={{ flex: 1, marginLeft: 10 }}>
             <Text style={{ color: textColor, fontFamily: 'Roboto-SemiBold', fontSize: 14 }} numberOfLines={1}>
@@ -6740,7 +6814,7 @@ export default function ChatScreen({ navigation, route }) {
             {isRegistered && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: theme.colors.themeColor, marginRight: 4 }} />
-                <Text style={{ color: isMyMessage ? 'rgba(255,255,255,0.8)' : theme.colors.themeColor, fontSize: 10, fontFamily: 'Roboto-Medium' }}>
+                <Text maxFontSizeMultiplier={1.2} style={{ color: isMyMessage ? sentBubbleMeta : theme.colors.link, fontSize: 11, fontFamily: 'Roboto-Medium' }}>
                   On TalksTry
                 </Text>
               </View>
@@ -6878,7 +6952,15 @@ export default function ChatScreen({ navigation, route }) {
   // Written every render so renderChatsItem never reads a stale array.
   renderableMessagesRef.current = Array.isArray(renderableMessages) ? renderableMessages : [];
 
-  const renderChatsItemBody = useCallback(({ item: msg, index }) => {
+  // The row body is a plain function re-created every render and reached through
+  // a ref, so its callback identity (what MessageRow compares) is STABLE. It used
+  // to be a useCallback over ~40 deps including the progress / audio-playback
+  // maps, so every download tick or 60 ms voice-note position update gave every
+  // mounted row a new `renderBody` and re-rendered all of them. Rows now
+  // re-render only when their own inputs change (see rowCtx / rowExtra / liveSig
+  // below). The body still reads the LATEST closure through the ref, so nothing
+  // it reads can be stale.
+  const renderChatsItemBodyImpl = ({ item: msg, index }) => {
     const messageKey = getMessageKey(msg);
     const isSelected = selectedMessage.some(sel => sameId(sel, messageKey));
     // Which side this row renders on. Resolved from the row's OWN participant
@@ -6995,19 +7077,18 @@ export default function ChatScreen({ navigation, route }) {
         const otpRestText = otpCode
           ? systemText.replace(otpCodeMatch[0], '').replace(/^\s*is\s+/, '').replace(/\s{2,}/g, ' ').trim()
           : systemText;
-        const otpAccent = theme?.colors?.primary || '#03b0a2';
+        const otpAccent = theme.colors.link;
         return (
           <React.Fragment>
             {/* Same geometry/colors as a normal RECEIVED text bubble (see the
-                generic bubble below: radius 8, top-left tail 3, #202C33 dark /
-                cardBackground light, same padding + shadow) — only the code
+                generic bubble below: radius 8, top-left tail 3, bubbleReceived token, same padding + shadow) — only the code
                 line inside is highlighted. */}
             <View style={{ alignItems: 'flex-start', paddingVertical: 2, paddingHorizontal: 12 }}>
               <View style={{
-                maxWidth: '80%',
+                maxWidth: Math.min(Math.floor((winW - 24) * 0.8), BUBBLE_MAX_PX),
                 borderRadius: 8,
                 borderTopLeftRadius: 3,
-                backgroundColor: isDarkMode ? '#202C33' : theme.colors.cardBackground,
+                backgroundColor: theme.colors.bubbleReceived,
                 paddingVertical: 6,
                 paddingHorizontal: 9,
                 shadowColor: theme.colors.shadow,
@@ -7018,17 +7099,17 @@ export default function ChatScreen({ navigation, route }) {
               }}>
                 {otpCode ? (
                   <>
-                    <Text style={{ fontSize: 15, color: isDarkMode ? '#E9EDEF' : theme.colors.textColor, fontFamily: 'Roboto-Regular', lineHeight: 21 }}>
+                    <Text maxFontSizeMultiplier={1.5} style={{ fontSize: 15, color: theme.colors.bubbleReceivedText, fontFamily: 'Roboto-Regular', lineHeight: 22 }}>
                       <Text selectable style={{ color: otpAccent, fontFamily: 'Roboto-Bold', fontSize: 17, letterSpacing: 2 }}>{otpCode}</Text>
                       {otpRestText ? ` is ${otpRestText}` : ''}
                     </Text>
                   </>
                 ) : (
-                  <Text style={{ fontSize: 15, color: isDarkMode ? '#E9EDEF' : theme.colors.textColor, fontFamily: 'Roboto-Regular', lineHeight: 21 }}>
+                  <Text maxFontSizeMultiplier={1.5} style={{ fontSize: 15, color: theme.colors.bubbleReceivedText, fontFamily: 'Roboto-Regular', lineHeight: 22 }}>
                     {otpRestText}
                   </Text>
                 )}
-                <Text style={{ fontSize: 11, color: theme.colors.secondaryTextColor, fontFamily: 'Roboto-Regular', alignSelf: 'flex-end', marginTop: 3 }}>
+                <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 11.5, color: theme.colors.bubbleMeta, fontFamily: 'Roboto-Regular', alignSelf: 'flex-end', marginTop: 3 }}>
                   {msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
                 </Text>
               </View>
@@ -7077,8 +7158,8 @@ export default function ChatScreen({ navigation, route }) {
       return (
         <React.Fragment>
           <View style={{ alignItems: 'center', paddingVertical: 3, paddingHorizontal: 30 }}>
-            <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 10, maxWidth: '85%' }}>
-              <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+            <View style={{ backgroundColor: theme.colors.systemBg, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 10, maxWidth: '85%' }}>
+              <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 12.5, lineHeight: 18, color: theme.colors.systemText, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
                 {systemDisplayText}
               </Text>
             </View>
@@ -7121,6 +7202,20 @@ export default function ChatScreen({ navigation, route }) {
       && sameId(olderMsg.senderId, msg.senderId)
       && !dateBadgeKey
       && withinGroupGap;
+    // Same-side run (any chat type): previous (older) message is from the same
+    // sender, no date divider between and not system-like. Drives the tighter
+    // consecutive gap (2dp) vs the larger sender-change gap (9dp) + tail corner.
+    const continuesSideRun = !!olderMsg
+      && !olderIsSystemLike
+      && !dateBadgeKey
+      && withinGroupGap
+      && (isMyMessage
+        ? isOutgoingMessage(olderMsg, currentUserId)
+        : (!isOutgoingMessage(olderMsg, currentUserId) && (!isGroupChatRow || sameId(olderMsg.senderId, msg.senderId))));
+    // Bubble max width: 80% of the row, capped on tablets (rows have 12dp
+    // gutters; group-received rows also reserve the 36dp avatar column).
+    const rowInnerW = winW - 24 - (isGroupReceived ? 36 : 0);
+    const bubbleMaxW = Math.min(Math.floor(rowInnerW * 0.8), BUBBLE_MAX_PX);
     // First message of a run → show avatar + name. Follow-ups → bubble only.
     const showSenderAvatar = isGroupReceived && !continuesRun;
     const showSenderName = showSenderAvatar;
@@ -7194,7 +7289,8 @@ export default function ChatScreen({ navigation, route }) {
           style={{
             flexDirection: isGroupReceived ? "row" : "column",
             alignItems: isGroupReceived ? "flex-start" : (isMyMessage ? "flex-end" : "flex-start"),
-            paddingVertical: 2,
+            paddingTop: continuesSideRun ? 1 : 8,
+            paddingBottom: 1,
             paddingHorizontal: 12,
             backgroundColor: isSelected
               ? theme.colors.themeColor + '20'
@@ -7230,10 +7326,11 @@ export default function ChatScreen({ navigation, route }) {
           <View style={{
             // WhatsApp bubble geometry: ~7.5px corners with a small tail at the
             // TOP corner on the sender's side (top-right for me, top-left for them).
-            maxWidth: "80%",
+            maxWidth: bubbleMaxW,
             borderRadius: 8,
-            borderTopRightRadius: isMyMessage ? 3 : 8,
-            borderTopLeftRadius: isMyMessage ? 8 : 3,
+            // Tail corner only on the first bubble of a run.
+            borderTopRightRadius: (isMyMessage && !continuesSideRun) ? 3 : 8,
+            borderTopLeftRadius: (!isMyMessage && !continuesSideRun) ? 3 : 8,
             backgroundColor: isDeletedMessage
               ? theme.colors.bubbleDeleted
               : (isMyMessage ? sentBubbleBg : theme.colors.bubbleReceived),
@@ -7247,8 +7344,10 @@ export default function ChatScreen({ navigation, route }) {
             // edge. The hairline restores it without darkening the bubble.
             borderWidth: isHighlighted
               ? 2
-              : ((!isDarkMode && !isMyMessage && !isDeletedMessage) ? StyleSheet.hairlineWidth : 0),
-            borderColor: isHighlighted ? theme.colors.replyHighlight : theme.colors.border,
+              : ((!isDarkMode && !isDeletedMessage) ? StyleSheet.hairlineWidth : 0),
+            // Light mode: hairline on EVERY bubble (the pale-teal sent bubble is
+            // only 1.06:1 against the warm wallpaper without an edge).
+            borderColor: isHighlighted ? theme.colors.replyHighlight : (isMyMessage ? 'rgba(0,0,0,0.12)' : theme.colors.border),
             shadowColor: theme.colors.shadow,
             shadowOffset: { width: 0, height: 1 },
             shadowOpacity: isDarkMode ? 0.2 : 0.08,
@@ -7260,9 +7359,10 @@ export default function ChatScreen({ navigation, route }) {
             {showSenderName && (
               <Text
                 numberOfLines={1}
+                maxFontSizeMultiplier={1.5}
                 style={{
                   fontSize: 13,
-                  color: getUserColor?.(msg.senderId) || theme.colors.themeColor,
+                  color: senderNameColorFor(msg.senderId, isDarkMode),
                   fontFamily: "Roboto-SemiBold",
                   marginBottom: 2,
                   paddingRight: 8,
@@ -7281,7 +7381,7 @@ export default function ChatScreen({ navigation, route }) {
               <Text
                 numberOfLines={1}
                 style={{
-                  fontSize: 11,
+                  fontSize: 12,
                   color: theme.colors.bubbleMeta,
                   fontFamily: 'Roboto-Regular',
                   marginBottom: 3,
@@ -7296,7 +7396,7 @@ export default function ChatScreen({ navigation, route }) {
               <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
                 <Ionicons name="time-outline" size={13} color={isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta} style={{ marginRight: 4 }} />
                 <Text style={{
-                  fontFamily: 'Roboto-Regular', fontSize: 11, fontStyle: 'italic',
+                  fontFamily: 'Roboto-Regular', fontSize: 12, fontStyle: 'italic',
                   color: isMyMessage ? sentBubbleMeta : theme.colors.bubbleMeta,
                 }}>
                   {msg.scheduleTimeLabel || msg.payload?.scheduleTimeLabel
@@ -7309,9 +7409,9 @@ export default function ChatScreen({ navigation, route }) {
             {/* Cancelled message label */}
             {!isDeletedMessage && msg.status === 'cancelled' && (
               <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 3, paddingTop: 1 }}>
-                <Ionicons name="close-circle" size={13} color="#FF8A80" style={{ marginRight: 4 }} />
-                <Text style={{
-                  fontFamily: 'Roboto-Regular', fontSize: 11, fontStyle: 'italic', color: '#FF8A80',
+                <Ionicons name="close-circle" size={14} color={isMyMessage ? tickColors.failed : theme.colors.dangerText} style={{ marginRight: 4 }} />
+                <Text maxFontSizeMultiplier={1.2} style={{
+                  fontFamily: 'Roboto-Regular', fontSize: 12, fontStyle: 'italic', color: isMyMessage ? tickColors.failed : theme.colors.dangerText,
                 }}>Cancelled</Text>
               </View>
             )}
@@ -7563,10 +7663,10 @@ export default function ChatScreen({ navigation, route }) {
                     caption below, so a bulk send whose text is a file name
                     renders as plain media. */}
                 {Boolean(msg.text) && !isFileNameCaption(msg.text, msg?.mediaMeta) && (
-                  <Text style={{
+                  <Text maxFontSizeMultiplier={1.5} style={{
                     fontSize: 15,
-                    lineHeight: 20,
-                    color: isMyMessage ? sentBubbleText : (isDarkMode ? '#E9EDEF' : theme.colors.textColor),
+                    lineHeight: 22,
+                    color: isMyMessage ? sentBubbleText : theme.colors.bubbleReceivedText,
                     fontFamily: 'Roboto-Regular',
                     marginTop: 5,
                     paddingHorizontal: 4,
@@ -7591,10 +7691,10 @@ export default function ChatScreen({ navigation, route }) {
                 why photos showed "Screenshot_20260910-101828.jpg" under them.
                 utils/mediaCaption holds the one rule, shared with the chat list. */}
             {!isDeletedMessage && (isImage || isVideo) && Boolean(msg.text) && !isFileNameCaption(msg.text, msg?.mediaMeta) && (
-              <Text style={{
+              <Text maxFontSizeMultiplier={1.5} style={{
                 fontSize: 15,
-                lineHeight: 20,
-                color: isMyMessage ? sentBubbleText : (isDarkMode ? '#E9EDEF' : theme.colors.textColor),
+                lineHeight: 22,
+                color: isMyMessage ? sentBubbleText : theme.colors.bubbleReceivedText,
                 fontFamily: 'Roboto-Regular',
                 marginTop: 5,
                 paddingHorizontal: 4,
@@ -7643,7 +7743,16 @@ export default function ChatScreen({ navigation, route }) {
         {dateBadgeKey && renderDateBadge(dateBadgeKey)}
       </React.Fragment>
     );
-  }, [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, playingAudioId, audioPlaybackStatus, downloadProgress, uploadProgress, mediaDownloadStates, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys, goneMedia, thumbnailCacheVersion]);
+  };
+  const bodyImplRef = useRef(renderChatsItemBodyImpl);
+  bodyImplRef.current = renderChatsItemBodyImpl;
+  const renderChatsItemBody = useCallback((args) => bodyImplRef.current(args), []);
+
+  // Row invalidation token: changes exactly when anything the body reads CHANGES
+  // DISCRETELY (selection, theme, search, handlers, translations …) — the old
+  // dependency list minus the five high-frequency maps below, which are
+  // reduced to a per-row signature (liveSig) so a tick only touches its own row.
+  const rowCtx = useMemo(() => ({}), [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys, goneMedia, thumbnailCacheVersion, winW]);
 
 
   // FlatList extraData for media rows. Its identity changes only when one of
@@ -7677,6 +7786,26 @@ export default function ChatScreen({ navigation, route }) {
   // expensive body per row: it re-renders only when THIS row's inputs change —
   // its message, position, the neighbour its grouping depends on, its measured
   // line count, the media/translation state (extra) or the body itself.
+  // `extra` for MessageRow = the discrete inputs only (mediaRenderExtra minus the
+  // per-tick progress / download-state maps, which ride in each row's liveSig).
+  const rowExtra = useMemo(
+    () => ({ downloadedMedia, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId, goneMedia, thumbnailCacheVersion }),
+    [downloadedMedia, failedLocalMedia, viewOnceLocalStatus, messageTranslations, language, translatingKeys, currentUserId, goneMedia, thumbnailCacheVersion]
+  );
+
+  // The high-frequency state ONE row reads, as a primitive string: its download
+  // progress / state, its upload progress, and — only for the voice note that is
+  // playing — the playback position. Everything else is false/empty, so a tick
+  // for message A leaves message B's signature (and memo) untouched.
+  const rowLiveSig = (msg) => {
+    const st = resolveMediaState(msg) || {};
+    const msgKey = msg?.serverMessageId || msg?.id || msg?.tempId;
+    const audio = playingAudioId && playingAudioId === msgKey
+      ? `${audioPlaybackStatus?.isPlaying ? 1 : 0}:${audioPlaybackStatus?.durationMillis || 0}:${audioPlaybackStatus?.positionMillis || 0}`
+      : '';
+    return `${resolveMediaProgress(msg)}|${resolveUploadProgress(msg)}|${st.status || ''}|${st.progress || 0}|${st.localPath || ''}|${st.error || ''}|${audio}`;
+  };
+
   const renderChatsItem = useCallback(({ item, index }) => {
     const list = messagesRef.current || [];
     return (
@@ -7685,11 +7814,13 @@ export default function ChatScreen({ navigation, route }) {
         msg={item}
         index={index}
         older={index < list.length - 1 ? list[index + 1] : null}
-        extra={mediaRenderExtra}
+        extra={rowExtra}
+        ctx={rowCtx}
+        live={rowLiveSig(item)}
         lineCount={richMessageLineCounts[getMessageKey(item)] || 0}
       />
     );
-  }, [renderChatsItemBody, mediaRenderExtra, richMessageLineCounts]);
+  }, [renderChatsItemBody, rowExtra, rowCtx, richMessageLineCounts, downloadProgress, uploadProgress, mediaDownloadStates, playingAudioId, audioPlaybackStatus]);
 
   // Typing indicator
   const renderTypingIndicator = () => {
@@ -7725,7 +7856,7 @@ export default function ChatScreen({ navigation, route }) {
               />
             ))}
           </View>
-          <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: "Roboto-Medium", fontStyle: 'italic', marginLeft: 4 }}>
+          <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 12, color: theme.colors.systemText, fontFamily: "Roboto-Medium", fontStyle: 'italic', marginLeft: 4 }}>
             typing...
           </Text>
         </View>
@@ -7741,7 +7872,7 @@ export default function ChatScreen({ navigation, route }) {
       return (
         <View style={{ paddingVertical: 20, alignItems: "center" }}>
           <ActivityIndicator size="small" color={theme.colors.themeColor} />
-          <Text style={{ marginTop: 8, fontSize: 11, color: theme.colors.placeHolderTextColor }}>
+          <Text maxFontSizeMultiplier={1.2} style={{ marginTop: 8, fontSize: 12, color: theme.colors.systemText }}>
             Loading older messages...
           </Text>
         </View>
@@ -7761,23 +7892,23 @@ export default function ChatScreen({ navigation, route }) {
         <View style={{ paddingVertical: 16, alignItems: "center", paddingHorizontal: 30 }}>
           {isGrpFooter ? (
             <View style={{ alignItems: 'center', gap: 6 }}>
-              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 }}>
-                <Text style={{ fontSize: 12, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+              <View style={{ backgroundColor: theme.colors.systemBg, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 }}>
+                <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 12.5, lineHeight: 18, color: theme.colors.systemText, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
                   {creatorName
                     ? `${creatorName} created group "${chatData?.chatName || chatData?.groupName || 'this group'}"`
                     : `Group "${chatData?.chatName || chatData?.groupName || ''}" created`}
                   {groupCreatedDate ? ` on ${groupCreatedDate}` : ''}
                 </Text>
               </View>
-              <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 }}>
-                <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
+              <View style={{ backgroundColor: theme.colors.systemBg, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 10 }}>
+                <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 12, lineHeight: 17, color: theme.colors.systemText, fontFamily: 'Roboto-Regular', textAlign: 'center' }}>
                   Messages and calls are end-to-end encrypted. Only people in this chat can read, listen to, or share them.
                 </Text>
               </View>
             </View>
           ) : (
-            <View style={{ backgroundColor: theme.colors.menuBackground, paddingHorizontal: 20, paddingVertical: 6, borderRadius: 20 }}>
-              <Text style={{ fontSize: 11, color: theme.colors.placeHolderTextColor }}>
+            <View style={{ backgroundColor: theme.colors.systemBg, paddingHorizontal: 20, paddingVertical: 6, borderRadius: 20 }}>
+              <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 12, color: theme.colors.systemText }}>
                 Beginning of conversation
               </Text>
             </View>
@@ -7802,7 +7933,7 @@ export default function ChatScreen({ navigation, route }) {
   // deeper near-black than the generic `cardBackground` so the card reads as a
   // lit panel above the conversation instead of a grey slab; light mode stays
   // white and separates with a hairline + shadow instead.
-  const menuSurface = isDarkMode ? '#0F1A21' : '#FFFFFF';
+  const menuSurface = theme.colors.menuSurface;
   const menuBorder = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.07)';
   if (!chatData || (!chatData.peerUser && !chatData.isGroup && !isBroadcastChat)) {
     return (
@@ -7911,6 +8042,10 @@ export default function ChatScreen({ navigation, route }) {
   // ─── LONG-PRESS MENU: what a single message can actually do ───
   // One vocabulary for BOTH surfaces — this popover and the selection-mode
   // header toolbar — so they can never drift apart.
+  const editPolicyChat = useMemo(
+    () => ({ chatType: chatData?.chatType, isBroadcast: isBroadcastChat }),
+    [chatData?.chatType, isBroadcastChat],
+  );
   const messageActionCaps = useCallback((msg) => {
     if (!msg) return null;
     const isOwn = isOutgoingMessage(msg, currentUserId);
@@ -7938,15 +8073,28 @@ export default function ChatScreen({ navigation, route }) {
       canReply: !isDeleted && !isScheduled,
       canForward: !isDeleted && !isViewOnce && Boolean(serverActionId),
       canCopy: !isDeleted && !isViewOnce && Boolean(msg.text && String(msg.text).trim().length > 0),
-      canEdit: isOwn && isTextish && !isDeleted && Boolean(serverActionId),
+      // Derived from the stored row every time (no separate state): read/seen,
+      // broadcast chats, unsettled rows and the 15-min hint all hide Edit.
+      canEdit: isOwn && !isDeleted && canEditMessage(
+        { ...msg, serverMessageId: serverActionId || undefined },
+        { chat: editPolicyChat, myUserId: currentUserId, isOwn },
+      ),
       canInfo: isOwn && !isDeleted && Boolean(serverActionId),
       canReport: !isOwn && !isDeleted,
       canCancelSchedule: isScheduled && isOwn,
       canReact: !isDeleted && !isScheduled,
     };
-  }, [currentUserId]);
+  }, [currentUserId, editPolicyChat]);
 
-  const menuCaps = useMemo(() => messageActionCaps(menuFor?.msg), [menuFor, messageActionCaps]);
+  // The menu keeps the row it was opened on, but its caps follow the LIVE row:
+  // a read receipt that lands while the menu is open removes Edit (E-A-02).
+  const menuLiveMsg = useMemo(() => {
+    const m = menuFor?.msg;
+    if (!m) return null;
+    const ids = [m.serverMessageId, m.id, m.messageId, m.tempId].filter(Boolean);
+    return messages.find((x) => ids.some((i) => sameId(x.serverMessageId, i) || sameId(x.id, i) || sameId(x.tempId, i))) || m;
+  }, [menuFor, messages]);
+  const menuCaps = useMemo(() => messageActionCaps(menuLiveMsg), [menuLiveMsg, messageActionCaps]);
 
   // Only the rows this app actually implements, filtered down to the ones that
   // make sense for THIS message. Reply / Forward / Copy lead (≈90% of taps),
@@ -8193,8 +8341,6 @@ export default function ChatScreen({ navigation, route }) {
               ? messages.find(m => sameId(m.id, selectedMessage[0]) || sameId(m.serverMessageId, selectedMessage[0]) || sameId(m.tempId, selectedMessage[0]))
               : null;
             const isOwnMsg = Boolean(selMsg) && isOutgoingMessage(selMsg, currentUserId);
-            const msgStatus = (selMsg?.status || '').toLowerCase();
-            const isSeen = msgStatus === 'seen' || msgStatus === 'read';
             // Canonical server id for actions that hit the server (edit / info).
             // Same fallback chain as Forward below: rows loaded from SQLite /
             // history sync (common in GROUP chats) may carry the server id in
@@ -8204,7 +8350,8 @@ export default function ChatScreen({ navigation, route }) {
               .map((v) => (v == null ? '' : String(v)))
               .find((v) => v && !v.startsWith('temp_')) || null;
             const hasServerId = Boolean(serverActionId);
-            const canEdit = selectedMessage.length === 1 && isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && hasServerId;
+            const canEdit = selectedMessage.length === 1 && isOwnMsg && selMsg?.type === 'text' && !selMsg?.isDeleted && hasServerId
+              && canEditMessage({ ...selMsg, serverMessageId: serverActionId }, { chat: editPolicyChat, myUserId: currentUserId, isOwn: isOwnMsg });
             const isTextMsg = selMsg?.type === 'text';
             // View-once messages can never be forwarded or copied.
             const isViewOnceSel = Boolean(selMsg?.isViewOnce || selMsg?.payload?.isViewOnce);
@@ -8227,7 +8374,7 @@ export default function ChatScreen({ navigation, route }) {
                       setReactionMsgId(null);
                     }}
                     style={{ paddingVertical: 8, paddingHorizontal: 7 }}>
-                    <Ionicons name="time-outline" size={22} color="#FF5252" />
+                    <Ionicons name="time-outline" size={22} color={theme.colors.dangerText} />
                   </TouchableOpacity>
                 )}
                 {/* Delete */}
@@ -8384,7 +8531,7 @@ export default function ChatScreen({ navigation, route }) {
               )}
               {isChatMuted && (
                 <View style={{ marginRight: 8 }}>
-                  <Ionicons name="notifications-off" size={20} color={theme.colors.placeHolderTextColor} />
+                  <Ionicons name="notifications-off" accessibilityLabel="Muted" size={20} color={theme.colors.iconColor} />
                 </View>
               )}
               {/* No filled circle behind the glyph: the video and call icons
@@ -8395,6 +8542,8 @@ export default function ChatScreen({ navigation, route }) {
                 onPress={openChatMenu}
                 activeOpacity={0.7}
                 hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                accessibilityRole="button"
+                accessibilityLabel="More options"
                 style={{ padding: 8 }} >
                 <Ionicons name="ellipsis-vertical" size={20} color={theme.colors.primaryTextColor} />
               </TouchableOpacity>
@@ -8429,26 +8578,38 @@ export default function ChatScreen({ navigation, route }) {
                   paddingVertical: 4, 
                   borderRadius: 12,
                 }}>
-                  <Text style={{ fontSize: 10, color: theme.colors.primaryTextColor }}>
+                  <Text maxFontSizeMultiplier={1.2} style={{ fontSize: 12, color: theme.colors.primaryTextColor }}>
                     {currentSearchIndex + 1}/{searchResults.length}
                   </Text>
                 </View>
                 <TouchableOpacity 
                   onPress={goToPreviousResult} 
+                  accessibilityRole="button"
+                  accessibilityLabel="Previous match"
+                  hitSlop={{ top: 4, bottom: 4, left: 2, right: 2 }}
                   style={{ 
                     backgroundColor: theme.colors.menuBackground, 
-                    padding: 6, 
-                    borderRadius: 12,
+                    width: 40,
+                    height: 40,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: 20,
                   }}
                 >
                   <Ionicons name="chevron-up" size={16} color={theme.colors.primaryTextColor} />
                 </TouchableOpacity>
                 <TouchableOpacity 
                   onPress={goToNextResult} 
+                  accessibilityRole="button"
+                  accessibilityLabel="Next match"
+                  hitSlop={{ top: 4, bottom: 4, left: 2, right: 2 }}
                   style={{ 
                     backgroundColor: theme.colors.menuBackground, 
-                    padding: 6, 
-                    borderRadius: 12,
+                    width: 40,
+                    height: 40,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    borderRadius: 20,
                   }}
                 >
                   <Ionicons name="chevron-down" size={16} color={theme.colors.primaryTextColor} />
@@ -8458,11 +8619,14 @@ export default function ChatScreen({ navigation, route }) {
 
             <TouchableOpacity 
               onPress={handleCloseSearchBar} 
+              accessibilityRole="button"
+              accessibilityLabel="Close search"
+              hitSlop={{ top: 4, bottom: 4, left: 4, right: 4 }}
               style={{ 
                 marginLeft: 8, 
-                width: 36, 
-                height: 36, 
-                borderRadius: 18, 
+                width: 40, 
+                height: 40, 
+                borderRadius: 20, 
                 alignItems: 'center', 
                 justifyContent: 'center', 
                 backgroundColor: theme.colors.menuBackground,
@@ -8623,8 +8787,8 @@ export default function ChatScreen({ navigation, route }) {
               borderRadius: 14,
               overflow: 'hidden',
               borderWidth: StyleSheet.hairlineWidth,
-              borderColor: dateChipColors(isDarkMode).border,
-              backgroundColor: dateChipColors(isDarkMode).bg,
+              borderColor: dateChipColors(theme).border,
+              backgroundColor: dateChipColors(theme).bg,
               shadowColor: theme.colors.shadow,
               shadowOffset: { width: 0, height: 2 },
               shadowOpacity: 0.16,
@@ -8634,9 +8798,10 @@ export default function ChatScreen({ navigation, route }) {
           >
 
             <Text
+              maxFontSizeMultiplier={1.2}
               style={{
-                fontSize: 11,
-                color: dateChipColors(isDarkMode).text,
+                fontSize: 12,
+                color: dateChipColors(theme).text,
                 fontFamily: 'Roboto-Medium',
                 textAlign: 'center',
                 paddingHorizontal: 12,
@@ -8692,6 +8857,8 @@ export default function ChatScreen({ navigation, route }) {
         {showScrollButton && (
           <TouchableOpacity
             onPress={handleScrollToLatest}
+            accessibilityRole="button"
+            accessibilityLabel={newMessagesCount > 0 ? `Scroll to latest, ${newMessagesCount} new messages` : 'Scroll to latest message'}
             style={{ 
               position: 'absolute', 
               right: 16, 
@@ -8699,7 +8866,7 @@ export default function ChatScreen({ navigation, route }) {
               width: 44, 
               height: 44, 
               borderRadius: 22, 
-              backgroundColor: theme.colors.cardBackground, 
+              backgroundColor: theme.colors.menuSurface, 
               alignItems: 'center', 
               justifyContent: 'center', 
               // borderWidth: 1, 
@@ -8711,7 +8878,7 @@ export default function ChatScreen({ navigation, route }) {
               // elevation: 4,
             }}
           >
-            <Ionicons name="arrow-down" size={20} color={theme.colors.themeColor} />
+            <Ionicons name="arrow-down" size={20} color={theme.colors.link} />
             {newMessagesCount > 0 && (
               <View style={{ 
                 position: 'absolute', 
@@ -8727,8 +8894,8 @@ export default function ChatScreen({ navigation, route }) {
                 borderWidth: 1.5,
                 borderColor: theme.colors.background,
               }}>
-                <Text style={{ 
-                  fontSize: 9, 
+ <Text maxFontSizeMultiplier={1.2} style={{ 
+                  fontSize: 11, 
                   color: '#FFFFFF', 
                   fontFamily: 'Roboto-Medium',
                 }}>

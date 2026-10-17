@@ -225,6 +225,9 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
         return;
       }
 
+      // P-A-05: a message deleted for everyone leaves the tray notification too.
+      try { require('../firebase/fcmService').dismissDeletedMessageNotification(chatId, messageId); } catch (_) { /* */ }
+
       const localKey = getChatMessagesKey(chatId);
       if (!localKey) return;
 

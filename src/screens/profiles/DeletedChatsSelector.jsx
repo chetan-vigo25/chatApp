@@ -1,13 +1,19 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import {
-  View, Text, FlatList, TouchableOpacity, StyleSheet, Image,
-  ActivityIndicator, Alert,
+  View,
+  Text,
+  FlatList,
+  TouchableOpacity,
+  StyleSheet,
+  ActivityIndicator,
+  Alert,
 } from 'react-native';
 import { Ionicons, MaterialCommunityIcons, FontAwesome6 } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import ChatDatabase from '../../services/ChatDatabase';
 import { updateUserSettings } from '../../Redux/Services/Profile/Settings.Services';
 import { getDeletedChatConfig, saveDeletedChatConfig, markDeletedPasswordSet } from '../../utils/deletedChatConfig';
+import AppImage from '../../components/AppImage';
 
 const AVATAR_COLORS = ['#6C5CE7', '#00B894', '#E17055', '#0984E3', '#E84393'];
 
@@ -199,7 +205,7 @@ export default function DeletedChatsSelector({ navigation, route }) {
         </View>
         <View style={[styles.avatar, { backgroundColor: avatarBg }]}>
           {image ? (
-            <Image source={{ uri: image }} style={styles.avatarImg} />
+            <AppImage source={{ uri: image }} style={styles.avatarImg} />
           ) : (
             <Text style={styles.avatarText}>{getInitials(name)}</Text>
           )}

@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, Image, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { alwaysDark } from '../../contexts/ThemeContext';
 import { usePeerProfileName } from '../../services/peerProfileNameStore';
 import { avatarNameSource, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
+import AppImage from '../../components/AppImage';
 
 // Stable color from an id/name (mirrors the app's avatar fallback style).
 const COLORS = ['#6C5CE7', '#0984E3', '#00B894', '#E17055', '#E84393', '#0EA5A4', '#F39C12'];
@@ -23,7 +24,7 @@ export default function CallAvatar({ uri, name = '', id = '', size = 132, profil
   const storedProfileName = usePeerProfileName(id, !profileName && (!uri || uri === failedUri));
   if (uri && uri !== failedUri) {
     return (
-      <Image
+      <AppImage
         source={{ uri }}
         onError={() => setFailedUri(uri)}
         style={[styles.img, { width: size, height: size, borderRadius: radius }]}

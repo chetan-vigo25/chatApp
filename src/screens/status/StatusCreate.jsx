@@ -282,7 +282,7 @@ export default function StatusCreate({ navigation, route }) {
               ref={textInputRef}
               style={[styles.textInput, { fontSize }]}
               placeholder="Type a status…"
-              placeholderTextColor="rgba(255,255,255,0.55)"
+              placeholderTextColor="rgba(255,255,255,0.78)"
               multiline
               autoFocus
               maxLength={700}

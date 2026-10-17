@@ -5,13 +5,13 @@ import {
   TextInput,
   FlatList,
   TouchableOpacity,
-  Image,
   Animated,
   Keyboard,
   Platform,
   StyleSheet,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import AppImage from './AppImage';
 
 // ── Mention data structures ──
 // A mention in the message:
@@ -43,7 +43,7 @@ const MentionSuggestionItem = React.memo(function MentionSuggestionItem({
       ]}
     >
       {member.profileImage ? (
-        <Image source={{ uri: member.profileImage }} style={styles.avatar} />
+        <AppImage source={{ uri: member.profileImage }} style={styles.avatar} />
       ) : (
         <View style={[styles.avatarFallback, { backgroundColor: member.color || '#02958a' }]}>
           <Text style={styles.avatarInitial}>

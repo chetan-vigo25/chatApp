@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import {
   View, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator, Keyboard, AppState,
+  Animated, Easing,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -18,7 +19,39 @@ import AppSearchBar from '../../components/AppSearchBar';
 // Estimated-progress tuning (see progressFor below).
 const PROGRESS_CEILING = 0.92;   // never claim "done" before the native side says so
 const PROGRESS_TAU_S = 25;       // seconds to reach ~63%
-const PROGRESS_SETTLE_MS = 350;  // how long the full bar is shown before the tick
+const PROGRESS_FINISH_MS = 700;  // the last stretch to 100% glides, never snaps
+const PROGRESS_HOLD_MS = 250;    // the full bar stays a beat before the tick
+const TICK_MS = 120;             // redraw rate while a bar is moving
+
+/** Fast at first, gentle into 100%. */
+const easeOutCubic = (x) => 1 - (1 - x) ** 3;
+
+/**
+ * The bar itself. Width is animated between redraws, so it glides instead of
+ * stepping every tick — and the jump at the end becomes a short smooth run.
+ * A component of its own: hooks cannot live inside the list's map().
+ */
+function ProgressTrack({ progress, color, trackColor, paused }) {
+  const value = useRef(new Animated.Value(progress)).current;
+  useEffect(() => {
+    Animated.timing(value, {
+      toValue: progress,
+      duration: TICK_MS + 40,
+      easing: Easing.linear,
+      useNativeDriver: false,          // width is a layout prop
+    }).start();
+  }, [progress, value]);
+  const width = value.interpolate({ inputRange: [0, 1], outputRange: ['2%', '100%'], extrapolate: 'clamp' });
+  return (
+    <View
+      style={[styles.track, { backgroundColor: trackColor }]}
+      accessibilityRole="progressbar"
+      accessibilityValue={{ min: 0, max: 100, now: Math.round(progress * 100) }}
+    >
+      <Animated.View style={[styles.fill, paused && styles.fillPaused, { backgroundColor: color, width }]} />
+    </View>
+  );
+}
 
 /**
  * Choose language.
@@ -47,8 +80,10 @@ export default function ChooseLanguage({ navigation }) {
   // Translate's module-level store, so it survives this screen being left and
   // re-opened mid-download. This screen only re-renders when it changes.
   const [, bumpStatus] = useReducer((n) => n + 1, 0);
-  // The row that just finished, held at 100% for a beat before the tick.
-  const [settlingCode, setSettlingCode] = useState(null);
+  // The row that just finished: `{ code, from, startAt }` while its bar runs
+  // from where it was to 100% (see progressFor), then held a beat.
+  const [settling, setSettling] = useState(null);
+  const settlingCode = settling?.code || null;
   // Clock for the estimated progress. ML Kit's downloadModelIfNeeded reports
   // completion only (no byte counts on either platform), so progress is an
   // ESTIMATE from the download's start time: it climbs quickly at first, slows
@@ -95,28 +130,49 @@ export default function ChooseLanguage({ navigation }) {
   // Which pick is the current one, so a slow earlier pick finishing cannot run
   // the 100% settle for a row the user has since moved away from.
   const pickSeqRef = useRef(0);
+  // Last progress drawn per row: the status is cleared the moment a download
+  // completes, and the finishing run must start from what the user SAW.
+  const lastShownRef = useRef({});
 
   const anyDownloading = LANGUAGES.some(({ code }) => getLanguageDownloadStatus(code)?.state === 'downloading');
   // Tick while anything is downloading. τ ≈ 25s: a 30MB model on an ordinary
   // connection lands around there, so most real downloads finish while the bar
   // is still visibly moving rather than parked at the ceiling.
+  // This clock only animates the on-screen estimate; it fetches nothing.
   useEffect(() => {
-    if (!anyDownloading) return undefined;
+    if (!anyDownloading && !settling) return undefined;
     setNow(Date.now());
-    const timer = setInterval(() => setNow(Date.now()), 250);
+    const timer = setInterval(() => setNow(Date.now()), TICK_MS);
     return () => clearInterval(timer);
-  }, [anyDownloading]);
+  }, [anyDownloading, settling]);
 
-  const progressFor = (code) => {
-    if (settlingCode === code) return 1;
-    const startedAt = getLanguageDownloadStatus(code)?.startedAt;
-    if (!startedAt) return 0;
-    const t = Math.max(0, now - startedAt) / 1000;
+  const estimateFor = (code) => {
+    const status = getLanguageDownloadStatus(code);
+    if (!status) return 0;
+    // iOS reports real progress; use it whenever it has arrived.
+    if (typeof status.progress === 'number' && status.progress > 0) return Math.min(1, status.progress);
+    // Otherwise estimate from time spent downloading. A paused row stays at
+    // the point it reached; a resumed one carries on from there.
+    const spentMs = status.state === 'paused'
+      ? (status.elapsedMs || 0)
+      : (status.startedAt ? Math.max(0, now - status.startedAt) : 0);
+    const t = spentMs / 1000;
     return Math.min(PROGRESS_CEILING, 1 - Math.exp(-t / PROGRESS_TAU_S));
   };
 
+  const progressFor = (code) => {
+    if (settling?.code === code) {
+      // Finished: run from where the bar was to 100% instead of jumping.
+      const x = Math.min(1, (now - settling.startAt) / PROGRESS_FINISH_MS);
+      return settling.from + (1 - settling.from) * easeOutCubic(x);
+    }
+    return estimateFor(code);
+  };
+
   const onPick = useCallback(async (code) => {
-    // A new pick replaces any old "failed" rows (a running download is kept).
+    // A new pick replaces any old "failed" rows. A running download is not
+    // thrown away: picking another language PAUSES it (Translate.js), and
+    // picking it again continues it.
     clearFailedLanguageDownloads();
     // Neither English (the app's own language) nor "Don't translate" needs a
     // model — both apply the instant they are tapped, with nothing to download
@@ -126,8 +182,11 @@ export default function ChooseLanguage({ navigation }) {
     // A model that is already on the device needs no download — apply it at
     // once. The list state is checked first for an instant answer, then the
     // native side for the case where the listing failed or is stale.
-    let onDevice = downloaded.includes(code);
-    if (!onDevice) {
+    // A row the user PAUSED is never short-cut, even if its model landed in
+    // the background meanwhile: it resumes and visibly finishes from its bar.
+    const wasPaused = getLanguageDownloadStatus(code)?.state === 'paused';
+    let onDevice = !wasPaused && downloaded.includes(code);
+    if (!onDevice && !wasPaused) {
       try {
         const models = await getDownloadedLanguages();
         onDevice = Array.isArray(models) && models.includes(code);
@@ -144,12 +203,13 @@ export default function ChooseLanguage({ navigation }) {
     const ok = await setLanguage(code, { requireWifi: false });
     if (!aliveRef.current || pickSeqRef.current !== seq) return;
     if (ok) {
-      // Let the bar visibly reach 100% before the row flips to "selected" —
-      // a jump from 60% straight to a tick reads as if something was skipped.
-      setSettlingCode(code);
-      await new Promise((r) => setTimeout(r, PROGRESS_SETTLE_MS));
+      // Let the bar visibly run on to 100% before the row flips to "selected"
+      // — a jump from 60% straight to a tick reads as if something was skipped.
+      const from = Math.min(PROGRESS_CEILING, estimateFor(code) || lastShownRef.current[code] || 0);
+      setSettling({ code, from, startAt: Date.now() });
+      await new Promise((r) => setTimeout(r, PROGRESS_FINISH_MS + PROGRESS_HOLD_MS));
       if (!aliveRef.current) return;
-      setSettlingCode((current) => (current === code ? null : current));
+      setSettling((current) => (current?.code === code ? null : current));
     }
     refreshDownloaded();
   }, [setLanguage, refreshDownloaded, downloaded]);
@@ -242,7 +302,19 @@ export default function ChooseLanguage({ navigation }) {
               // A model that is on disk is never "failed" — it may have landed
               // after the timeout gave up on it.
               const isFailed = !isBusy && status?.state === 'failed' && !onDisk;
-              const progress = isBusy ? progressFor(item.code) : 0;
+              // Picked another language mid-download, or it stalled / lost the
+              // network. Tapping it again carries on from where it was.
+              // Paused stays paused even if the model landed underneath — it
+              // completes only when the user picks it again.
+              const isPaused = !isBusy && status?.state === 'paused';
+              const progress = isBusy || isPaused ? progressFor(item.code) : 0;
+              if (isBusy || isPaused) lastShownRef.current[item.code] = progress;
+              const pct = Math.round(progress * 100);
+              const pausedNote = !isConnected || status?.reason === 'offline'
+                ? `Waiting for internet · ${pct}% — continues automatically`
+                : status?.reason === 'stalled'
+                  ? `Download is slow · ${pct}% — tap to continue`
+                  : `Paused at ${pct}% — tap to continue`;
               // English is the app's own language — nothing to download. Nor is
               // there anything to download for "Don't translate".
               const needsModel =
@@ -269,6 +341,7 @@ export default function ChooseLanguage({ navigation }) {
                   ]}
                   accessibilityRole="radio"
                   accessibilityState={{ selected, busy: isBusy }}
+                  accessibilityHint={isPaused ? 'Continues the download' : undefined}
                 >
                   <Text ignore style={styles.flag}>{item.flag}</Text>
                   <View style={styles.flex}>
@@ -303,18 +376,12 @@ export default function ChooseLanguage({ navigation }) {
                             </Text>
                           )}
                         </View>
-                        <View
-                          style={[styles.track, { backgroundColor: divider }]}
-                          accessibilityRole="progressbar"
-                          accessibilityValue={{ min: 0, max: 100, now: Math.round(progress * 100) }}
-                        >
-                          <View
-                            style={[
-                              styles.fill,
-                              { backgroundColor: themeColor, width: `${Math.max(2, progress * 100)}%` },
-                            ]}
-                          />
-                        </View>
+                        <ProgressTrack progress={progress} color={themeColor} trackColor={divider} />
+                      </View>
+                    ) : isPaused ? (
+                      <View>
+                        <Text style={[styles.rowSub, { color: subText }]}>{pausedNote}</Text>
+                        <ProgressTrack progress={progress} color={themeColor} trackColor={divider} paused />
                       </View>
                     ) : isFailed ? (
                       <Text style={[styles.rowSub, { color: theme.colors.danger || '#E5484D' }]}>
@@ -333,12 +400,14 @@ export default function ChooseLanguage({ navigation }) {
                     progress >= 1
                       ? <Ionicons name="checkmark-circle" size={22} color={themeColor} />
                       : <ActivityIndicator size="small" color={themeColor} />
+                  ) : isPaused ? (
+                    <Ionicons name="play-circle-outline" size={23} color={themeColor} />
                   ) : selected ? (
                     <Ionicons name="checkmark-circle" size={22} color={themeColor} />
                   ) : needsModel ? (
-                    <Ionicons name="cloud-download-outline" size={21} color={divider} />
+                    <Ionicons name="cloud-download-outline" size={21} color={subText} />
                   ) : (
-                    <Ionicons name="ellipse-outline" size={22} color={divider} />
+                    <Ionicons name="ellipse-outline" size={22} color={subText} />
                   )}
                 </TouchableOpacity>
               );
@@ -392,6 +461,7 @@ const styles = StyleSheet.create({
   rowPct: { fontFamily: 'Roboto-Medium', fontVariant: ['tabular-nums'] },
   track: { height: 4, borderRadius: 2, overflow: 'hidden', marginTop: 7, marginRight: 4 },
   fill: { height: '100%', borderRadius: 2 },
+  fillPaused: { opacity: 0.45 },
 
   empty: { alignItems: 'center', paddingTop: 60, gap: 10 },
   emptyText: { fontFamily: 'Roboto-Regular', fontSize: 14 },

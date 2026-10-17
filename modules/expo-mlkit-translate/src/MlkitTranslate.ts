@@ -1,3 +1,4 @@
+import { Platform } from 'react-native';
 import { requireOptionalNativeModule } from 'expo-modules-core';
 
 import {
@@ -16,6 +17,34 @@ interface NativeMlkitTranslateModule {
   deleteModel(language: MlkitLanguage): Promise<void>;
   getDownloadedModels(): Promise<string[]>;
   getSupportedLanguages(): string[];
+  addListener?(event: string, listener: (payload: any) => void): { remove(): void };
+}
+
+type Subscription = { remove(): void };
+const NOOP_SUBSCRIPTION: Subscription = { remove() {} };
+
+/**
+ * Subscribe to a native event. Only the iOS module emits download events —
+ * Android's ML Kit reports no progress — and a build made before the events
+ * existed simply has none, so this degrades to a no-op instead of throwing.
+ */
+function listen(event: string, listener: (payload: any) => void): Subscription {
+  if (Platform.OS !== 'ios' || typeof Native?.addListener !== 'function') return NOOP_SUBSCRIPTION;
+  try {
+    return Native.addListener(event, listener);
+  } catch {
+    return NOOP_SUBSCRIPTION;
+  }
+}
+
+/** iOS: `{ language, fraction }` (0..1) while a model downloads. */
+function addDownloadProgressListener(listener: (event: { language: string; fraction: number }) => void): Subscription {
+  return listen('onDownloadProgress', listener);
+}
+
+/** iOS: a model finished AFTER its downloadModel promise had timed out. */
+function addModelDownloadedListener(listener: (event: { language: string }) => void): Subscription {
+  return listen('onModelDownloaded', listener);
 }
 
 // Null instead of throwing when the native side isn't in the binary — Expo Go,
@@ -109,6 +138,8 @@ export const MlkitTranslate = {
   downloadModel,
   deleteModel,
   getDownloadedModels,
+  addDownloadProgressListener,
+  addModelDownloadedListener,
 };
 
 export default MlkitTranslate;

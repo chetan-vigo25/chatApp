@@ -187,7 +187,7 @@ export default function LinkDevice({ navigation }) {
                      setModalVisible(!modalVisible);
                     }}>
                       <View style={{ flex:1, justifyContent:'center',  backgroundColor:'#00000060', padding:20 }} >
-                        <View style={{ width:'100%', backgroundColor:theme.colors.cardBackground, padding:20, borderRadius:10, shadowOffset: { width: 0, height: 5, }, shadowOpacity: 0.25, shadowRadius: 4, elevation: 2, }} >
+                        <View style={{ width:'100%', backgroundColor:theme.colors.menuSurface, padding:20, borderRadius:10, shadowOffset: { width: 0, height: 5, }, shadowOpacity: 0.25, shadowRadius: 4, elevation: 2, }} >
                           <Text style={{ color:theme.colors.primaryTextColor, fontFamily:'Roboto-SemiBold', fontSize:16,}} >You want to logout from this device</Text>
                           <View style={{ marginVertical:15 }} >
                             {

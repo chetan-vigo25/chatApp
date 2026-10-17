@@ -3,7 +3,6 @@ import {
   View,
   TouchableOpacity,
   FlatList,
-  Image,
   StyleSheet,
   ActivityIndicator,
   Alert,
@@ -18,6 +17,7 @@ import { fetchBlockedContacts, unblockUser } from "../../Redux/Reducer/Block/Blo
 import ChatDatabase from "../../services/ChatDatabase";
 import { peerHidesContact } from "../../services/contactNameStore";
 import AppSearchBar from "../../components/AppSearchBar";
+import AppImage from '../../components/AppImage';
 
 // Settings → Privacy → Blocked Contacts. Lists everyone the user has blocked
 // (profile photo, name, phone, block date) with search + unblock.
@@ -115,7 +115,7 @@ export default function BlockedContacts({ navigation }) {
   const renderItem = ({ item }) => (
     <View style={[styles.row, { borderBottomColor: sepClr }]}>
       {item.profileImage ? (
-        <Image source={{ uri: item.profileImage }} style={styles.avatar} />
+        <AppImage source={{ uri: item.profileImage }} style={styles.avatar} />
       ) : (
         <View style={[styles.avatar, styles.avatarFallback, { backgroundColor: accent }]}>
           <Text style={styles.avatarInitial}>{(item.fullName || "?").charAt(0).toUpperCase()}</Text>
