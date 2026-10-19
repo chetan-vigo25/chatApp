@@ -3597,6 +3597,11 @@ export const CallProvider = ({ children }) => {
   // be STALE (a fast double-tap's first echo landing after the second tap) and
   // must not flip the button back — the button leads, the engine converges.
   const speakerToggleTsRef = useRef(0);
+  // Last time WE touched the iOS audio session/route (re-assert, engine audio
+  // restart, CallKit activation). A route change shortly after one of these is
+  // our own side effect; one with no such cause came from the user (CallKit
+  // lock-screen speaker button / Control Center).
+  const lastAudioOpTsRef = useRef(0);
   const toggleSpeaker = useCallback(() => {
     const next = !stateRef.current.speakerOn;
     if (__DEV__) console.log('[CALL][APP] toggleSpeaker →', next ? 'LOUDSPEAKER' : 'earpiece');
@@ -3641,6 +3646,7 @@ export const CallProvider = ({ children }) => {
     const s = stateRef.current;
     if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
     const on = !!s.speakerOn;
+    lastAudioOpTsRef.current = Date.now();
     if (__DEV__) console.log('[CALL][APP][audio] re-asserting route to match button →', on ? 'LOUDSPEAKER' : 'earpiece');
     if (Platform.OS === 'android') {
       // Re-assert through the session owner. Also re-arms the call audio mode if
@@ -3660,9 +3666,45 @@ export const CallProvider = ({ children }) => {
   // (didActivateAudioSession) — both are moments iOS may have torn down or replaced
   // our play-and-record session, leaving the WebView WebRTC call silent. Self-gates
   // to an answered (active) call so it never fires on a ringing/ended call.
+  // iOS LOCKED / killed answer: the user picks Speaker on the CallKit lock
+  // screen before JS has attached its route listener (or while it is still
+  // booting), so the button never learned about it — and the re-assert that
+  // follows CallKit's (late) audio activation forced the earpiece back: the
+  // loudspeaker "deselected itself" a few seconds later. Before re-asserting,
+  // read the LIVE route: Speaker while the button says earpiece, and the user
+  // hasn't touched the in-app button since answering → adopt Speaker. Must run
+  // BEFORE configureIOSAudioSession, which itself resets the route.
+  const adoptExternalSpeakerRoute = useCallback(async () => {
+    if (Platform.OS !== 'ios') return false;
+    const s = stateRef.current;
+    if (s.speakerOn) return false;
+    const answeredMs = Number(s.answeredAt) || 0;
+    if (speakerToggleTsRef.current && speakerToggleTsRef.current >= answeredMs) return false;
+    try {
+      const callKeep = require('react-native-callkeep');
+      const RNCallKeep = callKeep.default || callKeep;
+      const routes = await RNCallKeep.getAudioRoutes();
+      const onSpeaker = Array.isArray(routes)
+        && routes.some((r) => r && r.selected && (r.type === 'Speaker' || r.name === 'Speaker'));
+      if (!onSpeaker) return false;
+      markCallEvent('audio:route-adopt-speaker');
+      if (__DEV__) console.log('[CALL][APP][audio] live route is Speaker (picked outside the app) → button follows');
+      // The re-assert below reads stateRef in this same tick — update it now,
+      // the reducer render catches up with the same value.
+      stateRef.current = { ...stateRef.current, speakerOn: true };
+      dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: true });
+      if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(true);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }, []);
+
   const reassertCallAudio = useCallback(async () => {
     const s = stateRef.current;
     if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
+    lastAudioOpTsRef.current = Date.now();
+    await adoptExternalSpeakerRoute();
     try {
       if (Platform.OS === 'ios') await configureIOSAudioSession();
     } catch (_) { /* best-effort */ }
@@ -3674,7 +3716,7 @@ export const CallProvider = ({ children }) => {
     // An interruption / session swap can leave the local track disabled — re-assert
     // the mic so it matches the button state.
     sendCmd({ cmd: CMD.TOGGLE_MIC, on: s.micOn !== false });
-  }, [configureIOSAudioSession, reassertSpeakerRoute, resumeAudio, sendCmd]);
+  }, [adoptExternalSpeakerRoute, configureIOSAudioSession, reassertSpeakerRoute, resumeAudio, sendCmd]);
 
   // Force-rebuild the engine's WHOLE audio pipeline (fresh mic getUserMedia →
   // producer.replaceTrack + re-attach every remote stream). Needed when CallKit
@@ -3685,6 +3727,7 @@ export const CallProvider = ({ children }) => {
   const restartEngineAudio = useCallback(() => {
     const s = stateRef.current;
     if (s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
+    lastAudioOpTsRef.current = Date.now();
     sendCmd({ cmd: CMD.RESTART_AUDIO });
   }, [sendCmd]);
 
@@ -5763,6 +5806,7 @@ export const CallProvider = ({ children }) => {
           // when CallKit's activation lands seconds after the call connected.
           manualAudioActivated();
         }
+        lastAudioOpTsRef.current = Date.now();
         actionsRef.current.reassertCallAudio && actionsRef.current.reassertCallAudio();
         actionsRef.current.restartEngineAudio && actionsRef.current.restartEngineAudio();
         setTimeout(() => {
@@ -5772,6 +5816,38 @@ export const CallProvider = ({ children }) => {
           // more when the rebuilt audio pipeline has settled.
           actionsRef.current.reassertSpeakerRoute && actionsRef.current.reassertSpeakerRoute();
         }, 1200);
+      },
+      // iOS output-route change. AVAudioSessionRouteChangeReasonOverride (4) is
+      // an explicit speaker/receiver choice — CallKit's speaker button, Control
+      // Center, or our own InCallManager override. When it disagrees with the
+      // button (and isn't the echo of a tap we just made), the USER changed it
+      // outside the app: follow it, and move InCallManager's forced route along,
+      // or the next re-assert (CallKit activation, restartAudio) dragged the
+      // sound back to the earpiece and the loudspeaker "deselected itself".
+      // Other reasons (category change etc.) are OS resets — the re-assert
+      // still wins over those.
+      onAudioRouteChanged: (output, reason) => {
+        const s = stateRef.current;
+        if (!s.answeredAt || s.status === CALL_STATUS.IDLE || s.status === CALL_STATUS.ENDED) return;
+        const isSpeaker = output === 'Speaker';
+        const isReceiver = output === 'Receiver';
+        if (__DEV__) console.log('[CALL][APP][audio] route changed →', output, 'reason', reason, 'button', s.speakerOn ? 'LOUDSPEAKER' : 'earpiece');
+        if (!isSpeaker && !isReceiver) return;
+        if (isSpeaker === !!s.speakerOn) return;
+        const now = Date.now();
+        if (now - speakerToggleTsRef.current < 1500) return;
+        // Speaker is only ever reached by an explicit override (reason 4).
+        // Receiver is ALSO what the OS falls back to when our own session work
+        // resets the override (reason 3) — follow it only when none of our
+        // audio operations ran in the last 2 s, i.e. the user turned the
+        // speaker off on the CallKit screen. Otherwise InCallManager's sticky
+        // force flag kept snapping the speaker back on.
+        if (isSpeaker && Number(reason) !== 4) return;
+        if (isReceiver && now - lastAudioOpTsRef.current < 2000) return;
+        markCallEvent('audio:route-external', { output });
+        stateRef.current = { ...stateRef.current, speakerOn: isSpeaker };
+        dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: isSpeaker });
+        if (AudioRoute.isAvailable()) AudioRoute.setSpeaker(isSpeaker);
       },
       // CallKit released the session (call ended / interruption began). Without
       // this, react-native-webrtc's RTCAudioSession stays marked active and the

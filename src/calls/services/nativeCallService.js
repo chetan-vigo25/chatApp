@@ -572,6 +572,15 @@ export const registerEvents = (handlers = {}) => {
     RNCallKeep.addEventListener('didPerformSetMutedCallAction', mute);
     RNCallKeep.addEventListener('didActivateAudioSession', audioOn);
     RNCallKeep.addEventListener('didDeactivateAudioSession', audioOff);
+    // iOS: the output route changed (CallKit's own speaker button, Control
+    // Center, a headset). The provider syncs its speaker button to it — without
+    // this, a loudspeaker picked on the CallKit screen was pulled back to the
+    // earpiece seconds later by our "button is the truth" re-assert.
+    if (Platform.OS === 'ios') {
+      RNCallKeep.addEventListener('didChangeAudioRoute', ({ output, reason } = {}) => (
+        handlers.onAudioRouteChanged && handlers.onAudioRouteChanged(output, reason)
+      ));
+    }
     // Android: the user accepted from the native UI before JS came up.
     if (Platform.OS === 'android') {
       RNCallKeep.addEventListener('showIncomingCallUi', () => {});
@@ -585,6 +594,7 @@ export const registerEvents = (handlers = {}) => {
       RNCallKeep.removeEventListener('didPerformSetMutedCallAction');
       RNCallKeep.removeEventListener('didActivateAudioSession');
       RNCallKeep.removeEventListener('didDeactivateAudioSession');
+      if (Platform.OS === 'ios') RNCallKeep.removeEventListener('didChangeAudioRoute');
       if (Platform.OS === 'android') RNCallKeep.removeEventListener('showIncomingCallUi');
     } catch (_) { /* no-op */ }
   };
