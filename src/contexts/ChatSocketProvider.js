@@ -157,6 +157,7 @@ export default function ChatSocketProvider({ children, onNewMessage }) {
         localUri: null,
         chatId,
         mediaMeta: data.mediaMeta || data.contact || data.payload?.mediaMeta || data.payload?.contact || null,
+        templateParts: (data.templateParts && typeof data.templateParts === 'object') ? data.templateParts : null,
         payload: data.payload || (data.contact ? { contact: data.contact } : null),
       };
       console.log("msg", msg)

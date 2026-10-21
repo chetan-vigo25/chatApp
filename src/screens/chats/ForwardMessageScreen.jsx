@@ -19,6 +19,7 @@ import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { setForwardTimestamp } from '../../utils/forwardState';
 import { useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
+import { businessPeerIdSet, isBusinessRow } from '../../utils/businessChat';
 import ChatCache from '../../services/ChatCache';
 import ChatDatabase from '../../services/ChatDatabase';
 import OutboxWorker from '../../services/OutboxWorker';
@@ -171,6 +172,12 @@ export default function ForwardMessageScreen({ navigation, route }) {
     return [...chatMap.values()];
   }, [realtimeChatList, chatsData]);
 
+  // Business senders are read-only — nothing can be sent into them.
+  const businessPeers = useMemo(
+    () => businessPeerIdSet(realtimeChatList, chatsData),
+    [realtimeChatList, chatsData],
+  );
+
   // Build list of chats to forward to — includes both groups AND private chats
   const chatList = useMemo(() => {
     return allChats
@@ -178,6 +185,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
         if (!chat) return false;
         // Skip archived chats
         if (chat.isArchived || chat.archived) return false;
+        if (isBusinessRow(chat, businessPeers)) return false;
         const isGroup = chat.chatType === 'group' || chat.isGroup;
         const name = isGroup
           ? (chat.chatName || chat.group?.name || chat.groupName || '')
@@ -191,7 +199,7 @@ export default function ForwardMessageScreen({ navigation, route }) {
         const timeB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : (b.timestamp ? new Date(b.timestamp).getTime() : 0);
         return timeB - timeA;
       });
-  }, [allChats, searchQuery]);
+  }, [allChats, searchQuery, businessPeers]);
 
   const toggleReceiver = useCallback((chatId) => {
     setSelectedReceivers(prev =>

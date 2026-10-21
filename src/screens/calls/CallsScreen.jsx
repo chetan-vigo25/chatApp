@@ -28,8 +28,29 @@ import { clearMissed } from '../../calls/services/missedCallBadge';
 import { subscribeSocketState } from '../../Redux/Services/Socket/socket';
 import CallAvatar from '../../calls/components/CallAvatar';
 import CallsEmptyState from './CallsEmptyState';
+import { kv } from '../../services/kvStorage';
 
 const PAGE_SIZE = 30;
+
+// First page of the call log, kept on the device (per-account MMKV store, wiped
+// on logout/account switch). The tab paints it instantly and refreshes from the
+// server in the background — the network round trip (~1.2–1.7 s) used to show a
+// full-screen spinner every time the tab was opened after an app start.
+const CALL_LOG_CACHE_KEY = 'call_logs_page1_v1';
+const readCachedCalls = () => {
+  try {
+    const raw = kv.getStringSync(CALL_LOG_CACHE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+const writeCachedCalls = (rows) => {
+  try {
+    kv.setItem(CALL_LOG_CACHE_KEY, JSON.stringify((rows || []).slice(0, PAGE_SIZE))).catch(() => {});
+  } catch { /* cache is best-effort */ }
+};
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 // ── time label: "Today, 10:30 AM" · "Yesterday, 9:14 PM" · "12 May, 3:01 PM" ──
@@ -215,12 +236,15 @@ export default function CallsScreen({ navigation }) {
   } = useCall();
   const { resolveName, refresh: refreshContacts, peerPrivacyOf } = useContactDirectory();
 
-  const [items, setItems] = useState([]);
+  // Seeded from the on-device copy so the tab never opens on a spinner once a
+  // list has been seen; `initialised` is true straight away in that case.
+  const [cachedSeed] = useState(readCachedCalls);
+  const [items, setItems] = useState(() => cachedSeed || []);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [initialised, setInitialised] = useState(false);
+  const [initialised, setInitialised] = useState(() => cachedSeed !== null);
   const loadingRef = useRef(false);
 
   // ── multi-select + delete (WhatsApp-style) ──
@@ -271,14 +295,26 @@ export default function CallsScreen({ navigation }) {
       setTotalPages(pages);
       setPage(targetPage);
       setItems((prev) => (replace ? next : [...prev, ...next]));
+      if (targetPage === 1 && replace) writeCachedCalls(next);
     } catch (_) {
-      if (replace) setItems([]);
+      // Offline / server error: keep what is on screen (the cached copy) rather
+      // than blanking a list the user could already see.
+      if (replace && !cachedSeed) setItems([]);
     } finally {
       loadingRef.current = false;
       setLoading(false);
       setInitialised(true);
     }
-  }, []);
+  }, [cachedSeed]);
+
+  // Keep the on-device copy in step with realtime rows / deletes / clears, so
+  // the next cold open paints the current list.
+  const cacheReadyRef = useRef(false);
+  useEffect(() => {
+    if (!initialised) return;
+    if (!cacheReadyRef.current) { cacheReadyRef.current = true; return; }
+    writeCachedCalls(items);
+  }, [items, initialised]);
 
   // Single initial fetch: load page 1 only on the FIRST focus. After that the
   // list stays current via realtime socket events (below) and pull-to-refresh —
@@ -346,9 +382,13 @@ export default function CallsScreen({ navigation }) {
     setRefreshing(false);
   }, [fetchPage, refreshContacts]);
 
+  const loadingMoreRef = useRef(false);
   const onEndReached = useCallback(() => {
     if (loadingRef.current) return;
-    if (page < totalPages) fetchPage(page + 1, false);
+    if (page < totalPages) {
+      loadingMoreRef.current = true;
+      fetchPage(page + 1, false).finally(() => { loadingMoreRef.current = false; });
+    }
   }, [page, totalPages, fetchPage]);
 
   const groups = groupCalls(items);
@@ -641,7 +681,9 @@ export default function CallsScreen({ navigation }) {
   };
 
   const renderFooter = () => {
-    if (!loading || refreshing || !items.length) return null;
+    // Only for "load more" (page 2+). The background refresh of page 1 over the
+    // cached list is silent — that was the spinner under the list on every open.
+    if (!loading || refreshing || !items.length || !loadingMoreRef.current) return null;
     return (
       <View style={styles.footerLoad}>
         <ActivityIndicator color={theme.colors.themeColor} size="small" />

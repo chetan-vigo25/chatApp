@@ -181,7 +181,7 @@ export default function Otp({ navigation, route }) {
             });
             console.log("Session saved, navigating...");
 
-            showToast(loginData.message);
+            // No "logged in" toast/alert — the app opening is the confirmation.
             try {
               if (deviceInfo) {
                 initSocket(deviceInfo, navigation);
@@ -212,8 +212,8 @@ export default function Otp({ navigation, route }) {
           } catch (error) {
             console.error("OTP Verification Failed:", error);
             const msg = typeof error === 'string' ? error : error?.message || 'Invalid OTP. Please try again.';
+            // Inline only (red text under the boxes) — no toast/alert.
             setOtpError(msg);
-            showToast(msg);
             otpInputRef.current?.clear();
             setOtp("");
           } finally {
@@ -235,7 +235,6 @@ export default function Otp({ navigation, route }) {
               const otpMessage = payload?.otpMessage ?? payload;
               startOtpTimer(60);
               console.log("OTP Resend:", otpMessage);
-              showToast(otpMessage);
               otpInputRef.current?.clear();
               setOtp("");
             })

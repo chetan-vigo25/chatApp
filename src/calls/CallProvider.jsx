@@ -85,6 +85,7 @@ import {
 import { notifyIncomingCall } from './services/callNotifyService';
 import ColdStartCallCover from './components/ColdStartCallCover';
 import CallReliabilityGate from './components/CallReliabilityGate';
+import { isKnownBusinessPeer } from '../utils/businessChat';
 
 // CallContext now lives in its own leaf module (./CallContext) to break the
 // useCall ↔ CallProvider require cycle. Re-exported here for backward compat.
@@ -2817,6 +2818,14 @@ export const CallProvider = ({ children }) => {
     // no error anywhere. Every group entry point now passes `isGroup: true`;
     // the length check stays as the fallback for callers that don't.
     const isGroup = opts.isGroup === true || peers.length > 1;
+
+    // Business-API sender (read-only chat): it never takes calls. Every call
+    // entry point lands here, so one guard covers them all; the server refuses
+    // the ring too (unavailableCode 'business_sender').
+    if (!isGroup && peers[0]?.id && isKnownBusinessPeer(peers[0].id)) {
+      Alert.alert('Calls unavailable', 'This business account does not take calls.');
+      return;
+    }
 
     // Contact-block gate (1:1 only): never ring when either side blocked the other.
     // Group calls let the backend silently drop blocked members. This mirrors the

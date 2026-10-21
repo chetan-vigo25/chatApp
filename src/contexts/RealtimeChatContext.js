@@ -15,6 +15,7 @@ import { getChatActivityValue, compareChatsByActivity } from '../utils/chatOrder
 import { performDurableChatClear } from '../utils/chatClearStorage';
 import { setInactiveGroupIds } from '../utils/inactiveGroups';
 import { shouldEmitReadAll } from '../utils/readAllThrottle';
+import { mergeBusinessFlag, businessPeerIdSet, setKnownBusinessPeers } from '../utils/businessChat';
 import { watermarkTickDecision, canSendReadReceipt, readAllUpToSeq } from '../utils/receiptStatus';
 import { isFileNameCaption } from '../utils/mediaCaption';
 // Firebase/notifee message notifications disabled in Expo Go / dev builds.
@@ -798,6 +799,8 @@ const buildStorageChatList = (state) => {
       participants: Array.isArray(chat?.participants) ? chat.participants : [],
       otherUser: chat?.otherUser || chat?.peerUser || {},
       peerUser: chat?.peerUser || chat?.otherUser || {},
+      // Business-API sender flag (read-only chat) must survive a cold start.
+      ...(!isGroup && typeof chat?.isBusinessSender === 'boolean' ? { isBusinessSender: chat.isBusinessSender } : {}),
       lastMessage: chat?.lastMessage || {},
       unreadCount: Number(state?.unreadByChat?.[chatId] || chat?.unreadCount || 0),
       isPinned: Boolean(chat?.isPinned),
@@ -1035,12 +1038,17 @@ const reducer = (state, action) => {
         const preservePinned = Boolean(prev?.isPinned) && !Boolean(chat?.isPinned);
         const preserveMuted = Boolean(prev?.isMuted) && !Boolean(chat?.isMuted);
 
+        // Business sender flag is sticky: a row without it never clears it.
+        const bizFlag = isGroupChat ? undefined : mergeBusinessFlag(chat, prev);
         nextMap[chatId] = {
           ...prev,
           ...chat,
           _id: normalizeId(chat?._id) || chatId,
           chatId,
-          peerUser: normalizedPeerUser,
+          peerUser: (normalizedPeerUser && bizFlag !== undefined)
+            ? { ...normalizedPeerUser, isBusinessSender: bizFlag }
+            : normalizedPeerUser,
+          ...(bizFlag !== undefined ? { isBusinessSender: bizFlag } : {}),
           chatName: String(chat?.chatName || '').trim() || prev?.chatName || null,
           // 1-1: a server row that ships chatAvatar ("" / null = no photo) is
           // authoritative, like peerUser.profileImage above — `|| prev` kept a
@@ -2011,7 +2019,14 @@ const reducer = (state, action) => {
           } : {}),
           _id: normalizeId(item?._id) || normalizeId(existing?._id) || chatId,
           chatId,
-          peerUser: mergedPeerUser,
+          // A lean `chat:list:update` has no peer identity — never let it clear
+          // the business-sender flag.
+          ...(() => {
+            const biz = mergeBusinessFlag(item, existing);
+            return biz === undefined
+              ? { peerUser: mergedPeerUser }
+              : { peerUser: { ...mergedPeerUser, isBusinessSender: biz }, isBusinessSender: biz };
+          })(),
           // Same non-destructive rule for the flat aliases the row can render from.
           chatName: String(item?.chatName || '').trim() || existing?.chatName || null,
           chatAvatar: item?.chatAvatar || existing?.chatAvatar || null,
@@ -3597,6 +3612,8 @@ export function RealtimeChatProvider({ children }) {
           isViewOnce: Boolean(source?.isViewOnce),
           viewOnce: (source?.viewOnce && typeof source.viewOnce === 'object') ? source.viewOnce : null,
           mediaMeta: source?.mediaMeta || null,
+          // Business-API template layout — persisted into the payload JSON.
+          templateParts: (source?.templateParts && typeof source.templateParts === 'object') ? source.templateParts : null,
           // Album fields — survive the SQLite round-trip via payload JSON
           mediaGroupId: source?.mediaGroupId || null,
           mediaItems: Array.isArray(source?.mediaItems) ? source.mediaItems : null,
@@ -5159,6 +5176,7 @@ export function RealtimeChatProvider({ children }) {
           isViewOnce: Boolean(data?.isViewOnce),
           viewOnce: (data?.viewOnce && typeof data.viewOnce === 'object') ? data.viewOnce : null,
           mediaMeta: data?.mediaMeta || null,
+          templateParts: (data?.templateParts && typeof data.templateParts === 'object') ? data.templateParts : null,
           // Album fields — survive the SQLite round-trip via payload JSON
           mediaGroupId: data?.mediaGroupId || null,
           mediaItems: Array.isArray(data?.mediaItems) ? data.mediaItems : null,
@@ -6127,6 +6145,12 @@ export function RealtimeChatProvider({ children }) {
   }, []);
 
   // ─── Debounced SQLite chatlist save ───
+  // Business-sender peer ids for code outside React (CallProvider's startCall
+  // refuses to ring them) — see utils/businessChat.
+  useEffect(() => {
+    setKnownBusinessPeers(businessPeerIdSet(state.chatMap));
+  }, [state.chatMap]);
+
   // Persist chatMap changes to SQLite chats table (replaces AsyncStorage cache)
   useEffect(() => {
     if (!state.hasHydratedCache) return;

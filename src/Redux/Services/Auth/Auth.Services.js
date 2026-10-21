@@ -37,7 +37,7 @@ async function generateOtp(payload) {
         });
         if (response && response.message && typeof response.message === 'string') {
             if (response.statusCode === 200) {
-                showToast(response.message);
+                // Success is silent — the OTP screen opening is the confirmation.
                 return { otpMessage: response.message, otpData: response.data };
             } else {
                 // Deleted account: the Login screen shows a full alert with a
@@ -68,14 +68,15 @@ async function generateOtp(payload) {
  export async function verifyOtpService(payload) {
   // console.log("payload",payload)
    try {
-     const response = await apiCall("POST", "user/auth/login", payload);
+     // silent: a wrong OTP is shown inline on the OTP screen — no toast/alert
+     // from here or from the API layer.
+     const response = await apiCall("POST", "user/auth/login", payload, { silent: true });
   
      if (response && response.message && typeof response.message === 'string') {
        if (response.statusCode === 200) {
         //  return { otpMessage: response };
         return response;
        } else {
-         showToast(response.message);
          return Promise.reject(response.message);
        }
      } else {

@@ -127,7 +127,7 @@ export default function LoginEmail({ navigation }) {
       deviceId: session.deviceId,
       loginMethod: 'username',
     });
-    showToast(loginData.message);
+    // No "logged in" toast/alert — the app opening is the confirmation.
     if (deviceInfo) initSocket(deviceInfo, navigation);
     if (loginData?.data?.isNewUser) {
       navigation.reset({ index: 0, routes: [{ name: "EditProfile", params: { username: username.trim().toLowerCase() } }] });
@@ -167,7 +167,6 @@ export default function LoginEmail({ navigation }) {
       setTwoSv((prev) => ({ ...prev, otpExpiresAt: response?.data?.otpExpiresAt || prev.otpExpiresAt }));
       setOtpCode("");
       setResendCooldown(45);
-      showToast(response?.message || "A new code was sent.");
     } catch (error) {
       const code = error?.errorCode;
       showToast(error?.message || "Could not resend code.");

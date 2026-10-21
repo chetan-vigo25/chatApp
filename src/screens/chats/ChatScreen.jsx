@@ -104,9 +104,12 @@ import LinkPreviewCard from '../../components/LinkPreviewCard';
 import { getSocket, isSocketConnected } from '../../Redux/Services/Socket/socket';
 import CallButtons from '../../calls/components/CallButtons';
 import { isSelfChatId } from '../../utils/selfChat';
+import { isBusinessChat, BUSINESS_SUBTITLE, BUSINESS_COMPOSER_NOTICE } from '../../utils/businessChat';
 import GroupCallButtons from '../../calls/components/GroupCallButtons';
 import { useCall } from '../../calls/useCall';
 import CallMessageBubble from '../../calls/components/CallMessageBubble';
+import BusinessMessageCard from '../../components/BusinessMessageCard';
+import { fetchBusinessMedia, deleteBusinessMedia } from '../../services/businessMedia';
 // Message-body text only. Everything else on this screen keeps React
 // Native's <Text>: names, timestamps, ticks, menus and system rows must
 // never be sent to a translation API.
@@ -2785,6 +2788,12 @@ export default function ChatScreen({ navigation, route }) {
   useEffect(() => {
     const share = route?.params?.pendingShare;
     if (!share || consumedShareRef.current) return;
+    // A business chat is read-only — never send a share into it.
+    if (isBusinessChat(chatData)) {
+      consumedShareRef.current = true;
+      navigation.setParams({ pendingShare: undefined });
+      return;
+    }
     // WAIT for the thread to finish initializing before sending.
     //
     // sendMedia stamps its optimistic row with chatIdRef/currentUserIdRef, and
@@ -2924,6 +2933,10 @@ export default function ChatScreen({ navigation, route }) {
     || s?.profile?.profileData?.profileImageThumbnailUrl
     || null,
   );
+
+  // Business-API sender: a read-only inbox (no calls, composer, reply, react,
+  // forward, select or edit) — see utils/businessChat.
+  const isBusiness = isBusinessChat(chatData);
 
   // User-to-user (contact) block state for this 1-1 chat. `iBlockedPeer` hides
   // the composer with an Unblock CTA; `peerBlockedMe` silently disables sending.
@@ -7057,6 +7070,43 @@ export default function ChatScreen({ navigation, route }) {
       );
     }
 
+    // ── Business chat: the business's message, drawn like its template ──
+    // Replaces the image/video/file/text branches (and their download gates);
+    // the card draws its own time. Read-only: long-press opens the reduced
+    // menu (Copy / Report / Delete for me), nothing else.
+    if (isBusiness && !isMyMessage && !isDeletedMessage && !isViewOnce && !isSystemMessage) {
+      const onBizLongPress = () => openMessageActionsFor(msg);
+      return (
+        <React.Fragment>
+          <Pressable
+            ref={(r) => {
+              if (r) messageRowRefs.current[messageKey] = r;
+              else delete messageRowRefs.current[messageKey];
+            }}
+            onLongPress={onBizLongPress}
+            delayLongPress={300}
+            style={{
+              alignItems: 'flex-start',
+              paddingTop: 8,
+              paddingBottom: 1,
+              paddingHorizontal: 12,
+              backgroundColor: isHighlighted ? 'rgba(255, 193, 7, 0.15)' : 'transparent',
+            }}
+          >
+            <BusinessMessageCard
+              msg={msg}
+              timeLabel={msg?.time || (msg?.createdAt ? moment(msg.createdAt).format('hh:mm A') : '')}
+              theme={theme}
+              renderBodyText={(text) => renderRichMessageText({ ...msg, text }, false, `${messageKey}:biz`, null)}
+              onOpenImage={(m, uri) => openMediaViewer(m, uri, 'image')}
+              onLongPress={onBizLongPress}
+            />
+          </Pressable>
+          {dateBadgeKey && renderDateBadge(dateBadgeKey)}
+        </React.Fragment>
+      );
+    }
+
     // ── System messages (group created, member joined/left/removed) ──
     if (isSystemMessage) {
       // Group action notices render from their STRUCTURED event, so every name
@@ -7260,7 +7310,7 @@ export default function ChatScreen({ navigation, route }) {
 
     return (
       <React.Fragment>
-        <SwipeReplyRow isMyMessage={isMyMessage} disabled={isDeletedMessage || isSystemMessage} onReply={() => startReply(msg)}>
+        <SwipeReplyRow isMyMessage={isMyMessage} disabled={isDeletedMessage || isSystemMessage || isBusiness} onReply={() => startReply(msg)}>
         <Pressable
           // The popover anchors to THIS row, so a long press on any child
           // (bubble, media, album cell) resolves to the same rect.
@@ -7278,7 +7328,7 @@ export default function ChatScreen({ navigation, route }) {
             const now = Date.now();
             const lastTap = msg._lastTap || 0;
             msg._lastTap = now;
-            if (now - lastTap < 350 && !isDeletedMessage) {
+            if (now - lastTap < 350 && !isDeletedMessage && !isBusiness) {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
               toggleReaction(messageKey, '❤️');
             }
@@ -7723,7 +7773,7 @@ export default function ChatScreen({ navigation, route }) {
               anchored to the pressed bubble instead of living in every row. */}
 
           {/* WhatsApp-style reaction pill — overlaps bottom edge of bubble */}
-          {!isDeletedMessage && (
+          {!isDeletedMessage && !isBusiness && (
             <ReactionBar
               reactions={msg?.reactions}
               currentUserId={currentUserId}
@@ -7752,7 +7802,7 @@ export default function ChatScreen({ navigation, route }) {
   // DISCRETELY (selection, theme, search, handlers, translations …) — the old
   // dependency list minus the five high-frequency maps below, which are
   // reduced to a per-row signature (liveSig) so a tick only touches its own row.
-  const rowCtx = useMemo(() => ({}), [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isSearching, searchResults, currentSearchIndex, expandedRichMessages, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys, goneMedia, thumbnailCacheVersion, winW]);
+  const rowCtx = useMemo(() => ({}), [selectedMessage, currentUserId, chatColor, theme, isDarkMode, chatData, isBusiness, isSearching, searchResults, currentSearchIndex, expandedRichMessages, downloadedMedia, failedLocalMedia, viewOnceLocalStatus, toggleReaction, removeReaction, handleDeleteSelected, startEditMessage, startReply, groupMembersMap, handleToggleSelectMessages, clearSelectedMessages, replyHighlightId, language, messageTranslations, translationFor, translatingKeys, goneMedia, thumbnailCacheVersion, winW]);
 
 
   // FlatList extraData for media rows. Its identity changes only when one of
@@ -8066,10 +8116,28 @@ export default function ChatScreen({ navigation, route }) {
     const status = String(msg.status || '').toLowerCase();
     const isScheduled = status === 'scheduled' || status === 'processing';
     const isTextish = msg.type === 'text' || msg.type === undefined;
+    if (isBusiness) {
+      // Read-only business chat: Copy, Report and Delete-for-me only.
+      return {
+        isOwn,
+        isDeleted,
+        serverActionId,
+        canReply: false,
+        canForward: false,
+        canCopy: !isDeleted && !isViewOnce && Boolean(msg.text && String(msg.text).trim().length > 0),
+        canEdit: false,
+        canInfo: false,
+        canReport: !isOwn && !isDeleted,
+        canCancelSchedule: false,
+        canReact: false,
+        canSelect: false,
+      };
+    }
     return {
       isOwn,
       isDeleted,
       serverActionId,
+      canSelect: true,
       canReply: !isDeleted && !isScheduled,
       canForward: !isDeleted && !isViewOnce && Boolean(serverActionId),
       canCopy: !isDeleted && !isViewOnce && Boolean(msg.text && String(msg.text).trim().length > 0),
@@ -8084,7 +8152,7 @@ export default function ChatScreen({ navigation, route }) {
       canCancelSchedule: isScheduled && isOwn,
       canReact: !isDeleted && !isScheduled,
     };
-  }, [currentUserId, editPolicyChat]);
+  }, [currentUserId, editPolicyChat, isBusiness]);
 
   // The menu keeps the row it was opened on, but its caps follow the LIVE row:
   // a read receipt that lands while the menu is open removes Edit (E-A-02).
@@ -8186,15 +8254,17 @@ export default function ChatScreen({ navigation, route }) {
 
     // The way into multi-select — the selection header then offers Forward /
     // Delete across every message the user goes on to tap.
-    rows.push({
-      id: 'select',
-      label: 'Select messages',
-      icon: 'checkmark-circle-outline',
-      onPress: () => {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        if (!selectedMessage.includes(key)) handleToggleSelectMessages(key);
-      },
-    });
+    if (caps.canSelect) {
+      rows.push({
+        id: 'select',
+        label: 'Select messages',
+        icon: 'checkmark-circle-outline',
+        onPress: () => {
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+          if (!selectedMessage.includes(key)) handleToggleSelectMessages(key);
+        },
+      });
+    }
 
     if (caps.canCancelSchedule) {
       rows.push({
@@ -8331,6 +8401,7 @@ export default function ChatScreen({ navigation, route }) {
           // peer presence). isBroadcast lets the header suppress "last seen".
           isGroup={Boolean(chatData?.chatType === 'group' || chatData?.isGroup || isBroadcastChat)}
           isBroadcast={isBroadcastChat}
+          isBusiness={isBusiness}
           isVerified={liveChannel?.isVerified ?? liveVerified ?? Boolean(chatData?.isVerified || chatData?.peerUser?.isVerified)}
           groupName={liveChannel?.chatName ?? (chatData?.chatName || chatData?.group?.name || chatData?.groupName)}
           groupAvatar={liveChannel?.chatAvatar !== undefined ? liveChannel.chatAvatar : (chatData?.chatAvatar || chatData?.group?.avatar || chatData?.groupAvatar)}
@@ -8499,7 +8570,8 @@ export default function ChatScreen({ navigation, route }) {
           })() : (
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
               {/* No calling yourself — the self chat has no peer to ring. */}
-              {isBroadcastChat || isSelfChatId(chatData.chatId || chatData?._id || route?.params?.chatId) ? null : !isGroupChat ? (
+              {/* A business sender takes no calls (read-only inbox). */}
+              {isBroadcastChat || isBusiness || isSelfChatId(chatData.chatId || chatData?._id || route?.params?.chatId) ? null : !isGroupChat ? (
                 <CallButtons
                   peer={chatData.peerUser}
                   chatId={chatData.chatId || chatData?._id || route?.params?.chatId}
@@ -9031,6 +9103,12 @@ export default function ChatScreen({ navigation, route }) {
             <Ionicons name="megaphone-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
             <Text style={{ fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>Only the admin can post in this channel.</Text>
           </View>
+        ) : isBusiness ? (
+          // Read-only business chat: updates only — no composer at all.
+          <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingVertical: 14, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
+            <Ionicons name="storefront-outline" size={16} color={theme.colors.placeHolderTextColor} style={{ marginRight: 8 }} />
+            <Text style={{ flexShrink: 1, textAlign: 'center', fontFamily: 'Roboto-Regular', fontSize: 13, color: theme.colors.placeHolderTextColor }}>{BUSINESS_COMPOSER_NOTICE}</Text>
+          </View>
         ) : contactBlockedHide ? (
           <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12, paddingHorizontal: 20, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderTopWidth: 0.5, borderTopColor: theme.colors.borderColor }}>
             <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
@@ -9485,9 +9563,11 @@ export default function ChatScreen({ navigation, route }) {
                   </Text>
                 )}
               </View>
-              {/* Action icons — right side */}
+              {/* Action icons — right side. A business chat is read-only:
+                  no Share (nothing leaves the chat), but Save-to-gallery stays. */}
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
                 {/* Share */}
+                {isBusiness ? null : (
                 <TouchableOpacity
                   onPress={async () => {
                     if (viewerDownload.active) return;
@@ -9514,6 +9594,7 @@ export default function ChatScreen({ navigation, route }) {
                 >
                   <Ionicons name="share-social-outline" size={22} color="#fff" />
                 </TouchableOpacity>
+                )}
                 {/* Save to gallery — one tap, no repeat permission prompt */}
                 <TouchableOpacity
                   onPress={async () => {
@@ -9523,12 +9604,30 @@ export default function ChatScreen({ navigation, route }) {
                     setViewerDownload({ active: true, progress: 0, forIndex });
                     try {
                       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                      const localUri = await resolveFileForOpen(
-                        msg,
-                        (p) => setViewerDownload({ active: true, progress: p, forIndex }),
-                        (cancelFn) => { viewerDownloadCancelRef.current = cancelFn; }
-                      );
-                      if (!localUri) return;
+                      // Business media has no media record (mediaId null), so the
+                      // normal download path can't fetch it: use the viewer's own
+                      // file, else the api-media endpoint (services/businessMedia).
+                      let bizTemp = null;
+                      let localUri;
+                      if (isBusiness) {
+                        const shown = localMediaViewer.uri;
+                        if (shown && String(shown).startsWith('file://')) {
+                          localUri = shown;
+                        } else {
+                          bizTemp = await fetchBusinessMedia(msg).catch(() => null);
+                          localUri = bizTemp;
+                        }
+                      } else {
+                        localUri = await resolveFileForOpen(
+                          msg,
+                          (p) => setViewerDownload({ active: true, progress: p, forIndex }),
+                          (cancelFn) => { viewerDownloadCancelRef.current = cancelFn; }
+                        );
+                      }
+                      if (!localUri) {
+                        if (isBusiness) Alert.alert('', 'This file is no longer available.');
+                        return;
+                      }
                       // Re-asks in context when photos was denied earlier.
                       const photosOk = await ensurePermission(PERMISSION_IDS.PHOTOS, {
                         purpose: 'Allow photo access to save this media to your gallery.',
@@ -9541,6 +9640,7 @@ export default function ChatScreen({ navigation, route }) {
         await ensureSaveableFileUri(localUri, msg),
         (msg?.type || '').toLowerCase() === 'video' ? 'TalksTry Video' : 'TalksTry Images',
       ));
+                      if (bizTemp && bizTemp !== localMediaViewer.uri) deleteBusinessMedia(bizTemp);
                       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                       setViewerSavedToast(true);
                       if (viewerToastTimer.current) clearTimeout(viewerToastTimer.current);

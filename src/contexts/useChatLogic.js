@@ -81,6 +81,8 @@ import {
 import { computeSenderType, isOutgoingMessage } from "../utils/messageDirection";
 import { dropAlternateIdTwins } from "../utils/messageIdentity";
 import { normalizeMentions } from "../utils/mentions";
+import { mergeBusinessFlag } from "../utils/businessChat";
+import { probeBusinessPeer, knownBusinessPeer } from "../utils/businessPeerProbe";
 
 // Module-level cache of the logged-in user (id + display name). `initializeChat`
 // used to `await AsyncStorage.getItem("userInfo")` on EVERY chat open before it
@@ -607,6 +609,23 @@ export default function useChatLogic({ navigation, route }) {
   // unstable reference here forces the whole message list to re-render every
   // render — which shows up as old messages "blinking"/refreshing repeatedly.
   // All inputs below are pure functions of [item, user, routeChatId, liveGroupMeta].
+  // Business-sender fallback for servers that don't put `isBusinessSender` on
+  // the row yet: probe the peer's profile once (utils/businessPeerProbe).
+  const probePeerId = (!isGroupChat && !isBroadcastChat)
+    ? (normalizeId(knownChatRow?.peerUser?._id || item?.peerUser?._id || item?.peerUserId || knownChatRow?.peerUserId)
+      || peerIdFromPrivateChatId(lookupChatId, getCachedUserInfoSync()?._id || getCachedUserInfoSync()?.id)
+      || null)
+    : null;
+  const rowBusinessFlag = mergeBusinessFlag(knownChatRow, item);
+  const [probedBusinessPeer, setProbedBusinessPeer] = useState(() => knownBusinessPeer(probePeerId) === true);
+  useEffect(() => {
+    if (!probePeerId || rowBusinessFlag !== undefined) { setProbedBusinessPeer(false); return undefined; }
+    let alive = true;
+    setProbedBusinessPeer(knownBusinessPeer(probePeerId) === true);
+    probeBusinessPeer(probePeerId).then((isBiz) => { if (alive) setProbedBusinessPeer(isBiz === true); });
+    return () => { alive = false; };
+  }, [probePeerId, rowBusinessFlag]);
+
   const chatData = useMemo(() => {
     // Gap-fill the peer from the locally known chat row (see knownChatRow).
     const rowPeer = knownChatRow?.peerUser || null;
@@ -657,20 +676,26 @@ export default function useChatLogic({ navigation, route }) {
             || flatPeer?.mobileNumber || '',
         }
       : null;
+    // Business-API sender (read-only chat). The live chat-list row wins over
+    // whatever the route carried; see utils/businessChat.
+    const bizFlag = rowBusinessFlag !== undefined ? rowBusinessFlag : (probedBusinessPeer || undefined);
+    const bizField = bizFlag === true ? { isBusinessSender: true } : {};
+    // Keep the peer in step — every reader also checks peerUser.isBusinessSender.
+    const bizPeer = (bizFlag === true && peerUser) ? { ...peerUser, isBusinessSender: true } : peerUser;
     return (
     isBroadcastChat
       ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'broadcast', ...broadcastFields }
       : isGroupChat
         ? { peerUser: null, chatId: item?.chatId || item?._id || routeChatId || null, chatType: 'group', ...groupFields }
         : (item && peerUser)
-          ? { peerUser, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField }
+          ? { peerUser: bizPeer, chatId: item.chatId || item._id || routeChatId || null, chatType: chatTypeField, ...bizField }
           // Keep the thread id even with no peer at all: messages can still load,
           // and the id is what lets a later hydration fill the header in.
           : (peerUser
-            ? { peerUser, chatId: routeChatId || null, chatType: chatTypeField }
-            : { peerUser: null, chatId: lookupChatId || null, chatType: 'private' })
+            ? { peerUser: bizPeer, chatId: routeChatId || null, chatType: chatTypeField, ...bizField }
+            : { peerUser: null, chatId: lookupChatId || null, chatType: 'private', ...bizField })
     );
-  }, [item, user, routeChatId, liveGroupMeta, knownChatRow, lookupChatId, isGroupChat, isBroadcastChat]);
+  }, [item, user, routeChatId, liveGroupMeta, knownChatRow, lookupChatId, isGroupChat, isBroadcastChat, rowBusinessFlag, probedBusinessPeer]);
 
   // True when this is a group chat the current user has left or been removed
   // from — used to disable the message input (you can no longer send messages).
@@ -2972,6 +2997,10 @@ export default function useChatLogic({ navigation, route }) {
       statusPreview: apiMsg?.statusPreview
         || normalizedPayload?.statusPreview
         || null,
+      // Business-API template layout (header/body/footer); null for free text.
+      templateParts: (apiMsg?.templateParts && typeof apiMsg.templateParts === 'object')
+        ? apiMsg.templateParts
+        : (normalizedPayload?.templateParts || null),
     };
   }, [normalizeMessageStatus]);
 

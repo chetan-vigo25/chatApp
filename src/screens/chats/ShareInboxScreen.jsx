@@ -12,6 +12,7 @@ import { useSelector } from 'react-redux';
 
 import { useTheme } from '../../contexts/ThemeContext';
 import { useRealtimeChatLists } from '../../contexts/RealtimeChatContext';
+import { businessPeerIdSet, isBusinessRow } from '../../utils/businessChat';
 import AppSearchBar from '../../components/AppSearchBar';
 // 1-1 avatar = same rule as the chat list: photo, else the first letter of the
 // peer's OWN profile name (not my saved name, their @username or a "+").
@@ -129,10 +130,17 @@ export default function ShareInboxScreen({ navigation, route }) {
       ? (c.chatAvatar || c.group?.avatar || c.groupAvatar)
       : (c?.peerUser?.profileImage || c?.chatAvatar);
 
+  // Business senders are read-only — nothing can be shared into them.
+  const businessPeers = useMemo(
+    () => businessPeerIdSet(realtimeChatList, chatsData),
+    [realtimeChatList, chatsData],
+  );
+
   const chats = useMemo(() => {
     return allChats
       .filter((c) => {
         if (!c || c.isArchived || c.archived) return false;
+        if (isBusinessRow(c, businessPeers)) return false;
         const name = getName(c);
         if (!name) return false;
         if (query) return name.toLowerCase().includes(query.toLowerCase());
@@ -143,7 +151,7 @@ export default function ShareInboxScreen({ navigation, route }) {
         const tb = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
         return tb - ta;
       });
-  }, [allChats, query]);
+  }, [allChats, query, businessPeers]);
 
   const onSelect = useCallback((chat) => {
     // Open the thread and hand it the shared payload. `item` is the canonical

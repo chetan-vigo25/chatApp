@@ -149,7 +149,22 @@ export default function RootNavigator() {
           <Stack.Screen name="AccountStatus" component={AccountStatus} options={{ gestureEnabled: false }} />
           <Stack.Screen name="SyncScreen" component={SyncScreen} />
           <Stack.Screen name="ChatList" component={BottomTabNavigator} />
-          <Stack.Screen name="ChatScreen" component={ChatScreen} />
+          {/* Chat opens with a WhatsApp-style SLIDE, not the stack's cross-fade:
+              the fade showed the chat list and the thread half-transparent on top
+              of each other for the whole 150 ms, which read as a flicker —
+              loudest on image-heavy threads (business catalogues). The slide
+              brings in an opaque card, so nothing blends. */}
+          <Stack.Screen
+            name="ChatScreen"
+            component={ChatScreen}
+            options={{
+              cardStyleInterpolator: CardStyleInterpolators.forHorizontalIOS,
+              transitionSpec: {
+                open: { animation: 'timing', config: { duration: 200 } },
+                close: { animation: 'timing', config: { duration: 180 } },
+              },
+            }}
+          />
           <Stack.Screen name="NoInternet" component={NoInternet} />
           <Stack.Screen name="LinkDevice" component={LinkedDevicesScreen} />
           <Stack.Screen name="QRScanner" component={QRScannerScreen} />

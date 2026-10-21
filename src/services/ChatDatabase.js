@@ -971,6 +971,8 @@ const rowToMsg = (row) => {
     // Status reply / share — snapshot persisted in payload
     statusRef: pp?.statusRef || null,
     statusPreview: pp?.statusPreview || null,
+    // Business-API template layout (header/body/footer) — payload-only.
+    templateParts: pp?.templateParts || null,
     // View Once — metadata only (never a local media copy)
     isViewOnce: Boolean(pp?.isViewOnce),
     viewOnce: pp?.viewOnce || null,
@@ -1607,6 +1609,12 @@ const _runInsert = async (db, msg, _retried = false) => {
   let existingViewOnceInPayload = null;
   let existingMentionsInPayload = null;
   let existingCallInPayload = null;
+  let existingTemplateInPayload = null;
+  // Business-API template layout (header/body/footer). Top-level on the wire,
+  // payload-only here; carried forward like statusPreview.
+  const incomingTemplate = (msg.templateParts && typeof msg.templateParts === 'object')
+    ? msg.templateParts
+    : (msg.payload?.templateParts && typeof msg.payload.templateParts === 'object' ? msg.payload.templateParts : null);
   const incomingMentions = Array.isArray(msg.mentions) && msg.mentions.length
     ? msg.mentions
     : (Array.isArray(msg.payload?.mentions) && msg.payload.mentions.length ? msg.payload.mentions : null);
@@ -1618,7 +1626,7 @@ const _runInsert = async (db, msg, _retried = false) => {
   const isCallRow = (msg.type || msg.messageType) === 'call';
   const incomingCall = isCallRow ? pickCallFields(msg.payload, msg.callDetails) : null;
   if (!msg.replyToMessageId || !msg.statusRef || !msg.statusPreview || !msg.viewOnce || !incomingMentions
-    || (isCallRow && !incomingCall)) {
+    || (isCallRow && !incomingCall) || !incomingTemplate) {
     try {
       const ex = await db.getFirstAsync(`SELECT payload FROM messages WHERE id = $id LIMIT 1`, { $id: id });
       if (ex?.payload) {
@@ -1628,6 +1636,7 @@ const _runInsert = async (db, msg, _retried = false) => {
         if (ep?.isViewOnce || ep?.viewOnce) existingViewOnceInPayload = ep;
         if (Array.isArray(ep?.mentions) && ep.mentions.length) existingMentionsInPayload = ep.mentions;
         if (isCallRow) existingCallInPayload = pickCallFields(ep, null);
+        if (ep?.templateParts && typeof ep.templateParts === 'object') existingTemplateInPayload = ep.templateParts;
       }
     } catch {}
   }
@@ -1711,6 +1720,10 @@ const _runInsert = async (db, msg, _retried = false) => {
       : (existingViewOnceInPayload?.viewOnce
           ? { viewOnce: existingViewOnceInPayload.viewOnce }
           : {})),
+    // Business template layout — incoming wins, else carry forward.
+    ...((incomingTemplate || existingTemplateInPayload)
+      ? { templateParts: incomingTemplate || existingTemplateInPayload }
+      : {}),
     // Call log — incoming details win, else carry forward (a tick upsert must
     // not strip the duration off the bubble).
     ...(incomingCall || existingCallInPayload || {}),

@@ -36,10 +36,12 @@ export const otpVerify = createAsyncThunk(
     try {
       const response = await authServices.verifyOtpService(payload);
       // console.log("verify responce",response)
-      // return response.otpMessage; 
-      return response; 
+      // return response.otpMessage;
+      return response;
     } catch (error) {
-      return rejectWithValue(error.message);
+      // The service rejects with the server's message STRING — keep it so the
+      // OTP screen shows it inline ("OTP expired", …).
+      return rejectWithValue(typeof error === 'string' ? error : error?.message);
     }
   }
 );

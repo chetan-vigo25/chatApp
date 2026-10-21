@@ -30,17 +30,15 @@ export default function useDraggablePip({
     : SH - height - insets.bottom - 100;
 
   const pan = useRef(new Animated.ValueXY({ x: startX, y: startY })).current;
-  const posRef = useRef({ x: startX, y: startY });
+  // Where the window was when the current drag began. Read straight off the
+  // value at grant time — NOT kept fresh by pan.addListener: Animated removes
+  // every listener when the view driven by `pan` unmounts (AnimatedNode
+  // __detach → removeAllListeners), which tap-to-swap does by switching the
+  // tile, so after one swap the listener was gone and every drop sprang back.
+  const startRef = useRef({ x: startX, y: startY });
   const enabledRef = useRef(enabled);
 
   useEffect(() => { enabledRef.current = enabled; }, [enabled]);
-
-  // Track the live value so the responder can read the current position without
-  // reaching into Animated internals.
-  useEffect(() => {
-    const id = pan.addListener((v) => { posRef.current = v; });
-    return () => pan.removeListener(id);
-  }, [pan]);
 
   const panResponder = useRef(
     PanResponder.create({
@@ -56,13 +54,16 @@ export default function useDraggablePip({
       ),
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
-        pan.setOffset({ x: posRef.current.x, y: posRef.current.y });
+        // stopAnimation hands back the live position (mid-spring included).
+        pan.stopAnimation((v) => { startRef.current = v; });
+        pan.setOffset({ x: startRef.current.x, y: startRef.current.y });
         pan.setValue({ x: 0, y: 0 });
       },
       onPanResponderMove: Animated.event([null, { dx: pan.x, dy: pan.y }], { useNativeDriver: false }),
-      onPanResponderRelease: () => {
+      onPanResponderRelease: (_, g) => {
         pan.flattenOffset();
-        const { x, y } = posRef.current;
+        const x = startRef.current.x + g.dx;
+        const y = startRef.current.y + g.dy;
         const maxX = SW - width - SNAP_MARGIN;
         const minY = insets.top + SNAP_MARGIN;
         const maxY = SH - height - insets.bottom - SNAP_MARGIN;

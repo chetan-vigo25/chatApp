@@ -11,6 +11,7 @@ import { getSocket } from '../../Redux/Services/Socket/socket';
 import useDisplayName from '../../hooks/useDisplayName';
 import { usePeerProfileName } from '../../services/peerProfileNameStore';
 import { isSelfChatId, selfChatLabel, selfIdentityOf } from '../../utils/selfChat';
+import { BUSINESS_SUBTITLE } from '../../utils/businessChat';
 import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from '../../utils/avatarIdentity';
 import AppImage from '../../components/AppImage';
 
@@ -117,6 +118,9 @@ export default function ChatHeaderPresence({
   getUserColor,
   isGroup,
   isBroadcast,
+  // Business-API sender: fixed "Business account" subtitle, no presence, and
+  // the business's own name (never a number) — see utils/businessChat.
+  isBusiness = false,
   isVerified,
   groupName,
   groupAvatar,
@@ -130,9 +134,9 @@ export default function ChatHeaderPresence({
   const { theme, isDarkMode } = useTheme();
   // Self-chat header only — my own handle + contact-privacy toggle.
   const myProfile = useSelector((state) => state.profile?.profileData);
-  const { presence, lastSeenFormatted } = useUserPresence(isGroup ? null : user?._id);
+  const { presence, lastSeenFormatted } = useUserPresence((isGroup || isBusiness) ? null : user?._id);
   const realtimePresence = useRealtimeChatSlice(
-    useCallback((s) => ((!isGroup && user?._id) ? s?.presenceByUser?.[user._id] : null), [isGroup, user?._id]),
+    useCallback((s) => ((!isGroup && !isBusiness && user?._id) ? s?.presenceByUser?.[user._id] : null), [isGroup, isBusiness, user?._id]),
   );
   const realtimeTyping = useRealtimeChatSlice(
     useCallback((s) => (chatId ? s?.typingStates?.[chatId] : null), [chatId]),
@@ -240,6 +244,7 @@ export default function ChatHeaderPresence({
 
   const statusText = isBroadcast
     ? 'tap here for channel info'
+    : isBusiness ? BUSINESS_SUBTITLE
     : isSelf ? 'Message yourself'
     : isGroup ? groupStatusText : peerStatusText;
   // ONE rule: my saved contact name → the peer's number → (only when no number
@@ -293,7 +298,9 @@ export default function ChatHeaderPresence({
           name: user?.fullName || user?.name,
           ...selfIdentityOf(myProfile),
         })
-      : peerDisplayName;
+      : (isBusiness && String(user?.fullName || '').trim())
+        ? String(user.fullName).trim()
+        : peerDisplayName;
 
   // Same no-photo avatar as the chat-list row (utils/avatarIdentity): letter of
   // my saved name, else the peer's profile name — not the number / @username

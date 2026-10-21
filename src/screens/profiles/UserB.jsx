@@ -32,6 +32,8 @@ import useDisplayName from "../../hooks/useDisplayName";
 import { getPeerProfileName } from "../../services/peerProfileNameStore";
 import FadeScrim, { easedStops } from "../../components/FadeScrim";
 import { avatarNameSource, getAvatarColor, getAvatarInitial, shouldShowAvatarInitial, UNSAVED_AVATAR_BG } from "../../utils/avatarIdentity";
+import { isBusinessChat, isBusinessPeerInChats, looksLikeBusinessSender, BUSINESS_SUBTITLE } from "../../utils/businessChat";
+import BusinessDetailsCard from "../../components/BusinessDetailsCard";
 import AppImage from '../../components/AppImage';
 
 const { width } = Dimensions.get('window');
@@ -91,6 +93,14 @@ export default function UserB({ navigation, route }) {
   const peer = routeItem?.peerUser ? routeItem.peerUser : (routeItem || {});
   const peerId = peer?._id || peer?.userId || peer?.id || null;
   const chatId = routeItem?.chatId || routeItem?._id || null;
+  // Business-API sender (docs/BUSINESS_CHAT_README.md §3.7): "Business account",
+  // no Message / call actions, no number / email / username / groups in common,
+  // a Business details card from `peerProfile.business` (read here, never stored).
+  const isBusinessPeer = looksLikeBusinessSender(peerProfile) || isBusinessChat(routeItem)
+    || peer?.isBusinessSender === true || isBusinessPeerInChats(chatList, peerId);
+  const business = (isBusinessPeer && peerProfile?.business && typeof peerProfile.business === 'object')
+    ? peerProfile.business
+    : null;
 
   // Get mute state
   const chatItem = (chatList || []).find(c => (c?.chatId || c?._id) === chatId) || routeItem || {};
@@ -242,6 +252,8 @@ export default function UserB({ navigation, route }) {
   const serverDisplayName =
     peerProfile?.isSavedContact ? peerProfile?.displayName : null;
   const displayName =
+    // A business is always shown by its own name (never a number).
+    (isBusinessPeer && (String(business?.name || '').trim() || String(peerProfile?.fullName || peer?.fullName || '').trim())) ||
     // Privacy FIRST — `displayHandle` is non-empty only while the peer hides
     // their details, and then it outranks the saved name, exactly as in the
     // canonical resolver.
@@ -268,7 +280,10 @@ export default function UserB({ navigation, route }) {
   const initial = getAvatarInitial(initialSource);
   const isSavedPeer = shouldShowAvatarInitial(initialSource);
   const lastSeen = peerProfile?.lastSeen || peer?.lastSeen || '';
-  const about = peerProfile?.about || peer?.about || '';
+  const about = isBusinessPeer
+    ? String(business?.about || peerProfile?.about || '').trim()
+    : (peerProfile?.about || peer?.about || '');
+  const businessDescription = isBusinessPeer ? String(business?.description || '').trim() : '';
   // Admin-granted verified badge (from the profile view endpoint / chat item).
   const isVerified = Boolean(peerProfile?.isVerified || peer?.isVerified);
 
@@ -276,7 +291,8 @@ export default function UserB({ navigation, route }) {
   // changes show up immediately (the locally-saved contact image is only a
   // stale snapshot from save-time). Saved-contact NAME still wins above; only
   // the photo follows the server, matching WhatsApp.
-  const peerProfileImage = peerProfile?.profileImage;
+  // A business's logo is its avatar.
+  const peerProfileImage = (isBusinessPeer && business?.logoUrl) || peerProfile?.profileImage;
   const peerImage = peer?.profileImage || peer?.profilePicture || peer?.profilePictureUri;
   const localImage = localContact?.profileImage;
   const imageSource = peerProfileImage
@@ -525,16 +541,18 @@ export default function UserB({ navigation, route }) {
   // The backend hands back a raw ISO timestamp; never print it. This screen is
   // full-width, so it gets the long phrasing ("last seen today at 12:50 PM")
   // rather than the chat header's compact one.
-  const statusLine = isOnline
-    ? 'online'
-    : (lastSeen ? formatLastSeen(lastSeen, 'everyone', { style: 'long' }) : '');
+  const statusLine = isBusinessPeer
+    ? BUSINESS_SUBTITLE
+    : isOnline
+      ? 'online'
+      : (lastSeen ? formatLastSeen(lastSeen, 'everyone', { style: 'long' }) : '');
   // The line under the hero name. The handle stands in for a hidden number —
   // but not when the handle IS the name above it (a hidden peer), which would
   // print "@handle" twice; presence takes the slot instead.
-  const identifierLine =
+  const identifierLine = isBusinessPeer ? BUSINESS_SUBTITLE : (
     displayPhone
     || (displayHandle && displayHandle !== displayName ? displayHandle : '')
-    || statusLine;
+    || statusLine);
 
   return (
     <View style={[styles.container, { backgroundColor: pageBg }]}>
@@ -646,6 +664,8 @@ export default function UserB({ navigation, route }) {
         </View>
 
         {/* ─── Action buttons (Message · Audio · Video) — WhatsApp grouped card ─── */}
+        {/* A business: no Message / Audio / Video (read-only, takes no calls). */}
+        {isBusinessPeer ? null : (
         <View style={[styles.actionsCard, { backgroundColor: cardBg }]}>
           <ActionColumn icon="chatbubble" label="Message" color={themeColor} onPress={handleMessage} />
           <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
@@ -653,19 +673,37 @@ export default function UserB({ navigation, route }) {
           <View style={[styles.actionDivider, { backgroundColor: dividerClr }]} />
           <ActionColumn icon="videocam" label="Video" color={themeColor} onPress={handleVideoCall} disabled={callBusy || callBlocked} />
         </View>
+        )}
 
         {/* ─── About ─── */}
-        {about ? (
+        {(about || businessDescription) ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             <View style={styles.aboutRow}>
-              <Text style={[styles.aboutText, { color: primaryText }]} selectable>{about}</Text>
+              {about ? (
+                <Text style={[styles.aboutText, { color: primaryText }]} selectable>{about}</Text>
+              ) : null}
+              {businessDescription ? (
+                <Text style={[styles.fieldLabel, { color: primaryText }]} selectable>{businessDescription}</Text>
+              ) : null}
               <Text style={[styles.fieldLabel, { color: subText }]}>About</Text>
             </View>
           </View>
         ) : null}
 
+        {/* ─── Business details (replaces phone / email / username) ─── */}
+        {isBusinessPeer ? (
+          <BusinessDetailsCard
+            business={business}
+            cardBg={cardBg}
+            primaryText={primaryText}
+            subText={subText}
+            accent={themeColor}
+            dividerColor={dividerClr}
+          />
+        ) : null}
+
         {/* ─── Phone (with inline mini actions) ─── */}
-        {displayPhone ? (
+        {!isBusinessPeer && displayPhone ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             <View style={styles.phoneRow}>
               <View style={{ flex: 1 }}>
@@ -682,7 +720,7 @@ export default function UserB({ navigation, route }) {
         ) : null}
 
         {/* ─── Email / Username ─── */}
-        {(peerEmail || peerHandle) ? (
+        {!isBusinessPeer && (peerEmail || peerHandle) ? (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
             {peerEmail ? (
               <InfoRow
@@ -713,7 +751,7 @@ export default function UserB({ navigation, route }) {
         ) : null}
 
         {/* ─── Groups in common (always shown; empty state like the web) ─── */}
-        {peerId ? (() => {
+        {peerId && !isBusinessPeer ? (() => {
           const n = commonGroups.length;
           const isSelfPage = selfUserId && String(selfUserId) === String(peerId);
           const plural = `${n} group${n === 1 ? '' : 's'}`;
@@ -800,7 +838,8 @@ export default function UserB({ navigation, route }) {
             guard double-gated the row against a stale local flag (and against
             SQLite's original_id, which is not a device-saved marker), which is
             why unsaved numbers showed no button after a sync. */}
-        {!contactJustSaved
+        {!isBusinessPeer
+          && !contactJustSaved
           && saveContactStatus !== SAVE_CONTACT_STATUS.CHECKING
           && saveContactStatus !== SAVE_CONTACT_STATUS.SAVED && (
           <View style={[styles.card, { backgroundColor: cardBg }]}>
@@ -906,7 +945,7 @@ export default function UserB({ navigation, route }) {
               <View style={[styles.rowIconWrap, { backgroundColor: '#EF444418' }]}>
                 <Ionicons name="flag-outline" size={19} color="#EF4444" />
               </View>
-              <Text style={[styles.rowAction, { color: '#EF4444' }]}>Report {displayName}</Text>
+              <Text style={[styles.rowAction, { color: '#EF4444' }]}>{isBusinessPeer ? 'Report business' : `Report ${displayName}`}</Text>
             </TouchableOpacity>
           </View>
         ) : null}

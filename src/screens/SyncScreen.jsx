@@ -93,6 +93,7 @@ const _normalizeMessage = (msg, chat, chatId) => {
     mediaThumbnailUrl: isViewOnce ? null : (msg.mediaThumbnailUrl || msg.thumbnailUrl || null),
     mediaId: isViewOnce ? null : (msg.mediaId || null),
     mediaMeta: msg.mediaMeta || null,
+    templateParts: (msg.templateParts && typeof msg.templateParts === 'object') ? msg.templateParts : null,
     mediaGroupId: msg.mediaGroupId || null,
     mediaItems: Array.isArray(msg.mediaItems) ? msg.mediaItems : null,
     isViewOnce,
