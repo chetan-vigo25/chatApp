@@ -28,3 +28,25 @@ export const subscribeChrome = (fn) => {
 };
 
 export const useChromeVisible = () => useSyncExternalStore(subscribeChrome, getChromeVisible);
+
+// GROUP video only: true while one tile is SPOTLIGHTED (tapped big, or an
+// auto-focused screen share). The gallery grid already insets itself between
+// the top bar and the controls, so hiding the chrome there only leaves empty
+// bars — CallOverlay auto-hides the chrome only in the spotlight view, where
+// the big tile grows into the freed space.
+let stageFocused = false;
+const focusSubs = new Set();
+
+export const setStageFocused = (v) => {
+  const next = !!v;
+  if (stageFocused === next) return;
+  stageFocused = next;
+  focusSubs.forEach((fn) => { try { fn(); } catch { /* subscriber error */ } });
+};
+
+const subscribeFocus = (fn) => {
+  focusSubs.add(fn);
+  return () => { focusSubs.delete(fn); };
+};
+
+export const useStageFocused = () => useSyncExternalStore(subscribeFocus, () => stageFocused);

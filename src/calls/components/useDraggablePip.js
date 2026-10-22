@@ -20,6 +20,10 @@ const SNAP_MARGIN = 12;
 
 export default function useDraggablePip({
   width, height, enabled = true, initial = 'bottom-right', snapToEdge = true,
+  // Screen space the window must not be dropped into, below the top inset /
+  // above the bottom inset — e.g. the full-screen call's top bar and control
+  // row, so the self-view never parks behind the buttons.
+  topReserve = 0, bottomReserve = 0,
 }) {
   const insets = useSafeAreaInsets();
   const { width: SW, height: SH } = Dimensions.get('window');
@@ -65,8 +69,8 @@ export default function useDraggablePip({
         const x = startRef.current.x + g.dx;
         const y = startRef.current.y + g.dy;
         const maxX = SW - width - SNAP_MARGIN;
-        const minY = insets.top + SNAP_MARGIN;
-        const maxY = SH - height - insets.bottom - SNAP_MARGIN;
+        const minY = insets.top + Math.max(SNAP_MARGIN, topReserve);
+        const maxY = SH - height - insets.bottom - Math.max(SNAP_MARGIN, bottomReserve);
         const snapX = snapToEdge
           ? ((x + width / 2) < SW / 2 ? SNAP_MARGIN : maxX)
           : Math.min(Math.max(x, SNAP_MARGIN), maxX);

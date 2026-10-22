@@ -1,10 +1,12 @@
-import React, { useState, useCallback } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import {
+  View, Text, StyleSheet, TouchableOpacity, ScrollView,
+} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useTheme } from '../../contexts/ThemeContext';
 import CallAvatar from './CallAvatar';
 import {
-  gridLayout, tileBox, fitAvatar, MAX_VOICE_TILES,
+  gridLayout, tileBox, fitAvatar, pageTiles, MAX_VOICE_TILES,
 } from '../callGridLayout';
 
 /**
@@ -14,7 +16,8 @@ import {
  * Same tile geometry as the live video grid — see src/calls/callGridLayout.js.
  * A voice tile IS a video tile whose camera is off, so both surfaces share one
  * layout: 2 people stack top/bottom, 3 stretches the odd tile across its row,
- * 4+ fills a grid, and anything past the ceiling collapses into a "+N" chip.
+ * 4+ fills a grid, and past MAX_VOICE_TILES the rest page sideways (swipe,
+ * with dots) — a call can hold 32 people and every one of them gets a tile.
  *
  * Each tile shows the participant's avatar, their name, and a status line:
  * "Ringing…", "In call", or "Left". `activeSpeakerId` is whoever the SFU
@@ -41,6 +44,8 @@ const statusLabel = (p, ringing) => {
 // measured. The real size comes from the measured tile (fitAvatar) so the
 // avatar + name + status always fit — a fixed 104dp avatar clipped short tiles.
 const avatarCapFor = (n) => (n <= 2 ? 104 : n <= 4 ? 84 : n <= 6 ? 68 : 56);
+// Page dots under a multi-page grid.
+const DOTS_H = 16;
 
 // Cell padding (3 per side) + tile border (2 per side).
 const TILE_GUTTER = 10;
@@ -67,6 +72,8 @@ export default function CallParticipantsGrid({
 }) {
   const { theme, isDarkMode } = useTheme();
   const [gridSize, setGridSize] = useState(null);
+  const [page, setPage] = useState(0);
+  const pagerRef = useRef(null);
   const onGridLayout = useCallback((e) => {
     const { width, height } = e.nativeEvent.layout;
     setGridSize((prev) => (prev && prev.width === width && prev.height === height
@@ -82,6 +89,14 @@ export default function CallParticipantsGrid({
   const tileBorder = isDarkMode ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.06)';
 
   const others = Object.values(participants).filter((p) => p && p.id);
+  // People left and the last page vanished — slide back onto a real page.
+  const pageTotal = Math.max(1, Math.ceil((others.length + (showSelf ? 1 : 0)) / MAX_VOICE_TILES));
+  useEffect(() => {
+    if (page > pageTotal - 1) {
+      setPage(pageTotal - 1);
+      pagerRef.current?.scrollTo?.({ x: (pageTotal - 1) * (gridSize?.width || 0), animated: false });
+    }
+  }, [page, pageTotal, gridSize]);
   // Nobody else on the roster yet — render nothing rather than a lone card of
   // yourself. CallOverlay's title/status line is the whole screen in that gap.
   if (!others.length) return null;
@@ -91,94 +106,122 @@ export default function CallParticipantsGrid({
     ? [{ id: selfId || 'self', isSelf: true, name: selfName || 'You', avatar: selfAvatar, joined: true }, ...others]
     : others;
 
-  const layout = gridLayout(list.length, MAX_VOICE_TILES);
-  const shown = list.slice(0, layout.count);
-  const box = tileBox(layout, gridSize?.width, gridSize?.height, TILE_GUTTER);
-  // Short tiles (5+ people on a small phone) drop the @handle line and tighten
-  // the name; very short ones drop the status line too — never overflow.
-  const compact = !!box && box.height < 170;
-  const tiny = !!box && box.height < 96;
-  const showHandle = !compact && shown.some((p) => p.handle);
-  const reserve = (compact ? NAME_H_COMPACT : NAME_H)
-    + (tiny ? 0 : STATUS_H)
-    + (showHandle ? HANDLE_H : 0)
-    + (compact ? 8 : BREATHING);
-  const size = fitAvatar(box, reserve, avatarCapFor(layout.count))
-    || avatarCapFor(layout.count);
+  const pages = pageTiles(list, MAX_VOICE_TILES);
+  const pageCount = pages.length;
+  const curPage = Math.min(page, pageCount - 1);
+  const pageW = gridSize?.width || 0;
+  const pageH = gridSize ? Math.max(0, gridSize.height - (pageCount > 1 ? DOTS_H : 0)) : 0;
+
+  const renderPage = (pg, pi) => {
+    const layout = gridLayout(pg.length, MAX_VOICE_TILES);
+    const box = tileBox(layout, pageW, pageH, TILE_GUTTER);
+    // Short tiles (5+ people on a small phone) drop the @handle line and tighten
+    // the name; very short ones drop the status line too — never overflow.
+    const compact = !!box && box.height < 170;
+    const tiny = !!box && box.height < 96;
+    const showHandle = !compact && pg.some((p) => p.handle);
+    const reserve = (compact ? NAME_H_COMPACT : NAME_H)
+      + (tiny ? 0 : STATUS_H)
+      + (showHandle ? HANDLE_H : 0)
+      + (compact ? 8 : BREATHING);
+    const size = fitAvatar(box, reserve, avatarCapFor(layout.count))
+      || avatarCapFor(layout.count);
+    return (
+      <View
+        key={`page:${pi}`}
+        style={[styles.page, gridSize ? { width: pageW, height: pageH } : styles.pageFlex]}
+      >
+        {pg.map((p, i) => {
+          // Only a LIVE participant can be the speaker — a stale relay for someone
+          // who already left must not light their tile up.
+          const speaking = !p.isSelf && p.joined && !p.left
+            && String(p.id) === String(activeSpeakerId);
+          return (
+            <View key={p.id} style={[styles.cell, layout.tileStyle(i)]}>
+              <TouchableOpacity
+                style={[
+                  styles.tile,
+                  { backgroundColor: tileBg, borderColor: speaking ? '#00D26A' : tileBorder },
+                  p.left && styles.leftDim,
+                ]}
+                activeOpacity={onParticipantLongPress && !p.isSelf ? 0.7 : 1}
+                disabled={!onParticipantLongPress || p.isSelf}
+                onLongPress={onParticipantLongPress && !p.isSelf
+                  ? () => onParticipantLongPress(p)
+                  : undefined}
+                delayLongPress={350}
+              >
+                <CallAvatar uri={p.avatar} name={p.name} id={p.id} size={size} />
+                <Text style={[styles.name, compact && styles.nameCompact, { color: onBg }]} numberOfLines={1}>
+                  {p.name || 'Unknown'}
+                </Text>
+                {/* Public "@handle" under the name. useCallRoster nulls it out
+                    when it would only repeat the name above, so this line never
+                    shows the same identity twice. */}
+                {showHandle && p.handle ? (
+                  <Text style={[styles.handle, { color: onBgSoft }]} numberOfLines={1}>
+                    {p.handle}
+                  </Text>
+                ) : null}
+                {/* Your own tile is already named "You" — a second "You" status
+                    line under it is noise. */}
+                {tiny || p.isSelf ? null : (
+                  <Text
+                    style={[
+                      styles.status,
+                      compact && styles.statusCompact,
+                      { color: onBgSoft },
+                      p.joined && !p.isSelf && styles.statusActive,
+                    ]}
+                    numberOfLines={1}
+                  >
+                    {statusLabel(p, ringing)}
+                  </Text>
+                )}
+
+                {/* Muted. Your own state comes from the local toggle; a remote
+                    member's comes from the server roster (`audioEnabled`), which
+                    the backend broadcasts for group calls and conferences alike.
+                    A member whose roster entry predates the flag is `undefined`,
+                    never false, so an unknown state never shows a false badge. */}
+                {(p.isSelf ? micOn === false : p.audioEnabled === false) ? (
+                  <View style={styles.micBadge}>
+                    <Ionicons name="mic-off" size={13} color="#fff" />
+                  </View>
+                ) : null}
+              </TouchableOpacity>
+            </View>
+          );
+        })}
+      </View>
+    );
+  };
 
   return (
     <View style={styles.grid} onLayout={onGridLayout}>
-      {shown.map((p, i) => {
-        // Only a LIVE participant can be the speaker — a stale relay for someone
-        // who already left must not light their tile up.
-        const speaking = !p.isSelf && p.joined && !p.left
-          && String(p.id) === String(activeSpeakerId);
-        const showPlus = layout.extra > 0 && layout.isLast(i);
-        return (
-          <View key={p.id} style={[styles.cell, layout.tileStyle(i)]}>
-            <TouchableOpacity
-              style={[
-                styles.tile,
-                { backgroundColor: tileBg, borderColor: speaking ? '#00D26A' : tileBorder },
-                p.left && styles.leftDim,
-              ]}
-              activeOpacity={onParticipantLongPress && !p.isSelf ? 0.7 : 1}
-              disabled={!onParticipantLongPress || p.isSelf}
-              onLongPress={onParticipantLongPress && !p.isSelf
-                ? () => onParticipantLongPress(p)
-                : undefined}
-              delayLongPress={350}
-            >
-              <CallAvatar uri={p.avatar} name={p.name} id={p.id} size={size} />
-              <Text style={[styles.name, compact && styles.nameCompact, { color: onBg }]} numberOfLines={1}>
-                {p.name || 'Unknown'}
-              </Text>
-              {/* Public "@handle" under the name. useCallRoster nulls it out
-                  when it would only repeat the name above, so this line never
-                  shows the same identity twice. */}
-              {showHandle && p.handle ? (
-                <Text style={[styles.handle, { color: onBgSoft }]} numberOfLines={1}>
-                  {p.handle}
-                </Text>
-              ) : null}
-              {/* Your own tile is already named "You" — a second "You" status
-                  line under it is noise. */}
-              {tiny || p.isSelf ? null : (
-                <Text
-                  style={[
-                    styles.status,
-                    compact && styles.statusCompact,
-                    { color: onBgSoft },
-                    p.joined && !p.isSelf && styles.statusActive,
-                  ]}
-                  numberOfLines={1}
-                >
-                  {statusLabel(p, ringing)}
-                </Text>
-              )}
-
-              {/* Muted. Your own state comes from the local toggle; a remote
-                  member's comes from the server roster (`audioEnabled`), which
-                  the backend broadcasts for group calls and conferences alike.
-                  A member whose roster entry predates the flag is `undefined`,
-                  never false, so an unknown state never shows a false badge. */}
-              {(p.isSelf ? micOn === false : p.audioEnabled === false) ? (
-                <View style={styles.micBadge}>
-                  <Ionicons name="mic-off" size={13} color="#fff" />
-                </View>
-              ) : null}
-
-              {/* Past the ceiling the remaining people collapse onto the last
-                  tile rather than shrinking the whole grid into uselessness. */}
-              {showPlus ? (
-                <View style={styles.moreChip}>
-                  <Text style={styles.moreText}>+{layout.extra}</Text>
-                </View>
-              ) : null}
-            </TouchableOpacity>
+      {pageCount > 1 && gridSize ? (
+        <>
+          <ScrollView
+            ref={pagerRef}
+            horizontal
+            pagingEnabled
+            showsHorizontalScrollIndicator={false}
+            onMomentumScrollEnd={(e) => {
+              setPage(Math.round(e.nativeEvent.contentOffset.x / Math.max(1, pageW)));
+            }}
+          >
+            {pages.map(renderPage)}
+          </ScrollView>
+          <View style={styles.dots} pointerEvents="none">
+            {pages.map((_, i) => (
+              <View
+                key={i}
+                style={[styles.dot, { backgroundColor: i === curPage ? onBg : onBgSoft }, i !== curPage && styles.dotOff]}
+              />
+            ))}
           </View>
-        );
-      })}
+        </>
+      ) : renderPage(pages[0], 0)}
     </View>
   );
 }
@@ -186,10 +229,23 @@ export default function CallParticipantsGrid({
 const styles = StyleSheet.create({
   grid: {
     flex: 1,
+    overflow: 'hidden',
+  },
+  page: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     overflow: 'hidden',
   },
+  pageFlex: { flex: 1 },
+  dots: {
+    height: DOTS_H,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  dot: { width: 6, height: 6, borderRadius: 3 },
+  dotOff: { opacity: 0.45 },
   // 3pt of padding per cell = a 6pt visual gutter between neighbouring tiles.
   cell: { padding: 3 },
   tile: {
@@ -237,17 +293,4 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: 'rgba(0,0,0,0.45)',
   },
-  moreChip: {
-    position: 'absolute',
-    right: 8,
-    top: 8,
-    minWidth: 30,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 11,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(0,0,0,0.55)',
-  },
-  moreText: { color: '#fff', fontFamily: 'Roboto-Medium', fontSize: 13 },
 });

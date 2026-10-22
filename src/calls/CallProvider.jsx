@@ -3229,6 +3229,18 @@ export const CallProvider = ({ children }) => {
           // before ending, and fail OPEN when it can't answer: a genuinely dead
           // call is still ended by the connect watchdog and by call:ended.
           if (ack?.ended) {
+            // A GROUP ring that reached us ONLY through the media server — no
+            // app-socket call:incoming, so no signalId. The server's busy record
+            // knows nothing about this call (its own call:ring fan-out timed out
+            // or refused, e.g. stale "busy" members), so its "ended" says nothing
+            // either — while the media-server ring proves the host is live in
+            // the room. Believing it showed "Call already ended" the instant a
+            // group call was picked up. Fail OPEN: the connect / media watchdogs
+            // still end a call that is genuinely dead.
+            if (live.isGroup && !live.signalId && live.callId) {
+              if (__DEV__) console.log('[CALL][APP][accept] "ended" ack for a media-only group ring — joining the room anyway', { callId: live.callId });
+              return;
+            }
             // Only a REAL server-side conference can be cross-checked here. A
             // plain group call has no conference record (conference:state answers
             // {active:false} for it unconditionally), so asking would always come
@@ -3470,6 +3482,26 @@ export const CallProvider = ({ children }) => {
   const toggleMic = useCallback(() => {
     applyMic(!stateRef.current.micOn);
   }, [applyMic]);
+
+  // Multi-party: tell the server our OWN mic/camera state as soon as we are in
+  // the call (and again whenever the signaling id changes — e.g. a late ring
+  // adopted). The roster otherwise only learnt it from a toggle: a member who
+  // answered with the camera on and never touched the button was listed with
+  // videoEnabled false, so everyone else saw their AVATAR over a live camera.
+  const publishedMediaRef = useRef(null);
+  useEffect(() => {
+    if (state.status !== CALL_STATUS.ACTIVE || !isMultiParty(state) || !state.signalId) {
+      if (state.status === CALL_STATUS.IDLE) publishedMediaRef.current = null;
+      return;
+    }
+    if (publishedMediaRef.current === state.signalId) return;
+    publishedMediaRef.current = state.signalId;
+    conferenceMedia({
+      callId: state.signalId,
+      audioEnabled: state.micOn !== false,
+      videoEnabled: state.media === 'video' && state.cameraOn !== false,
+    }).catch(() => {});
+  }, [state.status, state.signalId, state.isGroup, state.isConference]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleCamera = useCallback(async () => {
     const snap = stateRef.current;
@@ -4024,7 +4056,7 @@ export const CallProvider = ({ children }) => {
         // end it, or it rings on with no JS state behind it. 3 = unanswered, which
         // looks like a missed ring (the caller must not learn they are blocked),
         // and no reject goes to the server for the same reason.
-        if (opts.skipNativeUi) nativeCall.dismissIncoming(payload?.callId, payload?.uuid || null, 3);
+        if (opts.skipNativeUi) nativeCall.dismissIncoming(payload?.callId, payload?.uuid || opts.voipUuid || null, 3);
         return;
       }
     }
@@ -4036,7 +4068,7 @@ export const CallProvider = ({ children }) => {
       // a CallKit ring up, end that one (busy) and tell the caller (event-driven).
       if (__DEV__) console.log('[CALL][APP] second call while ringing — not re-binding', { live: snap.signalId, incoming: payload?.callId });
       if (opts.skipNativeUi) {
-        nativeCall.dismissIncoming(payload?.callId, payload?.uuid || null, 3);
+        nativeCall.dismissIncoming(payload?.callId, payload?.uuid || opts.voipUuid || null, 3);
         rejectCallSignal({ callId: payload?.callId || null, callerId });
       }
       return;
@@ -4099,12 +4131,49 @@ export const CallProvider = ({ children }) => {
       }
       return;
     }
+    // The LATE app-socket / VoIP ring of the group call we are ALREADY in. When
+    // the server's group fan-out lags, the media-server ring gets here first and
+    // we join with no signalId; the backend's own ring for the same call can then
+    // land minutes later (seen: ~2 min). isDifferentCall() can't tell it apart
+    // without a signalId, so it was left alone — but on iOS that push had already
+    // raised a SECOND CallKit ring under its own uuid, and answering it made iOS
+    // "End & Accept": the live call was cut (typically while the user was away
+    // sharing their screen). Same host + group + we hold no (or the same)
+    // signalId → it IS this call: adopt the id, tell the server we answered, and
+    // take down only the duplicate CallKit ring.
+    if (snap.isGroup && snap.answeredAt && payload?.isGroup && payload?.callId
+      && snap.peer?.id && String(snap.peer.id) === callerId
+      && (!snap.signalId || String(snap.signalId) === String(payload.callId))
+      && (snap.status === CALL_STATUS.ACTIVE || snap.status === CALL_STATUS.INCOMING)) {
+      const sid = String(payload.callId);
+      if (__DEV__) console.log('[CALL][APP] late ring from the host of the group call we are in', { sid, callId: snap.callId });
+      // The server can also deliver a ring for an OLDER call by the same host
+      // (seen: 14 minutes late). The signaling id carries its creation time
+      // (sig_<caller>_<ms>) — only an id minted around this call's start is
+      // this call. A stale one is just a dead ring: dismissed below, never
+      // adopted (hang-up / sync would otherwise talk about the wrong call).
+      const sidMs = Number(sid.split('_').pop());
+      const freshForThisCall = !Number.isFinite(sidMs) || !snap.startedAt
+        || sidMs >= snap.startedAt - 120000;
+      if (!snap.signalId && freshForThisCall) {
+        dispatch({ type: ACT.SET_SIGNAL, signalId: sid });
+        acceptCallSignal({ callId: sid, callerId }).catch(() => {});
+        conferenceAccept({ callId: sid, operationId: payload?.operationId || payload?.inviteId || null }).catch(() => {});
+      }
+      const dupUuid = payload?.uuid || payload?.callUuid || payload?.callKitUuid || opts.voipUuid
+        || (opts.skipNativeUi ? nativeCall.knownUuidFor(sid) : null) || null;
+      const liveUuid = nativeCall.knownUuidFor(snap.callId) || nativeCall.knownUuidFor(snap.signalId);
+      if (Platform.OS === 'ios' && dupUuid && String(dupUuid).toLowerCase() !== String(liveUuid || '').toLowerCase()) {
+        nativeCall.dismissIncoming(null, dupUuid, 2);
+      }
+      return;
+    }
     if (snap.status !== CALL_STATUS.IDLE && snap.status !== CALL_STATUS.ENDED) {
       // busy. P-C-05: when a VoIP push already raised a CallKit ring for a
       // DIFFERENT call, end it (provably different callId only — a duplicate push
       // for the live call must leave it alone) and reject for the caller.
       if (opts.skipNativeUi && isDifferentCall(snap, payload?.callId)) {
-        nativeCall.dismissIncoming(payload?.callId, payload?.uuid || null, 3);
+        nativeCall.dismissIncoming(payload?.callId, payload?.uuid || opts.voipUuid || null, 3);
         rejectCallSignal({ callId: payload?.callId || null, callerId });
       }
       return;
@@ -4470,7 +4539,12 @@ export const CallProvider = ({ children }) => {
   const reconcileLiveCall = useCallback(async (source = 'unknown') => {
     const snap = stateRef.current;
     if (snap.status === CALL_STATUS.IDLE || snap.status === CALL_STATUS.ENDED) return;
-    const id = snap.signalId || snap.callId;
+    // Only the SIGNALING id is a server call record. A call that reached us
+    // through the media server alone (a group ring whose app-socket fan-out never
+    // came) has just the WebRTC id, which call:sync does not know — and it
+    // answers an unknown id with status "ended". Asking with it cut the call on
+    // the first foreground, e.g. the moment the iOS screen-share sheet closed.
+    const id = snap.signalId;
     if (!id) return;
     // A call dialled a moment ago may not have reached the server yet (the
     // ring emit is queued behind the same reconnect) — don't race our own ring.
@@ -4479,6 +4553,23 @@ export const CallProvider = ({ children }) => {
     try { ack = await syncCallState({ callId: id }); } catch (_) { return; }
     if (!ack || ack.ok === false || ack.timedOut) return; // not server truth
     if (ack.status !== 'ended') return;                    // live — leave it alone
+    // "ended" with no record behind it (never versioned, no end time, no
+    // reason) is the server not knowing the id — not proof the call is over.
+    if (!ack.version && !ack.endedAt && !ack.endReason && !ack.endedBy) return;
+    // A connected GROUP call lives in the media room, not in the 1:1 call
+    // record: a member's own ring leg can be settled ("missed", "ended") server
+    // side while the call they joined is very much alive. While anyone else is
+    // still in the room, that record says nothing — the room's own leave /
+    // callEnded events end the call.
+    {
+      const s = stateRef.current;
+      const othersLive = s.isGroup && s.status === CALL_STATUS.ACTIVE
+        && Object.values(s.participants || {}).some((p) => p && p.joined && !p.left);
+      if (othersLive) {
+        if (__DEV__) console.log('[CALL][APP] call:sync says ended, but the group room is live — ignoring', { source, id });
+        return;
+      }
+    }
     const live = stateRef.current;
     if (live.status === CALL_STATUS.IDLE || live.status === CALL_STATUS.ENDED) return;
     const ids = [live.signalId, live.callId].filter(Boolean).map(String);
@@ -4989,6 +5080,8 @@ export const CallProvider = ({ children }) => {
       expand,
       fullScreen: !!data?._fullScreen,
       skipNativeUi: !!data?._voip,
+      // The CallKit uuid the AppDelegate already rang this push under.
+      voipUuid: data?._voip ? (data?.uuid || null) : null,
     });
   }, [onSignalIncoming, mapPushToIncoming, myId, pullStillRingingInvites]);
 

@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  View, Text, Pressable, StyleSheet, Animated,
+  View, Text, Pressable, StyleSheet, Animated, ScrollView, FlatList, useWindowDimensions,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -10,9 +10,12 @@ import * as registry from './streamRegistry';
 import CallAvatar from '../components/CallAvatar';
 import useDraggablePip from '../components/useDraggablePip';
 import useCallRoster from '../useCallRoster';
-import { toggleChrome } from '../screens/callChromeStore';
+import { useCall } from '../useCall';
 import {
-  gridLayout, tileBox, fitAvatar, MAX_VIDEO_TILES,
+  toggleChrome, setChromeVisible, useChromeVisible, setStageFocused,
+} from '../screens/callChromeStore';
+import {
+  gridLayout, tileBox, fitAvatar, pageTiles, MAX_VIDEO_TILES,
 } from '../callGridLayout';
 
 /**
@@ -29,9 +32,10 @@ import {
  *    OWN tile is part of the grid, not a floating PiP, so two people on a group
  *    call sit one ABOVE the other rather than one-in-a-corner-of-the-other.
  *    Geometry is shared with the voice roster via src/calls/callGridLayout.js:
- *    2 = stacked halves, 3 = the odd tile stretches its row, 4-6 = grid, and
- *    the overflow collapses into a "+N" chip. Every participant gets a tile
- *    whether or not they have video — no camera just means an avatar tile.
+ *    2 = stacked halves, 3 = the odd tile stretches its row, 4-8 = grid, and
+ *    more people page sideways (up to 32). Tap a tile to spotlight it. Every
+ *    participant gets a tile whether or not they have video — no camera just
+ *    means an avatar tile.
  *  - audio-only 1:1 (no video tracks anywhere) → renders nothing; CallOverlay's
  *    existing avatar UI is the whole screen, exactly like today.
  *
@@ -73,11 +77,19 @@ function LocalCamOffCard({ big }) {
   );
 }
 
-// Peer camera off — their circular profile photo centered on a dark card.
+// Peer camera off — their circular profile photo centered on a dark card;
+// full-size, it also says WHO it is and why there is no picture (WhatsApp).
 function RemoteCamOffCard({ peer, big }) {
   return (
     <View style={styles.camOffCard}>
       <CallAvatar uri={peer?.avatar} name={peer?.name} id={peer?.id} size={big ? 150 : 52} />
+      {big && peer?.name ? <Text style={styles.camOffName} numberOfLines={1}>{peer.name}</Text> : null}
+      {big ? (
+        <View style={styles.camOffRow}>
+          <Ionicons name="videocam-off" size={15} color="rgba(255,255,255,0.7)" />
+          <Text style={styles.camOffSub}>Camera off</Text>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -108,10 +120,96 @@ const G_STATUS_H = 10 + 16;
 // itself to sit BETWEEN them. Keep these in step with CallOverlay's
 // videoTopBar / videoControls padding.
 const TOP_BAR_H = 60;   // insets.top + 8 padding + 38 button + 14 padding
-const CONTROLS_H = 94;  // 16 padding + 56 button + 22 padding
+const CONTROLS_H = 112; // the control pill (padding + 56 button) + 22 bottom padding + a gap
+// The 1:1 self / share tiles are kept below the call's top bar.
+const PIP_TOP_RESERVE = TOP_BAR_H + 10;
+
+// Spotlight filmstrip: the people who are not the big tile, in a row above the
+// controls (Zoom / Meet speaker view).
+const STRIP_TILE_W = 88;
+const STRIP_TILE_H = 116;
+const STRIP_GAP = 6;
+const STRIP_H = STRIP_TILE_H + 12;
+// Page dots under a multi-page gallery.
+const DOTS_H = 16;
 
 /**
- * The GROUP / CONFERENCE participant grid.
+ * One participant tile, used by the gallery cells, the spotlight (big) tile and
+ * the filmstrip. `live` = this tile may mount its RTCView — off-screen gallery
+ * pages pass false so a 32-person call never decodes 32 videos at once.
+ */
+function GroupTile({
+  t, RTCView, live = true, avatarSize, variant = 'grid', onPress, children,
+}) {
+  const strip = variant === 'strip';
+  const big = variant === 'focus';
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={!onPress}
+      style={[
+        styles.gTile,
+        strip && styles.gStripTile,
+        big && styles.gFocusTile,
+        t.dim && styles.gDim,
+        t.speaking && styles.gSpeaking,
+      ]}
+    >
+      {t.selfShare ? (
+        <View style={styles.gPlaceholder}>
+          <View style={[styles.camOffBadge, big && styles.camOffBadgeBig]}>
+            <Ionicons name="phone-portrait-outline" size={big ? 40 : 22} color="rgba(255,255,255,0.9)" />
+          </View>
+          {strip ? null : <Text style={styles.gStatus}>You're sharing your screen</Text>}
+        </View>
+      ) : t.stream && live ? (
+        <RTCView
+          // Keyed on the TRACK: a replaceTrack/rejoin keeps the same
+          // stream URL, and a stale key would keep painting a dead track.
+          key={`${variant}:${t.key}:${videoTrackId(t.stream)}`}
+          streamURL={t.stream.toURL()}
+          style={styles.gFill}
+          // A shared screen must never be cropped to fill the tile.
+          objectFit={t.isScreen ? 'contain' : 'cover'}
+          zOrder={strip ? 1 : 0}
+          mirror={!!t.mirror}
+        />
+      ) : (
+        <View style={[styles.gPlaceholder, strip && styles.gPlaceholderStrip]}>
+          {t.isSelf && t.camOff ? (
+            <View style={styles.camOffBadge}>
+              <Ionicons name="videocam-off" size={22} color="rgba(255,255,255,0.9)" />
+            </View>
+          ) : (
+            <CallAvatar uri={t.avatar} name={t.name} id={t.id} size={avatarSize} />
+          )}
+          {t.status && !strip ? <Text style={styles.gStatus}>{t.status}</Text> : null}
+        </View>
+      )}
+
+      {/* The RTCView is a native view that takes the touch itself on iOS —
+          the shield keeps the tap on the Pressable (see TouchShield). */}
+      {onPress ? <TouchShield /> : null}
+
+      <View style={[styles.gNameChip, strip && styles.gNameChipStrip]} pointerEvents="none">
+        <Text style={[styles.gNameText, strip && styles.gNameTextStrip]} numberOfLines={1}>{t.name}</Text>
+        {t.handle && !strip ? (
+          <Text style={styles.gHandleText} numberOfLines={1}>{t.handle}</Text>
+        ) : null}
+      </View>
+
+      {t.muted ? (
+        <View style={[styles.gMicBadge, strip && styles.gMicBadgeStrip]} pointerEvents="none">
+          <Ionicons name="mic-off" size={strip ? 11 : 13} color="#fff" />
+        </View>
+      ) : null}
+      {children}
+    </Pressable>
+  );
+}
+
+/**
+ * The GROUP / CONFERENCE participant stage.
  *
  * Split out as its own component on purpose: it owns the contact-directory
  * lookup (useCallRoster), and NativeVideoStage stays mounted for the whole app
@@ -122,26 +220,45 @@ const CONTROLS_H = 94;  // 16 padding + 56 button + 22 padding
  *  • you (always first, mirrored, "You"),
  *  • each roster member — their live feed if they have one, otherwise their
  *    avatar with "Ringing…"/"Connecting…"/"Left",
- *  • any screen share, as an extra tile (contain, not cover — a cropped
- *    shared screen is useless).
+ *  • every screen share, as an extra tile (contain, not cover — a cropped
+ *    shared screen is useless), and "You're sharing your screen" while you are.
  *
- * Tiles are ORDERED so the limited slots go to people you can actually see:
- * live video first, then joined, then still-ringing. Past MAX_VIDEO_TILES the
- * remainder collapses into a "+N" chip on the last tile instead of shrinking
- * every tile into uselessness.
+ * Two views (Zoom / WhatsApp):
+ *  • GALLERY — the grid. Up to MAX_VIDEO_TILES per page, laid out by
+ *    callGridLayout so it re-flows as people join and leave (2 stacked, 3 with
+ *    a stretched row, 2x2, 2x3, 2x4); more people page sideways, with dots.
+ *  • SPOTLIGHT — tap any tile and it fills the stage; everyone else moves to a
+ *    filmstrip above the controls (tap one to spotlight them instead, the grid
+ *    button goes back). A NEW remote screen share is spotlighted on its own,
+ *    and the view returns to the gallery when the spotlighted person leaves or
+ *    the share stops.
+ *
+ * Tiles are ORDERED so the first page goes to people you can actually see:
+ * shares, live video, then joined, then still-ringing.
  */
 function CallGroupGrid({
   snap, RTCView, participants, rosterConnectedOnly,
   selfId, selfName, selfAvatar, cameraOn, micOn, activeSpeakerId, tapToToggle,
 }) {
   const roster = useCallRoster(participants, { connectedOnly: rosterConnectedOnly });
+  const { call } = useCall();
   const insets = useSafeAreaInsets();
-  const [gridSize, setGridSize] = useState(null);
-  const onGridLayout = (e) => {
+  const { width: winW, height: winH } = useWindowDimensions();
+  const chromeShown = useChromeVisible();
+  const [stageSize, setStageSize] = useState(null);
+  const [page, setPage] = useState(0);
+  const [focusKey, setFocusKey] = useState(null);
+  const pagerRef = useRef(null);
+  const seenShares = useRef(new Set());
+  const onStageLayout = (e) => {
     const { width, height } = e.nativeEvent.layout;
-    setGridSize((prev) => (prev && prev.width === width && prev.height === height
+    setStageSize((prev) => (prev && prev.width === width && prev.height === height
       ? prev : { width, height }));
   };
+  const stageW = stageSize?.width || winW;
+  const stageH = stageSize?.height || winH;
+  // The minimized PiP draws this same stage, tiny, under its own tap target.
+  const interactive = !!tapToToggle;
 
   const local = snap.local;
   const localOff = cameraOn === false;
@@ -176,7 +293,7 @@ function CallGroupGrid({
       id: p.id,
       name: p.name || 'Member',
       // Resolved by useCallRoster, and already null when it would just repeat
-      // the name — see the name chip below.
+      // the name — see the name chip.
       handle: p.handle || null,
       avatar: p.avatar,
       stream: camOn && r && r.hasVideo ? r.stream : null,
@@ -195,14 +312,13 @@ function CallGroupGrid({
     if (seen.has(pid) || (self && pid === self) || !r.hasVideo) return;
     others.push({ key: `x:${pid}`, id: pid, name: 'Member', stream: r.stream, joined: true });
   });
-  // Live video wins the limited slots, then people who are actually in the
-  // call, then whoever is still ringing.
+  // Live video wins the first page, then people who are actually in the call,
+  // then whoever is still ringing.
   others.sort((a, b) => (Number(!!b.stream) - Number(!!a.stream))
     || (Number(!!b.joined) - Number(!!a.joined)));
 
   // A shared screen is what everyone is looking AT, so it sits right after your
-  // own tile — never sorted down among the faces, and never the tile that the
-  // "+N" truncation eats.
+  // own tile — never sorted down among the faces.
   const shares = screens.map((r) => {
     const owner = roster?.[r.peerId];
     return {
@@ -214,6 +330,11 @@ function CallGroupGrid({
       joined: true,
     };
   });
+  // Your own share: the people watching get the screen; you get a plain card
+  // (a live preview of your own screen would just mirror itself).
+  if (call?.screenSharing) {
+    shares.unshift({ key: 'self#screen', id: selfId, name: 'You · screen', selfShare: true, joined: true });
+  }
 
   const tiles = [{
     key: 'self',
@@ -227,83 +348,157 @@ function CallGroupGrid({
     isSelf: true,
   }, ...shares, ...others];
 
-  const layout = gridLayout(tiles.length, MAX_VIDEO_TILES);
-  const shown = tiles.slice(0, layout.count);
+  // ---- spotlight bookkeeping ----
+  const focused = focusKey ? tiles.find((t) => t.key === focusKey) || null : null;
+  const remoteShareKeys = screens.map((r) => r.key).join('|');
+  useEffect(() => {
+    const cur = remoteShareKeys ? remoteShareKeys.split('|') : [];
+    const fresh = cur.find((k) => !seenShares.current.has(k));
+    // Forget ended shares, so the same person sharing AGAIN is spotlighted again.
+    seenShares.current = new Set(cur);
+    if (fresh) setFocusKey(fresh);
+  }, [remoteShareKeys]);
+  // The spotlighted person left / the share stopped → back to the gallery.
+  useEffect(() => {
+    if (focusKey && !focused) setFocusKey(null);
+  }, [focusKey, focused]);
+  const spotlight = !!focused;
+  useEffect(() => { setStageFocused(spotlight && interactive); }, [spotlight, interactive]);
+  useEffect(() => () => setStageFocused(false), []);
+
+  const pages = pageTiles(tiles, MAX_VIDEO_TILES);
+  const pageCount = pages.length;
+  const curPage = Math.min(page, pageCount - 1);
+  // People left and the last page vanished — slide back onto a real page.
+  useEffect(() => {
+    if (page > pageCount - 1) {
+      setPage(pageCount - 1);
+      pagerRef.current?.scrollTo?.({ x: (pageCount - 1) * stageW, animated: false });
+    }
+  }, [page, pageCount, stageW]);
+
+  const focusTile = (key) => {
+    if (!interactive) return;
+    setFocusKey(key);
+    setChromeVisible(true);
+  };
+
+  // ---- SPOTLIGHT ----
+  if (focused) {
+    // The big tile grows into the chrome's space while the chrome is hidden.
+    const top = chromeShown || !interactive ? insets.top + TOP_BAR_H : insets.top;
+    const bottom = chromeShown || !interactive ? insets.bottom + CONTROLS_H : insets.bottom + 6;
+    const rest = tiles.filter((t) => t.key !== focused.key);
+    const bigH = stageH - top - bottom - (rest.length ? STRIP_H : 0);
+    const bigAvatar = Math.round(Math.max(56, Math.min(150, stageW * 0.36, bigH * 0.4)));
+    return (
+      <View style={styles.stage} pointerEvents="box-none" onLayout={onStageLayout}>
+        <View style={[styles.gFocusArea, { top, height: Math.max(0, bigH) }]}>
+          <GroupTile
+            t={focused}
+            RTCView={RTCView}
+            variant="focus"
+            avatarSize={bigAvatar}
+            onPress={interactive ? toggleChrome : undefined}
+          >
+            {interactive ? (
+              <Pressable
+                onPress={() => setFocusKey(null)}
+                style={styles.gGridBtn}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Ionicons name="grid-outline" size={18} color="#fff" />
+              </Pressable>
+            ) : null}
+          </GroupTile>
+        </View>
+        {rest.length ? (
+          <FlatList
+            style={[styles.gStrip, { bottom }]}
+            contentContainerStyle={styles.gStripContent}
+            data={rest}
+            horizontal
+            keyExtractor={(t) => t.key}
+            showsHorizontalScrollIndicator={false}
+            initialNumToRender={6}
+            windowSize={3}
+            ItemSeparatorComponent={StripGap}
+            renderItem={({ item }) => (
+              <GroupTile
+                t={item}
+                RTCView={RTCView}
+                variant="strip"
+                avatarSize={44}
+                onPress={interactive ? () => focusTile(item.key) : undefined}
+              />
+            )}
+          />
+        ) : null}
+      </View>
+    );
+  }
+
+  // ---- GALLERY ----
   const padTop = insets.top + TOP_BAR_H;
-  const padBottom = insets.bottom + CONTROLS_H;
-  const box = gridSize
-    ? tileBox(layout, gridSize.width, gridSize.height - padTop - padBottom, G_TILE_GUTTER)
-    : null;
-  const anyStatus = shown.some((t) => !t.stream && t.status);
-  const avatarSize = fitAvatar(box, G_CHIP_H + (anyStatus ? G_STATUS_H : 0) + 12, groupAvatarFor(layout.count))
-    || groupAvatarFor(layout.count);
+  const padBottom = insets.bottom + CONTROLS_H + (pageCount > 1 ? DOTS_H : 0);
+  const gridH = stageH - padTop - padBottom;
 
-  return (
-    <View style={styles.stage} pointerEvents="box-none">
-      {tapToToggle ? <TapLayer /> : null}
-      <View
-        style={[styles.gGrid, { paddingTop: padTop, paddingBottom: padBottom }]}
-        pointerEvents="none"
-        onLayout={onGridLayout}
-      >
-        {shown.map((t, i) => (
+  const renderPage = (pg, pi) => {
+    const layout = gridLayout(pg.length, MAX_VIDEO_TILES);
+    const box = tileBox(layout, stageW, gridH, G_TILE_GUTTER);
+    const anyStatus = pg.some((t) => !t.stream && t.status);
+    const avatarSize = fitAvatar(box, G_CHIP_H + (anyStatus ? G_STATUS_H : 0) + 12, groupAvatarFor(layout.count))
+      || groupAvatarFor(layout.count);
+    // Only the page on screen and its neighbours keep live video.
+    const live = Math.abs(pi - curPage) <= 1;
+    return (
+      <View key={`page:${pi}`} style={[styles.gPage, { width: stageW, height: gridH }]}>
+        {pg.map((t, i) => (
           <View key={t.key} style={[styles.gCell, layout.tileStyle(i)]}>
-            <View style={[
-              styles.gTile,
-              t.dim && styles.gDim,
-              t.speaking && styles.gSpeaking,
-            ]}>
-              {t.stream ? (
-                <RTCView
-                  // Keyed on the TRACK: a replaceTrack/rejoin keeps the same
-                  // stream URL, and a stale key would keep painting a dead track.
-                  key={`${t.key}:${videoTrackId(t.stream)}`}
-                  streamURL={t.stream.toURL()}
-                  style={styles.gFill}
-                  // A shared screen must never be cropped to fill the tile.
-                  objectFit={t.isScreen ? 'contain' : 'cover'}
-                  zOrder={0}
-                  mirror={!!t.mirror}
-                />
-              ) : (
-                <View style={styles.gPlaceholder}>
-                  {t.isSelf && t.camOff ? (
-                    <View style={styles.camOffBadge}>
-                      <Ionicons name="videocam-off" size={22} color="rgba(255,255,255,0.9)" />
-                    </View>
-                  ) : (
-                    <CallAvatar uri={t.avatar} name={t.name} id={t.id} size={avatarSize} />
-                  )}
-                  {t.status ? <Text style={styles.gStatus}>{t.status}</Text> : null}
-                </View>
-              )}
-
-              <View style={styles.gNameChip}>
-                <Text style={styles.gNameText} numberOfLines={1}>{t.name}</Text>
-                {t.handle ? (
-                  <Text style={styles.gHandleText} numberOfLines={1}>{t.handle}</Text>
-                ) : null}
-              </View>
-
-              {/* Mic state is only known for YOURSELF — the roster carries no
-                  per-member mute flag, so a remote tile never claims one. */}
-              {t.muted ? (
-                <View style={styles.gMicBadge}>
-                  <Ionicons name="mic-off" size={13} color="#fff" />
-                </View>
-              ) : null}
-
-              {layout.extra > 0 && layout.isLast(i) ? (
-                <View style={styles.gMoreChip}>
-                  <Text style={styles.gMoreText}>+{layout.extra}</Text>
-                </View>
-              ) : null}
-            </View>
+            <GroupTile
+              t={t}
+              RTCView={RTCView}
+              live={live}
+              avatarSize={avatarSize}
+              onPress={interactive ? () => focusTile(t.key) : undefined}
+            />
           </View>
         ))}
       </View>
+    );
+  };
+
+  return (
+    <View style={styles.stage} pointerEvents="box-none" onLayout={onStageLayout}>
+      {tapToToggle ? <TapLayer /> : null}
+      <View style={[styles.gPager, { top: padTop, height: gridH }]} pointerEvents={interactive ? 'box-none' : 'none'}>
+        {pageCount > 1 ? (
+          <ScrollView
+            ref={pagerRef}
+            horizontal
+            pagingEnabled
+            showsHorizontalScrollIndicator={false}
+            onMomentumScrollEnd={(e) => {
+              setPage(Math.round(e.nativeEvent.contentOffset.x / Math.max(1, stageW)));
+            }}
+          >
+            {pages.map(renderPage)}
+          </ScrollView>
+        ) : renderPage(pages[0], 0)}
+      </View>
+      {pageCount > 1 ? (
+        <View style={[styles.gDots, { top: padTop + gridH }]} pointerEvents="none">
+          {pages.map((_, i) => (
+            <View key={i} style={[styles.gDot, i === curPage && styles.gDotOn]} />
+          ))}
+        </View>
+      ) : null}
     </View>
   );
+}
+
+function StripGap() {
+  return <View style={{ width: STRIP_GAP }} />;
 }
 
 // Column-width / row-height style lookups for the split grid (see render).
@@ -329,6 +524,8 @@ export default function NativeVideoStage({
   tapToToggle = false,
 }) {
   const [snap, setSnap] = useState(registry.getSnapshot);
+  const { call, toggleScreenShare } = useCall();
+  const insets = useSafeAreaInsets();
   // 1:1 only: true = local feed full-bleed, remote in the small tile.
   const [swapped, setSwapped] = useState(false);
 
@@ -357,10 +554,12 @@ export default function NativeVideoStage({
   // cover the least of the video / shared screen.
   const { pan, panHandlers } = useDraggablePip({
     width: PIP_W, height: PIP_H, enabled: true, initial: 'top-right', snapToEdge: false,
+    topReserve: PIP_TOP_RESERVE, bottomReserve: CONTROLS_H,
   });
   // The sharer's camera tile during a 1:1 screen share — movable the same way.
   const { pan: camPan, panHandlers: camPanHandlers } = useDraggablePip({
     width: PIP_W, height: PIP_H, enabled: true, initial: 'top-left', snapToEdge: false,
+    topReserve: PIP_TOP_RESERVE, bottomReserve: CONTROLS_H,
   });
 
   const webrtc = getWebrtc();
@@ -429,6 +628,19 @@ export default function NativeVideoStage({
   );
   const selfTile = showLocal ? renderSelfTile(null) : null;
 
+  // WE are sharing (1:1): the person watching gets the screen, and without
+  // this the sharer's own call looked exactly like an ordinary video call.
+  // Left-aligned under the top bar so it never sits under the self tile.
+  const sharingPill = call?.screenSharing && tapToToggle ? (
+    <View style={[styles.sharePill, { top: insets.top + TOP_BAR_H + 8 }]} pointerEvents="box-none">
+      <Ionicons name="phone-portrait-outline" size={14} color="#fff" />
+      <Text style={styles.sharePillText}>You're sharing your screen</Text>
+      <Pressable onPress={toggleScreenShare} hitSlop={{ top: 8, bottom: 8, left: 6, right: 8 }}>
+        <Text style={styles.sharePillStop}>Stop</Text>
+      </Pressable>
+    </View>
+  ) : null;
+
   // ---- 1:1 screen share (WhatsApp / Meet style) ----
   // The shared screen owns the WHOLE stage, shown whole (contain, letterboxed
   // on black) — a phone or desktop screen cropped to `cover` is unreadable.
@@ -465,6 +677,7 @@ export default function NativeVideoStage({
           </Animated.View>
         ) : null}
         {selfTile}
+        {sharingPill}
       </View>
     );
   }
@@ -521,6 +734,7 @@ export default function NativeVideoStage({
             </Pressable>
           </Animated.View>
         )}
+        {sharingPill}
       </View>
     );
   }
@@ -577,6 +791,7 @@ export default function NativeVideoStage({
           </View>
         ) : renderSelfTile(null)
       )}
+      {sharingPill}
     </View>
   );
 }
@@ -598,6 +813,20 @@ function TapLayer() {
 
 const styles = StyleSheet.create({
   tapLayer: { ...StyleSheet.absoluteFillObject },
+  sharePill: {
+    position: 'absolute',
+    left: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingLeft: 10,
+    paddingRight: 12,
+    paddingVertical: 7,
+    borderRadius: 18,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+  },
+  sharePillText: { color: '#fff', fontFamily: 'Roboto-Medium', fontSize: 13 },
+  sharePillStop: { color: '#FF5A5F', fontFamily: 'Roboto-Medium', fontSize: 13, marginLeft: 4 },
   // 1:1 screen share: the screen fills the stage on black; the sharer's camera
   // is a small fixed tile top-left (same size as the self tile).
   screenStage: { backgroundColor: '#000' },
@@ -654,11 +883,48 @@ const styles = StyleSheet.create({
     backgroundColor: '#111',
   },
   // ---- group / conference grid ----
-  gGrid: {
-    flex: 1,
+  gPager: { position: 'absolute', left: 0, right: 0 },
+  gPage: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     overflow: 'hidden',
+  },
+  gDots: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: DOTS_H,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  gDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: 'rgba(255,255,255,0.35)' },
+  gDotOn: { backgroundColor: '#fff' },
+  // Spotlight: the big tile, then the filmstrip of everyone else under it.
+  gFocusArea: { position: 'absolute', left: 4, right: 4 },
+  gFocusTile: { borderRadius: 16 },
+  gGridBtn: {
+    position: 'absolute',
+    right: 10,
+    top: 10,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  gStrip: { position: 'absolute', left: 0, right: 0, height: STRIP_H },
+  gStripContent: { paddingHorizontal: 6, paddingVertical: 6 },
+  gStripTile: { flex: 0, width: STRIP_TILE_W, height: STRIP_TILE_H, borderRadius: 12 },
+  gPlaceholderStrip: { paddingBottom: 22, gap: 0 },
+  gNameChipStrip: {
+    left: 4, bottom: 4, right: 4, maxWidth: undefined, paddingHorizontal: 5, paddingVertical: 2,
+  },
+  gNameTextStrip: { fontSize: 10 },
+  gMicBadgeStrip: {
+    right: 4, top: 4, bottom: undefined, width: 20, height: 20, borderRadius: 10,
   },
   // 2pt per cell = a 4pt visual gutter between neighbouring tiles.
   gCell: { padding: 2 },
@@ -713,16 +979,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: 'rgba(0,0,0,0.45)',
   },
-  gMoreChip: {
-    position: 'absolute',
-    right: 8,
-    top: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 11,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-  },
-  gMoreText: { color: '#fff', fontFamily: 'Roboto-Medium', fontSize: 13 },
   // Camera-off placeholder card (both tiles) — dark surface, centered content.
   camOffCard: {
     flex: 1,
@@ -746,6 +1002,15 @@ const styles = StyleSheet.create({
     height: 96,
     borderRadius: 48,
   },
+  camOffName: {
+    color: '#fff',
+    fontFamily: 'Roboto-Medium',
+    fontSize: 20,
+    marginTop: 8,
+    maxWidth: '80%',
+  },
+  camOffRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  camOffSub: { color: 'rgba(255,255,255,0.7)', fontFamily: 'Roboto-Regular', fontSize: 14 },
   camOffText: {
     color: 'rgba(255,255,255,0.85)',
     fontFamily: 'Roboto-Regular',

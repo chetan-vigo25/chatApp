@@ -432,7 +432,10 @@ export function callReducer(state, action) {
           joined: rp.status === 'CONNECTED',
           confStatus: rp.status,
           audioEnabled: rp.audioEnabled !== false,
-          videoEnabled: !!rp.videoEnabled,
+          // A roster entry WITHOUT the flag is "not reported", not "camera
+          // off" — `!!undefined` turned every such member into an avatar tile
+          // over a live camera. Keep what we knew (undefined = shown as on).
+          videoEnabled: typeof rp.videoEnabled === 'boolean' ? rp.videoEnabled : prev.videoEnabled,
         };
       });
       return {

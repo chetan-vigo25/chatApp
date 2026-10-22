@@ -15,29 +15,38 @@
  *   2      stacked full-width halves — one on top, one below
  *   3      2x2 where the odd last tile STRETCHES to the full row width
  *   4      clean 2x2
- *   5-6    2 columns x 3 rows (a 5th tile stretches its last row)
- *   7+     3 columns, up to `max`
- *   > max  truncated, and the caller draws a "+N" chip on the last tile
+ *   5-8    2 columns x 3-4 rows (an odd last tile stretches its row)
+ *   9+     3 columns, up to `max` per page
+ *   > max  the surfaces PAGE the rest (swipe left/right), see pageTiles —
+ *          a call can hold up to 32 people
+ *          (callMachine MAX_PARTICIPANTS), and every one of them gets a tile.
  *
  * The last-row stretch is the whole reason this is a function and not a
  * lookup table: without it an odd participant count leaves a dead black cell
  * in the corner of the grid.
  */
 
-// Beyond ~6 live video tiles a phone cannot render anything useful, so video
-// stops here and shows "+N". Voice tiles are just avatars (no decode cost), so
-// the roster passes a higher ceiling.
-export const MAX_VIDEO_TILES = 6;
-export const MAX_VOICE_TILES = 9;
+// Tiles per PAGE. A phone shows 8 live videos at a usable size (2 x 4, like
+// WhatsApp); the rest sit on the next page. Voice tiles are just avatars, so a
+// voice page holds a 3 x 4 grid.
+export const MAX_VIDEO_TILES = 8;
+export const MAX_VOICE_TILES = 12;
 
 // Percentages are rounded so RN never receives "33.333333333333336%".
 const pct = (parts) => `${Math.round((100 / parts) * 10000) / 10000}%`;
 
 const colsFor = (n) => {
   if (n <= 2) return 1;   // 1 = full bleed, 2 = stacked top/bottom
-  if (n <= 6) return 2;   // 2x2 / 2x3
+  if (n <= 8) return 2;   // 2x2 / 2x3 / 2x4
   return 3;
 };
+
+/** Split the ordered tile list into pages of at most `size` tiles. */
+export function pageTiles(list, size) {
+  const pages = [];
+  for (let i = 0; i < list.length; i += size) pages.push(list.slice(i, i + size));
+  return pages.length ? pages : [[]];
+}
 
 /**
  * @param {number} count  total participants to place (self included)

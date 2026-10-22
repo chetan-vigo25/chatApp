@@ -22,7 +22,27 @@ import PulsingRing from '../components/PulsingRing';
 import CallMiniBanner from '../components/CallMiniBanner';
 import AddParticipantSheet from '../components/AddParticipantSheet';
 import ConferenceAddPeopleSheet from '../components/ConferenceAddPeopleSheet';
-import { setChromeVisible, useChromeVisible } from './callChromeStore';
+import { setChromeVisible, useChromeVisible, useStageFocused } from './callChromeStore';
+
+// Soft dark fade behind the video call's top bar (WhatsApp style), so the
+// white name / timer / buttons read on any picture without a hard-edged band
+// cutting across the video. Stacked bands instead of an SVG gradient: an
+// absolutely-filled <Svg> did not stretch to its parent on Android and ended in
+// a visible line. (The control row is its own dark pill and needs no scrim.)
+// `fromTop` = darkest at the top edge.
+const SCRIM_BANDS = 16;
+const SCRIM_MAX = 0.6;
+function VideoScrim({ fromTop }) {
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      {Array.from({ length: SCRIM_BANDS }, (_, i) => {
+        const t = (i + 0.5) / SCRIM_BANDS;            // 0 = top, 1 = bottom
+        const k = fromTop ? 1 - t : t;                // 1 = darkest edge
+        return <View key={i} style={{ flex: 1, backgroundColor: `rgba(0,0,0,${(SCRIM_MAX * k * k).toFixed(3)})` }} />;
+      })}
+    </View>
+  );
+}
 
 const END_TEXT = {
   completed: 'Call ended',
@@ -125,8 +145,12 @@ export default function CallOverlay() {
   // prompt). The tap-to-toggle surface lives in NativeVideoStage, under this
   // overlay; touching the controls themselves restarts the countdown.
   const chromeShown = useChromeVisible();
+  // A group gallery keeps its chrome: the grid is already laid out between the
+  // bars. Only the spotlight view (one tile big) hides it — see setStageFocused.
+  const stageFocused = useStageFocused();
   const autoHideChrome = isVideoActive && mediaConnected && !minimized && !showAddSheet
-    && !call?.reconnecting && !call?.needsUnmuteGesture;
+    && !call?.reconnecting && !call?.needsUnmuteGesture
+    && (!isGroup || stageFocused);
   const [chromeTouch, setChromeTouch] = useState(0);
   const keepChrome = () => setChromeTouch((n) => n + 1);
   useEffect(() => {
@@ -293,7 +317,10 @@ export default function CallOverlay() {
     const n = Math.max(others.length - 1, 0);
     return n > 0 ? `${firstName} & ${n} other${n > 1 ? 's' : ''}` : firstName;
   })();
-  const groupTitle = isConference
+  // A call that came from a GROUP keeps the group's name even when the server
+  // runs it as a conference (it does for every group ring); only an ad-hoc
+  // conference (a 1:1 people were added to) has no name and lists the people.
+  const groupTitle = isConference && !call?.groupName
     ? conferenceTitle
     : (call?.groupName || (isGroup ? `Group ${isVideo ? 'video ' : ''}call` : peerDisplayName));
 
@@ -396,6 +423,7 @@ export default function CallOverlay() {
           pointerEvents={chromePointer}
           onTouchStart={keepChrome}
         >
+          <VideoScrim fromTop />
           {canMinimize ? (
             <TouchableOpacity
               onPress={minimize}
@@ -410,7 +438,7 @@ export default function CallOverlay() {
             {isGroup ? (
               <Text style={styles.videoSub}>{joined + 1} in call</Text>
             ) : timerRunning ? (
-              <CallTimer startMs={call?.connectedAt || call?.answeredAt} />
+              <CallTimer startMs={call?.connectedAt || call?.answeredAt} style={styles.videoSub} />
             ) : (
               <Text style={styles.videoSub}>{subtitle}</Text>
             )}
@@ -762,8 +790,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 14,
-    paddingBottom: 14,
-    backgroundColor: 'rgba(0,0,0,0.28)',
+    // The scrim fades out over this extra space instead of ending in a line.
+    paddingBottom: 30,
   },
   videoTitleCol: { flex: 1 },
   minBtn: {
@@ -795,8 +823,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: 'rgba(255,255,255,0.14)',
   },
-  videoName: { color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 18 },
-  videoSub: { color: 'rgba(255,255,255,0.8)', fontFamily: 'Roboto-Regular', fontSize: 13, marginTop: 2 },
+  videoName: {
+    color: '#fff', fontFamily: 'Roboto-SemiBold', fontSize: 18,
+    textShadowColor: 'rgba(0,0,0,0.45)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
+  videoSub: {
+    color: 'rgba(255,255,255,0.9)', fontFamily: 'Roboto-Regular', fontSize: 13, marginTop: 2,
+    textShadowColor: 'rgba(0,0,0,0.45)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 3,
+  },
   videoControls: {
     paddingTop: 16,
   },
