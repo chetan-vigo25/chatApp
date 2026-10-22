@@ -182,7 +182,10 @@ export function callReducer(state, action) {
         peers, media, chatId, groupId, groupName, nowMs,
       } = action;
       const list = (peers || []).filter((p) => p && p.id);
-      const isGroup = list.length > 1;
+      // Group intent is DECLARED by the dialler (startCall) — a group with one
+      // other member is still a group call (loudspeaker, grid, host). Inferring
+      // it from the list length started those on the earpiece as a 1:1.
+      const isGroup = action.isGroup === true || list.length > 1;
       return {
         ...initialCallState,
         status: CALL_STATUS.OUTGOING,

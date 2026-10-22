@@ -6,6 +6,7 @@ import { Platform, NativeModules } from 'react-native';
 // `uuid` + the crypto polyfill is the strongest option available in the build.
 import { v4 as uuidGen } from 'uuid';
 import { markCallEvent } from '../diagnostics/callDiagnostics';
+import { kv } from '../../services/kvStorage';
 
 /**
  * Native phone-call UI bridge (CallKit on iOS / ConnectionService on Android)
@@ -227,6 +228,13 @@ export const setup = async () => {
       ios: {
         appName: 'TalksTry',
         supportsVideo: true,
+        // Calls are reported with a PHONE-NUMBER handle when the peer shares
+        // their number (iOS then matches the saved contact in Recents — name,
+        // photo, contact card) and a GENERIC one otherwise (groups, hidden
+        // numbers). Without both here the provider only accepted phone
+        // numbers, and a generic Recents entry could not be called back.
+        handleType: ['generic', 'number'],
+        includesCallsInRecents: true,
         maximumCallGroups: '1',
         // ONE call at a time: with >1, a second incoming ring offers iOS's
         // "Hold & Accept" — a hold/second-line flow the WebView engine cannot
@@ -263,7 +271,7 @@ export const setup = async () => {
 // report under a NEW uuid while another incoming is live puts up a second
 // CallKit call (the "two banners / ghost call" failure). Single-call app →
 // one live incoming CallKit call at a time.
-export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
+export const displayIncomingCall = (callId, handle, name, hasVideo = false, handleType = 'generic') => {
   if (!isAvailable()) return;
   try {
     const u = uuidForCall(callId);
@@ -273,7 +281,7 @@ export const displayIncomingCall = (callId, handle, name, hasVideo = false) => {
     if (displayedIncoming.size > 0) return; // another incoming is live — never stack a 2nd CallKit call
     clearSelfEnded(u);
     displayedIncoming.set(u, now);
-    RNCallKeep.displayIncomingCall(u, String(handle || name || 'call'), name || 'Incoming call', 'generic', !!hasVideo);
+    RNCallKeep.displayIncomingCall(u, String(handle || name || 'call'), name || 'Incoming call', handleType || 'generic', !!hasVideo);
   } catch (_) { /* no-op */ }
 };
 
@@ -339,7 +347,7 @@ const wireStartAction = () => {
  * sits in an unfulfilled "connecting" state nor loses its connectedAt. iOS only; idempotent per callId (startCall on an existing
  * uuid is a no-op on the native side); safe no-op when CallKit is unavailable.
  */
-export const reportOutgoingConnected = (callId, handle, name, hasVideo = false) => {
+export const reportOutgoingConnected = (callId, handle, name, hasVideo = false, handleType = 'generic') => {
   if (!isAvailable() || !REPORT_OUTGOING_CONNECTED_TO_CALLKIT || Platform.OS !== 'ios') return;
   const key = String(callId || '');
   if (!key || outgoingReported.has(key)) return; // once per call — repeated stream events no-op
@@ -352,7 +360,7 @@ export const reportOutgoingConnected = (callId, handle, name, hasVideo = false) 
       uuid,
       timer: setTimeout(() => reportConnectedNow(key2), START_ACTION_TIMEOUT_MS),
     });
-    RNCallKeep.startCall(uuid, String(handle || name || 'call'), name || 'Call', 'generic', !!hasVideo);
+    RNCallKeep.startCall(uuid, String(handle || name || 'call'), name || 'Call', handleType || 'generic', !!hasVideo);
     // NO setCurrentCallActive here: it is `if (isIOS) return;` inside the
     // package — a pure no-op on iOS. An outgoing CallKit call goes active on
     // connectedAt being reported, which is exactly what the handshake above does.
@@ -485,6 +493,65 @@ export const resetAll = () => {
  *   onAudioSessionActivated(), onAudioSessionDeactivated()
  * Returns an unsubscribe function. Safe no-op when the native module is absent.
  */
+// ── iOS Recents: who a CallKit entry calls back ─────────────────────────────
+// Every call CallKit knows lands in the Phone app's Recents. Tapping one hands
+// the app the entry's HANDLE (via continueUserActivity → RNCallKeep →
+// didReceiveStartCallAction). The handle is what we reported, so we keep a
+// small local map handle → call target and dial that.
+//
+// Handle choice: the peer's phone number when they share it (iOS matches the
+// saved contact: name, photo and the full contact card behind the (i)); a
+// generic label otherwise — the group name, or the @handle / name of a peer
+// who hides their number (their number must never reach CallKit).
+const RECENTS_KEY = 'callkit_recents_v1';
+const RECENTS_MAX = 300;
+const digitsOf = (v) => String(v || '').replace(/[^\d]/g, '');
+const looksLikeNumber = (v) => /^\+?[\d\s()-]{7,}$/.test(String(v || '').trim());
+const recentKey = (handle) => (looksLikeNumber(handle)
+  ? `n:${digitsOf(handle).slice(-10)}`
+  : `g:${String(handle || '').trim().toLowerCase()}`);
+
+export const callKitIdentity = ({ peer, isGroup = false, groupName = null, hidesContact = false } = {}) => {
+  if (isGroup) {
+    const name = groupName || 'Group call';
+    return { handle: name, handleType: 'generic', name };
+  }
+  const name = (peer && peer.name) || 'TalksTry';
+  const mobile = !hidesContact && peer ? (peer.mobile || peer.mobileNumber || peer.phone || null) : null;
+  if (mobile && digitsOf(mobile).length >= 7) {
+    const m = String(mobile).trim();
+    return { handle: m.startsWith('+') ? m : digitsOf(m), handleType: 'number', name };
+  }
+  const user = peer && (peer.userName || peer.username);
+  return { handle: user ? `@${String(user).replace(/^@/, '')}` : name, handleType: 'generic', name };
+};
+
+const readRecents = () => {
+  try { return JSON.parse(kv.getStringSync(RECENTS_KEY) || '{}') || {}; } catch (_) { return {}; }
+};
+
+/** Remember what a Recents entry under any of `handles` should call back. */
+export const rememberRecentTarget = (handles, target) => {
+  if (!target) return;
+  const map = readRecents();
+  const now = Date.now();
+  (Array.isArray(handles) ? handles : [handles]).filter(Boolean).forEach((h) => {
+    map[recentKey(h)] = { ...target, ts: now };
+  });
+  const keys = Object.keys(map);
+  if (keys.length > RECENTS_MAX) {
+    keys.sort((a, b) => (map[a].ts || 0) - (map[b].ts || 0))
+      .slice(0, keys.length - RECENTS_MAX)
+      .forEach((k) => { delete map[k]; });
+  }
+  kv.setItem(RECENTS_KEY, JSON.stringify(map)).catch(() => {});
+};
+
+export const resolveRecentTarget = (handle) => {
+  if (!handle) return null;
+  return readRecents()[recentKey(handle)] || null;
+};
+
 export const registerEvents = (handlers = {}) => {
   if (!isAvailable()) return () => {};
   const answer = ({ callUUID }) => {
@@ -534,6 +601,15 @@ export const registerEvents = (handlers = {}) => {
   // the WKWebView engine can legally start in the background. If we don't re-assert
   // our play-and-record session here, a CallKit-answered call can connect SILENT
   // (no in/out audio) until the app is foregrounded. These events carry no callUUID.
+  // A tap on a TalksTry entry in the Phone app's Recents (or "call X on
+  // TalksTry" from Siri). It carries a HANDLE and no callUUID — the start
+  // action of a call WE place carries a callUUID and is handled elsewhere.
+  let recentsSub = null;
+  const startFromRecents = (data = {}) => {
+    if (!data || data.callUUID || !data.handle) return;
+    markCallEvent('callkit:recents', { handle: String(data.handle), video: !!data.video });
+    if (handlers.onStartFromRecents) handlers.onStartFromRecents({ handle: String(data.handle), video: !!data.video });
+  };
   const audioOn = () => {
     markCallEvent('callkit:audioOn');
     return handlers.onAudioSessionActivated && handlers.onAudioSessionActivated();
@@ -565,8 +641,12 @@ export const registerEvents = (handlers = {}) => {
         else if (event.name === 'RNCallKeepDidPerformSetMutedCallAction') mute(data);
         else if (event.name === 'RNCallKeepDidActivateAudioSession') audioOn();
         else if (event.name === 'RNCallKeepDidDeactivateAudioSession') audioOff();
+        else if (event.name === 'RNCallKeepDidReceiveStartCallAction') startFromRecents(data);
       });
     });
+    // Kept as a handle and removed ON ITS OWN below: removeEventListener(type)
+    // drops every listener of the type, including wireStartAction's.
+    recentsSub = RNCallKeep.addEventListener('didReceiveStartCallAction', startFromRecents);
     RNCallKeep.addEventListener('answerCall', answer);
     RNCallKeep.addEventListener('endCall', end);
     RNCallKeep.addEventListener('didPerformSetMutedCallAction', mute);
@@ -589,6 +669,7 @@ export const registerEvents = (handlers = {}) => {
   return () => {
     try {
       RNCallKeep.removeEventListener('didLoadWithEvents');
+      if (recentsSub && typeof recentsSub.remove === 'function') recentsSub.remove();
       RNCallKeep.removeEventListener('answerCall');
       RNCallKeep.removeEventListener('endCall');
       RNCallKeep.removeEventListener('didPerformSetMutedCallAction');
@@ -603,6 +684,9 @@ export const registerEvents = (handlers = {}) => {
 export default {
   isAvailable,
   setup,
+  callKitIdentity,
+  rememberRecentTarget,
+  resolveRecentTarget,
   uuidForCall,
   registerCallUuid,
   displayIncomingCall,

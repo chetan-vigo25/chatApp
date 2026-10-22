@@ -97,6 +97,9 @@ export const enableCallKitManualAudio = () => {
   return true;
 };
 
+/** True while CallKit's call audio session is live (activated, not yet deactivated). */
+export const isCallKitAudioActive = () => !!manualAudio.callKitActive;
+
 /** CallKit activated the session: (re)start the audio unit against it. */
 export const manualAudioActivated = () => {
   manualAudio.callKitActive = true;

@@ -109,6 +109,24 @@ export const recordCallFailure = (reason, { context, engine } = {}) => {
   return writeChain;
 };
 
+// The LAST call's whole trace, overwritten at every call end — release builds
+// have no debugger, so this is how a field call is read back afterwards (iOS:
+// `xcrun devicectl device copy from --domain-type appDataContainer
+// --domain-identifier com.chat.baatCheet --source Documents/last-call-trace.json`).
+const LAST_TRACE_FILE = 'last-call-trace.json';
+export const saveLastCallTrace = (meta = {}) => {
+  const dir = FileSystem.documentDirectory;
+  if (!dir) return Promise.resolve(false);
+  const body = JSON.stringify({
+    at: new Date().toISOString(),
+    platform: Platform.OS,
+    osVersion: String(Platform.Version),
+    meta: compact(meta, 4000),
+    trace: trace.map((e) => ({ ...e, ago: Date.now() - e.t })),
+  });
+  return FileSystem.writeAsStringAsync(`${dir}${LAST_TRACE_FILE}`, body).then(() => true, () => false);
+};
+
 /** The in-memory call event trace (oldest first) — for live debugging. */
 export const getCallTrace = () => trace.map((e) => ({ ...e, ago: Date.now() - e.t }));
 
@@ -129,4 +147,4 @@ export const clearCallFailures = async () => {
 // process a push cold-started before any debugger attached.
 if (__DEV__) globalThis.__callTrace = getCallTrace;
 
-export default { markCallEvent, recordCallFailure, readCallFailures, clearCallFailures, getCallTrace };
+export default { markCallEvent, recordCallFailure, readCallFailures, clearCallFailures, getCallTrace, saveLastCallTrace };

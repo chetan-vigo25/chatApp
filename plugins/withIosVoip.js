@@ -246,6 +246,10 @@ const PUSHKIT_METHODS = `
 
   public func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
     let dict = payload.dictionaryPayload
+    // When this push reached the phone (ms). JS reads it back (RN Settings =
+    // NSUserDefaults) to split a slow call pickup into "push arrived late"
+    // vs "app took long to start" — see CallProvider 'push:timing'.
+    UserDefaults.standard.set(Date().timeIntervalSince1970 * 1000, forKey: "tt_lastVoipPushAt")
     // EVERY path below reports a call to CallKit before completion() runs.
     AppDelegate.ensureCallKitProvider()
 
@@ -365,6 +369,16 @@ const withVoipAppDelegate = (config) =>
       );
     }
  
+    // d) iOS Recents / Siri call-back: hand the INStartCallIntent activity to
+    //    RNCallKeep (→ didReceiveStartCallAction { handle, video } in JS) before
+    //    the template's Universal Links handling.
+    if (!src.includes('RNCallKeep.application(application, continue:')) {
+      src = src.replace(
+        /(continue userActivity: NSUserActivity,\s*restorationHandler: @escaping \(\[UIUserActivityRestoring\]\?\) -> Void\s*\) -> Bool \{\n)/,
+        `$1    if RNCallKeep.application(application, continue: userActivity, restorationHandler: { objs in\n      restorationHandler(objs as? [UIUserActivityRestoring])\n    }) {\n      return true\n    }\n`,
+      );
+    }
+
     cfg.modResults.contents = src;
     return cfg;
   });

@@ -19,11 +19,13 @@ import { CallContext } from './CallContext';
 import CallEngineWebView from './engine/CallEngineWebView';
 import { isNativeCallEngine } from './engineSelector';
 import nativeEngine from './native-engine/NativeCallEngine';
-import { markCallEvent, recordCallFailure, readCallFailures } from './diagnostics/callDiagnostics';
+import {
+  markCallEvent, recordCallFailure, readCallFailures, saveLastCallTrace,
+} from './diagnostics/callDiagnostics';
 import {
   audioSessionDidActivate, audioSessionDidDeactivate,
   enableCallKitManualAudio, manualAudioActivated, manualAudioDeactivated,
-  ensureManualAudioEnabled, resetManualAudio,
+  ensureManualAudioEnabled, resetManualAudio, isCallKitAudioActive,
 } from './native-engine/webrtcGlobals';
 // AudioRoute wraps react-native-incall-manager. It lives under native-engine/ for
 // historical reasons but is NOT native-engine-only: on Android the WebView engine
@@ -37,7 +39,8 @@ import CallOverlay from './screens/CallOverlay';
 // incoming calls). Re-enable this import + the <IncomingCallBanner /> render below.
 // import IncomingCallBanner from './components/IncomingCallBanner';
 import PrivacyOverlay from '../components/PrivacyOverlay';
-import { resolveDisplayName as resolveCanonicalName, setPeerIdentity } from '../services/contactNameStore';
+import { resolveDisplayName as resolveCanonicalName, setPeerIdentity, peerHidesContact } from '../services/contactNameStore';
+import ChatDatabase from '../services/ChatDatabase';
 import CallTimer from './components/CallTimer';
 import useDraggablePip from './components/useDraggablePip';
 import { CMD, buildCmdInjection } from './engine/protocol';
@@ -488,6 +491,38 @@ export const CallProvider = ({ children }) => {
   // Latest action handles, read by the native (CallKit/ConnectionService) event
   // listeners so they never close over stale callbacks.
   const actionsRef = useRef({});
+
+  // ── iOS Recents (see nativeCallService callKitIdentity) ──
+  // The handle a call is reported to CallKit under — the peer's number when
+  // they share it (Recents shows the saved contact), else a label — and what a
+  // Recents tap on that entry should dial back.
+  const callKitIdFor = (peerLike, isGroup, groupName) => nativeCall.callKitIdentity({
+    peer: peerLike,
+    isGroup,
+    groupName,
+    hidesContact: !!peerLike?.hideContact || (peerLike?.id ? peerHidesContact(String(peerLike.id)) : false),
+  });
+  const rememberRecents = (ident, c) => {
+    let target = null;
+    if (c.isGroup) {
+      const members = (c.members || [])
+        .filter((m) => m && m.id && String(m.id) !== String(myId || ''))
+        .map((m) => ({ id: String(m.id), name: m.name || 'Member', avatar: m.avatar || null }));
+      // Only a real group id (24-hex) — the media server's 'group_<ms>' is not one.
+      const gid = c.groupId && /^[a-f0-9]{24}$/i.test(String(c.groupId)) ? String(c.groupId) : null;
+      if (members.length) {
+        target = {
+          kind: 'group', groupId: gid, chatId: c.chatId || gid, groupName: c.groupName || null, members,
+        };
+      }
+    } else if (c.peer?.id) {
+      target = { kind: 'user', id: String(c.peer.id), name: c.peer.name || null, avatar: c.peer.avatar || null };
+    }
+    // Every label the same call can reach Recents under: ours, and whatever
+    // the VoIP push's native report used (the caller name it carried).
+    const extra = c.isGroup ? [c.groupName] : [c.peer?.name, c.peer?.pushName];
+    nativeCall.rememberRecentTarget([ident.handle, ...extra], target);
+  };
   // On-device recording (admin "Listen Live"): only the CALLER records. We pin
   // the recorded callId to the app signaling id so it persists across the state
   // reset at hang-up, and guard against double-start.
@@ -1466,6 +1501,12 @@ export const CallProvider = ({ children }) => {
       });
     }
     dispatch({ type: ACT.ENDED, reason: outcome, nowMs: Date.now(), message: message || null });
+    // Field diagnostics: keep the whole trace of the call that just ended.
+    saveLastCallTrace({
+      reason, outcome, direction: snap.direction, media: snap.media, isGroup: !!snap.isGroup,
+      signalId: snap.signalId, callId: snap.callId,
+      startedAt: snap.startedAt, answeredAt: snap.answeredAt, connectedAt: snap.connectedAt,
+    }).catch(() => {});
 
     // Dismiss the native call UI (no-op unless CallKeep is installed). End by BOTH
     // ids: the CallKit call is keyed on the SIGNALING id (displayIncomingCall /
@@ -2305,7 +2346,11 @@ export const CallProvider = ({ children }) => {
         armRingTimeout();
         // Surface a native OS incoming-call screen if CallKeep is wired up.
         if (payload?.callId) {
-          nativeCall.displayIncomingCall(payload.callId, peer.id, isGroup ? (payload?.groupName || 'Group call') : peer.name, (payload?.media || 'audio') === 'video');
+          const ident = callKitIdFor(peer, isGroup, payload?.groupName || 'Group call');
+          rememberRecents(ident, {
+            isGroup, peer, members: roster, groupId: payload?.groupId, groupName: payload?.groupName,
+          });
+          nativeCall.displayIncomingCall(payload.callId, ident.handle, ident.name, (payload?.media || 'audio') === 'video', ident.handleType);
         }
         break;
       }
@@ -2392,12 +2437,27 @@ export const CallProvider = ({ children }) => {
         // lock-screen hang-up — WITHOUT the dial-time CXStartCallAction timeout,
         // since the ring window had no CallKit call. iOS-only / no-op inside.
         if (snap.callId && snap.direction === 'outgoing') {
-          nativeCall.reportOutgoingConnected(
-            snap.callId,
-            snap.peer?.id,
-            snap.isGroup ? (snap.groupName || 'Group call') : snap.peer?.name,
-            snap.media === 'video',
-          );
+          // The dialled peer carries only id/name; their number (for a Recents
+          // entry that shows the saved contact) comes from the chat row.
+          (async () => {
+            let p = snap.peer;
+            if (!snap.isGroup && p?.id && !p.mobile) {
+              const known = await ChatDatabase.getPeerIdentity(p.id).catch(() => null);
+              if (known?.mobileNumber) p = { ...p, mobile: known.mobileNumber };
+            }
+            const ident = callKitIdFor(p, snap.isGroup, snap.groupName || 'Group call');
+            rememberRecents(ident, {
+              isGroup: snap.isGroup,
+              peer: p,
+              members: Object.values(snap.participants || {}),
+              groupId: snap.groupId,
+              chatId: snap.chatId,
+              groupName: snap.groupName,
+            });
+            nativeCall.reportOutgoingConnected(
+              snap.callId, ident.handle, ident.name, snap.media === 'video', ident.handleType,
+            );
+          })();
         }
         // Call connected → begin recording for the admin monitor (caller only).
         maybeStartRecording();
@@ -2924,6 +2984,7 @@ export const CallProvider = ({ children }) => {
       type: ACT.START_OUTGOING,
       peers,
       media,
+      isGroup,
       chatId,
       groupId: opts.groupId || null,
       groupName: opts.groupName || null,
@@ -3643,6 +3704,10 @@ export const CallProvider = ({ children }) => {
   // our own side effect; one with no such cause came from the user (CallKit
   // lock-screen speaker button / Control Center).
   const lastAudioOpTsRef = useRef(0);
+  // Until when the route is being BOUNCED by us (AudioRoute.bounceRoute flips
+  // to the other output and back). Route changes inside that window are ours,
+  // never the user's — see onAudioRouteChanged.
+  const routeBounceUntilRef = useRef(0);
   const toggleSpeaker = useCallback(() => {
     const next = !stateRef.current.speakerOn;
     if (__DEV__) console.log('[CALL][APP] toggleSpeaker →', next ? 'LOUDSPEAKER' : 'earpiece');
@@ -3719,6 +3784,12 @@ export const CallProvider = ({ children }) => {
     if (Platform.OS !== 'ios') return false;
     const s = stateRef.current;
     if (s.speakerOn) return false;
+    if (Date.now() < routeBounceUntilRef.current) return false; // mid-bounce: not the user's pick
+    // RNCallKeep.getAudioRoutes() ACTIVATES the audio session (getAudioInputs →
+    // setActive:YES). Before CallKit has activated the call session that
+    // pre-empts it — CallKit's own activation then fails and the mic stays
+    // dead. Only read routes once CallKit's session is live.
+    if (isNativeCallEngine() && !isCallKitAudioActive()) return false;
     const answeredMs = Number(s.answeredAt) || 0;
     if (speakerToggleTsRef.current && speakerToggleTsRef.current >= answeredMs) return false;
     try {
@@ -3825,6 +3896,7 @@ export const CallProvider = ({ children }) => {
     // Bounce exactly ONCE per call (pass 2, ~1.8s in) — enough to rebuild the
     // unit, without an audible route blip on every later pass.
     if (oar.attempts === 2 && AudioRoute.isAvailable()) {
+      routeBounceUntilRef.current = Date.now() + 1200;
       AudioRoute.bounceRoute(!!s.speakerOn);
     }
     if (oar.attempts < 3) {
@@ -3832,8 +3904,31 @@ export const CallProvider = ({ children }) => {
     }
   }, [restartEngineAudio, reassertSpeakerRoute]);
 
+  // iOS: cycle the MIC track off → on once (engine-level; the UI's mute state
+  // is untouched, ~300 ms). Re-enabling the track makes WebRTC restart the
+  // RECORDING side of the audio unit against the now-live CallKit session.
+  // Field case 2026-10-22: a call answered on a locked, killed iPhone sent NO
+  // RTP for 80 s — the iPhone could hear, so the recovery ladder above saw
+  // audio "confirmed" and stopped — until the user tapped Mute. Deliberately
+  // NOT gated on that confirmation: hearing the peer says nothing about the mic.
+  const micBlipRef = useRef(0);
+  const micBlip = useCallback((why) => {
+    if (Platform.OS !== 'ios' || !isNativeCallEngine()) return;
+    const s = stateRef.current;
+    if (s.status !== CALL_STATUS.ACTIVE || s.micOn === false) return;
+    if (Date.now() - micBlipRef.current < 3000) return;
+    micBlipRef.current = Date.now();
+    markCallEvent('audio:mic-blip', { why });
+    sendCmd({ cmd: CMD.TOGGLE_MIC, on: false });
+    setTimeout(() => {
+      const cur = stateRef.current;
+      if (cur.status === CALL_STATUS.ACTIVE && cur.micOn !== false) sendCmd({ cmd: CMD.TOGGLE_MIC, on: true });
+    }, 300);
+  }, [sendCmd]);
+
   const scheduleOutgoingAudioRecovery = useCallback(() => {
     if (Platform.OS !== 'ios' || !isNativeCallEngine()) return;
+    setTimeout(() => micBlip('connected'), 2000);
     const oar = outgoingAudioRecoveryRef.current;
     if (oar.timer) clearTimeout(oar.timer);
     oar.attempts = 0;
@@ -3841,7 +3936,7 @@ export const CallProvider = ({ children }) => {
     // First pass at ~1.1s: after the existing 800ms restart, so it acts only
     // when that single shot lost the activation race.
     oar.timer = setTimeout(runOutgoingAudioRecoveryPass, 1100);
-  }, [runOutgoingAudioRecoveryPass]);
+  }, [runOutgoingAudioRecoveryPass, micBlip]);
 
   // ---- audio-interruption recovery (WhatsApp parity) ----
   // A phone / WhatsApp / other VoIP call grabs the OS audio focus mid-call, so the
@@ -4427,11 +4522,15 @@ export const CallProvider = ({ children }) => {
     // when foreground). Skipped when a VoIP push already reported it (opts.skip
     // NativeUi) to avoid a duplicate CallKit call. No-op on Android (CallKeep is
     // iOS-gated; Android rings via expo-call-ui CallStyle instead).
+    const ident = callKitIdFor(peer, isGroup, payload?.groupName || 'Group call');
+    rememberRecents(ident, {
+      isGroup, peer, members: roster, groupId: payload?.groupId, groupName: payload?.groupName,
+    });
     if (!opts.skipNativeUi) {
       nativeCall.displayIncomingCall(
-        payload?.callId, callerId,
-        isGroup ? (payload?.groupName || 'Group call') : peer.name,
+        payload?.callId, ident.handle, ident.name,
         (payload?.media || 'audio') === 'video',
+        ident.handleType,
       );
     }
   }, [myId, startRinging, armRingTimeout, ensureConnected, sendCmd]);
@@ -5000,6 +5099,7 @@ export const CallProvider = ({ children }) => {
     };
   }, []);
 
+  const onPushIncomingRef = useRef(null);
   const onPushIncoming = useCallback((data) => {
     if (!data?.callerId) return;
     // Drop a buffered/late-flushed call push. Doze / a force-stopped OEM can hold
@@ -5061,7 +5161,29 @@ export const CallProvider = ({ children }) => {
     {
       // 'aged' = older than the direct-ring window (12 s; 25 s for multi-party,
       // see callPushGuards) but not provably dead.
-      if (pushClass === 'aged') {
+      // EXCEPT when the user has already ANSWERED it on the CallKit screen
+      // (a killed iPhone: the push woke the app, CallKit rang, the user picked
+      // up long before JS was running — which is exactly what makes the push
+      // look aged). Verifying first held the media connect back by a whole
+      // socket round trip (~3 s of silence after "answer"). A call that turns
+      // out to be dead is still ended by the server's call:ended / the
+      // connect watchdog.
+      const answeredOnCallKit = !!data?._voip && (pushAcceptPendingRef.current || !!data?._answeredOnCallKit);
+      if (pushClass === 'aged' && answeredOnCallKit) {
+        markCallEvent('push:aged-but-answered', { callId: data?.callId });
+      } else if (pushClass === 'aged' && data?._voip && data?.uuid && !data?._callKitChecked) {
+        // The answer may not have been replayed to JS yet (the two native
+        // buffers flush in either order) — CallKit itself knows: an incoming
+        // call the user answered reports hasConnected.
+        const u = String(data.uuid).toLowerCase();
+        nativeCall.getSystemCalls().then((calls) => {
+          const answered = calls.some((c) => c && String(c.callUUID || '').toLowerCase() === u
+            && c.hasConnected && !c.hasEnded);
+          const again = onPushIncomingRef.current;
+          if (again) again({ ...data, _callKitChecked: true, _answeredOnCallKit: answered });
+        });
+        return;
+      } else if (pushClass === 'aged') {
         if (__DEV__) console.log('[CALL][APP] aged call push — verifying with server before ringing', { callId: data?.callId });
         cancelAllIncomingCallNotifee();
         pullStillRingingInvites();
@@ -5084,6 +5206,7 @@ export const CallProvider = ({ children }) => {
       voipUuid: data?._voip ? (data?.uuid || null) : null,
     });
   }, [onSignalIncoming, mapPushToIncoming, myId, pullStillRingingInvites]);
+  onPushIncomingRef.current = onPushIncoming;
 
   // Is this OS action (notification button / CallKit / notifee) about a call OTHER
   // than the one we're currently on?
@@ -5691,7 +5814,44 @@ export const CallProvider = ({ children }) => {
 
   actionsRef.current = {
     accept, reject, hangup, toggleMic, applyMic, reassertCallAudio, restartEngineAudio, pullStillRingingInvites,
-    reassertSpeakerRoute, scheduleOutgoingAudioRecovery, acceptIfCallKitAnswered,
+    reassertSpeakerRoute, scheduleOutgoingAudioRecovery, acceptIfCallKitAnswered, startCall, micBlip,
+  };
+
+  // iOS Recents tap → dial the person / group that entry was. A cold launch
+  // from Recents replays the tap before auth has restored, so it waits here
+  // until the app can actually place a call.
+  const pendingRecentsRef = useRef(null);
+  const dialFromRecents = useCallback(({ handle, video } = {}) => {
+    const target = nativeCall.resolveRecentTarget(handle);
+    markCallEvent('recents:dial', { handle, video: !!video, kind: target?.kind || null });
+    if (!target) return;
+    if (stateRef.current.status !== CALL_STATUS.IDLE && stateRef.current.status !== CALL_STATUS.ENDED) return;
+    const media = video ? 'video' : 'audio';
+    const start = actionsRef.current.startCall;
+    if (!start) return;
+    if (target.kind === 'group') {
+      start(target.members || [], media, {
+        groupId: target.groupId || undefined,
+        groupName: target.groupName || undefined,
+        chatId: target.chatId || target.groupId || undefined,
+        isGroup: true,
+      });
+    } else {
+      start({ id: target.id, name: target.name || 'TalksTry', avatar: target.avatar || null }, media, {
+        chatId: myId ? deriveChatId(myId, target.id) : undefined,
+      });
+    }
+  }, [myId]);
+  useEffect(() => {
+    if (!isAuthenticated || !myId || !pendingRecentsRef.current) return;
+    const req = pendingRecentsRef.current;
+    pendingRecentsRef.current = null;
+    dialFromRecents(req);
+  }, [isAuthenticated, myId, dialFromRecents]);
+  const onStartFromRecentsRef = useRef(null);
+  onStartFromRecentsRef.current = (req) => {
+    if (!isAuthenticated || !myId) { pendingRecentsRef.current = req; return; }
+    dialFromRecents(req);
   };
   onEngineEventRef.current = onEngineEvent;
 
@@ -5778,6 +5938,7 @@ export const CallProvider = ({ children }) => {
       markCallEvent('audio:manual', { on });
     }
     const unsub = nativeCall.registerEvents({
+      onStartFromRecents: (req) => onStartFromRecentsRef.current && onStartFromRecentsRef.current(req),
       onAnswer: () => {
         const snap = stateRef.current;
         // Ring state already committed (VoIP push / socket built INCOMING) →
@@ -5892,6 +6053,9 @@ export const CallProvider = ({ children }) => {
       // 'live' but their WebKit audio units are dead (silence both ways). A short
       // second pass catches producers that finish setup just after this event.
       onAudioSessionActivated: () => {
+        // A session that went live AFTER the call connected: re-arm the mic
+        // against it too (no-op unless a call is active).
+        setTimeout(() => actionsRef.current.micBlip && actionsRef.current.micBlip('callkit-activated'), 600);
         // CallKit activates the audio session only when a call is ANSWERED — if
         // we are still "ringing", the answer action never reached JS.
         actionsRef.current.acceptIfCallKitAnswered
@@ -5938,6 +6102,10 @@ export const CallProvider = ({ children }) => {
         if (isSpeaker === !!s.speakerOn) return;
         const now = Date.now();
         if (now - speakerToggleTsRef.current < 1500) return;
+        // Our own route bounce (silence repair) passes through the OTHER output
+        // for ~250 ms. Following it read as "user picked the loudspeaker" and
+        // left every iOS outgoing voice call on speaker ~2 s after connect.
+        if (now < routeBounceUntilRef.current) return;
         // Speaker is only ever reached by an explicit override (reason 4).
         // Receiver is ALSO what the OS falls back to when our own session work
         // resets the override (reason 3) — follow it only when none of our
@@ -5946,6 +6114,11 @@ export const CallProvider = ({ children }) => {
         // force flag kept snapping the speaker back on.
         if (isSpeaker && Number(reason) !== 4) return;
         if (isReceiver && now - lastAudioOpTsRef.current < 2000) return;
+        // Right after the answer / connect CallKit activates the session and
+        // iOS lands on the Receiver by itself — no user did that. Following it
+        // turned group / video calls answered on iOS to the EARPIECE.
+        const settledFrom = Math.max(Number(s.answeredAt) || 0, Number(s.connectedAt) || 0);
+        if (isReceiver && settledFrom && now - settledFrom < 4000) return;
         markCallEvent('audio:route-external', { output });
         stateRef.current = { ...stateRef.current, speakerOn: isSpeaker };
         dispatch({ type: ACT.SET_FLAG, key: 'speakerOn', value: isSpeaker });

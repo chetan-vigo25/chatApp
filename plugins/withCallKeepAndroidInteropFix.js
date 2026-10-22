@@ -99,11 +99,26 @@ const IOS_ANSWER_FROM = `    [self configureAudioSession];
     [self sendEventWithNameWrapper:RNCallKeepPerformAnswerCallAction body:`;
 const IOS_ANSWER_TO = `    // ${PATCH_MARKER}: category only — never setActive here; CallKit activates
     // the session itself and didActivateAudioSession configures it fully.
+    // If something already ACTIVATED our session (seen 2026-10-22: active since
+    // launch, before JS), changing its category while CallKit's ringtone plays
+    // fails with '!pri' and iOS resets it to AmbientSound (mixable) — CallKit
+    // then cannot activate the call session at all: no didActivate, no mic for
+    // the whole call. Deactivate first: an INACTIVE session takes the category
+    // without an interruption, and CallKit activates it right after fulfill.
+    [[AVAudioSession sharedInstance] setActive:NO error:nil];
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionAllowBluetooth error:nil];
+    [self sendEventWithNameWrapper:RNCallKeepPerformAnswerCallAction body:`;
+
+const IOS_ANSWER_PREV = `    // ${PATCH_MARKER}: category only — never setActive here; CallKit activates
+    // the session itself and didActivateAudioSession configures it fully.
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionAllowBluetooth error:nil];
     [self sendEventWithNameWrapper:RNCallKeepPerformAnswerCallAction body:`;
 
 const IOS_REPLACEMENTS = [
   ['route event guard', IOS_ROUTE_FROM, IOS_ROUTE_TO],
+  // An install patched by the previous version of this plugin — upgraded FIRST
+  // so the entry below then finds its target already in place.
+  ['answer: deactivate before category', IOS_ANSWER_PREV, IOS_ANSWER_TO],
   ['answer without setActive', IOS_ANSWER_FROM, IOS_ANSWER_TO],
 ];
 
@@ -119,6 +134,7 @@ function patchCallKeepIos(projectRoot) {
   IOS_REPLACEMENTS.forEach(([label, from, to]) => {
     if (patched.includes(to)) return;
     if (!patched.includes(from)) {
+      if (from === IOS_ANSWER_PREV) return; // nothing to upgrade
       console.warn(`[withCallKeepAndroidInteropFix] iOS anchor not found (${label}) — RNCallKeep.m `
         + 'changed; re-check it before shipping.');
       return;

@@ -45,6 +45,11 @@
           "remote-notification",
           "audio",
           "voip"
+        ],
+        "NSUserActivityTypes": [
+          "INStartCallIntent",
+          "INStartAudioCallIntent",
+          "INStartVideoCallIntent"
         ]
       }
     },
