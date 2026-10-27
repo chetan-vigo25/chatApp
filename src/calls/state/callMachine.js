@@ -510,9 +510,13 @@ export function callReducer(state, action) {
 }
 
 // Derive the outcome to persist from the terminal state.
-export function deriveOutcome(state, reason) {
+export function deriveOutcome(state, reason, message) {
   const wasActive = !!state.answeredAt;
   if (reason === 'rejected') return 'rejected';
+  // A ring that ran out (server call:timeout or the local backstop) is not the
+  // caller cancelling — keep it apart so the history can say "No answer".
+  // recordCall falls back to 'cancelled' while the backend still 400s on it.
+  if (reason === 'cancelled' && state.direction === 'outgoing' && /no answer/i.test(message || '')) return 'no_answer';
   if (reason === 'cancelled') return 'cancelled';
   if (reason === 'failed') return 'failed';
   if (reason === 'missed') return 'missed';

@@ -12,7 +12,15 @@ export const recordCall = async (payload) => {
   try {
     const res = await apiCall('post', 'user/call/log', payload, { silent: true });
     return res?.data || null;
-  } catch (_) {
+  } catch (err) {
+    // A backend that predates outcome 'no_answer' answers 400 (seen 2026-10-27)
+    // — re-send as the old 'cancelled' so the log is never lost.
+    // A silent apiCall rejects with the response BODY ({ statusCode, … }), or
+    // with the axios error when there was no body.
+    const status = err?.statusCode ?? err?.response?.status;
+    if (payload?.outcome === 'no_answer' && Number(status) === 400) {
+      return recordCall({ ...payload, outcome: 'cancelled' });
+    }
     return null;
   }
 };

@@ -114,8 +114,23 @@ const IOS_ANSWER_PREV = `    // ${PATCH_MARKER}: category only — never setActi
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayAndRecord withOptions:AVAudioSessionCategoryOptionAllowBluetooth error:nil];
     [self sendEventWithNameWrapper:RNCallKeepPerformAnswerCallAction body:`;
 
+// allocWithZone hands back ONE shared instance, but init runs on every alloc
+// (AppDelegate's early RNCallKeep, the bridge, every JS reload) and each run
+// added another route-change observer on that same object — so every iOS route
+// change reached JS 3–4 times (seen 2026-10-27 after a cold start). Drop the
+// previous registration before adding it.
+const IOS_OBSERVER_FROM = `        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAudioRouteChange:)`;
+const IOS_OBSERVER_TO = `        // ${PATCH_MARKER}: init re-runs on the shared instance — register once.
+        [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                        name:AVAudioSessionRouteChangeNotification
+                                                      object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(onAudioRouteChange:)`;
+
 const IOS_REPLACEMENTS = [
   ['route event guard', IOS_ROUTE_FROM, IOS_ROUTE_TO],
+  ['route observer registered once', IOS_OBSERVER_FROM, IOS_OBSERVER_TO],
   // An install patched by the previous version of this plugin — upgraded FIRST
   // so the entry below then finds its target already in place.
   ['answer: deactivate before category', IOS_ANSWER_PREV, IOS_ANSWER_TO],

@@ -2,7 +2,7 @@
   "expo": {
     "name": "TalksTry",
     "slug": "baatCheet",
-    "version": "1.3.9",
+    "version": "1.4.1",
     "orientation": "portrait",
     "scheme": "talkstry",
     "userInterfaceStyle": "automatic",
@@ -26,7 +26,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.chat.baatCheet",
-      "buildNumber": "16",
+      "buildNumber": "17",
       "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,

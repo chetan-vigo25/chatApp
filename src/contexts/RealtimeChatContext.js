@@ -436,7 +436,7 @@ const buildLastMessageDisplay = ({ chat, currentUserId, isTyping, typingUserName
     const isOutgoing = Boolean(currentUserId && messageSender && String(currentUserId) === String(messageSender));
     const kind = media === 'video' ? 'video' : 'voice';
     const callIcon = media === 'video' ? '📹' : '📞';
-    const missedLike = (outcome === 'missed' || outcome === 'cancelled') && !isOutgoing;
+    const missedLike = (outcome === 'missed' || outcome === 'cancelled' || outcome === 'no_answer') && !isOutgoing;
     let label;
     if (outcome === 'completed') label = media === 'video' ? 'Video call' : 'Voice call';
     else if (outcome === 'rejected') label = isOutgoing ? 'Call declined' : 'Declined call';

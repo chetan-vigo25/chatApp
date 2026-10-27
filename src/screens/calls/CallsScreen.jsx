@@ -112,6 +112,7 @@ const callMetaLabel = (direction, outcome) => {
     case 'missed': return 'Missed';
     case 'rejected': return 'Declined';
     case 'cancelled': return isOut ? 'Cancelled' : 'Missed';
+    case 'no_answer': return isOut ? 'No answer' : 'Missed';
     case 'failed': return 'Not connected';
     case 'completed':
     default: return isOut ? 'Outgoing' : 'Incoming';

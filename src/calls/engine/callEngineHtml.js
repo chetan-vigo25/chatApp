@@ -196,6 +196,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
     // who never answered must NOT get a fresh ring out of nowhere.
     var RETRY_WINDOW_MS = 40000;
     var REASSERT_MS = 5000;       // min gap between ring reasserts after a successful dial
+    var PROMOTE_REASSERT_MS = 2000; // producer-state safety re-assert after the pre-answer promote
 
     // Explicit voice-processing constraints — most WebViews default these ON,
     // but relying on defaults left it device-dependent (echo/level complaints
@@ -389,12 +390,15 @@ export const buildCallEngineHtml = () => `<!doctype html>
     // Produce the mic with the opus voice tuning; if a WebView rejects the
     // codecOptions, fall back to a PLAIN produce — tuning must never be the
     // reason a call has no audio at all.
+    // stopTracks:false — a media rebuild closes the producers and re-produces the
+    // SAME tracks; the default (stop on close) failed that with "track ended".
+    // Teardown stops the tracks itself.
     CallingSDK.prototype._produceMic = function (track) {
       var self = this;
-      return self._sendTransport.produce({ track: track, codecOptions: MIC_CODEC_OPTIONS, appData: { source: 'mic' } })
+      return self._sendTransport.produce({ track: track, stopTracks: false, codecOptions: MIC_CODEC_OPTIONS, appData: { source: 'mic' } })
         .catch(function (e) {
           self._log('mic produce with codecOptions failed (' + (e && e.message) + ') — retrying plain');
-          return self._sendTransport.produce({ track: track, appData: { source: 'mic' } });
+          return self._sendTransport.produce({ track: track, stopTracks: false, appData: { source: 'mic' } });
         });
     };
 
@@ -611,7 +615,12 @@ export const buildCallEngineHtml = () => `<!doctype html>
         // _out.callId dropped the accept (caller kept ringing while the callee
         // sat alone in the room). No cancelCall of sibling ids here: the relay
         // would surface as 'cancelled' on a callee still holding them.
-        var mine = !!self._outIds[cid] || (self._out && self._out.callId === cid) || self._acceptedId === cid;
+        // …or ANY accept for the room we are sitting in pre-answer: the dial-id
+        // bookkeeping can be cleared under us (grace sweep / redial / reassert),
+        // and dropping that accept left the caller's mic paused for the whole call.
+        var preRoom = !!(self._room && self._room.preAnswer && p.roomId != null
+          && String(self._room.roomId) === String(p.roomId));
+        var mine = preRoom || !!self._outIds[cid] || (self._out && self._out.callId === cid) || self._acceptedId === cid;
         if (!mine) return;
         self._out = null;
         self._outIds = {};
@@ -625,20 +634,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
         var pre = self._room && self._room.preAnswer;
         if (pre && String(self._room.roomId) === String(p.roomId)
             && (!p.serverUrl || p.serverUrl === self._serverUrl)) {
-          self._room.callId = String(p.callId);
-          self._room.media = self._media;
-          self._room.preAnswer = false;
-          ['mic', 'camera'].forEach(function (k) {
-            var pr = self._producers[k];
-            if (pr && !pr.closed) {
-              try { pr.resume(); } catch (e) {}
-              // STATE-SYNC (not raw retry): this is the single message that
-              // un-mutes the caller for the whole call — and a stale queued
-              // pause must never be able to land after it.
-              self._syncProducerState(pr).catch(function () {});
-            }
-          });
-          self._log('accepted — pre-joined room promoted (media already warm)');
+          self._promotePreAnswer(String(p.callId), 'accepted');
           return;
         }
         if (pre) {
@@ -1514,6 +1510,53 @@ export const buildCallEngineHtml = () => `<!doctype html>
       }
     };
 
+    // End the pre-answer privacy hold: bind the callId and un-pause the
+    // producers. Reached from callAccepted, OR from the first peer track we
+    // consume while still pre-answer — the callee only joins the room after
+    // accepting, so their media IS the accept. Without that fallback a lost /
+    // guard-dropped callAccepted left the caller's mic server-paused for the
+    // whole call (callee hears nothing, caller hears fine, UI says connected).
+    CallingSDK.prototype._promotePreAnswer = function (callId, why) {
+      var self = this;
+      var room = self._room;
+      if (!room || !room.preAnswer) return;
+      if (why !== 'accepted') {
+        // callAccepted never ran — settle the dial state it would have
+        // cleared, or the redial loop keeps re-ringing an answered call.
+        callId = callId || (self._out && self._out.callId) || self._acceptedId || null;
+        self._out = null;
+        self._outIds = {};
+        self._acceptedId = null;
+        self._clearRetry();
+      }
+      room.callId = callId != null ? String(callId) : room.callId;
+      room.media = self._media;
+      room.preAnswer = false;
+      ['mic', 'camera'].forEach(function (k) {
+        var pr = self._producers[k];
+        if (pr && !pr.closed) {
+          try { pr.resume(); } catch (e) {}
+          // STATE-SYNC (not raw retry): this is the single message that
+          // un-mutes the caller for the whole call — and a stale queued
+          // pause must never be able to land after it.
+          self._syncProducerState(pr).catch(function () {});
+        }
+      });
+      self._log(why === 'accepted'
+        ? 'accepted — pre-joined room promoted (media already warm)'
+        : 'pre-joined room promoted by ' + why + ' (callAccepted missed)');
+      // Safety tick: re-assert the producers' local state once the call has
+      // settled, so a resumeProducer lost on a flapping socket can't leave the
+      // server-side producer paused (idempotent when everything already agrees).
+      setTimeout(function () {
+        if (self._room !== room || room.preAnswer) return;
+        ['mic', 'camera'].forEach(function (k) {
+          var pr = self._producers[k];
+          if (pr && !pr.closed) self._syncProducerState(pr, 3).catch(function () {});
+        });
+      }, PROMOTE_REASSERT_MS);
+    };
+
     CallingSDK.prototype._produceLocal = function () {
       var self = this;
       var chain = Promise.resolve();
@@ -1533,7 +1576,7 @@ export const buildCallEngineHtml = () => `<!doctype html>
             for (var i = 0; i < codecs.length; i++) {
               if (String(codecs[i].mimeType).toLowerCase() === 'video/vp8') { vp8 = codecs[i]; break; }
             }
-            var opts = { track: video, encodings: CAM_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 1000 }, appData: { source: 'camera' } };
+            var opts = { track: video, encodings: CAM_ENCODINGS, codecOptions: { videoGoogleStartBitrate: 1000 }, stopTracks: false, appData: { source: 'camera' } };
             if (vp8) opts.codec = vp8;
             return self._sendTransport.produce(opts).then(function (pr) { self._producers.camera = pr; self._pauseIfPreAnswer(pr); });
           });
@@ -1577,6 +1620,8 @@ export const buildCallEngineHtml = () => `<!doctype html>
         return self._reqRetry('resumeConsumer', { consumerId: consumer.id }).then(function () {
           self._groupJoined[peerId] = true;
           self._log('consuming ' + consumer.track.kind + (isScreen ? ' (screen)' : '') + ' from ' + peerId);
+          // Peer media while still pre-answer = the callee accepted and joined.
+          if (self._room && self._room.preAnswer) self._promotePreAnswer(null, 'media from ' + peerId);
           // Peer's camera was ALREADY off when we consumed — no producerPaused
           // event will come, so seed the state from the consume response.
           if (consumer.kind === 'video' && !isScreen && consumedPaused) {

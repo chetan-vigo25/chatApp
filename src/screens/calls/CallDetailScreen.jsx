@@ -34,6 +34,8 @@ const callDescriptor = (direction, outcome, media) => {
       return isOut ? `Declined ${mediaWord}` : `Declined ${mediaWord}`;
     case 'cancelled':
       return isOut ? `Cancelled ${mediaWord}` : `Missed ${mediaWord}`;
+    case 'no_answer':
+      return isOut ? `Unanswered ${mediaWord}` : `Missed ${mediaWord}`;
     case 'failed':
       return `Not connected · ${mediaWord}`;
     case 'completed':

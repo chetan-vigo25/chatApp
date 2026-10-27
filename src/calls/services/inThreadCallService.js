@@ -19,6 +19,7 @@ const labelFor = (media, direction, outcome) => {
   if (outcome === 'missed') return `Missed ${kind} call`;
   if (outcome === 'rejected') return direction === 'outgoing' ? 'Call declined' : 'Declined call';
   if (outcome === 'cancelled') return direction === 'outgoing' ? 'Cancelled call' : 'Missed call';
+  if (outcome === 'no_answer') return direction === 'outgoing' ? 'No answer' : 'Missed call';
   if (outcome === 'failed') return `${kind === 'video' ? 'Video' : 'Voice'} call`;
   // completed
   return direction === 'outgoing' ? `Outgoing ${kind} call` : `Incoming ${kind} call`;

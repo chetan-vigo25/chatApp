@@ -71,7 +71,7 @@ export default function CallMessageBubble({
   // neutrally too — matching the calls list, which reserves red text for a
   // genuinely missed incoming call. The ARROW is separate: it goes red for
   // every unconnected call on both sides.
-  const isMissed = !isOutgoing && (outcome === 'missed' || outcome === 'cancelled');
+  const isMissed = !isOutgoing && (outcome === 'missed' || outcome === 'cancelled' || outcome === 'no_answer');
 
   const peerMobile = peer?.mobileNumber
     || (peer?.mobile?.number ? `${peer.mobile.code || ''}${peer.mobile.number}` : null)
@@ -122,6 +122,10 @@ export default function CallMessageBubble({
   else if (isMissed) subtitle = 'Tap to call back';
   else if (outcome === 'rejected') subtitle = isOutgoing ? 'Declined' : 'You declined';
   else if (outcome === 'failed') subtitle = 'Not connected';
+  // Ring-outs persist as 'no_answer' (backend accepts it since 2026-10-27), so
+  // an outgoing 'cancelled' is the caller hanging up — older ring-outs logged
+  // as 'cancelled' read "Cancelled" too.
+  else if (outcome === 'cancelled' && isOutgoing) subtitle = 'Cancelled';
   else subtitle = 'No answer';
 
   // Bubble surfaces match the text bubbles: sent = the user's chat accent

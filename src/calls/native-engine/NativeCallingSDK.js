@@ -30,6 +30,7 @@ import { showPicker as showIosBroadcastPicker } from 'expo-screen-broadcast';
 const RETRY_MS = 2500;
 const RETRY_WINDOW_MS = 40000;
 const REASSERT_MS = 5000; // min gap between ring reasserts after a successful dial
+const PROMOTE_REASSERT_MS = 2000; // producer-state safety re-assert after the pre-answer promote
 // A _pendingIn entry older than this is garbage: no server ring outlives the
 // ring window (~40s). Entries normally die on callCancelled/accept/decline —
 // but a cancel that lands while OUR socket is down is lost forever, and the
@@ -255,11 +256,16 @@ export default class NativeCallingSDK {
   // Produce the mic with the opus voice tuning; if the device rejects the
   // codecOptions, fall back to a PLAIN produce — tuning must never be the
   // reason a call has no audio at all.
+  //
+  // stopTracks:false — mediasoup-client's default STOPS the track when the
+  // producer closes. _rebuildMedia closes every producer and re-produces the SAME
+  // local tracks, which then failed "track ended" and left this side sending
+  // nothing for the rest of the call. Teardown stops the tracks itself.
   _produceMic(track) {
-    return this._sendTransport.produce({ track, codecOptions: MIC_CODEC_OPTIONS, appData: { source: 'mic' } })
+    return this._sendTransport.produce({ track, stopTracks: false, codecOptions: MIC_CODEC_OPTIONS, appData: { source: 'mic' } })
       .catch((e) => {
         this._log(`mic produce with codecOptions failed (${e && e.message}) — retrying plain`);
-        return this._sendTransport.produce({ track, appData: { source: 'mic' } });
+        return this._sendTransport.produce({ track, stopTracks: false, appData: { source: 'mic' } });
       });
   }
 
@@ -579,7 +585,12 @@ export default class NativeCallingSDK {
       // EARLIER redial/reassert id than the latest one in _out; matching only
       // _out.callId dropped the accept on the floor (caller kept ringing while
       // the callee sat alone in the room until the watchdog cut the call).
-      const mine = !!this._outIds[cid] || (this._out && this._out.callId === cid) || this._acceptedId === cid;
+      // …or ANY accept for the room we are sitting in pre-answer: the dial-id
+      // bookkeeping can be cleared under us (grace sweep / redial / reassert),
+      // and dropping that accept left the caller's mic paused for the whole call.
+      const preRoom = !!(this._room && this._room.preAnswer && p.roomId != null
+        && String(this._room.roomId) === String(p.roomId));
+      const mine = preRoom || !!this._outIds[cid] || (this._out && this._out.callId === cid) || this._acceptedId === cid;
       if (!mine) return;
       // NEVER cancelCall the sibling reassert ids here: the server relays every
       // cancel to the callee as callCancelled, and a WEBVIEW-engine callee
@@ -600,20 +611,7 @@ export default class NativeCallingSDK {
       const pre = this._room && this._room.preAnswer;
       if (pre && String(this._room.roomId) === String(p.roomId)
         && (!p.serverUrl || p.serverUrl === this._serverUrl)) {
-        this._room.callId = String(p.callId);
-        this._room.media = this._media;
-        this._room.preAnswer = false;
-        ['mic', 'camera'].forEach((k) => {
-          const pr = this._producers[k];
-          if (pr && !pr.closed) {
-            try { pr.resume(); } catch (_) {}
-            // STATE-SYNC (not raw retry): this is the single message that
-            // un-mutes the caller for the whole call — and a stale queued
-            // pause must never be able to land after it.
-            this._syncProducerState(pr).catch(() => {});
-          }
-        });
-        this._log('accepted — pre-joined room promoted (media already warm)');
+        this._promotePreAnswer(String(p.callId), 'accepted');
         return;
       }
       if (pre) {
@@ -1600,6 +1598,10 @@ export default class NativeCallingSDK {
         packetLossPct: total > 0 ? Math.round((lost / total) * 1000) / 10 : null,
         lastRttMs: rtt != null ? Math.round(rtt) : null,
         framesDecoded,
+        // Cumulative inbound RTP packets — growth between samples is the proof
+        // that the peer's media is reaching us (the app clears its reconnect
+        // watchdog on it).
+        packetsReceived: recv,
       });
     }).catch(() => {});
   }
@@ -1615,6 +1617,52 @@ export default class NativeCallingSDK {
       // NEVER land after the promote resume and mute the call forever.
       this._syncProducerState(pr).catch(() => {});
     }
+  }
+
+  // End the pre-answer privacy hold: bind the callId and un-pause the
+  // producers. Reached from callAccepted, OR from the first peer track we
+  // consume while still pre-answer — the callee only joins the room after
+  // accepting, so their media IS the accept. Without that fallback a lost /
+  // guard-dropped callAccepted left the caller's mic server-paused for the
+  // whole call (callee hears nothing, caller hears fine, UI says connected).
+  _promotePreAnswer(callId, why) {
+    const room = this._room;
+    if (!room || !room.preAnswer) return;
+    if (why !== 'accepted') {
+      // callAccepted never ran — settle the dial state it would have cleared,
+      // or the redial loop keeps re-ringing an answered call.
+      callId = callId || (this._out && this._out.callId) || this._acceptedId || null;
+      this._out = null;
+      this._outIds = {};
+      this._acceptedId = null;
+      this._clearRetry();
+    }
+    room.callId = callId != null ? String(callId) : room.callId;
+    room.media = this._media;
+    room.preAnswer = false;
+    ['mic', 'camera'].forEach((k) => {
+      const pr = this._producers[k];
+      if (pr && !pr.closed) {
+        try { pr.resume(); } catch (_) {}
+        // STATE-SYNC (not raw retry): this is the single message that
+        // un-mutes the caller for the whole call — and a stale queued
+        // pause must never be able to land after it.
+        this._syncProducerState(pr).catch(() => {});
+      }
+    });
+    this._log(why === 'accepted'
+      ? 'accepted — pre-joined room promoted (media already warm)'
+      : `pre-joined room promoted by ${why} (callAccepted missed)`);
+    // Safety tick: re-assert the producers' local state once the call has
+    // settled, so a resumeProducer lost on a flapping socket can't leave the
+    // server-side producer paused (idempotent when everything already agrees).
+    setTimeout(() => {
+      if (this._room !== room || room.preAnswer) return;
+      ['mic', 'camera'].forEach((k) => {
+        const pr = this._producers[k];
+        if (pr && !pr.closed) this._syncProducerState(pr, 3).catch(() => {});
+      });
+    }, PROMOTE_REASSERT_MS);
   }
 
   _produceLocal() {
@@ -1643,6 +1691,9 @@ export default class NativeCallingSDK {
             // 0 frames). The pause still stops everything being SENT; and the
             // user's camera-off toggle disables the track itself (toggleCamera).
             disableTrackOnPause: false,
+            // Keep the track alive when a media rebuild closes this producer
+            // (see _produceMic).
+            stopTracks: false,
             appData: { source: 'camera' },
           };
           if (vp8) opts.codec = vp8;
@@ -1691,6 +1742,8 @@ export default class NativeCallingSDK {
       return this._reqRetry('resumeConsumer', { consumerId: consumer.id }).then(() => {
         this._groupJoined[peerId] = true;
         this._log(`consuming ${consumer.track.kind}${isScreen ? ' (screen)' : ''} from ${peerId}`);
+        // Peer media while still pre-answer = the callee accepted and joined.
+        if (this._room && this._room.preAnswer) this._promotePreAnswer(null, `media from ${peerId}`);
         // Joined while the peer's camera was ALREADY paused (camera off before
         // we consumed) — no producerPaused event will come, so seed the state
         // from the consume response.

@@ -453,9 +453,24 @@ class ExpoCallUiModule : Module() {
       // a later recents resume with leftover extras is still bounced.
       if (isFreshCallLaunch(activity.intent)) return@OnActivityEntersForeground
       val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-      if (km?.isKeyguardLocked == true) {
+        ?: return@OnActivityEntersForeground
+      if (!km.isKeyguardLocked) return@OnActivityEntersForeground
+      // UNLOCK RACE: right after the user unlocks, the keyguard's exit animation
+      // (~150–200ms) resumes this showWhenLocked activity while isKeyguardLocked
+      // still reads true — bouncing then sent the app to the background the
+      // moment the user unlocked ("app closes on unlock"). isDeviceLocked turns
+      // false as soon as the credential is accepted, so only a genuinely locked
+      // device is bounced at once; a keyguard that is merely on its way out (or
+      // a non-secure swipe keyguard) is re-checked once it has had time to go.
+      if (km.isDeviceLocked) {
         try { activity.moveTaskToBack(true) } catch (_: Exception) {}
+        return@OnActivityEntersForeground
       }
+      activity.window?.decorView?.postDelayed({
+        if (!callActive && km.isKeyguardLocked) {
+          try { activity.moveTaskToBack(true) } catch (_: Exception) {}
+        }
+      }, 700)
     }
 
     OnCreate {

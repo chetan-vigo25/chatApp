@@ -190,6 +190,11 @@ const ENV_RING_SEC = (() => {
 })();
 const clampRingSec = (s) => Math.min(Math.max(Number(s) || 0, 10), 180);
 const getRingTimeoutMs = () => clampRingSec(getServerRingDurationSec() || ENV_RING_SEC) * 1000;
+// The 1:1 ring verdict belongs to the SERVER (call:timeout = no_answer, after its
+// own ring window + grace). The local timer is only the backstop for a timeout
+// that never arrives, so it runs this much LONGER — firing first turned every
+// unanswered call into an app "cancelled" and the server's no_answer never ran.
+const RING_BACKSTOP_GRACE_MS = 10000;
 
 // After a call is ANSWERED, how long to wait for remote media to actually
 // connect (status → ACTIVE) before giving up. This guards the holes the ring
@@ -292,7 +297,7 @@ const deriveEndCause = (reason, message, snap, opts) => {
     else code = 'call_failed';
   } else if (reason === 'missed') code = 'remote_missed';
   else if (reason === 'rejected') code = 'remote_declined';
-  else if (reason === 'cancelled') code = /no answer/i.test(m) ? 'ring_timeout' : 'remote_cancelled';
+  else if (reason === 'cancelled') code = /no answer/i.test(m) ? 'no_answer' : 'remote_cancelled';
   return { code, trigger: 'system', source: 'app_auto', message: m || null, appState };
 };
 
@@ -433,6 +438,9 @@ export const CallProvider = ({ children }) => {
   const autoExpandedRef = useRef(false);
   const reconnectWatchdogRef = useRef(null); // mid-call media-drop recovery watchdog (APP-6)
   const engineRetryRef = useRef(null);       // re-arm a FAILED engine connect (keeps this device callable)
+  const lastEndCauseRef = useRef(null);      // cause of the last finalizeEnd, for cancels re-sent after it
+  const finalizedStartRef = useRef(null);    // startedAt of the last finalized call — never finalize it twice
+  const reconnectStatsBaseRef = useRef(null); // inbound packet count when a reconnect began (rtcStats recovery proof)
   const authedRef = useRef(false);           // isAuthenticated, readable from timers without re-arming them
   const healEngineRef = useRef(() => {});     // latest healEngine, so the heartbeat never re-arms on identity churn
   const audioRouteAppliedRef = useRef(false); // did the user toggle Speaker this call? (so we reset routing on end)
@@ -1450,7 +1458,14 @@ export const CallProvider = ({ children }) => {
   // log, UI reset) is unchanged. See the emit block below for why.
   const finalizeEnd = useCallback((reason, message, opts) => {
     if (endedRef.current) return;
+    // The post-end reset clears endedRef and dispatches RESET, but stateRef only
+    // catches up after React commits. A terminal echo landing in that gap (our
+    // own call:ended back from the server) finalized the SAME call a second time
+    // and sent a second call:cancel whose remote_ended cause overwrote user_cancel.
+    const startedAt = stateRef.current?.startedAt || null;
+    if (startedAt && finalizedStartRef.current === startedAt) return;
     endedRef.current = true;
+    finalizedStartRef.current = startedAt;
     // Kill any pending outgoing-audio recovery pass — it must never fire after
     // the call ends (restartEngineAudio self-gates too; this is the belt).
     {
@@ -1493,7 +1508,7 @@ export const CallProvider = ({ children }) => {
     resetAudioRoute(); // restore loudspeaker if the user had switched to earpiece
 
     const snap = stateRef.current;
-    const outcome = deriveOutcome(snap, reason);
+    const outcome = deriveOutcome(snap, reason, message);
     if (__DEV__) {
       console.log('[CALL] end', {
         reason, outcome, callId: snap.callId, signalId: snap.signalId,
@@ -1564,23 +1579,33 @@ export const CallProvider = ({ children }) => {
     // Cancel any mid-call "Add participant" ring that is STILL unanswered, so
     // the invitee's ring dismisses when the call ends (a joined invitee is
     // skipped — a cancel on their sub-ring could tear down their live call UI).
+    // Every end emit carries WHY (server CallTraces) — a causeless cancel is
+    // recorded as an anonymous app abort. Kept for the post-ring re-cancel too.
+    const cause = deriveEndCause(reason, message, snap, opts);
+    lastEndCauseRef.current = cause;
     const pendingInvites = inviteSignalsRef.current;
     inviteSignalsRef.current = [];
     pendingInvites.forEach(({ sigId, ids }) => {
       const stillRinging = (ids || []).filter((id) => !snap.participants?.[String(id)]?.joined);
-      if (stillRinging.length) cancelCall({ callId: sigId, toUserIds: stillRinging });
+      if (stillRinging.length) cancelCall({ callId: sigId, toUserIds: stillRinging, cause });
     });
 
     // Release the server-side busy lock + notify the peer over the app socket,
     // keyed on the signaling id. Only when this call used the signaling path
     // (an id is present); pure-WebRTC fallbacks have no lock to clear.
-    if (snap.signalId && snap.peer?.id) {
+    // Not when the SERVER told us the 1:1 is over (call:ended / cancelled /
+    // rejected / timeout): it already recorded the verdict, and an echoed
+    // end/cancel made it mint a NEW terminal event that overwrote it
+    // (no_answer → cancelled). Multi-party keeps its roster emits.
+    const serverEnded = !!opts?.serverEnded && !isMultiParty(snap);
+    if (snap.signalId && snap.peer?.id && !serverEnded) {
       const otherIds = (snap.peers || []).map((p) => p.id).filter(Boolean);
-      const cause = deriveEndCause(reason, message, snap, opts);
       if (reason === 'rejected' && snap.direction === 'incoming') {
         rejectCallSignal({ callId: snap.signalId, callerId: snap.peer.id, cause });
       } else if (snap.direction === 'outgoing' && !snap.answeredAt) {
-        cancelCall({ callId: snap.signalId, toUserIds: otherIds, cause });
+        // The SERVER ended this ring (call:timeout) — it already recorded
+        // no_answer and released the lock; a cancel would overwrite that verdict.
+        if (!opts?.serverEnded) cancelCall({ callId: snap.signalId, toUserIds: otherIds, cause });
       } else if (opts?.leaveOnly && snap.isConference) {
         // LEAVING a real CONFERENCE that continues without me. `call:end` is the
         // 1:1 "this call is over" vocabulary, broadcast to every other member —
@@ -1823,7 +1848,8 @@ export const CallProvider = ({ children }) => {
   }, [clearGroupRingSweep, removeGroupParticipant]);
 
   // Arm the unanswered-call timeout. Fires once after the configured ring window
-  // (getRingTimeoutMs) unless the call is answered (ACTIVE) or already ended.
+  // plus RING_BACKSTOP_GRACE_MS unless the call is answered (ACTIVE), already
+  // ended, or the server's call:timeout ended it first (the normal case).
   const armRingTimeout = useCallback(() => {
     clearRingTimeout();
     ringTimeoutRef.current = setTimeout(() => {
@@ -1852,7 +1878,7 @@ export const CallProvider = ({ children }) => {
       }
       if (snap.status === CALL_STATUS.OUTGOING) finalizeEnd('cancelled', 'No answer');
       else if (snap.status === CALL_STATUS.INCOMING) finalizeEnd('missed');
-    }, getRingTimeoutMs());
+    }, getRingTimeoutMs() + RING_BACKSTOP_GRACE_MS);
   }, [clearRingTimeout, finalizeEnd, removeGroupParticipant]);
 
   // Save a call-failure report (src/calls/diagnostics) before a watchdog ends
@@ -2668,6 +2694,23 @@ export const CallProvider = ({ children }) => {
       case 'rtcStats': {
         // Periodic quality snapshot from the engine — keep the latest only.
         if (payload && typeof payload === 'object') rtcStatsRef.current = payload;
+        // Recovery the server never announces: after the PEER's network drop the
+        // media server sent peerMedia 'disconnected' but no 'connected' once the
+        // peer resumed inside its grace window, so this side's watchdog ended a
+        // call that was flowing again (2026-10-27). Inbound packets growing past
+        // the first sample taken while reconnecting = the peer's media is back.
+        const snap = stateRef.current;
+        const pkts = payload?.packetsReceived;
+        if (!snap.reconnecting || typeof pkts !== 'number') {
+          reconnectStatsBaseRef.current = null;
+        } else if (reconnectStatsBaseRef.current == null) {
+          reconnectStatsBaseRef.current = pkts;
+        } else if (pkts > reconnectStatsBaseRef.current) {
+          if (__DEV__) console.log('[CALL] inbound media flowing again → reconnect cleared', { pkts, base: reconnectStatsBaseRef.current });
+          reconnectStatsBaseRef.current = null;
+          clearReconnectWatchdog();
+          dispatch({ type: ACT.SET_FLAG, key: 'reconnecting', value: false });
+        }
         break;
       }
       // NOTE on these two: they are the MEDIA-LAYER twins of onSignalRejected /
@@ -2717,8 +2760,10 @@ export const CallProvider = ({ children }) => {
           if (id) removeGroupParticipant(String(id), 'cancelled');
           break;
         }
-        // caller gave up before we answered → missed for the callee
-        finalizeEnd(snap.direction === 'incoming' ? 'missed' : 'cancelled');
+        // caller gave up before we answered → missed for the callee. The caller
+        // cancels on the app socket too, so the server already has the verdict.
+        finalizeEnd(snap.direction === 'incoming' ? 'missed' : 'cancelled', undefined,
+          { serverEnded: snap.direction === 'incoming' && !snap.answeredAt });
         break;
       }
       case 'peerleft': {
@@ -3015,7 +3060,9 @@ export const CallProvider = ({ children }) => {
       // setup (cancel processed first → nothing to cancel then). The ring ack
       // has LANDED now, so server state exists — re-send the cancel; idempotent
       // (tombstone) server-side. Without this the callee rang a dead call.
-      cancelCall({ callId: signalId, toUserIds: peerIds });
+      // Same cause as the first cancel — a causeless re-send overwrote the
+      // server's user_cancel with code:null.
+      cancelCall({ callId: signalId, toUserIds: peerIds, cause: lastEndCauseRef.current || undefined });
       return;
     }
 
@@ -4592,7 +4639,7 @@ export const CallProvider = ({ children }) => {
       if (by) removeGroupParticipant(by, 'cancelled');
       return;
     }
-    finalizeEnd(snap.direction === 'incoming' ? 'missed' : 'cancelled');
+    finalizeEnd(snap.direction === 'incoming' ? 'missed' : 'cancelled', undefined, { serverEnded: true });
   }, [finalizeEnd, dismissGhostRing, removeGroupParticipant]);
   const onSignalRejected = useCallback((payload) => {
     if (!matchesCurrent(payload)) return;
@@ -4604,7 +4651,7 @@ export const CallProvider = ({ children }) => {
       if (by) removeGroupParticipant(by, 'rejected');
       return;
     }
-    finalizeEnd('rejected');
+    finalizeEnd('rejected', undefined, { serverEnded: true });
   }, [finalizeEnd, removeGroupParticipant]);
   const onSignalEnded = useCallback((payload) => {
     if (!matchesCurrent(payload)) { dismissGhostRing(payload); return; }
@@ -4625,7 +4672,7 @@ export const CallProvider = ({ children }) => {
       if (by) removeGroupParticipant(by, 'completed');
       return;
     }
-    finalizeEnd('completed');
+    finalizeEnd('completed', undefined, { serverEnded: true });
   }, [finalizeEnd, removeGroupParticipant, dismissGhostRing, myId]);
 
   // ── Reliability contract §4: reconcile the LIVE call with the server ───────
@@ -4733,8 +4780,8 @@ export const CallProvider = ({ children }) => {
         .forEach((p) => removeGroupParticipant(p.id));
       return;
     }
-    if (snap.direction === 'outgoing') finalizeEnd('cancelled', 'No answer');
-    else if (snap.direction === 'incoming' && !snap.answeredAt) finalizeEnd('missed');
+    if (snap.direction === 'outgoing') finalizeEnd('cancelled', 'No answer', { serverEnded: true });
+    else if (snap.direction === 'incoming' && !snap.answeredAt) finalizeEnd('missed', undefined, { serverEnded: true });
   }, [finalizeEnd, removeGroupParticipant, dismissGhostRing]);
 
   // Multi-device dismissal (XR-1 / APP-4). Another device on THIS account handled

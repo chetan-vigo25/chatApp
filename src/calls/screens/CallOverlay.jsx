@@ -48,6 +48,7 @@ const END_TEXT = {
   completed: 'Call ended',
   rejected: 'Call declined',
   cancelled: 'Call cancelled',
+  no_answer: 'No answer',
   missed: 'Missed call',
   failed: 'Call failed',
   busy: 'User is busy on another call',
